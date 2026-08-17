@@ -22,8 +22,9 @@ Work ONLY inside this temporary per-run folder (create subdirectories as needed)
 {{run_root}}
 
 Keep every artifact you produce inside that folder — nothing outside it. The
-folder is temporary: it will be swept after the run finishes, so the prototypes
-only need to serve the research (they are NOT merged into any repository).
+folder is temporary: it is removed as a whole when the run's cleanup completes,
+so the prototypes only need to serve the research (they are NOT merged into any
+repository).
 
 Rules:
 - Prefer the smallest artifact that would meaningfully inform the research:

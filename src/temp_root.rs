@@ -1,5 +1,5 @@
 //! Private daemon temp root: one `/tmp/mahbot-<uid>` root for ALL daemon temp
-//! artifacts, plus the boot sweep and the one-time legacy temp-dir cleanup.
+//! artifacts.
 //!
 //! ## One root
 //!
@@ -9,22 +9,17 @@
 //! the very start of startup (before config and any temp use), so every
 //! `std::env::temp_dir()`-based consumer relocates automatically: shell spill
 //! files, research run folders, background-mode output, voice/telegram temp.
-//! The OS removes empty directories on its 3-day temp sweep, so the root is
-//! recreated and re-verified on every boot.
+//! The OS removes stale files on its periodic temp sweep — the daemon builds
+//! no startup/periodic reclamation of its own (crash leftovers are the
+//! operating system's job), so the root is simply recreated/re-verified on
+//! every boot.
 //!
 //! Shell children get `TMPDIR` set to the same root (see
 //! [`crate::tools::shell::shell_tmpdir`]).
 //!
-//! ## Boot sweep + legacy cleanup
-//!
-//! At real daemon boot [`boot_sweep`] sweeps crash leftovers in the root
-//! (`.agent` spill files + liveness-guarded run-root sweep) and cleans the
-//! mahbot-managed bases left by previous generations in the pre-pin legacy
-//! temp dir: `.agent`, `mahbot_voice`, `mahbot_telegram_files` exactly ONCE
-//! (marker-gated), plus the legacy `mahbot-research` base EVERY boot
-//! (liveness-guarded so live pre-upgrade run folders are preserved — and
-//! folders preserved on an earlier boot are reclaimed once their runs
-//! terminalize, instead of orphaning forever).
+//! Run folders inside the root (`mahbot-research/{job_id}`) are removed by
+//! the run's own completion flow (see `crate::research_cleanup`); nothing is
+//! reclaimed at daemon startup.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -34,8 +29,7 @@ static TEMP_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// The pre-pin OS temp dir (e.g. `/var/folders/.../T` on macOS). Captured
 /// before the `TMPDIR` pin so the readonly guard keeps it as an allowed root
-/// (bare macOS `mktemp` ignores `TMPDIR` and lands there) and the one-time
-/// legacy cleanup can target it.
+/// (bare macOS `mktemp` ignores `TMPDIR` and lands there).
 static LEGACY_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The pinned root path, if [`init_temp_root`] ran (production unix startup).
@@ -161,115 +155,6 @@ pub(crate) fn bare_mktemp_landing_root() -> PathBuf {
     }
     std::env::temp_dir()
 }
-
-/// Boot sweep: crash leftovers in the root + one-time legacy temp-dir cleanup.
-///
-/// Runs at real daemon boot AFTER the stores are open (the run-root sweep is
-/// liveness-guarded against the session store). Never deletes the root itself.
-#[cfg(unix)]
-pub async fn boot_sweep() {
-    if let Some(root) = temp_root() {
-        // Crash leftovers: `.agent` spill/bg files from a previous daemon
-        // session. THE startup purge — `agent_temp_dir` deliberately has no
-        // once-flag purge anymore (overlapping mechanisms; the eager boot
-        // sweep runs first and is the single mechanism).
-        let agent_dir = root.join(".agent");
-        if let Ok(mut entries) = tokio::fs::read_dir(&agent_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let _ = tokio::fs::remove_file(entry.path()).await;
-            }
-        }
-        // Dead run-root folders (liveness-guarded — live runs are preserved).
-        if let Ok(n) = crate::research_cleanup::sweep_run_roots().await
-            && n > 0
-        {
-            tracing::info!(n, "Boot sweep: reclaimed dead research run folders");
-        }
-    }
-    one_time_legacy_cleanup().await;
-}
-
-/// Clean the mahbot-managed bases left by previous generations in the legacy
-/// (pre-pin) temp dir.
-///
-/// Two tiers:
-/// - NON-liveness-gated bases (`.agent`, `mahbot_voice`, `mahbot_telegram_files`)
-///   are removed exactly ONCE (marker-gated: the marker lives in the storage
-///   root `~/.mahbot/.legacy-temp-cleaned`, which survives OS temp sweeps). The
-///   marker is written ONLY when every removal succeeds — a failure (e.g. a
-///   busy file) leaves no marker so the cleanup retries on the next boot
-///   instead of being silently skipped forever.
-/// - The legacy `mahbot-research` base is re-swept EVERY boot (cheap, usually
-///   empty) with a liveness-guarded sweep: live pre-upgrade run folders are
-///   preserved (prototypes are never destroyed by the migration), and folders
-///   whose runs have since terminalized are reclaimed. NOT marker-gated — a
-///   preserved-then-terminalized pre-upgrade folder must not orphan forever
-///   just because the once-marker was already written.
-async fn one_time_legacy_cleanup() {
-    let Some(legacy) = legacy_temp_dir() else {
-        return;
-    };
-    // Storage root for the once-only marker (CONFIG is loaded by the time the
-    // boot sweep runs).
-    let Some(storage_root) = crate::config::CONFIG
-        .try_storage_root()
-        .or_else(|| crate::config::default_config_dir().ok())
-    else {
-        return;
-    };
-    let marker = storage_root.join(".legacy-temp-cleaned");
-    let already_cleaned = tokio::fs::try_exists(&marker).await.unwrap_or(false);
-
-    if !already_cleaned {
-        // `.agent` — daemon-owned spill/bg leftovers (recreated on demand).
-        if !remove_if_exists(&legacy.join(".agent")).await {
-            return;
-        }
-        // `mahbot_voice` / `mahbot_telegram_files` — daemon-owned ephemeral bases.
-        if !remove_if_exists(&legacy.join("mahbot_voice")).await {
-            return;
-        }
-        if !remove_if_exists(&legacy.join(crate::util::TELEGRAM_FILES_DIR)).await {
-            return;
-        }
-        if let Err(e) = tokio::fs::write(&marker, b"legacy temp-dir bases cleaned once\n").await {
-            tracing::warn!(error = %e, "Legacy temp cleanup: marker write failed — retrying next boot");
-            return;
-        }
-        tracing::info!(legacy = %legacy.display(), "Legacy temp-dir bases cleaned once");
-    }
-
-    // EVERY boot: liveness-guarded sweep of the legacy research base. Live
-    // pre-upgrade run folders (jobs rows still exist) are preserved; dead
-    // leftovers are reclaimed — including folders preserved on earlier boots
-    // whose runs have since terminalized.
-    let legacy_research = legacy.join("mahbot-research");
-    match crate::research_cleanup::sweep_run_roots_at(&legacy_research).await {
-        Ok(n) if n > 0 => {
-            tracing::info!(n, "Legacy temp cleanup: reclaimed dead legacy run folders");
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "Legacy temp cleanup: run-root sweep failed — retrying next boot");
-        }
-    }
-}
-
-/// Remove a legacy base directory; `NotFound` counts as cleaned. Returns
-/// false (and logs) on any other failure so the once-only marker is withheld.
-async fn remove_if_exists(dir: &std::path::Path) -> bool {
-    match tokio::fs::remove_dir_all(dir).await {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(e) => {
-            tracing::warn!(path = %dir.display(), error = %e, "Legacy temp cleanup: removal failed — retrying next boot");
-            false
-        }
-    }
-}
-
-#[cfg(not(unix))]
-pub async fn boot_sweep() {}
 
 #[cfg(test)]
 mod tests {

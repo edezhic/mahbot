@@ -222,8 +222,8 @@ pub(crate) enum SpawnChild {
     Research,
     /// A research-run cleanup Sanitation agent. No child row: the jobs row's
     /// `task` holds the cleanup prompt, and the row id == the run id (folder
-    /// name) so the run-root sweep's jobs-row liveness holds the run folder
-    /// alive for the duration of the cleanup run.
+    /// name) so the row holds the run folder until the cleanup completes —
+    /// the folder is released by the cleanup tail (folder first, row last).
     ResearchCleanup,
     /// ticket_stage_jobs (id, ticket_id, stage, phase, round).
     TicketStage {
@@ -716,7 +716,8 @@ pub(crate) enum ResumableStage {
         capped: bool,
     },
     /// A research-run cleanup Sanitation agent interrupted by a crash. The
-    /// jobs row id == the run id, so the run folder is still held alive.
+    /// jobs row id == the run id, so the row is the cleanup's resume marker
+    /// and holds the folder until the cleanup completes.
     ResearchCleanup {
         job_id: String,
         workspace_name: String,
@@ -844,20 +845,22 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
         }
         // Crash-window cleanup dispatch: a genuinely-undelivered
         // research-completion envelope whose run has NO `research_cleanup`
-        // jobs row AND no archived cleanup report means the daemon died
-        // between complete_durable_job and dispatch_research_cleanup — the
-        // cleanup agent never ran. Create the durable row NOW (the dedup
-        // marker + sweep-liveness hold); the `research_cleanup` boot-scan arm
-        // below — which reads list_active_jobs AFTER this replay — is the
-        // SOLE dispatcher for the agent (spawning here would double-run the
-        // same `cleanup_{run_id}` id: the scan arm would register it via
-        // AgentRegistry, replacing + cancelling this dispatch). Runs whose
-        // cleanup was already dispatched have the row and are skipped here
-        // (their cleanup resumes via the `research_cleanup` boot-scan arm).
-        // A missing row with an ARCHIVED cleanup report means the cleanup
-        // COMPLETED while the envelope stayed undelivered (dead target
-        // session) — re-dispatching would be a duplicate LLM round every boot
-        // (the archive is the durable completed marker).
+        // jobs row means the daemon died between complete_durable_job and
+        // dispatch_research_cleanup — the cleanup agent never ran. Create the
+        // durable row NOW (the dedup marker + folder-hold); the
+        // `research_cleanup` boot-scan arm below — which reads
+        // list_active_jobs AFTER this replay — is the SOLE dispatcher for the
+        // agent (spawning here would double-run the same `cleanup_{run_id}`
+        // id: the scan arm would register it via AgentRegistry, replacing +
+        // cancelling this dispatch). Runs whose cleanup was already dispatched
+        // have the row and are skipped here (their cleanup resumes via the
+        // `research_cleanup` boot-scan arm).
+        // `dispatch_cleanup_for_pending_envelope` uses RUN-FOLDER EXISTENCE as
+        // its replay discriminator (crash-window classifier only, not a
+        // dispatch condition): a folder still present means the cleanup never
+        // ran; a folder already gone means the cleanup COMPLETED in a previous
+        // lifetime while the envelope stayed undelivered (dead target session)
+        // — no re-dispatch, so no per-boot duplicate cleanup LLM round.
         // Deliberately after the appended-dedup check: an already-appended
         // envelope proves dispatch ran in the previous lifetime, so a missing
         // row there means the cleanup COMPLETED — re-dispatching would be a
@@ -988,6 +991,15 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     // board rollback keeps ticket_stage rows in place so the next purge tick
     // retries the CAS — deleting the job first would strand the ticket in a
     // blocking phase with no runtime recovery until the next boot reset.
+    //
+    // Structural safety for research_cleanup rows (kind-agnostic DELETE here):
+    // a research_cleanup row can only reach this purge with its run folder
+    // ALREADY released — `recover_from_restart` handles every research_cleanup
+    // row synchronously at boot, before this periodic loop's first tick, by
+    // either resuming it (the cleanup tail releases the folder before it
+    // terminalizes the row, so the row never ages into the purge) or capping
+    // it (the cap branch releases the folder in-process and leaves the row to
+    // age out HERE, folder already gone). No folder is orphaned by the purge.
     let tx = conn.begin_tx().await?;
     let mut deleted = 0usize;
     for id in &purge_ids {
@@ -1273,18 +1285,21 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
             "research_cleanup" => {
                 // A research-run cleanup Sanitation agent interrupted by a
                 // crash. Resume it like any other durable job; on cap the row
-                // is NOT resumed — it is left to age into the purge (8h from
-                // its last checkpoint), which deletes the row and releases the
-                // run-folder liveness hold so the existing sweep reclaims the
-                // folder (the cleanup backstop). Deliberately no checkpoint
-                // bump on cap: that would refresh updated_at and keep the row
-                // purge-immune forever (a capped cleanup is not worth an LLM
-                // round every boot).
+                // is NOT resumed — the run folder is released IN-PROCESS
+                // (recover_from_restart runs before any agent spawns, so
+                // nothing is reading the folder) and the row is left to age
+                // into the purge (8h from its last checkpoint), which deletes
+                // the row. Any path that removes a research_cleanup row must
+                // release the run folder in the same operation. Deliberately
+                // no checkpoint bump on cap: that would refresh updated_at and
+                // keep the row purge-immune forever (a capped cleanup is not
+                // worth an LLM round every boot).
                 if job.retry_count >= MAX_BOOT_REDISPATCH {
                     warn!(
                         job = %job.id,
-                        "Research cleanup job exceeded boot re-dispatch cap — left for the purge (run folder reclaimed by the sweep)",
+                        "Research cleanup job exceeded boot re-dispatch cap — run folder released in-process, row left for the purge",
                     );
+                    crate::research_cleanup::release_run_folder(&job.id).await;
                     continue;
                 }
                 let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
@@ -2344,11 +2359,11 @@ mod tests {
     /// NOT be resumed: the resume would spend one LLM round per boot, and the
     /// checkpoint bump would keep the row purge-immune forever (updated_at
     /// refreshed each boot), holding the run folder indefinitely. On cap the
-    /// row is left to age into the 8h purge, which releases the folder for
-    /// the sweep (the documented cleanup backstop).
+    /// run folder is released IN-PROCESS (no sweep exists anymore) and the
+    /// row is left to age into the 8h purge.
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // recover_from_restart resets the shared global board
-    async fn recover_from_restart_caps_research_cleanup_leaves_for_purge() {
+    async fn recover_from_restart_caps_research_cleanup_releases_folder() {
         // Router init: recover_from_restart replays pending_jobs, which can
         // route envelopes (panic if ROUTER is uninitialized).
         crate::util::test::init_management_test_stores().await;
@@ -2362,6 +2377,9 @@ mod tests {
         )
         .await
         .unwrap();
+        // Run-folder fixture: what a crash-left cleanup run leaves behind.
+        let run_folder = crate::research_cleanup::run_root_path("jclean");
+        tokio::fs::create_dir_all(&run_folder).await.unwrap();
         let resumable = recover_from_restart().await.unwrap();
         assert!(
             !resumable.iter().any(|r| matches!(
@@ -2369,6 +2387,10 @@ mod tests {
                 ResumableStage::ResearchCleanup { job_id, .. } if job_id.as_str() == "jclean"
             )),
             "capped cleanup must NOT be selected for resume (left for the purge)"
+        );
+        assert!(
+            !run_folder.exists(),
+            "the cap branch releases the run folder in-process (no sweep exists)"
         );
         let updated: String = conn
             .query_row("SELECT updated_at FROM jobs WHERE id = 'jclean'", (), |r| {
@@ -2495,8 +2517,13 @@ mod tests {
         )
         .await
         .unwrap();
+        // Run-folder fixture: the terminalized run left its folder behind, so
+        // the replay's folder-existence discriminator classifies this as the
+        // crash window (cleanup never ran) and recreates the row.
+        let run_folder = crate::research_cleanup::run_root_path("rcln2");
+        tokio::fs::create_dir_all(&run_folder).await.unwrap();
         let resumable = recover_from_restart().await.unwrap();
-        // (a) The replay created the row (dedup marker + sweep-liveness hold).
+        // (a) The replay created the row (dedup marker + folder-hold).
         assert!(
             crate::research_cleanup::research_cleanup_row_exists(conn, "rcln2")
                 .await
@@ -2534,26 +2561,31 @@ mod tests {
         conn.execute("DELETE FROM jobs WHERE id = 'rcln2'", ())
             .await
             .unwrap();
+        let _ = tokio::fs::remove_dir_all(&run_folder).await;
     }
 
     /// Cleanup-completed-but-envelope-undelivered dedup: a pending
-    /// research-completion envelope whose run ALREADY has an archived cleanup
-    /// report (cleanup ran to completion in a previous lifetime; the row was
-    /// terminalized) must NOT re-dispatch — the archive is the durable
-    /// completed marker, and re-dispatching would cost one LLM round per boot
-    /// until the 7-day pending cap. The envelope itself still replays.
+    /// research-completion envelope whose run folder is ALREADY GONE (the
+    /// cleanup ran to completion in a previous lifetime — the tail released
+    /// the folder and terminalized the row) must NOT re-dispatch — folder
+    /// absence is the completed marker on the replay path, and re-dispatching
+    /// would cost one LLM round per boot until the 7-day pending cap. The
+    /// envelope itself still replays.
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // shared process-lifetime store rows
-    async fn replay_skips_cleanup_dispatch_when_report_archived() {
+    async fn replay_skips_cleanup_dispatch_when_run_folder_gone() {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         crate::util::test::create_test_workspace("/tmp/test_ws_replay_archived", "ws_replay3")
             .await;
         let now = crate::turso::now();
-        // Archive a completed cleanup report for this run (what a finished
-        // cleanup leaves in the durable archive).
-        crate::research_cleanup::write_cleanup_report("rcln3", "question?", "removed 2 files")
-            .await;
+        // Simulate a cleanup that completed in a previous lifetime: the run
+        // folder was released by the cleanup tail (folder removed, row
+        // terminalized) while the envelope stayed undelivered.
+        let run_folder = crate::research_cleanup::run_root_path("rcln3");
+        tokio::fs::create_dir_all(&run_folder).await.unwrap();
+        crate::research_cleanup::release_run_folder("rcln3").await;
+        assert!(!run_folder.exists(), "fixture: run folder released");
         conn.execute(
             "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
              VALUES ('rcln3', 'manager_ws_replay3', ?1, ?2)",
@@ -2580,7 +2612,7 @@ mod tests {
             !crate::research_cleanup::research_cleanup_row_exists(conn, "rcln3")
                 .await
                 .unwrap(),
-            "an archived cleanup report means the cleanup completed — no re-dispatch"
+            "a released run folder means the cleanup completed — no re-dispatch"
         );
         let sessions = conn
             .query(
@@ -2599,14 +2631,6 @@ mod tests {
         conn.execute("DELETE FROM pending_jobs WHERE id = 'rcln3'", ())
             .await
             .unwrap();
-        // Remove the archived results.md created for this test run.
-        let _ = tokio::fs::remove_file(
-            crate::config::CONFIG
-                .try_storage_root()
-                .map(|r| r.join("research").join("results").join("rcln3.md"))
-                .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
-        )
-        .await;
     }
 
     /// Boot classification: launched jobs whose ticket left the

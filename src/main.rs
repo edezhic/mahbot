@@ -73,14 +73,6 @@ async fn bootstrap_mahbot() -> Result<()> {
     // and model settings take effect.
     mahbot::config::reload_from_db().await?;
 
-    // Boot sweep: crash leftovers in the private temp root + the one-time
-    // legacy temp-dir cleanup. Runs after the stores are open (the run-root
-    // sweep is liveness-guarded against the session store) and BEFORE any
-    // background task / boot-resume recreates live run folders — the sweep
-    // only reclaims DEAD folders, so ordering with resume is safe either way.
-    #[cfg(unix)]
-    mahbot::temp_root::boot_sweep().await;
-
     // Local Qwen3-ASR transcriber: start the load-or-download chain as a
     // background task. Config is authoritative here (honors a user-set
     // audio_transcription_use_local=false) and this runs BEFORE the provider
@@ -167,13 +159,13 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
                 // the TTL guard after the purge cascade removes their job rows.
                 let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
                 let cleaned = mahbot::session::cleanup_old_transient_sessions(&cutoff).await?;
-                // Research sweeps (run roots + artist generated/uploads) — after
-                // the purge so dead-run detection sees the final jobs state;
-                // artist sessions are never transient, so keep-evidence is live
-                // regardless of ordering.
-                let run_roots = mahbot::research_cleanup::sweep_run_roots().await?;
+                // Artist generated/uploads keep-detection — after the purge so
+                // the jobs-state is final; artist sessions are never transient,
+                // so keep-evidence is live regardless of ordering. (Research
+                // run folders are NOT swept here — they are released by the
+                // run's own cleanup flow; crash leftovers are the OS's job.)
                 let media = mahbot::research_cleanup::sweep_media().await?;
-                Ok(purged + cleaned + run_roots + media)
+                Ok(purged + cleaned + media)
             },
         ),
     );

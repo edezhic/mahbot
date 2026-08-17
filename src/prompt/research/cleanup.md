@@ -16,10 +16,11 @@ ran (raw, unfiltered, newest first).
 ## Your task
 1. **Read the command dump** at `{{dump_path}}` — it is the run's *intent*:
    which commands its agents executed and where they pointed.
-2. **Enumerate the filesystem as *fact***: list the contents of the per-run
-   folder `{{run_folder}}`, the temp root, and `/tmp`. Delete temporary files
-   that are attributable to THIS run — files whose creation this run's commands
-   explain, or leftover scratch inside its own per-run folder.
+2. **Enumerate the filesystem as *fact***: list the contents of the temp root
+   and `/tmp` (the per-run folder itself is removed as a whole by the run's
+   completion flow — you do not need to empty it). Delete temporary files
+   that are attributable to THIS run — files whose creation this run's
+   commands explain.
 3. **Report what you removed and what you left**, with paths. If nothing was
    attributable, say so explicitly.
 
@@ -33,9 +34,8 @@ ran (raw, unfiltered, newest first).
 - **Never delete another agent's active files** or any file you cannot attribute
   to this run with confidence.
 - **When in doubt, leave it.** Attribution failures favor keeping the file —
-  the run folder is reclaimed by the daemon's sweep anyway, so leaving a stray
-  file costs nothing; deleting a file that belongs elsewhere is irreversible
-  damage to another agent's work.
+  deleting a file that belongs elsewhere is irreversible damage to another
+  agent's work.
 
 You may delete files under the allowed temp roots with your shell tool
 (`rm`/`rmdir` are permitted there). Do NOT modify anything else.

@@ -549,9 +549,9 @@ fn stop_annotation_wait() -> Duration {
 
 /// Create the output file with create_new semantics in the shared `.agent`
 /// temp directory. The name is a distinct `bg_*` shape (flat, outside the
-/// `spill_*` namespace) so the existing startup cleanup purges it and spill
-/// detection never mistakes it for a spill file. Returns the path and an
-/// open handle for the command's stdout/stderr.
+/// `spill_*` namespace) so spill detection never mistakes it for a spill
+/// file and the OS temp sweep reclaims it like any other leftover. Returns
+/// the path and an open handle for the command's stdout/stderr.
 fn create_bg_output_file() -> std::io::Result<(PathBuf, File)> {
     let dir = super::agent_temp_dir().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "agent temp dir unavailable")

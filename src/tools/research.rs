@@ -23,10 +23,9 @@ use crate::retry::FailureClass;
 use crate::tools::Tool;
 use crate::tools::analyze::{
     AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
-    await_round_members, build_async_result_envelope, complete_durable_job_and_route,
-    dispatch_claim_verifiers, escape_fences, extract_query_telemetry,
-    extract_query_telemetry_from_history, load_analyst_angles, max_confidence, normalize_claim,
-    round_timeout,
+    await_round_members, build_async_result_envelope, dispatch_claim_verifiers, escape_fences,
+    extract_query_telemetry, extract_query_telemetry_from_history, load_analyst_angles,
+    max_confidence, normalize_claim, round_timeout,
 };
 use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, ToolSpec, Workspace};
 use anyhow::Result;
@@ -564,17 +563,16 @@ async fn dispatch_durable_research(
     )
     .await;
     // Cleanup dispatch AFTER the exactly-once boundary: the cleanup jobs row
-    // reuses id == run_id (the folder name) for the sweep-liveness hold, so it
-    // must be spawned only after complete_durable_job freed that id (a
-    // wrongly-ordered row would be deleted by the completion DELETE).
-    if spawned
-        && let Err(e) =
-            crate::research_cleanup::dispatch_research_cleanup(&job_id, ws, question).await
+    // reuses id == run_id (the folder name) as the durability marker that
+    // holds the folder until the cleanup completes, so it must be spawned
+    // only after complete_durable_job freed that id (a wrongly-ordered row
+    // would be deleted by the completion DELETE).
+    if spawned && let Err(e) = crate::research_cleanup::dispatch_research_cleanup(&job_id, ws).await
     {
         tracing::warn!(
             job = %job_id,
             error = %e,
-            "Research cleanup dispatch failed — run folder will be reclaimed by the sweep"
+            "Research cleanup dispatch failed — run folder left for the OS temp sweep"
         );
     }
     Some(envelope)
@@ -602,10 +600,12 @@ async fn write_terminalization_artifacts(
     crate::research_cleanup::write_command_dump(&run_root, &state.commands).await;
 }
 
-/// Real-terminalization tail: artifacts (results.md + command dump + cleanup
-/// dispatch) written BEFORE the exactly-once boundary, then durable completion
-/// and routing to the stored caller. Callers pass their already-loaded state
-/// (the capped path loads it earlier for the partial report).
+/// Real-terminalization tail: artifacts (results.md + command dump) written
+/// BEFORE the exactly-once boundary, then durable completion, cleanup
+/// dispatch, and routing to the stored caller (in that order — matching the
+/// fresh-dispatch path: the envelope is never routed before the cleanup row
+/// exists). Callers pass their already-loaded state (the capped path loads it
+/// earlier for the partial report).
 ///
 /// The boot-cap path never enters `run_deep_research`, so both artifacts are
 /// produced here.
@@ -619,26 +619,30 @@ async fn terminalize_research(
 ) {
     let delivered = build_async_research_message(result);
     write_terminalization_artifacts(job_id, &caller.task, &delivered, state).await;
-    complete_durable_job_and_route(
+    // Complete BEFORE the cleanup dispatch (the cleanup jobs row reuses
+    // id == run_id; the completion DELETE must free it first) and BEFORE the
+    // route: a crash between complete and cleanup dispatch leaves the
+    // envelope pending, and boot replay recreates the cleanup row while the
+    // run folder still exists — closing the durability hole where the
+    // envelope was routed before the cleanup row was created.
+    let envelope = crate::jobs::complete_durable_job(
         job_id,
         delivered,
         JobKind::ResearchResult,
         caller_role,
-        caller,
+        &caller.user_name,
+        &caller.channel,
         &ws.name,
     )
     .await;
-    // Cleanup dispatch AFTER the exactly-once boundary (the cleanup jobs row
-    // reuses id == run_id; the completion DELETE must free it first).
-    if let Err(e) =
-        crate::research_cleanup::dispatch_research_cleanup(job_id, ws, &caller.task).await
-    {
+    if let Err(e) = crate::research_cleanup::dispatch_research_cleanup(job_id, ws).await {
         tracing::warn!(
             job = %job_id,
             error = %e,
-            "Research cleanup dispatch failed — run folder will be reclaimed by the sweep"
+            "Research cleanup dispatch failed — run folder left for the OS temp sweep"
         );
     }
+    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
 /// Boot resume of a research run: re-enter the orchestrator at the
@@ -3441,12 +3445,12 @@ mod tests {
         assert_eq!(
             job_rows.len(),
             1,
-            "research job terminalized; the research_cleanup liveness row remains"
+            "research job terminalized; the research_cleanup durability row remains"
         );
         assert_eq!(
             job_rows[0].get::<String>(0).unwrap(),
             "research_cleanup",
-            "the surviving row is the cleanup liveness hold, not the research job"
+            "the surviving row is the cleanup durability row, not the research job"
         );
         let pending = conn
             .query(
@@ -3571,7 +3575,8 @@ mod tests {
         // Terminalized into the durable envelope addressed to the stored
         // caller (the consumer skips it — the workspace is not registered, so
         // the pending row survives for the assertion). The surviving jobs row
-        // is the research_cleanup liveness hold (id == run_id == folder name).
+        // is the research_cleanup durability row (id == run_id == folder
+        // name) — the cleanup's resume marker, held until it completes.
         let job_rows = conn
             .query(
                 "SELECT kind FROM jobs WHERE id = ?1",
@@ -3582,12 +3587,12 @@ mod tests {
         assert_eq!(
             job_rows.len(),
             1,
-            "research job terminalized; the research_cleanup liveness row remains"
+            "research job terminalized; the research_cleanup durability row remains"
         );
         assert_eq!(
             job_rows[0].get::<String>(0).unwrap(),
             "research_cleanup",
-            "the surviving row is the cleanup liveness hold, not the research job"
+            "the surviving row is the cleanup durability row, not the research job"
         );
         let pending = conn
             .query(

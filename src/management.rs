@@ -703,6 +703,14 @@ pub async fn run_management() {
             // would linger without a workspace to drive it (envelope kinds
             // have no ticket to reset; ticket_stage kinds are re-covered by
             // the next boot's reset once no job row protects them).
+            // Any path that removes a research_cleanup row must release the
+            // run folder in the same operation (the row is the folder-hold;
+            // no sweep is a backstop anymore). A cleanup can never run
+            // without its workspace, so the folder would be orphaned — release
+            // it before terminalizing the row.
+            if matches!(&stage, ResumableStage::ResearchCleanup { .. }) {
+                crate::research_cleanup::release_run_folder(job_id).await;
+            }
             let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
             continue;
         };

@@ -199,7 +199,7 @@ fn resolve_query(args: &serde_json::Value) -> Option<String> {
 async fn resolve_workspace_engine(
     ws: &crate::Workspace,
 ) -> anyhow::Result<std::sync::Arc<search_engine::SearchEngineEntry>> {
-    match search_engine::resolve_engine(&ws.name, &ws.path, "").await {
+    match search_engine::resolve_engine(&ws.name, &ws.path, "", ws.ephemeral).await {
         Ok(entry) => Ok(entry),
         Err(e) if ws.ephemeral && search_engine::is_empty_index_error(&e) => {
             tracing::warn!(ws = %ws.name, "Ephemeral workspace has an empty search index — searching a not-yet-written folder");
@@ -209,8 +209,12 @@ async fn resolve_workspace_engine(
             // folder was empty stays empty for the run's lifetime — the scan
             // never re-runs, so a coder searching its own run_root after
             // writing prototypes sees no results.
-            search_engine::get_or_init_engine(&ws.name, std::path::Path::new(&ws.path))
-                .map_err(|e| anyhow::anyhow!(e))
+            search_engine::get_or_init_engine(
+                &ws.name,
+                std::path::Path::new(&ws.path),
+                ws.ephemeral,
+            )
+            .map_err(|e| anyhow::anyhow!(e))
         }
         Err(e) => Err(anyhow::anyhow!(e)),
     }

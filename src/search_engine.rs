@@ -13,6 +13,18 @@
 //! in-memory-only tracker — searches still work but combo-boosting resets on
 //! restart.
 //!
+//! Ephemeral per-run workspaces (the deep-research coder's search over its own
+//! run folder) are different: their tracker lives INSIDE the run folder
+//! (`{run_folder}/.queries` — dot-prefixed). The leading dot keeps it out of
+//! the run folder's own fff-search index: the run folder is a non-git root, so
+//! the walkers skip hidden entries and the per-dir (Linux) watcher never
+//! subscribes to a hidden dir; on macOS the single recursive FSEvents stream
+//! may still deliver write events, but the LMDB files are binary-classified
+//! (excluded from content/grep matches) and the whole folder dies with the
+//! run. Everything temporary lives in temp. On resume, a lost folder recreates
+//! the tracker empty, while a surviving folder re-opens the surviving LMDB —
+//! either way a fail-open ranking cache.
+//!
 //! ## Unready-state handling
 //!
 //! When `ensure_scanned` is called before the background scan has finished,
@@ -83,11 +95,15 @@ pub(crate) struct SearchEngineEntry {
 /// filesystem scan via [`FilePicker::new_with_shared_state`]. The persistent
 /// query tracker database is also opened (or falls back to in-memory).
 ///
+/// `ephemeral` marks per-run workspaces (the research coder's run folder): their
+/// query tracker lives inside the run folder instead of `~/.mahbot/search/`.
+///
 /// Returns a cloneable handle. Multiple callers racing on first access are
 /// serialized by the registry write lock — only one engine is created.
 pub(crate) fn get_or_init_engine(
     name: &str,
     path: &Path,
+    ephemeral: bool,
 ) -> Result<Arc<SearchEngineEntry>, String> {
     // Fast path: read-lock check.
     {
@@ -106,7 +122,7 @@ pub(crate) fn get_or_init_engine(
         return Ok(Arc::clone(existing));
     }
 
-    let entry = Arc::new(init_engine_for_workspace(name, path)?);
+    let entry = Arc::new(init_engine_for_workspace(name, path, ephemeral)?);
     reg.insert(name.to_string(), Arc::clone(&entry));
     Ok(entry)
 }
@@ -115,7 +131,11 @@ pub(crate) fn get_or_init_engine(
 ///
 /// Handles persistent query tracker setup with fallback, creates the
 /// `FilePicker`, and spawns the background scan.
-fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntry, String> {
+fn init_engine_for_workspace(
+    name: &str,
+    path: &Path,
+    ephemeral: bool,
+) -> Result<SearchEngineEntry, String> {
     if !path.exists() {
         return Err(format!(
             "Workspace directory does not exist: {}",
@@ -127,7 +147,7 @@ fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntr
     let frecency = SharedFrecency::default();
 
     // Try to open persistent query tracker DB; fall back to in-memory
-    let query_tracker = match open_persistent_query_tracker(name) {
+    let query_tracker = match open_persistent_query_tracker(name, path, ephemeral) {
         Ok(qt) => qt,
         Err(e) => {
             tracing::warn!(
@@ -167,13 +187,37 @@ fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntr
     })
 }
 
-/// Open a persistent [`QueryTracker`] database for a workspace.
+/// Open a persistent [`QueryTracker`] database.
 ///
-/// The LMDB environment lives at `~/.mahbot/search/{workspace_name}/queries/`.
-/// Parent directories are created if necessary.
-fn open_persistent_query_tracker(workspace_name: &str) -> Result<SharedQueryTracker, String> {
-    let root = CONFIG.global_storage_root();
-    let db_path = root.join("search").join(workspace_name).join("queries");
+/// Real workspaces: `~/.mahbot/search/{workspace_name}/queries/` — durable
+/// combo-boost data that survives restarts. Parent directories are created if
+/// necessary.
+///
+/// Ephemeral per-run workspaces (the research coder's run folder): the tracker
+/// lives at `{workspace_path}/.queries` — dot-prefixed INSIDE the run folder in
+/// the pinned temp root, so everything temporary lives in temp. The leading
+/// dot keeps it out of the run folder's own fff-search index: the run folder
+/// is a non-git root, so the walkers skip hidden entries and the per-dir
+/// (Linux) watcher never subscribes to a hidden dir; on macOS the recursive
+/// FSEvents stream may still deliver write events, but the LMDB files are
+/// binary-classified (excluded from content/grep matches). It dies with the
+/// folder (released by the run's cleanup flow); a resume after the folder was
+/// lost recreates it empty, while a surviving folder re-opens the surviving
+/// LMDB — a fail-open ranking cache.
+fn open_persistent_query_tracker(
+    workspace_name: &str,
+    workspace_path: &Path,
+    ephemeral: bool,
+) -> Result<SharedQueryTracker, String> {
+    let db_path = if ephemeral {
+        workspace_path.join(".queries")
+    } else {
+        CONFIG
+            .global_storage_root()
+            .join("search")
+            .join(workspace_name)
+            .join("queries")
+    };
 
     std::fs::create_dir_all(&db_path).map_err(|e| {
         format!(
@@ -271,13 +315,15 @@ pub(crate) fn is_empty_index_error(e: &str) -> bool {
 /// editor's run path passes `"Search engine not ready: "` while other callers
 /// pass `""` to keep the raw error. Ephemeral per-run workspaces downgrade the
 /// empty-index error at their call site (see [`is_empty_index_error`]) — this
-/// shared entry point never does.
+/// shared entry point never does. `ephemeral` is passed through to
+/// [`get_or_init_engine`] (per-run trackers live inside the run folder).
 pub(crate) async fn resolve_engine(
     name: &str,
     path: &str,
     scan_error_prefix: &str,
+    ephemeral: bool,
 ) -> Result<Arc<SearchEngineEntry>, String> {
-    let entry = get_or_init_engine(name, Path::new(path))?;
+    let entry = get_or_init_engine(name, Path::new(path), ephemeral)?;
     ensure_scanned(&entry)
         .await
         .map_err(|e| format!("{scan_error_prefix}{e}"))?;
@@ -308,9 +354,12 @@ pub(crate) fn get_engine_if_exists(ws: &Workspace) -> Option<Arc<SearchEngineEnt
 /// [`SharedFilePicker`], which triggers the background scan's cancellation
 /// flag and cleans up any associated threads.
 ///
-/// The persistent query tracker LMDB directory is **not** deleted — that would
-/// require closing the LMDB environment while no readers are active, which is
-/// tricky across threads. The directory is small and harmless to leave behind.
+/// The persistent query tracker LMDB directory is **not** deleted here — that
+/// would require closing the LMDB environment while no readers are active,
+/// which is tricky across threads. Real-workspace trackers stay in
+/// `~/.mahbot/search` (durable combo-boost data); ephemeral per-run trackers
+/// live inside the run folder, which the caller removes after dropping the
+/// engine (see `crate::research_cleanup::release_run_folder`).
 pub(crate) fn remove_engine(workspace_name: &str) {
     let mut reg = registry().write().unwrap_poison();
     if let Some(entry) = reg.remove(workspace_name) {
@@ -334,7 +383,7 @@ pub async fn init_all_engines() {
     };
 
     for ws in &workspaces {
-        match get_or_init_engine(&ws.name, Path::new(&ws.path)) {
+        match get_or_init_engine(&ws.name, Path::new(&ws.path), false) {
             Ok(_) => { /* scan started */ }
             Err(e) => {
                 tracing::warn!(

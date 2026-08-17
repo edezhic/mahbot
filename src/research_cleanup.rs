@@ -1,52 +1,51 @@
 //! Research-run cleanup: per-run temp folders, results archive, the raw
-//! shell-command dump, the Sanitation-agent cleanup dispatch, and the periodic
-//! sweeps (run roots + artist generated/uploads keep-detection).
+//! shell-command dump, and the Sanitation-agent cleanup dispatch.
 //!
-//! ## Run roots
+//! ## Run folders
 //!
 //! Every deep-research run gets a per-run folder under
 //! `<temp_dir()>/mahbot-research/{job_id}` — inside the readonly-shell's
 //! allowed temp roots, so analysts can write scratch files there. The folder
 //! is created idempotently at dispatch AND boot resume (a resume after an OS
-//! temp cleanup recreates it; lost prototypes are fail-open). A `.keep` file
-//! inside the folder disables sweeping (manual escape hatch).
+//! temp cleanup recreates it; lost prototypes are fail-open). The run's
+//! ephemeral search tracker also lives inside the folder (see
+//! `crate::search_engine`), so everything temporary dies with it.
 //!
-//! ## Sweeps
-//!
-//! `sweep_run_roots` deletes run folders whose jobs row is gone (no liveness)
-//! and whose pending_jobs envelope is delivered or older than the 7-day cap.
-//! `sweep_media` deletes generated/uploads files in userspaces that no Artist
-//! session mentions (keep-detection is strictly session-based — solution 1).
-//! Both fold their deletion counts into the cleanup loop's `Result<u64>`.
+//! The folder is removed ONLY by the run's own completion flow: the cleanup
+//! tail ([`run_cleanup_agent_and_finish`]) releases the search-engine state,
+//! deletes the whole folder, then terminalizes the cleanup row. Folders of
+//! crashed runs are left for the OS — the daemon builds no mechanisms for
+//! crash leftovers, so there are no boot or periodic run-folder sweeps.
 //!
 //! ## Command dump + Sanitation cleanup
 //!
 //! At terminalization the run's accumulated raw shell commands (UNFILTERED —
 //! no zone classification; attribution is the cleanup agent's job) are written
-//! as a command dump file INSIDE the run's per-run folder. The dump dies with
-//! the folder when the sweep reclaims it (the failure backstop). At the same
-//! time a Sanitation-role agent is dispatched with a dedicated task prompt
+//! as a command dump file INSIDE the run's per-run folder. At the same time a
+//! Sanitation-role agent is dispatched with a dedicated task prompt
 //! (see `src/prompt/research/cleanup.md`) to clean artifacts attributable to
-//! the run. Its run is recorded as a durable `research_cleanup` jobs row (the
-//! run-root sweep's jobs-row liveness holds the folder alive during the run),
-//! and its report is archived into results.md + the run folder.
+//! the run OUTSIDE the folder. Its run is recorded as a durable
+//! `research_cleanup` jobs row (the row holds the folder until the cleanup
+//! completes and survives a crash for boot resume — durability is a separate
+//! mechanism from filesystem reclamation). The agent's final response is
+//! logged for observability; there is no report archive.
+//!
+//! ## Artist media sweep
+//!
+//! `sweep_media` deletes generated/uploads files in userspaces that no Artist
+//! session mentions (keep-detection is strictly session-based — solution 1).
+//! It is orthogonal to research-run cleanup and stays in the periodic
+//! cleanup loop.
 
 use crate::Workspace;
 use crate::config;
-use crate::turso::{self, params};
+use crate::turso::params;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-/// Freshness grace for run-root sweeps: a folder younger than this is never
-/// swept (covers the mkdir → INSERT jobs race on dispatch).
-const RUN_ROOT_GRACE: Duration = Duration::from_hours(1);
-/// Hard cap on how long an undelivered pending_jobs envelope keeps a run
-/// folder: a stuck envelope cannot hold the folder forever.
-const PENDING_GUARD_CAP: Duration = Duration::from_hours(7 * 24);
 /// Command-dump cap (bytes, soft — newest-wins): the raw unfiltered shell
 /// command history of a run, written at terminalization inside the run folder.
 /// The dump is intent for the Sanitation cleanup agent, not a report body, so
@@ -84,6 +83,56 @@ pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
         tracing::warn!(job = %job_id, error = %e, "Failed to create run root — analyst scratch writes may fail");
     }
     tokio::fs::canonicalize(&path).await.unwrap_or(path)
+}
+
+/// Does the run's per-run folder exist? The boot-replay crash-window
+/// classifier: the cleanup tail removes the folder when the cleanup
+/// completes, so folder absence on the replay path means the cleanup already
+/// ran in a previous lifetime (see [`dispatch_cleanup_for_pending_envelope`]).
+///
+/// Fail-closed by design (`unwrap_or(false)`): a transient IO error on the
+/// replay path skips row recreation, so a crash-window cleanup never runs and
+/// its outside-folder scratch leaks to the OS temp sweep — the safe direction.
+/// The alternative (fail-open on error) would re-dispatch a cleanup LLM round
+/// for a run that ALREADY completed, per boot, until the envelope is delivered
+/// or the pending cap fires — a bounded but avoidable cost for a transient
+/// read error that is far more likely than a genuine crash-window hit.
+async fn run_folder_exists(job_id: &str) -> bool {
+    tokio::fs::try_exists(run_root_path(job_id))
+        .await
+        .unwrap_or(false)
+}
+
+/// Release a run's per-run folder and its search-engine state — the SOLE
+/// run-folder deleter now that the sweeps are gone. Search-engine registry
+/// entry first (drops the picker + LMDB tracker handles), then the whole
+/// folder (the ephemeral search tracker lives inside it and dies with it).
+///
+/// Called by the cleanup tail ([`run_cleanup_agent_and_finish`], folder
+/// before row terminalize) and by the boot cap branch in `recover_from_restart`
+/// (a capped cleanup is never resumed — the folder is released in-process at
+/// boot, before any agent spawns). The cleanup jobs row is NOT touched here:
+/// callers own row removal/aging.
+///
+/// Removal failure is swallowed (the folder is "left for the OS") and the row
+/// is still terminalized by the caller — the crash-window classifier then
+/// self-heals: if the completion envelope stayed undelivered, the next boot's
+/// replay sees the surviving folder and re-dispatches the cleanup, which
+/// retries the removal; if the envelope was delivered, the folder leaks to the
+/// OS temp sweep only (the accepted crash-class edge — no retry machinery).
+pub(crate) async fn release_run_folder(job_id: &str) {
+    if crate::search_engine::registry_initialized() {
+        crate::search_engine::remove_engine(job_id);
+    }
+    let path = run_root_path(job_id);
+    match tokio::fs::remove_dir_all(&path).await {
+        Ok(()) => {}
+        // The tracker/folder only exists when the run actually created it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(job = %job_id, error = %e, "Run-folder release: folder removal failed — left for the OS");
+        }
+    }
 }
 
 // ── Results archive (results.md) ──────────────────────────────────────────
@@ -214,20 +263,16 @@ pub(crate) fn cap_command_dump(commands: &mut Vec<String>, cap: usize) {
     }
 }
 
-/// Write the raw command dump file INSIDE the run's per-run folder. Scrubbed
-/// of credentials (the dump is fed to the Sanitation agent as context).
-/// Newest-wins, capped at [`COMMAND_DUMP_CAP_BYTES`].
+/// Write the raw command dump file INSIDE the run's per-run folder. The
+/// commands are already credential-scrubbed at collection (see
+/// [`collect_agent_shell_commands`] — the in-memory capture and the dump must
+/// match, or a crash-resume would accumulate both variants). Newest-wins,
+/// capped at [`COMMAND_DUMP_CAP_BYTES`].
 pub(crate) async fn write_command_dump(run_root: &Path, commands: &[String]) {
     let path = run_root.join("commands.dump");
     let mut deduped = dedup_newest_wins(commands);
     cap_command_dump(&mut deduped, COMMAND_DUMP_CAP_BYTES);
-    let mut content = String::new();
-    for cmd in &deduped {
-        let _ = std::fmt::write(
-            &mut content,
-            format_args!("{}\n", crate::util::scrub_credentials(cmd)),
-        );
-    }
+    let content = deduped.join("\n") + "\n";
     if let Err(e) = tokio::fs::write(&path, content).await {
         tracing::warn!(error = %e, "Failed to write command dump — cleanup intent degraded");
     }
@@ -273,7 +318,7 @@ pub(crate) fn build_cleanup_prompt(
     )
 }
 
-/// Dedup marker / liveness-hold query: does a `research_cleanup` jobs row for
+/// Dedup marker / folder-hold query: does a `research_cleanup` jobs row for
 /// this run exist? Shared by the dispatch dedup, the boot-replay crash-window
 /// hook, and tests (which pre-create the row to assert dedup without running
 /// the agent).
@@ -292,29 +337,28 @@ pub(crate) async fn research_cleanup_row_exists(
 }
 
 /// Boot-replay crash-window hook: a pending research-completion envelope with
-/// NO `research_cleanup` jobs row AND no archived cleanup report means the
-/// daemon crashed between `complete_durable_job` and `dispatch_research_cleanup`
-/// — the cleanup agent was never dispatched. Creates the durable row ONLY (the
-/// dedup marker + sweep-liveness hold); the `research_cleanup` boot-scan arm —
-/// which runs AFTER the envelope replay in `recover_from_restart` — is the SOLE
-/// dispatcher for the actual agent (it sees the just-created row and resumes
-/// it, and `resume_research_cleanup` runs + terminalizes exactly like a fresh
+/// NO `research_cleanup` jobs row means the daemon crashed between
+/// `complete_durable_job` and `dispatch_research_cleanup` — the cleanup agent
+/// was never dispatched. Creates the durable row ONLY (the dedup marker +
+/// folder-hold); the `research_cleanup` boot-scan arm — which runs AFTER the
+/// envelope replay in `recover_from_restart` — is the SOLE dispatcher for the
+/// actual agent (it sees the just-created row and resumes it, and
+/// `resume_research_cleanup` runs + terminalizes exactly like a fresh
 /// dispatch). Spawning the agent here would DOUBLE-run the same
 /// `cleanup_{run_id}` agent on this boot: the scan arm would register the same
 /// id via AgentRegistry, REPLACING and CANCELING this dispatch.
 ///
-/// A missing row with an ARCHIVED cleanup report (results.md contains the
-/// "## Cleanup report" section) means the cleanup COMPLETED in a previous
-/// lifetime while the envelope stayed undelivered (dead target session;
-/// envelopes are never purged) — re-dispatching would be a duplicate LLM round
-/// every boot. The archive is the durable completed marker.
+/// Replay discriminator = run-folder existence (a crash-window classifier on
+/// this replay path only, NOT a dispatch condition — fresh dispatch stays
+/// unconditional): the cleanup tail removes the run folder when the cleanup
+/// completes, so a folder still present here means the cleanup never ran
+/// (crash window) → recreate the row; a folder already gone means the cleanup
+/// COMPLETED in a previous lifetime while the envelope stayed undelivered
+/// (dead target session; envelopes are never purged) → skip, preventing a
+/// per-boot duplicate cleanup LLM round for completed-but-undelivered runs.
 ///
 /// Called from `recover_from_restart`'s pending-envelope replay, BEFORE the
-/// envelope is routed. The research question is recovered from the archived
-/// results.md when possible (the research jobs row was CASCADE-deleted at
-/// completion; the archive already holds the question — `write_cleanup_report`
-/// appends on that path and the question is only used by the standalone-archive
-/// fallback).
+/// envelope is routed.
 pub(crate) async fn dispatch_cleanup_for_pending_envelope(
     job_id: &str,
     envelope: &crate::message_router::AgentJob,
@@ -326,21 +370,18 @@ pub(crate) async fn dispatch_cleanup_for_pending_envelope(
         tracing::warn!(
             job = %job_id,
             workspace = %envelope.workspace_name,
-            "Cleanup dispatch for pending envelope: workspace unresolvable — run folder reclaimed by the sweep"
+            "Cleanup dispatch for pending envelope: workspace unresolvable"
         );
         return;
     };
-    if cleanup_report_archived(job_id).await {
+    if !run_folder_exists(job_id).await {
         tracing::debug!(
             job = %job_id,
-            "Cleanup report already archived — cleanup completed in a previous lifetime; envelope replay only"
+            "Run folder absent — cleanup completed in a previous lifetime; envelope replay only"
         );
         return;
     }
-    // Recover the research question from the archived results.md (empty
-    // fallback only when the archive is missing — spawn-failure path).
-    let question = read_archived_question(job_id).await.unwrap_or_default();
-    if let Err(e) = create_cleanup_job_row(job_id, &ws, &question).await {
+    if let Err(e) = create_cleanup_job_row(job_id, &ws).await {
         tracing::warn!(job = %job_id, error = %e, "Cleanup row creation for pending envelope failed");
     }
 }
@@ -353,88 +394,40 @@ pub(crate) fn cleanup_agent_id(job_id: &str) -> String {
     format!("cleanup_{job_id}")
 }
 
-/// Does the ARCHIVED results.md for a run already contain a cleanup report?
-/// The durable "cleanup completed" marker: `write_cleanup_report` appends the
-/// "## Cleanup report" section to `<storage_root>/research/results/{run_id}.md`
-/// at the END of every cleanup agent run (success AND failure — a failed
-/// cleanup is still terminal; the sweep/purge is its backstop, per the
-/// ticket). The run-folder copy dies with the sweep, so the archive is the
-/// only check that survives folder reclamation.
-async fn cleanup_report_archived(job_id: &str) -> bool {
-    let Some(root) = config::CONFIG
-        .try_storage_root()
-        .or_else(|| config::default_config_dir().ok())
-    else {
-        return false;
-    };
-    let path = root
-        .join("research")
-        .join("results")
-        .join(format!("{job_id}.md"));
-    match tokio::fs::read_to_string(&path).await {
-        Ok(content) => content.contains("## Cleanup report"),
-        Err(_) => false,
-    }
-}
-
-/// Read the research question back from the archived results.md
-/// (`write_results_md` writes `## Question\n\n{question}\n\n## Result`).
-/// Crash-replay hook: the research jobs row is gone at completion, but the
-/// archive survives — reusing it keeps the persisted question.txt (and the
-/// crash-resumed cleanup's standalone-archive fallback) accurate.
-async fn read_archived_question(job_id: &str) -> Option<String> {
-    let root = config::CONFIG
-        .try_storage_root()
-        .or_else(|| config::default_config_dir().ok())?;
-    let path = root
-        .join("research")
-        .join("results")
-        .join(format!("{job_id}.md"));
-    let content = tokio::fs::read_to_string(&path).await.ok()?;
-    let start = content.find("## Question\n\n")? + "## Question\n\n".len();
-    // The question is terminated by the next `## ` section — `## Result` on
-    // the results.md path, `## Cleanup report` on the standalone archive
-    // (spawn-failure) path.
-    let end = content[start..]
-        .find("\n\n## ")
-        .map_or(content.len(), |i| i + start);
-    let question = content[start..end].trim();
-    (!question.is_empty()).then(|| question.to_string())
-}
-
 /// Create the durable `research_cleanup` jobs row for a run (dedup marker +
-/// sweep-liveness hold). Shared by the fresh terminalization dispatch, the
+/// folder-hold). Shared by the fresh terminalization dispatch, the
 /// boot-replay crash-window hook, and tests. Returns `Ok(Some(prompt))` when
 /// the row was created (the caller spawns the agent with that prompt), or
 /// `Ok(None)` when the row already exists (deduped — the boot-scan arm resumes
 /// the surviving row). Idempotent.
-pub(crate) async fn create_cleanup_job_row(
-    job_id: &str,
-    ws: &Workspace,
-    question: &str,
-) -> Result<Option<String>> {
+pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<String>> {
     let conn = &crate::session::store().conn;
-    // Dedup via the jobs row.
+    // The row itself is the dedup marker: a surviving row means the cleanup is
+    // already in flight (crash between dispatch and completion) — no second
+    // agent is dispatched; the boot scan resumes the surviving row. The
+    // invariant: cleanup row exists ⟺ cleanup not finished — with one
+    // deliberate exception: the boot cap branch in `recover_from_restart`
+    // releases the folder in-process and leaves the row alive (~8h) for the
+    // purge to delete, so a row can outlive its folder on that path only.
     if research_cleanup_row_exists(conn, job_id).await? {
         tracing::info!(job = %job_id, "Research cleanup already dispatched — skipping");
         return Ok(None);
     }
 
     let run_root = ensure_run_root(job_id).await;
+    // `ensure_run_root` is idempotent (create_dir_all), so on the replay path
+    // — where `dispatch_cleanup_for_pending_envelope` just verified the folder
+    // exists — this is a no-op. It stays as a defensive recreate for the
+    // fresh path: an OS temp sweep between research terminalization and the
+    // cleanup dispatch would otherwise hand the agent a prompt pointing at a
+    // missing folder.
     let dump_path = run_root.join("commands.dump");
     let prompt = build_cleanup_prompt(job_id, &run_root, &dump_path, ws);
 
-    // Persist the research question for the boot-resume path: the cleanup
-    // jobs row's task is the agent PROMPT, not the question, and the archived
-    // results.md must show the question (the fresh dispatch's archive uses
-    // this same question; a crash-resumed cleanup re-reads it from the folder,
-    // which is held alive by the jobs row).
-    let _ = tokio::fs::write(run_root.join("question.txt"), question).await;
-
-    // Durable jobs row: id == run_id (folder name) → sweep liveness holds the
-    // folder for the duration of the cleanup run. The row also makes the
-    // cleanup boot-resumable (recover_from_restart arm for kind
-    // "research_cleanup") and its failure visible (jobs table status).
+    // Durable jobs row: id == run_id (folder name) → the row holds the folder
+    // for the duration of the cleanup run. The row also makes the cleanup
+    // boot-resumable (recover_from_restart arm for kind "research_cleanup")
+    // and its failure visible (jobs table status).
     crate::jobs::spawn_job(
         conn,
         job_id,
@@ -464,33 +457,18 @@ pub(crate) async fn create_cleanup_job_row(
 /// Called at terminalization (all three terminalization points funnel through
 /// the terminalize_research / write_terminalization_artifacts tail). The
 /// cleanup runs FIRE-AND-FORGET (result delivery is never delayed); the run
-/// folder is held alive against the stale-run-folder sweep by the durable
-/// `research_cleanup` jobs row (the sweep keeps folders whose jobs.id ==
-/// folder name — the same liveness mechanism the research run itself used).
-///
-/// The sub-millisecond gap between `complete_durable_job` (which deletes the
-/// research jobs row) and this row's INSERT is covered twice: the pending
-/// envelope just inserted by the completion holds the folder via the sweep's
-/// pending guard, and the folder's mtime is fresh (terminalization wrote
-/// commands.dump moments ago) so RUN_ROOT_GRACE skips it. A failed-envelope
-/// INSERT (rare) leaves the freshness grace as the sole guard — degraded
-/// intent only (results.md is durably archived), matching the documented
-/// fail-open contract.
-///
-/// Dedup: the jobs row itself is the marker — if a `research_cleanup` row for
-/// this run already exists (a crash between dispatch and completion), no
-/// second agent is dispatched; the boot scan resumes the surviving row.
+/// folder is held by the durable `research_cleanup` jobs row (id == run_id —
+/// the folder name) until the cleanup completes. Dispatch is UNCONDITIONAL:
+/// research completed + command dump created ⇒ cleanup runs. The row-exists
+/// dedup inside `create_cleanup_job_row` covers the crash window (a resumed
+/// run terminalizes again while its cleanup row survives).
 ///
 /// Delete capability: Role::Sanitation's standard toolset (Read / Search /
 /// Shell ReadOnly) already permits rm/mv/cp under the allowed temp roots —
 /// the readonly guard's TEMP_MUTATORS gate on the path, not the role. The
 /// cleanup agent therefore needs NO custom toolset.
-pub(crate) async fn dispatch_research_cleanup(
-    job_id: &str,
-    ws: &Workspace,
-    question: &str,
-) -> Result<()> {
-    let Some(prompt) = create_cleanup_job_row(job_id, ws, question).await? else {
+pub(crate) async fn dispatch_research_cleanup(job_id: &str, ws: &Workspace) -> Result<()> {
+    let Some(prompt) = create_cleanup_job_row(job_id, ws).await? else {
         return Ok(());
     };
 
@@ -498,35 +476,32 @@ pub(crate) async fn dispatch_research_cleanup(
     // Deliberately a raw tokio::spawn, NOT spawn_cancellable: the cleanup is
     // not a background daemon task. NOTE: a raw spawn task does NOT survive
     // process shutdown (it is dropped with the runtime) — the durability is
-    // the jobs row, which the boot scan resumes on the next start. The drain
-    // ignores unregistered agents; if the process dies mid-run the row is the
-    // resume point and the folder stays held.
+    // the jobs row, which the boot scan resumes on the next start after a
+    // HARD crash (the drain ignores unregistered agents; if the process dies
+    // mid-run the row is the resume point and the folder stays held). A
+    // graceful-drain abort is different: `run_cleanup_agent_and_finish`
+    // terminalizes the row on EVERY exit path, so a drain-aborted cleanup is
+    // terminalized with its outside-folder scratch never cleaned and never
+    // retried — matching the pinned "terminalize on every exit path"
+    // decision; only hard crashes get the boot-resume retry.
     let ws = ws.clone();
     let job_id_log = job_id.to_string();
     let agent_id = cleanup_agent_id(job_id);
     let agent_id_log = agent_id.clone();
     let job_id = job_id.to_string();
-    let question = question.to_string();
     tokio::spawn(async move {
-        run_cleanup_agent_and_finish(&job_id, &ws, &prompt, &question, "Research cleanup FAILED")
-            .await;
+        run_cleanup_agent_and_finish(&job_id, &ws, &prompt).await;
     });
 
     tracing::info!(job = %job_id_log, agent = %agent_id_log, "Research cleanup dispatched");
     Ok(())
 }
 
-/// Run the cleanup agent and finish: archive the report (results.md + run
-/// folder copy) and release the liveness hold on EVERY exit path. The shared
-/// tail of the fresh dispatch and the boot-resume path — a divergence here
-/// would silently change one path's report/terminalize behavior.
-async fn run_cleanup_agent_and_finish(
-    job_id: &str,
-    ws: &Workspace,
-    prompt: &str,
-    question: &str,
-    failure_prefix: &str,
-) {
+/// Run the cleanup agent and finish: log the outcome and release the run
+/// folder — folder first, row last — on EVERY exit path. The shared tail of
+/// the fresh dispatch and the boot-resume path — a divergence here would
+/// silently change one path's folder-release/terminalize behavior.
+async fn run_cleanup_agent_and_finish(job_id: &str, ws: &Workspace, prompt: &str) {
     let agent_id = cleanup_agent_id(job_id);
     let (agent, response) = crate::agent::run_default_agent(
         &agent_id,
@@ -537,63 +512,41 @@ async fn run_cleanup_agent_and_finish(
         Some(crate::registry::ParentKey::Research(job_id.to_string())),
     )
     .await;
-    // The report is the agent's final response: what was removed and what was
-    // left. On failure it becomes a visible failure signal.
+    // The cleaner's final response is logged for observability (no archive
+    // append, no cleanup_report.md, no report consumer); on failure it is a
+    // visible failure signal in the log.
     let report = response.unwrap_or_else(|| {
         format!(
-            "{failure_prefix} (job {job_id}): {}",
+            "Research cleanup FAILED (job {job_id}): {}",
             agent
                 .failure
                 .clone()
                 .unwrap_or_else(|| "no failure detail".to_string())
         )
     });
-    let run_root = tokio::fs::canonicalize(run_root_path(job_id))
-        .await
-        .unwrap_or_else(|_| run_root_path(job_id));
-    // Archive the report (results.md + run folder copy); the run-folder
-    // copy dies with the sweep — the archive is the durable record (and the
-    // "cleanup completed" marker for the boot-replay dedup).
-    write_cleanup_report(job_id, question, &report).await;
-    let _ = tokio::fs::write(run_root.join("cleanup_report.md"), &report).await;
-    // Release the folder: delete the cleanup jobs row. On failure the row
-    // is not preserved as 'failed' — the run folder is reclaimed by the
-    // existing sweep, which is the documented backstop for a failed
-    // cleanup (no silent garbage accumulation: the failure is in the
-    // agent's session record, the archive, and the error log above).
+    tracing::info!(
+        job = %job_id,
+        agent = %agent_id,
+        "Research cleanup finished: {}",
+        crate::util::scrub_credentials(&report)
+    );
+    // Release the folder — the SOLE run-folder deleter (no sweeps exist):
+    // search-engine state, then the whole folder, then the row. Folder first,
+    // row last: a crash between folder removal and row terminalize leaves
+    // row + no folder, which boot resume converges from with one extra round.
+    // Invariant: cleanup row exists ⟺ cleanup not finished — with one
+    // deliberate exception: the boot cap branch in `recover_from_restart`
+    // releases the folder in-process and leaves the row alive (~8h) for the
+    // purge to delete, so a row can outlive its folder on that path only.
+    release_run_folder(job_id).await;
     let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
-}
-
-/// Append the cleanup report to the run's archived results.md (the persistent
-/// record — the run folder's copy dies with the sweep).
-pub(crate) async fn write_cleanup_report(job_id: &str, question: &str, report: &str) {
-    let root = config::CONFIG
-        .try_storage_root()
-        .or_else(|| config::default_config_dir().ok());
-    let Some(root) = root else {
-        return;
-    };
-    let dir = root.join("research").join("results");
-    let path = dir.join(format!("{job_id}.md"));
-    let section = format!("\n\n## Cleanup report\n\n{report}\n");
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        // Append to the existing results.md (created by write_results_md).
-        if let Ok(mut f) = tokio::fs::OpenOptions::new().append(true).open(&path).await {
-            use tokio::io::AsyncWriteExt;
-            let _ = f.write_all(section.as_bytes()).await;
-        }
-    } else {
-        // No results.md (spawn-failure path) — write a standalone archive.
-        let content = format!("# Research {job_id}\n\n## Question\n\n{question}\n{section}");
-        let _ = tokio::fs::create_dir_all(&dir).await;
-        let _ = tokio::fs::write(&path, content).await;
-    }
 }
 
 /// Boot-scan resume of a `research_cleanup` job: re-dispatch the Sanitation
 /// agent with the stored task (the row survived a crash mid-cleanup). The
-/// folder is still held by the jobs row, so the cleanup completes and the
-/// report lands exactly like a fresh dispatch.
+/// folder is still held by the jobs row (recreated empty if the crash was in
+/// the folder-release window), so the cleanup completes and the folder is
+/// released exactly like a fresh dispatch.
 pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
     let Some((caller, _role)) = crate::jobs::resume_job_preamble(
         &crate::session::store().conn,
@@ -603,150 +556,26 @@ pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
     )
     .await
     else {
+        // The shared preamble returns None either on a drain abort (the row
+        // STAYS — the folder stays held for the next boot) or on a missing /
+        // unloadable row (the preamble terminalized it). Only the terminalize
+        // path removes a research_cleanup row, so release the run folder there
+        // to keep the invariant "row removal ⟹ folder released in the same
+        // operation" (no sweep is a backstop anymore). The row-existence check
+        // is the discriminator (more robust than re-reading the abort flag:
+        // a drain that starts between the preamble's guard and here must not
+        // suppress the release of an already-removed row). A row that still
+        // exists after a failed terminalize keeps its folder for the boot scan.
+        if !research_cleanup_row_exists(&crate::session::store().conn, job_id)
+            .await
+            .unwrap_or(true)
+        {
+            release_run_folder(job_id).await;
+        }
         return;
     };
     let prompt = caller.task.clone();
-    // The archived results.md must show the RESEARCH question, not the cleanup
-    // prompt (the jobs row task). The question was persisted to the run folder
-    // at dispatch; fall back to the prompt only if the folder was lost.
-    let question = tokio::fs::read_to_string(run_root_path(job_id).join("question.txt"))
-        .await
-        .unwrap_or_else(|_| caller.task.clone());
-    run_cleanup_agent_and_finish(
-        job_id,
-        ws,
-        &prompt,
-        &question,
-        "Research cleanup resume FAILED",
-    )
-    .await;
-}
-
-// ── Sweep: run roots ──────────────────────────────────────────────────────
-
-/// Sweep run-root folders: delete folders with no live jobs row whose
-/// pending_jobs envelope is delivered (or older than the cap). Production
-/// entry — base is the daemon's temp dir.
-pub async fn sweep_run_roots() -> Result<u64> {
-    sweep_run_roots_at(&research_root_base()).await
-}
-
-/// Run-root sweep over an explicit base (injectable for tests).
-#[allow(clippy::too_many_lines)] // per-entry guards (liveness, grace, .keep) are sequential and inline
-pub(crate) async fn sweep_run_roots_at(base: &Path) -> Result<u64> {
-    let conn = &crate::session::store().conn;
-    let mut deleted = 0u64;
-    let Ok(mut entries) = tokio::fs::read_dir(base).await else {
-        return Ok(0);
-    };
-    loop {
-        // A single entry-read failure must not abort the whole tick (the OS
-        // temp cleaner may remove a folder mid-iteration).
-        let entry = match entries.next_entry().await {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!(error = %e, "Run-root sweep: read_dir entry failed — skipping");
-                continue;
-            }
-        };
-        let path = entry.path();
-        // OS temp race between read_dir and stat — skip, never abort the tick.
-        let Ok(file_type) = entry.file_type().await else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Some(job_id) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        // .keep escape hatch.
-        if tokio::fs::try_exists(path.join(".keep"))
-            .await
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        // Freshness grace — covers the mkdir → INSERT jobs race AND the
-        // purge-vs-live-run hazard. Residual: only the top-level mtime is
-        // watched (subdir writes don't bump it) — jobs-row liveness below is
-        // the primary guard.
-        let Ok(modified) = entry
-            .metadata()
-            .await
-            .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH))
-        else {
-            continue;
-        };
-        if SystemTime::now()
-            .duration_since(modified)
-            .map_or(true, |d| d < RUN_ROOT_GRACE)
-        {
-            continue;
-        }
-        // Liveness: a jobs row with id = folder name keeps the folder.
-        let has_job = conn
-            .query_optional(
-                "SELECT 1 FROM jobs WHERE id = ?1",
-                params![job_id.clone()],
-                |_| Ok::<(), anyhow::Error>(()),
-            )
-            .await?
-            .is_some();
-        if has_job {
-            continue;
-        }
-        // Undelivered pending envelope keeps the folder — hard 7-day cap.
-        let pending_created: Option<String> = conn
-            .query_optional(
-                "SELECT created_at FROM pending_jobs WHERE id = ?1",
-                params![job_id.clone()],
-                |r| r.get::<String>(0),
-            )
-            .await?;
-        if let Some(created) = pending_created {
-            let keep = turso::parse_utc_timestamp(&created).ok().is_none_or(|dt| {
-                SystemTime::now()
-                    .duration_since(dt.into())
-                    .map_or(true, |d| d < PENDING_GUARD_CAP)
-            });
-            if keep {
-                continue;
-            }
-        }
-        // Dead: remove search-engine registry entry + LMDB query-tracker tree,
-        // then the folder itself. Failures retry on the next tick.
-        if crate::search_engine::registry_initialized() {
-            crate::search_engine::remove_engine(&job_id);
-        }
-        if let Some(root) = config::CONFIG.try_storage_root() {
-            let tracker_dir = root.join("search").join(&job_id);
-            match tokio::fs::remove_dir_all(&tracker_dir).await {
-                Ok(()) => {}
-                // The tracker dir only exists when a coder/searcher actually
-                // ran — a dead run that never searched has none.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    tracing::warn!(job = %job_id, error = %e, "Run-root sweep: failed to remove query-tracker dir");
-                }
-            }
-        }
-        match tokio::fs::remove_dir_all(&path).await {
-            Ok(()) => {
-                deleted += 1;
-                tracing::info!(job = %job_id, "Run-root swept");
-            }
-            Err(e) => {
-                tracing::warn!(job = %job_id, error = %e, "Run-root sweep: folder removal failed — retrying next tick");
-            }
-        }
-    }
-    Ok(deleted)
+    run_cleanup_agent_and_finish(job_id, ws, &prompt).await;
 }
 
 // ── Sweep: artist generated/uploads keep-detection ────────────────────────
@@ -1216,86 +1045,6 @@ mod tests {
         out
     }
 
-    /// Insert a fake jobs row (or pending_jobs row) in the test sessions store.
-    async fn insert_jobs_row(id: &str, now: &str) {
-        crate::session::store()
-            .conn
-            .execute(
-                "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-                 VALUES (?1, 'research', 'launched', '', 'ws', 'manager', ?2, ?2)",
-                params![id, now],
-            )
-            .await
-            .unwrap();
-    }
-
-    async fn insert_pending_row(id: &str, created: &str) {
-        crate::session::store()
-            .conn
-            .execute(
-                "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
-                 VALUES (?1, 'manager_ws', '{}', ?2)",
-                params![id, created],
-            )
-            .await
-            .unwrap();
-    }
-
-    fn stale_time() -> String {
-        (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339()
-    }
-
-    fn stale_time_8d() -> String {
-        (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339()
-    }
-
-    #[tokio::test]
-    async fn sweep_run_roots_keeps_live_and_fresh_and_keep_marked() {
-        init_stores().await;
-        let base = tempfile::tempdir().unwrap();
-        let now = crate::turso::now();
-        let live = base.path().join("run_live");
-        let fresh = base.path().join("run_fresh");
-        let kept = base.path().join("run_keep");
-        let pending = base.path().join("run_pending");
-        let dead = base.path().join("run_dead");
-        let stuck = base.path().join("run_stuck");
-        for p in [&live, &fresh, &kept, &pending, &dead, &stuck] {
-            tokio::fs::create_dir_all(p).await.unwrap();
-        }
-        insert_jobs_row("run_live", &now).await;
-        // run_pending: undelivered envelope within the cap → kept.
-        insert_pending_row("run_pending", &stale_time()).await;
-        // run_dead: delivered envelope (no pending row) → swept.
-        // run_stuck: undelivered pending envelope OLDER than the 7-day cap → swept.
-        insert_pending_row("run_stuck", &stale_time_8d()).await;
-        // Old mtime on the folders that must NOT be grace-protected.
-        let old = std::time::SystemTime::now() - Duration::from_hours(3);
-        for p in [&kept, &pending, &dead, &stuck] {
-            std::fs::File::open(p).unwrap().set_modified(old).unwrap();
-        }
-        // .keep escape hatch on an otherwise-dead folder.
-        tokio::fs::write(kept.join(".keep"), "").await.unwrap();
-
-        let n = sweep_run_roots_at(base.path()).await.unwrap();
-        assert_eq!(n, 2, "the dead and over-cap-stuck run-roots are swept");
-        assert!(live.exists(), "live jobs row keeps the folder");
-        assert!(fresh.exists(), "freshness grace keeps the folder");
-        assert!(
-            kept.exists(),
-            ".keep escape hatch protects an old dead folder"
-        );
-        assert!(
-            pending.exists(),
-            "undelivered envelope within the cap keeps the folder"
-        );
-        assert!(!dead.exists(), "dead run-root swept");
-        assert!(
-            !stuck.exists(),
-            "stuck envelope beyond the 7-day cap is swept"
-        );
-    }
-
     #[tokio::test]
     #[serial_test::serial(media_sweep)] // shared MEDIA_CURSORS static + session store
     async fn sweep_media_keeps_mentioned_and_removes_unmentioned_after_full_scan() {
@@ -1424,12 +1173,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_dump_written_scrubbed_and_capped() {
+    async fn command_dump_written_matches_scrubbed_collection() {
         let td = tempfile::tempdir().unwrap();
         let run_root = td.path();
         let secret =
             "curl -o /tmp/out.bin \"https://api.example.com/data?api_key=SECRET_API_KEY_123\"";
-        let commands = vec![secret.to_string(), "cat > /tmp/x".to_string()];
+        // Credentials are scrubbed AT COLLECTION (collect_agent_shell_commands);
+        // the dump is written verbatim from that already-scrubbed capture — the
+        // two must match, or a crash-resume would accumulate both variants.
+        let commands: Vec<String> = [secret, "cat > /tmp/x"]
+            .into_iter()
+            .map(crate::util::scrub_credentials)
+            .collect();
         write_command_dump(run_root, &commands).await;
         let content = tokio::fs::read_to_string(run_root.join("commands.dump"))
             .await
@@ -1437,7 +1192,12 @@ mod tests {
         assert!(content.contains("/tmp/x"));
         assert!(
             !content.contains("SECRET_API_KEY_123"),
-            "credentials scrubbed from the dump"
+            "the scrubbed collection form is what lands in the dump"
+        );
+        assert_eq!(
+            content,
+            commands.join("\n") + "\n",
+            "dump written verbatim from the scrubbed capture"
         );
     }
 
@@ -1518,9 +1278,7 @@ mod tests {
                 .unwrap(),
             "the pre-created row is the dedup marker"
         );
-        dispatch_research_cleanup("run_dedup", &ws, "q?")
-            .await
-            .unwrap();
+        dispatch_research_cleanup("run_dedup", &ws).await.unwrap();
         let rows = crate::session::store()
             .conn
             .query(

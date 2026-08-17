@@ -12,4 +12,4 @@ For long-running non-interactive commands (e.g. starting a dev server that must 
 - Sessions are strictly scoped to the agent that started them: no other agent can read or stop them, and they are force-killed when your run ends (success, error, or abort). Never assume a background process survives past your run — if you need it later, restart it.
 - Launch failures (command not found, not executable) are returned as a tool error immediately — check the tool response before assuming the session started.
 
-Caveats: output is unbounded — a command that prints forever will fill the temp disk. Prefer commands that write modest output, and tail large outputs via the shell tool (the read tool caps at 10 MB). Output files persist until the next daemon startup.
+Caveats: output is unbounded — a command that prints forever will fill the temp disk. Prefer commands that write modest output, and tail large outputs via the shell tool (the read tool caps at 10 MB). Output files persist in the temp area until the OS temp sweep reclaims them (the daemon performs no startup purge).
