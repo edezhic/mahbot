@@ -547,7 +547,7 @@ async fn fetch_async_video(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        tracing::info!(%job_id, %status, attempt, "{} poll", labels.label);
+        tracing::debug!(%job_id, %status, attempt, "{} poll", labels.label);
 
         if status == "completed" {
             // Download URL: OpenRouter provides unsigned_urls array or
