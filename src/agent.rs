@@ -277,6 +277,11 @@ impl Agent {
     /// Flush accumulated tool stats to the logs store, then persist the final
     /// assistant message via `session.finalize(&self.agent_id)`. Flush failures are logged
     /// but do not abort finalization.
+    ///
+    /// An empty unpersisted tail is logged here with full agent/role/workspace/
+    /// ticket attribution: at INFO when the graceful drain cut the turn
+    /// (expected and lossless — committed tool frames are durable, ticket
+    /// rounds resume at boot), at WARN otherwise (genuine anomaly).
     pub async fn finalize_session(&mut self) -> anyhow::Result<()> {
         // Drain accumulated tool usage stats
         let stats = {
@@ -311,12 +316,48 @@ impl Agent {
         if self.cancel_token.is_cancelled() || crate::shutdown::shutdown_token().is_cancelled() {
             tracing::debug!(
                 agent_id = %self.agent_id,
+                role = %self.role,
+                workspace = %self.workspace.name,
+                ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
                 "Session finalize skipped (agent cancelled or shutdown)"
             );
             return Ok(());
         }
 
-        self.session.finalize(&self.agent_id).await
+        match self.session.finalize(&self.agent_id).await? {
+            crate::session::FinalizeOutcome::Flushed => {}
+            crate::session::FinalizeOutcome::NoUnpersistedTail => {
+                if crate::shutdown::is_draining() {
+                    // Graceful drain cut the turn right after the last
+                    // tool-group commit: nothing was left unpersisted.
+                    // Expected and lossless — committed tool frames are
+                    // durable, ticket rounds resume at boot (job stays
+                    // status='launched'), direct sessions resume on the next
+                    // user message.
+                    tracing::info!(
+                        agent_id = %self.agent_id,
+                        role = %self.role,
+                        workspace = %self.workspace.name,
+                        ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
+                        "Session finalize no-op: turn cut by graceful drain — \
+                         committed frames are durable; resumes at boot or on the next user message"
+                    );
+                } else {
+                    // Genuine anomaly: the turn ended with no persisted output
+                    // outside a drain (e.g. an LLM call failing with no output
+                    // produced). Keep the byte-identical historical message so
+                    // external correlation keeps working.
+                    tracing::warn!(
+                        agent_id = %self.agent_id,
+                        role = %self.role,
+                        workspace = %self.workspace.name,
+                        ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
+                        "finalize called but no new assistant message in history"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check whether cancellation has been triggered on this agent.

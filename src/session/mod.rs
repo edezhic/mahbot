@@ -2,6 +2,7 @@
 
 pub mod dead_session;
 pub mod manager;
+pub(crate) use manager::FinalizeOutcome;
 pub use manager::Session;
 
 use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
@@ -1374,13 +1375,19 @@ mod tests {
             .unwrap();
 
         // No new assistant output this turn → the persisted trailing answer
-        // must not be re-appended.
-        session.finalize(&k).await.unwrap();
+        // must not be re-appended; the empty-tail no-op is reported.
+        assert_eq!(
+            session.finalize(&k).await.unwrap(),
+            FinalizeOutcome::NoUnpersistedTail
+        );
         assert_eq!(store().load(&k).await.len(), 3);
 
         // A genuinely new answer IS appended.
         session.push_assistant("a2".to_string());
-        session.finalize(&k).await.unwrap();
+        assert_eq!(
+            session.finalize(&k).await.unwrap(),
+            FinalizeOutcome::Flushed
+        );
         let msgs = store().load(&k).await;
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[3].content, "a2");

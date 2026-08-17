@@ -10,6 +10,8 @@
 //! 3. Agent loop calls `session.push_assistant()`, `session.persist_messages()`,
 //!    `session.push_messages_unpersisted()`, etc. during tool rounds
 //! 4. `session.finalize(agent_id)` on success — persists the final assistant response
+//!    and reports a [`FinalizeOutcome`]; an empty unpersisted tail is a no-op
+//!    (everything already durable) and is surfaced to the caller to log
 
 use std::fmt::Write;
 
@@ -37,6 +39,25 @@ pub struct Session {
     /// appends, tool traffic awaiting commit, the final answer). Every
     /// successful persist advances this prefix over the span it wrote.
     persisted_len: usize,
+}
+
+/// Outcome of a [`Session::finalize`] call.
+///
+/// The finalize guard is deliberately logging-free: whether an empty
+/// unpersisted tail is expected (graceful drain cut right after the last
+/// tool-group commit) or anomalous (LLM failure with no output, iteration
+/// limit) depends on shutdown state this module does not track. The caller
+/// inspects the outcome and logs with full agent/role/workspace/ticket
+/// attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalizeOutcome {
+    /// The unpersisted tail (final assistant answer / delivered comments)
+    /// was flushed to the store and the persisted prefix advanced.
+    Flushed,
+    /// Nothing was unpersisted — the turn ended with an empty tail. All
+    /// committed state is already durable; the caller decides whether the
+    /// no-op is expected (drain) or a genuine anomaly.
+    NoUnpersistedTail,
 }
 
 impl Session {
@@ -281,16 +302,19 @@ impl Session {
 
     /// Flush any unpersisted history tail to the session store and advance
     /// the persisted prefix — the final assistant answer, or just delivered
-    /// comments on aborted turns. No-op on an empty tail (e.g. after
-    /// compaction), so a retained assistant answer is never duplicated.
-    /// Skipped by the agent-level cancel path (see `finalize_session`).
-    pub(crate) async fn finalize(&mut self, agent_id: &str) -> Result<()> {
+    /// comments on aborted turns. No-op on an empty tail (e.g. a drain cut
+    /// right after the last tool-group commit, or a turn with no output), so
+    /// a retained assistant answer is never duplicated. The no-op is surfaced
+    /// via [`FinalizeOutcome::NoUnpersistedTail`] for the caller to log with
+    /// attribution. Skipped by the agent-level cancel path (see
+    /// `finalize_session`).
+    pub(crate) async fn finalize(&mut self, agent_id: &str) -> Result<FinalizeOutcome> {
         debug_assert!(self.persisted_len <= self.history.len());
         if self.persisted_len == self.history.len() {
-            tracing::warn!("finalize called but no new assistant message in history");
-            return Ok(());
+            return Ok(FinalizeOutcome::NoUnpersistedTail);
         }
-        self.persist_messages(agent_id, &[]).await
+        self.persist_messages(agent_id, &[]).await?;
+        Ok(FinalizeOutcome::Flushed)
     }
 
     // ── Internals ────────────────────────────────────────────────────
