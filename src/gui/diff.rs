@@ -2309,6 +2309,7 @@ mod tests {
             line_kinds: Vec::new(),
             line_numbers: Vec::new(),
             gutter_digits: 0,
+            content_fingerprint: 0,
         });
         state.file_tree.expanded_dirs.insert("stale/dir".into());
         state.tree_auto_expand_pending = false;

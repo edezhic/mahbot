@@ -280,6 +280,14 @@ pub(crate) fn draw_buffer_text<Renderer>(
 /// When `stop_after_first` is set, scanning stops after the first drawn
 /// highlight (used by the bracket-match path, which must break after the
 /// first run of a logical line).
+///
+/// `visible_y` optionally restricts processing to runs whose vertical span
+/// (`text_y + run.line_top` … `+ run.line_height`, in the same absolute
+/// coordinate space as `text_y`/`text_clip`) intersects the given
+/// `(top, bottom)` range. Off-screen runs are skipped — and scanning stops
+/// once runs fall entirely below the range, since runs are yielded in
+/// ascending y order — so per-frame cost scales with the visible content.
+/// Pass `None` to process every run (previous behaviour).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_run_highlights<Renderer, F>(
     renderer: &mut Renderer,
@@ -289,12 +297,23 @@ pub(crate) fn draw_run_highlights<Renderer, F>(
     text_y: f32,
     color: Color,
     stop_after_first: bool,
+    visible_y: Option<(f32, f32)>,
     mut filter: F,
 ) where
     Renderer: iced::advanced::Renderer,
     F: FnMut(&cosmic_text::LayoutRun) -> Option<((usize, usize), (usize, usize))>,
 {
     for run in buffer.layout_runs() {
+        if let Some((top, bottom)) = visible_y {
+            let run_top = text_y + run.line_top;
+            let run_bottom = run_top + run.line_height;
+            if run_bottom <= top {
+                continue;
+            }
+            if run_top >= bottom {
+                break;
+            }
+        }
         let Some(((start_line, start_idx), (end_line, end_idx))) = filter(&run) else {
             continue;
         };

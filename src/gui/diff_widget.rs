@@ -18,6 +18,19 @@
 //! Gutter (old/new line numbers) is rendered entirely in `draw()` via
 //! `fill_text` — it is NOT part of the buffer text at all. This avoids the
 //! problem of gutter text being repeated on wrapped continuation lines.
+//!
+//! ## Shape cache and viewport culling
+//!
+//! Shaping a large diff is expensive, and the UI rebuilds every second
+//! (auto-refresh tick) plus on many interactions. The shaped
+//! [`cosmic_text::Buffer`] is therefore cached in widget state, keyed on a
+//! content fingerprint plus the text-area width (see [`ShapeCacheKey`]);
+//! unchanged content reuses the cached buffer instead of re-shaping. `draw()`
+//! additionally processes only layout runs intersecting the visible
+//! viewport, so per-frame cost scales with the visible content rather than
+//! the whole diff. The cache key is content-derived so that iced's
+//! position-based state reuse (e.g. after a file-list reshuffle) can never
+//! display stale content.
 
 use std::sync::Arc;
 
@@ -77,6 +90,51 @@ pub struct DiffFileBuffer {
     pub line_numbers: Vec<(Option<usize>, Option<usize>)>,
     /// Digit count for the widest old/new line number (minimum 1).
     pub gutter_digits: usize,
+    /// Content fingerprint over every other field, computed once at build
+    /// time. Used as part of the shape-cache key so an unchanged diff
+    /// (e.g. after a 5-second auto-refresh rebuilt byte-identical buffers)
+    /// reuses the already-shaped layout, while any content change forces a
+    /// full re-shape — stale content must never be displayed.
+    pub content_fingerprint: u64,
+}
+
+// ── Shape cache ──────────────────────────────────────────────────────
+
+/// Cache key for a shaped [`cosmic_text::Buffer`].
+///
+/// The key covers every input to shaping: the diff content (via the
+/// content fingerprint), the content lengths (hash-collision hardening),
+/// and the shaping width (wrapping depends on it). If any of these change,
+/// the cached buffer is invalid and the full re-shape path runs — stale
+/// content must never be displayed, including when iced recycles widget
+/// state positionally after the file list changes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ShapeCacheKey {
+    content_fingerprint: u64,
+    text_len: usize,
+    span_count: usize,
+    width_bits: u32,
+}
+
+impl ShapeCacheKey {
+    /// Build the key for a buffer's data shaped at the given text-area width.
+    fn new(data: &DiffFileBuffer, text_area_width: f32) -> Self {
+        Self {
+            content_fingerprint: data.content_fingerprint,
+            text_len: data.text.len(),
+            span_count: data.span_data.len(),
+            width_bits: text_area_width.to_bits(),
+        }
+    }
+}
+
+/// A shaped buffer cached in widget state across UI rebuilds, together with
+/// its total content height (kept consistent with the buffer so the
+/// scrollable content height never drifts from the drawn content).
+struct ShapeCacheEntry {
+    key: ShapeCacheKey,
+    buffer: Arc<cosmic_text::Buffer>,
+    total_height: f32,
 }
 
 // ── Widget state ─────────────────────────────────────────────────────
@@ -84,8 +142,10 @@ pub struct DiffFileBuffer {
 /// Persistent state stored in `widget::Tree::State`.
 #[derive(Default)]
 struct DiffBufferState {
-    /// The `Arc<Buffer>` must live across frames for `fill_raw` to work.
-    buffer_for_render: Option<Arc<cosmic_text::Buffer>>,
+    /// Cached shaped buffer + total height, reused while the cache key is
+    /// unchanged. The `Arc<Buffer>` must live across frames for `fill_raw`
+    /// to work.
+    shape_cache: Option<ShapeCacheEntry>,
     /// Cached gutter width in pixels (computed per frame in layout).
     gutter_width: f32,
     /// Selection anchor byte offset in buffer text (`None` = no selection).
@@ -145,6 +205,64 @@ fn gutter_column_right_edges(bounds_x: f32, padding: f32, gutter_width: f32) -> 
         bounds_x + padding + half_gutter,
         bounds_x + padding + gutter_width,
     )
+}
+
+/// Compute a content fingerprint for a [`DiffFileBuffer`]'s shaping inputs.
+///
+/// The fingerprint covers every field that can influence the shaped buffer
+/// (text bytes, span positions/colors, line kinds, line numbers, gutter
+/// digits). It is computed once at buffer-build time and forms the core of
+/// the shape-cache key, so that unchanged diff content — e.g. after a
+/// 5-second auto-refresh that rebuilt byte-identical buffers — reuses the
+/// existing shaped layout, while any content change forces a full re-shape.
+#[must_use]
+pub(crate) fn compute_content_fingerprint(
+    text: &str,
+    span_data: &[(usize, usize, Color)],
+    line_kinds: &[Option<DiffLineKind>],
+    line_numbers: &[(Option<usize>, Option<usize>)],
+    gutter_digits: usize,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    for &(start, end, color) in span_data {
+        start.hash(&mut hasher);
+        end.hash(&mut hasher);
+        color.r.to_bits().hash(&mut hasher);
+        color.g.to_bits().hash(&mut hasher);
+        color.b.to_bits().hash(&mut hasher);
+        color.a.to_bits().hash(&mut hasher);
+    }
+    for kind in line_kinds {
+        match kind {
+            Some(k) => {
+                1u8.hash(&mut hasher);
+                (*k as u8).hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+    }
+    for (old, new) in line_numbers {
+        match old {
+            Some(n) => {
+                1u8.hash(&mut hasher);
+                n.hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+        match new {
+            Some(n) => {
+                1u8.hash(&mut hasher);
+                n.hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+    }
+    gutter_digits.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Convert a shaped-buffer hit to a global byte offset in the source text.
@@ -266,9 +384,28 @@ where
         )
         .width;
 
-        // No content — collapse to zero height
+        // No content — collapse to zero height and drop any cached buffer
+        // so a recycled state slot can never draw stale content.
         if self.data.text.is_empty() {
+            state.shape_cache = None;
             return layout::Node::new(Size::new(bounds.width, 0.0));
+        }
+
+        let cache_key = ShapeCacheKey::new(self.data, text_area_width);
+
+        // ── Shape-cache hit: content and width unchanged ─────────────
+        // Reuse the previously shaped buffer and its total height instead of
+        // re-shaping the whole diff. The key covers the content fingerprint,
+        // content lengths, and the text-area width, so any change to an
+        // input (diff data, wrapping width, file-list reshuffle that recycles
+        // this state slot) falls through to the full re-shape path below.
+        if let Some(entry) = &state.shape_cache
+            && entry.key == cache_key
+        {
+            return layout::Node::new(Size::new(
+                bounds.width,
+                entry.total_height + self.padding * 2.0,
+            ));
         }
 
         let metrics = font_metrics();
@@ -313,9 +450,14 @@ where
             (buffer, total_height)
         });
 
-        // Move the shaped buffer into an Arc and store for fill_raw
+        // Move the shaped buffer into an Arc and store with its cache key
+        // and total height for reuse on subsequent layouts.
         let arc = Arc::new(buffer);
-        state.buffer_for_render = Some(arc);
+        state.shape_cache = Some(ShapeCacheEntry {
+            key: cache_key,
+            buffer: arc,
+            total_height,
+        });
 
         layout::Node::new(Size::new(bounds.width, total_height + self.padding * 2.0))
     }
@@ -329,11 +471,23 @@ where
         _style: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<DiffBufferState>();
         let bounds = layout.bounds();
         let gutter_width = state.gutter_width;
+
+        // ── Visible viewport (content coordinates) ──────────────────
+        // The scrollable passes its visible region translated into the same
+        // coordinate space as `bounds` (see scrollable's draw: the renderer
+        // is translated, the viewport is not). Only runs intersecting it are
+        // processed below, so per-frame cost scales with the visible content
+        // instead of the whole diff. Fully off-screen → nothing to draw.
+        let Some(visible) = bounds.intersection(viewport) else {
+            return;
+        };
+        let viewport_top = visible.y;
+        let viewport_bottom = visible.y + visible.height;
 
         // ── 0. Fill background ──
         draw_background(renderer, bounds);
@@ -346,8 +500,8 @@ where
 
         let text_clip = text_rect;
 
-        let buffer_for_draw = match &state.buffer_for_render {
-            Some(arc) => arc.clone(),
+        let buffer_for_draw = match &state.shape_cache {
+            Some(entry) => entry.buffer.clone(),
             None => return,
         };
 
@@ -356,6 +510,16 @@ where
         // wrapped continuation lines. (Unlike the gutter section below,
         // backgrounds must cover the full visible span.)
         for run in buffer_for_draw.layout_runs() {
+            // Cull off-screen runs: layout_runs yields in ascending y order.
+            let run_top = text_y + run.line_top;
+            let run_bottom = run_top + run.line_height;
+            if run_bottom <= viewport_top {
+                continue;
+            }
+            if run_top >= viewport_bottom {
+                break;
+            }
+
             if run.line_i >= self.data.line_kinds.len() {
                 continue;
             }
@@ -384,13 +548,27 @@ where
         let number_color = theme::TEXT_MUTED;
         let gutter_clip = gutter_clip_rect(bounds, self.padding, gutter_width, text_area_height);
 
+        // Only draw gutter for the first visual line of each logical line.
+        // `last_drawn_line` is updated for every run — including off-screen
+        // ones above the viewport — so a wrapped line whose first visual run
+        // is scrolled out never gets its number drawn on a visible
+        // continuation line (the number stays at the first visual run).
         let mut last_drawn_line = usize::MAX;
         for run in buffer_for_draw.layout_runs() {
-            // Only draw gutter for the first visual line of each logical line
             if run.line_i == last_drawn_line {
                 continue;
             }
             last_drawn_line = run.line_i;
+
+            // Cull off-screen runs (ascending y order).
+            let run_top = text_y + run.line_top;
+            let run_bottom = run_top + run.line_height;
+            if run_bottom <= viewport_top {
+                continue;
+            }
+            if run_top >= viewport_bottom {
+                break;
+            }
 
             if run.line_i >= self.data.line_numbers.len() {
                 continue;
@@ -471,6 +649,7 @@ where
                 text_y,
                 SELECTION_COLOR,
                 false,
+                Some((viewport_top, viewport_bottom)),
                 filter,
             );
         }
@@ -496,8 +675,8 @@ where
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<DiffBufferState>();
-        let buffer = match &state.buffer_for_render {
-            Some(arc) => arc.clone(),
+        let buffer = match &state.shape_cache {
+            Some(entry) => entry.buffer.clone(),
             None => return,
         };
 
@@ -725,6 +904,8 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
     span_data.sort_by_key(|(start, _, _)| *start);
 
     let gutter_digits = compute_gutter_digits(&line_numbers);
+    let content_fingerprint =
+        compute_content_fingerprint(&text, &span_data, &line_kinds, &line_numbers, gutter_digits);
 
     DiffFileBuffer {
         text,
@@ -732,6 +913,7 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
         line_kinds,
         line_numbers,
         gutter_digits,
+        content_fingerprint,
     }
 }
 
@@ -1014,5 +1196,68 @@ mod tests {
     #[test]
     fn test_compute_gutter_digits_empty_defaults_to_one() {
         assert_eq!(compute_gutter_digits(&[]), 1);
+    }
+
+    #[test]
+    fn test_shape_cache_key_tracks_content_and_width() {
+        // Same diff content rebuilt twice (the 5-second auto-refresh case)
+        // must produce the same fingerprint; changed content must not.
+        let file_a = make_test_diff_file(
+            "a.rs",
+            vec![make_hunk(
+                "@@ -1,3 +1,4 @@ fn main() {",
+                vec![
+                    make_line(DiffLineKind::Context, "let x = 1;", Some(1), Some(1)),
+                    make_line(DiffLineKind::Removed, "let y = 2;", Some(2), None),
+                    make_line(DiffLineKind::Added, "let z = 3;", None, Some(2)),
+                ],
+            )],
+            DiffFileStatus::Modified,
+        );
+        let file_a_again = make_test_diff_file(
+            "a.rs",
+            vec![make_hunk(
+                "@@ -1,3 +1,4 @@ fn main() {",
+                vec![
+                    make_line(DiffLineKind::Context, "let x = 1;", Some(1), Some(1)),
+                    make_line(DiffLineKind::Removed, "let y = 2;", Some(2), None),
+                    make_line(DiffLineKind::Added, "let z = 3;", None, Some(2)),
+                ],
+            )],
+            DiffFileStatus::Modified,
+        );
+        let file_b = make_test_diff_file(
+            "a.rs",
+            vec![make_hunk(
+                "@@ -1,3 +1,4 @@ fn main() {",
+                vec![
+                    make_line(DiffLineKind::Context, "let x = 1;", Some(1), Some(1)),
+                    make_line(DiffLineKind::Removed, "let y = 2;", Some(2), None),
+                    make_line(DiffLineKind::Added, "let z = 99;", None, Some(2)),
+                ],
+            )],
+            DiffFileStatus::Modified,
+        );
+
+        let buf_a = &build_file_buffers(&[file_a], None, None)[0];
+        let buf_a_again = &build_file_buffers(&[file_a_again], None, None)[0];
+        let buf_b = &build_file_buffers(&[file_b], None, None)[0];
+
+        assert_eq!(buf_a.content_fingerprint, buf_a_again.content_fingerprint);
+        assert_ne!(buf_a.content_fingerprint, buf_b.content_fingerprint);
+
+        // The full cache key also covers the shaping width: a resize changes
+        // wrapping, so the cached layout must be invalidated.
+        let width = 500.0;
+        let key_a = ShapeCacheKey::new(buf_a, width);
+        let key_a_again = ShapeCacheKey::new(buf_a_again, width);
+        let key_a_wider = ShapeCacheKey::new(buf_a, width + 1.0);
+        let key_b = ShapeCacheKey::new(buf_b, width);
+        assert_eq!(
+            key_a, key_a_again,
+            "identical content+width must hit the cache"
+        );
+        assert_ne!(key_a, key_a_wider, "width change must invalidate the cache");
+        assert_ne!(key_a, key_b, "content change must invalidate the cache");
     }
 }

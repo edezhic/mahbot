@@ -3012,7 +3012,7 @@ fn draw_find_match_highlights<Renderer>(
                     .then_some(((match_line, col_start), (match_line, col_end)))
             };
             draw_run_highlights(
-                renderer, buffer, geo.clip, geo.x, geo.y, color, false, filter,
+                renderer, buffer, geo.clip, geo.x, geo.y, color, false, None, filter,
             );
         }
     }
@@ -3045,6 +3045,7 @@ fn draw_bracket_match_highlights<Renderer>(
                 geo.y,
                 theme::BRACKET_MATCH,
                 true,
+                None,
                 filter,
             );
         }
@@ -3089,6 +3090,7 @@ fn draw_selection<Renderer>(
             geo.y,
             theme::ACCENT_DIM,
             false,
+            None,
             filter,
         );
     }
