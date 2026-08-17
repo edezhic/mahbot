@@ -46,10 +46,6 @@ pub struct ToolErrorEntry {
 /// All fields are optional — `None` means no filter is applied.
 #[derive(Debug, Clone, Default)]
 pub struct ToolErrorQuery {
-    /// Optional role name filter (exact match via `WHERE role = ?`).
-    pub role_filter: Option<String>,
-    /// Optional workspace name filter (exact match via `WHERE workspace = ?`).
-    pub workspace_filter: Option<String>,
     /// Optional search text filter (substring match via `LIKE` on error text).
     pub search: Option<String>,
 }
@@ -416,16 +412,6 @@ fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<turso::Value>
     let mut clauses = vec!["error_message IS NOT NULL".to_string()];
     let mut params = Vec::new();
 
-    if let Some(ref role) = query.role_filter {
-        params.push(turso::Value::Text(role.clone()));
-        clauses.push("role = ?".to_string());
-    }
-
-    if let Some(ref workspace) = query.workspace_filter {
-        params.push(turso::Value::Text(workspace.clone()));
-        clauses.push("workspace = ?".to_string());
-    }
-
     if let Some(ref search) = query.search {
         params.push(turso::Value::Text(format!("%{search}%")));
         clauses.push("error_message LIKE ?".to_string());
@@ -438,13 +424,13 @@ fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<turso::Value>
 mod tests {
     use super::*;
 
-    /// All 8 combinations of optional filters in [`ToolErrorQuery`].
+    /// Both states of the sole remaining optional filter (`search`) in
+    /// [`ToolErrorQuery`].
     ///
     /// Each case verifies the exact SQL clause string and param values produced
     /// by [`build_tool_error_filter`].
-    #[allow(clippy::too_many_lines)]
     #[test]
-    fn build_tool_error_filter_all_combinations() {
+    fn build_tool_error_filter_with_and_without_search() {
         struct Case {
             name: &'static str,
             query: ToolErrorQuery,
@@ -460,87 +446,12 @@ mod tests {
                 expected_params: vec![],
             },
             Case {
-                name: "role_only",
-                query: ToolErrorQuery {
-                    role_filter: Some("Engineer".to_string()),
-                    workspace_filter: None,
-                    search: None,
-                },
-                expected_clause: "error_message IS NOT NULL AND role = ?",
-                expected_params: vec![turso::Value::Text("Engineer".to_string())],
-            },
-            Case {
-                name: "workspace_only",
-                query: ToolErrorQuery {
-                    role_filter: None,
-                    workspace_filter: Some("my-workspace".to_string()),
-                    search: None,
-                },
-                expected_clause: "error_message IS NOT NULL AND workspace = ?",
-                expected_params: vec![turso::Value::Text("my-workspace".to_string())],
-            },
-            Case {
                 name: "search_only",
                 query: ToolErrorQuery {
-                    role_filter: None,
-                    workspace_filter: None,
                     search: Some("timeout".to_string()),
                 },
                 expected_clause: "error_message IS NOT NULL AND error_message LIKE ?",
                 expected_params: vec![turso::Value::Text("%timeout%".to_string())],
-            },
-            Case {
-                name: "role_and_workspace",
-                query: ToolErrorQuery {
-                    role_filter: Some("Analyst".to_string()),
-                    workspace_filter: Some("ws1".to_string()),
-                    search: None,
-                },
-                expected_clause: "error_message IS NOT NULL AND role = ? AND workspace = ?",
-                expected_params: vec![
-                    turso::Value::Text("Analyst".to_string()),
-                    turso::Value::Text("ws1".to_string()),
-                ],
-            },
-            Case {
-                name: "role_and_search",
-                query: ToolErrorQuery {
-                    role_filter: Some("Analyst".to_string()),
-                    workspace_filter: None,
-                    search: Some("connection refused".to_string()),
-                },
-                expected_clause: "error_message IS NOT NULL AND role = ? AND error_message LIKE ?",
-                expected_params: vec![
-                    turso::Value::Text("Analyst".to_string()),
-                    turso::Value::Text("%connection refused%".to_string()),
-                ],
-            },
-            Case {
-                name: "workspace_and_search",
-                query: ToolErrorQuery {
-                    role_filter: None,
-                    workspace_filter: Some("ws2".to_string()),
-                    search: Some("error msg".to_string()),
-                },
-                expected_clause: "error_message IS NOT NULL AND workspace = ? AND error_message LIKE ?",
-                expected_params: vec![
-                    turso::Value::Text("ws2".to_string()),
-                    turso::Value::Text("%error msg%".to_string()),
-                ],
-            },
-            Case {
-                name: "all_three",
-                query: ToolErrorQuery {
-                    role_filter: Some("Manager".to_string()),
-                    workspace_filter: Some("ws3".to_string()),
-                    search: Some("fatal".to_string()),
-                },
-                expected_clause: "error_message IS NOT NULL AND role = ? AND workspace = ? AND error_message LIKE ?",
-                expected_params: vec![
-                    turso::Value::Text("Manager".to_string()),
-                    turso::Value::Text("ws3".to_string()),
-                    turso::Value::Text("%fatal%".to_string()),
-                ],
             },
         ];
 
@@ -623,34 +534,8 @@ mod tests {
         assert_eq!(errors[0].role, "Engineer");
         assert_eq!(errors[0].workspace, "my-workspace");
 
-        // Verify error filtering by role
-        let query = ToolErrorQuery {
-            role_filter: Some("Engineer".to_string()),
-            workspace_filter: None,
-            search: None,
-        };
-        let (errors, total) = store
-            .query_tool_errors(&query, 100, 0)
-            .await
-            .expect("query_tool_errors with role filter");
-        assert_eq!(total, 1, "Engineer should have 1 error");
-        assert_eq!(errors.len(), 1);
-
-        let query = ToolErrorQuery {
-            role_filter: Some("Manager".to_string()),
-            workspace_filter: None,
-            search: None,
-        };
-        let (_errors, total) = store
-            .query_tool_errors(&query, 100, 0)
-            .await
-            .expect("query_tool_errors with role filter");
-        assert_eq!(total, 0, "Manager should have 0 errors");
-
         // Verify error filtering by search text
         let query = ToolErrorQuery {
-            role_filter: None,
-            workspace_filter: None,
             search: Some("permission".to_string()),
         };
         let (errors, total) = store
@@ -661,8 +546,6 @@ mod tests {
         assert_eq!(errors[0].tool_name, "write");
 
         let query = ToolErrorQuery {
-            role_filter: None,
-            workspace_filter: None,
             search: Some("timeout".to_string()),
         };
         let (_errors, total) = store
@@ -670,29 +553,6 @@ mod tests {
             .await
             .expect("query_tool_errors with search");
         assert_eq!(total, 0, "search 'timeout' should find 0 errors");
-
-        // Verify error filtering by workspace
-        let query = ToolErrorQuery {
-            role_filter: None,
-            workspace_filter: Some("my-workspace".to_string()),
-            search: None,
-        };
-        let (_errors, total) = store
-            .query_tool_errors(&query, 100, 0)
-            .await
-            .expect("query_tool_errors with workspace filter");
-        assert_eq!(total, 1, "my-workspace should have 1 error");
-
-        let query = ToolErrorQuery {
-            role_filter: None,
-            workspace_filter: Some("other-ws".to_string()),
-            search: None,
-        };
-        let (_errors, total) = store
-            .query_tool_errors(&query, 100, 0)
-            .await
-            .expect("query_tool_errors with workspace filter");
-        assert_eq!(total, 0, "other-ws should have 0 errors");
     }
 
     /// `llm_requests` insert round-trip — verifies the schema (including

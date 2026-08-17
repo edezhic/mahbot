@@ -396,8 +396,6 @@ pub struct LogQuery {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub agent_id: Option<String>,
-    pub agent_role: Option<String>,
-    pub workspace: Option<String>,
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -453,18 +451,6 @@ fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
     if let Some(ref agent_id) = filters.agent_id {
         conditions.push("agent_id LIKE ?".into());
         values.push(Value::Text(format!("%{agent_id}%")));
-    }
-
-    if let Some(ref agent_role) = filters.agent_role {
-        conditions.push("agent_role = ?".into());
-        values.push(Value::Text(agent_role.clone()));
-    }
-
-    if let Some(ref workspace) = filters.workspace
-        && !workspace.is_empty()
-    {
-        conditions.push("workspace = ?".into());
-        values.push(Value::Text(workspace.clone()));
     }
 
     if conditions.is_empty() {

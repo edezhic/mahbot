@@ -12,14 +12,11 @@ pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
 /// Pagination state shared by dashboard pages that display paginated data.
 ///
 /// Groups `page`, `page_size`, and `total` into a single struct with helper
-/// methods for common operations.  Used by [`PaginationState`] and the
-/// [`pagination_bar`](super::widgets::pagination_bar) widget.
+/// methods for common operations (used by the Logs and Tool Failures pages).
 ///
 /// # Structural benefits (not line savings)
 ///
 /// The struct adds a few lines of definition, but the value is:
-/// - Cleaner [`pagination_bar`](super::widgets::pagination_bar) signature
-///   (takes `page` / `total_pages` instead of needing the whole state object)
 /// - Centralised boundary logic in [`prev_page`](Self::prev_page) /
 ///   [`next_page`](Self::next_page)
 /// - Reusable by any future page that needs pagination
@@ -71,6 +68,35 @@ impl PaginationState {
     /// Reset to page 0 (e.g. when a filter changes).
     pub(crate) fn reset(&mut self) {
         self.page = 0;
+    }
+
+    /// Clamp `page` to a valid range for a freshly returned `total`.
+    ///
+    /// Totals can shrink between refreshes (e.g. log retention purges rows),
+    /// leaving a previously valid page past the end. Returns `true` when the
+    /// page moved to a valid in-range page and the caller should re-query —
+    /// the entries it currently holds are from a now-out-of-range offset.
+    /// Returns `false` when no re-query is needed (the page was already
+    /// valid, or the total is zero so the fresh empty result is correct).
+    ///
+    /// Note: the bound is computed from `total` (the value just returned by
+    /// the query), not the stored `self.total` — the stored value is stale
+    /// until the caller assigns it, so clamping against it could never fire
+    /// on the refresh that observes the shrink. When a clamp fires, callers
+    /// should assign `self.total = total` before re-querying so the page
+    /// indicator stays consistent with the clamped page during the re-query
+    /// window.
+    pub(crate) fn clamp_page(&mut self, total: usize) -> bool {
+        let total_pages = total.div_ceil(self.page_size);
+        if total_pages == 0 {
+            self.page = 0;
+            false
+        } else if self.page >= total_pages {
+            self.page = total_pages - 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Compute the offset for SQL ``LIMIT … OFFSET …`` queries.

@@ -1,8 +1,9 @@
 //! Tool Failures dashboard page — browse flattened tool call errors from the logs store.
 //!
 //! Two-line row layout with role badges and HH:MM:SS timestamps, matching the
-//! Logs page style. Filter bar is shared with the Logs page via [`super::logs`].
-//! No live streaming — data refreshes on filter changes or tab switch.
+//! Logs page style. No live streaming — data refreshes on search changes or
+//! tab switch. Pagination and search controls live in the Logs page's shared
+//! bottom bar (see [`super::logs`]), so this page only renders the entries.
 
 use crate::stats::{ToolErrorEntry, ToolErrorQuery};
 
@@ -17,14 +18,11 @@ use super::widgets::selectable_text;
 
 #[derive(Debug, Clone)]
 pub enum ToolFailuresMessage {
-    /// Data refreshed from the store. Carries entries and total count.
-    Refreshed(Vec<ToolErrorEntry>, usize),
-    /// Refresh query failed.
-    RefreshError(String),
-    /// Go to previous page.
-    PrevPage,
-    /// Go to next page.
-    NextPage,
+    /// Data refreshed from the store. Carries the refresh generation (stale
+    /// responses are dropped), the entries, and the total count.
+    Refreshed(u64, Vec<ToolErrorEntry>, usize),
+    /// Refresh query failed. Carries the generation so stale errors are dropped.
+    RefreshError(u64, String),
 }
 
 pub struct ToolFailuresState {
@@ -33,6 +31,14 @@ pub struct ToolFailuresState {
 
     // Pagination
     pagination: super::common::PaginationState,
+
+    /// This tab's own search query (preserved across tab switches).
+    search: String,
+
+    /// Monotonic guard: refresh responses carry the generation they were
+    /// issued under; stale responses (issued before a newer refresh) are
+    /// dropped so an older query can never overwrite newer data.
+    refresh_generation: u64,
 }
 
 impl ToolFailuresState {
@@ -42,13 +48,13 @@ impl ToolFailuresState {
             entries: Vec::new(),
             load_state: super::common::AsyncLoadState::new(),
             pagination: super::common::PaginationState::new(50),
+            search: String::new(),
+            refresh_generation: 0,
         }
     }
 
-    fn build_query(role_filter: &str, workspace_filter: &str, search: &str) -> ToolErrorQuery {
+    fn build_query(search: &str) -> ToolErrorQuery {
         ToolErrorQuery {
-            role_filter: crate::util::none_if_empty(role_filter),
-            workspace_filter: crate::util::none_if_empty(workspace_filter),
             search: crate::util::none_if_empty(search),
         }
     }
@@ -56,52 +62,67 @@ impl ToolFailuresState {
     /// Request a refresh from the logs store.
     ///
     /// Delegates to `AsyncLoadState::start_loading`.
-    pub fn refresh(
-        &mut self,
-        role_filter: &str,
-        workspace_filter: &str,
-        search: &str,
-    ) -> Task<ToolFailuresMessage> {
+    pub fn refresh(&mut self) -> Task<ToolFailuresMessage> {
         self.load_state.start_loading();
-        let query = Self::build_query(role_filter, workspace_filter, search);
+        self.refresh_generation = self.refresh_generation.wrapping_add(1);
+        let generation = self.refresh_generation;
+        let query = Self::build_query(&self.search);
         let page = self.pagination.page;
         let page_size = self.pagination.page_size;
         Task::perform(
             async move {
                 // Fail-open: no logs store → empty result, not a panic.
                 let Some(store) = crate::logs::LOG_STORE.get() else {
-                    return Ok((Vec::new(), 0));
+                    return Ok((generation, Vec::new(), 0));
                 };
                 store
                     .query_tool_errors(&query, page_size, page * page_size)
                     .await
-                    .map_err(|e| e.to_string())
+                    .map(|(entries, total)| (generation, entries, total))
+                    .map_err(|e| (generation, e.to_string()))
             },
             |res| match res {
-                Ok((entries, total)) => ToolFailuresMessage::Refreshed(entries, total),
-                Err(e) => ToolFailuresMessage::RefreshError(e),
+                Ok((generation, entries, total)) => {
+                    ToolFailuresMessage::Refreshed(generation, entries, total)
+                }
+                Err((generation, e)) => ToolFailuresMessage::RefreshError(generation, e),
             },
         )
     }
 
     pub fn update(&mut self, message: ToolFailuresMessage) -> Task<ToolFailuresMessage> {
         match message {
-            ToolFailuresMessage::Refreshed(entries, total) => {
+            ToolFailuresMessage::Refreshed(generation, entries, total) => {
+                if generation != self.refresh_generation {
+                    return Task::none();
+                }
+                // Page clamp against the fresh `total` from the response:
+                // if the total shrank between refreshes a previously valid
+                // page may now be past the end — clamp and re-query so the
+                // "Page X of Y" indicator stays valid.
+                if self.pagination.clamp_page(total) {
+                    // Adopt the fresh total immediately so the shared bottom
+                    // bar's "Page X of Y" indicator stays consistent with the
+                    // clamped page during the re-query window; the old
+                    // entries stay on screen.
+                    self.pagination.total = total;
+                    return self.refresh();
+                }
                 self.entries = entries;
                 self.pagination.total = total;
                 self.load_state.finish_loading();
                 Task::none()
             }
-            ToolFailuresMessage::RefreshError(e) => {
+            ToolFailuresMessage::RefreshError(generation, e) => {
+                if generation != self.refresh_generation {
+                    return Task::none();
+                }
                 self.load_state.fail(e);
                 // ToolFailures shows "empty state" instead of "Loading…" after
                 // the first attempt, even if it failed, so mark has_loaded=true.
                 self.load_state.set_has_loaded();
                 Task::none()
             }
-            // PrevPage and NextPage are intercepted by LogsState, which calls
-            // prev_page()/next_page() directly with filter parameters.
-            _ => Task::none(),
         }
     }
 
@@ -110,32 +131,43 @@ impl ToolFailuresState {
         self.pagination.reset();
     }
 
-    /// Go to the previous page and refresh with the given filter parameters.
-    pub fn prev_page(
-        &mut self,
-        role_filter: &str,
-        workspace_filter: &str,
-        search: &str,
-    ) -> Task<ToolFailuresMessage> {
+    /// Go to the previous page and refresh.
+    pub fn prev_page(&mut self) -> Task<ToolFailuresMessage> {
         if self.pagination.prev_page() {
-            self.refresh(role_filter, workspace_filter, search)
+            self.refresh()
         } else {
             Task::none()
         }
     }
 
-    /// Go to the next page and refresh with the given filter parameters.
-    pub fn next_page(
-        &mut self,
-        role_filter: &str,
-        workspace_filter: &str,
-        search: &str,
-    ) -> Task<ToolFailuresMessage> {
+    /// Go to the next page and refresh.
+    pub fn next_page(&mut self) -> Task<ToolFailuresMessage> {
         if self.pagination.next_page() {
-            self.refresh(role_filter, workspace_filter, search)
+            self.refresh()
         } else {
             Task::none()
         }
+    }
+
+    /// Current page index (rendered by the Logs page's shared bottom bar).
+    pub(crate) fn page(&self) -> usize {
+        self.pagination.page
+    }
+
+    /// Total number of pages given the current total (rendered by the Logs
+    /// page's shared bottom bar).
+    pub(crate) fn total_pages(&self) -> usize {
+        self.pagination.total_pages()
+    }
+
+    /// This tab's search query (bound to the Logs page's shared search input).
+    pub(crate) fn search(&self) -> &str {
+        &self.search
+    }
+
+    /// Replace this tab's search query (from the Logs page's shared search input).
+    pub(crate) fn set_search(&mut self, search: String) {
+        self.search = search;
     }
 
     pub fn view(&self) -> Element<'_, ToolFailuresMessage> {
@@ -170,14 +202,6 @@ impl ToolFailuresState {
 
             content = content.push(entries_view);
         }
-
-        // Pagination bar
-        content = content.push(widgets::pagination_bar(
-            self.pagination.page,
-            self.pagination.total_pages(),
-            ToolFailuresMessage::PrevPage,
-            ToolFailuresMessage::NextPage,
-        ));
 
         container(content)
             .width(Length::Fill)

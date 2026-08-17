@@ -1,14 +1,16 @@
-//! Logs dashboard page — live log viewing with streaming, filters, pagination,
+//! Logs dashboard page — live log viewing with per-tab pagination/search,
 //! plus a Tool Failures tab for browsing tool error entries.
+//!
+//! Each tab (All Logs / Issues / Tool Failures) keeps its own entries,
+//! pagination state and search query, so switching tabs never reuses another
+//! tab's page index or search. Pause is a single global control. The bottom
+//! bar holds pagination + pause + search; the top bar holds only the tabs.
 
-use crate::Role;
 use crate::logs::{LogEntry, LogQuery, LogStore};
-
-use strum::IntoEnumIterator;
 
 use iced::advanced::text::Span;
 use iced::widget::{
-    Column, Space, button, column, container, pick_list, row, scrollable, text, text_input, tooltip,
+    Column, Space, button, column, container, row, scrollable, text, text_input, tooltip,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, window};
 use iced_anim::Animated;
@@ -47,24 +49,26 @@ fn log_stream_producer() -> impl futures_util::Stream<Item = LogMessage> {
 
 #[derive(Debug, Clone)]
 pub enum LogMessage {
-    // Data
-    Refreshed(Vec<LogEntry>, usize, Vec<super::widgets::PickOption>),
-    RefreshError(String),
+    // Data — tagged with the originating tab and refresh generation so stale
+    // async responses (issued before a newer refresh of the same tab) are
+    // dropped instead of overwriting newer data.
+    Refreshed(LogsTab, u64, Vec<LogEntry>, usize),
+    RefreshError(LogsTab, u64, String),
 
     // Live stream
     LiveEntry(LogEntry),
     StreamLagged,
 
-    // Filters
-    RoleFilterInput(String),
-    WorkspaceInput(String),
+    // Search
     SearchInput(String),
 
     // Tab switching
     TabSelected(LogsTab),
 
-    // Debounced refresh after text input (~300ms)
-    DebouncedRefresh(u64),
+    // Debounced refresh after text input (~300ms). Carries the tab whose
+    // query changed so the refresh still targets that tab if the user
+    // switches tabs within the debounce window.
+    DebouncedRefresh(u64, LogsTab),
 
     // Pagination
     PrevPage,
@@ -86,27 +90,49 @@ pub enum LogMessage {
     ToolFailures(super::tool_failures::ToolFailuresMessage),
 }
 
-pub struct LogsState {
+/// Per-tab state shared by the All Logs and Issues tabs. Each tab keeps its
+/// own entries, load state, pagination and search query so switching tabs
+/// never reuses another tab's page index or query.
+struct LogsTabData {
     entries: Vec<LogEntry>,
     load_state: super::common::AsyncLoadState,
-
-    // Filters
-    role_filter: String,
-    workspace_filter: String,
-    search_filter: String,
-
-    // Dropdown options (populated on refresh)
-    role_options: Vec<super::widgets::PickOption>,
-    workspace_options: Vec<super::widgets::PickOption>,
 
     // Pagination
     pagination: super::common::PaginationState,
 
-    // Tab state
-    active_tab: LogsTab,
+    /// This tab's own search query (preserved across tab switches).
+    search: String,
+
+    /// Monotonic guard: refresh responses carry the generation they were
+    /// issued under; stale responses (issued before a newer refresh of this
+    /// tab) are dropped so an older query can never overwrite newer data.
+    refresh_generation: u64,
+}
+
+impl LogsTabData {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            load_state: super::common::AsyncLoadState::new(),
+            pagination: super::common::PaginationState::new(50),
+            search: String::new(),
+            refresh_generation: 0,
+        }
+    }
+}
+
+pub struct LogsState {
+    /// All Logs tab data (live-streamed).
+    all_logs: LogsTabData,
+    /// Issues tab data (ERROR/WARN only).
+    issues: LogsTabData,
+    /// Tool Failures tab data (delegated sub-state).
     tool_failures_state: super::tool_failures::ToolFailuresState,
 
-    // Stream control
+    // Tab state
+    active_tab: LogsTab,
+
+    // Stream control (global across tabs)
     paused: bool,
 
     /// Visual highlight for search input (Cmd+F).
@@ -124,24 +150,10 @@ impl LogsState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            load_state: super::common::AsyncLoadState::new(),
-            role_filter: String::new(),
-            workspace_filter: String::new(),
-            search_filter: String::new(),
-            role_options: Role::iter()
-                .map(|r| {
-                    let name = r.to_string();
-                    super::widgets::PickOption {
-                        value: name.clone(),
-                        label: name,
-                    }
-                })
-                .collect(),
-            workspace_options: Vec::new(),
-            pagination: super::common::PaginationState::new(50),
-            active_tab: LogsTab::AllLogs,
+            all_logs: LogsTabData::new(),
+            issues: LogsTabData::new(),
             tool_failures_state: super::tool_failures::ToolFailuresState::new(),
+            active_tab: LogsTab::AllLogs,
             paused: false,
             focus_search: false,
             newest_entry_timestamp: None,
@@ -153,81 +165,97 @@ impl LogsState {
         }
     }
 
-    fn build_query(&self) -> LogQuery {
-        let level = match self.active_tab {
-            LogsTab::AllLogs => None,
-            LogsTab::Issues => Some("ERROR,WARN".to_string()),
-            LogsTab::ToolFailures => {
-                unreachable!("build_query is never called on the ToolFailures tab")
-            }
-        };
+    /// Immutable access to one log tab's data. Returns `None` for the Tool
+    /// Failures tab (handled via `tool_failures_state`).
+    fn tab_data(&self, tab: LogsTab) -> Option<&LogsTabData> {
+        match tab {
+            LogsTab::AllLogs => Some(&self.all_logs),
+            LogsTab::Issues => Some(&self.issues),
+            LogsTab::ToolFailures => None,
+        }
+    }
 
-        LogQuery {
-            level,
-            target: None,
-            search: crate::util::none_if_empty(&self.search_filter),
-            agent_id: None,
-            agent_role: crate::util::none_if_empty(&self.role_filter),
-            workspace: crate::util::none_if_empty(&self.workspace_filter),
-            since: None,
-            until: None,
-            limit: Some(self.pagination.page_size),
-            offset: Some(self.pagination.offset()),
+    /// Mutable access to one log tab's data. Returns `None` for the Tool
+    /// Failures tab (handled via `tool_failures_state`).
+    fn tab_data_mut(&mut self, tab: LogsTab) -> Option<&mut LogsTabData> {
+        match tab {
+            LogsTab::AllLogs => Some(&mut self.all_logs),
+            LogsTab::Issues => Some(&mut self.issues),
+            LogsTab::ToolFailures => None,
+        }
+    }
+
+    /// The active tab's search query (bound to the shared search input).
+    fn active_search(&self) -> &str {
+        match self.active_tab {
+            LogsTab::AllLogs => &self.all_logs.search,
+            LogsTab::Issues => &self.issues.search,
+            LogsTab::ToolFailures => self.tool_failures_state.search(),
         }
     }
 
     /// Reset pagination for whichever tab is currently active.
     fn reset_pagination_for_active_tab(&mut self) {
-        match self.active_tab {
-            LogsTab::AllLogs | LogsTab::Issues => self.pagination.reset(),
-            LogsTab::ToolFailures => self.tool_failures_state.reset_pagination(),
+        match self.tab_data_mut(self.active_tab) {
+            Some(data) => data.pagination.reset(),
+            None => self.tool_failures_state.reset_pagination(),
         }
     }
 
-    /// Refresh the active tab's data.
+    /// Refresh whichever tab is currently active.
     fn refresh_active_tab(&mut self, log_store: &LogStore) -> Task<LogMessage> {
-        match self.active_tab {
-            LogsTab::AllLogs | LogsTab::Issues => self.refresh(log_store),
-            LogsTab::ToolFailures => self
-                .tool_failures_state
-                .refresh(
-                    &self.role_filter,
-                    &self.workspace_filter,
-                    &self.search_filter,
-                )
-                .map(LogMessage::ToolFailures),
-        }
+        self.refresh_tab(log_store, self.active_tab)
     }
 
+    /// Public entry point: refresh the currently active tab (used at boot).
     pub fn refresh(&mut self, log_store: &LogStore) -> Task<LogMessage> {
-        self.load_state.start_loading();
-        let query = self.build_query();
+        self.refresh_active_tab(log_store)
+    }
+
+    /// Issue a refresh for one specific tab, tagging the async response with
+    /// its origin tab and a generation counter so stale responses (issued
+    /// before a newer refresh of the same tab) are dropped by the handler.
+    /// Total over all three tabs: the Tool Failures tab refreshes through
+    /// its own state/store path instead.
+    fn refresh_tab(&mut self, log_store: &LogStore, tab: LogsTab) -> Task<LogMessage> {
+        // Tool Failures has its own state and store path.
+        let Some(data) = self.tab_data_mut(tab) else {
+            return self
+                .tool_failures_state
+                .refresh()
+                .map(LogMessage::ToolFailures);
+        };
+        data.load_state.start_loading();
+        data.refresh_generation = data.refresh_generation.wrapping_add(1);
+        let generation = data.refresh_generation;
+        let query = LogQuery {
+            // Issues shows ERROR/WARN entries only; All Logs is unfiltered.
+            level: match tab {
+                LogsTab::Issues => Some("ERROR,WARN".to_string()),
+                LogsTab::AllLogs | LogsTab::ToolFailures => None,
+            },
+            target: None,
+            search: crate::util::none_if_empty(&data.search),
+            agent_id: None,
+            since: None,
+            until: None,
+            limit: Some(data.pagination.page_size),
+            offset: Some(data.pagination.offset()),
+        };
         let store = log_store.clone();
         Task::perform(
             async move {
-                let (log_result, ws_result) = tokio::join!(
-                    async { store.query(&query).await.map_err(|e| e.to_string()) },
-                    async {
-                        crate::workspace::store()
-                            .list()
-                            .await
-                            .map(|ws_list| {
-                                ws_list
-                                    .into_iter()
-                                    .map(|ws| super::widgets::PickOption {
-                                        value: ws.path,
-                                        label: ws.name,
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    },
-                );
-                log_result.map(|(entries, total)| (entries, total, ws_result))
+                store
+                    .query(&query)
+                    .await
+                    .map(|(entries, total)| (generation, entries, total))
+                    .map_err(|e| (generation, e.to_string()))
             },
-            |res| match res {
-                Ok((entries, total, ws_opts)) => LogMessage::Refreshed(entries, total, ws_opts),
-                Err(e) => LogMessage::RefreshError(e),
+            move |res| match res {
+                Ok((generation, entries, total)) => {
+                    LogMessage::Refreshed(tab, generation, entries, total)
+                }
+                Err((generation, e)) => LogMessage::RefreshError(tab, generation, e),
             },
         )
     }
@@ -245,70 +273,75 @@ impl LogsState {
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: LogMessage, log_store: &LogStore) -> Task<LogMessage> {
         match msg {
-            LogMessage::Refreshed(entries, total, ws_opts) => {
-                self.entries = entries;
-                self.pagination.total = total;
-                self.load_state.finish_loading();
-
-                // Build workspace options from registry
-                self.workspace_options = ws_opts;
-
+            LogMessage::Refreshed(tab, generation, entries, total) => {
+                // A ToolFailures-tagged refresh cannot originate from
+                // `refresh_tab`; drop it defensively rather than panic.
+                let Some(data) = self.tab_data_mut(tab) else {
+                    return Task::none();
+                };
+                // Drop stale responses: a newer refresh was issued for this
+                // tab since this query started.
+                if generation != data.refresh_generation {
+                    return Task::none();
+                }
+                // Page clamp against the fresh `total` from the response:
+                // totals can shrink (INFO retention purge) between refreshes,
+                // leaving a previously valid page past the end. Clamp and
+                // re-query — keeping the current entries on screen until the
+                // clamped page's data lands — so the "Page X of Y" indicator
+                // never shows an out-of-range page with empty data.
+                if data.pagination.clamp_page(total) {
+                    // Adopt the fresh total immediately so the "Page X of Y"
+                    // indicator stays consistent with the clamped page during
+                    // the re-query window; the old entries stay on screen.
+                    data.pagination.total = total;
+                    return self.refresh_tab(log_store, tab);
+                }
+                data.entries = entries;
+                data.pagination.total = total;
+                data.load_state.finish_loading();
                 Task::none()
             }
-            LogMessage::RefreshError(e) => {
-                self.load_state.fail(e);
+            LogMessage::RefreshError(tab, generation, e) => {
+                let Some(data) = self.tab_data_mut(tab) else {
+                    return Task::none();
+                };
+                if generation != data.refresh_generation {
+                    return Task::none();
+                }
+                data.load_state.fail(e);
                 Task::none()
             }
             LogMessage::LiveEntry(entry) => {
+                // Live entries only arrive while the All Logs tab is active and
+                // unpaused (the subscription is gated in `subscription()`).
+                let data = &mut self.all_logs;
                 // Only prepend live entries when on page 0 (the live view).
                 // Other pages are static snapshots from the database.
-                if self.pagination.page != 0 {
+                if data.pagination.page != 0 {
                     return Task::none();
                 }
 
-                // Filter check — only for AllLogs tab; Issues tab uses DB filter.
-                // Live entries arrive regardless, but we filter them client-side
-                // to match the current active tab and filters.
-                let passes = match self.active_tab {
-                    LogsTab::AllLogs => true,
-                    LogsTab::Issues => entry.level == "ERROR" || entry.level == "WARN",
-                    LogsTab::ToolFailures => return Task::none(),
-                };
-                let passes = passes
-                    && (self.role_filter.is_empty()
-                        || entry
-                            .agent_role
-                            .to_lowercase()
-                            .contains(&self.role_filter.to_lowercase()));
-                let passes = passes
-                    && (self.workspace_filter.is_empty()
-                        || entry
-                            .workspace
-                            .to_lowercase()
-                            .contains(&self.workspace_filter.to_lowercase()));
-                let passes = passes
-                    && (self.search_filter.is_empty()
-                        || entry
-                            .message
-                            .to_lowercase()
-                            .contains(&self.search_filter.to_lowercase())
-                        || entry
-                            .target
-                            .to_lowercase()
-                            .contains(&self.search_filter.to_lowercase()));
+                // Client-side search filter matching this tab's query (the
+                // level filter comes from the DB query for the Issues tab,
+                // which never receives live entries).
+                let passes = data.search.is_empty()
+                    || entry
+                        .message
+                        .to_lowercase()
+                        .contains(&data.search.to_lowercase())
+                    || entry
+                        .target
+                        .to_lowercase()
+                        .contains(&data.search.to_lowercase());
 
                 if passes {
-                    self.entries.insert(0, entry);
-                    self.pagination.total += 1;
+                    data.entries.insert(0, entry);
+                    data.pagination.total += 1;
                     // Auto-evict: keep exactly page_size entries visible.
-                    self.entries.truncate(self.pagination.page_size);
+                    data.entries.truncate(data.pagination.page_size);
                     // Mark this entry as newest so the view can fade it in.
-                    self.newest_entry_timestamp = Some(
-                        self.entries
-                            .first()
-                            .map(|e| e.timestamp.clone())
-                            .unwrap_or_default(),
-                    );
+                    self.newest_entry_timestamp = data.entries.first().map(|e| e.timestamp.clone());
                     // Reset the fade animation so it goes 0→1 for the new entry.
                     self.fade_anim = Animated::transition(
                         0.0f32,
@@ -324,70 +357,60 @@ impl LogsState {
                 Task::none()
             }
             LogMessage::StreamLagged => {
-                // On lag, just refresh (but not on ToolFailures tab)
-                if self.active_tab == LogsTab::ToolFailures {
-                    return Task::none();
-                }
-                self.refresh(log_store)
-            }
-            // ── Filter routing based on active tab ─────────────
-            LogMessage::RoleFilterInput(v) => {
-                self.role_filter = v;
-                self.reset_pagination_for_active_tab();
-                self.refresh_active_tab(log_store)
-            }
-            LogMessage::WorkspaceInput(v) => {
-                self.workspace_filter = v;
-                self.reset_pagination_for_active_tab();
+                // Only delivered while the All Logs stream is active.
                 self.refresh_active_tab(log_store)
             }
             LogMessage::SearchInput(v) => {
-                self.search_filter = v;
+                // The search input is bound to the active tab's own query.
+                match self.tab_data_mut(self.active_tab) {
+                    Some(data) => data.search = v,
+                    None => self.tool_failures_state.set_search(v),
+                }
                 self.reset_pagination_for_active_tab();
-                self.debounce.trigger(300).map(LogMessage::DebouncedRefresh)
+                // Tag the debounced refresh with the tab whose query changed
+                // so it still targets that tab if the user switches away
+                // within the debounce window.
+                let tab = self.active_tab;
+                self.debounce
+                    .trigger(300)
+                    .map(move |g| LogMessage::DebouncedRefresh(g, tab))
             }
-            LogMessage::DebouncedRefresh(generation) => {
+            LogMessage::DebouncedRefresh(generation, tab) => {
                 if !self.debounce.should_process(generation) {
                     return Task::none();
                 }
-                self.refresh_active_tab(log_store)
+                self.refresh_tab(log_store, tab)
             }
-            LogMessage::PrevPage => match self.active_tab {
-                LogsTab::AllLogs | LogsTab::Issues => {
-                    if self.pagination.prev_page() {
-                        return self.refresh(log_store);
+            LogMessage::PrevPage => match self.tab_data_mut(self.active_tab) {
+                Some(data) => {
+                    if data.pagination.prev_page() {
+                        return self.refresh_active_tab(log_store);
                     }
                     Task::none()
                 }
-                LogsTab::ToolFailures => self
+                None => self
                     .tool_failures_state
-                    .prev_page(
-                        &self.role_filter,
-                        &self.workspace_filter,
-                        &self.search_filter,
-                    )
+                    .prev_page()
                     .map(LogMessage::ToolFailures),
             },
-            LogMessage::NextPage => match self.active_tab {
-                LogsTab::AllLogs | LogsTab::Issues => {
-                    if self.pagination.next_page() {
-                        return self.refresh(log_store);
+            LogMessage::NextPage => match self.tab_data_mut(self.active_tab) {
+                Some(data) => {
+                    if data.pagination.next_page() {
+                        return self.refresh_active_tab(log_store);
                     }
                     Task::none()
                 }
-                LogsTab::ToolFailures => self
+                None => self
                     .tool_failures_state
-                    .next_page(
-                        &self.role_filter,
-                        &self.workspace_filter,
-                        &self.search_filter,
-                    )
+                    .next_page()
                     .map(LogMessage::ToolFailures),
             },
             LogMessage::TogglePause => {
                 self.paused = !self.paused;
                 if !self.paused {
-                    return self.refresh(log_store);
+                    // Resume refreshes whatever tab is active — the pause
+                    // button works from every tab.
+                    return self.refresh_active_tab(log_store);
                 }
                 Task::none()
             }
@@ -403,28 +426,10 @@ impl LogsState {
                 self.active_tab = tab;
                 self.refresh_active_tab(log_store)
             }
-            LogMessage::ToolFailures(msg) => match msg {
-                super::tool_failures::ToolFailuresMessage::PrevPage => self
-                    .tool_failures_state
-                    .prev_page(
-                        &self.role_filter,
-                        &self.workspace_filter,
-                        &self.search_filter,
-                    )
-                    .map(LogMessage::ToolFailures),
-                super::tool_failures::ToolFailuresMessage::NextPage => self
-                    .tool_failures_state
-                    .next_page(
-                        &self.role_filter,
-                        &self.workspace_filter,
-                        &self.search_filter,
-                    )
-                    .map(LogMessage::ToolFailures),
-                _ => self
-                    .tool_failures_state
-                    .update(msg)
-                    .map(LogMessage::ToolFailures),
-            },
+            LogMessage::ToolFailures(msg) => self
+                .tool_failures_state
+                .update(msg)
+                .map(LogMessage::ToolFailures),
         }
     }
 
@@ -448,7 +453,7 @@ impl LogsState {
     }
 
     pub fn view(&self) -> Element<'_, LogMessage> {
-        // ── Tab bar ───────────────────────────────────────────────
+        // ── Tab bar (top bar: tabs only) ──────────────────────────
         let all_logs_btn = Self::tab_button("All Logs", LogsTab::AllLogs, self.active_tab);
         let issues_btn = Self::tab_button("Issues", LogsTab::Issues, self.active_tab);
         let tf_btn = Self::tab_button("Tool Failures", LogsTab::ToolFailures, self.active_tab);
@@ -460,9 +465,6 @@ impl LogsState {
         )
         .width(Length::Fill)
         .style(theme::surface_container_style);
-
-        // ── Shared filter bar ─────────────────────────────────────
-        let filter_bar = self.shared_filter_bar();
 
         // ── Tab content ────────────────────────────────────────────
         let body: Element<'_, LogMessage> = match self.active_tab {
@@ -478,7 +480,10 @@ impl LogsState {
         // tracing to report them without recursing into itself).
         let write_error_banner = Self::write_error_banner();
 
-        let content = column![tab_bar, write_error_banner, filter_bar, body]
+        // ── Bottom bar: pagination + pause + search ───────────────
+        let bottom_bar = self.bottom_bar();
+
+        let content = column![tab_bar, write_error_banner, body, bottom_bar]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -538,12 +543,54 @@ impl LogsState {
         .into()
     }
 
-    /// Render the shared filter bar: role picklist, workspace picklist, search input.
+    /// Render the bottom bar: pause button, pagination controls, and the
+    /// search input. Pagination and search are bound to the active tab; pause
+    /// is a single global control that works from every tab.
     #[allow(clippy::too_many_lines)]
-    fn shared_filter_bar(&self) -> Element<'_, LogMessage> {
+    fn bottom_bar(&self) -> Element<'_, LogMessage> {
+        let (page, total_pages) = match self.tab_data(self.active_tab) {
+            Some(d) => (d.pagination.page, d.pagination.total_pages()),
+            None => (
+                self.tool_failures_state.page(),
+                self.tool_failures_state.total_pages(),
+            ),
+        };
+
+        // Pagination cluster — hidden entirely when there are no pages so the
+        // "Page X of Y" indicator never shows an invalid page.
+        let pagination_cluster: Element<'_, LogMessage> = if total_pages == 0 {
+            Space::new().width(0).into()
+        } else {
+            let prev_button = button(text("← Prev").size(12))
+                .style(theme::button_text)
+                .on_press_maybe(if page > 0 {
+                    Some(LogMessage::PrevPage)
+                } else {
+                    None
+                });
+            let next_button = button(text("Next →").size(12))
+                .style(theme::button_text)
+                .on_press_maybe(if page + 1 < total_pages {
+                    Some(LogMessage::NextPage)
+                } else {
+                    None
+                });
+            row![
+                prev_button,
+                Space::new().width(8),
+                text(format!("Page {} of {}", page + 1, total_pages))
+                    .size(12)
+                    .color(theme::TEXT_MUTED),
+                Space::new().width(8),
+                next_button,
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        };
+
         let search_input: Element<'_, LogMessage> = if self.focus_search {
             container(
-                text_input("search", &self.search_filter)
+                text_input("search", self.active_search())
                     .on_input(LogMessage::SearchInput)
                     .style(super::widgets::text_input_style)
                     .size(13)
@@ -554,43 +601,13 @@ impl LogsState {
             .style(|_| theme::container_style(iced::Color::TRANSPARENT, 4.0, 1.0, theme::ACCENT))
             .into()
         } else {
-            text_input("search", &self.search_filter)
+            text_input("search", self.active_search())
                 .on_input(LogMessage::SearchInput)
                 .style(super::widgets::text_input_style)
                 .size(13)
                 .padding(4)
                 .width(Length::Fixed(160.0))
                 .into()
-        };
-
-        let role_pick_list = {
-            let role_selected = self
-                .role_options
-                .iter()
-                .find(|o| o.value == self.role_filter)
-                .cloned();
-            pick_list(self.role_options.as_slice(), role_selected, |opt| {
-                LogMessage::RoleFilterInput(opt.value)
-            })
-            .placeholder("Role")
-            .style(super::widgets::pick_list_style)
-            .padding([4, 8])
-            .width(Length::Fixed(100.0))
-        };
-
-        let workspace_pick_list = {
-            let ws_selected = self
-                .workspace_options
-                .iter()
-                .find(|o| o.value == self.workspace_filter)
-                .cloned();
-            pick_list(self.workspace_options.as_slice(), ws_selected, |opt| {
-                LogMessage::WorkspaceInput(opt.value)
-            })
-            .placeholder("Workspace")
-            .style(super::widgets::pick_list_style)
-            .padding([4, 8])
-            .width(Length::Fixed(120.0))
         };
 
         let search_group = row![
@@ -625,42 +642,44 @@ impl LogsState {
             .delay(Duration::from_millis(400))
         };
 
-        let filter_row = row![
-            // Pause only visible on AllLogs tab
-            match self.active_tab {
-                LogsTab::AllLogs => {
-                    iced::Element::<'_, LogMessage>::from(pause_button)
-                }
-                _ => iced::Element::<'_, LogMessage>::from(Space::new().width(0)),
-            },
-            Space::new().width(Length::Fill),
-            role_pick_list,
-            Space::new().width(Length::Fill),
-            workspace_pick_list,
+        let bottom_row = row![
+            pause_button,
+            Space::new().width(12),
+            pagination_cluster,
             Space::new().width(Length::Fill),
             search_group,
         ]
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
-        container(filter_row)
+        container(bottom_row)
             .width(Length::Fill)
             .padding([8, 24])
             .style(theme::surface_container_style)
             .into()
     }
 
-    /// Render the Logs/Issues tab content (entries list + pagination).
+    /// Render the Logs/Issues tab content (entries list). Pagination lives in
+    /// the shared bottom bar.
     fn logs_view(&self) -> Element<'_, LogMessage> {
+        // Only the log tabs reach this view (the caller routes Tool Failures
+        // separately); fall back to the Tool Failures view rather than panic
+        // if a future caller misroutes.
+        let Some(data) = self.tab_data(self.active_tab) else {
+            return self
+                .tool_failures_state
+                .view()
+                .map(LogMessage::ToolFailures);
+        };
         let mut content = Column::new();
 
         // Error display
-        content = widgets::push_error_banner(content, self.load_state.error());
+        content = widgets::push_error_banner(content, data.load_state.error());
 
         // Log entries
-        if self.load_state.loading() && !self.load_state.has_loaded() {
+        if data.load_state.loading() && !data.load_state.has_loaded() {
             content = content.push(widgets::loading_text());
-        } else if self.entries.is_empty() {
+        } else if data.entries.is_empty() {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::activity::<iced::Theme, iced::Renderer>(),
                 "No log entries",
@@ -671,7 +690,7 @@ impl LogsState {
                 let newest_ts = self.newest_entry_timestamp.clone();
                 let scroll = scrollable(
                     Column::with_children(
-                        self.entries
+                        data.entries
                             .iter()
                             .map(|entry| {
                                 let is_newest = newest_ts.as_deref() == Some(&entry.timestamp);
@@ -699,14 +718,6 @@ impl LogsState {
 
             content = content.push(entries_view);
         }
-
-        // Pagination bar
-        content = content.push(widgets::pagination_bar(
-            self.pagination.page,
-            self.pagination.total_pages(),
-            LogMessage::PrevPage,
-            LogMessage::NextPage,
-        ));
 
         let base = container(content)
             .width(Length::Fill)
@@ -788,10 +799,7 @@ impl LogsState {
                 spans.push(
                     Span::new(format!("{key}: {val_str}"))
                         .size(10)
-                        .color(theme::TEXT_MUTED)
-                        .background(theme::BG_ELEVATED)
-                        .border(iced::border::rounded(4))
-                        .padding([1, 4]),
+                        .color(theme::TEXT_SECONDARY),
                 );
             }
         }
