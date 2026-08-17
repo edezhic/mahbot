@@ -3793,11 +3793,7 @@ fn run_faph_phase_inner() -> serde_json::Value {
         // line keeps the multi-hour phase observable while it runs.  Corpus
         // files vary widely in length (long speech recordings to short noise
         // clips), so the cadence is time-based, not file-count-based.
-        // Skip the zero-state line: if the first file(s) fail to decode, the
-        // 60 s cadence would otherwise emit "0 files / 0.00 h / 0.0x realtime".
-        // The timer is not reset on a skipped line, so the first successful
-        // feed prints immediately instead of waiting another 60 s.
-        if files_fed > 0 && last_progress_print.elapsed() >= Duration::from_mins(1) {
+        if last_progress_print.elapsed() >= Duration::from_mins(1) {
             let wall_secs = phase_start.elapsed().as_secs_f64();
             eprintln!(
                 "  FAPH progress: {files_fed}/{} files, {:.2} h audio, {:.0} s wall \

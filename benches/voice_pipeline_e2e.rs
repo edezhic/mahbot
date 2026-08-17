@@ -106,11 +106,8 @@ fn main() {
     let runtime = tokio::runtime::Runtime::new()
         .expect("failed to create tokio runtime for benchmark timeout");
 
-    // 3. Run benchmark with a per-mode timeout.
-    //    Standard runs: 30 minutes (fast-fail hang guard — a non-hung run
-    //    completes in ~9 min).  FAPH runs (MAHBOT_FAPH=1): 300 minutes — the
-    //    phase feeds the full 5.99 h corpus at ~6-8× real-time (measured ~47
-    //    min FAPH / ~54 min total), so 300 min is an abort net, not a budget.
+    // 3. Run benchmark with a per-mode timeout — 30 min standard / 300 min
+    //    when MAHBOT_FAPH=1; rationale in the module doc.
     // NOTE: spawn_blocking tasks are NOT cancelable at the Rust level.
     // When the timeout fires, tokio returns Err(Elapsed) but the kernel
     // threads (ONNX evaluations) continue executing.  We call
