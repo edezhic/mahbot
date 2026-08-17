@@ -1628,6 +1628,18 @@ fn telegram_msg(user_name: &str, content: &str) -> ChannelMessage {
     }
 }
 
+fn voice_msg(user_name: &str, content: &str) -> ChannelMessage {
+    ChannelMessage {
+        user_name: user_name.to_string(),
+        reply_target: String::new(),
+        content: content.to_string(),
+        channel: "voice".to_string(),
+        workspace: "test".to_string(),
+        optimistic_id: None,
+        callback_query_id: None,
+    }
+}
+
 // ── Guard tests: early-return conditions ─────────────────────────────
 
 /// Per-case setup for `assert_mirror_skips`, applied after the shared
@@ -1689,7 +1701,7 @@ async fn mirror_skips_guard_cases() {
     assert_mirror_skips(
         MirrorSkipSetup::BoundTo("skip_telegram", "target_non_gui"),
         &telegram_msg("skip_telegram", "hello from telegram"),
-        "non-GUI source should not send",
+        "Telegram-originated messages should not send (voice is the only non-GUI source accepted)",
     )
     .await;
     assert_mirror_skips(
@@ -1750,6 +1762,30 @@ async fn sends_blockquote_to_single_binding() {
     assert_eq!(
         our_msgs[0].content,
         "<blockquote>\nHello, world!\n</blockquote>"
+    );
+    assert!(our_msgs[0].reply_markup.is_none());
+}
+
+#[tokio::test]
+async fn mirrors_voice_transcript_to_telegram() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding("voice_user", "unique_voice", "voice_user").await;
+
+    // Voice-originated messages (GUI mic-button recording / wake-word
+    // command) must mirror exactly like GUI text: same recipient bindings,
+    // same blockquote format, no audio payload.
+    let msg = voice_msg("voice_user", "Record this voice note");
+    super::mirror_gui_message_to_telegram(&msg).await;
+
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "unique_voice")
+        .collect();
+    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    assert_eq!(
+        our_msgs[0].content,
+        "<blockquote>\nRecord this voice note\n</blockquote>"
     );
     assert!(our_msgs[0].reply_markup.is_none());
 }

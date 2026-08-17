@@ -2030,9 +2030,25 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
             &timestamp,
         );
     } else {
-        crate::channels::broadcast_and_persist_user_message(
-            user_name, "voice", transcript, workspace,
-        )
+        crate::channels::broadcast_and_persist_user_message(user_name, "voice", transcript, workspace)
+            .await;
+
+        // Mirror the transcription to the user's Telegram bindings as text —
+        // exactly the content persisted above (the same message text stored
+        // and shown in the GUI chat), so the full chat history stays mirrored
+        // regardless of how the message was produced. Voice is a strictly
+        // local source that can never originate from Telegram, so accepting
+        // it cannot create an echo loop. Without an active user or Telegram
+        // binding this silently no-ops (matches the GUI text mirror rule).
+        crate::channels::mirror_gui_message_to_telegram(&crate::ChannelMessage {
+            user_name: user_name.to_string(),
+            reply_target: String::new(),
+            content: transcript.to_string(),
+            channel: "voice".to_string(),
+            workspace: workspace.to_string(),
+            optimistic_id: None,
+            callback_query_id: None,
+        })
         .await;
     }
 }

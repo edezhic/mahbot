@@ -2348,14 +2348,17 @@ pub async fn send_direct(
     channel.send(&reply).await
 }
 
-/// Mirror a GUI user's message to their Telegram chats as a blockquote, so conversation history is readable from both surfaces.
+/// Mirror a local user's message to their Telegram chats as a blockquote, so conversation history is readable from both surfaces.
 ///
 /// This should be called before enrichment to preserve the original
 /// user-typed text (pre-link-summary, pre-transcription).
 ///
 /// # Guards
 ///
-/// * Only mirrors messages where `channel == "gui"` (prevents echo loops).
+/// * Only mirrors messages where `channel == "gui"` or `channel == "voice"`
+///   (prevents echo loops: voice is a strictly local source that can never
+///   originate from Telegram, so accepting it cannot create feedback;
+///   Telegram-originated messages remain excluded).
 /// * Skips empty or whitespace-only messages.
 /// * Silently returns when no Telegram channel is registered or the user has no
 ///   Telegram binding with a `reply_target` (no error, no crash).
@@ -2370,8 +2373,11 @@ pub async fn send_direct(
 /// so raw marker syntax does not appear in the quote; purely media-only
 /// messages are skipped entirely.
 pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
-    // Guard: only mirror GUI-originated user messages (prevents echo loops).
-    if msg.channel != "gui" {
+    // Guard: only mirror local-originated user messages — GUI text and local
+    // voice transcripts (prevents echo loops: voice is a strictly local source
+    // that can never originate from Telegram, so accepting it cannot create
+    // feedback; Telegram-originated messages remain excluded).
+    if msg.channel != "gui" && msg.channel != "voice" {
         return;
     }
 
