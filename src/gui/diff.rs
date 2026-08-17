@@ -5,7 +5,7 @@
 //! Files are parsed in their entirety (old version from HEAD, new version from
 //! disk) for correct multi-line token coloring.
 //!
-//! The page layout splits into a fixed-width directory tree sidebar (left)
+//! The page layout splits into an auto-sizing directory tree sidebar (left)
 //! and a scrollable diff panel (right, filling the remaining width). Click a
 //! file in the tree to filter the diff to just that file; click again to show
 //! all files.
@@ -874,7 +874,63 @@ impl DiffState {
             .enumerate()
             .map(|(i, n)| self.render_tree_node(n, 0, 0, i == count - 1))
             .collect();
-        widgets::build_tree_panel(&self.file_tree, elements, |viewport| {
+        // Natural width of every rendered row, in render order, for the
+        // auto-sizing tree panel. Replicates the exact row composition:
+        // guide (depth*2 box-drawing chars at 14px) + lucide icon
+        // (15px dirs / 14px files) + 4px gap + name at 14px, plus the ±
+        // change counts at 10px with a 6px trailing gap on file rows.
+        let row_widths = widgets::collect_tree_row_widths(
+            &self.file_tree.nodes,
+            &self.file_tree.expanded_dirs,
+            |node, depth| {
+                let guide_chars = depth * 2;
+                if node.is_dir {
+                    widgets::tree_row_natural_width(
+                        guide_chars,
+                        widgets::TREE_ICON_SIZE,
+                        &node.name,
+                        widgets::TREE_FONT_SIZE,
+                        None,
+                        None,
+                    )
+                } else {
+                    // File rows always render a counts slot (empty when the
+                    // file has no changes or is not in the diff list) plus a
+                    // 6px trailing gap — replicate that exactly.
+                    let counts: Option<(String, String)> = Some(
+                        match self.diff_files.iter().find(|f| f.path == node.full_path) {
+                            Some(f) if f.content == DiffContent::Binary => {
+                                ("binary".to_string(), String::new())
+                            }
+                            Some(f) if f.add_count > 0 || f.remove_count > 0 => (
+                                if f.add_count > 0 {
+                                    format!("+{}", f.add_count)
+                                } else {
+                                    String::new()
+                                },
+                                if f.remove_count > 0 {
+                                    format!("-{}", f.remove_count)
+                                } else {
+                                    String::new()
+                                },
+                            ),
+                            _ => (String::new(), String::new()),
+                        },
+                    );
+                    widgets::tree_row_natural_width(
+                        guide_chars,
+                        widgets::TREE_FONT_SIZE,
+                        &node.name,
+                        widgets::TREE_FONT_SIZE,
+                        None,
+                        counts
+                            .as_ref()
+                            .map(|(add, rem)| (add.as_str(), rem.as_str())),
+                    )
+                }
+            },
+        );
+        widgets::build_tree_panel(&self.file_tree, elements, &row_widths, |viewport| {
             DiffMessage::TreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
         })
     }

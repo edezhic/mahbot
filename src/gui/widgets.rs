@@ -754,6 +754,169 @@ pub const TREE_FONT_SIZE: f32 = 14.0;
 /// at the same nominal point size).
 pub const TREE_ICON_SIZE: f32 = 15.0;
 
+/// Minimum width of the auto-sizing file-tree panel — the tree never gets
+/// narrower than this (matches the previous fixed 260px width).
+pub const TREE_MIN_WIDTH: f32 = 260.0;
+
+/// Maximum width cap of the auto-sizing file-tree panel. The cap guarantees
+/// sibling panels (editor content, diff content) keep a sane minimum width
+/// at the smallest supported window size.
+pub const TREE_MAX_WIDTH: f32 = 400.0;
+
+/// Right-side room reserved in the auto-sized panel width so the 6px overlay
+/// scrollbar (see [`super::theme::thin_scrollbar`]) never covers the widest
+/// visible row's content: 6px scrollbar + 4px breathing room.
+pub const TREE_SCROLLBAR_ALLOWANCE: f32 = 10.0;
+
+/// Horizontal padding of every tree row (`.padding([0, 8])` in the editor
+/// and diff row renderers). The panel width computation adds both sides.
+pub const TREE_ROW_H_PADDING: f32 = 8.0;
+
+/// Glyph advance of JetBrains Mono as a fraction of em. Every glyph the tree
+/// rows render — ASCII, box-drawing (`│ ├ └`), `⚠`, `…`, digits — measures
+/// exactly 0.6em in both the Regular and Bold faces (verified from the TTFs
+/// in `src/gui/`), so `chars × size × 0.6` is an exact width, not an
+/// estimate. The dashboard default font is JetBrains Mono
+/// (see [`super::JETBRAINS_MONO`]), so `text()` widgets without an explicit
+/// font (diff ± counts, `[⚠]` suffixes) use it too.
+pub const JETBRAINS_MONO_ADVANCE: f32 = 0.6;
+
+/// Glyph advance of the lucide icon font as a fraction of em (verified from
+/// the lucide TTF). Every icon in the tree measures exactly 1.0em, so an
+/// icon rendered via `.size(s)` is `s` px wide.
+pub const LUCIDE_ADVANCE: f32 = 1.0;
+
+/// Width in px of `chars` glyphs of JetBrains Mono at `size` px.
+///
+/// Exact for every glyph the tree renders — see [`JETBRAINS_MONO_ADVANCE`].
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // usize glyph count → px width
+pub fn mono_text_width(chars: usize, size: f32) -> f32 {
+    chars as f32 * size * JETBRAINS_MONO_ADVANCE
+}
+
+/// Natural content width of a rendered tree row, excluding the row's
+/// horizontal padding (added by [`tree_panel_width`]).
+///
+/// Replicates the exact row composition in the editor and diff renderers:
+/// `guide_chars` box-drawing guide glyphs (14px) + a lucide icon at
+/// `icon_size` px + a 4px gap + the name label at `name_size` px, an optional
+/// `name_suffix` segment preceded by another 4px gap (editor error file rows
+/// render `[⚠]` at 11px), and — for diff file rows — the ± change counts at
+/// 10px followed by a 6px trailing gap.
+///
+/// `counts` is `Some((add, remove))` for diff file rows (either string may be
+/// empty; the 6px trailing gap is part of the row either way) and `None` for
+/// every other row type. When both strings are non-empty they render as
+/// `"{add} {remove}"` — one separating space at 10px.
+///
+/// JetBrains Mono is monospace with a single advance for all weights, so the
+/// bold name of selected rows and the regular name of unselected rows measure
+/// identically.
+#[must_use]
+pub fn tree_row_natural_width(
+    guide_chars: usize,
+    icon_size: f32,
+    name: &str,
+    name_size: f32,
+    name_suffix: Option<(&str, f32)>,
+    counts: Option<(&str, &str)>,
+) -> f32 {
+    let mut w = mono_text_width(guide_chars, TREE_FONT_SIZE)
+        + icon_size * LUCIDE_ADVANCE
+        + 4.0
+        + mono_text_width(name.chars().count(), name_size);
+    if let Some((suffix, size)) = name_suffix {
+        w += 4.0 + mono_text_width(suffix.chars().count(), size);
+    }
+    if let Some((add, rem)) = counts {
+        let counts_chars = if add.is_empty() {
+            rem.chars().count()
+        } else if rem.is_empty() {
+            add.chars().count()
+        } else {
+            add.chars().count() + 1 + rem.chars().count()
+        };
+        w += mono_text_width(counts_chars, 10.0) + 6.0;
+    }
+    w
+}
+
+/// Collect the natural content width of every rendered tree row, in render
+/// order (one entry per row — the same DFS order as the recursive node
+/// renderers, which may nest multiple rows per root element).
+///
+/// Mirrors the render walk: a directory row is followed by its children's
+/// rows when the directory is expanded. `row_width` computes one row's
+/// width from the node and its nesting `depth` (0 = root).
+pub fn collect_tree_row_widths(
+    nodes: &[TreeNode],
+    expanded: &HashSet<String>,
+    row_width: impl Fn(&TreeNode, usize) -> f32,
+) -> Vec<f32> {
+    fn walk(
+        nodes: &[TreeNode],
+        expanded: &HashSet<String>,
+        row_width: &impl Fn(&TreeNode, usize) -> f32,
+        depth: usize,
+        out: &mut Vec<f32>,
+    ) {
+        for node in nodes {
+            out.push(row_width(node, depth));
+            if node.is_dir && expanded.contains(&node.full_path) {
+                walk(&node.children, expanded, row_width, depth + 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(nodes, expanded, &row_width, 0, &mut out);
+    out
+}
+
+/// Compute the auto-sized width of the tree panel from the natural content
+/// width of every rendered row (in render order — see
+/// [`collect_tree_row_widths`]).
+///
+/// Only rows currently visible in the viewport are measured. The visible
+/// range is derived from [`FileTree::scroll_y`] / [`FileTree::viewport_h`]
+/// with [`ESTIMATED_TREE_ROW_HEIGHT`] row spacing, extended by one row on
+/// each side to absorb height-estimate drift (over-measuring is safe; the
+/// result is clamped either way).
+///
+/// Before the first scroll event — and for trees whose content fits without
+/// scrolling, where Iced never fires `on_scroll` (see
+/// [`FileTree::viewport_h`]) — `viewport_h` is `None` and all rows are
+/// measured: the documented fallback.
+///
+/// The result is the widest measured row's natural content width plus the
+/// row's horizontal padding on both sides and
+/// [`TREE_SCROLLBAR_ALLOWANCE`], clamped to
+/// [`TREE_MIN_WIDTH`]..=[`TREE_MAX_WIDTH`]. A tree whose rows all fit at the
+/// minimum width stays at [`TREE_MIN_WIDTH`].
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // viewport px → row index
+pub fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
+    let widest = match file_tree.viewport_h {
+        Some(viewport_h) if viewport_h > 0.0 => {
+            let row_h = ESTIMATED_TREE_ROW_HEIGHT;
+            let first = (file_tree.scroll_y / row_h).floor().max(0.0) as usize;
+            let last = ((file_tree.scroll_y + viewport_h) / row_h).ceil() as usize + 1;
+            row_widths
+                .iter()
+                .enumerate()
+                .skip(first.saturating_sub(1))
+                .take(last - first + 2)
+                .map(|(_, w)| *w)
+                .fold(0.0f32, f32::max)
+        }
+        // Viewport unknown — measure everything (first frame / non-scrolling
+        // tree, where every row is visible anyway).
+        _ => row_widths.iter().copied().fold(0.0f32, f32::max),
+    };
+    (widest + 2.0 * TREE_ROW_H_PADDING + TREE_SCROLLBAR_ALLOWANCE)
+        .clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH)
+}
+
 /// Controls whether [`scroll_to_tree_focus`] snaps to the focused row or
 /// uses viewport-aware scroll-into-view logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,9 +1024,15 @@ fn absolute_scroll_to<Message: 'static>(file_tree: &mut FileTree, y: f32) -> Tas
 
 /// Build a file-tree panel widget.
 ///
-/// Renders a scrollable, fixed-width column wrapping the pre-built
-/// `tree_element` rows. A focus border is applied when `file_tree.tree_focused`
-/// is true.
+/// Renders a scrollable, auto-width column wrapping the pre-built
+/// `tree_rows` elements. The panel width adapts to the widest currently
+/// visible row (see [`tree_panel_width`]); a focus border is applied when
+/// `file_tree.tree_focused` is true.
+///
+/// `row_widths` holds the natural content width of every rendered row in
+/// render order — one entry per row, in the same DFS order as the recursive
+/// node renderers (which may nest multiple rows per root element). See
+/// [`collect_tree_row_widths`].
 ///
 /// `on_scroll` is attached to the inner [`widget::scrollable()`] via
 /// `on_scroll` and fires whenever the viewport changes
@@ -873,8 +1042,11 @@ fn absolute_scroll_to<Message: 'static>(file_tree: &mut FileTree, y: f32) -> Tas
 pub fn build_tree_panel<'a, Message: 'a>(
     file_tree: &'a FileTree,
     tree_rows: Vec<Element<'a, Message>>,
+    row_widths: &[f32],
     on_scroll: impl Fn(scrollable::Viewport) -> Message + 'a,
 ) -> Element<'a, Message> {
+    let panel_width = tree_panel_width(file_tree, row_widths);
+
     let tree_body = widget::scrollable(column(tree_rows).spacing(0))
         .id(file_tree.tree_scroll_id.clone())
         .on_scroll(on_scroll)
@@ -884,7 +1056,7 @@ pub fn build_tree_panel<'a, Message: 'a>(
         .style(theme::scrollbar_style);
 
     let tree_inner: Element<'_, Message> = container(tree_body)
-        .width(Length::Fixed(260.0))
+        .width(Length::Fixed(panel_width))
         .height(Length::Fill)
         .style(theme::surface_container_style)
         .into();
@@ -1410,6 +1582,237 @@ mod tests {
     fn guide_prefix_depth_overflow_debug() {
         // debug_assert fires at depth >= 64 in debug builds.
         let _ = tree_guide_prefix(0, 64, false);
+    }
+
+    // ── Auto-sizing tree panel width tests ───────────────────────────
+    //
+    // These are pure-arithmetic tests of the geometry constants (0.6em mono
+    // advance, 1.0em lucide, 4px gaps, 10px counts, 6px trailing gap) — they
+    // do not touch the global font system, so the expected values are exact.
+
+    #[test]
+    fn mono_text_width_uses_06em_advance() {
+        assert!(close(mono_text_width(0, 14.0), 0.0));
+        assert!(close(mono_text_width(1, 14.0), 8.4));
+        assert!(close(mono_text_width(10, 14.0), 84.0));
+        // "binary" count label at 10px.
+        assert!(close(mono_text_width(6, 10.0), 36.0));
+    }
+
+    #[test]
+    fn tree_row_natural_width_plain_file_row() {
+        // Depth 1 (guide 2 chars) + 14px icon + 4px gap + 11-char name.
+        let w =
+            tree_row_natural_width(2, TREE_FONT_SIZE, "src/main.rs", TREE_FONT_SIZE, None, None);
+        assert!(close(w, 127.2));
+    }
+
+    #[test]
+    fn tree_row_natural_width_dir_loading_suffix() {
+        // Root dir row: 15px icon + 4px gap + "src  Loading…" (13 glyphs).
+        let w = tree_row_natural_width(
+            0,
+            TREE_ICON_SIZE,
+            "src  Loading…",
+            TREE_FONT_SIZE,
+            None,
+            None,
+        );
+        assert!(close(w, 128.2));
+    }
+
+    #[test]
+    fn tree_row_natural_width_error_file_suffix() {
+        // Error file row: name + 4px gap + "[⚠]" at 11px.
+        let w = tree_row_natural_width(
+            0,
+            TREE_FONT_SIZE,
+            "broken.txt",
+            TREE_FONT_SIZE,
+            Some(("[⚠]", 11.0)),
+            None,
+        );
+        assert!(close(w, 125.8));
+    }
+
+    #[test]
+    fn tree_row_natural_width_diff_counts() {
+        // Diff file row: name + "+123 -45" at 10px + 6px trailing gap.
+        let w = tree_row_natural_width(
+            0,
+            TREE_FONT_SIZE,
+            "lib.rs",
+            TREE_FONT_SIZE,
+            None,
+            Some(("+123", "-45")),
+        );
+        assert!(close(w, 122.4));
+    }
+
+    #[test]
+    fn tree_row_natural_width_diff_binary_count() {
+        // 8-char name + "binary" at 10px + 6px trailing gap.
+        let w = tree_row_natural_width(
+            0,
+            TREE_FONT_SIZE,
+            "data.bin",
+            TREE_FONT_SIZE,
+            None,
+            Some(("binary", "")),
+        );
+        assert!(close(w, 127.2));
+    }
+
+    /// Epsilon-equality for the pure-arithmetic width tests (0.001px is far
+    /// below any visible difference; the formulas use `f32` accumulation).
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.001
+    }
+
+    /// Build a FileTree with a known viewport for panel-width tests.
+    fn tree_with_panel_viewport(scroll_y: f32, viewport_h: Option<f32>) -> FileTree {
+        let mut tree = FileTree::new(iced::widget::Id::new("width_test"));
+        tree.scroll_y = scroll_y;
+        tree.viewport_h = viewport_h;
+        tree
+    }
+
+    #[test]
+    fn tree_panel_width_clamps_to_minimum() {
+        // Short rows → widest 68.4 + 26 = 94.4 < 260 → stays at minimum.
+        let tree = tree_with_panel_viewport(0.0, Some(400.0));
+        let widths = vec![68.4, 100.0, 50.0];
+        assert!(close(tree_panel_width(&tree, &widths), TREE_MIN_WIDTH));
+    }
+
+    #[test]
+    fn tree_panel_width_clamps_to_maximum() {
+        // 50-char name → natural 438 → 464 → clamped to the 400px cap.
+        let tree = tree_with_panel_viewport(0.0, Some(400.0));
+        let long_name = "x".repeat(50);
+        let widths = vec![tree_row_natural_width(
+            0,
+            TREE_FONT_SIZE,
+            &long_name,
+            TREE_FONT_SIZE,
+            None,
+            None,
+        )];
+        assert!(close(tree_panel_width(&tree, &widths), TREE_MAX_WIDTH));
+    }
+
+    #[test]
+    fn tree_panel_width_scales_with_widest_row() {
+        // 27-char name → 261.6 natural → 287.6 panel (within the bounds).
+        let tree = tree_with_panel_viewport(0.0, Some(400.0));
+        let wide = tree_row_natural_width(
+            2,
+            TREE_FONT_SIZE,
+            "some_really_long_file_name.rs",
+            TREE_FONT_SIZE,
+            None,
+            None,
+        );
+        let widths = vec![68.4, wide, 50.0];
+        assert!(close(
+            tree_panel_width(&tree, &widths),
+            wide + 2.0 * TREE_ROW_H_PADDING + TREE_SCROLLBAR_ALLOWANCE
+        ));
+    }
+
+    #[test]
+    fn tree_panel_width_measures_all_rows_without_viewport() {
+        // viewport_h None (first frame / non-scrolling fallback): all rows count.
+        let tree = tree_with_panel_viewport(0.0, None);
+        let long_name = "y".repeat(40);
+        let wide =
+            tree_row_natural_width(0, TREE_FONT_SIZE, &long_name, TREE_FONT_SIZE, None, None);
+        let widths = vec![50.0, wide, 60.0];
+        assert!(close(
+            tree_panel_width(&tree, &widths),
+            (wide + 2.0 * TREE_ROW_H_PADDING + TREE_SCROLLBAR_ALLOWANCE)
+                .clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH)
+        ));
+    }
+
+    #[test]
+    fn tree_panel_width_filters_out_of_viewport_rows() {
+        // Viewport 200px tall at scroll 0 → rows ~0..14 measured.
+        let tree = tree_with_panel_viewport(0.0, Some(200.0));
+        let mut widths = vec![68.4; 50];
+        widths[40] = 500.0; // below the fold → must not inflate the width
+        assert!(close(tree_panel_width(&tree, &widths), TREE_MIN_WIDTH));
+        widths[2] = 500.0; // visible → inflates to the cap
+        assert!(close(tree_panel_width(&tree, &widths), TREE_MAX_WIDTH));
+    }
+
+    #[test]
+    fn tree_panel_width_scrolled_viewport_measures_mid_rows() {
+        // scroll_y 400, viewport 200 → rows ~20..35 measured.
+        let tree = tree_with_panel_viewport(400.0, Some(200.0));
+        let mut widths = vec![68.4; 60];
+        widths[10] = 500.0; // above the fold → ignored
+        assert!(close(tree_panel_width(&tree, &widths), TREE_MIN_WIDTH));
+        widths[30] = 500.0; // visible → inflates to the cap
+        assert!(close(tree_panel_width(&tree, &widths), TREE_MAX_WIDTH));
+    }
+
+    #[test]
+    fn tree_panel_width_empty_tree_stays_at_minimum() {
+        let tree = tree_with_panel_viewport(0.0, None);
+        assert!(close(tree_panel_width(&tree, &[]), TREE_MIN_WIDTH));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)] // test-only encoding closure (depth, name length)
+    fn collect_tree_row_widths_mirrors_render_order() {
+        // src (dir, expanded) → src/main.rs, src/lib.rs; Cargo.toml at root.
+        let mut tree = FileTree::new(iced::widget::Id::new("w"));
+        tree.nodes = vec![
+            TreeNode {
+                name: "src".into(),
+                full_path: "src".into(),
+                is_dir: true,
+                children: vec![
+                    TreeNode {
+                        name: "main.rs".into(),
+                        full_path: "src/main.rs".into(),
+                        is_dir: false,
+                        children: vec![],
+                        error: None,
+                    },
+                    TreeNode {
+                        name: "lib.rs".into(),
+                        full_path: "src/lib.rs".into(),
+                        is_dir: false,
+                        children: vec![],
+                        error: None,
+                    },
+                ],
+                error: None,
+            },
+            TreeNode {
+                name: "Cargo.toml".into(),
+                full_path: "Cargo.toml".into(),
+                is_dir: false,
+                children: vec![],
+                error: None,
+            },
+        ];
+        tree.expanded_dirs.insert("src".to_string());
+
+        // Closure encodes depth and name length so the order is observable.
+        let widths = collect_tree_row_widths(&tree.nodes, &tree.expanded_dirs, |node, depth| {
+            depth as f32 * 10.0 + node.name.chars().count() as f32
+        });
+        assert_eq!(widths, vec![3.0, 17.0, 16.0, 10.0]);
+
+        // Collapsed src → only the two root rows remain.
+        tree.expanded_dirs.clear();
+        let widths = collect_tree_row_widths(&tree.nodes, &tree.expanded_dirs, |node, depth| {
+            depth as f32 * 10.0 + node.name.chars().count() as f32
+        });
+        assert_eq!(widths, vec![3.0, 10.0]);
     }
 
     // ── expand_dir_and_focus_first_child / collapse_dir_and_keep_focus tests ──

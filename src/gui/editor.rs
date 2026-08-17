@@ -4652,7 +4652,49 @@ impl EditorState {
             .enumerate()
             .map(|(i, n)| self.render_tree_node(n, 0, 0, i == self.file_tree.nodes.len() - 1))
             .collect();
-        let panel = widgets::build_tree_panel(&self.file_tree, elements, |viewport| {
+        // Natural width of every rendered row, in render order, for the
+        // auto-sizing tree panel. Replicates the exact row composition:
+        // guide (depth*2 box-drawing chars at 14px) + lucide icon
+        // (15px dirs / 14px files) + 4px gap + name label at 14px, with the
+        // loading/error suffixes and `[⚠]` error marker. The rename
+        // text-input mode measures the would-be label so the tree does not
+        // snap to its cap while renaming.
+        let row_widths = widgets::collect_tree_row_widths(
+            &self.file_tree.nodes,
+            &self.file_tree.expanded_dirs,
+            |node, depth| {
+                let guide_chars = depth * 2;
+                if node.is_dir {
+                    let label: std::borrow::Cow<'_, str> =
+                        if self.loading_dirs.contains(&node.full_path) {
+                            std::borrow::Cow::Owned(format!("{}  Loading…", node.name))
+                        } else if let Some(ref err) = node.error {
+                            std::borrow::Cow::Owned(format!("{} [⚠ {err}]", node.name))
+                        } else {
+                            std::borrow::Cow::Borrowed(&node.name)
+                        };
+                    widgets::tree_row_natural_width(
+                        guide_chars,
+                        widgets::TREE_ICON_SIZE,
+                        &label,
+                        widgets::TREE_FONT_SIZE,
+                        None,
+                        None,
+                    )
+                } else {
+                    let suffix = node.error.as_ref().map(|_| ("[⚠]", 11.0));
+                    widgets::tree_row_natural_width(
+                        guide_chars,
+                        widgets::TREE_FONT_SIZE,
+                        &node.name,
+                        widgets::TREE_FONT_SIZE,
+                        suffix,
+                        None,
+                    )
+                }
+            },
+        );
+        let panel = widgets::build_tree_panel(&self.file_tree, elements, &row_widths, |viewport| {
             EditorMessage::TreeScrolled(viewport.absolute_offset().y, viewport.bounds().height)
         });
 
