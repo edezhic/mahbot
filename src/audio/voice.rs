@@ -3940,9 +3940,9 @@ pub fn get_enrolled_phrase() -> Option<String> {
 /// CONFIG.
 ///
 /// The CONFIG update ensures GUI snapshot readers / pipeline restart see the
-/// latest enrollment.  `save_and_reload` skips `wake_word_templates` (it's
-/// excluded from the write loop), so this update is about cross-session
-/// visibility.
+/// latest enrollment.  The per-field persist paths never write
+/// `wake_word_templates` (it's structurally excluded), so this update is
+/// about cross-session visibility.
 ///
 /// Warnings are logged on failure. Returns `true` if both the DB write and the
 /// CONFIG update succeeded. Callers use the return value to gate their own

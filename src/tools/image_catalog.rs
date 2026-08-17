@@ -217,9 +217,11 @@ pub async fn validate_image_model(model: &str) -> anyhow::Result<()> {
     validate_image_model_for_endpoint(model, &endpoint).await
 }
 
-/// Like [`validate_image_model`], but against the catalog for `endpoint`
-/// rather than the currently configured one — the settings save path uses
-/// this when a save may switch providers.
+/// Like [`validate_image_model`], but against the catalog for the explicit
+/// `endpoint` rather than the currently committed one — the settings page
+/// uses this so a model edit is checked against the endpoint it will run
+/// under (the model picker validates additions against the staged endpoint;
+/// the active-model persist against the committed one).
 pub(crate) async fn validate_image_model_for_endpoint(
     model: &str,
     endpoint: &str,

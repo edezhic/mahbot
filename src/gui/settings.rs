@@ -1,8 +1,10 @@
 //! Settings page — dynamic configuration editor.
 //!
 //! Reads the current config snapshot from [`crate::config::CONFIG`],
-//! presents editable fields organised in sections, and saves changes
-//! via [`crate::config::save_and_reload`].
+//! presents editable fields organised in sections, and persists every change
+//! immediately when the value settles (debounced text inputs, immediate
+//! toggles/pickers, release-settled slider) via the per-field persistence
+//! functions in [`crate::config`].
 //!
 //! Also manages workspaces and users (formerly separate pages), with
 //! modal dialogs for add operations.
@@ -23,7 +25,7 @@ use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use super::theme;
@@ -86,6 +88,7 @@ fn model_picker_list<'a>(
     active_field: Option<&'a str>,
     add_input: &'a str,
     add_placeholder: &'static str,
+    error: Option<&'a str>,
 ) -> Element<'a, SettingsMessage> {
     let on_add_input = move |v| SettingsMessage::ModelPicker {
         target,
@@ -183,12 +186,18 @@ fn model_picker_list<'a>(
     ]
     .align_y(Alignment::Center);
 
-    column![
+    let mut col = column![
         Column::from_iter(items).spacing(2),
         Space::new().height(4),
         add_row,
-    ]
-    .into()
+    ];
+
+    if let Some(err) = error {
+        col = col.push(Space::new().height(2));
+        col = col.push(inline_error(err, 0.0));
+    }
+
+    col.into()
 }
 
 // ── Messages ─────────────────────────────────────────────────────
@@ -243,9 +252,41 @@ pub enum PasswordTarget {
 pub enum SettingsMessage {
     /// Generic editable config field identified by its snake_case key
     /// (matches the keys in [`crate::config::ConfigData::set_string_field`]).
+    /// Stages the value in the editable snapshot; text inputs also arm a
+    /// debounced settle, immediate controls (toggles / pick lists) persist
+    /// right away, and the `adaptive_k` slider waits for
+    /// [`ConfigFieldSettleNow`](Self::ConfigFieldSettleNow) (release).
     ConfigField {
         key: &'static str,
         value: String,
+    },
+    /// A config field value has settled and should be persisted now.
+    ///
+    /// `field` is the canonical field id (`config:<key>`,
+    /// `role_model:<role>`, `role_reasoning:<role>`,
+    /// `routing_order:<model>`, `routing_allow:<model>`). `generation` is the
+    /// generation counter captured when the value was staged; a settle whose
+    /// generation no longer matches the current counter is stale and dropped,
+    /// so per-keystroke and out-of-order writes are impossible.
+    ConfigFieldSettled {
+        field: String,
+        value: String,
+        generation: u64,
+    },
+    /// Settle the staged value of a field immediately (Enter on a text
+    /// input, slider release) instead of waiting for the debounce timer.
+    ConfigFieldSettleNow {
+        field: String,
+    },
+    /// Result of an async per-field persist. `Ok` carries the canonical
+    /// persisted value (trimmed, `None` collapsed to `""`) so the display
+    /// snapshot re-syncs to exactly what was written — not the raw typed
+    /// value. The handler applies it only when the generation is still
+    /// current (a stale result is dropped).
+    ConfigFieldSaveResult {
+        field: String,
+        generation: u64,
+        result: Result<String, String>,
     },
     /// Per-role model edits
     RoleModel {
@@ -265,9 +306,6 @@ pub enum SettingsMessage {
         model: String,
         allow: bool,
     },
-    /// Actions
-    Save,
-    SaveResult(Result<(), String>),
     /// Toggle password visibility for a specific field.
     TogglePasswordVisibility(PasswordTarget),
     // ── Workspace management (sub-messages) ─────────────────────
@@ -347,12 +385,55 @@ pub enum SettingsMessage {
 
 const REASONING_EFFORT_OPTIONS: &[&str] = &["xhigh", "high", "medium", "low", "minimal"];
 
+/// Debounce delay for text inputs: a change is persisted only when the value
+/// has settled (typing paused this long), or immediately on Enter.
+const SETTLE_MS: u64 = 700;
+
+/// Config keys rendered as free-text inputs — persisted only after the value
+/// settles (debounce / Enter), never per keystroke.
+const TEXT_INPUT_KEYS: &[&str] = &[
+    "provider_key",
+    "provider_endpoint",
+    "firecrawl_key",
+    "exa_key",
+    "telegram_bot_token",
+    "media_transcription_model",
+    "media_transcription_provider",
+];
+
+/// Config keys rendered as discrete controls (toggles / pick lists) that
+/// persist immediately on change. The `adaptive_k` slider is intentionally
+/// absent — it persists on release only (see [`SettingsMessage::ConfigFieldSettleNow`]).
+const IMMEDIATE_KEYS: &[&str] = &["audio_transcription_use_local", "web_search_provider"];
+
 pub struct SettingsState {
     /// Current editable snapshot, loaded from CONFIG each refresh.
     config: ConfigData,
-    /// Whether a save is in progress.
-    saving: bool,
-    /// Last error message from save.
+    /// Per-field generation counters for settled autosaves, keyed by the
+    /// canonical field id (see [`SettingsMessage::ConfigFieldSettled`]).
+    ///
+    /// Bumped every time a field's value is staged (keystroke, toggle,
+    /// picker action). A settle or persist result whose generation no longer
+    /// matches is stale and dropped, so out-of-order async writes can never
+    /// land after a newer edit.
+    field_gen: HashMap<String, u64>,
+    /// Fields with a persist task currently in flight. Only one persist per
+    /// field runs at a time, so the last settle always lands last in the DB —
+    /// generation counters alone protect the UI snapshot, not write ordering
+    /// (two concurrent persists for the same field could otherwise complete
+    /// out of order and the older value would land last).
+    in_flight_persists: HashSet<String>,
+    /// Values queued for fields whose persist is in flight: the user's latest
+    /// edit for that field (value plus the generation at which it was
+    /// queued), flushed when the in-flight persist completes. The flush
+    /// carries the queued generation — if a newer edit was staged in the
+    /// meantime, the flushed persist's result is dropped by the stale-result
+    /// check instead of clobbering the newer staged value.
+    pending_persists: HashMap<String, (String, u64)>,
+    /// Per-field inline errors from rejected settles (invalid values are
+    /// never persisted — the error is shown next to the offending control).
+    field_errors: HashMap<String, String>,
+    /// Last error message from the voice/TTS toggle paths (bottom banner).
     error: Option<String>,
     /// Which password fields are currently visible.
     password_visible: HashSet<PasswordTarget>,
@@ -404,8 +485,7 @@ pub struct SettingsState {
 }
 
 /// Sync the voice assistant pipeline state with `CONFIG.voice_enabled()`.
-/// Called both from the immediate `VoiceToggle` handler and from `SaveResult`
-/// (after a full Save where the config may have changed).
+/// Called from the immediate `VoiceToggle` handler after the toggle persists.
 fn sync_voice_state(enabled: bool) {
     if enabled {
         crate::audio::voice::set_enabled(true);
@@ -420,7 +500,10 @@ impl SettingsState {
     pub fn new() -> Self {
         Self {
             config: CONFIG.snapshot(),
-            saving: false,
+            field_gen: HashMap::new(),
+            in_flight_persists: HashSet::new(),
+            pending_persists: HashMap::new(),
+            field_errors: HashMap::new(),
             error: None,
             password_visible: HashSet::new(),
             workspaces_state: workspaces::WorkspacesState::new(),
@@ -442,9 +525,14 @@ impl SettingsState {
     }
 
     /// Reload the editable snapshot from the current CONFIG.
+    ///
+    /// Inline errors are cleared (the page is being shown fresh). Pending
+    /// debounced settles are NOT invalidated — a value typed before
+    /// navigating away must still be persisted when its settle fires.
     pub fn refresh(&mut self) {
         self.config = CONFIG.snapshot();
         self.error = None;
+        self.field_errors.clear();
     }
 
     /// Close the add-workspace modal and reset all form fields.
@@ -539,40 +627,422 @@ impl SettingsState {
         }
     }
 
+    // ── Per-field autosave helpers ─────────────────────────────
+
+    /// Bump the generation counter for a field and return the new value.
+    fn bump_gen(&mut self, field: &str) -> u64 {
+        let g = self.field_gen.entry(field.to_string()).or_insert(0);
+        *g = g.wrapping_add(1);
+        *g
+    }
+
+    /// Read the currently staged value of a canonical field id from the
+    /// editable snapshot (used by Enter/submit and slider-release settles).
+    ///
+    /// Only text-style fields reach this path: `ConfigFieldSettleNow` is
+    /// dispatched by the Enter/submit and slider-release handlers, and
+    /// discrete controls (`role_reasoning:`, `routing_allow:`) settle with
+    /// their value passed directly to [`Self::settle_now`] instead.
+    fn staged_value(&self, field: &str) -> Option<String> {
+        if let Some(key) = field.strip_prefix("config:") {
+            return self
+                .config
+                .string_fields()
+                .into_iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, v)| v.map(String::from));
+        }
+        if let Some(role) = field.strip_prefix("role_model:") {
+            return self.role_config_for(role).and_then(|rc| rc.model.clone());
+        }
+        if let Some(model) = field.strip_prefix("routing_order:") {
+            return self
+                .config
+                .model_routings
+                .iter()
+                .find(|mr| mr.model == model)
+                .and_then(|mr| mr.provider_order.clone());
+        }
+        None
+    }
+
+    /// Schedule an immediate (delay-0) settle for a field.
+    fn settle_now(&mut self, field: &str, value: String) -> Task<SettingsMessage> {
+        let generation = self.bump_gen(field);
+        let f = field.to_string();
+        Task::perform(super::widgets::debounce_sleep(0, generation), move |g| {
+            SettingsMessage::ConfigFieldSettled {
+                field: f,
+                value,
+                generation: g,
+            }
+        })
+    }
+
+    /// Spawn the async persist for a settled field. The generation captured
+    /// at settle time rides along so a stale persist result can be dropped.
+    /// Callers pass the generation at which the value settled (or, for a
+    /// pending flush, the generation at which the value was queued) — never
+    /// the current one, so a flushed value can never carry a newer
+    /// generation than the edit it represents.
+    /// The persist layer returns the canonical value (trimmed, `None`
+    /// collapsed to `""`), which is surfaced through the result's `Ok` so
+    /// the display snapshot re-syncs to exactly what was written.
+    fn spawn_field_persist(field: String, value: String, generation: u64) -> Task<SettingsMessage> {
+        let f_async = field.clone();
+        let v_async = value;
+        Task::perform(
+            async move {
+                persist_settled_field(&f_async, &v_async)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            move |result| SettingsMessage::ConfigFieldSaveResult {
+                field,
+                generation,
+                result,
+            },
+        )
+    }
+
+    /// Re-sync a single persisted column of a role/routing row into the
+    /// editable snapshot.
+    ///
+    /// Only the column whose persist just completed (or failed) is written —
+    /// a sibling column may hold a staged-but-unsettled edit (e.g. a model
+    /// typed while a reasoning click's persist is in flight) and must not be
+    /// clobbered by a whole-row mirror. `value` is the canonical persisted
+    /// value for the field's own column; when `None` (a failed persist
+    /// rolling back a discrete control) the column is read back from CONFIG,
+    /// the source of truth. When the persist deleted the row, the row is
+    /// dropped from the snapshot only if it holds no staged sibling content
+    /// — a staged sibling edit keeps it alive and re-creates the row when it
+    /// persists.
+    fn sync_field(&mut self, field: &str, value: Option<&str>) {
+        if let Some(role) = field.strip_prefix("role_model:") {
+            let model = value.and_then(crate::config::trimmed_or_none).or_else(|| {
+                crate::config::CONFIG
+                    .role_config_by_key(role)
+                    .and_then(|rc| rc.model)
+            });
+            RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
+                c.model = model;
+            });
+            self.drop_role_row_if_cleared(role);
+            return;
+        }
+        if let Some(role) = field.strip_prefix("role_reasoning:") {
+            let effort = value.and_then(crate::config::trimmed_or_none).or_else(|| {
+                crate::config::CONFIG
+                    .role_config_by_key(role)
+                    .and_then(|rc| rc.reasoning_effort)
+            });
+            RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
+                c.reasoning_effort = effort;
+            });
+            self.drop_role_row_if_cleared(role);
+            return;
+        }
+        if let Some(model) = field.strip_prefix("routing_order:") {
+            let order = value.and_then(crate::config::trimmed_or_none).or_else(|| {
+                crate::config::CONFIG
+                    .model_routing_by_key(model)
+                    .and_then(|mr| mr.provider_order)
+            });
+            ModelRouting::upsert(&mut self.config.model_routings, model, |row| {
+                row.provider_order = order;
+            });
+            self.drop_routing_row_if_cleared(model);
+            return;
+        }
+        if let Some(model) = field.strip_prefix("routing_allow:") {
+            let allow = match value {
+                Some(v) => Some(v == "true"),
+                None => crate::config::CONFIG
+                    .model_routing_by_key(model)
+                    .and_then(|mr| mr.allow_fallbacks),
+            };
+            ModelRouting::upsert(&mut self.config.model_routings, model, |row| {
+                row.allow_fallbacks = allow;
+            });
+            self.drop_routing_row_if_cleared(model);
+            return;
+        }
+        if let Some(key) = field.strip_prefix("config:") {
+            let value = value.map(str::to_owned).or_else(|| {
+                crate::config::CONFIG
+                    .snapshot()
+                    .string_fields()
+                    .into_iter()
+                    .find(|(k, _)| *k == key)
+                    .and_then(|(_, v)| v.map(String::from))
+            });
+            let _ = self
+                .config
+                .set_string_field(key, value.as_deref().unwrap_or_default());
+        }
+    }
+
+    /// Drop a role row from the editable snapshot when the persist deleted it
+    /// from the DB/CONFIG — unless a staged sibling edit keeps it alive (the
+    /// row is re-created when that edit persists).
+    fn drop_role_row_if_cleared(&mut self, role: &str) {
+        if crate::config::CONFIG.role_config_by_key(role).is_none() {
+            self.config.per_role_configs.retain(|rc| {
+                rc.role != role || rc.model.is_some() || rc.reasoning_effort.is_some()
+            });
+        }
+    }
+
+    /// Drop a routing row from the editable snapshot when the persist deleted
+    /// it from the DB/CONFIG — unless a staged sibling edit keeps it alive
+    /// (the row is re-created when that edit persists).
+    fn drop_routing_row_if_cleared(&mut self, model: &str) {
+        if crate::config::CONFIG.model_routing_by_key(model).is_none() {
+            self.config.model_routings.retain(|mr| {
+                mr.model != model || mr.provider_order.is_some() || mr.allow_fallbacks.is_some()
+            });
+        }
+    }
+
+    /// Revert a field's staged snapshot value to the last persisted value
+    /// (used when a persist fails and the control is a discrete state —
+    /// toggle / picker — rather than free text).
+    fn revert_field(&mut self, field: &str) {
+        self.sync_field(field, None);
+    }
+
+    /// Apply a canonical persisted value back into the editable snapshot
+    /// (a settled text field may have been replaced by a refresh while the
+    /// persist was in flight — the persisted value is the user's last edit
+    /// and must win).
+    fn apply_persisted_value(&mut self, field: &str, value: &str) {
+        self.sync_field(field, Some(value));
+    }
+
+    /// Whether a failed persist should roll the control back to the last
+    /// persisted value. Discrete-state controls (toggles, pick lists, the
+    /// slider, per-role effort buttons, routing fallback toggles, and the
+    /// model pickers' optimistic active/list markers) revert; free-text
+    /// inputs keep the typed value so the user can correct it.
+    fn field_reverts_on_error(field: &str) -> bool {
+        field.starts_with("role_reasoning:")
+            || field.starts_with("routing_allow:")
+            || matches!(
+                field,
+                "config:audio_transcription_use_local"
+                    | "config:web_search_provider"
+                    | "config:adaptive_k"
+                    | "config:image_gen_model"
+                    | "config:image_gen_models"
+                    | "config:video_model"
+                    | "config:video_models"
+            )
+    }
+
+    /// Persist a model-picker's list field immediately (discrete action —
+    /// add/remove a model). Clears the picker's inline error and settles now.
+    fn persist_picker_list(&mut self, target: ModelPickerTarget) -> Task<SettingsMessage> {
+        let (field, value) = match target {
+            ModelPickerTarget::ImageGen => (
+                "config:image_gen_models",
+                self.config.image_gen_models.clone().unwrap_or_default(),
+            ),
+            ModelPickerTarget::Video => (
+                "config:video_models",
+                self.config.video_models.clone().unwrap_or_default(),
+            ),
+        };
+        self.field_errors.remove(field);
+        self.settle_now(field, value)
+    }
+
+    /// Persist a model-picker's active-model field immediately. Clears the
+    /// picker's inline error and settles now.
+    fn persist_picker_active(&mut self, target: ModelPickerTarget) -> Task<SettingsMessage> {
+        let (field, value) = match target {
+            ModelPickerTarget::ImageGen => (
+                "config:image_gen_model",
+                self.config.image_gen_model.clone().unwrap_or_default(),
+            ),
+            ModelPickerTarget::Video => (
+                "config:video_model",
+                self.config.video_model.clone().unwrap_or_default(),
+            ),
+        };
+        self.field_errors.remove(field);
+        self.settle_now(field, value)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: SettingsMessage) -> Task<SettingsMessage> {
         match msg {
             // ── Config field edits ─────────────────────────────
             SettingsMessage::ConfigField { key, value } => {
                 let _ = self.config.set_string_field(key, &value);
-                Task::none()
+                let field = format!("config:{key}");
+                self.field_errors.remove(&field);
+                if TEXT_INPUT_KEYS.contains(&key) {
+                    // Text input: persist only after the value settles
+                    // (debounce), never per keystroke.
+                    let generation = self.bump_gen(&field);
+                    let f = field.clone();
+                    Task::perform(
+                        super::widgets::debounce_sleep(SETTLE_MS, generation),
+                        move |g| SettingsMessage::ConfigFieldSettled {
+                            field: f,
+                            value,
+                            generation: g,
+                        },
+                    )
+                } else if IMMEDIATE_KEYS.contains(&key) {
+                    // Toggles / pick lists are discrete: persist right away.
+                    self.settle_now(&field, value)
+                } else if key == "adaptive_k" {
+                    // Release-settled slider: the value is staged in the
+                    // snapshot; the slider's on_release sends
+                    // ConfigFieldSettleNow to persist it. Bump the generation
+                    // like every other staging path so an in-flight persist
+                    // result from an earlier release can't pass the stale
+                    // check and clobber the newly staged drag value.
+                    let _ = self.bump_gen(&field);
+                    Task::none()
+                } else {
+                    // No settle path for this key: the value would stage
+                    // forever and never persist — exactly the silent-edit-loss
+                    // this design removes. Every rendered config field must be
+                    // classified in TEXT_INPUT_KEYS, IMMEDIATE_KEYS, or the
+                    // release-settled arm above.
+                    tracing::warn!(
+                        key,
+                        "settings: unclassified config field staged but not persisted"
+                    );
+                    Task::none()
+                }
+            }
+            SettingsMessage::ConfigFieldSettleNow { field } => {
+                let value = self.staged_value(&field).unwrap_or_default();
+                self.settle_now(&field, value)
+            }
+            SettingsMessage::ConfigFieldSettled {
+                field,
+                value,
+                generation,
+            } => {
+                // Drop settles superseded by a newer edit for the same field
+                // (the user typed/toggled again while the timer was running).
+                if generation != self.field_gen.get(&field).copied().unwrap_or(0) {
+                    return Task::none();
+                }
+                // Serialize persists per field: if one is already in flight,
+                // queue the newest value instead of spawning a second persist
+                // — two concurrent persists for the same field could complete
+                // out of order and the older value would land last in the DB
+                // while the UI shows the newer one.
+                if self.in_flight_persists.contains(&field) {
+                    self.pending_persists.insert(field, (value, generation));
+                    return Task::none();
+                }
+                self.in_flight_persists.insert(field.clone());
+                Self::spawn_field_persist(field, value, generation)
+            }
+            SettingsMessage::ConfigFieldSaveResult {
+                field,
+                generation,
+                result,
+            } => {
+                // A completed persist frees the field. If a newer settle
+                // queued a pending value while this persist was in flight,
+                // persist it now — the pending value is the user's latest edit
+                // and must win regardless of this result's age.
+                let pending = if self.in_flight_persists.remove(&field) {
+                    self.pending_persists.remove(&field)
+                } else {
+                    None
+                };
+                if let Some((pending_value, queued_generation)) = pending {
+                    self.in_flight_persists.insert(field.clone());
+                    // Flush with the generation at which the value was queued
+                    // — NOT the current one: if a newer edit was staged since,
+                    // the flushed persist's result is dropped as stale and can
+                    // never clobber the newer staged value, while the value
+                    // itself still lands in the DB.
+                    return Self::spawn_field_persist(field, pending_value, queued_generation);
+                }
+                // Ignore results from a superseded persist.
+                if generation != self.field_gen.get(&field).copied().unwrap_or(0) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(canonical) => {
+                        self.field_errors.remove(&field);
+                        self.apply_persisted_value(&field, &canonical);
+                        Task::none()
+                    }
+                    Err(e) => {
+                        self.field_errors.insert(field.clone(), e);
+                        if Self::field_reverts_on_error(&field) {
+                            // Discrete-state controls (toggles/pickers/sliders)
+                            // roll back to the last persisted value; free text
+                            // keeps the typed value for correction.
+                            self.revert_field(&field);
+                        }
+                        Task::none()
+                    }
+                }
             }
             SettingsMessage::RoleModel { role, model } => {
-                let model_opt = Some(model).filter(|s| !s.is_empty());
+                let field = format!("role_model:{role}");
+                self.field_errors.remove(&field);
+                let model_opt = Some(model.clone()).filter(|s| !s.is_empty());
                 RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
                     c.model = model_opt;
                 });
-                Task::none()
+                let generation = self.bump_gen(&field);
+                let f = field.clone();
+                Task::perform(
+                    super::widgets::debounce_sleep(SETTLE_MS, generation),
+                    move |g| SettingsMessage::ConfigFieldSettled {
+                        field: f,
+                        value: model,
+                        generation: g,
+                    },
+                )
             }
             SettingsMessage::RoleReasoning { role, effort } => {
-                let effort_opt = Some(effort).filter(|s| !s.is_empty());
+                let field = format!("role_reasoning:{role}");
+                self.field_errors.remove(&field);
+                let effort_opt = Some(effort.clone()).filter(|s| !s.is_empty());
                 RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
                     c.reasoning_effort = effort_opt;
                 });
-                Task::none()
+                self.settle_now(&field, effort)
             }
             SettingsMessage::ModelRoutingOrder { model, order } => {
-                let order_opt = Some(order).filter(|s| !s.is_empty());
+                let field = format!("routing_order:{model}");
+                self.field_errors.remove(&field);
+                let order_opt = Some(order.clone()).filter(|s| !s.is_empty());
                 ModelRouting::upsert(&mut self.config.model_routings, model, |mr| {
                     mr.provider_order = order_opt;
                 });
-                Task::none()
+                let generation = self.bump_gen(&field);
+                let f = field.clone();
+                Task::perform(
+                    super::widgets::debounce_sleep(SETTLE_MS, generation),
+                    move |g| SettingsMessage::ConfigFieldSettled {
+                        field: f,
+                        value: order,
+                        generation: g,
+                    },
+                )
             }
             SettingsMessage::ModelRoutingAllowFallbacks { model, allow } => {
+                let field = format!("routing_allow:{model}");
+                self.field_errors.remove(&field);
                 ModelRouting::upsert(&mut self.config.model_routings, model, |mr| {
                     mr.allow_fallbacks = Some(allow);
                 });
-                Task::none()
+                self.settle_now(&field, allow.to_string())
             }
             SettingsMessage::TogglePasswordVisibility(target) => {
                 if self.password_visible.contains(&target) {
@@ -580,37 +1050,6 @@ impl SettingsState {
                 } else {
                     self.password_visible.insert(target);
                 }
-                Task::none()
-            }
-            SettingsMessage::Save => {
-                self.saving = true;
-                self.error = None;
-                let config = self.config.clone();
-                // NOTE: wake_word_templates is intentionally NOT preserved
-                // here — save_and_reload skips it, leaving the voice pipeline
-                // (persist_enrollment) as the sole owner of that key.
-                // This avoids the dual-writer race entirely.
-                Task::perform(
-                    async move {
-                        crate::config::save_and_reload(config)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    SettingsMessage::SaveResult,
-                )
-            }
-            SettingsMessage::SaveResult(Ok(())) => {
-                self.saving = false;
-                self.refresh();
-
-                // Sync voice assistant state with config
-                sync_voice_state(crate::config::CONFIG.voice_enabled().as_deref() == Some("true"));
-
-                Task::none()
-            }
-            SettingsMessage::SaveResult(Err(e)) => {
-                self.saving = false;
-                self.error = Some(e);
                 Task::none()
             }
 
@@ -734,14 +1173,9 @@ impl SettingsState {
             }
             SettingsMessage::AddWorkspaceResult(Ok(_ws)) => {
                 self.close_add_workspace_modal();
-                Task::batch([
-                    self.workspaces_state
-                        .refresh()
-                        .map(SettingsMessage::WorkspaceMsg),
-                    Task::done(SettingsMessage::WorkspaceMsg(
-                        workspaces::WorkspacesMessage::Toast(super::ToastMessage::Created),
-                    )),
-                ])
+                self.workspaces_state
+                    .refresh()
+                    .map(SettingsMessage::WorkspaceMsg)
             }
             SettingsMessage::AddWorkspaceResult(Err(e)) => {
                 self.add_workspace_adding = false;
@@ -809,12 +1243,7 @@ impl SettingsState {
             }
             SettingsMessage::AddUserResult(Ok(())) => {
                 self.close_add_user_modal();
-                Task::batch([
-                    self.users_state.refresh().map(SettingsMessage::UserMsg),
-                    Task::done(SettingsMessage::UserMsg(users::UsersMessage::Toast(
-                        super::ToastMessage::Created,
-                    ))),
-                ])
+                self.users_state.refresh().map(SettingsMessage::UserMsg)
             }
             SettingsMessage::AddUserResult(Err(e)) => {
                 self.add_user_adding = false;
@@ -836,7 +1265,7 @@ impl SettingsState {
                         // mutated; the input buffer is kept on rejection so the
                         // user can correct it. Validation uses the endpoint being
                         // drafted — the committed global may differ when the user
-                        // changed the endpoint in this unsaved session.
+                        // changed the endpoint in this session.
                         ModelPickerTarget::ImageGen => {
                             let model = self.model_picker_inputs[t.idx()].trim().to_string();
                             if model.is_empty() {
@@ -854,10 +1283,10 @@ impl SettingsState {
                                         validate_image_model_for_endpoint(&model, &endpoint)
                                         .await
                                         .map_err(|e| e.to_string());
-                                    (t, model, ok)
+                                    (model, ok)
                                 },
-                                |(target, model, ok)| SettingsMessage::ModelPickerAddResult {
-                                    target,
+                                |(model, ok)| SettingsMessage::ModelPickerAddResult {
+                                    target: ModelPickerTarget::ImageGen,
                                     model,
                                     ok,
                                 },
@@ -866,18 +1295,30 @@ impl SettingsState {
                         ModelPickerTarget::Video => {
                             let (models, _active) = picker_config_fields(&t, &mut self.config);
                             add_model_to_list(&mut self.model_picker_inputs[t.idx()], models);
-                            Task::none()
+                            self.persist_picker_list(t)
                         }
                     },
                     (t, ModelPickerAction::RemoveModel(model)) => {
                         let (models, active) = picker_config_fields(&t, &mut self.config);
                         remove_model_from_list(&model, models, active);
-                        Task::none()
+                        // The active model may have been reset by the removal —
+                        // persist both the list and the active model.
+                        Task::batch([self.persist_picker_list(t), self.persist_picker_active(t)])
                     }
                     (t, ModelPickerAction::SetActive(model)) => {
                         let (_models, active) = picker_config_fields(&t, &mut self.config);
-                        *active = Some(model);
-                        Task::none()
+                        *active = Some(model.clone());
+                        // Persist immediately. For the image target the persist
+                        // validates the model against the endpoint-keyed catalog
+                        // and fails without writing on rejection (the optimistic
+                        // active marker is then reverted inline).
+                        let key = match t {
+                            ModelPickerTarget::ImageGen => "config:image_gen_model",
+                            ModelPickerTarget::Video => "config:video_model",
+                        };
+                        let field = key.to_string();
+                        self.field_errors.remove(&field);
+                        self.settle_now(&field, model)
                     }
                 }
             }
@@ -899,11 +1340,20 @@ impl SettingsState {
                     if self.model_picker_inputs[target.idx()].trim() == model {
                         self.model_picker_inputs[target.idx()].clear();
                     }
-                    Task::done(SettingsMessage::Toast(super::ToastMessage::Saved))
+                    // Persist silently — no success toast.
+                    self.persist_picker_list(target)
                 }
-                Err(e) => Task::done(SettingsMessage::Toast(super::ToastMessage::Error(format!(
-                    "Model `{model}` rejected: {e}"
-                )))),
+                Err(e) => {
+                    // Inline error on the picker — no toast (silent success /
+                    // inline rejection for config validation).
+                    let key = match target {
+                        ModelPickerTarget::ImageGen => "config:image_gen_models",
+                        ModelPickerTarget::Video => "config:video_models",
+                    };
+                    self.field_errors
+                        .insert(key.to_string(), format!("Model `{model}` rejected: {e}"));
+                    Task::none()
+                }
             },
 
             SettingsMessage::Toast(_) => {
@@ -983,20 +1433,12 @@ impl SettingsState {
             .direction(theme::vertical_scrollbar())
             .style(theme::scrollbar_style);
 
-        // Floating save button near bottom-right
-        let save_btn = container(save_button(self.saving))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(Alignment::End)
-            .align_y(Alignment::End)
-            .padding(iced::Padding::default().right(20.0).bottom(20.0));
-
         // Modal overlay (rendered above everything else)
         let modal = self.render_modal_overlay();
 
-        // Stack order: [scroll content, floating save button, modal overlay]
-        // so the save button doesn't appear above the modal backdrop.
-        let body = stack([scroll.into(), save_btn.into(), modal]);
+        // Stack order: [scroll content, modal overlay] — every change on the
+        // page persists automatically, so there is no floating Save button.
+        let body = stack([scroll.into(), modal]);
 
         container(body)
             .width(Length::Fill)
@@ -1966,6 +2408,12 @@ impl SettingsState {
                             value: v
                         },
                         SettingsMessage::TogglePasswordVisibility(PasswordTarget::ProviderKey),
+                        SettingsMessage::ConfigFieldSettleNow {
+                            field: "config:provider_key".to_string()
+                        },
+                        self.field_errors
+                            .get("config:provider_key")
+                            .map(String::as_str),
                     ),
                     None,
                 ),
@@ -1974,6 +2422,9 @@ impl SettingsState {
                     "https://openrouter.ai/api/v1",
                     self.config.provider_endpoint.as_deref().unwrap_or_default(),
                     "provider_endpoint",
+                    self.field_errors
+                        .get("config:provider_endpoint")
+                        .map(String::as_str),
                 ),
             ],
         )
@@ -1989,17 +2440,24 @@ impl SettingsState {
                 .role_config_for(key)
                 .and_then(|rc| rc.model.clone())
                 .unwrap_or_default();
-            field_row(
+            let field = format!("role_model:{key}");
+            let submit = SettingsMessage::ConfigFieldSettleNow {
+                field: field.clone(),
+            };
+            let error = self.field_errors.get(&field).map(String::as_str);
+            field_row_with_error(
                 label,
                 text_input(default, &current)
                     .on_input(move |v| SettingsMessage::RoleModel {
                         role: key.to_string(),
                         model: v,
                     })
+                    .on_submit(submit)
                     .style(super::widgets::text_input_style)
                     .width(Length::Fixed(375.0))
                     .into(),
                 Some(default),
+                error,
             )
         });
         section("Models (per-role)", Column::from_iter(rows))
@@ -2036,7 +2494,11 @@ impl SettingsState {
                 ]
                 .into()
             }));
-            field_row(label, effort_buttons.into(), None)
+            let error = self
+                .field_errors
+                .get(&format!("role_reasoning:{key}"))
+                .map(String::as_str);
+            field_row_with_error(label, effort_buttons.into(), None, error)
         });
         section("Reasoning Effort (per-role)", Column::from_iter(rows))
     }
@@ -2047,7 +2509,7 @@ impl SettingsState {
         section(
             "Transcription",
             column![
-                field_row(
+                field_row_with_error(
                     "Local Transcription",
                     toggler(local_enabled)
                         .on_toggle(move |b| SettingsMessage::ConfigField {
@@ -2060,6 +2522,9 @@ impl SettingsState {
                         })
                         .into(),
                     Some("Use local Qwen3-ASR (offline) — audio never leaves the machine"),
+                    self.field_errors
+                        .get("config:audio_transcription_use_local")
+                        .map(String::as_str),
                 ),
                 Space::new().height(8),
                 config_text_input(
@@ -2070,6 +2535,9 @@ impl SettingsState {
                         .as_deref()
                         .unwrap_or_default(),
                     "media_transcription_model",
+                    self.field_errors
+                        .get("config:media_transcription_model")
+                        .map(String::as_str),
                 ),
                 config_text_input(
                     "Media Provider",
@@ -2079,6 +2547,9 @@ impl SettingsState {
                         .as_deref()
                         .unwrap_or_default(),
                     "media_transcription_provider",
+                    self.field_errors
+                        .get("config:media_transcription_provider")
+                        .map(String::as_str),
                 ),
             ],
         )
@@ -2101,6 +2572,10 @@ impl SettingsState {
                     self.config.image_gen_model.as_deref(),
                     self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()].as_str(),
                     "model name (e.g. google/gemini-...)",
+                    self.field_errors
+                        .get("config:image_gen_models")
+                        .or_else(|| self.field_errors.get("config:image_gen_model"))
+                        .map(String::as_str),
                 ),
                 Space::new().height(12),
                 text("Video Generation")
@@ -2114,6 +2589,10 @@ impl SettingsState {
                     self.config.video_model.as_deref(),
                     self.model_picker_inputs[ModelPickerTarget::Video.idx()].as_str(),
                     "model name (e.g. minimax/hailuo-3)",
+                    self.field_errors
+                        .get("config:video_models")
+                        .or_else(|| self.field_errors.get("config:video_model"))
+                        .map(String::as_str),
                 ),
             ],
         )
@@ -2143,7 +2622,14 @@ impl SettingsState {
         .style(super::widgets::pick_list_style)
         .width(Length::Fixed(180.0));
 
-        let provider_row = field_row("Web Search Provider", pick_list.into(), None);
+        let provider_row = field_row_with_error(
+            "Web Search Provider",
+            pick_list.into(),
+            None,
+            self.field_errors
+                .get("config:web_search_provider")
+                .map(String::as_str),
+        );
 
         section(
             "Integrations",
@@ -2161,6 +2647,12 @@ impl SettingsState {
                             value: v
                         },
                         SettingsMessage::TogglePasswordVisibility(PasswordTarget::FirecrawlKey),
+                        SettingsMessage::ConfigFieldSettleNow {
+                            field: "config:firecrawl_key".to_string()
+                        },
+                        self.field_errors
+                            .get("config:firecrawl_key")
+                            .map(String::as_str),
                     ),
                     None,
                 ),
@@ -2175,6 +2667,10 @@ impl SettingsState {
                             value: v
                         },
                         SettingsMessage::TogglePasswordVisibility(PasswordTarget::ExaKey),
+                        SettingsMessage::ConfigFieldSettleNow {
+                            field: "config:exa_key".to_string()
+                        },
+                        self.field_errors.get("config:exa_key").map(String::as_str),
                     ),
                     None,
                 ),
@@ -2193,8 +2689,14 @@ impl SettingsState {
                             value: v
                         },
                         SettingsMessage::TogglePasswordVisibility(PasswordTarget::TelegramToken),
+                        SettingsMessage::ConfigFieldSettleNow {
+                            field: "config:telegram_bot_token".to_string()
+                        },
+                        self.field_errors
+                            .get("config:telegram_bot_token")
+                            .map(String::as_str),
                     ),
-                    Some("Applied automatically on save"),
+                    Some("Applied automatically"),
                 ),
             ],
         )
@@ -2472,7 +2974,7 @@ impl SettingsState {
             .push(phrase_input)
             .push(enroll_btn);
 
-        // Adaptive threshold k slider
+        // Adaptive threshold k slider — persists on release (never on drag).
         let current_k: f32 = self
             .config
             .adaptive_k
@@ -2486,9 +2988,12 @@ impl SettingsState {
             }
         })
         .step(0.1_f32)
+        .on_release(SettingsMessage::ConfigFieldSettleNow {
+            field: "config:adaptive_k".to_string(),
+        })
         .width(Length::Fixed(200.0));
         column = column.push(iced::widget::Space::new().height(8));
-        column = column.push(field_row(
+        column = column.push(field_row_with_error(
             "Adaptive K",
             iced::widget::row![
                 k_slider,
@@ -2498,6 +3003,9 @@ impl SettingsState {
             .align_y(iced::Alignment::Center)
             .into(),
             Some("Detection sensitivity (1.0–4.0, default 2.5)"),
+            self.field_errors
+                .get("config:adaptive_k")
+                .map(String::as_str),
         ));
 
         if let Some(ui) = enrollment_ui {
@@ -2613,14 +3121,22 @@ impl SettingsState {
             let display_name = model_name.clone();
             let order_model = model_name.clone();
             let allow_model = model_name.clone();
+            let order_field = format!("routing_order:{model_name}");
+            let order_submit = SettingsMessage::ConfigFieldSettleNow {
+                field: order_field.clone(),
+            };
+            let order_error = self.field_errors.get(&order_field).map(String::as_str);
             let order_input = text_input("DeepSeek", &current_order.unwrap_or_default())
                 .on_input(move |v| SettingsMessage::ModelRoutingOrder {
                     model: order_model.clone(),
                     order: v,
                 })
+                .on_submit(order_submit)
                 .style(super::widgets::text_input_style)
                 .width(Length::Fixed(375.0));
 
+            let allow_field = format!("routing_allow:{model_name}");
+            let allow_error = self.field_errors.get(&allow_field).map(String::as_str);
             let allow_toggle = toggler(current_allow.unwrap_or(false)).on_toggle(move |b| {
                 SettingsMessage::ModelRoutingAllowFallbacks {
                     model: allow_model.clone(),
@@ -2636,12 +3152,18 @@ impl SettingsState {
                         .size(13)
                         .color(theme::TEXT_SECONDARY),
                     Space::new().height(4),
-                    field_row(
+                    field_row_with_error(
                         "Provider Order",
                         order_input.into(),
                         Some("Comma-separated provider slugs"),
+                        order_error,
                     ),
-                    field_row("Allow Fallbacks", allow_toggle.into(), None,),
+                    field_row_with_error(
+                        "Allow Fallbacks",
+                        allow_toggle.into(),
+                        None,
+                        allow_error,
+                    ),
                 ]
                 .spacing(2)
                 .into(),
@@ -2704,6 +3226,25 @@ fn field_row<'a>(
     input: Element<'a, SettingsMessage>,
     hint: Option<&'static str>,
 ) -> Element<'a, SettingsMessage> {
+    field_row_with_error(label, input, hint, None)
+}
+
+/// The inline error label rendered under a control: small, error-colored,
+/// indented `left_pad` px to align with the input column.
+fn inline_error(err: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
+    container(text(err).size(10).color(theme::STATUS_ERROR))
+        .padding(iced::Padding::default().left(left_pad))
+        .into()
+}
+
+/// Like [`field_row`], with an optional inline error rendered under the
+/// input (aligned with the input column) in the error color.
+fn field_row_with_error<'a>(
+    label: &'static str,
+    input: Element<'a, SettingsMessage>,
+    hint: Option<&'static str>,
+    error: Option<&'a str>,
+) -> Element<'a, SettingsMessage> {
     let mut row_widget = row![
         text(label).size(13).width(Length::Fixed(180.0)),
         Space::new().width(8),
@@ -2716,7 +3257,14 @@ fn field_row<'a>(
         row_widget = row_widget.push(text(h).size(10).color(theme::TEXT_SECONDARY));
     }
 
-    row_widget.into()
+    let row_elem: Element<'a, SettingsMessage> = row_widget.into();
+    if let Some(err) = error {
+        column![row_elem, inline_error(err, 188.0),]
+            .spacing(2)
+            .into()
+    } else {
+        row_elem
+    }
 }
 
 /// Role-pool checkbox row shared by the add-user and pool-edit modals.
@@ -2739,16 +3287,20 @@ fn role_checkbox_row<'a>(
 }
 
 /// Password input — masked by default, eye button toggles visibility.
+/// Settles on Enter in addition to the debounce timer. Optional inline error.
 fn password_input<'a>(
     placeholder: &str,
     value: &str,
     show: bool,
     on_input: impl Fn(String) -> SettingsMessage + 'a,
     on_toggle: SettingsMessage,
+    on_submit: SettingsMessage,
+    error: Option<&'a str>,
 ) -> Element<'a, SettingsMessage> {
     let input: Element<_> = text_input(placeholder, value)
         .secure(!show)
         .on_input(on_input)
+        .on_submit(on_submit)
         .style(super::widgets::text_input_style)
         .width(Length::Fixed(375.0))
         .into();
@@ -2759,7 +3311,7 @@ fn password_input<'a>(
         text("👁").size(14.0).into()
     };
 
-    row![
+    let controls: Element<'a, SettingsMessage> = row![
         input,
         Space::new().width(4),
         button(eye_text)
@@ -2768,7 +3320,15 @@ fn password_input<'a>(
             .on_press(on_toggle),
     ]
     .align_y(Alignment::Center)
-    .into()
+    .into();
+
+    if let Some(err) = error {
+        column![controls, inline_error(err, 188.0),]
+            .spacing(2)
+            .into()
+    } else {
+        controls
+    }
 }
 
 /// Delete-confirm button — shows a trash icon (with tooltip) or a
@@ -2812,43 +3372,57 @@ fn delete_confirm_button<'a>(
     }
 }
 
-/// Save button — disabled while saving.
-fn save_button<'a>(saving: bool) -> Element<'a, SettingsMessage> {
-    let content = if saving {
-        row![text("⟳").size(14.0), Space::new().width(4), text("Saving…"),]
-    } else {
-        row![text("✓").size(14.0), Space::new().width(4), text("Save"),]
-    };
-
-    let mut btn = button(content).padding(6);
-    if saving {
-        btn = btn.style(theme::button_secondary);
-    } else {
-        btn = btn
-            .style(theme::button_primary)
-            .on_press(SettingsMessage::Save);
+/// Dispatch a settled field value to its per-field persistence function.
+///
+/// Field ids (see [`SettingsMessage::ConfigFieldSettled`]):
+/// - `config:<key>` — string config fields
+/// - `role_model:<role>` / `role_reasoning:<role>` — per-role rows
+/// - `routing_order:<model>` / `routing_allow:<model>` — per-model rows
+///
+/// Returns the canonical persisted value.
+async fn persist_settled_field(field: &str, value: &str) -> anyhow::Result<String> {
+    if let Some(key) = field.strip_prefix("config:") {
+        return crate::config::persist_settled_string_field(key, value).await;
     }
-    btn.into()
+    if let Some(role) = field.strip_prefix("role_model:") {
+        return crate::config::persist_settled_role_model(role, value).await;
+    }
+    if let Some(role) = field.strip_prefix("role_reasoning:") {
+        return crate::config::persist_settled_role_reasoning(role, value).await;
+    }
+    if let Some(model) = field.strip_prefix("routing_order:") {
+        return crate::config::persist_settled_routing_order(model, value).await;
+    }
+    if let Some(model) = field.strip_prefix("routing_allow:") {
+        return crate::config::persist_settled_routing_allow(model, value == "true").await;
+    }
+    anyhow::bail!("unknown settings field: {field}");
 }
 
-/// Config text input — label on left, styled text input on right.
+/// Config text input — label on left, styled text input on right, optional
+/// inline error below. Settles on Enter in addition to the debounce timer.
 fn config_text_input<'a>(
     label: &'static str,
     placeholder: &str,
     value: &str,
     config_key: &'static str,
+    error: Option<&'a str>,
 ) -> Element<'a, SettingsMessage> {
-    field_row(
+    let field = format!("config:{config_key}");
+    let submit = SettingsMessage::ConfigFieldSettleNow { field };
+    field_row_with_error(
         label,
         text_input(placeholder, value)
             .on_input(move |v| SettingsMessage::ConfigField {
                 key: config_key,
                 value: v,
             })
+            .on_submit(submit)
             .style(super::widgets::text_input_style)
             .width(Length::Fixed(375.0))
             .into(),
         None,
+        error,
     )
 }
 
@@ -3304,6 +3878,356 @@ mod tests {
                 s.config.normalize();
                 crate::audio::tts::test_set_state(2); // ModelState::Ready
             },
+        );
+    }
+
+    // ── Per-field autosave: settle generations ──────────────────────
+    //
+    // The safety requirement "no per-keystroke writes, no out-of-order async
+    // writes" is enforced by the per-field generation counter: a settle whose
+    // generation no longer matches the current counter is dropped, and so is
+    // a persist result from a superseded settle. These tests pin that guard
+    // (they never await the spawned tasks — dropped tasks never run, so no
+    // store is needed; state transitions are the observable surface).
+
+    #[test]
+    fn text_field_keystrokes_arm_debounced_settles_with_generations() {
+        let mut state = SettingsState::new();
+
+        // Keystroke stages the value and arms a debounced settle (gen 1).
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "exa_key",
+            value: "key-a".into(),
+        });
+        assert_eq!(
+            state.field_gen.get("config:exa_key").copied(),
+            Some(1),
+            "first keystroke bumps gen to 1"
+        );
+        assert_eq!(
+            state.config.exa_key.as_deref(),
+            Some("key-a"),
+            "value staged in the editable snapshot"
+        );
+
+        // Continued typing bumps the generation and re-stages the value.
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "exa_key",
+            value: "key-ab".into(),
+        });
+        assert_eq!(
+            state.field_gen.get("config:exa_key").copied(),
+            Some(2),
+            "second keystroke bumps gen to 2"
+        );
+    }
+
+    #[test]
+    fn stale_settle_is_dropped_never_staging_the_old_value() {
+        let mut state = SettingsState::new();
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "exa_key",
+            value: "key-a".into(),
+        });
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "exa_key",
+            value: "key-ab".into(),
+        });
+
+        // The stale settle (gen 1) is dropped: no persist is spawned, the
+        // staged value does not regress, and the generation is not consumed.
+        let _task = state.update(SettingsMessage::ConfigFieldSettled {
+            field: "config:exa_key".into(),
+            value: "key-a".into(),
+            generation: 1,
+        });
+        assert_eq!(
+            state.field_gen.get("config:exa_key").copied(),
+            Some(2),
+            "stale settle must not consume the generation"
+        );
+        assert_eq!(
+            state.config.exa_key.as_deref(),
+            Some("key-ab"),
+            "stale settle must not stage the stale value"
+        );
+
+        // A stale RESULT is dropped too — its error must not surface.
+        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "config:exa_key".into(),
+            generation: 1,
+            result: Err("stale failure".into()),
+        });
+        assert!(
+            !state.field_errors.contains_key("config:exa_key"),
+            "stale result must not surface its error"
+        );
+    }
+
+    #[test]
+    fn stale_result_does_not_apply_stale_value() {
+        let mut state = SettingsState::new();
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "provider_endpoint",
+            value: "https://a.example".into(),
+        });
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "provider_endpoint",
+            value: "https://b.example".into(),
+        });
+
+        // A stale SUCCESS result (gen 1) must not overwrite the staged value.
+        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "config:provider_endpoint".into(),
+            generation: 1,
+            result: Ok("https://a.example".into()),
+        });
+        assert_eq!(
+            state.config.provider_endpoint.as_deref(),
+            Some("https://b.example"),
+            "stale success must not overwrite the newer staged value"
+        );
+    }
+
+    #[test]
+    fn in_flight_persist_queues_newer_settle_and_flushes_on_result() {
+        let mut state = SettingsState::new();
+
+        // First settle spawns a persist (field marked in flight).
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "audio_transcription_use_local",
+            value: "true".into(),
+        });
+        let _task = state.update(SettingsMessage::ConfigFieldSettled {
+            field: "config:audio_transcription_use_local".into(),
+            value: "true".into(),
+            generation: 1,
+        });
+        assert!(
+            state
+                .in_flight_persists
+                .contains("config:audio_transcription_use_local"),
+            "fresh settle marks the field in flight"
+        );
+
+        // A second toggle while the first persist runs must not spawn a
+        // second persist — it queues the newest value instead, so the last
+        // settle always lands last in the DB.
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "audio_transcription_use_local",
+            value: String::new(), // toggled back off
+        });
+        let _task = state.update(SettingsMessage::ConfigFieldSettled {
+            field: "config:audio_transcription_use_local".into(),
+            value: String::new(),
+            generation: 2,
+        });
+        assert_eq!(
+            state
+                .pending_persists
+                .get("config:audio_transcription_use_local"),
+            Some(&(String::new(), 2)),
+            "newer settle queued with the generation it was queued at"
+        );
+
+        // The in-flight persist's (stale) result frees the field and flushes
+        // the pending value into a fresh persist — the latest edit wins.
+        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "config:audio_transcription_use_local".into(),
+            generation: 1,
+            result: Ok("true".into()),
+        });
+        assert!(
+            !state
+                .pending_persists
+                .contains_key("config:audio_transcription_use_local"),
+            "pending value flushed"
+        );
+        assert!(
+            state
+                .in_flight_persists
+                .contains("config:audio_transcription_use_local"),
+            "flushed persist re-marks the field in flight"
+        );
+    }
+
+    #[test]
+    fn stale_pending_flush_never_clobbers_a_newer_staged_edit() {
+        let mut state = SettingsState::new();
+
+        // Settle #1 spawns a persist (field in flight, gen 1).
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "audio_transcription_use_local",
+            value: "true".into(),
+        });
+        let _task = state.update(SettingsMessage::ConfigFieldSettled {
+            field: "config:audio_transcription_use_local".into(),
+            value: "true".into(),
+            generation: 1,
+        });
+
+        // Settle #2 while the first persist runs queues a pending value.
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "audio_transcription_use_local",
+            value: String::new(), // toggled back off
+        });
+        let _task = state.update(SettingsMessage::ConfigFieldSettled {
+            field: "config:audio_transcription_use_local".into(),
+            value: String::new(),
+            generation: 2,
+        });
+        assert_eq!(
+            state
+                .pending_persists
+                .get("config:audio_transcription_use_local"),
+            Some(&(String::new(), 2)),
+            "pending value queued with its own generation"
+        );
+
+        // The user stages a THIRD edit (gen 3) before the first persist
+        // completes — its debounce is armed and the snapshot holds it.
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "audio_transcription_use_local",
+            value: "true".into(),
+        });
+        assert_eq!(
+            state
+                .field_gen
+                .get("config:audio_transcription_use_local")
+                .copied(),
+            Some(3),
+            "third edit bumped the generation"
+        );
+
+        // The first persist's result frees the field and flushes the pending
+        // value with ITS OWN generation (2) — never the current one (3).
+        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "config:audio_transcription_use_local".into(),
+            generation: 1,
+            result: Ok("true".into()),
+        });
+        assert!(
+            !state
+                .pending_persists
+                .contains_key("config:audio_transcription_use_local"),
+            "pending value flushed"
+        );
+        assert!(
+            state
+                .in_flight_persists
+                .contains("config:audio_transcription_use_local"),
+            "flush re-marks the field in flight"
+        );
+
+        // The flushed persist's result carries gen 2 — stale against the
+        // newer staged edit (gen 3) — so it must NOT overwrite the snapshot.
+        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "config:audio_transcription_use_local".into(),
+            generation: 2,
+            result: Ok(String::new()), // the flushed (older) value's canonical
+        });
+        assert_eq!(
+            state.config.audio_transcription_use_local.as_deref(),
+            Some("true"),
+            "stale flushed result must not clobber the newer staged value"
+        );
+        assert!(
+            !state
+                .field_errors
+                .contains_key("config:audio_transcription_use_local"),
+            "stale result must not surface anything either"
+        );
+    }
+
+    #[test]
+    fn settle_now_uses_the_staged_value_for_release_and_enter() {
+        let mut state = SettingsState::new();
+
+        // Slider drag stages the value (release-settled → no settle armed).
+        // The generation still bumps, like every other staging path, so an
+        // in-flight persist result from an earlier release is stale and can
+        // never clobber the newly staged drag value.
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "adaptive_k",
+            value: "3.2".into(),
+        });
+        assert_eq!(
+            state.field_gen.get("config:adaptive_k").copied(),
+            Some(1),
+            "drag bumps the generation but arms no settle"
+        );
+
+        // Release settles it immediately.
+        let _task = state.update(SettingsMessage::ConfigFieldSettleNow {
+            field: "config:adaptive_k".into(),
+        });
+        assert_eq!(
+            state.field_gen.get("config:adaptive_k").copied(),
+            Some(2),
+            "release arms a zero-delay settle"
+        );
+
+        // Enter on a text field settles the staged value immediately too.
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "provider_endpoint",
+            value: "https://c.example".into(),
+        });
+        let _task = state.update(SettingsMessage::ConfigFieldSettleNow {
+            field: "config:provider_endpoint".into(),
+        });
+        assert_eq!(
+            state.field_gen.get("config:provider_endpoint").copied(),
+            Some(2),
+            "Enter settles the staged value with a fresh generation"
+        );
+    }
+
+    #[test]
+    fn immediate_toggle_arms_a_zero_delay_settle() {
+        let mut state = SettingsState::new();
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "audio_transcription_use_local",
+            value: String::new(), // enabled → "" (None collapsed)
+        });
+        assert_eq!(
+            state
+                .field_gen
+                .get("config:audio_transcription_use_local")
+                .copied(),
+            Some(1),
+            "immediate toggle arms a zero-delay settle"
+        );
+    }
+
+    #[test]
+    fn per_role_reasoning_click_arms_immediate_settle_and_role_model_debounces() {
+        let mut state = SettingsState::new();
+
+        // Role reasoning is a discrete button → immediate settle.
+        let _task = state.update(SettingsMessage::RoleReasoning {
+            role: "engineer".to_string(),
+            effort: "high".to_string(),
+        });
+        assert_eq!(
+            state.field_gen.get("role_reasoning:engineer").copied(),
+            Some(1),
+            "reasoning click arms a zero-delay settle"
+        );
+
+        // Role model is a text input → debounced settle (700 ms).
+        let _task = state.update(SettingsMessage::RoleModel {
+            role: "engineer".to_string(),
+            model: "test-model".to_string(),
+        });
+        assert_eq!(
+            state.field_gen.get("role_model:engineer").copied(),
+            Some(1),
+            "role model keystroke arms a debounced settle"
+        );
+        assert_eq!(
+            state.config.per_role_configs[0].model.as_deref(),
+            Some("test-model"),
+            "role model staged in the editable snapshot"
         );
     }
 }

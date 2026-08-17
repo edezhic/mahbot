@@ -193,18 +193,7 @@ fn build_provider_and_transcriber(
 
     // Construct the transcriber eagerly — purely synchronous CPU work with no
     // I/O, so there's no reason to wait until after the warmup HTTP call.
-    let media_transcriber = create_transcriber(
-        Some(&endpoint_str),
-        config.provider_key.as_deref(),
-        Some(
-            resolve_or(
-                config.media_transcription_model.clone(),
-                crate::config::DEFAULT_MEDIA_TRANSCRIPTION_MODEL,
-            )
-            .as_str(),
-        ),
-        non_empty(config.media_transcription_provider.clone()).as_deref(),
-    );
+    let media_transcriber = build_media_transcriber(config);
 
     Ok((provider, media_transcriber))
 }
@@ -251,8 +240,9 @@ pub fn init_global() -> anyhow::Result<()> {
 /// Returns `Ok(())` if the new API key, endpoint, and models are valid
 /// (the provider responds to a warmup request). Does **not** modify the
 /// global `PROVIDER` or `MEDIA_TRANSCRIBER`.
-/// Used by [`save_and_reload`](crate::config::save_and_reload) as a
-/// pre-commit validation step.
+/// Used by the per-field persist path
+/// ([`crate::config::persist_settled_string_field`]) as a pre-commit
+/// validation step.
 pub(crate) async fn warmup_provider_from_config(
     config: &crate::config::ConfigData,
 ) -> anyhow::Result<()> {
@@ -303,6 +293,20 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::
     }
 
     Ok(())
+}
+
+/// Rebuild only the media transcriber singleton from the current `CONFIG`.
+///
+/// Used by the settings page's per-field autosave when a transcription
+/// setting (`media_transcription_model` / `media_transcription_provider`)
+/// settles — the media transcriber captures its model/provider at build time,
+/// so a change must rebuild it, but no provider warmup (network call) is
+/// needed: the provider itself is unaffected by transcription settings.
+pub(crate) fn recreate_media_transcriber() {
+    let config = CONFIG.snapshot();
+    let transcriber = build_media_transcriber(&config);
+    *MEDIA_TRANSCRIBER.write().unwrap_poison() = transcriber;
+    tracing::info!("Media transcriber recreated from updated config");
 }
 
 /// Get the global media transcriber, if a vision model is configured.
@@ -395,6 +399,34 @@ fn create_transcriber(
         .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT)
         .to_string();
     Some(MediaTranscriber::new(base_url, model, route))
+}
+
+/// Build the media transcriber from a config snapshot (synchronous, no I/O).
+///
+/// The transcriber captures its endpoint, model, and provider route at build
+/// time, so a change to any of those config fields requires a rebuild.
+/// Returns `None` when no API key is configured (no vision model can be
+/// used). Shared by the boot/`recreate_all` path
+/// ([`build_provider_and_transcriber`]) and the per-field transcription
+/// autosave ([`recreate_media_transcriber`]).
+#[must_use]
+fn build_media_transcriber(config: &crate::config::ConfigData) -> Option<MediaTranscriber> {
+    let endpoint_str = resolve_or(
+        config.provider_endpoint.clone(),
+        crate::config::DEFAULT_PROVIDER_ENDPOINT,
+    );
+    create_transcriber(
+        Some(&endpoint_str),
+        config.provider_key.as_deref(),
+        Some(
+            resolve_or(
+                config.media_transcription_model.clone(),
+                crate::config::DEFAULT_MEDIA_TRANSCRIPTION_MODEL,
+            )
+            .as_str(),
+        ),
+        non_empty(config.media_transcription_provider.clone()).as_deref(),
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────

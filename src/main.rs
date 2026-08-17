@@ -1064,8 +1064,8 @@ async fn handle_set_model_action(
         answer_telegram_callback(msg, Some(format!("Invalid image model: {e}"))).await;
         return;
     }
-    // Direct-write to config_kv table (bypasses save_and_reload which
-    // triggers provider warmup — unnecessary for a model name change).
+    // Direct-write to config_kv table (bypasses the per-field persist path
+    // which triggers provider warmup — unnecessary for a model name change).
     let store = mahbot::config_db::store();
     if let Err(e) = store.set_kv(config_key, payload).await {
         tracing::error!(config_key, error = %e, "Failed to save {config_key}");

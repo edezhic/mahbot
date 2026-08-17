@@ -73,8 +73,8 @@
 //! | Table | Read | Write |
 //! |---|---|---|
 //! | `config_kv` | [`crate::config_db::ConfigStore::get_all_kv`] | [`crate::config_db::ConfigStore::set_kv`] |
-//! | `config_role` | [`crate::config_db::ConfigStore::get_all_role_configs`] | [`crate::config_db::ConfigStore::save_role_and_routing_configs`] |
-//! | `config_model_routing` | [`crate::config_db::ConfigStore::get_all_model_routings`] | [`crate::config_db::ConfigStore::save_role_and_routing_configs`] |
+//! | `config_role` | [`crate::config_db::ConfigStore::get_all_role_configs`] | [`crate::config_db::ConfigStore::save_role_config`] |
+//! | `config_model_routing` | [`crate::config_db::ConfigStore::get_all_model_routings`] | [`crate::config_db::ConfigStore::save_model_routing`] |
 //!
 //! # Orphaned database keys
 //!
@@ -93,9 +93,7 @@
 //!   at the provider layer.
 
 use crate::Role;
-use crate::config_db::ConfigStore;
 use crate::role::role_info;
-use crate::turso;
 use crate::util::{UnwrapPoison, is_http_url};
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -232,14 +230,14 @@ impl ModelRouting {
 ///
 /// Fields that should NOT be persisted as config KV pairs (runtime-only
 /// caches, reconstructed state) will still appear in `string_fields()`
-/// and thus be written/read by `save_and_reload` / `reload_from_db`.
+/// and thus be written/read by the per-field persist paths / `reload_from_db`.
 /// If you truly need an unpersisted value, use a different type or a
 /// separate data structure — not an `Option<String>` on [`ConfigData`].
 ///
 /// ## UX asymmetry warning
 ///
 /// The GUI Settings page reads [`ConfigData`] directly via [`ConfigReload::snapshot`]
-/// (all fields).  But [`save_and_reload`] persists fields **only** through
+/// (all fields).  But the per-field persist functions persist fields **only** through
 /// [`ConfigData::string_fields`], which is macro-generated.  A field missing from
 /// the macro would appear editable in the GUI but silently discard its value on
 /// every save.  The compiler guard on `ConfigData::STRUCT_FIELDS_DEFAULT` prevents this.
@@ -338,10 +336,11 @@ pub struct ConfigData {
 // ══ UX asymmetry ═══════════════════════════════════════════════════
 //
 // The GUI Settings page reads [`ConfigData`] via [`ConfigReload::snapshot`],
-// which clones every struct field directly.  But [`save_and_reload`]
-// persists **only** through [`ConfigData::string_fields`] (macro-generated).
-// A field missing from the macro would appear editable in the UI but
-// silently discard on save.  The compiler guard above prevents this.
+// which clones every struct field directly.  But the per-field persist
+// functions persist **only** through [`ConfigData::string_fields`]
+// (macro-generated).  A field missing from the macro would appear editable
+// in the UI but silently discard on persist.  The compiler guard above
+// prevents this.
 //
 // ══ Per-field accessor patterns ═════════════════════════════════════
 //
@@ -443,9 +442,9 @@ macro_rules! string_config_fields {
         // ── Generate typed accessors on ConfigReload ────────────
         //
         // Both passes needed: `normalize()` writes canonical values so
-        // `save_and_reload`'s `!=` comparisons against current CONFIG accessors
-        // see no spurious diffs; accessors below re-normalise raw values.
-        // See `config_reload_accessors_roundtrip`.
+        // the per-field persist paths' `!=` comparisons against current
+        // CONFIG accessors see no spurious diffs; accessors below
+        // re-normalise raw values. See `config_reload_accessors_roundtrip`.
         impl ConfigReload {
             $(
                 string_config_fields!(@accessor $field $($annotation)*);
@@ -688,6 +687,24 @@ pub(crate) fn resolve_list_or(
 /// `RwLock<ConfigData>` that can be atomically swapped at runtime.
 pub static CONFIG: ConfigReload = ConfigReload::const_new();
 
+/// Serializes all per-field config persistence (settings-page autosave).
+///
+/// Every settled-field persist runs inside this lock so that:
+/// - read-modify-write sequences (per-role rows, endpoint/key probes built
+///   from the live config) never interleave with each other;
+/// - side-effect settles (provider warmup + recreate, Telegram listener
+///   restart) cannot race, which would let two full config rewrites with
+///   stale snapshots clobber each other's freshly-written rows.
+///
+/// The lock is held across the entire persist — including the provider
+/// warmup network call — so each settle validates and writes against the
+/// latest committed state.
+static CONFIG_PERSIST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn persist_lock() -> &'static tokio::sync::Mutex<()> {
+    CONFIG_PERSIST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Reloadable configuration with atomic swap capability.
 ///
 /// The inner [`ConfigData`] is protected by an [`RwLock`] so readers don't
@@ -774,7 +791,81 @@ impl ConfigReload {
         guard.set_string_field(key, value)
     }
 
+    /// Find the per-role override row by role key (string form), if one exists.
+    ///
+    /// Unlike [`Self::find_role_config`] (which takes the [`Role`] enum),
+    /// this accepts the raw role key as stored in `config_role.role`, so the
+    /// settings page and persistence layer can look rows up without
+    /// re-parsing the key.
+    pub(crate) fn role_config_by_key(&self, role: &str) -> Option<RoleConfig> {
+        let guard = self.read();
+        guard
+            .per_role_configs
+            .iter()
+            .find(|rc| rc.role == role)
+            .cloned()
+    }
+
+    /// Apply a single role-config row to the in-memory config (find-or-push).
+    ///
+    /// When both override fields are `None` the row is removed — an all-None
+    /// row is indistinguishable from having no override, and the removal keeps
+    /// the in-memory representation identical to what [`reload_from_db`]
+    /// would load from the DB after the matching row deletion.
+    pub(crate) fn set_role_config_row(
+        &self,
+        role: &str,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) {
+        let mut guard = self.inner.write().unwrap_poison();
+        if model.is_none() && reasoning_effort.is_none() {
+            guard.per_role_configs.retain(|rc| rc.role != role);
+        } else {
+            RoleConfig::upsert(&mut guard.per_role_configs, role, |rc| {
+                rc.model = model;
+                rc.reasoning_effort = reasoning_effort;
+            });
+        }
+    }
+
+    /// Apply a single model-routing row to the in-memory config (find-or-push).
+    ///
+    /// `Some(false)` on `allow_fallbacks` is meaningful and preserved; only
+    /// `None` + `None` removes the row (mirroring [`ConfigReload::set_role_config_row`]).
+    pub(crate) fn set_model_routing_row(
+        &self,
+        model: &str,
+        provider_order: Option<String>,
+        allow_fallbacks: Option<bool>,
+    ) {
+        let mut guard = self.inner.write().unwrap_poison();
+        if provider_order.is_none() && allow_fallbacks.is_none() {
+            guard.model_routings.retain(|mr| mr.model != model);
+        } else {
+            ModelRouting::upsert(&mut guard.model_routings, model, |mr| {
+                mr.provider_order = provider_order;
+                mr.allow_fallbacks = allow_fallbacks;
+            });
+        }
+    }
+
     // ── Provider routing (per-model) ──────────────────────────
+
+    /// Find the per-model routing row by model key, if one exists.
+    ///
+    /// Unlike [`Self::model_routing`] (which always returns a row, defaulting
+    /// missing entries to all-`None` fields), this returns `None` when no row
+    /// is configured — the settings page uses it to tell "no override" apart
+    /// from "all-None override" when mirroring settled rows.
+    pub(crate) fn model_routing_by_key(&self, model: &str) -> Option<ModelRouting> {
+        let guard = self.read();
+        guard
+            .model_routings
+            .iter()
+            .find(|mr| mr.model == model)
+            .cloned()
+    }
 
     /// Look up the provider routing config for a given model.
     ///
@@ -934,8 +1025,8 @@ pub async fn reload_from_db() -> Result<()> {
     let routings = store.get_all_model_routings().await?;
     config.model_routings = routings;
 
-    // Normalise and sort so the in-memory representation matches
-    // save_and_reload's persistence path.
+    // Normalise and sort so the in-memory representation matches the
+    // per-field persistence paths (see the "Per-field persistence" section).
     config.normalize();
 
     CONFIG.swap(config);
@@ -943,155 +1034,233 @@ pub async fn reload_from_db() -> Result<()> {
     Ok(())
 }
 
-/// Persist a [`ConfigData`] snapshot to the config database, reload runtime
-/// config, and recreate provider/transcriber singletons.
-///
-/// Atomicity guarantee: provider recreation is fully completed **before**
-/// the global [`CONFIG`] singleton is swapped. If recreation fails (transient
-/// network error), the DB has the new config but `CONFIG` and the running
-/// provider/transcriber globals remain unchanged. On the next restart the
-/// new config is loaded from the DB and goes through the full warmup sequence.
-///
-/// If the Telegram bot token changed, the listener is hot-reloaded after the
-/// config is persisted — no full application restart required.
-///
-/// Flow:
-/// 1. Normalize all config values (trim, collapse empty → None, sort vecs).
-/// 2. Validate config values (operates on canonical values after normalization).
-/// 3. Validate new Telegram token (if changed) — fails early without DB mutation.
-/// 4. Warm-up a temporary provider (no global swap yet).
-/// 5. On success: write to DB.
-/// 6. Recreate all provider/transcriber singletons from the new config.
-/// 7. Swap the global [`CONFIG`] singleton.
-/// 8. If Telegram token changed: hot-reload the listener.
-// Write all string config fields to the `config_kv` table within the given
-// transaction.
+// ── Per-field persistence (settings-page autosave) ─────────────────
 //
-// `wake_word_templates` is intentionally **skipped** — it is owned exclusively
-// by the voice pipeline (`persist_enrollment()` in `voice.rs`) and must never
-// be overwritten or deleted by a GUI save from any settings tab.
-pub(crate) async fn write_string_config_fields_to_db(
-    tx: &turso::TxGuard<'_>,
-    config: &ConfigData,
-) -> Result<()> {
-    for (key, value) in config.string_fields() {
-        if key == stringify!(wake_word_templates) {
-            continue;
+// Each settled config field is persisted individually — a single KV row or a
+// single role/routing row — instead of a whole-config rewrite. Every function
+// in this section:
+//
+// 1. Runs under [`persist_lock`] so read-modify-write sequences and
+//    side-effect settles never interleave (see the lock's doc comment).
+// 2. Validates the settled value BEFORE anything is written; on failure the
+//    DB and the in-memory CONFIG are untouched and the error propagates to
+//    the caller for inline display.
+// 3. Applies targeted side effects only for the fields that need them
+//    (provider/transcriber re-init, Telegram listener reload) — never per
+//    keystroke, only when a value settles.
+// 4. Returns the canonical persisted value (trimmed, `None` collapsed to
+//    `""`; `"true"`/`"false"` for the routing-allow toggle) so the caller
+//    can re-sync its display snapshot — the settings page writes exactly
+//    this value back into the editable snapshot for every field type.
+//
+// `wake_word_templates` is excluded from every path: it is owned exclusively
+// by the voice pipeline (`persist_enrollment` in `voice.rs`), which writes
+// the key directly, and any GUI write would create a dual-writer race.
+
+/// Persist a single settled string config field.
+///
+/// `key` must be a `config_kv` key (see [`ConfigData::string_fields`]).
+/// Returns the canonical persisted value.
+pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<String> {
+    let _guard = persist_lock().lock().await;
+    let trimmed = value.trim().to_string();
+
+    // Defense in depth: the settings page renders no control for this key, but
+    // refuse it structurally so no future caller can ever write it here.
+    if key == stringify!(wake_word_templates) {
+        return Ok(CONFIG.wake_word_templates().unwrap_or_default());
+    }
+
+    match key {
+        // Provider endpoint/key changes re-init the provider and transcriber.
+        // Ordering: validate → warmup (pre-commit) → write → recreate
+        // (post-commit). The probe is the live config with only this field
+        // applied, so concurrent changes to other fields are never clobbered
+        // (the persist lock serializes settles anyway).
+        //
+        // Note: the active image model is deliberately NOT re-validated here.
+        // The image-model catalog is endpoint-keyed, and validating the
+        // committed model against the new endpoint would deadlock a provider
+        // switch to a disjoint catalog (endpoint rejects until the model
+        // changes, model rejects until the endpoint changes). The image model
+        // is instead validated when it itself settles, against the then-
+        // committed endpoint — so a switch is two steps (endpoint first, then
+        // model), each independently valid.
+        "provider_endpoint" => {
+            let mut probe = CONFIG.snapshot();
+            let _ = probe.set_string_field("provider_endpoint", &trimmed);
+            probe.normalize();
+            validate_config(&probe)?;
+
+            crate::providers::warmup_provider_from_config(&probe).await?;
+            write_kv_and_update_config("provider_endpoint", &trimmed).await?;
+            crate::providers::recreate_all(&CONFIG.snapshot()).await?;
         }
-        if let Some(v) = value {
-            ConfigStore::set_kv_tx(tx, key, v).await?;
-        } else {
-            ConfigStore::delete_kv_tx(tx, key).await?;
+        "provider_key" => {
+            let mut probe = CONFIG.snapshot();
+            let _ = probe.set_string_field("provider_key", &trimmed);
+            probe.normalize();
+            validate_config(&probe)?;
+            crate::providers::warmup_provider_from_config(&probe).await?;
+            write_kv_and_update_config("provider_key", &trimmed).await?;
+            crate::providers::recreate_all(&CONFIG.snapshot()).await?;
+        }
+        // Telegram token change hot-reloads the listener after the write.
+        "telegram_bot_token" => {
+            let old_token = CONFIG.telegram_bot_token();
+            let new_token = trimmed_or_none(&trimmed);
+            if new_token != old_token
+                && let Some(ref token) = new_token
+            {
+                crate::channels::telegram::TelegramChannel::validate_token(token).await?;
+            }
+            write_kv_and_update_config("telegram_bot_token", &trimmed).await?;
+            let persisted = CONFIG.telegram_bot_token();
+            if persisted != old_token {
+                crate::channels::telegram::restart_telegram_listener(persisted.as_deref()).await?;
+            }
+        }
+        // The active image model must exist in the endpoint-keyed catalog
+        // (fail-open when the catalog is unreachable — matching the
+        // generation tool's semantics). A cleared model falls back to the
+        // default — the model that would actually be used — so it is
+        // validated too.
+        "image_gen_model" => {
+            let endpoint = CONFIG.provider_endpoint();
+            let model_opt = trimmed_or_none(&trimmed);
+            let model: &str = model_opt.as_deref().unwrap_or(DEFAULT_IMAGE_GEN_MODEL);
+            if model != CONFIG.image_gen_model() {
+                crate::tools::image_catalog::validate_image_model_for_endpoint(model, &endpoint)
+                    .await?;
+            }
+            write_kv_and_update_config("image_gen_model", &trimmed).await?;
+        }
+        // Transcription settings rebuild the media transcriber (no provider
+        // warmup — the provider is unaffected by these) and kick the local
+        // transcriber load when it becomes enabled.
+        "media_transcription_model" | "media_transcription_provider" => {
+            write_kv_and_update_config(key, &trimmed).await?;
+            crate::providers::recreate_media_transcriber();
+        }
+        "audio_transcription_use_local" => {
+            write_kv_and_update_config(key, &trimmed).await?;
+            if trimmed != "false" && !crate::audio::local_transcriber::is_loaded() {
+                crate::audio::local_transcriber::try_init_from_cache().await;
+            }
+        }
+        // Everything else is read dynamically at use time — persist only.
+        _ => {
+            write_kv_and_update_config(key, &trimmed).await?;
         }
     }
-    Ok(())
+
+    Ok(trimmed_or_none(&trimmed).unwrap_or_default())
 }
 
-pub async fn save_and_reload(mut config: ConfigData) -> Result<()> {
-    // Normalize BEFORE validation, any DB write, or provider warmup so that:
-    //  1. Validation operates on canonical (trimmed, None-normalized) values.
-    //  2. The database always stores canonical values.
-    //  3. The warmup uses exactly the same values that will be swapped
-    //     into the global CONFIG — no risk of a valid config change being
-    //     rejected due to superficial differences (e.g. leading/trailing
-    //     whitespace) that normalize would have stripped anyway.
-    config.normalize();
+/// Persist a settled per-role model override (`""` clears it).
+///
+/// Preserves the role row's current `reasoning_effort` from the live config,
+/// so a reasoning-effort edit and a model edit on the same role never clobber
+/// each other regardless of arrival order. Returns the canonical model value.
+pub async fn persist_settled_role_model(role: &str, model: &str) -> Result<String> {
+    let _guard = persist_lock().lock().await;
+    let model = trimmed_or_none(model);
+    let reasoning = CONFIG
+        .role_config_by_key(role)
+        .and_then(|rc| rc.reasoning_effort);
+    save_role_row(role, model, reasoning).await
+}
 
-    validate_config(&config)?;
+/// Persist a settled per-role reasoning-effort override.
+///
+/// Preserves the role row's current `model` from the live config. Returns the
+/// canonical effort value (the settled effort trimmed, `None` collapsed to
+/// `""` — NOT the row's preserved model).
+pub async fn persist_settled_role_reasoning(role: &str, effort: &str) -> Result<String> {
+    let _guard = persist_lock().lock().await;
+    let effort = trimmed_or_none(effort);
+    let model = CONFIG.role_config_by_key(role).and_then(|rc| rc.model);
+    save_role_row(role, model, effort.clone()).await?;
+    Ok(effort.unwrap_or_default())
+}
 
-    // Write-time validation of the active image-generation model: fail fast
-    // when the catalog is available and the model cannot generate images.
-    // Runs when the effective active model changes OR the provider endpoint
-    // does (the catalog is endpoint-keyed, so an endpoint switch can silently
-    // invalidate the active model), and validates against the endpoint being
-    // saved. A cleared model field falls back to the default — the model that
-    // would actually be used — so it is validated too. Fail-open when the
-    // catalog is unreachable (matches the generation tool's semantics).
-    let endpoint = config
-        .provider_endpoint
-        .as_deref()
-        .unwrap_or(DEFAULT_PROVIDER_ENDPOINT);
-    let model = config
-        .image_gen_model
-        .as_deref()
-        .unwrap_or(DEFAULT_IMAGE_GEN_MODEL);
-    if model != CONFIG.image_gen_model() || endpoint != CONFIG.provider_endpoint() {
-        crate::tools::image_catalog::validate_image_model_for_endpoint(model, endpoint).await?;
-    }
+/// Persist a settled per-model routing `provider_order` (`""` clears it).
+///
+/// Preserves the row's current `allow_fallbacks` from the live config.
+/// Returns the canonical order value.
+pub async fn persist_settled_routing_order(model: &str, order: &str) -> Result<String> {
+    let _guard = persist_lock().lock().await;
+    let order = trimmed_or_none(order);
+    let allow = CONFIG.model_routing(model).allow_fallbacks;
+    save_routing_row(model, order, allow).await
+}
 
-    // Capture old Telegram token BEFORE we mutate DB so we can detect
-    // changes and trigger hot-reload after persistence succeeds.
-    let old_token = CONFIG.telegram_bot_token();
+/// Persist a settled per-model routing `allow_fallbacks` toggle.
+///
+/// Preserves the row's current `provider_order` from the live config.
+/// Returns the canonical allow value (`"true"`/`"false"`) so the caller can
+/// re-sync its display snapshot — the row's order is unchanged by this call.
+pub async fn persist_settled_routing_allow(model: &str, allow: bool) -> Result<String> {
+    let _guard = persist_lock().lock().await;
+    let order = CONFIG.model_routing(model).provider_order;
+    save_routing_row(model, order, Some(allow)).await?;
+    Ok(allow.to_string())
+}
 
-    // If the token changed and the new token is non-empty, validate it
-    // early — before any DB write. If validation fails, nothing has been
-    // mutated and the existing listener keeps running.
-    if config.telegram_bot_token != old_token
-        && let Some(ref new_token) = config.telegram_bot_token
-    {
-        crate::channels::telegram::TelegramChannel::validate_token(new_token).await?;
-    }
-
-    // ── Pre-commit warmup (no global swap) ─────────────────────
-    // If this fails, nothing has changed — CONFIG, PROVIDER, and DB are untouched.
-    crate::providers::warmup_provider_from_config(&config).await?;
-
+/// Write a single role row (UPSERT or DELETE-if-empty) and mirror it into the
+/// in-memory CONFIG. Caller holds [`persist_lock`].
+async fn save_role_row(
+    role: &str,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<String> {
     let store = crate::config_db::store();
+    store
+        .save_role_config(role, model.as_deref(), reasoning_effort.as_deref())
+        .await?;
+    CONFIG.set_role_config_row(role, model.clone(), reasoning_effort);
+    Ok(model.unwrap_or_default())
+}
 
-    // Write all KV pairs, per-role configs, AND per-model routings inside a
-    // single transaction so a crash between writes doesn't leave inconsistent
-    // partial state on restart.
-    //
-    // NOTE: `wake_word_templates` is intentionally SKIPPED by the helper
-    // below — it is managed exclusively by the voice pipeline via
-    // `persist_enrollment()` which writes directly to the config_kv table and
-    // updates CONFIG independently.  Including it in the save loop would
-    // create a dual-writer race where a save from any settings tab could
-    // silently overwrite or delete freshly-enrolled templates.
-    let tx = store.conn.begin_tx().await?;
-    write_string_config_fields_to_db(&tx, &config).await?;
-    ConfigStore::save_role_and_routing_configs_tx(
-        &tx,
-        &config.per_role_configs,
-        &config.model_routings,
-    )
-    .await?;
-    tx.commit().await?;
+/// Write a single routing row (UPSERT or DELETE-if-empty) and mirror it into
+/// the in-memory CONFIG. Caller holds [`persist_lock`].
+async fn save_routing_row(
+    model: &str,
+    order: Option<String>,
+    allow: Option<bool>,
+) -> Result<String> {
+    let store = crate::config_db::store();
+    store
+        .save_model_routing(model, order.as_deref(), allow)
+        .await?;
+    CONFIG.set_model_routing_row(model, order.clone(), allow);
+    Ok(order.unwrap_or_default())
+}
 
-    // Recreate provider/transcriber singletons from the new config BEFORE
-    // swapping CONFIG. If this fails (transient network error), the database
-    // has the new config but CONFIG and the running globals remain unchanged.
-    // On restart the new config goes through the full warmup sequence.
-    crate::providers::recreate_all(&config).await?;
-    tracing::info!("Provider and transcriber singletons recreated from new config");
-
-    // Publish so readers see the latest values.
-    let new_token = config.telegram_bot_token.clone();
-
-    // Preserve `wake_word_templates` from the current CONFIG so that
-    // templates enrolled between the SettingsState snapshot and the Save
-    // click are not overwritten by stale snapshot data.  This key is owned
-    // exclusively by the voice pipeline — `write_string_config_fields_to_db`
-    // already skips it in the DB write loop above.
-    if let Some(templates) = CONFIG.wake_word_templates() {
-        config.wake_word_templates = Some(templates);
+/// Write a single `config_kv` row (delete when the value is empty after
+/// trimming) and mirror it into the in-memory CONFIG. Caller holds
+/// [`persist_lock`].
+async fn write_kv_and_update_config(key: &str, trimmed: &str) -> Result<()> {
+    // Reject unknown keys BEFORE touching the DB: `set_string_field` is
+    // deliberately lenient (returns `false` for unrecognised keys, leaving
+    // CONFIG untouched), and writing a row the in-memory config never
+    // mirrors would create an orphaned DB entry. Defensive — the settings
+    // page only renders known keys — but keeps a typo'd or future key from
+    // silently diverging the DB and CONFIG.
+    if !ConfigData::STRUCT_FIELDS_DEFAULT
+        .string_fields()
+        .iter()
+        .any(|(known, _)| *known == key)
+    {
+        anyhow::bail!("unknown config field: {key}");
     }
-
-    CONFIG.swap(config);
-    tracing::info!("Config saved and swapped into runtime");
-
-    // Do this AFTER the DB and CONFIG have been updated so the
-    // running listener reflects the persisted state.
-    if new_token != old_token {
-        tracing::info!(
-            old = ?old_token,
-            new = ?new_token,
-            "Telegram bot token changed — restarting listener",
-        );
-        crate::channels::telegram::restart_telegram_listener(new_token.as_deref()).await?;
+    let store = crate::config_db::store();
+    if trimmed.is_empty() {
+        store.delete_kv(key).await?;
+    } else {
+        store.set_kv(key, trimmed).await?;
     }
-
-    tracing::info!("Config saved and reloaded successfully");
+    let _ = CONFIG.set_string_field(key, trimmed);
     Ok(())
 }
 
@@ -1655,34 +1824,40 @@ mod tests {
         );
     }
 
-    /// When `save_and_reload` swaps the config, `wake_word_templates` that
-    /// were set after the snapshot was taken must be preserved in the new config
-    /// — otherwise a stale-snapshot `None` would silently erase them.
-    #[test]
-    fn save_and_reload_preserves_wake_word_templates_in_config() {
-        let reload = ConfigReload::const_new();
-
-        // Simulate: templates were enrolled (persist_enrollment updated CONFIG).
+    /// The per-field persist path must never write or delete
+    /// `wake_word_templates` — the key is owned exclusively by the voice
+    /// pipeline (`persist_enrollment`), and `persist_settled_string_field`
+    /// refuses it structurally (defense in depth) so no future caller can
+    /// accidentally create a dual-writer race.
+    ///
+    /// This test swaps the shared global CONFIG, so it joins the
+    /// `config_persist` serial group used by the config_db persist tests —
+    /// an unserialized restore swap could clobber a concurrent serialized
+    /// test's CONFIG writes and fail its asserts nondeterministically.
+    #[tokio::test]
+    #[serial_test::serial(config_persist)]
+    async fn persist_settled_string_field_refuses_wake_word_templates() {
+        // Templates enrolled by the voice pipeline.
         let template_json = r#"{"classifier":null}"#;
+        let original = CONFIG.snapshot();
         let mut enrolled = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(enrolled.set_string_field("wake_word_templates", template_json));
-        reload.swap(enrolled);
+        CONFIG.swap(enrolled);
 
-        // Simulate: a stale SettingsState snapshot has wake_word_templates = None.
-        let mut stale_snapshot = ConfigData::STRUCT_FIELDS_DEFAULT;
-        stale_snapshot.wake_word_templates = None;
-
-        // Run the same preservation logic that save_and_reload uses.
-        if let Some(templates) = reload.wake_word_templates() {
-            stale_snapshot.wake_word_templates = Some(templates);
-        }
-        reload.swap(stale_snapshot);
-
-        // Verify: templates survived the swap despite None in snapshot.
+        // The guard returns the current templates and never touches the DB —
+        // the call must not error and must not alter CONFIG.
+        let result = persist_settled_string_field("wake_word_templates", "garbage").await;
         assert_eq!(
-            reload.wake_word_templates(),
-            Some(template_json.to_string()),
-            "wake_word_templates must be preserved even when snapshot has None"
+            result.unwrap(),
+            template_json,
+            "guard must return the current templates unchanged"
         );
+        assert_eq!(
+            CONFIG.wake_word_templates(),
+            Some(template_json.to_string()),
+            "CONFIG wake_word_templates must be untouched"
+        );
+
+        CONFIG.swap(original);
     }
 }

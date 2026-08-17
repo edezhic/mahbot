@@ -104,6 +104,21 @@ const SET_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
 
 const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 
+// ── Per-row UPSERT / DELETE (config_role, config_model_routing) ──
+
+const UPSERT_ROLE_CONFIG_SQL: &str = "INSERT INTO config_role (role, model, reasoning_effort) VALUES (?1, ?2, ?3) \
+     ON CONFLICT(role) DO UPDATE SET \
+         model = excluded.model, reasoning_effort = excluded.reasoning_effort";
+
+const DELETE_ROLE_CONFIG_SQL: &str = "DELETE FROM config_role WHERE role = ?1";
+
+const UPSERT_MODEL_ROUTING_SQL: &str = "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
+     VALUES (?1, ?2, ?3) \
+     ON CONFLICT(model) DO UPDATE SET \
+         provider_order = excluded.provider_order, allow_fallbacks = excluded.allow_fallbacks";
+
+const DELETE_MODEL_ROUTING_SQL: &str = "DELETE FROM config_model_routing WHERE model = ?1";
+
 impl ConfigStore {
     // ── config_kv ────────────────────────────────────────────
 
@@ -166,88 +181,65 @@ impl ConfigStore {
         .await
     }
 
-    // ── batch save (role configs + model routings) ──────────────
+    // ── per-row save (role configs / model routings) ─────────────
+    //
+    // Used by the settings page's per-field autosave: each editable row is
+    // persisted individually (UPSERT, or DELETE once both override columns
+    // are `None` — an all-None row is indistinguishable from having no
+    // override, and the role's built-in defaults resolve identically either
+    // way).
 
-    /// Atomically replace all role configs and model routings in a single
-    /// transaction.
-    ///
-    /// Old rows are deleted with a blanket `DELETE` (no per-role iteration),
-    /// which is both simpler and prevents stale rows from surviving when a role
-    /// is removed from the enum.  The enclosing transaction guarantees that a
-    /// crash or error before commit rolls back to the prior state — partial
-    /// writes from the two tables are never visible.
-    pub async fn save_role_and_routing_configs(
+    /// Save a single `config_role` row: UPSERT, or DELETE when both override
+    /// fields are `None` (an all-None row is indistinguishable from having no
+    /// override — the role's built-in defaults resolve identically either way).
+    pub async fn save_role_config(
         &self,
-        role_configs: &[RoleConfig],
-        model_routings: &[ModelRouting],
+        role: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
     ) -> Result<()> {
-        let tx = self.conn.begin_tx().await?;
-        Self::save_role_and_routing_configs_tx(&tx, role_configs, model_routings).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Same as [`save_role_and_routing_configs`] but operates on an existing
-    /// transaction provided by the caller.  The caller is responsible for
-    /// calling `commit()` or `rollback()` on the [`turso::TxGuard`].
-    ///
-    /// # Deadlock safety
-    ///
-    /// This method does NOT call `begin_tx()` or `commit()` internally —
-    /// it uses the supplied `tx` directly, making it safe to call from within
-    /// an outer transaction without deadlocking on the connection mutex.
-    pub(crate) async fn save_role_and_routing_configs_tx(
-        tx: &turso::TxGuard<'_>,
-        role_configs: &[RoleConfig],
-        model_routings: &[ModelRouting],
-    ) -> Result<()> {
-        tx.execute("DELETE FROM config_role", turso::params![])
-            .await?;
-        let insert_role_sql =
-            format!("INSERT INTO config_role ({ROLE_CONFIG_COLUMNS}) VALUES (?1, ?2, ?3)");
-        for rc in role_configs {
-            tx.execute(
-                &insert_role_sql,
-                turso::params![
-                    rc.role.as_str(),
-                    rc.model.as_deref(),
-                    rc.reasoning_effort.as_deref()
-                ],
-            )
-            .await?;
-        }
-        tx.execute("DELETE FROM config_model_routing", turso::params![])
-            .await?;
-        let insert_routing_sql = format!(
-            "INSERT INTO config_model_routing ({MODEL_ROUTING_COLUMNS}) VALUES (?1, ?2, ?3)"
-        );
-        for mr in model_routings {
-            let allow_int = mr.allow_fallbacks.map(i32::from);
-            tx.execute(
-                &insert_routing_sql,
-                turso::params![mr.model.as_str(), mr.provider_order.as_deref(), allow_int],
-            )
-            .await?;
+        if model.is_none() && reasoning_effort.is_none() {
+            self.conn
+                .execute(DELETE_ROLE_CONFIG_SQL, turso::params![role])
+                .await?;
+        } else {
+            self.conn
+                .execute(
+                    UPSERT_ROLE_CONFIG_SQL,
+                    turso::params![role, model, reasoning_effort],
+                )
+                .await?;
         }
         Ok(())
     }
 
-    // ── config_kv — tx-aware variants ─────────────────────────
-
-    /// Upsert a key-value pair within an existing transaction.
-    /// Like [`set_kv`] but executes on the supplied [`turso::TxGuard`].
-    pub(crate) async fn set_kv_tx(tx: &turso::TxGuard<'_>, key: &str, value: &str) -> Result<()> {
-        tx.execute(SET_KV_SQL, turso::params![key, value]).await?;
+    /// Save a single `config_model_routing` row: UPSERT, or DELETE when both
+    /// override fields are `None`. `Some(false)` on `allow_fallbacks` is
+    /// meaningful (explicitly disables fallbacks at request time) and is
+    /// therefore preserved — only `None` + `None` deletes.
+    pub async fn save_model_routing(
+        &self,
+        model: &str,
+        provider_order: Option<&str>,
+        allow_fallbacks: Option<bool>,
+    ) -> Result<()> {
+        if provider_order.is_none() && allow_fallbacks.is_none() {
+            self.conn
+                .execute(DELETE_MODEL_ROUTING_SQL, turso::params![model])
+                .await?;
+        } else {
+            let allow_int = allow_fallbacks.map(i32::from);
+            self.conn
+                .execute(
+                    UPSERT_MODEL_ROUTING_SQL,
+                    turso::params![model, provider_order, allow_int],
+                )
+                .await?;
+        }
         Ok(())
     }
 
-    /// Delete a key-value pair within an existing transaction.
-    /// Like [`delete_kv`] but executes on the supplied [`turso::TxGuard`].
-    /// Succeeds even if the key does not exist.
-    pub(crate) async fn delete_kv_tx(tx: &turso::TxGuard<'_>, key: &str) -> Result<()> {
-        tx.execute(DELETE_KV_SQL, turso::params![key]).await?;
-        Ok(())
-    }
+    // ── config_kv ────────────────────────────────────────────
 
     /// Execute a read-only query with a row mapper, collecting all results into
     /// a `Vec`.  Shared implementation for all `get_all_*` methods.
@@ -284,144 +276,6 @@ mod tests {
     async fn setup() -> (ConfigStore, TempDir) {
         crate::open_test_store!(ConfigStore, "config")
     }
-
-    // ── Parameterised lifecycle tests (role + routing) ─────────
-    //
-    // Both config_role and config_model_routing share the same 6-step lifecycle
-    // against save_role_and_routing_configs.  A macro eliminates the structural
-    // duplication while keeping the per-type data fully explicit.
-    //
-    // Each step tuple is (roles, routings, expected, message):
-    //   roles/routings  — data passed to save_role_and_routing_configs
-    //   expected        — value that get_all_role_configs / get_all_model_routings
-    //                     must return after the save
-    //   message         — assertion label for the step
-
-    macro_rules! lifecycle_test {
-        (
-            $name:ident,
-            $getter:ident,
-            [$((
-                $roles:expr,
-                $routings:expr,
-                $expected:expr,
-                $msg:expr
-            )),+ $(,)?]
-        ) => {
-            #[tokio::test]
-            #[allow(clippy::too_many_lines)]
-            async fn $name() {
-                let (store, _dir) = setup().await;
-
-                // 1. empty state
-                let all = store.$getter().await.unwrap();
-                assert!(
-                    all.is_empty(),
-                    "get_all should return empty vec for empty table"
-                );
-
-                $(
-                    let roles: Vec<RoleConfig> = $roles;
-                    let routings: Vec<ModelRouting> = $routings;
-                    let expected = $expected;
-
-                    store
-                        .save_role_and_routing_configs(&roles, &routings)
-                        .await
-                        .unwrap();
-
-                    let all = store.$getter().await.unwrap();
-                    assert_eq!(all, expected, $msg);
-                )+
-            }
-        };
-    }
-
-    lifecycle_test!(
-        test_config_role_lifecycle,
-        get_all_role_configs,
-        [
-            (
-                vec![role_config("engineer", Some("test-model"), Some("high"))],
-                vec![],
-                vec![role_config("engineer", Some("test-model"), Some("high"))],
-                "save should persist item"
-            ),
-            (
-                vec![role_config("engineer", Some("test-model"), None)],
-                vec![],
-                vec![role_config("engineer", Some("test-model"), None)],
-                "save with None nullable should persist NULL"
-            ),
-            (
-                vec![role_config("engineer", Some("test-model"), Some("low"))],
-                vec![],
-                vec![role_config("engineer", Some("test-model"), Some("low"))],
-                "save should fully replace existing row"
-            ),
-            (
-                vec![
-                    role_config("engineer", Some("test-model"), Some("low")),
-                    role_config("reviewer", Some("test-model"), None),
-                ],
-                vec![],
-                vec![
-                    role_config("engineer", Some("test-model"), Some("low")),
-                    role_config("reviewer", Some("test-model"), None),
-                ],
-                "get_all should return all rows sorted by key"
-            ),
-            (
-                vec![role_config("reviewer", Some("test-model"), None)],
-                vec![],
-                vec![role_config("reviewer", Some("test-model"), None),],
-                "only the saved item should remain after replacement"
-            ),
-        ]
-    );
-
-    lifecycle_test!(
-        test_config_model_routing_lifecycle,
-        get_all_model_routings,
-        [
-            (
-                vec![],
-                vec![model_routing("test-model", Some("OpenAI"), Some(true))],
-                vec![model_routing("test-model", Some("OpenAI"), Some(true))],
-                "save should persist item"
-            ),
-            (
-                vec![],
-                vec![model_routing("test-model", Some("Azure"), None)],
-                vec![model_routing("test-model", Some("Azure"), None)],
-                "save with None nullable should persist NULL"
-            ),
-            (
-                vec![],
-                vec![model_routing("test-model", Some("OpenRouter"), Some(false))],
-                vec![model_routing("test-model", Some("OpenRouter"), Some(false))],
-                "save should fully replace existing row"
-            ),
-            (
-                vec![],
-                vec![
-                    model_routing("test-model-a", None, Some(true)),
-                    model_routing("test-model-b", Some("OpenRouter"), Some(false)),
-                ],
-                vec![
-                    model_routing("test-model-a", None, Some(true)),
-                    model_routing("test-model-b", Some("OpenRouter"), Some(false)),
-                ],
-                "get_all should return all rows sorted by key"
-            ),
-            (
-                vec![],
-                vec![model_routing("test-model", None, Some(true))],
-                vec![model_routing("test-model", None, Some(true)),],
-                "only the saved item should remain after replacement"
-            ),
-        ]
-    );
 
     // ── config_kv lifecycle ──────────────────────────────────
     //
@@ -485,138 +339,130 @@ mod tests {
         );
     }
 
-    // ── save_role_and_routing_configs ──────────────────────────
+    // ── Per-row save (settings-page autosave) ─────────────────────
 
-    /// Save role configs and model routings, then verify the saved data
-    /// matches input. Input slices are sorted to match DB ORDER BY.
-    async fn assert_save_configs(
-        store: &ConfigStore,
-        role_configs: &[RoleConfig],
-        model_routings: &[ModelRouting],
-    ) {
-        let mut roles = role_configs.to_vec();
-        let mut routings = model_routings.to_vec();
-        roles.sort_by(|a, b| a.role.cmp(&b.role));
-        routings.sort_by(|a, b| a.model.cmp(&b.model));
-        store
-            .save_role_and_routing_configs(&roles, &routings)
-            .await
-            .unwrap();
-        let saved_roles = store.get_all_role_configs().await.unwrap();
-        assert_eq!(saved_roles, roles, "saved role configs should match input");
-        let saved_routings = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            saved_routings, routings,
-            "saved model routings should match input"
-        );
-    }
-
+    /// `save_role_config` UPSERTs a row and DELETE-if-empty removes it once
+    /// both override columns are `None`; clearing a single column keeps the
+    /// row.
     #[tokio::test]
-    async fn test_save_role_and_routing_configs_replaces_old_rows() {
+    async fn test_save_role_config_upsert_and_delete_if_empty() {
         let (store, _dir) = setup().await;
 
-        // Pre-insert initial data
-        assert_save_configs(
-            &store,
-            &[role_config("manager", Some("old-model"), Some("low"))],
-            &[model_routing("old-model", Some("OldProvider"), Some(false))],
-        )
-        .await;
-
-        // Replace with completely different data
-        assert_save_configs(
-            &store,
-            &[role_config("qa", Some("new-model"), None)],
-            &[
-                model_routing("fallback-model", None, None),
-                model_routing("new-model", Some("NewProvider"), Some(true)),
-            ],
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_save_role_and_routing_configs_empty_slices() {
-        let (store, _dir) = setup().await;
-
-        // Pre-insert some data via the production batch path
+        // New row.
         store
-            .save_role_and_routing_configs(
-                &[role_config("should-be-cleared", Some("x"), None)],
-                &[model_routing("should-be-cleared", Some("y"), Some(true))],
-            )
+            .save_role_config("engineer", Some("m1"), None)
             .await
             .unwrap();
+        let all = store.get_all_role_configs().await.unwrap();
+        assert_eq!(
+            all,
+            vec![role_config("engineer", Some("m1"), None)],
+            "new row persisted"
+        );
 
-        // Save with empty slices — should clear both tables
-        assert_save_configs(&store, &[], &[]).await;
-    }
-
-    #[tokio::test]
-    async fn test_save_role_and_routing_configs_duplicate_key_returns_err() {
-        let (store, dir) = setup().await;
-
-        // Open a second connection *before* any transaction starts on the
-        // first one, so the schema DDL write can complete without lock
-        // contention.  Because SQLite's default isolation ensures that a
-        // separate connection never sees uncommitted changes from another
-        // connection, reading from `second` after a failed transaction proves
-        // that no durable trace was left.
-        let second = ConfigStore::open(dir.path()).await.unwrap();
-
-        // Pre-populate with known data.
-        let mut original_roles = vec![
-            role_config("alpha", Some("m1"), None),
-            role_config("beta", Some("m2"), Some("low")),
-        ];
-        let mut original_routings = vec![model_routing("m1", Some("ProviderX"), Some(true))];
-        original_roles.sort_by(|a, b| a.role.cmp(&b.role));
-        original_routings.sort_by(|a, b| a.model.cmp(&b.model));
+        // UPSERT over the same role replaces both columns.
         store
-            .save_role_and_routing_configs(&original_roles, &original_routings)
+            .save_role_config("engineer", Some("m2"), Some("high"))
             .await
             .unwrap();
-
-        // Attempt to save rows with a duplicate role key.
-        // The second INSERT will hit the PRIMARY KEY constraint and fail.
-        let conflicting_roles = vec![
-            role_config("collides", Some("first"), None),
-            role_config("collides", Some("second"), Some("high")),
-        ];
-        let result = store
-            .save_role_and_routing_configs(&conflicting_roles, &[])
-            .await;
-        assert!(result.is_err(), "duplicate role key should cause an error");
-
-        // Read from the separate connection — only committed state is visible,
-        // proving the failed transaction had no permanent effect.
-        let saved_roles = second.get_all_role_configs().await.unwrap();
+        let all = store.get_all_role_configs().await.unwrap();
         assert_eq!(
-            saved_roles, original_roles,
-            "role configs should be unchanged after rollback"
+            all,
+            vec![role_config("engineer", Some("m2"), Some("high"))],
+            "upsert replaces both columns"
         );
 
-        let saved_routings = second.get_all_model_routings().await.unwrap();
+        // Clearing only the model keeps the row (reasoning still set).
+        store
+            .save_role_config("engineer", None, Some("medium"))
+            .await
+            .unwrap();
+        let all = store.get_all_role_configs().await.unwrap();
         assert_eq!(
-            saved_routings, original_routings,
-            "model routings should be unchanged after rollback"
+            all,
+            vec![role_config("engineer", None, Some("medium"))],
+            "single-column clear keeps the row"
         );
+
+        // Both None → row deleted (all-None row == no override).
+        store
+            .save_role_config("engineer", None, None)
+            .await
+            .unwrap();
+        let all = store.get_all_role_configs().await.unwrap();
+        assert!(all.is_empty(), "all-None row deleted");
     }
 
-    /// `save_and_reload` must NOT overwrite or delete the `wake_word_templates`
-    /// [`write_string_config_fields_to_db`] intentionally skips the
-    /// `wake_word_templates` key because that key is owned exclusively by the voice pipeline
-    /// (`persist_enrollment`).  This test delegates to the shared helper
-    /// [`crate::config::write_string_config_fields_to_db`] — the same helper
-    /// that `save_and_reload` uses — so any change to the skip logic is
-    /// automatically reflected here.
+    /// `save_model_routing` UPSERTs a row and DELETE-if-empty removes it only
+    /// when BOTH columns are `None` — `Some(false)` on `allow_fallbacks` is
+    /// meaningful (explicitly disables fallbacks) and must survive.
     #[tokio::test]
-    async fn test_write_string_config_fields_skips_wake_word_templates() {
-        use crate::config::ConfigData;
-
+    async fn test_save_model_routing_upsert_and_delete_if_empty() {
         let (store, _dir) = setup().await;
 
-        // Simulate a freshly-enrolled template set.
+        // `Some(false)` is meaningful: row persists with order None.
+        store
+            .save_model_routing("test-model", None, Some(false))
+            .await
+            .unwrap();
+        let all = store.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            all,
+            vec![model_routing("test-model", None, Some(false))],
+            "Some(false) allow_fallbacks persists with None order"
+        );
+
+        // UPSERT replaces both columns.
+        store
+            .save_model_routing("test-model", Some("OpenAI"), Some(true))
+            .await
+            .unwrap();
+        let all = store.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            all,
+            vec![model_routing("test-model", Some("OpenAI"), Some(true))],
+            "upsert replaces both columns"
+        );
+
+        // Clearing only the order keeps the row (allow_fallbacks still set).
+        store
+            .save_model_routing("test-model", None, Some(true))
+            .await
+            .unwrap();
+        let all = store.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            all,
+            vec![model_routing("test-model", None, Some(true))],
+            "single-column clear keeps the row"
+        );
+
+        // Both None → row deleted.
+        store
+            .save_model_routing("test-model", None, None)
+            .await
+            .unwrap();
+        let all = store.get_all_model_routings().await.unwrap();
+        assert!(all.is_empty(), "all-None row deleted");
+    }
+
+    /// The per-field persist path must never overwrite or delete the
+    /// `wake_word_templates` key — it is owned exclusively by the voice
+    /// pipeline (`persist_enrollment`). `persist_settled_string_field`
+    /// refuses the key structurally; this test verifies both the guard and
+    /// that persisting an unrelated field leaves the enrolled templates row
+    /// untouched.
+    #[tokio::test]
+    #[serial_test::serial(config_persist)]
+    async fn test_persist_settled_never_touches_wake_word_templates() {
+        crate::util::test::init_test_stores().await;
+        let store = crate::config_db::store();
+        // Restore the global CONFIG on exit: the firecrawl_key persist below
+        // mutates it, and leaving the key set with its DB row deleted would
+        // leak a phantom web-search key into parallel agent tests.
+        let original = crate::config::CONFIG.snapshot();
+
+        // Simulate a freshly-enrolled template set (clean slate first — the
+        // global test store is shared across serialized persist tests).
         let template_json =
             r#"{"templates":[{"name":"hey","embeddings":[[0.1]],"threshold":0.5}]}"#;
         store
@@ -624,24 +470,238 @@ mod tests {
             .await
             .unwrap();
 
-        // Build a config that has wake_word_templates = None (as would happen
-        // if the SettingsState snapshot was taken before enrollment).
-        let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
-        config.wake_word_templates = None;
-
-        // Use the same helper that `save_and_reload` calls.
-        let tx = store.conn.begin_tx().await.unwrap();
-        crate::config::write_string_config_fields_to_db(&tx, &config)
+        // 1. The guard itself: calling persist on the key is a no-op.
+        crate::config::persist_settled_string_field("wake_word_templates", "garbage")
             .await
             .unwrap();
-        tx.commit().await.unwrap();
-
-        // Verify: wake_word_templates survived despite being None in config.
         let saved = store.get_kv("wake_word_templates").await.unwrap();
         assert_eq!(
             saved.as_deref(),
             Some(template_json),
-            "wake_word_templates must NOT be deleted by save_and_reload's write loop"
+            "guard must not overwrite the enrolled templates"
         );
+
+        // 2. An unrelated field persist must not delete the templates row.
+        crate::config::persist_settled_string_field("firecrawl_key", "fc-test-key")
+            .await
+            .unwrap();
+        let saved = store.get_kv("wake_word_templates").await.unwrap();
+        assert_eq!(
+            saved.as_deref(),
+            Some(template_json),
+            "persisting another field must not delete wake_word_templates"
+        );
+
+        // 3. The unrelated field itself must be persisted.
+        assert_eq!(
+            store.get_kv("firecrawl_key").await.unwrap().as_deref(),
+            Some("fc-test-key"),
+            "the unrelated field itself must be persisted"
+        );
+
+        // Clean up the shared store.
+        let _ = store.delete_kv("wake_word_templates").await;
+        let _ = store.delete_kv("firecrawl_key").await;
+        crate::config::CONFIG.swap(original);
+    }
+
+    // ── Per-field persist orchestration (global store) ─────────────
+    //
+    // `persist_settled_*` writes through the global `CONFIG_STORE` and the
+    // global `CONFIG` singleton, so these tests share `init_test_stores()`
+    // and are serialized (and clean up their rows) to avoid cross-test
+    // interference.
+
+    /// Invalid settled values are rejected before anything is written: the
+    /// endpoint must be a valid URL and the provider key must not be the
+    /// placeholder — the safety requirement "an invalid settled value must
+    /// never be persisted".
+    #[tokio::test]
+    #[serial_test::serial(config_persist)]
+    async fn test_persist_settled_rejects_invalid_values_before_writing() {
+        crate::util::test::init_test_stores().await;
+        let store = crate::config_db::store();
+        let _ = store.delete_kv("provider_endpoint").await;
+        let _ = store.delete_kv("provider_key").await;
+
+        let err = crate::config::persist_settled_string_field("provider_endpoint", "not-a-url")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("valid URL"),
+            "endpoint without scheme rejected: {err}"
+        );
+        assert!(
+            store.get_kv("provider_endpoint").await.unwrap().is_none(),
+            "rejected endpoint must not be written"
+        );
+
+        let err = crate::config::persist_settled_string_field("provider_key", "sk-or-v1-...")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("placeholder"),
+            "placeholder key rejected: {err}"
+        );
+        assert!(
+            store.get_kv("provider_key").await.unwrap().is_none(),
+            "rejected key must not be written"
+        );
+    }
+
+    /// A plain field (no side effects) persists its trimmed canonical value,
+    /// and clearing it deletes the row.
+    #[tokio::test]
+    #[serial_test::serial(config_persist)]
+    async fn test_persist_settled_plain_field_trims_and_clears() {
+        crate::util::test::init_test_stores().await;
+        let store = crate::config_db::store();
+        let _ = store.delete_kv("exa_key").await;
+        // Restore the global CONFIG on exit: the persists below mutate
+        // `CONFIG.exa_key` and must not leak the value into parallel tests.
+        let original = crate::config::CONFIG.snapshot();
+
+        let persisted = crate::config::persist_settled_string_field("exa_key", "  exa-abc  ")
+            .await
+            .unwrap();
+        assert_eq!(persisted, "exa-abc", "canonical trimmed value returned");
+        assert_eq!(
+            store.get_kv("exa_key").await.unwrap().as_deref(),
+            Some("exa-abc"),
+            "trimmed value persisted"
+        );
+        assert_eq!(
+            crate::config::CONFIG.exa_key().as_deref(),
+            Some("exa-abc"),
+            "in-memory CONFIG mirrors the persisted value"
+        );
+
+        let persisted = crate::config::persist_settled_string_field("exa_key", "   ")
+            .await
+            .unwrap();
+        assert_eq!(persisted, "", "cleared value returns empty");
+        assert!(
+            store.get_kv("exa_key").await.unwrap().is_none(),
+            "cleared value deletes the row"
+        );
+        crate::config::CONFIG.swap(original);
+    }
+
+    /// A per-role model settle preserves the row's reasoning effort from the
+    /// live config (the two columns are edited independently), and clearing
+    /// the model keeps the row when reasoning is still set.
+    #[tokio::test]
+    #[serial_test::serial(config_persist)]
+    async fn test_persist_settled_role_model_preserves_reasoning_effort() {
+        crate::util::test::init_test_stores().await;
+        let store = crate::config_db::store();
+        let original = crate::config::CONFIG.snapshot();
+
+        // Seed the live row (as a prior reasoning-effort settle would).
+        crate::config::CONFIG.set_role_config_row(
+            "engineer",
+            Some("old-model".into()),
+            Some("high".into()),
+        );
+        store
+            .save_role_config("engineer", Some("old-model"), Some("high"))
+            .await
+            .unwrap();
+
+        let persisted = crate::config::persist_settled_role_model("engineer", "new-model")
+            .await
+            .unwrap();
+        assert_eq!(persisted, "new-model");
+        let rows = store.get_all_role_configs().await.unwrap();
+        assert_eq!(
+            rows,
+            vec![role_config("engineer", Some("new-model"), Some("high"))],
+            "model updated, reasoning_effort preserved"
+        );
+
+        // Clearing the model keeps the row (reasoning still set).
+        crate::config::persist_settled_role_model("engineer", "")
+            .await
+            .unwrap();
+        let rows = store.get_all_role_configs().await.unwrap();
+        assert_eq!(
+            rows,
+            vec![role_config("engineer", None, Some("high"))],
+            "cleared model keeps the reasoning_effort row"
+        );
+
+        // Clearing the reasoning too deletes the empty row.
+        crate::config::persist_settled_role_reasoning("engineer", "")
+            .await
+            .unwrap();
+        let rows = store.get_all_role_configs().await.unwrap();
+        assert!(rows.is_empty(), "all-None row removed");
+
+        crate::config::CONFIG.swap(original);
+    }
+
+    /// A routing allow-fallbacks settle preserves the row's provider order,
+    /// and `Some(false)` survives (explicitly disabling fallbacks is
+    /// meaningful at request time).
+    #[tokio::test]
+    #[serial_test::serial(config_persist)]
+    async fn test_persist_settled_routing_allow_preserves_order() {
+        crate::util::test::init_test_stores().await;
+        let store = crate::config_db::store();
+        let original = crate::config::CONFIG.snapshot();
+
+        crate::config::CONFIG.set_model_routing_row(
+            "test-model",
+            Some("OpenAI".into()),
+            Some(false),
+        );
+        store
+            .save_model_routing("test-model", Some("OpenAI"), Some(false))
+            .await
+            .unwrap();
+
+        let persisted = crate::config::persist_settled_routing_allow("test-model", true)
+            .await
+            .unwrap();
+        assert_eq!(persisted, "true", "canonical allow value returned");
+        let rows = store.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            rows,
+            vec![model_routing("test-model", Some("OpenAI"), Some(true))],
+            "allow_fallbacks updated, provider_order preserved"
+        );
+
+        crate::config::persist_settled_routing_order("test-model", "")
+            .await
+            .unwrap();
+        let rows = store.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            rows,
+            vec![model_routing("test-model", None, Some(true))],
+            "cleared order keeps the allow_fallbacks row"
+        );
+
+        crate::config::persist_settled_routing_allow("test-model", false)
+            .await
+            .unwrap();
+        let rows = store.get_all_model_routings().await.unwrap();
+        assert_eq!(
+            rows,
+            vec![model_routing("test-model", None, Some(false))],
+            "Some(false) is meaningful and preserved"
+        );
+
+        crate::config::persist_settled_routing_allow("test-model", false)
+            .await
+            .unwrap();
+        crate::config::CONFIG.set_model_routing_row("test-model", None, None);
+        store
+            .save_model_routing("test-model", None, None)
+            .await
+            .unwrap();
+        let rows = store.get_all_model_routings().await.unwrap();
+        assert!(rows.is_empty(), "all-None routing row removed");
+
+        crate::config::CONFIG.swap(original);
     }
 }

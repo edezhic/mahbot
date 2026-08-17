@@ -212,10 +212,7 @@ impl UsersState {
                 UsersMessage::UpdateResult,
             ),
             UsersMessage::UpdateResult(Ok(())) | UsersMessage::RoleUpdateResult(Ok(())) => {
-                Task::batch([
-                    self.refresh(),
-                    Task::done(UsersMessage::Toast(super::ToastMessage::Saved)),
-                ])
+                self.refresh()
             }
             UsersMessage::UpdateResult(Err(e)) | UsersMessage::RoleUpdateResult(Err(e)) => {
                 self.load_state.fail(e.clone());
@@ -250,10 +247,7 @@ impl UsersState {
             UsersMessage::DeleteResult(Ok(()), _deleted_user) => {
                 self.deleting = false;
                 self.load_state.clear_error();
-                Task::batch([
-                    self.refresh(),
-                    Task::done(UsersMessage::Toast(super::ToastMessage::Deleted)),
-                ])
+                self.refresh()
             }
             UsersMessage::DeleteResult(Err(e), _deleted_user) => {
                 self.deleting = false;
@@ -328,10 +322,7 @@ impl UsersState {
                 self.bind_target = None;
                 self.bind_input.clear();
                 self.bind_error = None;
-                Task::batch([
-                    self.refresh(),
-                    Task::done(UsersMessage::Toast(super::ToastMessage::Saved)),
-                ])
+                self.refresh()
             }
             UsersMessage::BindResult(Err(e), user_name) => {
                 self.binding = false;
@@ -393,10 +384,7 @@ impl UsersState {
             UsersMessage::PoolEditResult(Ok(())) => {
                 self.pool_edit_target = None;
                 self.pool_edit_checked.clear();
-                Task::batch([
-                    self.refresh(),
-                    Task::done(UsersMessage::Toast(super::ToastMessage::Saved)),
-                ])
+                self.refresh()
             }
             UsersMessage::PoolEditResult(Err(e)) => {
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))

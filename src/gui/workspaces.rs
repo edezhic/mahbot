@@ -215,10 +215,7 @@ impl WorkspacesState {
             WorkspacesMessage::DeleteResult(Ok(())) => {
                 self.deleting = false;
                 self.load_state.clear_error();
-                Task::batch([
-                    self.refresh(),
-                    Task::done(WorkspacesMessage::Toast(super::ToastMessage::Deleted)),
-                ])
+                self.refresh()
             }
             WorkspacesMessage::DeleteResult(Err(e)) => {
                 self.deleting = false;
@@ -237,12 +234,7 @@ impl WorkspacesState {
                     WorkspacesMessage::ReanalyzeResult,
                 )
             }
-            WorkspacesMessage::ReanalyzeResult(Ok(())) => Task::batch([
-                self.refresh(),
-                Task::done(WorkspacesMessage::Toast(super::ToastMessage::SuccessMsg(
-                    "Re-analysis started".into(),
-                ))),
-            ]),
+            WorkspacesMessage::ReanalyzeResult(Ok(())) => self.refresh(),
             WorkspacesMessage::ReanalyzeResult(Err(e)) => {
                 self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
@@ -256,10 +248,7 @@ impl WorkspacesState {
                 },
                 WorkspacesMessage::ToggleResult,
             ),
-            WorkspacesMessage::ToggleResult(Ok(())) => Task::batch([
-                self.refresh(),
-                Task::done(WorkspacesMessage::Toast(super::ToastMessage::Saved)),
-            ]),
+            WorkspacesMessage::ToggleResult(Ok(())) => self.refresh(),
             WorkspacesMessage::ToggleResult(Err(e)) => {
                 self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
@@ -375,10 +364,7 @@ impl WorkspacesState {
                 self.diagnostics_busy = false;
                 self.diagnostics_edit_buffers.remove(&name);
                 self.diagnostics_modal = None;
-                Task::batch([
-                    self.refresh(),
-                    Task::done(WorkspacesMessage::Toast(super::ToastMessage::Saved)),
-                ])
+                self.refresh()
             }
             WorkspacesMessage::DiagnosticsSaved(_name, Err(e)) => {
                 self.diagnostics_busy = false;
@@ -405,12 +391,7 @@ impl WorkspacesState {
                 self.diagnostics_busy = false;
                 self.diagnostics_modal = None;
                 self.diagnostics_edit_buffers.remove(&name);
-                Task::batch([
-                    self.refresh(),
-                    Task::done(WorkspacesMessage::Toast(super::ToastMessage::SuccessMsg(
-                        "Diagnostics re-discovery started".into(),
-                    ))),
-                ])
+                self.refresh()
             }
             WorkspacesMessage::RediscoverDiagnosticsResult(_name, Err(e)) => {
                 self.diagnostics_busy = false;
@@ -479,10 +460,7 @@ impl WorkspacesState {
             WorkspacesMessage::NotesSaved(name, Ok(())) => {
                 self.notes_open.remove(&name);
                 self.notes_editor_content.remove(&name);
-                Task::batch([
-                    self.refresh(),
-                    Task::done(WorkspacesMessage::Toast(super::ToastMessage::Saved)),
-                ])
+                self.refresh()
             }
             WorkspacesMessage::NotesSaved(_name, Err(e)) => {
                 self.load_state.fail(e.clone());
