@@ -209,7 +209,7 @@ async fn run_discovery_task(
     // Create a Discovery agent pointed at the workspace
     let agent_id = discovery_agent_id(&ws.name, label);
     let (_agent, response) =
-        run_default_agent(&agent_id, Role::Discovery, ws, &prompt, None, None).await;
+        run_default_agent(&agent_id, Role::Discovery, ws, &prompt, None, None, None).await;
     let response =
         response.context("Discovery agent returned no response (cancelled or failed)")?;
 
@@ -271,7 +271,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
     let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");
 
     let (agent, response) =
-        run_default_agent(&agent_id, Role::Discovery, ws, &prompt, None, None).await;
+        run_default_agent(&agent_id, Role::Discovery, ws, &prompt, None, None, None).await;
     response.context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
 
     // Keep the Agent alive after run_default_agent() for extract_verdict —

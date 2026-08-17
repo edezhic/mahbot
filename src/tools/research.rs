@@ -567,7 +567,9 @@ async fn dispatch_durable_research(
     // holds the folder until the cleanup completes, so it must be spawned
     // only after complete_durable_job freed that id (a wrongly-ordered row
     // would be deleted by the completion DELETE).
-    if spawned && let Err(e) = crate::research_cleanup::dispatch_research_cleanup(&job_id, ws).await
+    if spawned
+        && let Err(e) =
+            crate::research_cleanup::dispatch_research_cleanup(&job_id, question, ws).await
     {
         tracing::warn!(
             job = %job_id,
@@ -635,7 +637,9 @@ async fn terminalize_research(
         &ws.name,
     )
     .await;
-    if let Err(e) = crate::research_cleanup::dispatch_research_cleanup(job_id, ws).await {
+    if let Err(e) =
+        crate::research_cleanup::dispatch_research_cleanup(job_id, &caller.task, ws).await
+    {
         tracing::warn!(
             job = %job_id,
             error = %e,
@@ -1098,6 +1102,7 @@ async fn wrap_up_timed_out(
     ledger: &mut QueryLedger,
     run_stats: &mut RunStats,
     run_key: &str,
+    question: &str,
 ) -> Vec<AnalystFindings> {
     if timed_out.is_empty() || crate::shutdown::aborting() {
         return Vec::new();
@@ -1148,6 +1153,7 @@ async fn wrap_up_timed_out(
         &ws.name,
         Some(crate::registry::ParentKey::Research(run_key.to_string())),
         false,
+        Some(question.to_string()),
     );
     let wrap_up_prompt = load_prompt("research/wrap_up.md");
     let handles: Vec<_> = prepared
@@ -1350,7 +1356,8 @@ fn resolve_round_members<T>(members: Vec<RoundMember<AnalystRun<T>>>) -> Vec<Ana
 /// telemetry `(tool_calls, searches, queries)` from the session history.
 ///
 /// `run_key` is the durable research job id — the sub-agent registers in the
-/// Running Agents view under the run's group.
+/// Running Agents view under the run's group. `question` is the run's
+/// question — threaded as the group header label (purely presentational).
 async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     ws: &Workspace,
     agent_id: &str,
@@ -1358,6 +1365,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     extraction_prompt: &str,
     round: crate::agent::RoundOpts,
     run_key: &str,
+    question: &str,
 ) -> AnalystRun<T> {
     let (agent, response) = run_default_agent(
         agent_id,
@@ -1366,6 +1374,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
         task,
         Some(round),
         Some(crate::registry::ParentKey::Research(run_key.to_string())),
+        Some(question.to_string()),
     )
     .await;
     let Some(raw) = response else {
@@ -1403,12 +1412,21 @@ fn make_round_member<T: serde::de::DeserializeOwned + Send>(
     task: String,
     extraction_prompt: String,
     run_key: String,
+    question: String,
 ) -> impl FnOnce(crate::agent::RoundOpts) -> futures_util::future::BoxFuture<'static, AnalystRun<T>> + Send
 {
     move |round| {
         Box::pin(async move {
-            run_structured_analyst::<T>(&ws, &agent_id, &task, &extraction_prompt, round, &run_key)
-                .await
+            run_structured_analyst::<T>(
+                &ws,
+                &agent_id,
+                &task,
+                &extraction_prompt,
+                round,
+                &run_key,
+                &question,
+            )
+            .await
         })
     }
 }
@@ -1493,19 +1511,22 @@ fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
 /// `prompt` embeds the JSON schema request. The general workspace context is
 /// prepended as the leading system message. `run_key` is the durable research
 /// job id — the orchestrator call registers in the Running Agents view under
-/// the run's group.
+/// the run's group; `question` is the run's question, threaded as the group
+/// header label (purely presentational).
 async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     ws: &Workspace,
     purpose: &'static str,
     prompt: &str,
     validate: Option<&crate::ExtractionValidator<T>>,
     run_key: &str,
+    question: &str,
 ) -> Result<T> {
     let _call = crate::call_registry::NON_AGENT_CALLS.register(
         purpose,
         &ws.name,
         Some(crate::registry::ParentKey::Research(run_key.to_string())),
         false,
+        Some(question.to_string()),
     );
     let params = orchestrator_params(ws, purpose);
     let mut messages = Vec::with_capacity(2);
@@ -1563,6 +1584,7 @@ async fn round0_decompose(
                 task,
                 extraction_prompt.clone(),
                 run_key.to_string(),
+                question.clone(),
             )
         })
         .collect();
@@ -1651,6 +1673,7 @@ async fn merge_decomposition_plans(
         &prompt,
         Some(&move |p| validate_merged_plan(p, &plans_owned)),
         run_key,
+        question,
     )
     .await
 }
@@ -1799,6 +1822,7 @@ async fn round1_research(
                 task,
                 extraction_prompt.clone(),
                 run_key.to_string(),
+                question.clone(),
             ));
         }
     }
@@ -1844,6 +1868,7 @@ async fn extract_gap_list(
         &prompt,
         Some(&move |g| validate_gap_list(g, &plan_owned)),
         run_key,
+        question,
     )
     .await
     .ok()
@@ -1926,6 +1951,7 @@ async fn run_gap_round(
             task,
             extraction_prompt.clone(),
             run_key.to_string(),
+            question.clone(),
         ));
     }
     let handles = crate::agent::spawn_staggered_round(members, resume).await;
@@ -2038,6 +2064,7 @@ async fn run_coder_round(
         &task,
         None,
         Some(crate::registry::ParentKey::Research(job_id.to_string())),
+        Some(question.to_string()),
     )
     .await;
     state.capture_round(&[agent_id], Path::new(run_root)).await;
@@ -2210,11 +2237,27 @@ async fn gap_rounds(
         // this position, and the final round's wrap-up must survive them; the
         // pre-checkpoint window already contains the annotate + gap-extract
         // orchestrator calls, so the wrap-up only extends an existing window.
-        recovered
-            .extend(wrap_up_timed_out(ws, timed_out, &mut state.ledger, run_stats, job_id).await);
+        recovered.extend(
+            wrap_up_timed_out(
+                ws,
+                timed_out,
+                &mut state.ledger,
+                run_stats,
+                job_id,
+                question,
+            )
+            .await,
+        );
         let (new_urls, pending) = state.acc.absorb(&round);
-        let novel_claims =
-            annotate_round(ws, &mut state.acc, &pending, &mut state.markers, job_id).await;
+        let novel_claims = annotate_round(
+            ws,
+            &mut state.acc,
+            &pending,
+            &mut state.markers,
+            job_id,
+            question,
+        )
+        .await;
         outcome.rounds_dispatched += 1;
         // A round whose analysts only re-asked already-asked queries counts
         // as no-progress (repeat queries are never pre-dispatch-droppable —
@@ -2282,6 +2325,7 @@ async fn annotate_claims(
     weak: &WeakLinks,
     pending: &[Claim],
     run_key: &str,
+    question: &str,
 ) -> Result<AnnotationPass> {
     let mut existing_claims = String::new();
     for (i, c) in existing.iter().enumerate() {
@@ -2310,6 +2354,7 @@ async fn annotate_claims(
         &user,
         Some(&move |a| validate_annotations(a, &existing_owned, &pending_owned)),
         run_key,
+        question,
     )
     .await
 }
@@ -2387,6 +2432,7 @@ async fn confirm_links(
     pending: &[Claim],
     pass: &AnnotationPass,
     run_key: &str,
+    question: &str,
 ) -> Result<ConfirmPass> {
     let mut links = String::new();
     for a in pass.annotations.iter().filter(|a| a.verdict != "novel") {
@@ -2422,6 +2468,7 @@ async fn confirm_links(
         &user,
         Some(&move |c| validate_confirm(c, &mutating)),
         run_key,
+        question,
     )
     .await
 }
@@ -2459,6 +2506,7 @@ async fn annotate_round(
     pending: &[Claim],
     markers: &mut Vec<String>,
     run_key: &str,
+    question: &str,
 ) -> usize {
     if pending.is_empty() {
         return 0;
@@ -2471,7 +2519,8 @@ async fn annotate_round(
         acc.claims.extend(pending.iter().cloned());
         return pending.len();
     }
-    let Ok(pass) = annotate_claims(ws, &acc.claims, &acc.weak, pending, run_key).await else {
+    let Ok(pass) = annotate_claims(ws, &acc.claims, &acc.weak, pending, run_key, question).await
+    else {
         acc.claims.extend(pending.iter().cloned());
         if !markers.iter().any(|m| m == CLAIM_ANNOTATION_FAILED) {
             markers.push(CLAIM_ANNOTATION_FAILED.to_string());
@@ -2481,7 +2530,7 @@ async fn annotate_round(
     // Confirm pass over the mutating links only (one call per round). No
     // mutating links → empty outcome, every verdict applies as-is.
     let confirm = if pass.annotations.iter().any(|a| a.verdict != "novel") {
-        if let Ok(c) = confirm_links(ws, &acc.claims, pending, &pass, run_key).await {
+        if let Ok(c) = confirm_links(ws, &acc.claims, pending, &pass, run_key, question).await {
             ConfirmOutcome::Passed(c)
         } else {
             // Fail-open: every mutating verdict becomes weak/unconfirmed
@@ -2511,10 +2560,16 @@ async fn check_answerability(
         &load_prompt("research/abstain.md"),
         &[("{{question}}", question), ("{{evidence}}", &evidence)],
     );
-    let verdict =
-        orchestrator_extract::<AnswerabilityCheck>(ws, "abstain_check", &prompt, None, run_key)
-            .await
-            .ok()?;
+    let verdict = orchestrator_extract::<AnswerabilityCheck>(
+        ws,
+        "abstain_check",
+        &prompt,
+        None,
+        run_key,
+        question,
+    )
+    .await
+    .ok()?;
     (!verdict.answerable).then_some(verdict.reason)
 }
 
@@ -2553,6 +2608,7 @@ async fn synthesize(
         &ws.name,
         Some(crate::registry::ParentKey::Research(run_key.to_string())),
         false,
+        Some(question.to_string()),
     );
     let evidence = render_accumulated_evidence(acc);
     let mut base_user = substitute(
@@ -2735,6 +2791,7 @@ async fn research_verification_pass(
     run_root: &str,
     captured: &mut Vec<String>,
     run_key: &str,
+    question: &str,
 ) -> Vec<VerificationResult> {
     let (targets, primary_count) = verification_targets(acc);
     if targets.is_empty() {
@@ -2765,6 +2822,7 @@ async fn research_verification_pass(
             deadline,
             resume,
             run_key,
+            question,
         )
         .await;
         captured.extend(verify_ids);
@@ -3069,6 +3127,7 @@ async fn run_deep_research(
         &ws.name,
         Some(crate::registry::ParentKey::Research(job_id.to_string())),
         true,
+        Some(question.to_string()),
     );
     let start = Instant::now();
     // One round-wide bound shared by every phase's member waits
@@ -3179,7 +3238,15 @@ async fn run_deep_research(
         state.capture_round(&round_agents, &run_root).await;
         round_agents.clear();
         let (_, pending) = state.acc.absorb(&r1);
-        annotate_round(ws, &mut state.acc, &pending, &mut state.markers, job_id).await;
+        annotate_round(
+            ws,
+            &mut state.acc,
+            &pending,
+            &mut state.markers,
+            job_id,
+            question,
+        )
+        .await;
         state.budget_spent = budget.spent;
         state.stage = ResearchStage::GapRounds;
         state.save(job_id).await;
@@ -3189,7 +3256,15 @@ async fn run_deep_research(
         // crash during the wrap-up resumes with a ledger missing the dead
         // analysts' queries, so gap rounds may re-ask them, bounded).
         recovered.extend(
-            wrap_up_timed_out(ws, r1_timed_out, &mut state.ledger, &mut run_stats, job_id).await,
+            wrap_up_timed_out(
+                ws,
+                r1_timed_out,
+                &mut state.ledger,
+                &mut run_stats,
+                job_id,
+                question,
+            )
+            .await,
         );
     }
 
@@ -3302,6 +3377,7 @@ async fn run_deep_research(
             &run_root_str,
             &mut round_agents,
             job_id,
+            question,
         )
         .await;
         state.capture_round(&round_agents, &run_root).await;
@@ -4164,7 +4240,15 @@ mod tests {
         let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
         let _provider_guard = crate::util::test::install_fake_provider(provider);
         let mut markers = Vec::new();
-        let novel = annotate_round(&ws, &mut acc, &pending, &mut markers, "test_run").await;
+        let novel = annotate_round(
+            &ws,
+            &mut acc,
+            &pending,
+            &mut markers,
+            "test_run",
+            "question",
+        )
+        .await;
         assert_eq!(
             novel, 1,
             "only the weak contradiction counts as novel — the weak duplicate never does"

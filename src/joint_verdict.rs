@@ -143,15 +143,19 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
 ///
 /// `ticket_id` attaches the synthesis LLM call to the ticket's group in the
 /// Running Agents view (the ticket's own work — joint-verdict synthesis of a
-/// review/QA/analysis round).
+/// review/QA/analysis round); `ticket_title` is the group header label for
+/// that ticket (purely presentational — the header keeps the ticket name even
+/// when the round's agents have already deregistered and only this synthesis
+/// call remains in the group).
 pub(crate) async fn build_joint_comment(
     round: &JointRound<'_>,
     role: Role,
     ws: &Workspace,
     ticket_id: &str,
+    ticket_title: &str,
 ) -> String {
     let items = issues_by_agent(round);
-    let outcome = run_synthesis(round, role, ws, ticket_id).await;
+    let outcome = run_synthesis(round, role, ws, ticket_id, ticket_title).await;
     render_joint_comment(round, &outcome, &crate::consensus::ItemTable::new(&items))
 }
 
@@ -164,6 +168,7 @@ pub(crate) async fn run_synthesis(
     role: Role,
     ws: &Workspace,
     ticket_id: &str,
+    ticket_title: &str,
 ) -> crate::consensus::RepairOutcome {
     let request = synthesis_request(round, role, ws);
     let items = issues_by_agent(round);
@@ -173,6 +178,7 @@ pub(crate) async fn run_synthesis(
         request,
         &items,
         Some(crate::registry::ParentKey::Ticket(ticket_id.to_string())),
+        Some(ticket_title.to_string()),
     )
     .await
 }

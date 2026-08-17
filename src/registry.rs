@@ -69,12 +69,23 @@ pub struct AgentHandle {
     pub workspace_name: String,
     /// Grouping key for the Running Agents view — see [`ParentKey`].
     pub parent_key: Option<ParentKey>,
+    /// Human-readable label for the DIRECT PARENT INVOCATION this agent
+    /// belongs to (ticket title / analyze question / research question) —
+    /// shown on the group header of the Running Agents view. `None` for
+    /// workspace singletons. Purely presentational; never affects pipeline
+    /// behavior.
+    pub parent_label: Option<String>,
     pub started_at: DateTime<Utc>,
     pub label: String,
     /// Snapshot of the tools currently executing inside this agent, taken at
     /// `list()` time. Empty when the agent is between tool executions (in an
     /// LLM call, between rounds) — absence is honest.
     pub current_tools: Vec<RunningTool>,
+    /// The most recent tool that COMPLETED inside this agent (kept until a
+    /// newer tool replaces it) — lets the Running Agents page keep showing a
+    /// finished fast tool instead of flashing it and vanishing. Recorded on
+    /// every completion (success or failure); purely observational.
+    pub last_tool: Option<RunningTool>,
     /// Live activity indicator for non-tool LLM phases inside this agent
     /// (e.g. "extracting", "summarizing", "transcribing"), taken at `list()`
     /// time. `None` between phases — the agent's card is the single tracker
@@ -105,6 +116,11 @@ struct AgentEntry {
     /// hold it), so the Vec needs no further synchronization. Each entry
     /// carries the unique tool instance id for exact removal.
     current_tools: Vec<RunningToolEntry>,
+    /// The most recent COMPLETED tool — kept after `tool_finished` removes
+    /// the entry from `current_tools` so the Running Agents page can keep
+    /// showing it until a newer tool replaces it (fast tools no longer flash
+    /// and vanish). Snapshot into [`AgentHandle::last_tool`] by `list()`.
+    last_tool: Option<RunningTool>,
     /// Live activity label (e.g. "extracting", "transcribing") for the
     /// non-tool LLM phase currently running inside this agent; `None` between
     /// phases. Single slot: an agent runs sequentially, so at most one
@@ -137,6 +153,10 @@ impl AgentRegistry {
     ///
     /// Used by [`crate::Agent::new`] where deregistration is handled by [`crate::Agent::drop`]
     /// instead of a guard.
+    ///
+    /// `parent_label` is the human-readable label of the agent's DIRECT PARENT
+    /// INVOCATION (ticket title / analyze question / research question) for the
+    /// Running Agents group header — purely presentational.
     #[allow(clippy::too_many_arguments)] // one positional arg per handle field; callers use literals
     pub fn register(
         &self,
@@ -147,6 +167,7 @@ impl AgentRegistry {
         label: String,
         cancel_token: CancellationToken,
         parent_key: Option<ParentKey>,
+        parent_label: Option<String>,
     ) -> u64 {
         let generation = NEXT_ENTRY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let handle = AgentHandle {
@@ -156,9 +177,11 @@ impl AgentRegistry {
             workspace_path: ws.path.clone(),
             workspace_name: ws.name.clone(),
             parent_key,
+            parent_label,
             started_at: Utc::now(),
             label,
             current_tools: Vec::new(),
+            last_tool: None,
             activity: None,
         };
         let mut map = self.inner.lock().unwrap_poison();
@@ -172,6 +195,7 @@ impl AgentRegistry {
                 handle,
                 cancel_token,
                 current_tools: Vec::new(),
+                last_tool: None,
                 activity: None,
             },
         );
@@ -221,14 +245,19 @@ impl AgentRegistry {
         }
     }
 
-    /// Remove a specific tool instance from the entry's live tools. No-op when
-    /// the agent is gone or the generation no longer matches (stale guard).
+    /// Remove a specific tool instance from the entry's live tools and record
+    /// it as the entry's last COMPLETED tool (kept until a newer tool replaces
+    /// it — the Running Agents page shows running tools if any, else the last
+    /// completed one). No-op when the agent is gone or the generation no longer
+    /// matches (stale guard).
     fn tool_finished(&self, agent_id: &str, generation: u64, tool_id: u64) {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.get_mut(agent_id)
             && entry.generation == generation
+            && let Some(pos) = entry.current_tools.iter().position(|t| t.id == tool_id)
         {
-            entry.current_tools.retain(|t| t.id != tool_id);
+            let removed = entry.current_tools.remove(pos);
+            entry.last_tool = Some(removed.tool);
         }
     }
 
@@ -340,6 +369,7 @@ impl AgentRegistry {
                     .iter()
                     .map(RunningToolEntry::to_handle)
                     .collect();
+                handle.last_tool.clone_from(&e.last_tool);
                 handle.activity.clone_from(&e.activity);
                 handle
             })
@@ -441,6 +471,7 @@ mod tests {
             &ws,
             "test".to_string(),
             CancellationToken::new(),
+            None,
             None,
         )
     }
@@ -654,6 +685,7 @@ mod tests {
             "label".to_string(),
             CancellationToken::new(),
             Some(ParentKey::Ticket("T-42".to_string())),
+            Some("Fix login bug".to_string()),
         );
         let handles = AGENT_REGISTRY.list();
         let h = handles
@@ -662,6 +694,60 @@ mod tests {
             .expect("agent registered");
         assert_eq!(h.workspace_name, "ws_parent");
         assert_eq!(h.parent_key, Some(ParentKey::Ticket("T-42".to_string())));
+        assert_eq!(
+            h.parent_label.as_deref(),
+            Some("Fix login bug"),
+            "parent label round-trips"
+        );
+        AGENT_REGISTRY.deregister(&agent_id, generation);
+    }
+
+    #[test]
+    fn completed_tool_is_kept_as_last_tool_until_replaced() {
+        let agent_id = format!("last_tool_{}", crate::generate_suffix());
+        let generation = register_test_agent(&agent_id, "/tmp/ws");
+        // First tool completes → becomes the last tool.
+        {
+            let guard = AGENT_REGISTRY.tool_started(
+                &agent_id,
+                generation,
+                "read",
+                &serde_json::json!({"path": "/tmp/ws/a.rs"}),
+            );
+            drop(guard);
+        }
+        let handles = AGENT_REGISTRY.list();
+        let h = handles
+            .iter()
+            .find(|h| h.agent_id == agent_id)
+            .expect("agent registered");
+        assert!(h.current_tools.is_empty(), "no running tools left");
+        let last = h
+            .last_tool
+            .as_ref()
+            .expect("completed tool kept as last_tool");
+        assert_eq!(last.name, "read");
+        assert!(last.args.contains("a.rs"));
+        // A second completion replaces the first.
+        {
+            let guard = AGENT_REGISTRY.tool_started(
+                &agent_id,
+                generation,
+                "edit",
+                &serde_json::json!({"path": "/tmp/ws/b.rs"}),
+            );
+            drop(guard);
+        }
+        let handles = AGENT_REGISTRY.list();
+        let h = handles
+            .iter()
+            .find(|h| h.agent_id == agent_id)
+            .expect("agent registered");
+        assert_eq!(
+            h.last_tool.as_ref().map(|t| t.name.as_str()),
+            Some("edit"),
+            "newer completed tool replaces the old one"
+        );
         AGENT_REGISTRY.deregister(&agent_id, generation);
     }
 }

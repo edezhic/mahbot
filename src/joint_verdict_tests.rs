@@ -556,7 +556,7 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
     );
     let _provider = crate::util::test::install_fake_provider(std::sync::Arc::new(provider));
     let ws = crate::workspace::test_ws("/tmp/test_ws");
-    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket").await;
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     match outcome {
         RepairOutcome::Repaired { output, .. } => assert_eq!(output.groups.len(), 1),
         RepairOutcome::Fallback => panic!("valid id-based output must not fall back"),
@@ -580,7 +580,7 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
         r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"id":99}]}],"ungrouped":[]}"#,
     ));
     let _provider = crate::util::test::install_fake_provider(fake.clone());
-    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket").await;
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     assert!(
         matches!(outcome, RepairOutcome::Fallback),
         "out-of-range id must exhaust synthesis into the fallback"
@@ -629,7 +629,7 @@ async fn repair_rounds_freeze_groups_and_converge() {
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake.clone());
     let ws = crate::workspace::test_ws("/tmp/test_ws");
-    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket").await;
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     let RepairOutcome::Repaired { output, references } = outcome else {
         panic!("repair must converge, got fallback");
     };
@@ -688,7 +688,7 @@ async fn repair_zero_progress_with_no_frozen_groups_falls_back() {
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake);
     let ws = crate::workspace::test_ws("/tmp/test_ws");
-    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket").await;
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     assert!(
         matches!(outcome, RepairOutcome::Fallback),
         "zero-progress with zero groups ever frozen must fall back"
@@ -725,7 +725,7 @@ async fn repair_contradiction_reference_renders_disputed() {
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake);
     let ws = crate::workspace::test_ws("/tmp/test_ws");
-    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket").await;
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     let RepairOutcome::Repaired { output, references } = outcome else {
         panic!("reference round must converge, got fallback");
     };
@@ -767,7 +767,7 @@ async fn repair_rejects_empty_member_group() {
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake.clone());
     let ws = crate::workspace::test_ws("/tmp/test_ws");
-    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket").await;
+    let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     let RepairOutcome::Repaired { output, .. } = outcome else {
         panic!("empty-member rejection must not force a fallback");
     };

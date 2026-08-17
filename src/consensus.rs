@@ -722,8 +722,15 @@ pub(crate) async fn run_grouping_repair(
     mut request: ChatRequest,
     items_by_agent: &[Vec<String>],
     parent: Option<crate::registry::ParentKey>,
+    parent_label: Option<String>,
 ) -> RepairOutcome {
-    let _call = crate::call_registry::NON_AGENT_CALLS.register(purpose, &ws.name, parent, false);
+    let _call = crate::call_registry::NON_AGENT_CALLS.register(
+        purpose,
+        &ws.name,
+        parent,
+        false,
+        parent_label,
+    );
     crate::prompt::prepend_general_context(&mut request.messages, ws).await;
     let policy = RetryPolicy::synthesis();
     let mut loop_state = RetryLoop::new(&policy);

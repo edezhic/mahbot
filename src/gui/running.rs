@@ -1,7 +1,7 @@
 //! "Running Agents" dashboard page — a live view of every currently-running
-//! agent and in-flight non-agent LLM work, grouped by DIRECT PARENT
-//! INVOCATION (ticket / analyze round / research run / workspace singleton /
-//! unattributable orchestrator calls).
+//! agent and in-flight non-agent LLM work, grouped by WORKSPACE, then by
+//! DIRECT PARENT INVOCATION (ticket / analyze round / research run / workspace
+//! singleton / unattributable orchestrator calls).
 //!
 //! The view is a running-only window: it reads the in-memory registries
 //! ([`crate::registry::AGENT_REGISTRY`] and
@@ -11,13 +11,22 @@
 //! view refreshes at that cadence for free.
 //!
 //! Truthfulness rules:
-//! - An agent not executing a tool (in an LLM call, between rounds) shows no
-//!   tool badge — absence is honest.
+//! - An agent not executing a tool (in an LLM call, between rounds) shows its
+//!   last COMPLETED tool instead of nothing — a fast tool no longer flashes
+//!   and vanishes (deliberate override of the strict absence-is-honest rule
+//!   for tools; the last-tool badge is a historical marker, always labeled by
+//!   its tool name, so it cannot be mistaken for live activity).
 //! - Parallel tool execution is represented honestly: every tool that
 //!   actually started executing appears as its own badge; tools that never
 //!   execute (unknown tool, pre-flight cancellation) never show.
 //! - The instrumentation is purely observational — it never affects
 //!   shutdown/drain logic and gains no cancellation semantics.
+//!
+//! The page is DB-free by design: everything it shows is derived from the
+//! live in-memory registries, plus the dashboard's registered-workspace map
+//! (only for the "(external)" marker on unregistered/ephemeral workspace
+//! sections). All header labels (ticket titles, analyze/research questions)
+//! are captured observationally at spawn — never read from the DB.
 
 use crate::call_registry::NonAgentCallHandle;
 use crate::gui::theme;
@@ -25,177 +34,68 @@ use crate::gui::widgets;
 use crate::registry::{AgentHandle, ParentKey};
 use chrono::{DateTime, Utc};
 
-use iced::widget::{Column, Row, Space, column, container, pick_list, row, scrollable, text};
-use iced::{Alignment, Element, Length, Padding};
+use iced::widget::{Column, Row, Space, column, container, row, scrollable, text};
+use iced::{Alignment, Element, Length};
 
 use iced_fonts::lucide;
 
-use super::WorkspaceInfo;
+use super::{Message, WorkspaceInfo};
 
-/// Workspace filter selection; `None` = "All workspaces". Persists while the
-/// page is open (the running data itself is not retained between ticks).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunningMessage {
-    FilterWorkspace(Option<String>),
-}
+/// Maximum display length (Unicode chars) of an analyze/research group header
+/// label (the question/task text). Truncated at a char boundary with "…".
+const MAX_GROUP_LABEL_CHARS: usize = 80;
 
-/// Page state — workspace filter selection plus the filter options cache.
+/// Maximum display length (Unicode chars) of a tool badge (name + args).
+/// The registration-side cap ([`crate::registry::MAX_LIVE_ARG_LENGTH`]) bounds
+/// what is stored; this is the shorter display-level bound.
+const MAX_TOOL_BADGE_CHARS: usize = 72;
+
+/// Render the live running-agents page.
 ///
-/// The filter options are recomputed on navigation and on each 1-second tick
-/// (in-memory reads only) so the pick_list can borrow them; the running data
-/// itself is always read live at render time and never retained between ticks.
-#[derive(Debug, Default)]
-pub struct RunningState {
-    filter: Option<String>,
-    workspace_options: Vec<widgets::PickOption>,
-}
+/// The page is purely observational: it emits no messages of its own, so it
+/// renders directly into the dashboard's [`Message`] type instead of carrying
+/// a page-local message enum. `workspaces` is the dashboard's
+/// registered-workspace map (name → info) — used only to mark
+/// unregistered/ephemeral workspace sections with the "(external)" suffix.
+/// Everything else comes from the live in-memory registries.
+pub(crate) fn view(
+    workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
+) -> Element<'static, Message> {
+    let agents = crate::registry::AGENT_REGISTRY.list();
+    let calls = crate::call_registry::NON_AGENT_CALLS.list();
 
-impl RunningState {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    // Workspace-first sections: each section holds its groups, groups
+    // sorted by kind (tickets → analyze rounds → research runs →
+    // singletons → unattributed), sections alphabetically by name.
+    let sections = build_sections(build_groups(&agents, &calls), workspaces);
 
-    pub fn update(&mut self, msg: RunningMessage) -> iced::Task<RunningMessage> {
-        match msg {
-            RunningMessage::FilterWorkspace(sel) => self.filter = sel,
+    let body: Element<'_, Message> = if sections.is_empty() {
+        // Shared empty-state pattern: large radar glyph (the page's nav
+        // icon) + label, centered.
+        widgets::empty_state_placeholder(
+            lucide::radar::<iced::Theme, iced::Renderer>(),
+            "Nothing is currently running.",
+        )
+    } else {
+        let mut content = Column::new().spacing(20);
+        for section in &sections {
+            content = content.push(render_section(section));
         }
-        iced::Task::none()
-    }
+        scrollable(container(content).width(Length::Fill).padding([0, 4]))
+            .height(Length::Fill)
+            .direction(theme::vertical_scrollbar())
+            .style(theme::scrollbar_style)
+            .into()
+    };
 
-    /// Recompute the workspace filter options from the live registries and the
-    /// dashboard's registered workspace set. Called on navigation to the page
-    /// and on each 1-second tick while the page is active (bounded freshness —
-    /// the same cadence that refreshes paused state).
-    pub fn refresh(&mut self, workspaces: &std::collections::HashMap<String, WorkspaceInfo>) {
-        let agents = crate::registry::AGENT_REGISTRY.list();
-        let calls = crate::call_registry::NON_AGENT_CALLS.list();
-        let mut ws_names: Vec<String> = Vec::new();
-        let mut push_ws = |name: &str| {
-            if name.is_empty() || ws_names.iter().any(|n| n == name) {
-                return;
-            }
-            ws_names.push(name.to_string());
-        };
-        for a in &agents {
-            push_ws(&a.workspace_name);
-        }
-        for c in &calls {
-            push_ws(&c.workspace);
-        }
-        for name in workspaces.keys() {
-            push_ws(name);
-        }
-        ws_names.sort();
-        let mut options: Vec<widgets::PickOption> = Vec::with_capacity(ws_names.len() + 1);
-        options.push(widgets::PickOption {
-            value: String::new(),
-            label: "All workspaces".to_string(),
-        });
-        for name in &ws_names {
-            options.push(widgets::PickOption {
-                value: name.clone(),
-                label: name.clone(),
-            });
-        }
-        self.workspace_options = options;
-        // Keep the selection if it still exists; otherwise fall back to All.
-        if let Some(f) = &self.filter
-            && !self.workspace_options.iter().any(|o| o.value == *f)
-        {
-            self.filter = None;
-        }
-    }
-
-    /// Render the live running-agents page.
-    ///
-    /// `workspaces` is the dashboard's registered-workspace map (name →
-    /// info, incl. paused state) — used for paused pills and to distinguish
-    /// registered workspaces from personal/ephemeral ones.
-    pub fn view<'a>(
-        &'a self,
-        workspaces: &'a std::collections::HashMap<String, WorkspaceInfo>,
-    ) -> Element<'a, RunningMessage> {
-        let agents = crate::registry::AGENT_REGISTRY.list();
-        let calls = crate::call_registry::NON_AGENT_CALLS.list();
-
-        // Build the ordered display groups.
-        let groups = build_groups(&agents, &calls);
-
-        // Filter by workspace selection.
-        let mut filtered: Vec<DisplayGroup> = groups
-            .into_iter()
-            .filter(|g| match &self.filter {
-                None => true,
-                Some(ws) => g.workspace == *ws,
-            })
-            .collect();
-
-        // Stable sort: tickets, analyze rounds, research runs, singletons,
-        // unattributed (the DisplayGroup::sort_key already encodes this).
-        filtered.sort_by_key(DisplayGroup::sort_key);
-
-        // The pick_list must SHOW the "All workspaces" label when no filter is
-        // active — with `selected = None` iced renders its blank placeholder,
-        // so select the empty-value option (label "All workspaces") instead.
-        let selected = match &self.filter {
-            Some(f) => self
-                .workspace_options
-                .iter()
-                .find(|o| o.value == *f)
-                .cloned(),
-            None => self
-                .workspace_options
-                .iter()
-                .find(|o| o.value.is_empty())
-                .cloned(),
-        };
-
-        let header = row![
-            text("Running Agents").size(18).color(theme::TEXT_PRIMARY),
-            Space::new().width(Length::Fill),
-            pick_list(self.workspace_options.as_slice(), selected, |opt| {
-                RunningMessage::FilterWorkspace(
-                    (!opt.value.is_empty()).then_some(opt.value.clone()),
-                )
-            },)
-            .style(widgets::pick_list_style)
-            .padding([4, 8])
-            .width(Length::Fixed(220.0)),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center);
-
-        let mut body = Column::new().spacing(12);
-        if filtered.is_empty() {
-            body = body.push(
-                container(
-                    text("Nothing is currently running.")
-                        .size(14)
-                        .color(theme::TEXT_MUTED),
-                )
-                .width(Length::Fill)
-                .center_x(Length::Fill)
-                .padding(24),
-            );
-        } else {
-            for group in &mut filtered {
-                body = body.push(render_group(group, workspaces));
-            }
-        }
-
-        let content = column![
-            header,
-            scrollable(container(body).width(Length::Fill).padding([0, 4]))
-                .height(Length::Fill)
-                .style(theme::scrollbar_style),
-        ]
-        .spacing(16)
-        .padding(Padding::from([16, 24]))
+    // Uniform page chrome with the rest of the dashboard: base Flexoki
+    // fill + 24px padding, matching the other pages.
+    container(body)
         .width(Length::Fill)
-        .height(Length::Fill);
-
-        content.into()
-    }
+        .height(Length::Fill)
+        .padding(24)
+        .style(theme::base_container_style)
+        .into()
 }
 
 // ── Display model ─────────────────────────────────────────────────────────
@@ -217,7 +117,7 @@ struct CallRow {
     handle: NonAgentCallHandle,
 }
 
-/// Ordered group kinds — the ticket's grouping order.
+/// Ordered group kinds — the page's display order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GroupKind {
     Ticket,
@@ -234,10 +134,29 @@ struct DisplayGroup {
     key: String,
     /// Workspace name for the group header.
     workspace: String,
+    /// Human-readable header label for the group (ticket title / analyze
+    /// question / research question), captured observationally from any
+    /// member's `parent_label`. `None` for singletons/unattributed and for
+    /// parent-keyed groups whose members carried no label (defensive fallback
+    /// — the header then degrades to a generic label, never a raw key).
+    label: Option<String>,
     items: Vec<DisplayItem>,
     /// True when this research group carries a run-lifetime orchestrator
     /// marker (rendered as a run-lifetime indicator, not a call row).
     run_lifetime: bool,
+}
+
+/// One workspace section on the page: a section header (the workspace name)
+/// plus the groups running in that workspace.
+#[derive(Debug, Clone)]
+struct WorkspaceSection {
+    /// Raw workspace name — the grouping key.
+    workspace: String,
+    /// Resolved display label: the bare name for registered workspaces, the
+    /// "(external)"-suffixed form for unregistered/ephemeral ones, and
+    /// "workspace" for an empty name.
+    label: String,
+    groups: Vec<DisplayGroup>,
 }
 
 impl DisplayGroup {
@@ -315,11 +234,21 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
                 kind,
                 key: key.to_string(),
                 workspace: workspace.to_string(),
+                label: None,
                 items: Vec::new(),
                 run_lifetime: false,
             });
             groups.len() - 1
         };
+
+    // Adopt a member's parent label into the group (first non-None wins —
+    // all members of one invocation carry the same label; the fallback keeps
+    // a group whose only remaining member is label-less from degrading).
+    let adopt_label = |label: &Option<String>, group: &mut DisplayGroup| {
+        if group.label.is_none() && label.is_some() {
+            group.label.clone_from(label);
+        }
+    };
 
     for agent in agents {
         let workspace = agent.workspace_name.clone();
@@ -330,18 +259,14 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
                 &workspace,
                 &mut groups,
             );
+            adopt_label(&agent.parent_label, &mut groups[idx]);
             groups[idx].items.push(DisplayItem::Agent(AgentCard {
                 handle: agent.clone(),
             }));
         } else {
-            // Workspace singleton. Empty workspace name falls back to a
-            // generic label.
-            let ws_label = if workspace.is_empty() {
-                "workspace"
-            } else {
-                &workspace
-            };
-            let idx = find_group(GroupKind::Singleton, ws_label, ws_label, &mut groups);
+            // Workspace singleton. An empty workspace name groups under the
+            // empty key; the section label resolver renders it as "workspace".
+            let idx = find_group(GroupKind::Singleton, &workspace, &workspace, &mut groups);
             groups[idx].items.push(DisplayItem::Agent(AgentCard {
                 handle: agent.clone(),
             }));
@@ -357,6 +282,7 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
                 &workspace,
                 &mut groups,
             );
+            adopt_label(&call.parent_label, &mut groups[idx]);
             // Run-lifetime orchestrator markers render as a run-lifetime
             // indicator on the group, not as a transient call card.
             if call.run_lifetime {
@@ -367,12 +293,7 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
                 }));
             }
         } else {
-            let ws_label = if workspace.is_empty() {
-                "workspace"
-            } else {
-                &workspace
-            };
-            let idx = find_group(GroupKind::Unattributed, ws_label, ws_label, &mut groups);
+            let idx = find_group(GroupKind::Unattributed, &workspace, &workspace, &mut groups);
             groups[idx].items.push(DisplayItem::Call(CallRow {
                 handle: call.clone(),
             }));
@@ -382,80 +303,117 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
     groups
 }
 
+/// Group the display groups into WORKSPACE SECTIONS — the page is organized
+/// by workspace, each section headed by the workspace name.
+///
+/// Sections are ordered alphabetically by their resolved label (deterministic
+/// — activity-based ordering would flicker as agents come and go); within a
+/// section, groups keep the canonical kind order (tickets → analyze rounds →
+/// research runs → singletons → unattributed) via [`DisplayGroup::sort_key`].
+fn build_sections(
+    groups: Vec<DisplayGroup>,
+    workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
+) -> Vec<WorkspaceSection> {
+    let mut sections: Vec<WorkspaceSection> = Vec::new();
+    for group in groups {
+        let label = workspace_label_for(&group.workspace, workspaces);
+        if let Some(section) = sections.iter_mut().find(|s| s.workspace == group.workspace) {
+            section.groups.push(group);
+        } else {
+            sections.push(WorkspaceSection {
+                workspace: group.workspace.clone(),
+                label,
+                groups: vec![group],
+            });
+        }
+    }
+    sections.sort_by(|a, b| a.label.cmp(&b.label));
+    for section in &mut sections {
+        section.groups.sort_by_key(DisplayGroup::sort_key);
+    }
+    sections
+}
+
 // ── Rendering ─────────────────────────────────────────────────────────────
 
-/// Render one group: header (title + workspace + paused pill) then cards.
+/// Render one workspace section: the workspace name as the page-level header
+/// (styled like a page title), then the section's groups.
 ///
 /// The returned element owns all rendered content (text widgets take owned
-/// Strings), so its lifetime is independent of the `group` borrow — only the
-/// `workspaces` lookup borrows from the caller.
-fn render_group<'a>(
-    group: &DisplayGroup,
-    workspaces: &'a std::collections::HashMap<String, WorkspaceInfo>,
-) -> Element<'a, RunningMessage> {
-    // Paused pill: only for registered workspaces; personal/ephemeral
-    // workspaces render with a fallback label and no pill.
-    let (workspace_label, paused) = match workspaces.get(&group.workspace) {
-        Some(info) if !group.workspace.is_empty() => (group.workspace.clone(), info.paused),
-        _ => (fallback_workspace_label(&group.workspace), false),
-    };
-
-    // Singleton / Unattributed groups are keyed BY the workspace name, so the
-    // resolved label (with the "(external)" marker when unregistered) IS the
-    // title — never push a second workspace label beside it. Parent-keyed
-    // groups (ticket / analyze round / research) show the workspace label next to
-    // the title, with the round/run key included so concurrent rounds in one
-    // workspace are visually distinguishable at the header level.
-    let show_workspace_label =
-        !matches!(group.kind, GroupKind::Singleton | GroupKind::Unattributed);
-    let title = match &group.kind {
-        GroupKind::Ticket => format!("Ticket {}", group.key),
-        GroupKind::AnalyzeRound => format!("Analyze round {}", group.key),
-        GroupKind::Research => format!("Research run {}", group.key),
-        GroupKind::Singleton => workspace_label.clone(),
-        GroupKind::Unattributed => format!("Other LLM work — {workspace_label}"),
-    };
-
-    let mut header_parts: Vec<Element<'_, RunningMessage>> =
-        vec![text(title).size(15).color(theme::ACCENT).into()];
-    if show_workspace_label && !group.workspace.is_empty() {
-        header_parts.push(
-            text(workspace_label)
-                .size(12)
-                .color(theme::TEXT_MUTED)
-                .into(),
-        );
+/// Strings), so its lifetime is independent of the `section` borrow.
+fn render_section(section: &WorkspaceSection) -> Element<'static, Message> {
+    let mut groups = Column::new().spacing(10);
+    for group in &section.groups {
+        groups = groups.push(render_group(group));
     }
-    if paused {
-        header_parts.push(widgets::badge_pill(
-            "Paused".to_string(),
-            (theme::STATUS_WARNING, theme::TEXT_PRIMARY),
-            11,
-            [2, 8],
-        ));
+    column![
+        text(section.label.clone())
+            .size(18)
+            .color(theme::TEXT_PRIMARY),
+        groups,
+    ]
+    .spacing(10)
+    .into()
+}
+
+/// Resolve a group's header: the primary title plus an optional small
+/// secondary element (the ticket id).
+///
+/// - Ticket groups: the ticket NAME prominently, the ticket ID as a small
+///   secondary element. When no title was captured (defensive — every live
+///   ticket group carries one via its agents or the synthesis call), the ID
+///   becomes the title.
+/// - Analyze/research groups: the truncated question/task text; a generic
+///   fallback when no label was captured. The raw NanoID key is NEVER shown.
+/// - Singleton/unattributed groups: generic labels — their workspace name is
+///   already the section header, so repeating it would be redundant.
+fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
+    match &group.kind {
+        GroupKind::Ticket => match &group.label {
+            Some(title) => (title.clone(), Some(group.key.clone())),
+            None => (group.key.clone(), None),
+        },
+        GroupKind::AnalyzeRound => (
+            group.label.as_deref().map_or_else(
+                || "Analyze round".to_string(),
+                |l| crate::util::truncate(l, MAX_GROUP_LABEL_CHARS),
+            ),
+            None,
+        ),
+        GroupKind::Research => (
+            group.label.as_deref().map_or_else(
+                || "Research run".to_string(),
+                |l| crate::util::truncate(l, MAX_GROUP_LABEL_CHARS),
+            ),
+            None,
+        ),
+        GroupKind::Singleton => ("Standalone".to_string(), None),
+        GroupKind::Unattributed => ("Other LLM work".to_string(), None),
+    }
+}
+
+/// Render one group: header (title + secondary + run-lifetime marker) then
+/// the group panel holding its cards/rows. Cards are visually separated from
+/// the panel via the established card style.
+fn render_group(group: &DisplayGroup) -> Element<'static, Message> {
+    let (title, secondary) = group_title(group);
+    let mut header_parts: Vec<Element<'_, Message>> =
+        vec![text(title).size(15).color(theme::ACCENT).into()];
+    if let Some(secondary) = secondary {
+        header_parts.push(text(secondary).size(11).color(theme::TEXT_MUTED).into());
     }
     if group.run_lifetime {
-        header_parts.push(
-            row![
-                lucide::loader_circle::<iced::Theme, iced::Renderer>()
-                    .size(13)
-                    .color(theme::ACCENT),
-                text("run active").size(11).color(theme::ACCENT),
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center)
-            .into(),
-        );
+        header_parts.push(text("run active").size(11).color(theme::ACCENT).into());
     }
 
     let mut items = Column::new().spacing(6);
     for item in &group.items {
         match item {
             DisplayItem::Agent(card) => {
-                items = items.push(render_agent_card(card, workspaces));
+                items = items.push(render_agent_card(card));
             }
             DisplayItem::Call(call) => {
-                items = items.push(render_call_row(call, workspaces));
+                items = items.push(render_call_row(call));
             }
         }
     }
@@ -483,9 +441,10 @@ fn fallback_workspace_label(workspace: &str) -> String {
     }
 }
 
-/// Resolve a workspace's display label for a card/row: the bare name for
-/// registered workspaces, the fallback label (with the "(external)" marker)
-/// for unregistered/ephemeral ones, and "workspace" for an empty name.
+/// Resolve a workspace's display label for a section header: the bare name
+/// for registered workspaces, the fallback label (with the "(external)"
+/// marker) for unregistered/ephemeral ones, and "workspace" for an empty
+/// name.
 fn workspace_label_for(
     name: &str,
     workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
@@ -499,13 +458,12 @@ fn workspace_label_for(
     }
 }
 
-/// Render one running-agent card: role icon + label + workspace + current-tool
-/// badges + elapsed since the agent started (derived at render time, honestly
-/// shown as since-registration).
-fn render_agent_card<'a>(
-    card: &AgentCard,
-    workspaces: &'a std::collections::HashMap<String, WorkspaceInfo>,
-) -> Element<'a, RunningMessage> {
+/// Render one compact running-agent card: role icon, elapsed time, and last
+/// tool. The role text label and the workspace name are gone — the role icon
+/// carries the role and the workspace section header carries the workspace.
+/// Cards use the established surface-card style so they read as distinct from
+/// the group panel.
+fn render_agent_card(card: &AgentCard) -> Element<'static, Message> {
     let h = &card.handle;
     // Color resolution via the canonical string helper (handles derivative
     // names and falls back to muted grey for unknown roles); the icon still
@@ -514,85 +472,80 @@ fn render_agent_card<'a>(
     let role: crate::Role = h.role.parse().unwrap_or(crate::Role::Engineer);
     let icon = theme::role_icon(&role).size(20).color(fg);
 
-    let workspace_label = workspace_label_for(&h.workspace_name, workspaces);
-
+    // Elapsed time in the brighter readable tone (~4:1 on the card
+    // background, versus the old ~2:1 muted tone).
     let elapsed = format_elapsed(h.started_at);
 
-    let mut first_row = Row::new().spacing(8).align_y(Alignment::Center);
-    first_row = first_row.push(icon);
-    first_row = first_row.push(
-        text(h.label.clone())
-            .size(13)
-            .color(theme::TEXT_PRIMARY)
-            .width(Length::FillPortion(3)),
-    );
-    first_row = first_row.push(
-        text(workspace_label)
-            .size(11)
-            .color(theme::TEXT_MUTED)
-            .width(Length::FillPortion(2)),
-    );
-    first_row = first_row.push(text(elapsed).size(11).color(theme::TEXT_MUTED));
+    let first_row = row![
+        icon,
+        Space::new().width(Length::Fill),
+        text(elapsed).size(11).color(theme::TEXT_SECONDARY),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
 
-    // Tool badges — only tools that actually started executing. Absence is
-    // honest (agent in an LLM call / between rounds).
-    let mut badge_row = Row::new().spacing(6);
+    // Badge row: running tools if any, else the live activity phase, else the
+    // LAST COMPLETED tool — a fast tool no longer flashes and vanishes. Tool
+    // badges have no pill background; the text stays readable and overly long
+    // arguments are truncated.
+    let mut badge_row: Row<'static, Message> = Row::new().spacing(6);
+    let mut has_badges = false;
     for tool in &h.current_tools {
-        let tool_label = if tool.args.is_empty() {
-            tool.name.clone()
-        } else {
-            format!("{} {}", tool.name, tool.args)
-        };
-        badge_row = badge_row.push(
-            container(text(tool_label).size(11).color(theme::ACCENT))
-                .padding([1, 6])
-                .style(theme::pill_style(theme::ACCENT_DIM)),
-        );
+        badge_row = badge_row.push(render_tool_badge(tool));
+        has_badges = true;
     }
-    // Activity indicator — a non-tool LLM phase (verdict/summary extraction,
-    // media transcription) running inside this agent. The agent card is the
-    // single tracker for these calls (no separate call rows are ever created),
-    // so the badge is what keeps an extracting/transcribing agent from looking
-    // idle. Loader + label distinguishes it from tool badges.
-    if let Some(activity) = &h.activity {
-        badge_row = badge_row.push(
-            container(
-                row![
-                    lucide::loader_circle::<iced::Theme, iced::Renderer>()
-                        .size(11)
-                        .color(theme::ACCENT),
-                    text(activity.clone()).size(11).color(theme::ACCENT),
-                ]
-                .spacing(4)
-                .align_y(Alignment::Center),
-            )
-            .padding([1, 6])
-            .style(theme::pill_style(theme::ACCENT_DIM)),
-        );
+    if h.current_tools.is_empty() {
+        // Activity indicator — a non-tool LLM phase (verdict/summary
+        // extraction, media transcription) running inside this agent. The
+        // agent card is the single tracker for these calls (no separate call
+        // rows are ever created), so the badge is what keeps an
+        // extracting/transcribing agent from looking idle.
+        if let Some(activity) = &h.activity {
+            let badge: Element<'static, Message> =
+                text(activity.clone()).size(11).color(theme::ACCENT).into();
+            badge_row = badge_row.push(badge);
+            has_badges = true;
+        } else if let Some(last) = &h.last_tool {
+            badge_row = badge_row.push(render_tool_badge(last));
+            has_badges = true;
+        }
     }
 
     let mut col = Column::new().spacing(4);
     col = col.push(first_row);
-    if !h.current_tools.is_empty() || h.activity.is_some() {
+    if has_badges {
         col = col.push(badge_row);
     }
 
     container(col)
         .width(Length::Fill)
         .padding(8)
-        .style(theme::container_bar)
+        .style(theme::surface_card_style)
         .into()
 }
 
+/// Render one tool badge: plain tool text (no pill background), readable
+/// accent color, arguments truncated at the display bound.
+fn render_tool_badge(tool: &crate::registry::RunningTool) -> Element<'static, Message> {
+    let label = if tool.args.is_empty() {
+        tool.name.clone()
+    } else {
+        crate::util::truncate(
+            &format!("{} {}", tool.name, tool.args),
+            MAX_TOOL_BADGE_CHARS,
+        )
+    };
+    text(label).size(11).color(theme::ACCENT).into()
+}
+
 /// Render a compact non-agent LLM call row: zap marker + purpose + elapsed.
-fn render_call_row<'a>(
-    call: &CallRow,
-    workspaces: &'a std::collections::HashMap<String, WorkspaceInfo>,
-) -> Element<'a, RunningMessage> {
+/// No workspace name (the section header carries it); the elapsed time uses
+/// the same brighter tone as agent cards. The purpose is the static
+/// human-readable label — raw kind names never leak.
+fn render_call_row(call: &CallRow) -> Element<'static, Message> {
     let h = &call.handle;
-    let workspace_label = workspace_label_for(&h.workspace, workspaces);
     let elapsed = format_elapsed(h.started_at);
-    let purpose = call_purpose(h.kind);
+    let purpose = crate::call_registry::call_kind_label(h.kind);
 
     row![
         lucide::zap::<iced::Theme, iced::Renderer>()
@@ -600,34 +553,11 @@ fn render_call_row<'a>(
             .color(theme::ACCENT),
         text(purpose).size(12).color(theme::TEXT_SECONDARY),
         Space::new().width(Length::Fill),
-        text(workspace_label).size(11).color(theme::TEXT_MUTED),
-        text(elapsed).size(11).color(theme::TEXT_MUTED),
+        text(elapsed).size(11).color(theme::TEXT_SECONDARY),
     ]
     .spacing(6)
     .align_y(Alignment::Center)
     .into()
-}
-
-/// Human-readable purpose label for a call kind (the registry stores the
-/// same purpose string the call's `ChatRequestMeta` uses).
-///
-/// Note: `"research_orchestrator"` is deliberately absent — the orchestrator
-/// always registers with `run_lifetime = true`, so it renders as the group's
-/// run-lifetime indicator and never appears as a call row.
-fn call_purpose(kind: &str) -> String {
-    match kind {
-        "consolidate" => "Analyze consolidation".to_string(),
-        "synthesis" => "Ticket synthesis".to_string(),
-        "synthesize" => "Research synthesis".to_string(),
-        "decompose_merge" => "Research plan merge".to_string(),
-        "gap_extract" => "Research gap extraction".to_string(),
-        "abstain_check" => "Research answerability check".to_string(),
-        "claim_annotate" => "Research claim annotation".to_string(),
-        "confirm_links" => "Research link confirmation".to_string(),
-        "research_wrap_up" => "Research wrap-up".to_string(),
-        "media_transcription" => "Media transcription".to_string(),
-        other => other.to_string(),
-    }
 }
 
 /// Format the elapsed time since `started_at` at render time.
@@ -662,9 +592,11 @@ mod tests {
             workspace_path: format!("/ws/{workspace}"),
             workspace_name: workspace.to_string(),
             parent_key: parent,
+            parent_label: None,
             started_at: Utc::now(),
             label: role.to_string(),
             current_tools: Vec::new(),
+            last_tool: None,
             activity: None,
         }
     }
@@ -680,6 +612,7 @@ mod tests {
             workspace: workspace.to_string(),
             started_at: Utc::now(),
             parent_key: parent,
+            parent_label: None,
             run_lifetime,
         }
     }
@@ -851,6 +784,7 @@ mod tests {
                 kind: GroupKind::Unattributed,
                 key: "ws".to_string(),
                 workspace: "ws".to_string(),
+                label: None,
                 items: Vec::new(),
                 run_lifetime: false,
             },
@@ -858,6 +792,7 @@ mod tests {
                 kind: GroupKind::Ticket,
                 key: "T1".to_string(),
                 workspace: "ws".to_string(),
+                label: None,
                 items: Vec::new(),
                 run_lifetime: false,
             },
@@ -865,6 +800,7 @@ mod tests {
                 kind: GroupKind::Research,
                 key: "r".to_string(),
                 workspace: "ws".to_string(),
+                label: None,
                 items: Vec::new(),
                 run_lifetime: false,
             },
@@ -962,5 +898,145 @@ mod tests {
             2,
             "same round key in two workspaces stays separate"
         );
+    }
+
+    /// Build a handle with a parent label (the display-level label captured
+    /// at spawn — ticket title / question text).
+    fn agent_handle_labeled(
+        id: &str,
+        role: &str,
+        workspace: &str,
+        parent: Option<ParentKey>,
+        parent_label: Option<&str>,
+    ) -> AgentHandle {
+        let mut h = agent_handle(id, role, None, workspace, parent);
+        h.parent_label = parent_label.map(ToString::to_string);
+        h
+    }
+
+    fn call_handle_labeled(
+        kind: &'static str,
+        workspace: &str,
+        parent: Option<ParentKey>,
+        parent_label: Option<&str>,
+    ) -> NonAgentCallHandle {
+        let mut h = call_handle(kind, workspace, parent, false);
+        h.parent_label = parent_label.map(ToString::to_string);
+        h
+    }
+
+    #[test]
+    fn ticket_group_label_comes_from_members_not_the_key() {
+        // Ticket title is captured observationally at spawn (agents via
+        // Agent::new's ticket, the synthesis call via the joint-verdict
+        // threading). A group must carry the title even when only the
+        // synthesis call remains — never degrade to an ID-only header.
+        let agents = vec![agent_handle_labeled(
+            "a1",
+            "analyst",
+            "ws1",
+            Some(ParentKey::Ticket("T1".to_string())),
+            Some("Fix the login flow"),
+        )];
+        let calls = vec![call_handle_labeled(
+            "synthesis",
+            "ws1",
+            Some(ParentKey::Ticket("T1".to_string())),
+            Some("Fix the login flow"),
+        )];
+        let groups = build_groups(&agents, &calls);
+        let ticket = groups
+            .iter()
+            .find(|g| g.kind == GroupKind::Ticket)
+            .expect("ticket group exists");
+        assert_eq!(
+            ticket.label.as_deref(),
+            Some("Fix the login flow"),
+            "group label adopted from a member's parent label"
+        );
+        // The header title is the ticket name; the id is only the secondary.
+        let (title, secondary) = group_title(ticket);
+        assert_eq!(title, "Fix the login flow");
+        assert_eq!(secondary.as_deref(), Some("T1"));
+    }
+
+    #[test]
+    fn analyze_and_research_groups_render_question_not_raw_key() {
+        // Analyze/research headers show the question text; the raw NanoID key
+        // is never rendered. A missing label degrades to a generic label,
+        // never the key.
+        let agents = vec![agent_handle_labeled(
+            "a1",
+            "analyst",
+            "ws1",
+            Some(ParentKey::AnalyzeRound("job_abc".to_string())),
+            Some("Why is CI flaky?"),
+        )];
+        let groups = build_groups(&agents, &[]);
+        let analyze = groups
+            .iter()
+            .find(|g| g.kind == GroupKind::AnalyzeRound)
+            .expect("analyze group exists");
+        let (title, secondary) = group_title(analyze);
+        assert_eq!(title, "Why is CI flaky?");
+        assert!(secondary.is_none(), "no id secondary for analyze groups");
+        assert!(!title.contains("job_abc"), "raw key never leaks");
+
+        let mut no_label = analyze.clone();
+        no_label.label = None;
+        let (fallback, _) = group_title(&no_label);
+        assert_eq!(fallback, "Analyze round");
+        assert!(!fallback.contains("job_abc"), "generic fallback, no key");
+    }
+
+    #[test]
+    fn sections_group_by_workspace_and_keep_kind_order() {
+        // Workspace-first layout. Sections are alphabetical; within a section,
+        // groups keep the canonical kind order. Singleton groups are keyed by
+        // workspace, so they land in their own workspace's section.
+        let mut ws_map = std::collections::HashMap::new();
+        ws_map.insert(
+            "ws2".to_string(),
+            WorkspaceInfo::test_new("/ws/ws2".to_string(), false, false),
+        );
+        let agents = vec![
+            agent_handle(
+                "t_agent",
+                "engineer",
+                Some("T1".to_string()),
+                "ws1",
+                Some(ParentKey::Ticket("T1".to_string())),
+            ),
+            agent_handle("mgr_ws2", "manager", None, "ws2", None),
+            agent_handle("mgr_ws1", "manager", None, "ws1", None),
+        ];
+        let groups = build_groups(&agents, &[]);
+        let sections = build_sections(groups, &ws_map);
+        assert_eq!(sections.len(), 2, "one section per workspace");
+        assert_eq!(sections[0].workspace, "ws1");
+        assert_eq!(sections[1].workspace, "ws2");
+        // ws1: ticket group before singleton (kind order).
+        assert_eq!(sections[0].groups[0].kind, GroupKind::Ticket);
+        assert_eq!(sections[0].groups[1].kind, GroupKind::Singleton);
+        // ws2 is registered → bare name; ws1 is unregistered → "(external)".
+        assert_eq!(sections[1].label, "ws2");
+        assert_eq!(sections[0].label, "ws1 (external)");
+    }
+
+    #[test]
+    fn singleton_and_unattributed_headers_are_generic_not_workspace_titled() {
+        // Inside a workspace section the singleton/unattributed group headers
+        // must NOT repeat the workspace name (the section header carries it).
+        let agents = vec![agent_handle("mgr", "manager", None, "ws1", None)];
+        let calls = vec![call_handle("some_orchestrator_call", "ws1", None, false)];
+        let groups = build_groups(&agents, &calls);
+        for group in &groups {
+            let (title, _) = group_title(group);
+            assert_ne!(title, "ws1", "group header must not duplicate the section");
+            assert!(
+                !title.contains("ws1"),
+                "no workspace name in group headers: {title}"
+            );
+        }
     }
 }

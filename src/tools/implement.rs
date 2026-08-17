@@ -43,8 +43,19 @@ impl Tool for ImplementTool {
         let parent_key = crate::agent::CURRENT_TOOL_PARENT_KEY
             .try_with(std::clone::Clone::clone)
             .unwrap_or(None);
-        let (agent, response) =
-            run_default_agent(&agent_id, Role::Coder, ws, task, None, parent_key).await;
+        let parent_label = crate::agent::CURRENT_TOOL_PARENT_LABEL
+            .try_with(std::clone::Clone::clone)
+            .unwrap_or(None);
+        let (agent, response) = run_default_agent(
+            &agent_id,
+            Role::Coder,
+            ws,
+            task,
+            None,
+            parent_key,
+            parent_label,
+        )
+        .await;
 
         if let Some(response) = response {
             Ok(response)

@@ -337,7 +337,7 @@ async fn run_analyze_with_job(
         .collect();
     // Round key = the durable job_id — stable across resume so a resumed
     // round's analysts and consolidation call group under the same key.
-    let fresh_runs = run_analyze_slots(ws, &fresh_slots, deadline, resume, job_id).await;
+    let fresh_runs = run_analyze_slots(ws, &fresh_slots, deadline, resume, job_id, analyze).await;
 
     // Assemble runs in slot order.
     let mut runs: Vec<AnalyzeRun> = Vec::with_capacity(slots.len());
@@ -355,6 +355,7 @@ async fn run_analyze_with_job(
                 String::new(),
                 String::new(),
                 Some(crate::registry::ParentKey::AnalyzeRound(job_id.to_string())),
+                Some(analyze.to_string()),
             );
             let _ = agent
                 .session
@@ -428,6 +429,7 @@ async fn run_analyze_slots(
     deadline: std::time::Instant,
     resume: bool,
     round_key: &str,
+    question: &str,
 ) -> Vec<AnalyzeRun> {
     let members: Vec<_> = slots
         .iter()
@@ -436,6 +438,7 @@ async fn run_analyze_slots(
             let agent_id = slot.agent_id.clone();
             let task = slot.task.clone();
             let round_key = round_key.to_string();
+            let question = question.to_string();
             move |round| async move {
                 // Session-non-emptiness discriminator: a resumed slot whose
                 // session already contains the task continues with an empty
@@ -455,6 +458,7 @@ async fn run_analyze_slots(
                     resume,
                     Some(round),
                     Some(crate::registry::ParentKey::AnalyzeRound(round_key)),
+                    Some(question),
                 )
                 .await
             }
@@ -904,7 +908,7 @@ async fn run_parallel_analysts(
         .map(|i| analyst_slot(ws, &angles, round_key, i, analyze))
         .collect();
     let slot_refs: Vec<&AnalyzeSlot> = slots.iter().collect();
-    run_analyze_slots(ws, &slot_refs, deadline, false, round_key).await
+    run_analyze_slots(ws, &slot_refs, deadline, false, round_key, analyze).await
 }
 
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
@@ -1147,8 +1151,15 @@ async fn consolidate_findings(
             &outcomes,
         ));
     }
-    match crate::consensus::run_grouping_repair(ws, "consolidate", request, &items_by_agent, parent)
-        .await
+    match crate::consensus::run_grouping_repair(
+        ws,
+        "consolidate",
+        request,
+        &items_by_agent,
+        parent,
+        Some(analyze.to_string()),
+    )
+    .await
     {
         crate::consensus::RepairOutcome::Repaired { output, references } => Ok(
             render_analyze_groups(analyze, &output, &references, &table, n_valid, &outcomes),
@@ -1350,6 +1361,7 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
 /// sanitizer needs them at dispatch time — successful writers never appear in
 /// wrap-up snapshots; the ids ride the return value so the shared helper
 /// keeps no write-only out-parameter).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_claim_verifiers(
     ws: &Workspace,
     id_prefix: &str,
@@ -1358,6 +1370,7 @@ pub(crate) async fn dispatch_claim_verifiers(
     deadline: std::time::Instant,
     resume: bool,
     run_key: &str,
+    question: &str,
 ) -> (Vec<VerificationResult>, Vec<String>) {
     let task_template = load_prompt("analyze/verify.md");
     let extraction_prompt = load_prompt("extraction/verify.md");
@@ -1383,6 +1396,7 @@ pub(crate) async fn dispatch_claim_verifiers(
             let extraction_prompt = extraction_prompt.clone();
             let claim_text = t.claim.clone();
             let run_key = run_key.to_string();
+            let question = question.to_string();
             move |round| async move {
                 run_claim_verifier(
                     &ws,
@@ -1392,6 +1406,7 @@ pub(crate) async fn dispatch_claim_verifiers(
                     &extraction_prompt,
                     round,
                     &run_key,
+                    &question,
                 )
                 .await
             }
@@ -1421,6 +1436,10 @@ pub(crate) async fn dispatch_claim_verifiers(
 
 /// Run one claim verifier: a fresh Analyst researches the claim and returns
 /// its structured verdict. Any failure yields "unresolved" — fail-open.
+///
+/// `question` is the research run's question — threaded as the run group's
+/// header label (purely presentational).
+#[allow(clippy::too_many_arguments)]
 async fn run_claim_verifier(
     ws: &Workspace,
     agent_id: &str,
@@ -1429,6 +1448,7 @@ async fn run_claim_verifier(
     extraction_prompt: &str,
     round: crate::agent::RoundOpts,
     run_key: &str,
+    question: &str,
 ) -> VerificationResult {
     let (agent, response) = run_default_agent(
         agent_id,
@@ -1437,6 +1457,7 @@ async fn run_claim_verifier(
         task,
         Some(round),
         Some(crate::registry::ParentKey::Research(run_key.to_string())),
+        Some(question.to_string()),
     )
     .await;
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
@@ -1595,6 +1616,7 @@ mod tests {
             None,
             String::new(),
             String::new(),
+            None,
             None,
         );
         AnalyzeRun::Completed {

@@ -40,6 +40,13 @@ tokio::task_local! {
     /// tools that spawn sub-agents (e.g. implement) can propagate the caller's
     /// group to the Running Agents view. `None` = workspace singleton caller.
     pub(crate) static CURRENT_TOOL_PARENT_KEY: Option<crate::registry::ParentKey>;
+    /// The calling agent's DIRECT PARENT INVOCATION human-readable label
+    /// (ticket title / analyze question / research question) — set alongside
+    /// [`CURRENT_TOOL_PARENT_KEY`] for the duration of tool execution so tools
+    /// that spawn sub-agents can propagate the caller's group header label to
+    /// the Running Agents view. Purely presentational; `None` for workspace
+    /// singletons.
+    pub(crate) static CURRENT_TOOL_PARENT_LABEL: Option<String>;
     /// The calling agent's background shell session registry — set for the
     /// duration of tool execution so the shell tool (Full roles only) can
     /// register/stop background sessions that are force-killed when the agent
@@ -200,7 +207,14 @@ impl Agent {
     /// the agent is a workspace singleton (manager / maintainer / discovery /
     /// direct chat) — ticket agents pass the ticket and get
     /// [`ParentKey::Ticket`] implicitly.
+    ///
+    /// `parent_label` is the human-readable label of that parent invocation
+    /// (ticket title / analyze question / research question) — purely
+    /// presentational. `None` falls back to the ticket title when the effective
+    /// parent is a ticket; callers of analyze/research rounds pass the
+    /// question/task text explicitly.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // one positional arg per construction field; callers use literals
     pub fn new(
         agent_id: String,
         role: crate::Role,
@@ -209,6 +223,7 @@ impl Agent {
         user_name: String,
         channel: String,
         parent_key: Option<crate::registry::ParentKey>,
+        parent_label: Option<String>,
     ) -> Self {
         let (tools, tool_specs) = role_tools_and_specs(role, ws);
 
@@ -225,6 +240,13 @@ impl Agent {
                 .as_ref()
                 .map(|t| crate::registry::ParentKey::Ticket(t.id.clone()))
         });
+        // The group header label: an explicit parent label (analyze/research
+        // question) wins; a ticket-parented agent without one falls back to
+        // the ticket title. Purely presentational — never affects behavior.
+        let parent_label = parent_label.or_else(|| match parent_key {
+            Some(crate::registry::ParentKey::Ticket(_)) => ticket.as_ref().map(|t| t.title.clone()),
+            _ => None,
+        });
         let generation = crate::registry::AGENT_REGISTRY.register(
             agent_id.clone(),
             role.to_string(),
@@ -233,6 +255,7 @@ impl Agent {
             label,
             cancel_token.clone(),
             parent_key.clone(),
+            parent_label.clone(),
         );
 
         Self {
@@ -249,6 +272,7 @@ impl Agent {
             user_name,
             channel,
             parent_key,
+            parent_label,
             incoming_rx: None,
             round_ts: None,
             first_call_notify: None,
@@ -539,6 +563,7 @@ impl Agent {
         let user_name = self.user_name.clone();
         let channel = self.channel.clone();
         let parent_key = self.parent_key.clone();
+        let parent_label = self.parent_label.clone();
         let background_sessions = Some(self.background_sessions.clone());
         let agent_id = Some(self.agent_id.clone());
         let agent_tracking = Some(crate::registry::AgentTracking {
@@ -553,38 +578,41 @@ impl Agent {
                     .scope(channel, async {
                         CURRENT_TOOL_PARENT_KEY
                             .scope(parent_key, async {
-                                CURRENT_TOOL_BACKGROUND_SESSIONS
-                                    .scope(background_sessions, async {
-                                        CURRENT_TOOL_AGENT_ID
-                                            .scope(agent_id, async {
-                                                CURRENT_TOOL_AGENT_TRACKING
-                                                    .scope(agent_tracking, async {
-                                                        while i < tool_calls.len() {
-                                                            if side_flags[i] {
-                                                                // Side-effecting: single-call group, executed alone.
-                                                                let outcome = self
-                                                                    .execute_tool(
-                                                                        &tool_calls[i].name,
-                                                                        tool_calls[i]
-                                                                            .arguments
-                                                                            .clone(),
-                                                                    )
-                                                                    .await;
-                                                                outcomes.push(outcome);
-                                                                i += 1;
-                                                            } else {
-                                                                // Read-only group: extend while consecutive calls are also read-only.
-                                                                let group_start = i;
-                                                                while i < tool_calls.len()
-                                                                    && !side_flags[i]
-                                                                {
-                                                                    i += 1;
-                                                                }
-                                                                let group_calls =
-                                                                    &tool_calls[group_start..i];
+                                CURRENT_TOOL_PARENT_LABEL
+                                    .scope(parent_label, async {
+                                        CURRENT_TOOL_BACKGROUND_SESSIONS
+                                            .scope(background_sessions, async {
+                                                CURRENT_TOOL_AGENT_ID
+                                                    .scope(agent_id, async {
+                                                        CURRENT_TOOL_AGENT_TRACKING
+                                                            .scope(agent_tracking, async {
+                                                                while i < tool_calls.len() {
+                                                                    if side_flags[i] {
+                                                                        // Side-effecting: single-call group, executed alone.
+                                                                        let outcome = self
+                                                                            .execute_tool(
+                                                                                &tool_calls[i].name,
+                                                                                tool_calls[i]
+                                                                                    .arguments
+                                                                                    .clone(),
+                                                                            )
+                                                                            .await;
+                                                                        outcomes.push(outcome);
+                                                                        i += 1;
+                                                                    } else {
+                                                                        // Read-only group: extend while consecutive calls are also read-only.
+                                                                        let group_start = i;
+                                                                        while i < tool_calls.len()
+                                                                            && !side_flags[i]
+                                                                        {
+                                                                            i += 1;
+                                                                        }
+                                                                        let group_calls =
+                                                                            &tool_calls
+                                                                                [group_start..i];
 
-                                                                // Execute the entire read-only group in parallel.
-                                                                let group_outcomes: Vec<_> =
+                                                                        // Execute the entire read-only group in parallel.
+                                                                        let group_outcomes: Vec<_> =
                                                                     futures_util::future::join_all(
                                                                         group_calls.iter().map(
                                                                             |call| {
@@ -598,9 +626,12 @@ impl Agent {
                                                                     )
                                                                     .await;
 
-                                                                outcomes.extend(group_outcomes);
-                                                            }
-                                                        }
+                                                                        outcomes
+                                                                            .extend(group_outcomes);
+                                                                    }
+                                                                }
+                                                            })
+                                                            .await;
                                                     })
                                                     .await;
                                             })
@@ -1231,6 +1262,7 @@ pub(crate) async fn run_agent(
     resume: bool,
     round: Option<RoundOpts>,
     parent_key: Option<crate::registry::ParentKey>,
+    parent_label: Option<String>,
 ) -> (Agent, Option<String>) {
     // Unregister from the message router on EVERY exit path, including a
     // panic mid-work (Drop runs during unwind) — a leaked router entry would
@@ -1256,6 +1288,7 @@ pub(crate) async fn run_agent(
         user_name,
         channel,
         parent_key,
+        parent_label,
     );
     agent.incoming_rx = incoming_rx;
     if let Some(round) = round {
@@ -1333,6 +1366,8 @@ pub(crate) async fn run_agent(
 /// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
 /// Running Agents view (ticket / analyze round / research run); `None` for
 /// workspace singletons (manager / maintainer / discovery / direct chat).
+/// `parent_label` is the human-readable label of that parent invocation
+/// (analyze question / research question) — purely presentational.
 pub(crate) async fn run_default_agent(
     agent_id: &str,
     role: crate::Role,
@@ -1340,6 +1375,7 @@ pub(crate) async fn run_default_agent(
     message: &str,
     round: Option<RoundOpts>,
     parent_key: Option<crate::registry::ParentKey>,
+    parent_label: Option<String>,
 ) -> (Agent, Option<String>) {
     run_agent(
         agent_id.to_string(),
@@ -1353,6 +1389,7 @@ pub(crate) async fn run_default_agent(
         false,
         round,
         parent_key,
+        parent_label,
     )
     .await
 }
@@ -1452,6 +1489,7 @@ mod tests {
             user_name: String::new(),
             channel: String::new(),
             parent_key: None,
+            parent_label: None,
             incoming_rx: None,
             round_ts: None,
             first_call_notify: None,
@@ -2175,6 +2213,7 @@ mod tests {
                 round_ts: crate::session::render_timestamp(),
                 first_call_notify: Some(notify.clone()),
             }),
+            None,
             None,
         )
         .await;

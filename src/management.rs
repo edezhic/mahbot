@@ -1429,6 +1429,7 @@ async fn run_single_agent(
         resume,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2727,6 +2728,11 @@ pub(crate) fn stage_role(name: &str) -> Option<Role> {
 /// Build the joint comment for a round: deterministic merge + single LLM
 /// synthesis pass (stage role's own model) + rendering. Runs entirely before
 /// any board transaction — the synthesis must never hold the board write lock.
+///
+/// `ticket_title` is threaded into the synthesis call's Running Agents group
+/// header label (purely presentational — the ticket group keeps its name even
+/// when only the synthesis call remains after the round's agents deregistered).
+#[allow(clippy::too_many_arguments)]
 async fn build_round_joint_comment(
     stage: &str,
     results: &[ParallelVerdict],
@@ -2735,6 +2741,7 @@ async fn build_round_joint_comment(
     header: &str,
     ws: &Workspace,
     ticket_id: &str,
+    ticket_title: &str,
 ) -> String {
     let mut verdicts: Vec<crate::joint_verdict::JointVerdict<'_>> = Vec::new();
     let mut failures: Vec<crate::joint_verdict::JointFailure> = Vec::new();
@@ -2780,7 +2787,7 @@ async fn build_round_joint_comment(
             &crate::consensus::ItemTable::new(&crate::joint_verdict::issues_by_agent(&round)),
         )
     } else {
-        crate::joint_verdict::build_joint_comment(&round, role, ws, ticket_id).await
+        crate::joint_verdict::build_joint_comment(&round, role, ws, ticket_id, ticket_title).await
     }
 }
 
@@ -2916,6 +2923,7 @@ async fn run_parallel_agents(
                         Some(rx),
                         resume,
                         Some(round),
+                        None,
                         None,
                     )
                     .await;
@@ -3644,6 +3652,7 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
         &summary,
         ws,
         &ticket.id,
+        &ticket.title,
     )
     .await;
 
@@ -4099,6 +4108,7 @@ async fn process_verifier_verdicts(
                 "",
                 ws,
                 &ticket.id,
+                &ticket.title,
             )
             .await,
         )

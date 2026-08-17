@@ -463,11 +463,20 @@ pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Resu
 /// dedup inside `create_cleanup_job_row` covers the crash window (a resumed
 /// run terminalizes again while its cleanup row survives).
 ///
+/// `question` is the research question/task text, threaded observationally to
+/// the cleanup agent so the Running Agents view keeps the group's question
+/// header during the cleanup window (all other run members have deregistered
+/// by then). Purely presentational — never affects cleanup behavior.
+///
 /// Delete capability: Role::Sanitation's standard toolset (Read / Search /
 /// Shell ReadOnly) already permits rm/mv/cp under the allowed temp roots —
 /// the readonly guard's TEMP_MUTATORS gate on the path, not the role. The
 /// cleanup agent therefore needs NO custom toolset.
-pub(crate) async fn dispatch_research_cleanup(job_id: &str, ws: &Workspace) -> Result<()> {
+pub(crate) async fn dispatch_research_cleanup(
+    job_id: &str,
+    question: &str,
+    ws: &Workspace,
+) -> Result<()> {
     let Some(prompt) = create_cleanup_job_row(job_id, ws).await? else {
         return Ok(());
     };
@@ -489,8 +498,9 @@ pub(crate) async fn dispatch_research_cleanup(job_id: &str, ws: &Workspace) -> R
     let agent_id = cleanup_agent_id(job_id);
     let agent_id_log = agent_id.clone();
     let job_id = job_id.to_string();
+    let question = question.to_string();
     tokio::spawn(async move {
-        run_cleanup_agent_and_finish(&job_id, &ws, &prompt).await;
+        run_cleanup_agent_and_finish(&job_id, Some(&question), &ws, &prompt).await;
     });
 
     tracing::info!(job = %job_id_log, agent = %agent_id_log, "Research cleanup dispatched");
@@ -501,7 +511,17 @@ pub(crate) async fn dispatch_research_cleanup(job_id: &str, ws: &Workspace) -> R
 /// folder — folder first, row last — on EVERY exit path. The shared tail of
 /// the fresh dispatch and the boot-resume path — a divergence here would
 /// silently change one path's folder-release/terminalize behavior.
-async fn run_cleanup_agent_and_finish(job_id: &str, ws: &Workspace, prompt: &str) {
+///
+/// `question` is the research question for the Running Agents group label
+/// (fresh dispatch always has it; the boot-resume path only stores the
+/// cleanup prompt, so it passes `None` and the header degrades to the generic
+/// label — presentational only).
+async fn run_cleanup_agent_and_finish(
+    job_id: &str,
+    question: Option<&str>,
+    ws: &Workspace,
+    prompt: &str,
+) {
     let agent_id = cleanup_agent_id(job_id);
     let (agent, response) = crate::agent::run_default_agent(
         &agent_id,
@@ -510,6 +530,7 @@ async fn run_cleanup_agent_and_finish(job_id: &str, ws: &Workspace, prompt: &str
         prompt,
         None,
         Some(crate::registry::ParentKey::Research(job_id.to_string())),
+        question.map(str::to_string),
     )
     .await;
     // The cleaner's final response is logged for observability (no archive
@@ -575,7 +596,9 @@ pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
         return;
     };
     let prompt = caller.task.clone();
-    run_cleanup_agent_and_finish(job_id, ws, &prompt).await;
+    // The row stores the cleanup prompt, not the research question — the
+    // group header falls back to the generic label on this path.
+    run_cleanup_agent_and_finish(job_id, None, ws, &prompt).await;
 }
 
 // ── Sweep: artist generated/uploads keep-detection ────────────────────────
@@ -1279,7 +1302,9 @@ mod tests {
                 .unwrap(),
             "the pre-created row is the dedup marker"
         );
-        dispatch_research_cleanup("run_dedup", &ws).await.unwrap();
+        dispatch_research_cleanup("run_dedup", "test question", &ws)
+            .await
+            .unwrap();
         let rows = crate::session::store()
             .conn
             .query(

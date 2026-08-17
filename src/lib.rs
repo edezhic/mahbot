@@ -734,6 +734,12 @@ pub struct Agent {
     /// Propagated to sub-agents spawned by tools via
     /// [`CURRENT_TOOL_PARENT_KEY`](crate::agent::CURRENT_TOOL_PARENT_KEY).
     pub(crate) parent_key: Option<crate::registry::ParentKey>,
+    /// Human-readable label of the DIRECT PARENT INVOCATION (ticket title /
+    /// analyze question / research question) — shown on the Running Agents
+    /// group header. Purely presentational. Propagated to sub-agents spawned
+    /// by tools via
+    /// [`CURRENT_TOOL_PARENT_LABEL`](crate::agent::CURRENT_TOOL_PARENT_LABEL).
+    pub(crate) parent_label: Option<String>,
     /// Optional receiver for mid-work messages (e.g., ticket comments).
     /// When set, the `llm_loop` drains this channel before each LLM call
     /// and injects received messages into the session history.
