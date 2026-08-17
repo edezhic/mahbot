@@ -23,7 +23,7 @@ use super::widgets::{badge_pill, diff_stats_row, role_badge, selectable_text};
 
 /// Phases where an agent is actively running on the ticket. Cancelling a
 /// ticket in one of these phases aborts an in-flight agent run — the
-/// technical-failure auto-pause trigger (see `PerformAction`). The phase
+/// technical-failure auto-pause trigger (see `agent_in_flight`). The phase
 /// alone is a coarse proxy: `assigned_to` must also be set, so queued
 /// tickets in an agent phase with no running agent are not treated as
 /// in-flight cancels.
@@ -35,6 +35,16 @@ const AGENT_RUNNING_PHASES: &[TicketPhase] = &[
     TicketPhase::InQa,
     TicketPhase::InSanitation,
 ];
+
+/// Whether a cancel of this ticket aborts an in-flight agent run — an
+/// agent-running phase with an assigned agent. Shared by the
+/// `PerformAction` workspace-pause gate and the `RequestCancel`
+/// confirmation-eligibility check so the two sites can't drift (a drift
+/// would desync the pause behavior and make the modal's consequence
+/// text untrue).
+fn agent_in_flight(ticket: &Ticket) -> bool {
+    AGENT_RUNNING_PHASES.contains(&ticket.phase) && ticket.assigned_to.is_some()
+}
 
 /// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
@@ -70,6 +80,20 @@ pub enum BoardMessage {
     TicketDetailsRefreshError(u64, String),
     PerformAction(String, String), // ticket_id, new_phase
     ActionResult(Result<(), String>),
+
+    /// User clicked the cancel action on a ticket. Checks the freshest
+    /// cached ticket state synchronously ([`BoardState::ticket_in_flight`]):
+    /// an in-flight agent opens the mid-pipeline confirmation modal
+    /// ([`BoardMessage::ConfirmCancel`]); otherwise the cancel executes
+    /// directly (non-agent phases stay single-click). `PerformAction`
+    /// re-checks at execution, so the real pause decision is always
+    /// authoritative.
+    RequestCancel(String),
+    /// The user confirmed the mid-pipeline cancel modal — execute the cancel.
+    ConfirmCancel(String),
+    /// The user dismissed the mid-pipeline cancel modal (backdrop or button).
+    /// The ticket is left untouched.
+    DismissCancel,
 
     /// Open the ticket detail modal.
     OpenModal(String),
@@ -152,6 +176,10 @@ pub struct BoardState {
     commit_stats_loading: bool,
     /// Incremented on each new fetch; stale callbacks discarded.
     commit_stats_generation: u64,
+    /// Ticket awaiting mid-pipeline cancel confirmation. `Some(ticket_id)`
+    /// while the cancel-confirmation modal is shown; the cancel only runs
+    /// on [`BoardMessage::ConfirmCancel`].
+    pending_cancel: Option<String>,
     /// Tracks which comment indices are expanded (for diagnostics collapse).
     expanded_comments: HashSet<usize>,
     /// Stores the last detail-load error message for display in the modal.
@@ -210,6 +238,7 @@ impl BoardState {
             commit_stats: None,
             commit_stats_loading: false,
             commit_stats_generation: 0,
+            pending_cancel: None,
             expanded_comments: HashSet::new(),
             detail_error: None,
             detail_refresh_in_flight: false,
@@ -226,8 +255,42 @@ impl BoardState {
         }
     }
 
+    /// Dismiss an open mid-pipeline cancel confirmation without touching
+    /// the ticket. Shared by `Escape` and the modal's own dismiss actions
+    /// (`DismissCancel`), so both paths stay in sync.
+    fn dismiss_pending_cancel(&mut self) {
+        self.pending_cancel = None;
+    }
+
+    /// Whether `ticket_id` currently has an in-flight agent, using the
+    /// freshest synchronous state available: the open detail modal's
+    /// `selected_ticket` (a fresh DB fetch, refreshed every second even
+    /// during search), then the search results (the exact cards the user
+    /// sees while a search is active), then the board list (refreshed every
+    /// second; paused during search). Decides between the confirmation
+    /// modal and a single-click cancel in `RequestCancel`. `PerformAction`
+    /// re-fetches and re-checks `agent_in_flight` at execution, so the real
+    /// pause decision is always authoritative regardless of staleness here.
+    fn ticket_in_flight(&self, ticket_id: &str) -> bool {
+        if let Some(ref ticket) = self.selected_ticket {
+            if ticket.id == ticket_id {
+                return agent_in_flight(ticket);
+            }
+        }
+        if let Some(ticket) = self.search_results.iter().find(|t| t.id == ticket_id) {
+            return agent_in_flight(ticket);
+        }
+        self.tickets
+            .iter()
+            .any(|t| t.id == ticket_id && agent_in_flight(t))
+    }
+
     /// Reset all modal-related state fields (close detail modal).
     fn reset_modal(&mut self) {
+        // Dismiss any open cancel confirmation too. Unreachable today
+        // (Escape's first branch and the confirm backdrop guard it), but
+        // the reset contract should hold for any future caller.
+        self.dismiss_pending_cancel();
         self.selected_ticket = None;
         self.selected_loading = false;
         self.detail_error = None;
@@ -467,6 +530,12 @@ impl BoardState {
                         .style(style_fn)
                         .on_press_maybe(if is_disabled {
                             None
+                        } else if is_cancel {
+                            // Cancels go through the eligibility gate first
+                            // (`RequestCancel`): mid-pipeline cancels (agent
+                            // running) require explicit confirmation; other
+                            // cancels execute directly, exactly as before.
+                            Some(BoardMessage::RequestCancel(ticket_id.to_string()))
                         } else {
                             Some(BoardMessage::PerformAction(
                                 ticket_id.to_string(),
@@ -570,7 +639,12 @@ impl BoardState {
                 Task::none()
             }
             BoardMessage::Escape => {
-                if self.comment_focused {
+                if self.pending_cancel.is_some() {
+                    // Dismiss the cancel-confirmation modal first — the
+                    // ticket is left untouched.
+                    self.dismiss_pending_cancel();
+                    Task::none()
+                } else if self.comment_focused {
                     // On first Escape, blur the comment input (clear focus flag)
                     // so a second Escape closes the modal.
                     self.comment_focused = false;
@@ -653,10 +727,7 @@ impl BoardState {
                         // don't cascade. Supersede auto-cancels and Manager-tool
                         // cancels don't go through here; shutdown and
                         // already-paused are handled inside the helper.
-                        if phase == TicketPhase::Cancelled
-                            && AGENT_RUNNING_PHASES.contains(&ticket.phase)
-                            && ticket.assigned_to.is_some()
-                        {
+                        if phase == TicketPhase::Cancelled && agent_in_flight(&ticket) {
                             let notice = crate::management::pause_workspace_on_failure(
                                 &ticket,
                                 "user cancelled the ticket while an agent was running",
@@ -725,6 +796,34 @@ impl BoardState {
             BoardMessage::ActionResult(Err(e)) => {
                 self.action_loading = None;
                 Task::done(BoardMessage::Toast(super::ToastMessage::Error(e)))
+            }
+            BoardMessage::RequestCancel(ticket_id) => {
+                // Synchronous eligibility check against the freshest cached
+                // state (`ticket_in_flight`): an in-flight agent requires
+                // explicit confirmation; otherwise the cancel stays
+                // single-click, exactly as before. There is no async fetch
+                // to race with, so no stale-callback machinery is needed —
+                // `PerformAction` re-checks `agent_in_flight` at execution.
+                if self.ticket_in_flight(&ticket_id) {
+                    self.pending_cancel = Some(ticket_id);
+                    Task::none()
+                } else {
+                    Task::done(BoardMessage::PerformAction(
+                        ticket_id,
+                        TicketPhase::Cancelled.to_string(),
+                    ))
+                }
+            }
+            BoardMessage::ConfirmCancel(ticket_id) => {
+                self.pending_cancel = None;
+                Task::done(BoardMessage::PerformAction(
+                    ticket_id,
+                    TicketPhase::Cancelled.to_string(),
+                ))
+            }
+            BoardMessage::DismissCancel => {
+                self.dismiss_pending_cancel();
+                Task::none()
             }
             BoardMessage::ToggleCommentExpand(i) => {
                 if !self.expanded_comments.remove(&i) {
@@ -1207,10 +1306,17 @@ impl BoardState {
     }
 
     /// Render the modal overlay for ticket detail.
-    /// Includes the empty-case placeholder for `Stack` widget type stability.
+    ///
+    /// Always a two-layer `Stack`: the ticket detail modal (or a
+    /// type-stable placeholder) at child 0 and the cancel-confirmation
+    /// layer (or a type-stable placeholder) at child 1. Both slots keep a
+    /// `Stack` shape whether empty or populated, so the outer widget's
+    /// shape never changes when the confirmation is shown or dismissed —
+    /// child 0's tag stays stable and the detail subtree's transient
+    /// widget state (e.g. scroll position) survives the confirm cycle.
     #[must_use]
     pub fn render_modal_overlay(&self) -> Element<'_, BoardMessage> {
-        if self.is_modal_open() {
+        let detail_layer = if self.is_modal_open() {
             if self.selected_loading {
                 let dialog = container(
                     column![
@@ -1269,7 +1375,73 @@ impl BoardState {
             // Keep Stack widget type stable to prevent MouseArea state
             // from becoming orphaned when the modal closes.
             iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
-        }
+        };
+
+        let confirm_layer = if let Some(ref ticket_id) = self.pending_cancel {
+            Self::cancel_confirm_dialog(ticket_id)
+        } else {
+            // Type-stable placeholder so child 1's tag — and therefore the
+            // outer Stack's shape — does not change when the confirmation
+            // is dismissed.
+            iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
+        };
+
+        iced::widget::stack([detail_layer, confirm_layer]).into()
+    }
+
+    /// Build the mid-pipeline cancel confirmation dialog for a ticket.
+    ///
+    /// Shown when the eligibility check (`RequestCancel` →
+    /// [`BoardState::ticket_in_flight`]) reports an in-flight agent; the
+    /// listed consequences are real as of that check. If the agent finishes
+    /// before the user confirms, `PerformAction` re-checks `agent_in_flight`
+    /// at execution, so the pause just doesn't apply — the cancel itself is
+    /// always phase-CAS-guarded.
+    fn cancel_confirm_dialog(ticket_id: &str) -> Element<'_, BoardMessage> {
+        let dialog = container(
+            column![
+                text(format!("Cancel ticket {ticket_id}?"))
+                    .size(16)
+                    .color(theme::TEXT_PRIMARY)
+                    .font(theme::FONT_BOLD),
+                Space::new().height(12),
+                text("An agent is currently running on this ticket. Confirming will:")
+                    .size(13)
+                    .color(theme::TEXT_SECONDARY),
+                Space::new().height(8),
+                text(
+                    "• cancel the ticket immediately — it is archived \
+                     automatically afterwards;\n\
+                     • stop the running agent — the current tool may finish, \
+                     but no further work happens;\n\
+                     • leave uncommitted changes in the working tree — not \
+                     committed, not reverted;\n\
+                     • pause the workspace pipeline — new development is \
+                     blocked until you manually resume it (analysis, review, \
+                     and QA of other tickets continue).",
+                )
+                .size(13)
+                .color(theme::TEXT_SECONDARY),
+                Space::new().height(16),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Keep ticket").size(13))
+                        .style(theme::button_secondary)
+                        .on_press(BoardMessage::DismissCancel),
+                    Space::new().width(8),
+                    button(text("Cancel ticket").size(13))
+                        .style(theme::button_danger)
+                        .on_press(BoardMessage::ConfirmCancel(ticket_id.to_string())),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .width(Length::Fill),
+        )
+        .width(Length::Fixed(480.0))
+        .padding(24)
+        .style(theme::dialog_container_style);
+
+        widget_helpers::modal_backdrop(dialog, BoardMessage::DismissCancel, 0.5)
     }
 
     /// Render the ticket detail modal content.
@@ -2197,6 +2369,139 @@ mod tests {
         assert!(
             state.selected_ticket.is_none(),
             "modal should close on second Escape"
+        );
+    }
+
+    // ── Mid-pipeline cancel confirmation ─────────────────────────
+
+    fn ticket_with(id: &str, phase: TicketPhase, assigned_to: Option<String>) -> Ticket {
+        Ticket {
+            assigned_to,
+            ..make_ticket(id, phase)
+        }
+    }
+
+    #[test]
+    fn test_mid_pipeline_cancel_confirmation_cycle() {
+        // A ticket with an in-flight agent (agent-running phase + assigned
+        // agent) in the cached board list → the confirmation modal opens.
+        // (No detail modal open, so the list is the eligibility source.)
+        let mut state = BoardState::new();
+        state.tickets = vec![ticket_with(
+            "T-1",
+            TicketPhase::InDevelopment,
+            Some("engineer".into()),
+        )];
+        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
+        assert_eq!(
+            state.pending_cancel.as_deref(),
+            Some("T-1"),
+            "in-flight cancel must open the confirmation modal"
+        );
+
+        // Dismissal (backdrop / Keep ticket) leaves the ticket untouched.
+        let _task = state.update(BoardMessage::DismissCancel);
+        assert!(state.pending_cancel.is_none());
+
+        // A plain cancel (no in-flight agent) never opens the modal.
+        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog, None)];
+        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
+        assert!(
+            state.pending_cancel.is_none(),
+            "non-pipeline cancel must stay single-click"
+        );
+
+        // Confirming closes the modal (the PerformAction task carries the
+        // actual transition).
+        state.tickets = vec![ticket_with(
+            "T-1",
+            TicketPhase::InDevelopment,
+            Some("engineer".into()),
+        )];
+        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
+        let _task = state.update(BoardMessage::ConfirmCancel("T-1".into()));
+        assert!(state.pending_cancel.is_none());
+
+        // Escape dismisses the confirmation modal first, even when the
+        // comment input is focused — with the detail modal open showing an
+        // in-flight ticket.
+        let mut state = make_board_state();
+        state.selected_ticket = Some(ticket_with(
+            "T-1",
+            TicketPhase::InDevelopment,
+            Some("engineer".into()),
+        ));
+        state.comment_focused = true;
+        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
+        let _task = state.update(BoardMessage::Escape);
+        assert!(
+            state.pending_cancel.is_none(),
+            "Escape must close the cancel-confirmation modal first"
+        );
+        assert!(
+            state.comment_focused,
+            "Escape on the confirm modal must not blur the comment input"
+        );
+        assert!(
+            state.selected_ticket.is_some(),
+            "Escape on the confirm modal must not close the ticket detail modal"
+        );
+    }
+
+    #[test]
+    fn test_request_cancel_eligibility_source_precedence() {
+        // The eligibility check uses the freshest synchronous state:
+        // `selected_ticket` (a fresh fetch, per-second refresh even during
+        // search), then search results (the exact cards the user sees while
+        // a search is active), then the board list. A stale lower-priority
+        // source must not decide the modal.
+        let mut state = make_board_state(); // selected_ticket: T-1, Backlog, no assignee
+        state.tickets = vec![ticket_with(
+            "T-1",
+            TicketPhase::InDevelopment,
+            Some("engineer".into()),
+        )];
+        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
+        assert!(
+            state.pending_cancel.is_none(),
+            "the fresher open detail (Backlog) must win over a stale list"
+        );
+
+        // Detail says in-flight while the list is stale → modal opens.
+        let mut state = make_board_state();
+        state.selected_ticket = Some(ticket_with(
+            "T-1",
+            TicketPhase::InDiagnostics,
+            Some("diagnostics".into()),
+        ));
+        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog, None)];
+        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
+        assert_eq!(
+            state.pending_cancel.as_deref(),
+            Some("T-1"),
+            "in-flight detail must open the confirmation modal"
+        );
+
+        // During search the visible cards come from search_results (the
+        // list refresh is paused), so they are consulted before the list.
+        let mut state = make_board_state();
+        state.selected_ticket = None;
+        state.search_results = vec![ticket_with("T-1", TicketPhase::InQa, Some("qa".into()))];
+        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog, None)];
+        let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
+        assert_eq!(
+            state.pending_cancel.as_deref(),
+            Some("T-1"),
+            "search results must be consulted while a search is active"
+        );
+
+        // A ticket in none of the eligibility sources is not treated as
+        // in-flight, so the cancel stays single-click.
+        let mut state = make_board_state();
+        let _task = state.update(BoardMessage::RequestCancel("T-unknown".into()));
+        assert!(
+            state.pending_cancel.is_none(),
+            "unknown ticket must stay single-click"
         );
     }
 

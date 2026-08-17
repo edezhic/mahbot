@@ -251,8 +251,12 @@ pub enum Message {
     FocusSearch,
     /// Keyboard shortcut: Escape — dismiss modal/panel/confirmation on the current page.
     EscapePressed,
-    /// Update button pressed — trigger self-update.
+    /// Update button pressed — open the self-update confirmation modal.
     UpdateBot,
+    /// Self-update confirmed — start the background build/install.
+    ConfirmUpdate,
+    /// Self-update confirmation dismissed — nothing happens.
+    CancelUpdate,
     /// Self-update result.
     UpdateResult(Result<String, String>),
     /// Registry-mode: periodic crates.io availability check tick (immediate
@@ -527,6 +531,10 @@ pub struct Dashboard {
     /// Graceful-drain window active: the window stays open with input
     /// disabled until the drain completes.
     draining: bool,
+    /// Whether the self-update confirmation modal is open. Set by
+    /// [`Message::UpdateBot`]; the build/install itself only starts on
+    /// [`Message::ConfirmUpdate`], so dismissing leaves the system untouched.
+    show_update_confirm: bool,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
@@ -580,6 +588,7 @@ impl Dashboard {
             registry_latest: None,
             exit_requested_during_update: false,
             draining: false,
+            show_update_confirm: false,
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
@@ -901,12 +910,16 @@ impl Dashboard {
         Task::batch([ws_refresh, page_task, git_tasks])
     }
 
-    /// Handle Escape key: dismiss modals in priority order (diff modal →
-    /// git branch modal → page-level escape dispatch).
+    /// Handle Escape key: dismiss modals in priority order (self-update
+    /// confirmation → diff modal → git branch modal → page-level escape
+    /// dispatch).
     fn process_escape(&mut self) -> Task<Message> {
-        // Modal close priority: diff modal first, then branch modal,
-        // then page-level escapes.
-        if self.show_diff_modal {
+        // Modal close priority: self-update confirmation first, then diff
+        // modal, then branch modal, then page-level escapes.
+        if self.show_update_confirm {
+            self.show_update_confirm = false;
+            Task::none()
+        } else if self.show_diff_modal {
             self.show_diff_modal = false;
             Task::done(Message::DiffModal(diff::DiffMessage::ClearCommitState))
         } else if self.git_state.is_modal_open() {
@@ -1251,6 +1264,15 @@ impl Dashboard {
             },
             Message::EscapePressed => self.process_escape(),
             Message::UpdateBot => {
+                // Only opens the confirmation modal — the build/install
+                // starts on `ConfirmUpdate`.
+                if self.update_status == UpdateStatus::Available {
+                    self.show_update_confirm = true;
+                }
+                Task::none()
+            }
+            Message::ConfirmUpdate => {
+                self.show_update_confirm = false;
                 if self.update_status != UpdateStatus::Available {
                     return Task::none();
                 }
@@ -1273,6 +1295,10 @@ impl Dashboard {
                     },
                     Message::UpdateResult,
                 )
+            }
+            Message::CancelUpdate => {
+                self.show_update_confirm = false;
+                Task::none()
             }
             Message::UpdateResult(result) => {
                 // execute_update() calls exit(0) on success, so we never
@@ -1722,7 +1748,10 @@ impl Dashboard {
             widget_helpers::empty_stack_placeholder()
         };
 
-        iced::widget::stack![body, diff_overlay, branch_overlay, overlay].into()
+        // ── Self-update confirmation modal overlay ─────────────────
+        let update_overlay: Element<'_, Message> = self.render_update_confirm();
+
+        iced::widget::stack![body, diff_overlay, branch_overlay, update_overlay, overlay].into()
     }
 }
 
@@ -2249,6 +2278,61 @@ impl Dashboard {
             },
             tooltip::Position::Top,
         )
+    }
+
+    /// Render the self-update confirmation modal (opened by
+    /// [`Message::UpdateBot`], confirmed by [`Message::ConfirmUpdate`]).
+    /// Returns a type-stable placeholder when closed.
+    ///
+    /// The text truthfully reflects the real sequence: the build/install
+    /// runs in the background while the system keeps working — nothing is
+    /// paused during the build — then in-flight work drains, databases are
+    /// checkpointed, and the app restarts and resumes work automatically.
+    /// The window closing is the success signal.
+    fn render_update_confirm(&self) -> Element<'_, Message> {
+        if !self.show_update_confirm {
+            // Keep the Stack widget type stable across open/close transitions
+            // (see `empty_stack_placeholder`): the open state is a Stack.
+            return iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into();
+        }
+        let dialog = container(
+            column![
+                text("Update MahBot?")
+                    .size(16)
+                    .color(theme::TEXT_PRIMARY)
+                    .font(theme::FONT_BOLD),
+                Space::new().height(12),
+                text(
+                    "The new version is built and installed in the background \
+                     while the system keeps working — the build can take \
+                     10–60 minutes and nothing is paused during it.\n\n\
+                     When the build finishes, current in-flight work is \
+                     drained (up to ~10 min), databases are checkpointed, and \
+                     the app restarts, automatically resuming work afterwards. \
+                     The window closing signals the restart.",
+                )
+                .size(13)
+                .color(theme::TEXT_SECONDARY),
+                Space::new().height(16),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Cancel").size(13))
+                        .style(theme::button_secondary)
+                        .on_press(Message::CancelUpdate),
+                    Space::new().width(8),
+                    button(text("Update").size(13))
+                        .style(theme::button_primary)
+                        .on_press(Message::ConfirmUpdate),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .width(Length::Fill),
+        )
+        .width(Length::Fixed(480.0))
+        .padding(24)
+        .style(theme::dialog_container_style);
+
+        widget_helpers::modal_backdrop(dialog, Message::CancelUpdate, 0.5)
     }
 
     /// Render the self-update button in the footer bar.

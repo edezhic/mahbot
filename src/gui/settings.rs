@@ -1878,19 +1878,16 @@ impl SettingsState {
                     .into()
                 };
 
-                let delete_btn = if is_admin {
+                let delete_btn: Element<'_, SettingsMessage> = if is_admin {
                     row![].into()
                 } else {
-                    delete_confirm_button(
-                        Some(&user.name) == us.delete_target.as_ref(),
-                        SettingsMessage::UserMsg(users::UsersMessage::ConfirmDelete(
-                            user.name.clone(),
-                        )),
-                        SettingsMessage::UserMsg(users::UsersMessage::CancelDelete),
-                        SettingsMessage::UserMsg(users::UsersMessage::DeleteUser(
-                            user.name.clone(),
-                        )),
-                    )
+                    // Users confirm deletion via the modal in
+                    // `render_modal_overlay` (the inline "Delete? Yes / No"
+                    // prompt is only used for workspaces), so the trash
+                    // button is rendered directly.
+                    delete_trash_button(SettingsMessage::UserMsg(users::UsersMessage::DeleteUser(
+                        user.name.clone(),
+                    )))
                 };
 
                 let user_row = container(
@@ -2177,6 +2174,13 @@ impl SettingsState {
         } else if self.show_add_user_modal {
             let dialog = self.add_user_dialog();
             widget_helpers::modal_backdrop(dialog, SettingsMessage::ToggleAddUserModal, 0.5)
+        } else if let Some(ref del_user) = self.users_state.delete_target {
+            let dialog = Self::user_delete_dialog(del_user);
+            widget_helpers::modal_backdrop(
+                dialog,
+                SettingsMessage::UserMsg(users::UsersMessage::CancelDelete),
+                0.5,
+            )
         } else if let Some(ref pool_user) = self.users_state.pool_edit_target {
             let dialog = self.pool_edit_dialog(pool_user);
             widget_helpers::modal_backdrop(
@@ -2195,6 +2199,51 @@ impl SettingsState {
             // Keep Stack widget type stable
             iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
         }
+    }
+
+    /// Build the user-deletion confirmation modal.
+    ///
+    /// The text truthfully states what [`users::UserStore::delete_user`]
+    /// does — removes the user row, their roles, and all channel bindings
+    /// (access cut immediately) — and what it preserves (sessions, chat
+    /// history, userspace files).
+    fn user_delete_dialog(user_name: &str) -> Element<'_, SettingsMessage> {
+        container(
+            column![
+                text(format!("Delete user {user_name}?"))
+                    .size(16)
+                    .color(theme::TEXT_PRIMARY)
+                    .font(theme::FONT_BOLD),
+                Space::new().height(12),
+                text(
+                    "This permanently removes the user, their roles, and all \
+                     channel bindings (including Telegram) — their access is \
+                     cut immediately. Their sessions, chat history, and \
+                     userspace files are preserved.",
+                )
+                .size(13)
+                .color(theme::TEXT_SECONDARY),
+                Space::new().height(16),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text("Keep user").size(13))
+                        .style(theme::button_secondary)
+                        .on_press(SettingsMessage::UserMsg(users::UsersMessage::CancelDelete)),
+                    Space::new().width(8),
+                    button(text("Delete").size(13))
+                        .style(theme::button_danger)
+                        .on_press(SettingsMessage::UserMsg(
+                            users::UsersMessage::ConfirmDelete(user_name.to_string()),
+                        )),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .width(Length::Fill),
+        )
+        .width(Length::Fixed(460.0))
+        .padding(24)
+        .style(theme::dialog_container_style)
+        .into()
     }
 
     /// Build the role-pool editor modal for a user.
@@ -3348,8 +3397,33 @@ fn password_input<'a>(
     }
 }
 
-/// Delete-confirm button — shows a trash icon (with tooltip) or a
-/// "Delete? Yes / No" confirmation prompt when the item is the delete target.
+/// Trash-icon delete button (with tooltip). Starts the item's deletion
+/// flow — for users this is the confirmation modal in
+/// `render_modal_overlay`; for workspaces it is the inline "Delete? Yes /
+/// No" prompt rendered by [`delete_confirm_button`] when the row is the
+/// delete target.
+fn delete_trash_button<'a>(on_delete: SettingsMessage) -> Element<'a, SettingsMessage> {
+    row![
+        tooltip(
+            button(
+                lucide::x::<iced::Theme, iced::Renderer>()
+                    .size(18)
+                    .color(theme::STATUS_ERROR),
+            )
+            .style(theme::button_text)
+            .on_press(on_delete),
+            "Delete",
+            tooltip::Position::Top,
+        )
+        .style(theme::tooltip_style)
+        .delay(Duration::from_millis(400)),
+    ]
+    .into()
+}
+
+/// Delete button — shows a "Delete? Yes / No" confirmation prompt when the
+/// item is the delete target, or a trash icon (with tooltip) that starts
+/// the item's deletion flow otherwise.
 fn delete_confirm_button<'a>(
     is_delete_target: bool,
     on_confirm: SettingsMessage,
@@ -3370,22 +3444,7 @@ fn delete_confirm_button<'a>(
         ]
         .into()
     } else {
-        row![
-            tooltip(
-                button(
-                    lucide::x::<iced::Theme, iced::Renderer>()
-                        .size(18)
-                        .color(theme::STATUS_ERROR),
-                )
-                .style(theme::button_text)
-                .on_press(on_delete),
-                "Delete",
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .delay(Duration::from_millis(400)),
-        ]
-        .into()
+        delete_trash_button(on_delete)
     }
 }
 
