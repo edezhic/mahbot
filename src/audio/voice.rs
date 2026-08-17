@@ -1495,7 +1495,7 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
         .default_input_config()
         .context("Failed to get default input config")?;
 
-    info!(
+    debug!(
         "Microphone: {} ({:?}, {} Hz, {} ch)",
         device
             .description()
@@ -1541,7 +1541,7 @@ fn start_microphone() -> Result<(mpsc::Receiver<Vec<f32>>, cpal::Stream)> {
 
     stream.play().context("Failed to start microphone stream")?;
 
-    info!(
+    debug!(
         "Microphone listening started ({} Hz, {} channels)",
         sample_rate, channels
     );
@@ -2072,7 +2072,7 @@ async fn route_to_agent(text: String) {
         let (role, ws) = crate::users::effective_role_and_workspace(role, ws, &user_name, &pool);
 
         info!(
-            "Voice command -> {role} (user: {user_name}, workspace: {}): {text}",
+            "Voice command -> {role} (user: {user_name}, workspace: {})",
             ws.name
         );
 
@@ -2114,7 +2114,7 @@ async fn route_to_agent(text: String) {
     // broken `personal:` path.
     let (role, ws) = crate::users::effective_role_and_workspace(role, ws, "admin", &admin_pool);
 
-    info!("Voice command -> {role} (workspace: {}): {}", ws.name, text);
+    info!("Voice command -> {role} (workspace: {})", ws.name);
     broadcast_voice_transcript(&text, "", &ws.name).await;
 
     crate::message_router::route_user_message(
@@ -3152,7 +3152,7 @@ impl PipelineCtx {
         self.command_buffer.extend_from_slice(samples);
         let duration_secs = self.command_buffer.len() as f64 / f64::from(SAMPLE_RATE);
         if duration_secs > MAX_RECORD_SECS as f64 {
-            info!("Manual recording stopped: max duration ({duration_secs:.1}s)");
+            debug!("Manual recording stopped: max duration ({duration_secs:.1}s)");
             let cmd_buf = std::mem::take(&mut self.command_buffer);
             self.silence_sample_count = 0;
             self.finalize_manual_recording(cmd_buf).await;
@@ -3166,7 +3166,6 @@ impl PipelineCtx {
         set_status(VoiceStatus::Transcribing);
         match transcribe_audio(&cmd_buf).await {
             Ok(transcribed) if !transcribed.trim().is_empty() => {
-                info!("Transcribed (manual): {transcribed}");
                 route_to_agent(transcribed).await;
             }
             Ok(_) => {
@@ -3228,7 +3227,7 @@ impl PipelineCtx {
             self.mic_rx = None;
             set_status(VoiceStatus::Disabled);
         }
-        info!("Voice pipeline: manual recording ended");
+        debug!("Voice pipeline: manual recording ended");
     }
 
     /// Attempt to retry loading the shared ASR transcriber, debounced to at
@@ -4003,7 +4002,7 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
     let silence_timeout = ctx.silence_sample_count >= SILENCE_THRESHOLD_SAMPLES;
 
     if silence_timeout || duration_secs > MAX_RECORD_SECS as f64 {
-        info!(
+        debug!(
             "Recording stopped: {:.1}s, reason: {}",
             duration_secs,
             if silence_timeout {
@@ -4028,7 +4027,6 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
                         duration_secs,
                     );
                 } else {
-                    info!("Transcribed: {transcribed}");
                     route_to_agent(transcribed).await;
                 }
 
