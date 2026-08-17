@@ -1,9 +1,16 @@
 //! Dead-session recovery poller.
 //!
 //! Periodically checks all direct user-agent sessions for signs of silent
-//! failure (user sent a message, no agent responded, and no agent is running)
-//! and automatically re-triggers the agent by routing a recovery job through
-//! the message router.
+//! failure and automatically re-triggers the agent by routing a recovery job
+//! through the message router. Two states are treated as dead:
+//!
+//! * **Unanswered user message** — the user sent a message, no agent
+//!   responded, and no agent is running.
+//! * **Unfinished turn (terminal tool frame)** — the agent committed a tool
+//!   result but was cut (drain/restart) before producing the final assistant
+//!   reply, so the last persisted message is a tool result. The tool result
+//!   is already in the session history; the recovery re-run continues from
+//!   there and delivers the missing answer.
 //!
 //! # Exclusion list
 //!
@@ -24,7 +31,8 @@
 //! (accounting for adaptive backoff: first wait ~20 min, ~40 min per
 //! subsequent attempt) and be permanently given up.
 //! The session becoming healthy is detected naturally on the next poll
-//! cycle when condition 1 (last message is user) no longer holds.
+//! cycle when the last message is an assistant reply (condition 1 no longer
+//! holds).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -54,8 +62,9 @@ const BASE_BACKOFF_MINUTES: i64 = 10;
 /// Maximum backoff in minutes.
 const MAX_BACKOFF_MINUTES: i64 = 40;
 
-/// Grace period: only attempt recovery if the user's last message is at least
-/// this old.  Prevents races with agents that are still spawning or loading.
+/// Grace period: only attempt recovery if the session's last candidate
+/// message (user message or terminal tool frame) is at least this old.
+/// Prevents races with agents that are still spawning or loading.
 const STALE_GRACE_PERIOD: Duration = Duration::from_mins(5);
 
 // ── Retry tracker (in-memory) ───────────────────────────────────────────────
@@ -133,10 +142,10 @@ impl DeadSessionTracker {
     /// Remove the tracking entry for a session that has self-healed.
     ///
     /// Called when the poller detects that a session is healthy (the last
-    /// message is from the agent, not the user).  This ensures the retry
-    /// cap counts *consecutive* failures per episode, matching the ticket
-    /// spec — a session that fails, recovers, then fails again starts with
-    /// a fresh retry budget.
+    /// message is an assistant reply — the turn completed).  This ensures the
+    /// retry cap counts *consecutive* failures per episode, matching the
+    /// ticket spec — a session that fails, recovers, then fails again starts
+    /// with a fresh retry budget.
     ///
     /// Safe to call for untracked sessions (no-op).
     fn cleanup(&self, agent_id: &str) {
@@ -188,6 +197,27 @@ fn excluded_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
     std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
 }
 
+/// Classify a session by its last persisted message role: is it a
+/// dead-session recovery candidate?
+///
+/// Candidates:
+///
+/// * `User` tail — the user sent a message and the agent never answered.
+/// * `Tool` tail — the agent committed a tool result but was cut (drain or
+///   restart) before producing the final assistant reply, so the turn is
+///   unfinished. The tool result is already in the session history; the
+///   recovery re-run continues from it and delivers the missing answer.
+///   There is no user-facing cancel path in the codebase, so a tool-frame
+///   tail cannot mean "cancelled" — resuming is safe.
+///
+/// Healthy (not candidates):
+///
+/// * `Assistant` tail — the turn completed; the agent already responded.
+/// * `System` tail — no in-flight turn.
+fn is_recovery_candidate(last_role: ChatRole) -> bool {
+    matches!(last_role, ChatRole::User | ChatRole::Tool)
+}
+
 /// Check all sessions for dead direct user-agent sessions and route recovery
 /// jobs where needed.
 async fn recover_dead_sessions() -> anyhow::Result<()> {
@@ -204,7 +234,8 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     for session in &sessions {
         let agent_id = &session.agent_id;
 
-        // ── Condition 1: last message is from the user ─────────────────
+        // ── Condition 1: last message is a user message or a terminal
+        //    tool frame ─────────────────────────────────────────────────
         let Some(last_role) = crate::session::store()
             .get_last_message_role(agent_id)
             .await
@@ -212,12 +243,12 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             DEAD_SESSION_TRACKER.cleanup(agent_id);
             continue; // empty session — clean up any stale tracker entry
         };
-        if last_role != ChatRole::User {
-            // Last message is from the agent (or is a tool/system message).
-            // The session is healthy — the agent has already responded.
-            // Clean up the retry-tracking entry so a future failure starts
-            // with a fresh retry budget (consecutive-failure-per-episode,
-            // matching the ticket spec).
+        if !is_recovery_candidate(last_role) {
+            // Last message is an assistant reply (or a system message): the
+            // turn is complete — the agent has already responded. Clean up
+            // the retry-tracking entry so a future failure starts with a
+            // fresh retry budget (consecutive-failure-per-episode, matching
+            // the ticket spec).
             DEAD_SESSION_TRACKER.cleanup(agent_id);
             continue;
         }
@@ -228,7 +259,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Condition 3: user message is stale ─────────────────────────
+        // ── Condition 3: candidate message is stale ────────────────────
         let age = now - session.last_activity;
         let grace = chrono::Duration::from_std(STALE_GRACE_PERIOD)
             .expect("STALE_GRACE_PERIOD fits in chrono::Duration");
@@ -377,6 +408,20 @@ mod tests {
         assert!(!is_excluded_agent_id(
             "telegram_some_user_my_cool_workspace_reviewer"
         ));
+    }
+
+    #[test]
+    fn test_is_recovery_candidate_classification() {
+        // User tail: user sent a message, agent never answered → candidate.
+        assert!(is_recovery_candidate(ChatRole::User));
+        // Tool tail: committed tool frame without a following assistant reply
+        // (turn cut by a drain/restart) → candidate — the recovery re-run
+        // continues from the tool result already in the history.
+        assert!(is_recovery_candidate(ChatRole::Tool));
+        // Assistant tail: turn completed, agent responded → healthy.
+        assert!(!is_recovery_candidate(ChatRole::Assistant));
+        // System tail: no in-flight turn → healthy.
+        assert!(!is_recovery_candidate(ChatRole::System));
     }
 
     #[test]
