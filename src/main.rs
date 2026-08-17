@@ -507,7 +507,7 @@ fn main() -> Result<()> {
     }
 
     // Consolidate ALL daemon temp files under one private root
-    // (`/tmp/mahbot-<uid>`, mode 0700) and pin TMPDIR to it — BEFORE any
+    // (`/tmp/mahbot`, mode 0700) and pin TMPDIR to it — BEFORE any
     // temp use (config, logs, stores, shell children). The debug and
     // __grep-engine subcommands above must NOT create the root (they exit
     // before this point).

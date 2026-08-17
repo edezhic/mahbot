@@ -1,9 +1,9 @@
-//! Private daemon temp root: one `/tmp/mahbot-<uid>` root for ALL daemon temp
+//! Private daemon temp root: one `/tmp/mahbot` root for ALL daemon temp
 //! artifacts.
 //!
 //! ## One root
 //!
-//! The daemon creates a single private root under `/tmp` (`/tmp/mahbot-<uid>`,
+//! The daemon creates a single private root under `/tmp` (`/tmp/mahbot`,
 //! mode 0700) with exclusive-create + ownership/mode verification, and fails
 //! loudly on a squatted path. It then pins its own `TMPDIR` to that root at
 //! the very start of startup (before config and any temp use), so every
@@ -13,6 +13,13 @@
 //! no startup/periodic reclamation of its own (crash leftovers are the
 //! operating system's job), so the root is simply recreated/re-verified on
 //! every boot.
+//!
+//! The path is fixed (no per-user `-{uid}` suffix): this is a single-user
+//! deployment, and the suffix was superfluous. The accepted multi-user
+//! consequence: with a shared fixed path, a second OS user's daemon fails
+//! loudly at boot via the ownership check below — accepted for this
+//! deployment. Old suffixed leftovers (`/tmp/mahbot-<uid>`) are left to the
+//! OS sweep.
 //!
 //! Shell children get `TMPDIR` set to the same root (see
 //! [`crate::tools::shell::shell_tmpdir`]).
@@ -48,12 +55,14 @@ pub(crate) fn legacy_temp_dir() -> Option<&'static Path> {
 ///
 /// Must run at the very start of startup, BEFORE config and any temp use, and
 /// AFTER the debug/`__grep-engine` subcommand dispatches (those must not
-/// create the root). Unix-only: `/tmp/mahbot-<uid>` is meaningless on Windows,
+/// create the root). Unix-only: `/tmp/mahbot` is meaningless on Windows,
 /// where the shell env uses `TEMP`/`TMP` instead.
 ///
 /// Failure modes (fail loudly, never paper over):
 /// - the root exists but is not a directory;
-/// - the root exists and is owned by a different uid (squatting);
+/// - the root exists and is owned by a different uid (squatting — with the
+///   fixed shared path this is also the second-OS-user guard: their daemon
+///   fails loudly here, the accepted multi-user consequence);
 /// - the root's mode has group/other bits AND re-chmod fails — a loose mode on
 ///   OUR OWN path (uid verified) is self-healed to 0700 (a previous boot's
 ///   create-time chmod can fail on a race with the umask; bricking startup
@@ -64,7 +73,10 @@ pub fn init_temp_root() -> anyhow::Result<()> {
     // darwin user temp dir (`/var/folders/.../T`) that bare `mktemp` uses.
     let legacy = std::env::temp_dir();
     let uid = unsafe { libc::geteuid() };
-    let root = PathBuf::from(format!("/tmp/mahbot-{uid}"));
+    // Fixed shared path (no `-{uid}` suffix): single-user deployment; the
+    // ownership check below is what makes the shared path safe — a second OS
+    // user's daemon fails loudly at boot instead of sharing the root.
+    let root = PathBuf::from("/tmp/mahbot");
 
     // Exclusive create with explicit mode 0700. `create_dir` fails when the
     // path already exists (exclusive semantics); the mode is applied

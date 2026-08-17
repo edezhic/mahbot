@@ -577,7 +577,7 @@ static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     // Explicit spill directory (usually under `temp_dir()`; documents intent).
     add_path_with_canonical(&mut dirs, std::env::temp_dir().join(".agent"));
     // The legacy (pre-pin) OS temp dir — captured before the daemon pinned
-    // TMPDIR to `/tmp/mahbot-<uid>`. On macOS this is `/var/folders/.../T`,
+    // TMPDIR to `/tmp/mahbot`. On macOS this is `/var/folders/.../T`,
     // where bare `mktemp -d` STILL lands (it ignores TMPDIR). Preserving it
     // keeps the readonly guard's coverage exactly as broad as before the pin
     // (no write restrictions are added by the consolidation).

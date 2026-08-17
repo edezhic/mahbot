@@ -1363,6 +1363,36 @@ fn open_readonly(
     Ok((io, db))
 }
 
+/// Connect to an opened store, applying the in-memory temp-store setting.
+///
+/// Every turso connection the application opens — the service connection
+/// factory AND this debug CLI path (they do not share an opening path) —
+/// runs with in-memory temp storage, so no statement or transaction can
+/// ever fail because a temp directory is missing. turso_core's tempdir
+/// creation has no parent-creation and no fallback chain, and resolves
+/// through `$TMPDIR`, which the daemon pins to its private root; a missing
+/// root used to fail every eager-temp statement (RETURNING buffers, ORDER
+/// BY/LIMIT heap sorts, DISTINCT, subqueries, window functions, spills)
+/// with "I/O error (tempdir): entity not found". The PRAGMA maps to the
+/// per-connection `set_temp_store` (turso_core translate/pragma.rs); if a
+/// future engine rejects it, the CLI fails loudly here instead of silently
+/// regressing to disk-backed temp storage.
+fn connect_readonly(
+    db: &std::sync::Arc<turso::core::Database>,
+    db_path: &Path,
+) -> Result<std::sync::Arc<turso::core::Connection>> {
+    let conn = db
+        .connect()
+        .map_err(|e| anyhow!("failed to connect to database '{}': {e}", db_path.display()))?;
+    conn.execute("PRAGMA temp_store = MEMORY").map_err(|e| {
+        anyhow!(
+            "failed to set in-memory temp storage on '{}': {e}",
+            db_path.display()
+        )
+    })?;
+    Ok(conn)
+}
+
 /// Connect to an opened store and execute `sql`, returning the pipe-delimited
 /// output. Output is buffered and returned only on success: a mid-query
 /// failure (e.g. a torn-frame read) must not leave a partial column header on
@@ -1373,9 +1403,7 @@ fn connect_execute(
     sql: &str,
     db_path: &Path,
 ) -> Result<String> {
-    let conn = db
-        .connect()
-        .map_err(|e| anyhow!("failed to connect to database '{}': {e}", db_path.display()))?;
+    let conn = connect_readonly(db, db_path)?;
     execute_query_readonly(io, &conn, sql, db_path)
 }
 
@@ -1586,9 +1614,7 @@ fn dump_schema(
     label: &str,
 ) -> Result<String> {
     use std::fmt::Write as _;
-    let conn = db
-        .connect()
-        .map_err(|e| anyhow!("failed to connect to database '{}': {e}", db_path.display()))?;
+    let conn = connect_readonly(db, db_path)?;
     let tables_sql = USER_TABLES_SQL.replace("{filter}", turso_mod::USER_OBJECT_FILTER);
     let tables = collect_rows(io, &conn, &tables_sql, db_path, |row| {
         let name = format_core_value(row.get_value(0));

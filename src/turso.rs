@@ -679,6 +679,21 @@ impl Connection {
             .context("failed to open local database")?;
         let conn = db.connect()?;
         conn.busy_timeout(Duration::from_mins(1))?;
+        // In-memory temp storage for this connection (turso's
+        // TempStore::Memory): every intermediate query structure — RETURNING
+        // buffers, ORDER BY/LIMIT heap sorts, DISTINCT, IN-subqueries,
+        // compound SELECTs, window functions, CREATE INDEX, sorter/hash-join
+        // spills — stays in RAM and never touches a temp dir. turso_core's
+        // tempdir creation has no parent-creation and no fallback chain, and
+        // resolves through $TMPDIR, which the daemon pins to its private
+        // root: a missing root used to fail every eager-temp statement with
+        // "I/O error (tempdir): entity not found". The PRAGMA maps to the
+        // per-connection set_temp_store (turso_core translate/pragma.rs);
+        // if a future engine rejects it, this open fails loudly instead of
+        // silently regressing to disk-backed temp storage.
+        conn.execute("PRAGMA temp_store = MEMORY;", ())
+            .await
+            .context("failed to set in-memory temp storage (PRAGMA temp_store = MEMORY)")?;
         // Open the persistent sidecar fds AFTER turso's open (which creates
         // the .tshm on first use). These fds are never closed for the
         // process lifetime — see PersistentSidecarFd.
@@ -2731,6 +2746,68 @@ mod tests {
              All database access must go through crate::turso::Connection (turso.rs);\n\
              the debug CLI (debug.rs) is the only documented exception.\n\
              Violations: {violations:#?}"
+        );
+    }
+
+    /// Guard: the in-memory temp-store setting is applied on BOTH turso
+    /// opening paths.
+    ///
+    /// P0 incident (2026-08-17): a missing pinned temp root failed every
+    /// statement whose plan contains eager temp-file opcodes (RETURNING
+    /// buffers, ORDER BY+LIMIT heap sorts, DISTINCT, IN-subqueries, compound
+    /// SELECTs, window functions, CREATE INDEX) and every overflowing
+    /// sorter/hash-join spill with "I/O error (tempdir): entity not found" —
+    /// turso_core's tempdir creation has no parent-creation and no fallback
+    /// chain. The fix: every application connection runs with
+    /// `PRAGMA temp_store = MEMORY` (the engine's `TempStore::Memory`), so
+    /// intermediate query structures stay in RAM and a missing temp root
+    /// cannot affect any turso operation.
+    ///
+    /// The service connection factory (`Connection::open` in src/turso.rs)
+    /// and the debug CLI's separate read-only path (`connect_readonly` in
+    /// src/debug.rs) do NOT share an opening path — both must carry the
+    /// PRAGMA. If either regresses, the guarantee silently breaks; this
+    /// source-scanning tripwire fails with a pointer to the requirement.
+    /// The bench harnesses in `benches/` are outside this scan (documented
+    /// repro exceptions, not application code).
+    #[test]
+    fn in_memory_temp_store_applied_on_both_opening_paths() {
+        const PRAGMA: &str = "PRAGMA temp_store = MEMORY";
+        // (file, symbol that must carry the PRAGMA)
+        const EXPECTED: [(&str, &str); 2] = [
+            ("src/turso.rs", "impl Connection"),
+            ("src/debug.rs", "fn connect_readonly"),
+        ];
+
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut violations: Vec<String> = Vec::new();
+        for (file, carrier) in EXPECTED {
+            let path = manifest_dir.join(file);
+            let content =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+            // Skip line comments so doc comments mentioning the PRAGMA don't
+            // false-positive — the tripwire targets actual code usage (same
+            // best-effort approach as the raw-builder guard).
+            let code_only: String = content
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !code_only.contains(PRAGMA) {
+                violations.push(format!(
+                    "{file} ({carrier}) no longer applies the in-memory temp-store \
+                     setting (missing `{PRAGMA}` in code).\n\
+                     The missing-temp-root guarantee requires EVERY turso connection \
+                     the application opens — service factory AND debug CLI — to run \
+                     with in-memory temp storage."
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "in-memory temp-store regression guard failed:\n{}",
+            violations.join("\n\n")
         );
     }
 
