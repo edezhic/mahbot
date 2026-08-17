@@ -101,9 +101,11 @@ pub(crate) fn view(
 // ── Display model ─────────────────────────────────────────────────────────
 
 /// One running work item: either an agent card or a non-agent LLM call row.
+/// The agent card is boxed — `AgentHandle` is large and the variant would
+/// otherwise dominate the enum's size (clippy::large_enum_variant).
 #[derive(Debug, Clone)]
 enum DisplayItem {
-    Agent(AgentCard),
+    Agent(Box<AgentCard>),
     Call(CallRow),
 }
 
@@ -260,16 +262,20 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
                 &mut groups,
             );
             adopt_label(&agent.parent_label, &mut groups[idx]);
-            groups[idx].items.push(DisplayItem::Agent(AgentCard {
-                handle: agent.clone(),
-            }));
+            groups[idx]
+                .items
+                .push(DisplayItem::Agent(Box::new(AgentCard {
+                    handle: agent.clone(),
+                })));
         } else {
             // Workspace singleton. An empty workspace name groups under the
             // empty key; the section label resolver renders it as "workspace".
             let idx = find_group(GroupKind::Singleton, &workspace, &workspace, &mut groups);
-            groups[idx].items.push(DisplayItem::Agent(AgentCard {
-                handle: agent.clone(),
-            }));
+            groups[idx]
+                .items
+                .push(DisplayItem::Agent(Box::new(AgentCard {
+                    handle: agent.clone(),
+                })));
         }
     }
 
@@ -476,13 +482,19 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, Message> {
     // background, versus the old ~2:1 muted tone).
     let elapsed = format_elapsed(h.started_at);
 
-    let first_row = row![
-        icon,
-        Space::new().width(Length::Fill),
-        text(elapsed).size(11).color(theme::TEXT_SECONDARY),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+    // First row: role icon on the left; the session length (when known) and
+    // elapsed time as small secondary metrics on the right.
+    let mut first_row = row![icon, Space::new().width(Length::Fill)]
+        .spacing(8)
+        .align_y(Alignment::Center);
+    if let Some(len) = h.session_tokens {
+        first_row = first_row.push(
+            text(format_compact_tokens(len))
+                .size(11)
+                .color(theme::TEXT_SECONDARY),
+        );
+    }
+    first_row = first_row.push(text(elapsed).size(11).color(theme::TEXT_SECONDARY));
 
     // Badge row: running tools if any, else the live activity phase, else the
     // LAST COMPLETED tool — a fast tool no longer flashes and vanishes. Tool
@@ -573,6 +585,26 @@ fn format_elapsed(started_at: DateTime<Utc>) -> String {
     }
 }
 
+/// Compact session-length format: raw below 1,000 ("500"), one decimal in the
+/// k-range ("12.3k" for 12300), one decimal at/above one million ("1.2M") —
+/// sessions routinely exceed 200K tokens with context windows up to 1M.
+/// Values that would round up past a unit boundary are rendered in the next
+/// unit (999_999 → "1.0M", never "1000.0k").
+#[allow(clippy::cast_precision_loss)] // token counts are far below f64's 2^53 exact range
+fn format_compact_tokens(tokens: u64) -> String {
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 999_950 {
+        // k-range stops below values that would round to "1000.0k"
+        // (999_950 / 1000 = 999.95).
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else if tokens < 999_950_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1}G", tokens as f64 / 1_000_000_000.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +630,7 @@ mod tests {
             current_tools: Vec::new(),
             last_tool: None,
             activity: None,
+            session_tokens: None,
         }
     }
 
@@ -1038,5 +1071,25 @@ mod tests {
                 "no workspace name in group headers: {title}"
             );
         }
+    }
+
+    #[test]
+    fn compact_token_format_edges() {
+        // Raw below 1,000; one decimal in the k-range; one decimal at/above
+        // 1M (sessions routinely exceed 200K with context windows up to 1M).
+        // Values rounding up past a unit boundary render in the next unit.
+        assert_eq!(format_compact_tokens(0), "0");
+        assert_eq!(format_compact_tokens(500), "500");
+        assert_eq!(format_compact_tokens(999), "999");
+        assert_eq!(format_compact_tokens(1_000), "1.0k");
+        assert_eq!(format_compact_tokens(12_300), "12.3k");
+        assert_eq!(format_compact_tokens(200_000), "200.0k");
+        assert_eq!(format_compact_tokens(999_949), "999.9k");
+        assert_eq!(format_compact_tokens(999_999), "1.0M");
+        assert_eq!(format_compact_tokens(1_000_000), "1.0M");
+        assert_eq!(format_compact_tokens(1_234_567), "1.2M");
+        assert_eq!(format_compact_tokens(999_949_999), "999.9M");
+        assert_eq!(format_compact_tokens(999_950_000), "1.0G");
+        assert_eq!(format_compact_tokens(1_000_000_000), "1.0G");
     }
 }

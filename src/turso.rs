@@ -1110,6 +1110,144 @@ pub(crate) async fn ensure_fts_index(
     Ok(())
 }
 
+// ── Database migrations ────────────────────────────────────────────────
+//
+// Centralized migration machinery. This design tracks applied migrations in a
+// `schema_migrations` table — the historical PRAGMA user_version approach was
+// deliberately removed and must NOT be resurrected (it is not
+// transaction-atomic with DDL). Each migration is a ready-made SQL
+// statement/script applied exactly once, in order, at store initialization.
+
+/// One ordered, ready-made schema migration.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Migration {
+    /// Stable unique id recorded in `schema_migrations` — a migration with
+    /// this id never runs twice, even across store recreations.
+    pub(crate) id: &'static str,
+    /// The SQL statement/script applied when the migration is pending.
+    pub(crate) sql: &'static str,
+    /// Optional existence guard `(table, column)`: when the column already
+    /// exists, the SQL is skipped but the migration is still recorded as
+    /// applied. This is what makes the wipe-and-recreate operational
+    /// sequence safe — a fresh-DB SCHEMA already contains the migrated shape
+    /// (the column exists), so a duplicate-column ALTER must never fire; the
+    /// guard turns it into a no-op recorded as applied. The upgrade-in-place
+    /// path (column missing) runs the SQL and records it. Both paths
+    /// converge to the same final state.
+    pub(crate) guard: Option<(&'static str, &'static str)>,
+}
+
+/// Check whether `table` has a column named `column`.
+///
+/// `PRAGMA table_info` reports one row per column with the column name at
+/// position 1.
+pub(crate) async fn column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .context("Failed to read table schema (PRAGMA table_info)")?;
+    Ok(rows
+        .iter()
+        .any(|row| row.get::<String>(1).ok().as_deref() == Some(column)))
+}
+
+/// Apply pending migrations for a store, in order, exactly once each.
+///
+/// Called at store initialization (after the SCHEMA batch ran) via the
+/// store's `post_open` hook (see [`crate::define_store!`]). Migrations are
+/// tracked in a per-store `schema_migrations` table:
+///
+/// - The tracking table is created if missing (fresh databases).
+/// - Each pending migration runs inside its own transaction — the schema
+///   change and its tracking row commit atomically (turso supports
+///   transactional DDL), so a failed migration never leaves a half-applied
+///   state or a false "applied" record.
+/// - When a migration's guard already holds (e.g. a fresh-DB SCHEMA that
+///   already contains the migrated shape), the SQL is skipped and only the
+///   tracking row is written.
+/// - Already-applied migrations are skipped entirely (never re-run).
+///
+/// The `logs` store and the read-only `mahbot debug` path never call this —
+/// the debug CLI opens with `OpenFlags::ReadOnly|NoLock` and migrations only
+/// run through the store `open` methods.
+pub(crate) async fn run_pending_migrations(
+    conn: &Connection,
+    store_name: &str,
+    migrations: &[Migration],
+) -> anyhow::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (\
+             id         TEXT PRIMARY KEY,\
+             applied_at TEXT NOT NULL\
+         )",
+        (),
+    )
+    .await
+    .context("Failed to create schema_migrations tracking table")?;
+
+    let applied: std::collections::HashSet<String> = conn
+        .query("SELECT id FROM schema_migrations", ())
+        .await
+        .context("Failed to read applied migrations")?
+        .into_iter()
+        .filter_map(|row| row.get::<String>(0).ok())
+        .collect();
+
+    for migration in migrations {
+        if applied.contains(migration.id) {
+            continue;
+        }
+        let guard_holds = match migration.guard {
+            Some((table, column)) => {
+                column_exists(conn, table, column).await.with_context(|| {
+                    format!(
+                        "Migration '{}' guard check failed on {table}.{column}",
+                        migration.id
+                    )
+                })?
+            }
+            None => false,
+        };
+        if guard_holds {
+            // Fresh-DB path: the SCHEMA already produced the migrated shape —
+            // record the migration as applied without running its SQL.
+            conn.execute(
+                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+                params![migration.id, now()],
+            )
+            .await
+            .with_context(|| format!("Failed to record migration '{}' as applied", migration.id))?;
+        } else {
+            let tx = conn.begin_tx().await.with_context(|| {
+                format!("Migration '{}': failed to begin transaction", migration.id)
+            })?;
+            tx.execute_batch(migration.sql)
+                .await
+                .with_context(|| format!("Migration '{}' failed", migration.id))?;
+            tx.execute(
+                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
+                params![migration.id, now()],
+            )
+            .await
+            .with_context(|| format!("Failed to record migration '{}' as applied", migration.id))?;
+            tx.commit()
+                .await
+                .with_context(|| format!("Migration '{}': failed to commit", migration.id))?;
+        }
+        tracing::info!(
+            store = store_name,
+            migration = migration.id,
+            skipped_sql = guard_holds,
+            "Applied database migration",
+        );
+    }
+    Ok(())
+}
+
 /// Open a database, create parent directories if needed, and run schema init.
 ///
 /// `schema` is executed via `execute_batch` (multiple DDL statements).

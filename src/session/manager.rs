@@ -39,6 +39,12 @@ pub struct Session {
     /// appends, tool traffic awaiting commit, the final answer). Every
     /// successful persist advances this prefix over the span it wrote.
     persisted_len: usize,
+    /// Real provider-reported session length (input + output tokens of the
+    /// most recent successful agent LLM call), loaded at [`init`](Self::init)
+    /// and updated after every successful agent-purpose LLM call. `None` for
+    /// sessions that never recorded a value (new sessions, pre-migration
+    /// sessions — approved no-backfill semantics).
+    token_length: Option<u64>,
 }
 
 /// Outcome of a [`Session::finalize`] call.
@@ -171,6 +177,13 @@ impl Session {
         }
         self.history = history;
 
+        // Load the real provider-reported session length (last successful
+        // agent LLM call's input + output tokens) so `maybe_summarize` and
+        // the Running Agents card see it from the start of the turn. `None`
+        // for sessions that never recorded a value — treated as below the
+        // summarization threshold.
+        self.token_length = crate::session::store().get_token_length(agent_id).await;
+
         // Session context (channel, user_name, workspace_name, role) was
         // already persisted atomically alongside the messages above —
         // no separate write needed.
@@ -188,6 +201,21 @@ impl Session {
     #[must_use]
     pub(crate) fn history(&self) -> &[ChatMessage] {
         &self.history
+    }
+
+    /// Real provider-reported session length (see the field doc), loaded at
+    /// [`init`](Self::init). `None` when no successful usage-bearing agent
+    /// call ever recorded a value.
+    #[must_use]
+    pub(crate) fn token_length(&self) -> Option<u64> {
+        self.token_length
+    }
+
+    /// Update the in-memory session length after a successful agent LLM call.
+    /// The durable store write and the observational registry mirror are the
+    /// caller's responsibility ([`crate::Agent::record_session_usage`]).
+    pub(crate) fn set_token_length(&mut self, token_length: Option<u64>) {
+        self.token_length = token_length;
     }
 
     /// Append an assistant message (final response or intermediate tool-call).

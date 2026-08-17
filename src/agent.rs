@@ -421,6 +421,19 @@ impl Agent {
             )
             .await?;
 
+        // Surface the persisted session length on the live card: the registry
+        // entry is created synchronously at `Agent::new` (no DB access there),
+        // so resumed sessions would otherwise show no length until the first
+        // successful LLM call of the turn. Purely observational — the page
+        // reads the registry, never the database.
+        if let Some(token_length) = self.session.token_length() {
+            crate::registry::AGENT_REGISTRY.set_session_tokens(
+                &self.agent_id,
+                self.generation,
+                token_length,
+            );
+        }
+
         // Pre-maybe_summarize drain check: a fresh dispatch that starts during
         // the graceful drain (or a fired shutdown token) must not destructively
         // compact an over-threshold session before the llm_loop drain
@@ -796,7 +809,7 @@ impl Agent {
         outcome
     }
 
-    async fn llm_call(&self) -> anyhow::Result<ChatResponse> {
+    async fn llm_call(&mut self) -> anyhow::Result<ChatResponse> {
         let request = self.build_chat_request(
             self.session.history().to_vec(),
             self.role.requires_multimodal(),
@@ -804,9 +817,55 @@ impl Agent {
         );
 
         let policy = crate::retry::RetryPolicy::current();
-        crate::retry::agent_chat(request, &policy)
+        let response = crate::retry::agent_chat(request, &policy)
             .await
-            .with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))
+            .with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))?;
+
+        // A SUCCESSFUL agent-purpose call updates the session length; failures
+        // never reach here (the error above propagates).
+        self.record_session_usage(&response).await;
+        Ok(response)
+    }
+
+    /// Record the real provider-reported session length after a SUCCESSFUL
+    /// agent-purpose LLM call: `input_tokens + output_tokens` of the full
+    /// request envelope plus the response that just arrived.
+    ///
+    /// Only agent-purpose calls pass through here — extraction, summarize,
+    /// consolidate, synthesis, and research sub-calls use other builders and
+    /// are excluded (they are not session context).
+    ///
+    /// Post-compaction note: [`Session::apply_summary`] deliberately does NOT
+    /// reset the value — the fixed scope says no logic changes beyond
+    /// replacing estimated tokens with real tokens. After a compaction the
+    /// stale pre-compaction length may re-fire `maybe_summarize` on a
+    /// following turn if no successful agent call lands in between; that
+    /// edge is spec-compliant (accepted, not fixed).
+    async fn record_session_usage(&mut self, response: &ChatResponse) {
+        let Some(usage) = &response.usage else {
+            return;
+        };
+        let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) else {
+            return;
+        };
+        let token_length = input.saturating_add(output);
+
+        self.session.set_token_length(Some(token_length));
+        if let Err(e) = crate::session::store()
+            .set_token_length(&self.agent_id, Some(token_length))
+            .await
+        {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                error = %e,
+                "Failed to persist session token length — in-memory value may drift from the store until the next successful call"
+            );
+        }
+        crate::registry::AGENT_REGISTRY.set_session_tokens(
+            &self.agent_id,
+            self.generation,
+            token_length,
+        );
     }
 
     /// Persist tool results to the session store and push them into the in-memory
@@ -1038,28 +1097,33 @@ impl Agent {
         Ok(crate::util::truncate(&summary_text, 32_000))
     }
 
-    /// Check the session history token count against [`SUMMARIZATION_THRESHOLD`]
-    /// and summarise if necessary.
+    /// Check the session length against [`SUMMARIZATION_THRESHOLD`] and
+    /// summarise if necessary.
+    ///
+    /// The session length is the REAL provider-reported value (input +
+    /// output tokens of the last successful agent LLM call), loaded at
+    /// session init. `None` — no successful usage-bearing call ever recorded
+    /// a value (new sessions, pre-migration sessions; approved no-backfill)
+    /// — is treated as below the threshold: no summarization. A FAILED call
+    /// never updates the value (the session did not change).
     ///
     /// KV-cache preservation: [`Agent::summarize`] keeps all parameters identical
     /// (see [`Agent::build_chat_request`]) so the cached prefix is reusable.
     async fn maybe_summarize(&mut self) {
-        let history_tokens = crate::session::estimate_tokens(
-            self.session.history(),
-            &self.tool_specs,
-            self.role.requires_multimodal(),
-        );
+        let Some(token_length) = self.session.token_length() else {
+            return;
+        };
         tracing::debug!(
             agent_id = %self.agent_id,
             role = %self.role,
-            estimate_tokens = history_tokens,
-            "Session token estimate",
+            token_length,
+            "Session token length",
         );
-        if history_tokens > crate::session::SUMMARIZATION_THRESHOLD {
+        if token_length > crate::session::SUMMARIZATION_THRESHOLD {
             tracing::info!(
                 agent_id = %self.agent_id,
                 role = %self.role,
-                estimate_tokens = history_tokens,
+                token_length,
                 "Session exceeded summarization threshold",
             );
             match self.summarize().await {
@@ -2224,5 +2288,102 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
             .await
             .expect("first-call signal must fire even when the call fails");
+    }
+
+    // ── Real provider-token session length semantics ───────────────────
+
+    /// Both-or-nothing / keep-last / never-zero rule of
+    /// [`Agent::record_session_usage`].
+    #[tokio::test]
+    async fn record_session_usage_keeps_last_on_missing_or_partial_usage() {
+        crate::util::test::init_test_stores().await;
+        let mut agent = make_agent(vec![]);
+        agent.session.set_token_length(Some(7_000));
+
+        // No usage data at all → keep the last known value.
+        agent
+            .record_session_usage(&crate::ChatResponse::default())
+            .await;
+        assert_eq!(agent.session.token_length(), Some(7_000));
+
+        // Only one side present → keep the last known value.
+        let partial_input = crate::ChatResponse {
+            usage: Some(crate::ProviderUsage {
+                input_tokens: Some(1_000),
+                ..crate::ProviderUsage::default()
+            }),
+            ..crate::ChatResponse::default()
+        };
+        agent.record_session_usage(&partial_input).await;
+        assert_eq!(agent.session.token_length(), Some(7_000));
+
+        let partial_output = crate::ChatResponse {
+            usage: Some(crate::ProviderUsage {
+                output_tokens: Some(1_000),
+                ..crate::ProviderUsage::default()
+            }),
+            ..crate::ChatResponse::default()
+        };
+        agent.record_session_usage(&partial_output).await;
+        assert_eq!(agent.session.token_length(), Some(7_000));
+
+        // Both present → input + output; a later usage-less response never
+        // resets the value to zero.
+        let full = crate::ChatResponse {
+            usage: Some(crate::ProviderUsage {
+                input_tokens: Some(12_000),
+                output_tokens: Some(300),
+                ..crate::ProviderUsage::default()
+            }),
+            ..crate::ChatResponse::default()
+        };
+        agent.record_session_usage(&full).await;
+        assert_eq!(agent.session.token_length(), Some(12_300));
+        agent
+            .record_session_usage(&crate::ChatResponse::default())
+            .await;
+        assert_eq!(
+            agent.session.token_length(),
+            Some(12_300),
+            "a usage-less response must never reset the length to zero"
+        );
+    }
+
+    /// Saturating sum: an overflowing usage pair cannot wrap into a small
+    /// bogus session length.
+    #[tokio::test]
+    async fn record_session_usage_overflow_saturates() {
+        crate::util::test::init_test_stores().await;
+        let mut agent = make_agent(vec![]);
+        let huge = crate::ChatResponse {
+            usage: Some(crate::ProviderUsage {
+                input_tokens: Some(u64::MAX),
+                output_tokens: Some(u64::MAX),
+                ..crate::ProviderUsage::default()
+            }),
+            ..crate::ChatResponse::default()
+        };
+        agent.record_session_usage(&huge).await;
+        assert_eq!(agent.session.token_length(), Some(u64::MAX));
+    }
+
+    /// An unknown session length (`None` — no successful usage-bearing call
+    /// ever recorded) is below the summarization threshold: the check exits
+    /// before the summarize LLM call. No provider is installed on purpose —
+    /// reaching [`Agent::summarize`] would panic on the unset provider.
+    #[tokio::test]
+    async fn maybe_summarize_none_and_below_threshold_are_noops() {
+        crate::util::test::init_test_stores().await;
+        let mut agent = make_agent(vec![]);
+
+        // None (new / pre-migration session): early exit, nothing fires.
+        agent.maybe_summarize().await;
+        assert_eq!(agent.session.token_length(), None);
+
+        // A real value below the fixed threshold is equally a no-op.
+        agent
+            .session
+            .set_token_length(Some(crate::session::SUMMARIZATION_THRESHOLD / 2));
+        agent.maybe_summarize().await;
     }
 }

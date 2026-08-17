@@ -91,6 +91,13 @@ pub struct AgentHandle {
     /// time. `None` between phases — the agent's card is the single tracker
     /// for these calls (no separate registry rows are ever created for them).
     pub activity: Option<String>,
+    /// Real provider-reported session length (input + output tokens of the
+    /// agent's last successful LLM call), mirrored here observationally from
+    /// the durable per-session value. `None` until the first successful
+    /// usage-bearing call of the agent's life (new / pre-migration sessions
+    /// — approved no-backfill). Purely presentational: the Running Agents
+    /// page reads the registry, never the database.
+    pub session_tokens: Option<u64>,
 }
 
 /// Agent identity + registry generation propagated to tool execution via a
@@ -183,6 +190,7 @@ impl AgentRegistry {
             current_tools: Vec::new(),
             last_tool: None,
             activity: None,
+            session_tokens: None,
         };
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(old) = map.remove(&agent_id) {
@@ -299,6 +307,22 @@ impl AgentRegistry {
             && entry.generation == generation
         {
             entry.activity = None;
+        }
+    }
+
+    /// Update the observational session-length metric on a live agent card.
+    ///
+    /// The value is the REAL provider-reported length (input + output tokens)
+    /// of the agent's last successful LLM call, persisted durably per session
+    /// by the caller and mirrored here for display only. Generation-safety: a
+    /// stale writer from a finished/restarted agent can never mutate a
+    /// replacement agent's card.
+    pub fn set_session_tokens(&self, agent_id: &str, generation: u64, token_length: u64) {
+        let mut map = self.inner.lock().unwrap_poison();
+        if let Some(entry) = map.get_mut(agent_id)
+            && entry.generation == generation
+        {
+            entry.handle.session_tokens = Some(token_length);
         }
     }
 

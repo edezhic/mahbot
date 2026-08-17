@@ -425,7 +425,10 @@ pub(crate) struct ImageUrlPart {
 /// entries alongside the cleaned text. Otherwise the raw content is returned as
 /// [`MessageContent::Text`].
 ///
-/// Mirrored by [`crate::session::estimate_tokens`] — keep marker handling in sync.
+/// The old estimator-side mirror of this marker handling
+/// (`crate::session::estimate_tokens`) was removed with the
+/// token-estimation heuristic — this conversion is now the only place
+/// marker parsing lives.
 pub(crate) fn to_message_content(
     role: ChatRole,
     content: &str,
