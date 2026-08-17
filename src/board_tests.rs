@@ -2848,10 +2848,13 @@ async fn test_bounce_back_to_dev_transitions_and_increments_counter() {
     let ws = crate::workspace::test_ws("/tmp/test_bounce_back_to_dev");
     let id = make_ticket(&store, &ws, "Redo Dev", TicketPhase::Reviewed).await;
 
-    store
-        .bounce_back_to_dev(&id)
-        .await
-        .expect("bounce-back succeeds");
+    assert!(
+        store
+            .bounce_back_to_dev(&id)
+            .await
+            .expect("bounce-back succeeds"),
+        "bounce-back from Reviewed must apply"
+    );
 
     let ticket = expect_ticket(&store, &id).await;
     assert_eq!(ticket.phase, TicketPhase::ReadyForDevelopment);
@@ -2863,10 +2866,13 @@ async fn test_bounce_back_to_dev_transitions_and_increments_counter() {
         .transition_to(&id, None, TicketPhase::Reviewed, None)
         .await
         .expect("move back to Reviewed for a second round");
-    store
-        .bounce_back_to_dev(&id)
-        .await
-        .expect("second bounce-back succeeds");
+    assert!(
+        store
+            .bounce_back_to_dev(&id)
+            .await
+            .expect("second bounce-back succeeds"),
+        "second bounce-back from Reviewed must apply"
+    );
     let ticket = expect_ticket(&store, &id).await;
     assert_eq!(ticket.bounce_count, 2);
 
@@ -2874,8 +2880,25 @@ async fn test_bounce_back_to_dev_transitions_and_increments_counter() {
         .transition_to(&id, None, TicketPhase::InQa, None)
         .await
         .expect("move to InQa");
+    // Bouncing from a non-Reviewed phase is a phase-guard miss: the ticket
+    // moved externally, which is an expected, silent no-op — not an error
+    // (the claim convention: guard miss = `Ok(false)`).
+    let outcome = store
+        .bounce_back_to_dev(&id)
+        .await
+        .expect("guard-missed bounce-back must not error");
     assert!(
-        store.bounce_back_to_dev(&id).await.is_err(),
-        "bounce-back from a non-Reviewed phase must fail (fail-closed)"
+        !outcome,
+        "bounce-back from a non-Reviewed phase must report the guard miss"
+    );
+    let ticket = expect_ticket(&store, &id).await;
+    assert_eq!(
+        ticket.phase,
+        TicketPhase::InQa,
+        "guard-missed bounce-back must leave the ticket untouched"
+    );
+    assert_eq!(
+        ticket.bounce_count, 2,
+        "guard-missed bounce-back must not bump the bounce counter"
     );
 }

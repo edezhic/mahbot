@@ -282,18 +282,45 @@ struct TransitionCtx<'a> {
     breaker_trip: bool,
 }
 
+/// Result of a stage-finalization comment+transition.
+///
+/// The phase-guard miss is a first-class, expected outcome: a ticket that was
+/// moved externally (cancelled, superseded, or otherwise transitioned) while
+/// the stage was finishing is a clean skip, not a failure. Only genuine write
+/// failures keep the warning path.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum FinalizeOutcome {
+    /// Guard applied — comment + transition committed; notification dispatched.
+    Applied,
+    /// Guard missed — the ticket was moved externally while the stage was
+    /// finishing. Nothing was written; a silent, expected skip (at most a
+    /// low-level log entry).
+    Moved,
+    /// Genuine write failure — warning already logged, assignment cleared.
+    Failed,
+}
+
 /// Unified helper for combining comment writes + phase transition + notification.
 ///
-/// Wraps [`crate::turso::with_tx`] for the comment-writing closure and phase
-/// transition, then dispatches a notification. The closure is responsible for
-/// writing all per-agent/system comments to the database.
+/// Wraps [`crate::turso::with_tx_outcome`] for the comment-writing closure and
+/// phase transition, then dispatches a notification. The closure is
+/// responsible for writing all per-agent/system comments to the database.
 ///
 /// `pipeline_reservation` is automatically derived from the target phase:
 /// `Some(true)` when transitioning to [`TicketPhase::ReadyForDevelopment`]
 /// (bounce-back transitions get priority re-dispatch over fresh tickets),
 /// `None` for all other transitions.
 ///
-/// Returns `true` on success, `false` on failure (with a warning logged).
+/// Returns a [`FinalizeOutcome`]:
+/// - [`Applied`](FinalizeOutcome::Applied) — guard applied, finalization
+///   committed, notification dispatched.
+/// - [`Moved`](FinalizeOutcome::Moved) — the CAS phase guard missed: the
+///   ticket was moved externally while the stage was finishing. The
+///   transaction is rolled back silently (nothing written, no warning) and
+///   `assigned_to` is **not** cleared — the external mover already handled
+///   it.
+/// - [`Failed`](FinalizeOutcome::Failed) — genuine write failure: a warning
+///   is logged and `assigned_to` is cleared for re-dispatch.
 ///
 /// # Correctness
 ///
@@ -305,18 +332,23 @@ struct TransitionCtx<'a> {
 /// function. Do **not** call this on a path where an agent may still be
 /// executing on the ticket.
 #[must_use]
-async fn with_comment_and_transition<F>(ctx: TransitionCtx<'_>, write_comments: F) -> bool
+async fn with_comment_and_transition<F>(
+    ctx: TransitionCtx<'_>,
+    write_comments: F,
+) -> FinalizeOutcome
 where
     F: AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
 {
     let pipeline_reservation = (ctx.target == TicketPhase::ReadyForDevelopment).then_some(true);
 
-    if let Err(e) = crate::turso::with_tx(
+    let outcome = match crate::turso::with_tx_outcome(
         &board().conn,
         &ctx.ticket.id,
         ctx.log_label,
         async move |tx| {
             write_comments(tx).await?;
+            // The transition's `Ok(false)` (guard miss) is the closure's
+            // `Ok(false)`: the whole transaction is rolled back silently.
             BoardStore::transition_to_tx(
                 tx,
                 &ctx.ticket.id,
@@ -324,41 +356,57 @@ where
                 ctx.target,
                 pipeline_reservation,
             )
-            .await?;
-            Ok(())
+            .await
         },
     )
     .await
     {
-        // Use phase values directly (not strings) so phase names can't drift.
-        warn!(
-            ticket = %ctx.ticket.id,
-            error = %e,
-            "{}: transition to {} failed — ticket stuck in {}",
-            ctx.log_label, ctx.target, ctx.source,
-        );
-        // Clear assigned_to so the ticket can be re-dispatched on the next poll
-        // cycle. All call sites set assigned_to before reaching this function, so
-        // the field is always populated when this runs.
-        clear_assigned_to_no_cancel(&ctx.ticket.id, ctx.log_label).await;
-        return false;
-    }
-
-    match ctx.notify {
-        NotifyPolicy::Notify => {
-            notify_ticket(ctx.ticket, ctx.source, ctx.target, ctx.breaker_trip).await;
-        }
-        NotifyPolicy::Buffer => {
-            ticket_buffer::push(
-                &ctx.ticket.workspace_name,
-                &ctx.ticket.id,
-                ctx.source,
-                ctx.target,
-                ticket_buffer::TransitionOrigin::Pipeline,
+        Ok(true) => FinalizeOutcome::Applied,
+        Ok(false) => {
+            debug!(
+                ticket = %ctx.ticket.id,
+                "{}: ticket moved externally while in {} — finalization skipped (nothing written)",
+                ctx.log_label, ctx.source,
             );
+            FinalizeOutcome::Moved
+        }
+        Err(e) => {
+            // Use phase values directly (not strings) so phase names can't drift.
+            warn!(
+                ticket = %ctx.ticket.id,
+                error = %e,
+                "{}: transition to {} failed — ticket stuck in {}",
+                ctx.log_label, ctx.target, ctx.source,
+            );
+            // Clear assigned_to so the ticket can be re-dispatched on the next poll
+            // cycle. All call sites set assigned_to before reaching this function, so
+            // the field is always populated when this runs. Only on genuine write
+            // failures — a guard-missed ticket was already handled by the mover.
+            clear_assigned_to_no_cancel(&ctx.ticket.id, ctx.log_label).await;
+            FinalizeOutcome::Failed
+        }
+    };
+
+    // Notifications fire only when the guard applied — a moved ticket was
+    // already announced by the external mover, and a genuine failure has no
+    // transition to announce.
+    if matches!(outcome, FinalizeOutcome::Applied) {
+        match ctx.notify {
+            NotifyPolicy::Notify => {
+                notify_ticket(ctx.ticket, ctx.source, ctx.target, ctx.breaker_trip).await;
+            }
+            NotifyPolicy::Buffer => {
+                ticket_buffer::push(
+                    &ctx.ticket.workspace_name,
+                    &ctx.ticket.id,
+                    ctx.source,
+                    ctx.target,
+                    ticket_buffer::TransitionOrigin::Pipeline,
+                );
+            }
         }
     }
-    true
+    outcome
 }
 
 /// Write a comment to a ticket, then transition it to a new phase.
@@ -369,7 +417,7 @@ where
 /// Both `role` and `text` are required — the compiler guarantees a comment
 /// is always written.
 #[must_use]
-async fn comment_and_transition(ctx: TransitionCtx<'_>, role: &str, text: &str) -> bool {
+async fn comment_and_transition(ctx: TransitionCtx<'_>, role: &str, text: &str) -> FinalizeOutcome {
     let ticket = ctx.ticket;
 
     with_comment_and_transition(ctx, async |tx| {
@@ -381,10 +429,13 @@ async fn comment_and_transition(ctx: TransitionCtx<'_>, role: &str, text: &str) 
 
 /// Shared finalizer for post-agent comment-and-transition sites.
 ///
-/// Runs [`comment_and_transition`] and, on success, logs `message` with the
-/// ticket ID and the `target` phase field from `ctx`. On failure
-/// `comment_and_transition` already logs the warning, so nothing more is
-/// emitted here. Must be the caller's final step.
+/// Runs [`comment_and_transition`] and, on [`Applied`](FinalizeOutcome::Applied),
+/// logs `message` with the ticket ID and the `target` phase field from `ctx`.
+/// On a guard miss ([`Moved`](FinalizeOutcome::Moved)) nothing is emitted —
+/// the ticket was moved externally and the skip is expected. On genuine
+/// failure ([`Failed`](FinalizeOutcome::Failed)) `comment_and_transition`
+/// already logged the warning, so nothing more is emitted here. Must be the
+/// caller's final step.
 async fn comment_and_transition_or_bail(
     ctx: TransitionCtx<'_>,
     role: &str,
@@ -393,7 +444,10 @@ async fn comment_and_transition_or_bail(
 ) {
     let ticket_id = &ctx.ticket.id;
     let target = ctx.target;
-    if !comment_and_transition(ctx, role, text).await {
+    if !matches!(
+        comment_and_transition(ctx, role, text).await,
+        FinalizeOutcome::Applied
+    ) {
         return;
     }
     info!(ticket = %ticket_id, target = %target, "{message}");
@@ -1803,20 +1857,22 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
     let log_label = "Finalize";
-    if comment_and_transition(
-        TransitionCtx {
-            ticket,
-            source,
-            target: TicketPhase::Done,
-            notify: notify_policy,
-            log_label,
-            breaker_trip: false,
-        },
-        SYSTEM_ROLE,
-        comment,
-    )
-    .await
-    {
+    if matches!(
+        comment_and_transition(
+            TransitionCtx {
+                ticket,
+                source,
+                target: TicketPhase::Done,
+                notify: notify_policy,
+                log_label,
+                breaker_trip: false,
+            },
+            SYSTEM_ROLE,
+            comment,
+        )
+        .await,
+        FinalizeOutcome::Applied
+    ) {
         info!(ticket = %ticket.id, "{comment}");
     }
 }
@@ -1954,30 +2010,32 @@ async fn finalize_commit_and_transition(
         commit_info.short_hash(),
     );
 
-    if with_comment_and_transition(
-        TransitionCtx {
-            ticket,
-            source,
-            target: TicketPhase::Done,
-            notify: notify_policy,
-            log_label: &log_label,
-            breaker_trip: false,
-        },
-        async |tx| {
-            BoardStore::set_commit_info_tx(
-                tx,
-                &ticket.id,
-                &commit_info.hash,
-                commit_info.lines_added,
-                commit_info.lines_removed,
-            )
-            .await?;
-            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &comment).await?;
-            Ok(())
-        },
-    )
-    .await
-    {
+    if matches!(
+        with_comment_and_transition(
+            TransitionCtx {
+                ticket,
+                source,
+                target: TicketPhase::Done,
+                notify: notify_policy,
+                log_label: &log_label,
+                breaker_trip: false,
+            },
+            async |tx| {
+                BoardStore::set_commit_info_tx(
+                    tx,
+                    &ticket.id,
+                    &commit_info.hash,
+                    commit_info.lines_added,
+                    commit_info.lines_removed,
+                )
+                .await?;
+                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &comment).await?;
+                Ok(())
+            },
+        )
+        .await,
+        FinalizeOutcome::Applied
+    ) {
         info!(ticket = %ticket.id, "Committed {}, moving to Done", commit_info.short_hash());
     }
 }
@@ -2353,30 +2411,37 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         // Write both comments and transition atomically via
         // [`with_comment_and_transition`], which wraps all writes in a single
         // transaction. This matches the pattern used by all other verdict paths.
-        if !with_comment_and_transition(
-            TransitionCtx {
-                ticket,
-                source: TicketPhase::InSanitation,
-                target: TicketPhase::ReadyForDevelopment,
-                notify: NotifyPolicy::Buffer,
-                log_label: "Sanitation",
-                breaker_trip: false,
-            },
-            async |tx| {
-                BoardStore::add_comment_tx(
-                    tx,
-                    &ticket.id,
-                    Role::Sanitation.as_str(),
-                    comment.as_str(),
-                )
-                .await?;
-                BoardStore::add_comment_tx(tx, &ticket.id, SANITATION_ROLE, sys_comment.as_str())
+        if !matches!(
+            with_comment_and_transition(
+                TransitionCtx {
+                    ticket,
+                    source: TicketPhase::InSanitation,
+                    target: TicketPhase::ReadyForDevelopment,
+                    notify: NotifyPolicy::Buffer,
+                    log_label: "Sanitation",
+                    breaker_trip: false,
+                },
+                async |tx| {
+                    BoardStore::add_comment_tx(
+                        tx,
+                        &ticket.id,
+                        Role::Sanitation.as_str(),
+                        comment.as_str(),
+                    )
                     .await?;
-                Ok(())
-            },
-        )
-        .await
-        {
+                    BoardStore::add_comment_tx(
+                        tx,
+                        &ticket.id,
+                        SANITATION_ROLE,
+                        sys_comment.as_str(),
+                    )
+                    .await?;
+                    Ok(())
+                },
+            )
+            .await,
+            FinalizeOutcome::Applied
+        ) {
             return;
         }
 
@@ -3582,23 +3647,30 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
     )
     .await;
 
-    if !with_comment_and_transition(
-        TransitionCtx {
-            ticket,
-            source: TicketPhase::Analysis,
-            target: TicketPhase::Planning,
-            notify: NotifyPolicy::Notify,
-            log_label: "Analyst",
-            breaker_trip: false,
-        },
-        async |tx| {
-            BoardStore::add_comment_tx(tx, &ticket.id, stage_name(Role::Analyst), &joint_comment)
+    if !matches!(
+        with_comment_and_transition(
+            TransitionCtx {
+                ticket,
+                source: TicketPhase::Analysis,
+                target: TicketPhase::Planning,
+                notify: NotifyPolicy::Notify,
+                log_label: "Analyst",
+                breaker_trip: false,
+            },
+            async |tx| {
+                BoardStore::add_comment_tx(
+                    tx,
+                    &ticket.id,
+                    stage_name(Role::Analyst),
+                    &joint_comment,
+                )
                 .await?;
-            Ok(())
-        },
-    )
-    .await
-    {
+                Ok(())
+            },
+        )
+        .await,
+        FinalizeOutcome::Applied
+    ) {
         return;
     }
 
@@ -3832,7 +3904,7 @@ async fn try_trip_circuit_breaker(
     );
 
     let breaker_label = format!("{log_label} circuit breaker");
-    if !comment_and_transition(
+    match comment_and_transition(
         TransitionCtx {
             ticket,
             source: source_phase,
@@ -3846,12 +3918,21 @@ async fn try_trip_circuit_breaker(
     )
     .await
     {
-        error!(
-            ticket = %ticket.id,
-            source_phase = %source_phase,
-            log_label = %breaker_label,
-            "Circuit breaker transition to Failed failed — ticket may loop indefinitely",
-        );
+        // Guard applied, or the ticket was already moved externally
+        // (cancelled, superseded, ...) while the stage finished — nothing to
+        // fail, no loop risk.
+        FinalizeOutcome::Applied | FinalizeOutcome::Moved => {}
+        // Genuine write failure: the breaker tripped but the Failed transition
+        // did not land — the ticket is still claimable in the source phase and
+        // will be re-dispatched, so the loop is real.
+        FinalizeOutcome::Failed => {
+            error!(
+                ticket = %ticket.id,
+                source_phase = %source_phase,
+                log_label = %breaker_label,
+                "Circuit breaker transition to Failed failed — ticket may loop indefinitely",
+            );
+        }
     }
 
     true
@@ -4033,34 +4114,37 @@ async fn process_verifier_verdicts(
         )
     });
 
-    if !with_comment_and_transition(
-        TransitionCtx {
-            ticket,
-            source: verifier.active_phase,
-            target,
-            notify,
-            log_label: verifier.log_label,
-            breaker_trip: bounce_trip,
-        },
-        async |tx| {
-            if let Some(comment) = &joint_comment {
-                BoardStore::add_comment_tx(tx, &ticket.id, stage_name(verifier.role), comment)
-                    .await?;
-            }
-            if let Some(comment) = &bounce_breaker_comment {
-                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment).await?;
-            }
-            if all_failed {
-                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &failure_comment).await?;
-            }
-            if target == TicketPhase::ReadyForDevelopment {
-                BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
-            }
-            Ok(())
-        },
-    )
-    .await
-    {
+    if !matches!(
+        with_comment_and_transition(
+            TransitionCtx {
+                ticket,
+                source: verifier.active_phase,
+                target,
+                notify,
+                log_label: verifier.log_label,
+                breaker_trip: bounce_trip,
+            },
+            async |tx| {
+                if let Some(comment) = &joint_comment {
+                    BoardStore::add_comment_tx(tx, &ticket.id, stage_name(verifier.role), comment)
+                        .await?;
+                }
+                if let Some(comment) = &bounce_breaker_comment {
+                    BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment).await?;
+                }
+                if all_failed {
+                    BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &failure_comment)
+                        .await?;
+                }
+                if target == TicketPhase::ReadyForDevelopment {
+                    BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
+                }
+                Ok(())
+            },
+        )
+        .await,
+        FinalizeOutcome::Applied
+    ) {
         return false;
     }
 

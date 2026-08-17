@@ -2439,14 +2439,44 @@ fn quarantine_family(db_path: &Path, sources: &[(&Path, &str)]) -> bool {
 /// Uses `ticket_id` (or any identifying label) and `action_label` for
 /// structured warn-level logging on failure.
 ///
-/// This is the canonical implementation; callers in `board.rs` and
-/// `management.rs` delegate to it rather than duplicating the logic.
+/// Thin adapter over [`with_tx_outcome`]: commits whenever `work` returns
+/// `Ok`, inheriting its transaction lifecycle and warning semantics.
 pub(crate) async fn with_tx(
     conn: &Connection,
     ticket_id: &str,
     action_label: &str,
     work: impl AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    with_tx_outcome(conn, ticket_id, action_label, async |tx| {
+        work(tx).await?;
+        Ok(true)
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Execute `work` within a transaction, letting the work choose the outcome
+/// via its return value, and report it.
+///
+/// `work` returns `anyhow::Result<bool>`:
+/// - `Ok(true)` — commit the transaction.
+/// - `Ok(false)` — roll back **without** a warning: the work deliberately
+///   aborted and nothing must be written. This follows the board layer's
+///   claim convention for expected no-ops (e.g. a CAS phase-guard miss when
+///   the ticket moved externally while a stage was finishing).
+/// - `Err(e)` — roll back and log the standard warn-level messages,
+///   including `"{action_label}: transaction rolled back"`.
+///
+/// Returns `Ok(true)` when the transaction committed, `Ok(false)` when it
+/// was rolled back silently, and the wrapped error on failure.
+///
+/// This is the canonical transaction helper; [`with_tx`] delegates to it.
+pub(crate) async fn with_tx_outcome(
+    conn: &Connection,
+    ticket_id: &str,
+    action_label: &str,
+    work: impl AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
     let tx = conn
         .begin_tx()
         .await
@@ -2460,35 +2490,51 @@ pub(crate) async fn with_tx(
         })
         .with_context(|| format!("Failed to begin transaction for {action_label}"))?;
 
-    if let Err(e) = work(&tx).await {
-        if let Err(rollback_err) = tx.rollback().await {
-            warn!(
-                ticket = %ticket_id,
-                error = %rollback_err,
-                "Transaction rollback also failed for {action_label}",
-            );
+    match work(&tx).await {
+        Ok(true) => {
+            tx.commit()
+                .await
+                .map_err(|e| {
+                    warn!(
+                        ticket = %ticket_id,
+                        error = %e,
+                        "Failed to commit transaction for {action_label}",
+                    );
+                    e
+                })
+                .with_context(|| format!("Failed to commit transaction for {action_label}"))?;
+            Ok(true)
         }
-        warn!(
-            ticket = %ticket_id,
-            error = %e,
-            "{action_label}: transaction rolled back",
-        );
-        return Err(e.context(format!("{action_label}: transaction rolled back")));
-    }
-
-    tx.commit()
-        .await
-        .map_err(|e| {
+        Ok(false) => {
+            tx.rollback()
+                .await
+                .map_err(|e| {
+                    warn!(
+                        ticket = %ticket_id,
+                        error = %e,
+                        "Transaction rollback also failed for {action_label}",
+                    );
+                    e
+                })
+                .with_context(|| format!("Failed to roll back transaction for {action_label}"))?;
+            Ok(false)
+        }
+        Err(e) => {
+            if let Err(rollback_err) = tx.rollback().await {
+                warn!(
+                    ticket = %ticket_id,
+                    error = %rollback_err,
+                    "Transaction rollback also failed for {action_label}",
+                );
+            }
             warn!(
                 ticket = %ticket_id,
                 error = %e,
-                "Failed to commit transaction for {action_label}",
+                "{action_label}: transaction rolled back",
             );
-            e
-        })
-        .with_context(|| format!("Failed to commit transaction for {action_label}"))?;
-
-    Ok(())
+            Err(e.context(format!("{action_label}: transaction rolled back")))
+        }
+    }
 }
 
 /// Forensic-family name suffix `{stamp}-{pid}` (stamp = `%Y%m%dT%H%M%SZ`, pid = process

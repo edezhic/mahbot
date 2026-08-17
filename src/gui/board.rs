@@ -673,27 +673,30 @@ impl BoardState {
                             }
                         }
                         // Manual "Redo Dev" (Reviewed → ReadyForDevelopment)
-                        // is a bounce-back from review into development — it
-                        // must consume the same breaker budget as pipeline
-                        // bounce-backs.
-                        if source == TicketPhase::Reviewed
+                        // is a bounce-back into development that consumes the
+                        // same breaker budget as pipeline bounce-backs. The
+                        // transition is phase-guarded (Reviewed only): a guard
+                        // miss means the ticket was already moved externally —
+                        // an expected no-op (no error, no bogus hop).
+                        let applied = if source == TicketPhase::Reviewed
                             && phase == TicketPhase::ReadyForDevelopment
                         {
                             board
                                 .bounce_back_to_dev(&ticket_id)
                                 .await
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| e.to_string())?
                         } else {
                             board
                                 .transition_to(&ticket_id, None, phase, None)
                                 .await
                                 .map_err(|e| e.to_string())?;
-                        }
+                            true
+                        };
                         // Skip the hop when the ticket already reached the
                         // requested phase between render and click — the
                         // transition was a no-op and a self-transition entry
                         // would be a bogus hop.
-                        if source != phase {
+                        if source != phase && applied {
                             crate::ticket_buffer::push(
                                 &ticket.workspace_name,
                                 &ticket_id,

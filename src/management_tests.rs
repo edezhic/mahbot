@@ -696,6 +696,143 @@ async fn process_verifier_verdicts_cases() {
     }
 }
 
+/// The stage-finalization choke point treats a phase-guard miss (ticket moved
+/// externally while the stage was finishing) as a first-class, expected
+/// outcome: the whole round is rolled back silently — nothing is written, no
+/// bounce is counted — and `assigned_to` is NOT cleared by the finalizer (the
+/// external mover already handled the ticket; a finalizer clear would clobber
+/// a fresh claim by the new phase).
+///
+/// The round uses a mixed verdict (pass/fail/pass → any_failed), so the
+/// target is ReadyForDevelopment and the closure increments the bounce
+/// counter: the `bounce_count == 0` assertion genuinely exercises the
+/// rollback of an in-transaction write that WOULD have committed had the
+/// guard applied.
+///
+/// Regression guard for the structural fix: the guard miss is a silent skip
+/// (the silent-rollback path never reaches the warn arms), not an error —
+/// this test asserts the observable side effects (phase untouched, bounce
+/// unchanged, assignment preserved, no comment written).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+
+    let ws = test_ws_named("/tmp/test", "vp_moved");
+    let ticket_id = make_ticket(board(), &ws, "VP Moved", TicketPhase::InReview).await;
+
+    // The Manager triages the ticket to Planning while the verifier round
+    // finishes. The mover's claim on the ticket must survive the finalizer.
+    board()
+        .transition_to(&ticket_id, None, TicketPhase::Planning, None)
+        .await
+        .expect("external move to Planning");
+    board()
+        .set_assigned_to_no_cancel(&ticket_id, Some("external-mover"))
+        .await
+        .expect("external mover claims the ticket");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let transitioned = process_verifier_verdicts(
+        &ws,
+        &ticket,
+        // Mixed verdict → any_failed → target ReadyForDevelopment: the
+        // closure writes a joint comment AND increments the bounce counter,
+        // so the guard miss must roll both back.
+        &[pass_result(), fail_result(), pass_result()],
+        REVIEWER_VI,
+    )
+    .await;
+    assert!(!transitioned, "guard miss must not report a transition");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        ticket.phase,
+        TicketPhase::Planning,
+        "the moved ticket must be left untouched"
+    );
+    assert_eq!(
+        ticket.bounce_count, 0,
+        "guard miss must not bump the bounce counter"
+    );
+    assert_eq!(
+        ticket.assigned_to.as_deref(),
+        Some("external-mover"),
+        "guard miss must not clear the external mover's assignment"
+    );
+
+    // Nothing was written: a skipped round leaves no joint comment behind.
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    assert!(
+        !comments
+            .iter()
+            .any(|c| c.role == stage_name(REVIEWER_VI.role)),
+        "a skipped round must not write a joint comment"
+    );
+}
+
+/// A circuit breaker whose ticket was moved externally while the stage
+/// finished is a silent no-op at the transition site too: the CAS guard miss
+/// must NOT surface as a "may loop indefinitely" failure (that error fires
+/// only on genuine write failures) and must NOT clobber the external mover's
+/// assignment. The breaker still reports tripped so the caller aborts
+/// dispatch.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn circuit_breaker_on_moved_ticket_is_silent_noop() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+
+    let ws = test_ws_named("/tmp/test", "cb_moved");
+    let ticket_id = make_ticket(board(), &ws, "CB Moved", TicketPhase::InSanitation).await;
+    for _ in 0..4 {
+        add_breaker_failure(CircuitBreakerKind::Sanitation, &ticket_id).await;
+    }
+
+    // The Manager moves the ticket externally while the sanitation stage
+    // finishes; the mover's claim must survive the breaker's Failed attempt.
+    board()
+        .transition_to(&ticket_id, None, TicketPhase::Planning, None)
+        .await
+        .expect("external move to Planning");
+    board()
+        .set_assigned_to_no_cancel(&ticket_id, Some("external-mover"))
+        .await
+        .expect("external mover claims the ticket");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    assert!(
+        try_trip_circuit_breaker(
+            &ticket,
+            TicketPhase::InSanitation,
+            Some(CircuitBreakerKind::Sanitation),
+            "Sanitation",
+        )
+        .await,
+        "breaker still reports tripped — the caller must abort dispatch"
+    );
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        ticket.phase,
+        TicketPhase::Planning,
+        "the moved ticket must be left untouched (no Failed transition)"
+    );
+    assert_eq!(
+        ticket.assigned_to.as_deref(),
+        Some("external-mover"),
+        "guard miss must not clear the external mover's assignment"
+    );
+}
+
 /// Resume a review round from stored roster outcomes: done slots replay their
 /// checkpointed verdicts (no re-invocation, no LLM for the agents) and the
 /// verdicts are re-processed through the existing process_verifier_verdicts —

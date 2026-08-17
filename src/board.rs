@@ -572,8 +572,9 @@ impl std::str::FromStr for TicketPhase {
 
 /// Bundles a SQL mutation statement with its parameters and ticket id.
 /// Returned by [`BoardStore::build_transition_sql`]; executed via
-/// [`PreparedUpdate::execute_no_cancel`], [`PreparedUpdate::execute_tx`] or
-/// [`PreparedUpdate::execute_and_cancel`].
+/// [`PreparedUpdate::execute_no_cancel`], [`PreparedUpdate::execute_tx`],
+/// [`PreparedUpdate::execute_and_cancel`] or
+/// [`PreparedUpdate::execute_tx_matched`].
 struct PreparedUpdate {
     sql: String,
     params: Vec<turso::Value>,
@@ -624,6 +625,17 @@ impl PreparedUpdate {
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&self.ticket_id);
         Ok(())
+    }
+
+    /// Execute within an existing transaction, reporting whether the CAS
+    /// guard matched: `Ok(true)` when a row was updated, `Ok(false)` when no
+    /// row matched — the ticket is no longer in the expected phase (moved
+    /// externally) or does not exist. Follows the claim convention
+    /// (guard miss = `Ok(false)`, an expected no-op), unlike the other
+    /// executors which treat a no-row match as an error.
+    async fn execute_tx_matched(self, tx: &turso::TxGuard<'_>) -> Result<bool> {
+        let rows = tx.execute(&self.sql, self.params).await?;
+        Ok(rows > 0)
     }
 }
 
@@ -1299,16 +1311,26 @@ impl BoardStore {
     /// Does NOT cancel registered agents — the caller is responsible for
     /// cancelling agents **before** beginning the transaction (or at least
     /// before `tx.commit()`) to avoid orphaned agents on crash.
+    ///
+    /// # Return value
+    ///
+    /// Returns `Ok(true)` when the CAS guard matched and the row was
+    /// updated; `Ok(false)` when no row matched — the ticket is no longer in
+    /// the expected phase (moved externally while the stage finished) or does
+    /// not exist. The guard miss follows the board layer's claim convention
+    /// (expected no-op, not an error), unlike
+    /// [`transition_to`](Self::transition_to) whose callers perform
+    /// user-initiated actions on a ticket that must exist.
     pub(crate) async fn transition_to_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
         reservation: Option<bool>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let prepared =
             Self::build_transition_sql(ticket_id, expected_phase, target_phase, reservation);
-        prepared.execute_tx(tx).await
+        prepared.execute_tx_matched(tx).await
     }
 
     /// Verify that a mutation query affected at least one row, returning an
@@ -1522,24 +1544,44 @@ impl BoardStore {
     /// manual bounce-backs consume the same breaker budget as pipeline
     /// bounce-backs. Sets `pipeline_reservation` for
     /// rework priority (matching pipeline bounce-backs). Cancels any
-    /// registered agent only after the transition succeeds — a failed CAS
-    /// guard (ticket moved externally) must not cancel a just-claimed agent.
-    pub(crate) async fn bounce_back_to_dev(&self, ticket_id: &str) -> Result<()> {
-        crate::turso::with_tx(&self.conn, ticket_id, "bounce back to dev", async |tx| {
-            Self::transition_to_tx(
-                tx,
-                ticket_id,
-                Some(TicketPhase::Reviewed),
-                TicketPhase::ReadyForDevelopment,
-                Some(true),
-            )
-            .await?;
-            Self::increment_bounce_count_tx(tx, ticket_id).await?;
-            Ok(())
-        })
+    /// registered agent only after the transition succeeds — a CAS
+    /// guard miss (ticket moved externally) must not cancel a just-claimed
+    /// agent.
+    ///
+    /// # Return value
+    ///
+    /// Returns `Ok(true)` when the bounce-back committed and `Ok(false)`
+    /// when the guard missed (the ticket is no longer in
+    /// [`TicketPhase::Reviewed`]) — the expected, silent no-op for a ticket
+    /// that was moved externally while the user was clicking. Follows the
+    /// board layer's claim convention (guard miss = `Ok(false)`).
+    pub(crate) async fn bounce_back_to_dev(&self, ticket_id: &str) -> Result<bool> {
+        let applied = crate::turso::with_tx_outcome(
+            &self.conn,
+            ticket_id,
+            "bounce back to dev",
+            async |tx| {
+                if Self::transition_to_tx(
+                    tx,
+                    ticket_id,
+                    Some(TicketPhase::Reviewed),
+                    TicketPhase::ReadyForDevelopment,
+                    Some(true),
+                )
+                .await?
+                {
+                    Self::increment_bounce_count_tx(tx, ticket_id).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            },
+        )
         .await?;
-        crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
-        Ok(())
+        if applied {
+            crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
+        }
+        Ok(applied)
     }
 
     /// Transition pairs for crash/restart recovery (extracted so tests can verify
