@@ -8,7 +8,7 @@ use std::time::Duration;
 use iced::keyboard;
 use iced::widget::{
     self, Column, Row, Space, button, column, container, pick_list, row, scrollable, stack, text,
-    text_editor, text_input,
+    text_editor, text_input, tooltip,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task};
 
@@ -282,6 +282,10 @@ pub struct ChatComposerOptions<'a, M> {
     /// Home enables this (empty-input affordance); Board keeps its legacy
     /// always-active look.
     pub grey_on_empty: bool,
+    /// Tooltip text for the send button — surface-specific wording
+    /// ("send text message" on Home, "send comment" on the Board ticket
+    /// modal). Shown on hover even while the button is disabled.
+    pub send_tooltip: &'a str,
 }
 
 /// Shared chat composer: text editor with Enter-to-send and Cmd+Z intercept,
@@ -356,22 +360,27 @@ pub fn chat_composer<'a, M: Clone + 'a>(
     // never allocates content.text() per frame.
     let send_disabled = options.sending
         || (options.grey_on_empty && (content.is_empty() || content.text().trim().is_empty()));
-    let send_btn = button(
-        lucide::send::<iced::Theme, iced::Renderer>()
-            .size(14)
-            .color(if send_disabled {
-                theme::TEXT_MUTED
-            } else {
-                theme::ACCENT
-            }),
+    let send_btn = tooltip(
+        button(
+            lucide::send::<iced::Theme, iced::Renderer>()
+                .size(14)
+                .color(if send_disabled {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::ACCENT
+                }),
+        )
+        .style(theme::icon_button_style(send_disabled))
+        .on_press_maybe(if send_disabled {
+            None
+        } else {
+            Some(send_msg_btn)
+        })
+        .padding(4),
+        text(options.send_tooltip).size(11),
+        tooltip::Position::Top,
     )
-    .style(theme::icon_button_style(send_disabled))
-    .on_press_maybe(if send_disabled {
-        None
-    } else {
-        Some(send_msg_btn)
-    })
-    .padding(4);
+    .style(theme::tooltip_style);
 
     // Right-edge overlay: controls column (when present) above the send button.
     let mut col = Column::new().spacing(6).align_x(Alignment::End);

@@ -1535,14 +1535,24 @@ impl SettingsState {
                             container(
                                 row![
                                     // Maintainer toggle
-                                    button(widgets::maint_badge(maintainer_on))
-                                        .style(theme::button_text)
-                                        .on_press(SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::ToggleMaintainer(
-                                                ws_item.name.clone(),
-                                                !maintainer_on,
-                                            ),
-                                        )),
+                                    tooltip(
+                                        button(widgets::maint_badge(maintainer_on))
+                                            .style(theme::button_text)
+                                            .on_press(SettingsMessage::WorkspaceMsg(
+                                                workspaces::WorkspacesMessage::ToggleMaintainer(
+                                                    ws_item.name.clone(),
+                                                    !maintainer_on,
+                                                ),
+                                            ),),
+                                        text(if maintainer_on {
+                                            "stop maintenance"
+                                        } else {
+                                            "start maintenance"
+                                        })
+                                        .size(11),
+                                        tooltip::Position::Top,
+                                    )
+                                    .style(theme::tooltip_style),
                                     Space::new().width(4),
                                     button(row![
                                         lucide::refresh_cw::<iced::Theme, iced::Renderer>()
@@ -2085,18 +2095,25 @@ impl SettingsState {
                                             .into();
                                         e
                                     } else {
-                                        button(
-                                            lucide::x::<iced::Theme, iced::Renderer>()
-                                                .size(11)
-                                                .color(theme::TEXT_MUTED),
-                                        )
-                                        .style(theme::button_text)
-                                        .on_press(SettingsMessage::UserMsg(
-                                            users::UsersMessage::UnbindChannel(
-                                                user.name.clone(),
-                                                binding.identifier.clone(),
+                                        tooltip(
+                                            button(
+                                                lucide::x::<iced::Theme, iced::Renderer>()
+                                                    .size(11)
+                                                    .color(theme::TEXT_MUTED),
+                                            )
+                                            .style(theme::button_text)
+                                            .on_press(
+                                                SettingsMessage::UserMsg(
+                                                    users::UsersMessage::UnbindChannel(
+                                                        user.name.clone(),
+                                                        binding.identifier.clone(),
+                                                    ),
+                                                ),
                                             ),
-                                        ))
+                                            text("Unlink Telegram").size(11),
+                                            tooltip::Position::Top,
+                                        )
+                                        .style(theme::tooltip_style)
                                         .into()
                                     },
                                 ]

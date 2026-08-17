@@ -10,7 +10,7 @@ use crate::chat_history::ChatHistoryEntry;
 use futures_util::SinkExt;
 use iced::widget::rule;
 use iced::widget::{
-    Column, Id, Space, button, column, container, row, scrollable, text, text_editor,
+    Column, Id, Space, button, column, container, row, scrollable, text, text_editor, tooltip,
 };
 use iced::{Alignment, Element, Length, Task, keyboard};
 use iced_fonts::lucide;
@@ -885,20 +885,36 @@ impl HomeState {
         } else {
             role_btn.into()
         };
-        controls.push(role_btn);
+        controls.push(
+            tooltip(
+                role_btn,
+                text("switch agent").size(11),
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style)
+            .into(),
+        );
 
-        let mic_btn = button(lucide::mic::<iced::Theme, iced::Renderer>().size(14).color(
-            if mic_busy {
-                theme::TEXT_MUTED
-            } else {
-                theme::TEXT_SECONDARY
-            },
-        ))
-        .on_press_maybe(
-            (self.selected_user.is_some() && !mic_busy).then_some(HomeMessage::StartVoiceRecording),
+        let mic_btn = tooltip(
+            button(
+                lucide::mic::<iced::Theme, iced::Renderer>()
+                    .size(14)
+                    .color(if mic_busy {
+                        theme::TEXT_MUTED
+                    } else {
+                        theme::TEXT_SECONDARY
+                    }),
+            )
+            .on_press_maybe(
+                (self.selected_user.is_some() && !mic_busy)
+                    .then_some(HomeMessage::StartVoiceRecording),
+            )
+            .style(theme::icon_button_style(mic_busy))
+            .padding(3),
+            text("record voice message").size(11),
+            tooltip::Position::Top,
         )
-        .style(theme::icon_button_style(mic_busy))
-        .padding(3);
+        .style(theme::tooltip_style);
         controls.push(mic_btn.into());
 
         let input_area = super::widgets::chat_composer(
@@ -916,6 +932,7 @@ impl HomeState {
                 max_height: 330.0,
                 controls,
                 grey_on_empty: true,
+                send_tooltip: "send text message",
             },
         );
 

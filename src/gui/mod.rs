@@ -1802,10 +1802,15 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         .style(widgets::text_input_style)
         .size(13)
         .padding([4, 8]);
-    let clear_btn = button(text("×").size(14))
-        .on_press(Message::Board(board::BoardMessage::SearchCleared))
-        .style(theme::button_text)
-        .padding(4);
+    let clear_btn = tooltip(
+        button(text("×").size(14))
+            .on_press(Message::Board(board::BoardMessage::SearchCleared))
+            .style(theme::button_text)
+            .padding(4),
+        text("clear search").size(11),
+        tooltip::Position::Top,
+    )
+    .style(theme::tooltip_style);
     let search_row = row![search_input, clear_btn]
         .spacing(4)
         .align_y(Alignment::Center);
@@ -2179,9 +2184,9 @@ impl Dashboard {
         let tooltip_text = if !has_ws {
             "Select a workspace to toggle maintainer"
         } else if self.maintenance_enabled() {
-            "Maintainer ON"
+            "stop maintenance"
         } else {
-            "Maintainer OFF"
+            "start maintenance"
         };
         render_sidebar_toggle(
             maint_icon.into(),
@@ -2335,11 +2340,16 @@ impl Dashboard {
         .spacing(6)
         .align_y(Alignment::Center);
         Some(
-            button(branch_content)
-                .style(theme::button_text)
-                .padding(3)
-                .on_press(Message::Git(git::GitMessage::OpenModal))
-                .into(),
+            tooltip(
+                button(branch_content)
+                    .style(theme::button_text)
+                    .padding(3)
+                    .on_press(Message::Git(git::GitMessage::OpenModal)),
+                text("active branch").size(11),
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style)
+            .into(),
         )
     }
 
@@ -2406,15 +2416,20 @@ impl Dashboard {
         .spacing(6)
         .align_y(Alignment::Center);
         Some(
-            button(sync_content)
-                .style(theme::button_text)
-                .padding(3)
-                .on_press_maybe(if self.git_state.is_syncing() {
-                    None
-                } else {
-                    Some(Message::Git(git::GitMessage::Sync))
-                })
-                .into(),
+            tooltip(
+                button(sync_content)
+                    .style(theme::button_text)
+                    .padding(3)
+                    .on_press_maybe(if self.git_state.is_syncing() {
+                        None
+                    } else {
+                        Some(Message::Git(git::GitMessage::Sync))
+                    }),
+                text("sync commits pull and push").size(11),
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style)
+            .into(),
         )
     }
 
@@ -2427,11 +2442,16 @@ impl Dashboard {
         }
         let stats_row = widgets::diff_stats_row::<Message>(added, removed, 15.0);
         Some(
-            button(stats_row)
-                .style(theme::button_text)
-                .padding(3)
-                .on_press(Message::OpenDiffModal(None))
-                .into(),
+            tooltip(
+                button(stats_row)
+                    .style(theme::button_text)
+                    .padding(3)
+                    .on_press(Message::OpenDiffModal(None)),
+                text("uncommitted changes").size(11),
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style)
+            .into(),
         )
     }
 

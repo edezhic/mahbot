@@ -288,16 +288,35 @@ impl BoardState {
         }
     }
 
-    /// Map an action label to the appropriate lucide icon element (16px).
-    fn action_icon<'a>(label: &str) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
-        match label {
-            l if l.contains("Cancel") => lucide::circle_x(),
-            l if l.contains("Redo") => lucide::refresh_cw(),
-            l if l.contains("QA") => lucide::shield_check(),
-            l if l.contains("Pause") => lucide::pause(),
-            l if l.contains("Dev") => lucide::play(),
-            l if l.contains("Backlog") => lucide::rotate_ccw(),
-            _ => lucide::circle_check(),
+    /// Map an action label to its lucide icon (16px) and tooltip text.
+    ///
+    /// Keyed off the action label (not the target phase): "Redo Dev" and
+    /// "Ready for Dev" both transition to ReadyForDevelopment but need
+    /// different texts, so `Redo` must be matched before `Dev`. The single
+    /// keyword chain (Cancel → Redo → QA → Pause → Dev → Backlog) drives
+    /// both the icon and the tooltip, so the two can never drift apart.
+    /// The trailing `circle_check`/"move phase" pair is a defensive
+    /// catch-all for labels outside [`Self::available_actions`].
+    fn action_icon_and_tooltip<'a>(
+        label: &str,
+    ) -> (
+        iced::widget::Text<'a, iced::Theme, iced::Renderer>,
+        &'static str,
+    ) {
+        if label.contains("Cancel") {
+            (lucide::circle_x(), "cancel ticket")
+        } else if label.contains("Redo") {
+            (lucide::refresh_cw(), "redo dev")
+        } else if label.contains("QA") {
+            (lucide::shield_check(), "send to QA")
+        } else if label.contains("Pause") {
+            (lucide::pause(), "move to planning")
+        } else if label.contains("Dev") {
+            (lucide::play(), "ready for dev")
+        } else if label.contains("Backlog") {
+            (lucide::rotate_ccw(), "back to analysis")
+        } else {
+            (lucide::circle_check(), "move phase")
         }
     }
 
@@ -313,7 +332,7 @@ impl BoardState {
         let mut icon_row = Row::new().spacing(4);
         for (label, phase) in actions {
             let is_cancel = label.contains("Cancel");
-            let icon = Self::action_icon(label);
+            let (icon, tooltip_text) = Self::action_icon_and_tooltip(label);
             let icon_color = if is_disabled {
                 theme::TEXT_MUTED
             } else if is_cancel {
@@ -330,16 +349,21 @@ impl BoardState {
                 theme::button_text
             };
             icon_row = icon_row.push(
-                button(icon.size(16).color(icon_color))
-                    .style(style_fn)
-                    .on_press_maybe(if is_disabled {
-                        None
-                    } else {
-                        Some(BoardMessage::PerformAction(
-                            ticket_id.to_string(),
-                            phase.to_string(),
-                        ))
-                    }),
+                tooltip(
+                    button(icon.size(16).color(icon_color))
+                        .style(style_fn)
+                        .on_press_maybe(if is_disabled {
+                            None
+                        } else {
+                            Some(BoardMessage::PerformAction(
+                                ticket_id.to_string(),
+                                phase.to_string(),
+                            ))
+                        }),
+                    text(tooltip_text).size(11),
+                    tooltip::Position::Top,
+                )
+                .style(theme::tooltip_style),
             );
         }
         icon_row
@@ -984,13 +1008,18 @@ impl BoardState {
             ]
             .spacing(0)
             .align_y(Alignment::Center);
-            let stats_button = button(stats_parts)
-                .padding([2, 6])
-                .style(theme::button_text)
-                .on_press(BoardMessage::ViewCommitDiff {
-                    commit_hash: hash.clone(),
-                    workspace_name: ws_name.clone(),
-                });
+            let stats_button = tooltip(
+                button(stats_parts)
+                    .padding([2, 6])
+                    .style(theme::button_text)
+                    .on_press(BoardMessage::ViewCommitDiff {
+                        commit_hash: hash.clone(),
+                        workspace_name: ws_name.clone(),
+                    }),
+                text("ticket commit diff").size(11),
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style);
             badge_row = badge_row.push(stats_button);
         }
 
@@ -1000,33 +1029,43 @@ impl BoardState {
         // Per-ticket archive button for done/cancelled tickets
         if matches!(ticket.phase, TicketPhase::Done | TicketPhase::Cancelled) && !ticket.is_archived
         {
-            let archive_btn = button(
-                lucide::archive::<iced::Theme, iced::Renderer>()
-                    .size(16)
-                    .color(theme::TEXT_MUTED),
+            let archive_btn = tooltip(
+                button(
+                    lucide::archive::<iced::Theme, iced::Renderer>()
+                        .size(16)
+                        .color(theme::TEXT_MUTED),
+                )
+                .style(theme::button_text)
+                .on_press_maybe(if is_action_disabled {
+                    None
+                } else {
+                    Some(BoardMessage::ArchiveTicket(ticket.id.clone()))
+                }),
+                text("archive ticket").size(11),
+                tooltip::Position::Top,
             )
-            .style(theme::button_text)
-            .on_press_maybe(if is_action_disabled {
-                None
-            } else {
-                Some(BoardMessage::ArchiveTicket(ticket.id.clone()))
-            });
+            .style(theme::tooltip_style);
             badge_row = badge_row.push(archive_btn);
         }
 
         let mut card_children: Vec<Element<'_, BoardMessage>> = vec![
             // Title + ID row: both clickable
-            button(
-                column![
-                    text(&ticket.title).size(13).color(theme::TEXT_PRIMARY),
-                    text(&ticket.id).size(10).color(theme::TEXT_MUTED),
-                ]
-                .spacing(2),
+            tooltip(
+                button(
+                    column![
+                        text(&ticket.title).size(13).color(theme::TEXT_PRIMARY),
+                        text(&ticket.id).size(10).color(theme::TEXT_MUTED),
+                    ]
+                    .spacing(2),
+                )
+                .padding(iced::Padding::new(8.0).bottom(2.0))
+                .width(Length::Fill)
+                .style(theme::button_text)
+                .on_press(BoardMessage::OpenModal(ticket.id.clone())),
+                text("open ticket details").size(11),
+                tooltip::Position::Top,
             )
-            .padding(iced::Padding::new(8.0).bottom(2.0))
-            .width(Length::Fill)
-            .style(theme::button_text)
-            .on_press(BoardMessage::OpenModal(ticket.id.clone()))
+            .style(theme::tooltip_style)
             .into(),
         ];
 
@@ -1248,13 +1287,18 @@ impl BoardState {
                     .color(theme::TEXT_PRIMARY)
                     .font(theme::FONT_BOLD),
                 Space::new().width(Length::Fill),
-                button(
-                    lucide::x::<iced::Theme, iced::Renderer>()
-                        .size(16)
-                        .color(theme::TEXT_MUTED),
+                tooltip(
+                    button(
+                        lucide::x::<iced::Theme, iced::Renderer>()
+                            .size(16)
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .style(theme::button_text)
+                    .on_press(BoardMessage::CloseModal),
+                    text("close").size(11),
+                    tooltip::Position::Top,
                 )
-                .style(theme::button_text)
-                .on_press(BoardMessage::CloseModal),
+                .style(theme::tooltip_style),
             ]
             .align_y(Alignment::Center),
             text(&ticket.id).size(12).color(theme::TEXT_MUTED),
@@ -1399,6 +1443,7 @@ impl BoardState {
                 // Board comment input is out of ticket scope — keep its
                 // legacy always-active send button look.
                 grey_on_empty: false,
+                send_tooltip: "send comment",
             },
         ))
         .width(Length::Fill)
