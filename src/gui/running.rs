@@ -549,10 +549,31 @@ fn render_agent_card<'a>(
                 .style(theme::pill_style(theme::ACCENT_DIM)),
         );
     }
+    // Activity indicator — a non-tool LLM phase (verdict/summary extraction,
+    // media transcription) running inside this agent. The agent card is the
+    // single tracker for these calls (no separate call rows are ever created),
+    // so the badge is what keeps an extracting/transcribing agent from looking
+    // idle. Loader + label distinguishes it from tool badges.
+    if let Some(activity) = &h.activity {
+        badge_row = badge_row.push(
+            container(
+                row![
+                    lucide::loader_circle::<iced::Theme, iced::Renderer>()
+                        .size(11)
+                        .color(theme::ACCENT),
+                    text(activity.clone()).size(11).color(theme::ACCENT),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+            .padding([1, 6])
+            .style(theme::pill_style(theme::ACCENT_DIM)),
+        );
+    }
 
     let mut col = Column::new().spacing(4);
     col = col.push(first_row);
-    if !h.current_tools.is_empty() {
+    if !h.current_tools.is_empty() || h.activity.is_some() {
         col = col.push(badge_row);
     }
 
@@ -603,6 +624,8 @@ fn call_purpose(kind: &str) -> String {
         "abstain_check" => "Research answerability check".to_string(),
         "claim_annotate" => "Research claim annotation".to_string(),
         "confirm_links" => "Research link confirmation".to_string(),
+        "research_wrap_up" => "Research wrap-up".to_string(),
+        "media_transcription" => "Media transcription".to_string(),
         other => other.to_string(),
     }
 }
@@ -642,6 +665,7 @@ mod tests {
             started_at: Utc::now(),
             label: role.to_string(),
             current_tools: Vec::new(),
+            activity: None,
         }
     }
 

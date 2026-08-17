@@ -1249,7 +1249,8 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 pub(crate) struct ChatRequestMeta {
     /// Purpose tag: "agent" (agent loop incl. direct chat / discovery /
     /// sub-agents / maintainer), "extraction", "summarize", "consolidate",
-    /// "research_wrap_up" (deadline wrap-up extraction).
+    /// "research_wrap_up" (deadline wrap-up extraction), "media_transcription"
+    /// (vision-model transcription of inbound media / video tool results).
     pub purpose: &'static str,
     pub agent_id: String,
     pub role: String,

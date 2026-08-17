@@ -918,21 +918,16 @@ async fn consolidate_analyst_runs(
     deadline: std::time::Instant,
     round_key: &str,
 ) -> Result<String> {
-    // Orchestrator-only LLM phase — the extraction sub-phase still runs while
-    // the analyst Agents are alive/registered; only the grouping pass runs
-    // with zero registered agents. Tracking the whole phase is a harmless
-    // superset that keeps the drain-watch from firing the token into an
-    // in-flight call while the registry looks quiescent. The parent key
-    // attaches the consolidation call to its analyze round in the Running Agents
-    // view.
-    let _call = crate::call_registry::NON_AGENT_CALLS.register(
-        "consolidate",
-        &ws.name,
-        Some(crate::registry::ParentKey::AnalyzeRound(
-            round_key.to_string(),
-        )),
-        false,
-    );
+    // Drain-watch coverage for this phase: extraction runs while the analyst
+    // Agents are still registered (their registry entries keep the drain-watch
+    // from firing); the grouping pass runs with zero live agents and is
+    // covered by the guard INSIDE the shared consensus core
+    // (`run_grouping_repair`) — the single tracker for the consolidation call.
+    // `consolidate_findings` re-checks the drain flag before the grouping call,
+    // closing the sync-only window between extraction end and the core guard's
+    // registration (documented accepted-residual-window contract, jobs.rs). No
+    // phase guard here: it would duplicate the core's row and register a
+    // phantom row on 0/1-valid-response rounds where no grouping call runs.
     let valid_count = runs
         .iter()
         .filter(|r| r.response().is_some_and(|t| !t.trim().is_empty()))
@@ -1045,6 +1040,22 @@ fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Render the fail-open analyst deliverable: the flat numbered claim list
+/// plus the raw analyst dumps, headed by an explicit `marker` naming why
+/// consolidation produced no groups. Head-placed so the sync path's 5 KB
+/// sandwich truncation keeps the marker. Shared by every no-groups path so
+/// the fallback shape stays identical.
+#[must_use]
+fn render_unconsolidated_fallback(
+    marker: &str,
+    items_by_agent: &[Vec<String>],
+    outcomes: &[AnalystOutcome],
+) -> String {
+    let flat = render_flat_claim_list(items_by_agent);
+    let raw_dump = render_raw_analyst_dump(outcomes);
+    format!("## Analyst Reports\n\n({marker})\n\n{flat}\n\n{raw_dump}")
+}
+
 /// Consolidate extracted outcomes: build the per-agent claim lists and run the
 /// shared repair-mode grouping pass (semantic grouping + contradiction
 /// judgment, frozen groups + deterministic remainder). ≥2 valid responses go
@@ -1085,10 +1096,10 @@ async fn consolidate_findings(
         // so skip the provider call and deliver the flat claim list + raw
         // dumps with an explicit marker.
         tracing::info!("Single-analyst consolidation — skipping grouping pass");
-        let flat = render_flat_claim_list(&items_by_agent);
-        let raw_dump = render_raw_analyst_dump(&outcomes);
-        return Ok(format!(
-            "## Analyst Reports\n\n(only one analyst produced parseable claims — grouping skipped)\n\n{flat}\n\n{raw_dump}"
+        return Ok(render_unconsolidated_fallback(
+            "only one analyst produced parseable claims — grouping skipped",
+            &items_by_agent,
+            &outcomes,
         ));
     }
     // User material: global flat ids across ALL agents (each claim exactly one
@@ -1120,6 +1131,22 @@ async fn consolidate_findings(
     let parent = Some(crate::registry::ParentKey::AnalyzeRound(
         round_key.to_string(),
     ));
+    // Drain fired in the extraction-end → grouping-start gap (the analyst
+    // agents have dropped, the consensus core's guard is not yet registered):
+    // never start a new LLM call once the drain begins — deliver the fail-open
+    // raw claim list instead (the same deliverable as a Fallback, without the
+    // doomed call). The extraction itself is covered by the live analyst
+    // cards; this check closes the sync-only residual window.
+    if crate::shutdown::aborting() {
+        tracing::warn!(
+            "Analyst consolidation skipped — shutdown/drain in progress; delivering raw claim list"
+        );
+        return Ok(render_unconsolidated_fallback(
+            "unconsolidated — shutdown during consolidation",
+            &items_by_agent,
+            &outcomes,
+        ));
+    }
     match crate::consensus::run_grouping_repair(ws, "consolidate", request, &items_by_agent, parent)
         .await
     {
@@ -1127,14 +1154,11 @@ async fn consolidate_findings(
             render_analyze_groups(analyze, &output, &references, &table, n_valid, &outcomes),
         ),
         crate::consensus::RepairOutcome::Fallback => {
-            // Fail-open deliverable: flat numbered claim list (the grouping
-            // input) + raw analyst dumps + explicit marker. The marker is
-            // head-placed so the sync path's 5 KB sandwich truncation keeps it.
             tracing::warn!("Analyst consolidation failed — delivering raw claim list");
-            let flat = render_flat_claim_list(&items_by_agent);
-            let raw_dump = render_raw_analyst_dump(&outcomes);
-            Ok(format!(
-                "## Analyst Reports\n\n(unconsolidated — consolidation failed)\n\n{flat}\n\n{raw_dump}"
+            Ok(render_unconsolidated_fallback(
+                "unconsolidated — consolidation failed",
+                &items_by_agent,
+                &outcomes,
             ))
         }
     }

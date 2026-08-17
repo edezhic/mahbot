@@ -231,6 +231,7 @@ async fn handle_multimodal_video(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
+    workspace: &str,
 ) -> MultimodalVideoAction {
     if is_http_url(path) {
         return MultimodalVideoAction::annotation(format!("[Video: {path}]"));
@@ -251,7 +252,8 @@ async fn handle_multimodal_video(
         // (deleted after a successful copy). The annotation keeps the original
         // Telegram filename; fail-open: any failure degrades to the plain
         // [Saved video: ...] annotation.
-        let transcription = transcribe_saved_video(&saved.dest, file_name_or_path(path)).await;
+        let transcription =
+            transcribe_saved_video(&saved.dest, file_name_or_path(path), workspace).await;
         return MultimodalVideoAction {
             replacement: saved.annotation,
             delete_temp: true,
@@ -268,17 +270,26 @@ async fn handle_multimodal_video(
 /// transcription fails (unavailable transcriber, unsupported format, upload
 /// or model error, timeout, empty output) — the overall timeout lives inside
 /// [`transcribe_video_file`](crate::providers::transcribe_video_file),
-/// bounding both callers.
-async fn transcribe_saved_video(path: &std::path::Path, file_name: &str) -> Option<String> {
-    let text = crate::providers::transcribe_video_file(path).await?;
+/// bounding both callers. `workspace` names the workspace for telemetry and
+/// the live non-agent call row (the inbound path has no agent card).
+async fn transcribe_saved_video(
+    path: &std::path::Path,
+    file_name: &str,
+    workspace: &str,
+) -> Option<String> {
+    let text = crate::providers::transcribe_video_file(path, Some(workspace)).await?;
     Some(format!("[Video transcription of {file_name}]: {text}"))
 }
 
 /// Handle an IMAGE marker in non-multimodal mode — transcribe to text
 /// description or fall back to a generic attachment annotation.
-async fn handle_non_multimodal_image(path_obj: &std::path::Path, file_name: &str) -> String {
+async fn handle_non_multimodal_image(
+    path_obj: &std::path::Path,
+    file_name: &str,
+    workspace: &str,
+) -> String {
     if let Some(ref transcriber) = crate::providers::media_transcriber() {
-        match transcribe_image_file(path_obj, transcriber).await {
+        match transcribe_image_file(path_obj, transcriber, workspace).await {
             Ok(description) => format!("[Image: {description}]"),
             Err(e) => {
                 tracing::warn!(path = %path_obj.display(), error = %e, "Image transcription failed");
@@ -353,7 +364,9 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                 }
                 EnrichmentStrategy::NonMultimodal => {
                     let file_name = file_name_or_path(path);
-                    annotations.push(handle_non_multimodal_image(path_obj, file_name).await);
+                    annotations.push(
+                        handle_non_multimodal_image(path_obj, file_name, &msg.workspace).await,
+                    );
                     // IMAGE temp files cleaned up regardless of outcome.
                     files_to_delete.push(path_obj.to_path_buf());
                 }
@@ -373,7 +386,13 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                         replacement,
                         delete_temp,
                         transcription,
-                    } = handle_multimodal_video(path, path_obj, uploads_dir.as_deref()).await;
+                    } = handle_multimodal_video(
+                        path,
+                        path_obj,
+                        uploads_dir.as_deref(),
+                        &msg.workspace,
+                    )
+                    .await;
                     result = result.replacen(whole.as_str(), &replacement, 1);
                     if let Some(annotation) = transcription {
                         annotations.push(annotation);
@@ -493,13 +512,14 @@ pub fn has_only_audio_markers(content: &str) -> bool {
 async fn transcribe_image_file(
     path: &std::path::Path,
     transcriber: &crate::providers::transcribe::MediaTranscriber,
+    workspace: &str,
 ) -> anyhow::Result<String> {
     if !path.exists() || !path.is_file() {
         anyhow::bail!("image file not found: {}", path.display());
     }
 
     let data_uri = crate::util::local_image_to_data_uri(path).await?;
-    transcriber.transcribe(&data_uri).await
+    transcriber.transcribe(&data_uri, Some(workspace)).await
 }
 
 /// Extract all unique URLs from message text.

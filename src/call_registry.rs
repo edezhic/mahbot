@@ -27,7 +27,8 @@ static NEXT_ENTRY_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Serialize)]
 pub struct NonAgentCallHandle {
     /// Call kind — the same purpose string the call's `ChatRequestMeta` uses
-    /// (e.g. `"consolidate"`, `"synthesis"`, `"gap_extract"`).
+    /// (e.g. `"consolidate"`, `"synthesis"`, `"gap_extract"`,
+    /// `"research_wrap_up"`, `"media_transcription"`).
     pub kind: &'static str,
     pub workspace: String,
     pub started_at: DateTime<Utc>,

@@ -250,6 +250,17 @@ pub(crate) struct LlmRequestRecord {
     pub recorded_at: String,
 }
 
+/// The request fields the durable `llm_requests` row actually reads — the
+/// minimal carrier for calls made outside the `ChatRequest` retry pipeline
+/// (e.g. raw-HTTP media transcription), where synthesizing a full request
+/// envelope would be a misleading data shape.
+pub(crate) struct LlmCallMeta {
+    pub meta: crate::ChatRequestMeta,
+    pub model: String,
+    /// Requested provider routing (provider_order); `None` = provider default.
+    pub provider_order: Option<String>,
+}
+
 /// Build an [`LlmRequestRecord`] from a request + optional response envelope.
 /// `None` when the request carries no metadata (context-free calls — test
 /// doubles, ad-hoc requests) — such rows are never recorded.
@@ -266,15 +277,39 @@ fn llm_request_record(
     failure_class: Option<&'static str>,
 ) -> Option<LlmRequestRecord> {
     let meta = request.meta.as_ref()?;
+    Some(llm_request_record_meta(
+        &LlmCallMeta {
+            meta: meta.clone(),
+            model: request.model.clone(),
+            provider_order: request.provider_order.clone(),
+        },
+        duration_ms,
+        attempts,
+        response,
+        finish_reason,
+        failure_class,
+    ))
+}
+
+/// Build an [`LlmRequestRecord`] from explicit metadata (see
+/// [`record_llm_operation_meta`]).
+fn llm_request_record_meta(
+    call: &LlmCallMeta,
+    duration_ms: u64,
+    attempts: u32,
+    response: Option<&crate::ChatResponse>,
+    finish_reason: Option<&str>,
+    failure_class: Option<&'static str>,
+) -> LlmRequestRecord {
     let usage = response.and_then(|r| r.usage.as_ref());
-    Some(LlmRequestRecord {
-        purpose: meta.purpose,
-        agent_id: meta.agent_id.clone(),
-        role: meta.role.clone(),
-        workspace: meta.workspace.clone(),
-        ticket_id: meta.ticket_id.clone(),
-        model: request.model.clone(),
-        routing: request
+    LlmRequestRecord {
+        purpose: call.meta.purpose,
+        agent_id: call.meta.agent_id.clone(),
+        role: call.meta.role.clone(),
+        workspace: call.meta.workspace.clone(),
+        ticket_id: call.meta.ticket_id.clone(),
+        model: call.model.clone(),
+        routing: call
             .provider_order
             .as_deref()
             .unwrap_or("default")
@@ -295,7 +330,7 @@ fn llm_request_record(
         failure_class: failure_class.map(str::to_string),
         success: failure_class.is_none(),
         recorded_at: crate::turso::now(),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -352,10 +387,42 @@ pub(crate) async fn record_llm_operation(
     ) else {
         return;
     };
+    persist_llm_request(&rec).await;
+}
+
+/// Emit one per-operation LLM request stat row from explicit metadata — for
+/// calls made outside the `ChatRequest` retry pipeline (e.g. raw-HTTP media
+/// transcription), which carry no response envelope. `attempts` is supplied
+/// by the caller: the transcription paths always pass 1 (a single-shot
+/// fail-open call never retries). Same fail-open semantics as
+/// [`record_llm_operation`]: a store write failure is logged and never
+/// propagates.
+pub(crate) async fn record_llm_operation_meta(
+    call: &LlmCallMeta,
+    duration_ms: u64,
+    attempts: u32,
+    response: Option<&crate::ChatResponse>,
+    finish_reason: Option<&str>,
+    failure_class: Option<&'static str>,
+) {
+    let rec = llm_request_record_meta(
+        call,
+        duration_ms,
+        attempts,
+        response,
+        finish_reason,
+        failure_class,
+    );
+    persist_llm_request(&rec).await;
+}
+
+/// Best-effort, fail-open persist of an [`LlmRequestRecord`] to the logs
+/// store; silently skipped when the store is not yet open.
+async fn persist_llm_request(rec: &LlmRequestRecord) {
     let Some(store) = log_store_for_stats() else {
         return;
     };
-    if let Err(e) = store.record_llm_request(&rec).await {
+    if let Err(e) = store.record_llm_request(rec).await {
         tracing::debug!(error = %e, "Failed to persist LLM request stat");
     }
 }

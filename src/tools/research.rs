@@ -1082,10 +1082,18 @@ fn wrap_up_params(ws: &Workspace, agent_id: &str, tool_specs: Vec<ToolSpec>) -> 
 /// aborts promptly if the drain starts mid-stage (the orchestrator guard
 /// blocks the drain-watch token, so the wrap-up self-aborts on the drain
 /// flag — the partial report is not delayed past the drain).
+///
+/// Live tracking: one NON_AGENT_CALLS row per wrap-up stage, registered only
+/// when the LLM batch actually runs (the stage is the logical task — the
+/// per-analyst extraction calls share it, never spawning N duplicate rows).
+/// Each extraction call still records its own durable llm_requests row via
+/// its `"research_wrap_up"` ChatRequestMeta.
 async fn wrap_up_timed_out(
+    ws: &Workspace,
     timed_out: Vec<WrapUpEntry>,
     ledger: &mut QueryLedger,
     run_stats: &mut RunStats,
+    run_key: &str,
 ) -> Vec<AnalystFindings> {
     if timed_out.is_empty() || crate::shutdown::aborting() {
         return Vec::new();
@@ -1127,6 +1135,16 @@ async fn wrap_up_timed_out(
     if prepared.is_empty() || crate::shutdown::aborting() {
         return Vec::new();
     }
+    // Live tracker for the wrap-up stage — registered here, only when the LLM
+    // batch actually runs (prep-only stages register nothing). Attaches to the
+    // research run's group; the whole-run orchestrator guard already blocks
+    // the drain-watch, so this row is purely observational.
+    let _wrap_up_call = crate::call_registry::NON_AGENT_CALLS.register(
+        "research_wrap_up",
+        &ws.name,
+        Some(crate::registry::ParentKey::Research(run_key.to_string())),
+        false,
+    );
     let wrap_up_prompt = load_prompt("research/wrap_up.md");
     let handles: Vec<_> = prepared
         .into_iter()
@@ -2188,7 +2206,8 @@ async fn gap_rounds(
         // this position, and the final round's wrap-up must survive them; the
         // pre-checkpoint window already contains the annotate + gap-extract
         // orchestrator calls, so the wrap-up only extends an existing window.
-        recovered.extend(wrap_up_timed_out(timed_out, &mut state.ledger, run_stats).await);
+        recovered
+            .extend(wrap_up_timed_out(ws, timed_out, &mut state.ledger, run_stats, job_id).await);
         let (new_urls, pending) = state.acc.absorb(&round);
         let novel_claims =
             annotate_round(ws, &mut state.acc, &pending, &mut state.markers, job_id).await;
@@ -3165,7 +3184,9 @@ async fn run_deep_research(
         // Its ledger registrations are not in the checkpoint (fail-open — a
         // crash during the wrap-up resumes with a ledger missing the dead
         // analysts' queries, so gap rounds may re-ask them, bounded).
-        recovered.extend(wrap_up_timed_out(r1_timed_out, &mut state.ledger, &mut run_stats).await);
+        recovered.extend(
+            wrap_up_timed_out(ws, r1_timed_out, &mut state.ledger, &mut run_stats, job_id).await,
+        );
     }
 
     // ── Interim consolidation + conditional gap rounds (resumable) ────

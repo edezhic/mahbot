@@ -52,6 +52,14 @@ tokio::task_local! {
     /// (owner-deletes-at-end: the run's spill files are deleted when the agent
     /// run ends). `None` outside an agent run (management diagnostics, tests).
     pub(crate) static CURRENT_TOOL_AGENT_ID: Option<String>;
+    /// The calling agent's registry identity + generation — set for the
+    /// duration of tool execution so tool-internal LLM calls (e.g. media
+    /// transcription in video tool results) can attribute themselves to the
+    /// owning agent's Running Agents card and telemetry. `None` outside an
+    /// agent run (inbound enrichment, tests) — such calls register in
+    /// [`crate::call_registry::NON_AGENT_CALLS`] instead.
+    pub(crate) static CURRENT_TOOL_AGENT_TRACKING:
+        Option<crate::registry::AgentTracking>;
 }
 
 /// Maximum LLM iterations before the agent loop bails out.
@@ -492,6 +500,12 @@ impl Agent {
         let parent_key = self.parent_key.clone();
         let background_sessions = Some(self.background_sessions.clone());
         let agent_id = Some(self.agent_id.clone());
+        let agent_tracking = Some(crate::registry::AgentTracking {
+            agent_id: self.agent_id.clone(),
+            generation: self.generation,
+            role: self.role.as_str().to_string(),
+            workspace: self.workspace.name.clone(),
+        });
         CURRENT_TOOL_USER_NAME
             .scope(user_name, async {
                 CURRENT_TOOL_CHANNEL
@@ -502,42 +516,52 @@ impl Agent {
                                     .scope(background_sessions, async {
                                         CURRENT_TOOL_AGENT_ID
                                             .scope(agent_id, async {
-                                                while i < tool_calls.len() {
-                                                    if side_flags[i] {
-                                                        // Side-effecting: single-call group, executed alone.
-                                                        let outcome = self
-                                                            .execute_tool(
-                                                                &tool_calls[i].name,
-                                                                tool_calls[i].arguments.clone(),
-                                                            )
-                                                            .await;
-                                                        outcomes.push(outcome);
-                                                        i += 1;
-                                                    } else {
-                                                        // Read-only group: extend while consecutive calls are also read-only.
-                                                        let group_start = i;
-                                                        while i < tool_calls.len() && !side_flags[i]
-                                                        {
-                                                            i += 1;
-                                                        }
-                                                        let group_calls =
-                                                            &tool_calls[group_start..i];
-
-                                                        // Execute the entire read-only group in parallel.
-                                                        let group_outcomes: Vec<_> =
-                                                            futures_util::future::join_all(
-                                                                group_calls.iter().map(|call| {
-                                                                    self.execute_tool(
-                                                                        &call.name,
-                                                                        call.arguments.clone(),
+                                                CURRENT_TOOL_AGENT_TRACKING
+                                                    .scope(agent_tracking, async {
+                                                        while i < tool_calls.len() {
+                                                            if side_flags[i] {
+                                                                // Side-effecting: single-call group, executed alone.
+                                                                let outcome = self
+                                                                    .execute_tool(
+                                                                        &tool_calls[i].name,
+                                                                        tool_calls[i]
+                                                                            .arguments
+                                                                            .clone(),
                                                                     )
-                                                                }),
-                                                            )
-                                                            .await;
+                                                                    .await;
+                                                                outcomes.push(outcome);
+                                                                i += 1;
+                                                            } else {
+                                                                // Read-only group: extend while consecutive calls are also read-only.
+                                                                let group_start = i;
+                                                                while i < tool_calls.len()
+                                                                    && !side_flags[i]
+                                                                {
+                                                                    i += 1;
+                                                                }
+                                                                let group_calls =
+                                                                    &tool_calls[group_start..i];
 
-                                                        outcomes.extend(group_outcomes);
-                                                    }
-                                                }
+                                                                // Execute the entire read-only group in parallel.
+                                                                let group_outcomes: Vec<_> =
+                                                                    futures_util::future::join_all(
+                                                                        group_calls.iter().map(
+                                                                            |call| {
+                                                                                self.execute_tool(
+                                                                                    &call.name,
+                                                                                    call.arguments
+                                                                                        .clone(),
+                                                                                )
+                                                                            },
+                                                                        ),
+                                                                    )
+                                                                    .await;
+
+                                                                outcomes.extend(group_outcomes);
+                                                            }
+                                                        }
+                                                    })
+                                                    .await;
                                             })
                                             .await;
                                     })
@@ -882,6 +906,15 @@ impl Agent {
         validate: Option<&crate::ExtractionValidator<T>>,
         policy_override: Option<&crate::retry::RetryPolicy>,
     ) -> Result<T, crate::retry::RetryExhausted> {
+        // Live-view indicator: the agent's card is the single tracker for
+        // extractions (they never register a separate non-agent call row) —
+        // without it the card would look idle while the extraction LLM call
+        // runs. Purely observational; the guard clears on every exit path.
+        let _activity = crate::registry::AGENT_REGISTRY.activity_started(
+            &self.agent_id,
+            self.generation,
+            "extracting",
+        );
         let params = self.build_chat_request(vec![], false, "extraction");
         crate::extraction::retry_extract_structured_scoped(
             self.session.history(),
@@ -897,6 +930,14 @@ impl Agent {
     ///
     /// KV-cache requirements: see [`Self::build_chat_request`].
     pub(crate) async fn summarize(&self) -> anyhow::Result<String> {
+        // Live-view indicator: same single-tracker contract as extraction —
+        // the agent's card shows the summarization phase instead of looking
+        // idle during the (potentially large) compaction call.
+        let _activity = crate::registry::AGENT_REGISTRY.activity_started(
+            &self.agent_id,
+            self.generation,
+            "summarizing",
+        );
         let mut history = self.session.history().to_vec();
         history.push(crate::ChatMessage::user(self.role.summary_prompt()));
 

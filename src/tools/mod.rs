@@ -407,9 +407,11 @@ async fn save_generated_file(
 /// Format a video tool result: the `[VIDEO:path]` marker first (so the reply
 /// path and GUI keep working), then a "Video content:" description line when
 /// the shared video transcription succeeds. Fail-open: marker-only on any
-/// failure.
+/// failure. The transcription's live tracking resolves via the tool-execution
+/// task-local (the owning agent's activity indicator); `None` is passed for
+/// workspace because the in-agent path never needs a non-agent call row.
 pub(crate) async fn format_video_result(marker: String, output_path: &std::path::Path) -> String {
-    match crate::providers::transcribe_video_file(output_path).await {
+    match crate::providers::transcribe_video_file(output_path, None).await {
         Some(text) => format!("{marker}\n\nVideo content: {text}"),
         None => marker,
     }

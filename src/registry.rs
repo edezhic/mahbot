@@ -75,6 +75,23 @@ pub struct AgentHandle {
     /// `list()` time. Empty when the agent is between tool executions (in an
     /// LLM call, between rounds) — absence is honest.
     pub current_tools: Vec<RunningTool>,
+    /// Live activity indicator for non-tool LLM phases inside this agent
+    /// (e.g. "extracting", "summarizing", "transcribing"), taken at `list()`
+    /// time. `None` between phases — the agent's card is the single tracker
+    /// for these calls (no separate registry rows are ever created for them).
+    pub activity: Option<String>,
+}
+
+/// Agent identity + registry generation propagated to tool execution via a
+/// task-local, so tool-internal LLM calls (e.g. media transcription in video
+/// tool results) can attribute themselves to the owning agent's card and
+/// telemetry. `None` outside an agent run (inbound enrichment, tests).
+#[derive(Clone, Debug)]
+pub(crate) struct AgentTracking {
+    pub agent_id: String,
+    pub generation: u64,
+    pub role: String,
+    pub workspace: String,
 }
 
 struct AgentEntry {
@@ -88,6 +105,12 @@ struct AgentEntry {
     /// hold it), so the Vec needs no further synchronization. Each entry
     /// carries the unique tool instance id for exact removal.
     current_tools: Vec<RunningToolEntry>,
+    /// Live activity label (e.g. "extracting", "transcribing") for the
+    /// non-tool LLM phase currently running inside this agent; `None` between
+    /// phases. Single slot: an agent runs sequentially, so at most one
+    /// activity can be live at a time. Snapshot into
+    /// [`AgentHandle::activity`] by `list()`.
+    activity: Option<String>,
 }
 
 /// Internal live-tool entry: the public tool fields plus the unique instance
@@ -136,6 +159,7 @@ impl AgentRegistry {
             started_at: Utc::now(),
             label,
             current_tools: Vec::new(),
+            activity: None,
         };
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(old) = map.remove(&agent_id) {
@@ -148,6 +172,7 @@ impl AgentRegistry {
                 handle,
                 cancel_token,
                 current_tools: Vec::new(),
+                activity: None,
             },
         );
         generation
@@ -204,6 +229,47 @@ impl AgentRegistry {
             && entry.generation == generation
         {
             entry.current_tools.retain(|t| t.id != tool_id);
+        }
+    }
+
+    /// Register a live activity label on a running agent's card (e.g.
+    /// "extracting" during a verdict extraction, "transcribing" during a
+    /// media-transcription LLM call inside a tool). Purely observational — no
+    /// cancellation semantics.
+    ///
+    /// The returned guard clears the label on drop (RAII — guaranteed cleanup
+    /// on completion AND on failure, including early returns and task
+    /// cancellation). Generation-safety: the entry is only mutated when
+    /// `generation` matches the current entry — a stale guard from a
+    /// finished/restarted agent can never mutate a replacement agent's card.
+    ///
+    /// Single-slot semantics: an agent runs sequentially, so at most one
+    /// activity is live at a time; a second registration overwrites the label
+    /// and both guards clear on drop (the slot is `Option`-reset, not
+    /// reference-counted).
+    pub fn activity_started(&self, agent_id: &str, generation: u64, label: &str) -> ActivityGuard {
+        {
+            let mut map = self.inner.lock().unwrap_poison();
+            if let Some(entry) = map.get_mut(agent_id)
+                && entry.generation == generation
+            {
+                entry.activity = Some(label.to_string());
+            }
+        }
+        ActivityGuard {
+            agent_id: agent_id.to_string(),
+            generation,
+        }
+    }
+
+    /// Clear the entry's live activity label. No-op when the agent is gone or
+    /// the generation no longer matches (stale guard).
+    fn activity_finished(&self, agent_id: &str, generation: u64) {
+        let mut map = self.inner.lock().unwrap_poison();
+        if let Some(entry) = map.get_mut(agent_id)
+            && entry.generation == generation
+        {
+            entry.activity = None;
         }
     }
 
@@ -274,6 +340,7 @@ impl AgentRegistry {
                     .iter()
                     .map(RunningToolEntry::to_handle)
                     .collect();
+                handle.activity.clone_from(&e.activity);
                 handle
             })
             .collect()
@@ -332,6 +399,22 @@ pub struct RunningToolGuard {
 impl Drop for RunningToolGuard {
     fn drop(&mut self) {
         AGENT_REGISTRY.tool_finished(&self.agent_id, self.generation, self.tool_id);
+    }
+}
+
+/// RAII guard: clears the agent's live activity label on drop.
+///
+/// Creation is generation-gated; removal is generation-gated the same way — a
+/// stale guard from a finished/restarted agent can never clear the
+/// replacement agent's card.
+pub struct ActivityGuard {
+    agent_id: String,
+    generation: u64,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        AGENT_REGISTRY.activity_finished(&self.agent_id, self.generation);
     }
 }
 
@@ -431,6 +514,62 @@ mod tests {
         assert_eq!(h.current_tools[0].name, "read");
         drop(guard_b);
         AGENT_REGISTRY.deregister(&agent_id, generation);
+    }
+
+    #[test]
+    fn activity_shows_in_list_and_guard_clears_it() {
+        let agent_id = format!("activity_guard_{}", crate::generate_suffix());
+        let generation = register_test_agent(&agent_id, "/tmp/ws");
+        {
+            let guard = AGENT_REGISTRY.activity_started(&agent_id, generation, "extracting");
+            let handles = AGENT_REGISTRY.list();
+            let h = handles
+                .iter()
+                .find(|h| h.agent_id == agent_id)
+                .expect("agent registered");
+            assert_eq!(
+                h.activity.as_deref(),
+                Some("extracting"),
+                "activity must be visible on the live card"
+            );
+            drop(guard);
+        }
+        let handles = AGENT_REGISTRY.list();
+        let h = handles
+            .iter()
+            .find(|h| h.agent_id == agent_id)
+            .expect("agent still registered");
+        assert!(
+            h.activity.is_none(),
+            "guard drop must clear the activity label"
+        );
+        AGENT_REGISTRY.deregister(&agent_id, generation);
+    }
+
+    #[test]
+    fn stale_activity_guard_cannot_clear_replacement_agent() {
+        let agent_id = format!("activity_stale_{}", crate::generate_suffix());
+        let generation = register_test_agent(&agent_id, "/tmp/ws");
+        // An activity starts, then the agent is deregistered (finished/restarted).
+        let stale_guard = AGENT_REGISTRY.activity_started(&agent_id, generation, "extracting");
+        AGENT_REGISTRY.deregister(&agent_id, generation);
+        // Replacement registers with a NEW generation and starts its own activity.
+        let new_gen = register_test_agent(&agent_id, "/tmp/ws");
+        let fresh_guard = AGENT_REGISTRY.activity_started(&agent_id, new_gen, "transcribing");
+        // Stale guard drops — must NOT clear the replacement's activity.
+        drop(stale_guard);
+        let handles = AGENT_REGISTRY.list();
+        let h = handles
+            .iter()
+            .find(|h| h.agent_id == agent_id)
+            .expect("replacement agent registered");
+        assert_eq!(
+            h.activity.as_deref(),
+            Some("transcribing"),
+            "stale guard must not clear the replacement's activity"
+        );
+        drop(fresh_guard);
+        AGENT_REGISTRY.deregister(&agent_id, new_gen);
     }
 
     #[test]
