@@ -2016,6 +2016,8 @@ pub(crate) fn segment_utterances_by_vad(
 
 async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace: &str) {
     if user_name.is_empty() {
+        // No active user (admin fallback): broadcast-only — there is no user
+        // to persist under or mirror to.
         let message_id = crate::generate_id();
         let timestamp = crate::turso::now();
         crate::channels::broadcast_chat_event(
@@ -2030,17 +2032,11 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
             &timestamp,
         );
     } else {
-        crate::channels::broadcast_and_persist_user_message(user_name, "voice", transcript, workspace)
-            .await;
-
-        // Mirror the transcription to the user's Telegram bindings as text —
-        // exactly the content persisted above (the same message text stored
-        // and shown in the GUI chat), so the full chat history stays mirrored
-        // regardless of how the message was produced. Voice is a strictly
-        // local source that can never originate from Telegram, so accepting
-        // it cannot create an echo loop. Without an active user or Telegram
-        // binding this silently no-ops (matches the GUI text mirror rule).
-        crate::channels::mirror_gui_message_to_telegram(&crate::ChannelMessage {
+        // Broadcast, persist, and mirror through the canonical incoming-message
+        // pipeline — exactly the GUI text path — so the transcription reaches
+        // Telegram with the same bindings and format. Voice is a strictly local
+        // source, so the mirror cannot echo (see `mirror_gui_message_to_telegram`).
+        let msg = crate::ChannelMessage {
             user_name: user_name.to_string(),
             reply_target: String::new(),
             content: transcript.to_string(),
@@ -2048,8 +2044,8 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
             workspace: workspace.to_string(),
             optimistic_id: None,
             callback_query_id: None,
-        })
-        .await;
+        };
+        crate::channels::broadcast_and_persist_incoming_message(&msg, transcript, transcript).await;
     }
 }
 

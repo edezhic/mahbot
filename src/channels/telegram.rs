@@ -2402,7 +2402,7 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
             tracing::warn!(
                 user = %msg.user_name,
                 error = %e,
-                "Failed to look up user channels for GUI message mirror"
+                "Failed to look up user channels for message mirror"
             );
             return;
         }
@@ -2446,7 +2446,7 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
                 user = %msg.user_name,
                 recipient = %reply_target,
                 error = %e,
-                "Failed to mirror GUI message to Telegram"
+                "Failed to mirror local message to Telegram"
             );
         }
     }

@@ -105,31 +105,6 @@ pub(crate) async fn broadcast_and_persist_agent_response(
     .await;
 }
 
-/// Broadcast a user message to the GUI and persist it to chat_history.
-///
-/// Symmetric to [`broadcast_and_persist_agent_response`] — provides the
-/// same convenience for user-originated messages without requiring a
-/// [`ChannelMessage`] struct.  The `channel` field records the message
-/// source (e.g. `"voice"`, `"gui"`, `"telegram"`).
-pub(crate) async fn broadcast_and_persist_user_message(
-    user_name: &str,
-    channel: &str,
-    content: &str,
-    workspace: &str,
-) {
-    BroadcastPersistEntry {
-        user_name: user_name.to_string(),
-        channel: channel.to_string(),
-        content: content.to_string(),
-        direction: ChatDirection::User,
-        agent_role: None,
-        workspace: workspace.to_string(),
-        optimistic_id: None,
-    }
-    .broadcast_and_persist()
-    .await;
-}
-
 /// Send a [`ChatEvent::Message`] to the broadcast channel.
 ///
 /// This is the single shared entry point for all broadcast operations,
