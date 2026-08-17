@@ -23,6 +23,7 @@ pub(crate) mod logs;
 pub(crate) mod media_markers;
 pub(crate) mod role_menu;
 pub(crate) mod running;
+pub(crate) mod session_preview;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod shell;

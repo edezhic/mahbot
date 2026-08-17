@@ -1,9 +1,13 @@
 //! Sessions dashboard page — view and manage conversation sessions.
 
+use std::cell::RefCell;
+
 use crate::ChatMessage;
 use crate::session::{DecodedNativeHistoryMessage, SessionMetadata, decode_native_history_message};
 
-use iced::widget::{Column, Id, Space, button, column, container, markdown, row, scrollable, text};
+use iced::widget::{
+    Column, Id, Space, button, column, container, markdown, responsive, row, scrollable, text,
+};
 use iced::{Alignment, Element, Length, Task};
 
 use iced_anim::Animated;
@@ -13,9 +17,74 @@ use std::time::{Duration, Instant};
 use iced::window;
 use iced_fonts::lucide;
 
+use super::session_preview::{
+    MAX_PREVIEW_LINES, MessageMeasure, measure_message, re_measure, width_bucket,
+};
 use super::theme;
 use super::widgets;
 use super::widgets::selectable_text;
+
+/// Horizontal inset between the `responsive` transcript area width and the
+/// markdown body width: the transcript container adds 8px padding per side
+/// and each message card adds another 8px per side.
+const TRANSCRIPT_CONTENT_INSET_PX: f32 = 32.0;
+
+/// Shared transcript render context: the per-message markdown items, the
+/// collapse-measurement cache, the expanded-message set, and the current
+/// transcript content width. Bundled so the render helpers do not thread
+/// four parameters through every call.
+struct TranscriptCtx<'a> {
+    md_items: &'a [Vec<markdown::Item>],
+    measure_cache: &'a RefCell<Vec<Option<MessageMeasure>>>,
+    expanded_messages: &'a std::collections::HashSet<usize>,
+    text_width: f32,
+}
+
+/// Content of a regular (non-tool-call) message: either plain body text or a
+/// `[thinking]` block followed by the visible body text.
+enum ContentParts {
+    Simple(String),
+    WithThinking {
+        thinking: String,
+        after_thinking: String,
+    },
+}
+
+/// Parse `[thinking]...[/thinking]` markup from a content string.
+/// Returns [`ContentParts::WithThinking`] if a complete thinking block is
+/// found, otherwise falls back to [`ContentParts::Simple`].
+///
+/// The closer is searched only after the opener: a literal `[/thinking]`
+/// appearing before the opener must not slice-panic (the historical
+/// `content_str.find("[/thinking]")` found a closer at an offset before
+/// `body_start`, panicking with "byte range starts at X but ends at Y" — the
+/// same crash-class as the RTL measurement panic, reachable from malformed
+/// LLM output). Only the first pair is consumed; a later literal block stays
+/// visible body text.
+///
+/// Legacy-divergence note (pre-existing): for messages whose stored content
+/// contains a literal `[thinking]` block, the collapse measurement sees the
+/// body after the first pair (the collapse rule targets the visible message
+/// body — thinking keeps its own collapse) while the expanded markdown body
+/// (`md_items`, parsed from the full display text) re-renders the literal
+/// block. Such a message can render longer than its measured line count;
+/// acceptable per the err-toward-collapse design constraint (the block is
+/// not worth re-reading).
+fn parse_thinking_blocks(content_str: String) -> ContentParts {
+    if let Some(thinking_start) = content_str.find("[thinking]") {
+        let body_start = thinking_start + "[thinking]".len();
+        if let Some(rel_end) = content_str[body_start..].find("[/thinking]") {
+            let end = body_start + rel_end;
+            let thinking = content_str[body_start..end].trim().to_string();
+            let after = content_str[end + "[/thinking]".len()..].trim().to_string();
+            return ContentParts::WithThinking {
+                thinking,
+                after_thinking: after,
+            };
+        }
+    }
+    ContentParts::Simple(content_str)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionsMessage {
@@ -26,6 +95,8 @@ pub(crate) enum SessionsMessage {
     SessionError(String),
     ToggleToolRound(usize),
     ToggleThinkingBlock(usize),
+    /// Toggle a long message's 3-line preview / full content.
+    ToggleMessage(usize),
     AnimTick(Instant),
 
     /// Auto-refresh the currently selected session's transcript.
@@ -63,6 +134,15 @@ pub(crate) struct SessionsState {
     selected_loading: bool,
     expanded_tool_rounds: std::collections::HashSet<usize>,
     expanded_thinking_blocks: std::collections::HashSet<usize>,
+    /// Messages the user expanded beyond their 3-line preview. Index-keyed,
+    /// survives the periodic refresh, reset when switching sessions.
+    expanded_messages: std::collections::HashSet<usize>,
+    /// Per-message collapse measurement cache, parallel to `selected_messages`
+    /// (entry `i` corresponds to message `i`). Survives the 1-second
+    /// auto-refresh — session messages are append-only, so an existing entry
+    /// stays valid and only new messages are measured lazily. Mutated during
+    /// layout (the transcript width is only known there), hence `RefCell`.
+    measure_cache: RefCell<Vec<Option<MessageMeasure>>>,
     /// Animated transition for selected row background.
     selected_anim: Animated<f32>,
     /// Cached session list display data. Rebuilt only when `sessions` changes.
@@ -93,6 +173,8 @@ impl SessionsState {
             selected_loading: false,
             expanded_tool_rounds: std::collections::HashSet::new(),
             expanded_thinking_blocks: std::collections::HashSet::new(),
+            expanded_messages: std::collections::HashSet::new(),
+            measure_cache: RefCell::new(Vec::new()),
             selected_anim: Animated::transition(
                 0.0f32,
                 Easing::EASE_OUT.with_duration(Duration::from_millis(theme::ANIM_SELECTED_MS)),
@@ -164,6 +246,17 @@ impl SessionsState {
                 self.selected_loading = true;
                 self.expanded_thinking_blocks.clear();
                 self.expanded_tool_rounds.clear();
+                self.expanded_messages.clear();
+                // The measurement cache is cleared+resized in SessionMessages
+                // when the new session's messages actually arrive. The
+                // loading frames in between show "Loading..." (old messages
+                // are not rendered), but the cache must not be cleared here:
+                // on SessionError the fallback keeps rendering the previous
+                // session's messages, whose cache entries are still
+                // index-valid for that path. `expanded_messages` is cleared
+                // eagerly because the design resets collapse state on
+                // session switch; on the error path that simply renders the
+                // previous transcript collapsed (cosmetic, error-path only).
                 // Do NOT set auto_scroll_enabled here — let ScrollChanged
                 // determine it from the user's scroll behavior. The initial
                 // snap to bottom happens eagerly in SessionMessages instead
@@ -183,6 +276,13 @@ impl SessionsState {
             SessionsMessage::SessionMessages(key, messages) => {
                 if self.selected_session.as_deref() == Some(&key) {
                     self.selected_md_items = parse_messages_to_md_items(&messages);
+                    // Fresh session load: reset the measurement cache (the
+                    // previous session's entries are index-stale).
+                    {
+                        let mut cache = self.measure_cache.borrow_mut();
+                        cache.clear();
+                        cache.resize_with(messages.len(), || None);
+                    }
                     self.selected_messages = messages;
                     self.selected_loading = false;
                     // Snap to bottom so the user sees the most recent messages
@@ -228,6 +328,11 @@ impl SessionsState {
                 // Parse markdown for each message (same as SessionMessages but
                 // without touching selected_loading, preserving scrollable identity).
                 self.selected_md_items = parse_messages_to_md_items(&messages);
+                // Incremental cache: session messages are append-only, so keep
+                // existing measurements and only add entries for new messages.
+                self.measure_cache
+                    .borrow_mut()
+                    .resize_with(messages.len(), || None);
                 self.selected_messages = messages;
                 self.messages_refreshing = false;
 
@@ -265,11 +370,21 @@ impl SessionsState {
                 }
                 Task::none()
             }
+            SessionsMessage::ToggleMessage(idx) => {
+                if self.expanded_messages.contains(&idx) {
+                    self.expanded_messages.remove(&idx);
+                } else {
+                    self.expanded_messages.insert(idx);
+                }
+                Task::none()
+            }
             SessionsMessage::Escape => {
                 self.selected_session = None;
                 self.selected_messages.clear();
                 self.expanded_thinking_blocks.clear();
                 self.expanded_tool_rounds.clear();
+                self.expanded_messages.clear();
+                self.measure_cache.borrow_mut().clear();
                 Task::none()
             }
             SessionsMessage::LinkClicked(_) => Task::none(),
@@ -293,10 +408,14 @@ impl SessionsState {
         self.cached_session_items = if items.is_empty() { None } else { Some(items) };
     }
 
+    /// Render the transcript column for the selected session: decode the
+    /// messages, group tool-call rounds, and apply the 3-line collapse rule
+    /// to regular messages and stray tool results (tool rounds and thinking
+    /// blocks keep their own collapse).
     #[allow(clippy::too_many_lines)]
     fn render_transcript<'a>(
         messages: &'a [ChatMessage],
-        md_items: &'a [Vec<markdown::Item>],
+        ctx: &TranscriptCtx<'a>,
         expanded_rounds: &'a std::collections::HashSet<usize>,
         expanded_thinking: &'a std::collections::HashSet<usize>,
         scrollable_id: &Id,
@@ -335,36 +454,10 @@ impl SessionsState {
             kind: DecodedMsgKind,
         }
 
-        enum ContentParts {
-            Simple(String),
-            WithThinking {
-                thinking: String,
-                after_thinking: String,
-            },
-        }
-
         // Used during tool-call↔result matching in the second pass.
         struct MatchedPair<'a> {
             call: &'a ToolCallInfo,
             result_content: Option<&'a str>,
-        }
-
-        /// Parse `[thinking]...[/thinking]` markup from a content string.
-        /// Returns `ContentParts::WithThinking` if a complete thinking block
-        /// is found, otherwise falls back to `ContentParts::Simple`.
-        fn parse_thinking_blocks(content_str: String) -> ContentParts {
-            if let Some(thinking_start) = content_str.find("[thinking]") {
-                let body_start = thinking_start + "[thinking]".len();
-                if let Some(end) = content_str.find("[/thinking]") {
-                    let thinking = content_str[body_start..end].trim().to_string();
-                    let after = content_str[end + "[/thinking]".len()..].trim().to_string();
-                    return ContentParts::WithThinking {
-                        thinking,
-                        after_thinking: after,
-                    };
-                }
-            }
-            ContentParts::Simple(content_str)
         }
 
         if messages.is_empty() {
@@ -663,7 +756,8 @@ impl SessionsState {
                     tool_call_id: _,
                     content,
                 } => {
-                    // Stray tool result (no preceding tool call) — render as regular message
+                    // Stray tool result (no preceding tool call) — render as
+                    // regular message, subject to the 3-line collapse rule.
                     let mut msg_col = Column::new().spacing(2);
                     msg_col = msg_col.push(widgets::role_badge(
                         dm_role.clone(),
@@ -672,21 +766,13 @@ impl SessionsState {
                         [1, 6],
                         true,
                     ));
-                    if !content.is_empty() {
-                        msg_col = msg_col.push({
-                            let md: iced::Element<
-                                '_,
-                                SessionsMessage,
-                                iced::Theme,
-                                iced::Renderer,
-                            > = super::media_markers::selectable_markdown_view(
-                                &md_items[i],
-                                theme::markdown_settings(),
-                            )
-                            .map(SessionsMessage::LinkClicked);
-                            md
-                        });
-                    }
+                    msg_col = push_message_body(
+                        msg_col,
+                        ctx,
+                        i,
+                        (!content.is_empty()).then_some(content.as_str()),
+                        messages[i].content.len(),
+                    );
                     items = items.push(
                         container(msg_col)
                             .padding(8)
@@ -748,21 +834,13 @@ impl SessionsState {
                             );
                         }
                     }
-                    if after.is_some() || simple.is_some() {
-                        msg_col = msg_col.push({
-                            let md: iced::Element<
-                                '_,
-                                SessionsMessage,
-                                iced::Theme,
-                                iced::Renderer,
-                            > = super::media_markers::selectable_markdown_view(
-                                &md_items[i],
-                                theme::markdown_settings(),
-                            )
-                            .map(SessionsMessage::LinkClicked);
-                            md
-                        });
-                    }
+                    msg_col = push_message_body(
+                        msg_col,
+                        ctx,
+                        i,
+                        simple.as_deref().or(after.as_deref()),
+                        messages[i].content.len(),
+                    );
 
                     items = items.push(
                         container(msg_col)
@@ -873,7 +951,9 @@ impl SessionsState {
                 .direction(theme::vertical_scrollbar())
                 .style(theme::scrollbar_style);
 
-            // Transcript on the right side
+            // Transcript on the right side. Wrapped in `responsive` so the
+            // collapse measurement uses the real transcript content width,
+            // correct on first render and after every window resize.
             let transcript: iced::Element<'_, SessionsMessage> = if self.selected_loading {
                 iced::widget::container(
                     iced::widget::text("Loading messages...")
@@ -885,16 +965,36 @@ impl SessionsState {
                 .padding(16)
                 .into()
             } else if let Some(ref _key) = self.selected_session {
-                container(Self::render_transcript(
-                    &self.selected_messages,
-                    &self.selected_md_items,
-                    &self.expanded_tool_rounds,
-                    &self.expanded_thinking_blocks,
-                    &self.scrollable_id,
-                ))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(8)
+                let messages = &self.selected_messages;
+                let md_items = &self.selected_md_items;
+                let expanded_rounds = &self.expanded_tool_rounds;
+                let expanded_thinking = &self.expanded_thinking_blocks;
+                let expanded_messages = &self.expanded_messages;
+                let measure_cache = &self.measure_cache;
+                let scrollable_id = self.scrollable_id.clone();
+                responsive(move |size| {
+                    // The transcript container adds 8px padding each side and
+                    // each message card adds another 8px — the markdown body
+                    // (and therefore the measurement) sees `size - 32`.
+                    let text_width = (size.width - TRANSCRIPT_CONTENT_INSET_PX).max(0.0);
+                    let ctx = TranscriptCtx {
+                        md_items,
+                        measure_cache,
+                        expanded_messages,
+                        text_width,
+                    };
+                    container(Self::render_transcript(
+                        messages,
+                        &ctx,
+                        expanded_rounds,
+                        expanded_thinking,
+                        &scrollable_id,
+                    ))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(8)
+                    .into()
+                })
                 .into()
             } else {
                 container(
@@ -927,18 +1027,218 @@ impl SessionsState {
 /// Decode native history messages and parse their content into markdown items.
 /// Shared between initial load (`SessionMessages`) and auto-refresh
 /// (`AutoRefreshResult`) to keep the decoding logic in a single place.
+///
+/// The display text is the decoded assistant/tool-result content (falling
+/// back to the raw stored content) — the exact text the markdown body and
+/// the collapse measurement both see, so the measured line count matches the
+/// rendered body.
 fn parse_messages_to_md_items(messages: &[ChatMessage]) -> Vec<Vec<markdown::Item>> {
     messages
         .iter()
         .map(|m| {
-            let display_text = decode_native_history_message(m)
+            let display = decode_native_history_message(m)
                 .and_then(|d| match d {
                     DecodedNativeHistoryMessage::Assistant { content, .. } => content,
                     DecodedNativeHistoryMessage::ToolResult { content, .. } => Some(content),
                 })
                 .unwrap_or_else(|| m.content.clone());
-            let processed = super::media_markers::preprocess(&display_text);
+            let processed = super::media_markers::preprocess(&display);
             markdown::parse(&processed).collect()
         })
         .collect()
+}
+
+/// Resolve the collapse measurement for message `i` at the current
+/// `text_width`, measuring on cache miss (cached per message and width;
+/// session messages are append-only, so a cached entry stays valid across
+/// the 1-second auto-refresh). Returns the wrapped-line count and — only
+/// when `need_preview` is set (the message is currently collapsed) — its
+/// 3-line plain-text preview, so expanded messages do not pay a per-frame
+/// preview clone.
+///
+/// The preview is cloned out of the cache once per frame for each collapsed
+/// message (~1KB memcpy-scale, bounded). An `Arc<str>` would not remove that
+/// copy: `iced_selection::text::IntoFragment<'a>` accepts `Cow<'a, str>`
+/// (`Fragment`'s Borrowed/Owned variants) plus `&str`/`String`/primitives —
+/// there is no `Arc<str>` impl — and borrowing `&'a str` out of the
+/// `RefCell` cache would be unsound: later cache misses replace entries
+/// while widgets from earlier in the frame still hold the borrow.
+///
+/// `measure_text` is the already-decoded body (both render arms pass it from
+/// the decode pass — the measurement never decodes itself; the WithThinking
+/// arm passes the body after the first thinking block, so thinking keeps its
+/// own collapse and never counts toward the rule, and a later literal block
+/// counts as visible body text — err toward collapsing). `content_len` is the
+/// raw message content length — a cheap fingerprint so the index-keyed cache
+/// re-measures after session compaction replaces a message.
+fn message_measurement(
+    measure_cache: &RefCell<Vec<Option<MessageMeasure>>>,
+    i: usize,
+    text_width: f32,
+    need_preview: bool,
+    measure_text: &str,
+    content_len: usize,
+) -> (u32, Option<String>) {
+    let bucket = width_bucket(text_width);
+    let mut cache = measure_cache.borrow_mut();
+    let cache_hit = cache.get(i).and_then(Option::as_ref);
+    let stale = cache_hit.is_none_or(|m| m.width_bucket != bucket || m.content_len != content_len);
+    if stale {
+        // Cache miss: measure. A pure width change reuses the cached
+        // processed display text (an `Arc` clone — no re-decode, no re-copy,
+        // no media preprocessing re-run); otherwise measure from the
+        // caller's decoded body.
+        let m = match cache_hit {
+            Some(m) if m.width_bucket != bucket && m.content_len == content_len => {
+                re_measure(m, text_width)
+            }
+            _ => measure_message(measure_text, text_width, content_len),
+        };
+        debug_assert!(
+            cache.len() > i,
+            "cache is resized in lockstep with selected_messages on every load/refresh"
+        );
+        cache[i] = Some(m);
+    }
+    let m = cache[i].as_ref().expect("measurement resolved above");
+    (
+        m.wrapped_lines,
+        if need_preview {
+            m.preview.clone()
+        } else {
+            None
+        },
+    )
+}
+
+/// Push the body of message `i` onto `msg_col` with the 3-line collapse rule
+/// applied: when the message renders more than [`MAX_PREVIEW_LINES`] wrapped
+/// lines and is not expanded, a plain selectable 3-line preview is pushed;
+/// otherwise the full markdown view. When the message collapses, a bottom
+/// chevron toggle is appended (the toggle and the role badge do not count
+/// toward the line budget). Returns the augmented column.
+///
+/// `measure_text` is the already-decoded body from the first pass (`None` =
+/// empty body — the rule never applies to empty content); `content_len` is
+/// the raw message content length used as the measurement cache fingerprint.
+fn push_message_body<'a>(
+    mut msg_col: Column<'a, SessionsMessage>,
+    ctx: &TranscriptCtx<'a>,
+    i: usize,
+    measure_text: Option<&str>,
+    content_len: usize,
+) -> Column<'a, SessionsMessage> {
+    let Some(measure_text) = measure_text else {
+        return msg_col;
+    };
+    let is_expanded = ctx.expanded_messages.contains(&i);
+    let (wrapped_lines, preview) = message_measurement(
+        ctx.measure_cache,
+        i,
+        ctx.text_width,
+        !is_expanded,
+        measure_text,
+        content_len,
+    );
+    let collapses = wrapped_lines > MAX_PREVIEW_LINES;
+    if collapses && !is_expanded {
+        // Collapsed: plain selectable text of the first lines (media markers
+        // shown as placeholders). `preview` is `Some` exactly when the
+        // message exceeds the budget (message_measurement returns it only
+        // when `need_preview` is set) — fail loud on an invariant break
+        // instead of silently rendering an empty message body.
+        msg_col = msg_col.push(
+            selectable_text(
+                preview.expect("a collapsing message always has a preview"),
+                theme::TEXT_PRIMARY,
+            )
+            .size(theme::MARKDOWN_TEXT_SIZE),
+        );
+    } else {
+        msg_col = msg_col.push({
+            let md: iced::Element<'_, SessionsMessage, iced::Theme, iced::Renderer> =
+                super::media_markers::selectable_markdown_view(
+                    &ctx.md_items[i],
+                    theme::markdown_settings(),
+                )
+                .map(SessionsMessage::LinkClicked);
+            md
+        });
+    }
+    if collapses {
+        msg_col = msg_col.push(message_toggle_button(is_expanded, i));
+    }
+    msg_col
+}
+
+/// Bottom-positioned chevron toggle for a collapsed/expanded long message.
+/// Sits below the content (or preview) and does not count toward the
+/// 3-line budget.
+fn message_toggle_button(is_expanded: bool, idx: usize) -> Element<'static, SessionsMessage> {
+    let (icon, label) = if is_expanded {
+        (
+            lucide::chevron_up::<iced::Theme, iced::Renderer>().size(12),
+            " Show less",
+        )
+    } else {
+        (
+            lucide::chevron_down::<iced::Theme, iced::Renderer>().size(12),
+            " Show more",
+        )
+    };
+    button(
+        row![
+            icon.color(theme::TEXT_MUTED),
+            text(label).size(10).color(theme::TEXT_MUTED),
+        ]
+        .spacing(2)
+        .align_y(Alignment::Center),
+    )
+    .style(theme::button_text)
+    .on_press(SessionsMessage::ToggleMessage(idx))
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_thinking_blocks_never_panics_on_reversed_markers() {
+        // Regression: a literal "[/thinking]" before "[thinking]" previously
+        // sliced `content_str[body_start..end]` with `end < body_start`
+        // ("byte range starts at X but ends at Y"), aborting the GUI — the
+        // same crash-class as the RTL measurement panic. The closer is
+        // searched only after the opener, so this input parses as simple
+        // body text instead of crashing.
+        let parts = parse_thinking_blocks("[/thinking] before [thinking]".to_string());
+        match parts {
+            ContentParts::Simple(text) => {
+                assert_eq!(text, "[/thinking] before [thinking]");
+            }
+            ContentParts::WithThinking { .. } => {
+                panic!("reversed markers must not form a thinking block");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_thinking_blocks_extracts_first_pair_only() {
+        let parts = parse_thinking_blocks(
+            "intro [thinking] inner [/thinking] mid [thinking] later [/thinking] tail".to_string(),
+        );
+        match parts {
+            ContentParts::WithThinking {
+                thinking,
+                after_thinking,
+            } => {
+                assert_eq!(thinking, "inner");
+                // Only the first pair is consumed; a later literal block
+                // stays visible body text and counts toward the collapse
+                // budget — err toward collapsing.
+                assert_eq!(after_thinking, "mid [thinking] later [/thinking] tail");
+            }
+            ContentParts::Simple(_) => panic!("complete first pair must be extracted"),
+        }
+    }
 }

@@ -197,6 +197,13 @@ pub const FONT_REGULAR: iced::Font = iced::Font {
     ..iced::Font::DEFAULT
 };
 
+/// Body text size (px) of the transcript markdown renderer
+/// (`markdown_settings`). The sessions-page collapse measurement
+/// (`session_preview`) derives its body and heading sizes from this
+/// constant, so a theme font-size change cannot silently drift the measured
+/// wrap count away from the actual render.
+pub const MARKDOWN_TEXT_SIZE: f32 = 13.0;
+
 /// Markdown rendering settings consistent with the Flexoki dark theme.
 #[must_use]
 pub fn markdown_settings() -> iced::widget::markdown::Settings {
@@ -212,7 +219,7 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
         code_block_font: FONT_REGULAR,
         link_color: ACCENT,
     };
-    iced::widget::markdown::Settings::with_text_size(13, style)
+    iced::widget::markdown::Settings::with_text_size(MARKDOWN_TEXT_SIZE, style)
 }
 
 // ── Ticket phase colors ───────────────────────────────────────────
