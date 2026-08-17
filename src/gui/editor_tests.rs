@@ -2012,3 +2012,303 @@ fn test_switch_tab_relative_two_tabs() {
     let _ = state.switch_tab_relative(TabDirection::Prev);
     assert_eq!(state.active_tab_index, 1);
 }
+
+// ── Directory forgetting (deleted directories) ─────────────────
+
+#[test]
+fn test_classify_read_dir_error_not_found_vs_other() {
+    use std::io::ErrorKind;
+    // ENOENT / ENOTDIR mean the directory is gone or was never a
+    // directory — normal and forgettable.
+    assert!(matches!(
+        classify_read_dir_error(&std::io::Error::new(ErrorKind::NotFound, "gone")),
+        ReadDirError::NotFound
+    ));
+    assert!(matches!(
+        classify_read_dir_error(&std::io::Error::new(ErrorKind::NotADirectory, "file")),
+        ReadDirError::NotFound
+    ));
+    // Everything else means the directory exists but cannot be read —
+    // a real problem that must keep warning.
+    assert!(matches!(
+        classify_read_dir_error(&std::io::Error::new(ErrorKind::PermissionDenied, "locked")),
+        ReadDirError::Other(_)
+    ));
+}
+
+/// Set up an EditorState with "src" and "src/sub" expanded, a cached
+/// quick-open file list, and per-file absolute-path caches, so a
+/// directory-forget can be asserted against all of them.
+fn make_editor_with_expanded_subdir() -> EditorState {
+    let mut state = make_editor_with_tree();
+    state.file_tree.expanded_dirs.insert("src".to_string());
+    state.file_tree.expanded_dirs.insert("src/sub".to_string());
+    state.dir_entries.insert(
+        "src/sub".to_string(),
+        vec![FsEntry {
+            name: "deep.rs".to_string(),
+            full_path: "src/sub/deep.rs".to_string(),
+            is_dir: false,
+            error: None,
+        }],
+    );
+    state.dir_entries.get_mut("src").unwrap().push(FsEntry {
+        name: "sub".to_string(),
+        full_path: "src/sub".to_string(),
+        is_dir: true,
+        error: None,
+    });
+    state.loading_dirs.insert("src/sub".to_string());
+    state.dir_generations.insert("src".to_string(), 3);
+    state.dir_generations.insert("src/sub".to_string(), 7);
+    state.selected_file = Some("src/sub/deep.rs".to_string());
+    state.all_workspace_files = vec![
+        "Cargo.toml".to_string(),
+        "src/main.rs".to_string(),
+        "src/sub/deep.rs".to_string(),
+    ];
+    // Absolute-path-keyed caches (workspace root is "/tmp").
+    state
+        .file_mtimes
+        .insert("/tmp/src/main.rs".to_string(), std::time::SystemTime::now());
+    state
+        .file_generations
+        .insert("/tmp/src/main.rs".to_string(), 1);
+    state
+        .deleted_file_toasted
+        .insert("/tmp/src/main.rs".to_string());
+    state
+}
+
+#[test]
+fn test_dir_expanded_not_found_forgets_silently() {
+    // A missing directory must be forgotten regardless of the quiet flag:
+    // no toast and no warning, whether the deletion came from the GUI,
+    // external tooling, or a script.
+    for quiet in [true, false] {
+        let mut state = make_editor_with_expanded_subdir();
+        let r#gen = state.bump_generation();
+        state.dir_generations.insert("src".to_string(), r#gen);
+        let _ = state.update(EditorMessage::DirExpanded {
+            dir_path: "src".to_string(),
+            r#gen,
+            entries: Err(ReadDirError::NotFound),
+            quiet,
+        });
+
+        // The deleted directory and its descendants are forgotten from the
+        // expanded set, the cached listings, in-flight loads/generations,
+        // the quick-open cache, and the selection.
+        assert!(!state.file_tree.expanded_dirs.contains("src"));
+        assert!(!state.file_tree.expanded_dirs.contains("src/sub"));
+        assert!(!state.dir_entries.contains_key("src"));
+        assert!(!state.dir_entries.contains_key("src/sub"));
+        assert!(!state.loading_dirs.contains("src/sub"));
+        assert!(!state.dir_generations.contains_key("src"));
+        assert!(!state.dir_generations.contains_key("src/sub"));
+        assert_eq!(state.selected_file, None);
+        assert!(
+            !state
+                .all_workspace_files
+                .iter()
+                .any(|p| p.starts_with("src/"))
+        );
+
+        // The stale node is pruned from the parent's listing too, so the
+        // tree no longer shows the deleted directory.
+        let root_entries = state.dir_entries.get("").unwrap();
+        assert!(!root_entries.iter().any(|e| e.full_path == "src"));
+        assert!(
+            !state
+                .file_tree
+                .visible_tree_nodes
+                .iter()
+                .any(|(p, _)| p == "src")
+        );
+    }
+}
+
+#[test]
+fn test_dir_expanded_other_error_keeps_path() {
+    // A directory that still exists but cannot be read must NOT be
+    // forgotten — it stays in the refresh/cache state so the problem
+    // keeps surfacing as a warning.
+    let mut state = make_editor_with_expanded_subdir();
+    let r#gen = state.bump_generation();
+    state.dir_generations.insert("src".to_string(), r#gen);
+    let _ = state.update(EditorMessage::DirExpanded {
+        dir_path: "src".to_string(),
+        r#gen,
+        entries: Err(ReadDirError::Other("Permission denied".to_string())),
+        quiet: true,
+    });
+
+    assert!(state.file_tree.expanded_dirs.contains("src"));
+    assert!(state.file_tree.expanded_dirs.contains("src/sub"));
+    assert!(state.dir_entries.contains_key("src"));
+    assert!(state.dir_entries.contains_key("src/sub"));
+    assert_eq!(state.selected_file.as_deref(), Some("src/sub/deep.rs"));
+    assert!(state.all_workspace_files.iter().any(|p| p == "src/main.rs"));
+}
+
+#[test]
+fn test_forget_directory_prunes_path_descendants_and_root() {
+    // Phase 1: forgetting a subdirectory prunes it and its descendants from
+    // every refresh/cache structure while preserving the parent's state.
+    let mut state = make_editor_with_expanded_subdir();
+    state.dir_generations.insert(String::new(), 9); // parent (root) gen must survive
+    state.forget_directory("src");
+
+    assert!(state.file_tree.expanded_dirs.is_empty());
+    assert!(!state.dir_entries.contains_key("src"));
+    assert!(!state.dir_entries.contains_key("src/sub"));
+    assert!(state.loading_dirs.is_empty());
+    assert!(!state.dir_generations.contains_key("src"));
+    assert!(!state.dir_generations.contains_key("src/sub"));
+    assert_eq!(state.dir_generations.get(""), Some(&9));
+    assert_eq!(state.selected_file, None);
+    assert_eq!(state.all_workspace_files, vec!["Cargo.toml".to_string()]);
+
+    // Root listing keeps unrelated entries but drops the deleted node.
+    let root_entries = state.dir_entries.get("").unwrap();
+    assert_eq!(root_entries.len(), 1);
+    assert_eq!(root_entries[0].full_path, "Cargo.toml");
+
+    // Absolute-path-keyed caches are pruned as well.
+    assert!(state.file_mtimes.is_empty());
+    assert!(state.file_generations.is_empty());
+    assert!(state.deleted_file_toasted.is_empty());
+
+    state.rebuild_tree();
+    assert!(
+        !state
+            .file_tree
+            .visible_tree_nodes
+            .iter()
+            .any(|(p, _)| p == "src")
+    );
+
+    // Phase 2: forgetting the root (workspace itself gone) clears the whole
+    // tree — including the surviving root listing and, per the doc contract,
+    // the absolute-path-keyed caches under the workspace.
+    state
+        .file_mtimes
+        .insert("/tmp/Cargo.toml".to_string(), std::time::SystemTime::now());
+    state
+        .file_generations
+        .insert("/tmp/Cargo.toml".to_string(), 4);
+    state
+        .deleted_file_toasted
+        .insert("/tmp/Cargo.toml".to_string());
+    state.forget_directory("");
+
+    assert!(state.dir_entries.is_empty());
+    assert!(state.file_tree.expanded_dirs.is_empty());
+    assert!(state.loading_dirs.is_empty());
+    assert!(state.dir_generations.is_empty());
+    assert_eq!(state.selected_file, None);
+    assert!(state.all_workspace_files.is_empty());
+    assert!(state.file_mtimes.is_empty());
+    assert!(state.file_generations.is_empty());
+    assert!(state.deleted_file_toasted.is_empty());
+
+    state.rebuild_tree();
+    assert!(state.file_tree.nodes.is_empty());
+    assert!(state.file_tree.visible_tree_nodes.is_empty());
+}
+
+#[test]
+fn test_dir_deleted_prunes_and_refreshes_parent() {
+    // The DirDeleted message is emitted by the GUI-delete success path: it
+    // must prune the deleted directory (and descendants) from the tree state
+    // and register a parent re-read generation so the tree refreshes.
+    let mut state = make_editor_with_expanded_subdir();
+    let _ = state.update(EditorMessage::DirDeleted {
+        dir_path: "src".to_string(),
+        workspace_path: "/tmp".to_string(),
+    });
+
+    assert!(!state.file_tree.expanded_dirs.contains("src"));
+    assert!(!state.file_tree.expanded_dirs.contains("src/sub"));
+    assert!(!state.dir_entries.contains_key("src"));
+    assert!(!state.dir_entries.contains_key("src/sub"));
+    assert_eq!(state.selected_file, None);
+    assert!(
+        !state
+            .all_workspace_files
+            .iter()
+            .any(|p| p.starts_with("src/"))
+    );
+
+    // The parent (root) listing survives but no longer shows the deleted dir.
+    let root_entries = state.dir_entries.get("").unwrap();
+    assert!(!root_entries.iter().any(|e| e.full_path == "src"));
+    assert_eq!(root_entries.len(), 1);
+    assert_eq!(root_entries[0].full_path, "Cargo.toml");
+
+    // A fresh generation slot for the parent re-read task was registered.
+    assert!(state.dir_generations.contains_key(""));
+}
+
+#[test]
+fn test_dir_deleted_stale_workspace_guard() {
+    // The delete was started in another workspace: the completion must not
+    // prune the currently selected workspace's state at the same relative
+    // path (the user switched workspaces while remove_dir_all was running).
+    let mut state = make_editor_with_expanded_subdir();
+    let _ = state.update(EditorMessage::DirDeleted {
+        dir_path: "src".to_string(),
+        workspace_path: "/some/other/workspace".to_string(),
+    });
+
+    // Everything stays intact: no prune, no parent re-read registration.
+    assert!(state.file_tree.expanded_dirs.contains("src"));
+    assert!(state.file_tree.expanded_dirs.contains("src/sub"));
+    assert!(state.dir_entries.contains_key("src"));
+    assert!(state.dir_entries.contains_key("src/sub"));
+    assert_eq!(state.selected_file.as_deref(), Some("src/sub/deep.rs"));
+    assert_eq!(state.all_workspace_files.len(), 3);
+    assert!(!state.dir_generations.contains_key(""));
+    assert!(
+        state
+            .file_tree
+            .visible_tree_nodes
+            .iter()
+            .any(|(p, _)| p == "src")
+    );
+}
+
+#[test]
+fn test_confirm_delete_dir_defers_prune_until_success() {
+    // ConfirmDelete starts the async remove_dir_all but must NOT prune tree
+    // state yet: if the delete fails (e.g. permission denied), the
+    // still-existing directory must be fully intact in the tree. The prune
+    // only happens in the DirDeleted success message, so asserting the tree
+    // is untouched at delete-start is the testable proxy for the failure
+    // path (the async task is not executed in tests).
+    let mut state = make_editor_with_expanded_subdir();
+    state.active_modal = Some(ModalKind::DeleteConfirm(DeleteConfirmTarget {
+        path: "src".to_string(),
+        is_dir: true,
+        dirty_tab_count: 0,
+        abs_path: "/tmp/src".to_string(),
+    }));
+
+    let _ = state.update(EditorMessage::ConfirmDelete);
+
+    // Modal closed, but all tree/cache state survives the delete-start.
+    assert!(state.active_modal.is_none());
+    assert!(state.file_tree.expanded_dirs.contains("src"));
+    assert!(state.file_tree.expanded_dirs.contains("src/sub"));
+    assert!(state.dir_entries.contains_key("src"));
+    assert!(state.dir_entries.contains_key("src/sub"));
+    assert_eq!(state.selected_file.as_deref(), Some("src/sub/deep.rs"));
+    assert_eq!(state.all_workspace_files.len(), 3);
+    assert!(state.file_mtimes.contains_key("/tmp/src/main.rs"));
+    assert!(state.file_generations.contains_key("/tmp/src/main.rs"));
+
+    // No orphaned parent generation: the dir-delete path registers the
+    // parent slot only when the delete succeeds (via DirDeleted).
+    assert!(!state.dir_generations.contains_key(""));
+    assert_eq!(state.dir_generations.len(), 2); // fixture: "src" and "src/sub"
+}

@@ -403,10 +403,24 @@ pub enum EditorMessage {
     DirExpanded {
         dir_path: String,
         r#gen: u64,
-        entries: Result<Vec<FsEntry>, String>,
-        /// When `true`, errors are silently logged instead of shown as a toast.
+        entries: Result<Vec<FsEntry>, ReadDirError>,
+        /// When `true`, read errors are logged instead of shown as a toast.
         /// Used by background (periodic/manual) refresh to avoid noise.
+        /// Missing directories are forgotten silently either way.
         quiet: bool,
+    },
+    /// A GUI-initiated directory deletion succeeded in `workspace_path`.
+    /// The editor prunes the deleted path and its descendants from the tree
+    /// refresh/cache state and re-reads the parent directory.
+    ///
+    /// `workspace_path` is a staleness guard: the user can switch workspaces
+    /// while the async delete is in flight (large trees can take seconds),
+    /// so the completion must only prune the workspace it was started in —
+    /// applying it against a newly selected workspace would drop that
+    /// workspace's same-relative-path state.
+    DirDeleted {
+        dir_path: String,
+        workspace_path: String,
     },
     /// User toggled a directory in the file tree.
     ToggleDir(String),
@@ -602,7 +616,7 @@ pub enum EditorMessage {
         /// Result of the filesystem rename.
         result: Result<(), String>,
         /// Re-read parent directory entries.
-        dir_entries: Result<Vec<FsEntry>, String>,
+        dir_entries: Result<Vec<FsEntry>, ReadDirError>,
         /// Generation counter for the parent directory's `dir_generations`
         /// slot.  Used for stale-result prevention via the standard
         /// generation invalidation protocol (see `dir_expanded`).
@@ -788,10 +802,42 @@ fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
 
 // ── Helpers — async I/O ──────────────────────────────────────────
 
+/// Error classifying a failed directory read so callers can tell the
+/// normal "directory no longer exists" case (which the GUI must forget
+/// silently) apart from real problems (permission denied, I/O errors)
+/// that still need to be surfaced.
+#[derive(Debug, Clone)]
+pub enum ReadDirError {
+    /// The directory does not exist, or is not a directory. This is a
+    /// routine scenario — callers should silently forget the path.
+    NotFound,
+    /// The directory exists but could not be read.
+    Other(String),
+}
+
+/// Map an [`std::io::Error`] from a directory read to a [`ReadDirError`].
+/// ENOENT / ENOTDIR mean the directory is gone (or was never a directory) —
+/// a normal, forgettable scenario. Everything else means the directory
+/// exists but cannot be read — a real problem that must keep warning.
+fn classify_read_dir_error(e: &std::io::Error) -> ReadDirError {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) {
+        ReadDirError::NotFound
+    } else {
+        ReadDirError::Other(format!("{e}"))
+    }
+}
+
 /// Read a flat list of directory entries for a given path relative to the
 /// workspace root. The `root` is the workspace's filesystem path; `rel_path`
 /// is the subdirectory relative to root (empty string for root).
-async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntry>, String> {
+///
+/// A missing directory or a path that is not a directory yields
+/// [`ReadDirError::NotFound`]; any other read failure yields
+/// [`ReadDirError::Other`].
+async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntry>, ReadDirError> {
     let dir_path = if rel_path.is_empty() {
         root.to_string()
     } else {
@@ -800,14 +846,22 @@ async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntr
     };
     let mut entries = match tokio::fs::read_dir(&dir_path).await {
         Ok(rd) => rd,
-        Err(e) => return Err(format!("Failed to read directory '{rel_path}': {e}")),
+        Err(e) => return Err(classify_read_dir_error(&e)),
     };
 
     let mut result: Vec<FsEntry> = Vec::new();
     let mut dirs: Vec<FsEntry> = Vec::new();
     let mut files: Vec<FsEntry> = Vec::new();
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            // The directory can vanish while the listing is in flight
+            // (deleted mid-read). Classify it like a not-found instead of
+            // caching a partial listing.
+            Err(e) => return Err(classify_read_dir_error(&e)),
+        };
         let name = entry.file_name().to_string_lossy().to_string();
         // Filter out .git directory — it's not a user-editable file.
         if name == ".git" {
@@ -1619,6 +1673,73 @@ impl EditorState {
         self.file_tree.rebuild_visible();
     }
 
+    /// Forget `dir_path` and all of its descendants from the file-tree
+    /// refresh/cache state: expanded dirs, cached listings, in-flight loads
+    /// and generations, per-file generation slots, mtimes, toast guards,
+    /// quick-open cache, and the current selection. Also drops the stale
+    /// [`FsEntry`] for `dir_path` from its parent's cached listing so the node
+    /// disappears from the tree immediately instead of lingering until the
+    /// parent is next refreshed.
+    ///
+    /// This is the "forget" counterpart of the state migration directory
+    /// renames already perform — call it whenever a directory no longer exists
+    /// (deleted externally, by scripts, or via the GUI) so the tree stops
+    /// re-reading the path every refresh cycle and quick-open stops offering
+    /// its files. The caller is responsible for calling [`Self::rebuild_tree`]
+    /// afterwards. Open tabs are intentionally NOT touched: externally deleted
+    /// files keep their tabs so unsaved work survives, and GUI deletes close
+    /// their own tabs before calling this.
+    fn forget_directory(&mut self, dir_path: &str) {
+        let is_root = dir_path.is_empty();
+        let rel_prefix = format!("{dir_path}/");
+        let within_rel = |p: &str| is_root || p == dir_path || p.starts_with(&rel_prefix);
+
+        // Remove the deleted directory's stale node from its parent's cached
+        // listing so it disappears from the tree right away.
+        if !is_root {
+            if let Some(parent) = Path::new(dir_path).parent() {
+                let parent = parent.to_string_lossy();
+                if let Some(parent_entries) = self.dir_entries.get_mut(parent.as_ref()) {
+                    parent_entries.retain(|e| !within_rel(&e.full_path));
+                }
+            }
+        }
+
+        // Relative-path-keyed caches.
+        self.file_tree.expanded_dirs.retain(|p| !within_rel(p));
+        self.dir_entries.retain(|p, _| !within_rel(p));
+        self.loading_dirs.retain(|p| !within_rel(p));
+        self.dir_generations.retain(|p, _| !within_rel(p));
+        self.all_workspace_files.retain(|p| !within_rel(p));
+
+        // Absolute-path-keyed caches (workspace filesystem paths). For the
+        // root case the prefix is the workspace root itself, so every file
+        // under the workspace is pruned — consistent with "all descendants".
+        // (Path::join("") would append a trailing slash, so build the root
+        // prefix directly to avoid a doubled separator.)
+        let abs_prefix = if is_root {
+            self.selected_workspace_path
+                .as_ref()
+                .map(|ws| format!("{ws}/"))
+        } else {
+            self.abs_path(dir_path).map(|p| format!("{p}/"))
+        };
+        let within_abs = |p: &str| abs_prefix.as_deref().is_some_and(|pfx| p.starts_with(pfx));
+        self.file_generations.retain(|p, _| !within_abs(p));
+        self.file_mtimes.retain(|p, _| !within_abs(p));
+        self.deleted_file_toasted.retain(|p| !within_abs(p));
+
+        // Selection and pending-enter focus.
+        if let Some(ref sel) = self.selected_file {
+            if within_rel(sel) || within_abs(sel) {
+                self.selected_file = None;
+            }
+        }
+        if self.pending_enter_dir.as_deref().is_some_and(within_rel) {
+            self.pending_enter_dir = None;
+        }
+    }
+
     fn bump_generation(&mut self) -> u64 {
         let g = self.generation.wrapping_add(1);
         self.generation = g;
@@ -2217,6 +2338,11 @@ impl EditorState {
                 quiet,
             } => self.dir_expanded(&dir_path, r#gen, entries, quiet),
 
+            EditorMessage::DirDeleted {
+                dir_path,
+                workspace_path,
+            } => self.dir_deleted(&dir_path, &workspace_path),
+
             EditorMessage::ToggleDir(dir_path) => self.toggle_dir(&dir_path),
 
             EditorMessage::SelectFile(path) => self.select_file(&path),
@@ -2605,7 +2731,7 @@ impl EditorState {
         &mut self,
         dir_path: &str,
         r#gen: u64,
-        entries: Result<Vec<FsEntry>, String>,
+        entries: Result<Vec<FsEntry>, ReadDirError>,
         quiet: bool,
     ) -> Task<EditorMessage> {
         if self.dir_generations.get(dir_path) != Some(&r#gen) {
@@ -2630,17 +2756,66 @@ impl EditorState {
                         .expand_dir_and_focus_first_child::<EditorMessage>(dir_path);
                 }
             }
-            Err(e) => {
+            Err(ReadDirError::NotFound) => {
+                // The directory no longer exists (deleted externally, by a
+                // script, or via the GUI). Forget it silently — this is a
+                // normal scenario, not an error: no toast, and at most one
+                // low-level log per path (the path is pruned from the
+                // refresh state, so it cannot re-warn every cycle).
+                self.forget_directory(dir_path);
+                self.rebuild_tree();
+                if !dir_path.is_empty() {
+                    tracing::debug!(
+                        "File tree: forgotten directory that no longer exists: {dir_path}"
+                    );
+                }
+            }
+            Err(ReadDirError::Other(err)) => {
+                // The directory still exists but cannot be read — a real
+                // problem that must keep producing warnings.
                 if quiet {
-                    tracing::warn!("Failed to read directory (refresh): {e}");
+                    tracing::warn!("Failed to read directory '{dir_path}' (refresh): {err}");
                     return Task::none();
                 }
                 return Task::done(EditorMessage::Toast(super::ToastMessage::Warning(format!(
-                    "Failed to read directory: {e}"
+                    "Failed to read directory '{dir_path}': {err}"
                 ))));
             }
         }
         Task::none()
+    }
+
+    /// Handle dir-deleted — a GUI directory deletion succeeded. Prune the
+    /// deleted path and all descendants from the tree refresh/cache state,
+    /// then re-read the parent directory so the tree reflects the deletion
+    /// immediately (and picks up any unrelated external changes there).
+    ///
+    /// The prune is deferred to this success path so a failed delete (e.g.
+    /// permission denied) leaves a still-existing directory untouched in the
+    /// tree.
+    fn dir_deleted(&mut self, dir_path: &str, workspace_path: &str) -> Task<EditorMessage> {
+        // Staleness guard: the delete was started in `workspace_path`. If the
+        // user switched workspaces while the async delete was in flight, this
+        // completion belongs to the old workspace and must not prune the
+        // currently selected workspace's state at the same relative path.
+        if self.selected_workspace_path.as_deref() != Some(workspace_path) {
+            return Task::none();
+        }
+        self.forget_directory(dir_path);
+        self.rebuild_tree();
+
+        // Re-read the parent directory (mirrors perform_delete_with_refresh):
+        // register a fresh generation slot and spawn the async read.
+        let Some(ws_path) = self.selected_workspace_path.clone() else {
+            return Task::none();
+        };
+        let parent_dir = Path::new(dir_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let r#gen = self.bump_generation();
+        self.dir_generations.insert(parent_dir.clone(), r#gen);
+        dir_expanded_task(ws_path, parent_dir, r#gen, false)
     }
 
     /// Handle a file being loaded from disk — opens a tab, initializes
@@ -3558,7 +3733,7 @@ impl EditorState {
         new_path: &str,
         is_dir: bool,
         result: Result<(), String>,
-        dir_entries: Result<Vec<FsEntry>, String>,
+        dir_entries: Result<Vec<FsEntry>, ReadDirError>,
         rename_gen: u64,
     ) -> Task<EditorMessage> {
         // Workspace could have been cleared mid-rename.  abs_path()
@@ -3710,10 +3885,18 @@ impl EditorState {
                         // Focus on the renamed entry.
                         self.file_tree.focus_path(new_path);
                     }
-                    Err(e) => {
+                    Err(ReadDirError::NotFound) => {
+                        // Parent directory vanished mid-rename — forget it
+                        // silently like any other missing directory.
+                        self.forget_directory(&re_path);
+                        self.rebuild_tree();
+                    }
+                    Err(ReadDirError::Other(err)) => {
                         self.rebuild_tree();
                         return Task::done(EditorMessage::Toast(super::ToastMessage::Error(
-                            format!("Rename succeeded but failed to refresh tree: {e}"),
+                            format!(
+                                "Rename succeeded but failed to refresh tree '{re_path}': {err}"
+                            ),
                         )));
                     }
                 }
@@ -3733,7 +3916,12 @@ impl EditorState {
                         self.dir_entries.insert(re_path, entries);
                         self.rebuild_tree();
                     }
-                    Err(_) => {
+                    Err(ReadDirError::NotFound) => {
+                        // Parent directory vanished — forget it silently.
+                        self.forget_directory(&re_path);
+                        self.rebuild_tree();
+                    }
+                    Err(ReadDirError::Other(_)) => {
                         self.rebuild_tree();
                     }
                 }
@@ -5166,6 +5354,7 @@ impl EditorState {
             target.abs_path.clone(),
             &target.path,
             "file",
+            None,
             |abs_path| async move {
                 tokio::fs::remove_file(&abs_path)
                     .await
@@ -5174,10 +5363,13 @@ impl EditorState {
         )
     }
 
-    /// Perform directory deletion: remove dir, close affected tabs, re-read parent.
+    /// Perform directory deletion: remove dir, close affected tabs.
+    ///
+    /// The tree/cache prune is deferred to the delete-success path (via
+    /// [`EditorMessage::DirDeleted`]) so a failed delete — e.g. permission
+    /// denied — leaves a still-existing directory fully intact in the tree.
     fn perform_dir_delete(&mut self, target: &DeleteConfirmTarget) -> Task<EditorMessage> {
         let abs_prefix = format!("{}/", target.abs_path);
-        let rel_prefix = format!("{}/", target.path);
 
         // Collect open tabs inside this directory (close in reverse order).
         let mut affected_indices: Vec<usize> = self
@@ -5193,24 +5385,14 @@ impl EditorState {
             self.remove_tab_at(idx);
         }
 
-        // Clear selection if it was inside the deleted directory.
-        // selected_file stores relative paths.
-        if let Some(ref sel) = self.selected_file {
-            if sel == &target.path || sel.starts_with(&rel_prefix) {
-                self.selected_file = None;
-            }
-        }
-
-        // Clean up mtimes and toast guards for affected paths (absolute).
-        self.file_mtimes
-            .retain(|path, _| path != &target.abs_path && !path.starts_with(&abs_prefix));
-        self.deleted_file_toasted
-            .retain(|path| path != &target.abs_path && !path.starts_with(&abs_prefix));
-
         self.perform_delete_with_refresh(
             target.abs_path.clone(),
             &target.path,
             "directory",
+            Some(EditorMessage::DirDeleted {
+                dir_path: target.path.clone(),
+                workspace_path: self.selected_workspace_path.clone().unwrap_or_default(),
+            }),
             |abs_path| async move {
                 tokio::fs::remove_dir_all(&abs_path)
                     .await
@@ -5219,9 +5401,11 @@ impl EditorState {
         )
     }
 
-    /// Shared preamble for deleting a file or directory: compute parent directory,
-    /// bump generation, then run the async delete operation, re-read the parent
-    /// directory, and emit a [`DirExpanded`] message.
+    /// Shared preamble for deleting a file or directory: bump a generation,
+    /// run the async delete operation, then on success either emit
+    /// `success_msg` (when provided — e.g. a directory delete that must
+    /// prune tree state) or re-read the parent directory and emit a
+    /// [`DirExpanded`] message.
     ///
     /// `delete_op` receives the absolute path and returns `Result<(), String>`.
     /// `error_label` is used in the toast message on failure (e.g. "file" or
@@ -5231,6 +5415,7 @@ impl EditorState {
         abs_path: String,
         rel_path: &str,
         error_label: &'static str,
+        success_msg: Option<EditorMessage>,
         delete_op: D,
     ) -> Task<EditorMessage>
     where
@@ -5244,9 +5429,20 @@ impl EditorState {
                 .unwrap_or_default()
         };
         let ws_path = self.selected_workspace_path.clone().unwrap_or_default();
-        let r#gen = self.bump_generation();
-        // Register the generation so DirExpanded handler accepts the result.
-        self.dir_generations.insert(parent_dir.clone(), r#gen);
+        // Only the file-delete path re-reads the parent via a DirExpanded
+        // message and thus needs a registered generation slot. The
+        // directory-delete path emits DirDeleted, which prunes state and
+        // re-reads the parent with a fresh generation of its own —
+        // registering a slot here would leave an orphaned (never consumed)
+        // generation entry.
+        let r#gen = if success_msg.is_none() {
+            let r#gen = self.bump_generation();
+            // Register the generation so DirExpanded handler accepts the result.
+            self.dir_generations.insert(parent_dir.clone(), r#gen);
+            Some(r#gen)
+        } else {
+            None
+        };
 
         Task::perform(
             async move {
@@ -5255,7 +5451,12 @@ impl EditorState {
                         "Failed to delete {error_label}: {e}"
                     )));
                 }
-                // Re-read parent directory.
+                if let Some(msg) = success_msg {
+                    return msg;
+                }
+                // Re-read parent directory (the file-delete path registered
+                // the generation slot above).
+                let r#gen = r#gen.expect("file-delete path always registers a generation");
                 dir_expanded_msg(ws_path, parent_dir, r#gen, false).await
             },
             |msg| msg,
