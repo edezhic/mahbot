@@ -857,12 +857,27 @@ impl Dashboard {
         };
 
         let page_task = match self.page {
-            Page::Home
-                if !self.board_state.load_state.loading()
-                    && self.board_state.search_query.is_empty() =>
-            {
-                self.board_state.load_state.start_loading();
-                self.board_state.refresh().map(Message::Board)
+            Page::Home => {
+                // Periodic ticket-list refresh (unchanged gating: skip while
+                // a previous refresh is in flight or a search is active).
+                let list_refresh = if !self.board_state.load_state.loading()
+                    && self.board_state.search_query.is_empty()
+                {
+                    self.board_state.load_state.start_loading();
+                    self.board_state.refresh().map(Message::Board)
+                } else {
+                    Task::none()
+                };
+                // Open ticket window: re-fetch on the same periodic refresh
+                // so the modal always shows the latest phase/comments
+                // without close/reopen. Runs even while a search is active
+                // (search mode pauses the list refresh but the modal can
+                // still be open on a searched ticket).
+                let detail_refresh = self
+                    .board_state
+                    .refresh_selected_ticket()
+                    .map(Message::Board);
+                Task::batch([list_refresh, detail_refresh])
             }
             Page::Sessions if !self.sessions_state.load_state.loading() => {
                 self.sessions_state.load_state.start_loading();

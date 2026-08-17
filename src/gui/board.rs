@@ -56,6 +56,18 @@ pub enum BoardMessage {
     RefreshError(String),
     TicketDetails(Box<Ticket>),
     DetailError(String),
+    /// Periodic re-fetch of the open ticket detail (see
+    /// [`BoardState::refresh_selected_ticket`]). Carries the comment
+    /// generation captured at dispatch so stale callbacks (modal closed
+    /// or ticket switched while in flight) are dropped. Unlike
+    /// `TicketDetails`, this is non-destructive: an in-progress comment
+    /// draft survives.
+    TicketDetailsRefreshed(u64, Box<Ticket>),
+    /// Periodic re-fetch of the open ticket detail failed. Carries the
+    /// generation for the same stale-callback detection as
+    /// `TicketDetailsRefreshed`. Kept separate from `DetailError` so a
+    /// stale refresh error cannot clear `selected_loading` mid-open.
+    TicketDetailsRefreshError(u64, String),
     PerformAction(String, String), // ticket_id, new_phase
     ActionResult(Result<(), String>),
 
@@ -144,6 +156,10 @@ pub struct BoardState {
     expanded_comments: HashSet<usize>,
     /// Stores the last detail-load error message for display in the modal.
     detail_error: Option<String>,
+    /// True while a periodic ticket-detail refresh is in flight. Guards
+    /// against overlapping refreshes on slow reads (an older snapshot
+    /// landing after a newer one); cleared on every refresh completion.
+    detail_refresh_in_flight: bool,
 
     /// Comment text input state for the ticket detail modal.
     comment_input: text_editor::Content,
@@ -196,6 +212,7 @@ impl BoardState {
             commit_stats_generation: 0,
             expanded_comments: HashSet::new(),
             detail_error: None,
+            detail_refresh_in_flight: false,
             comment_input: text_editor::Content::new(),
             sending_comment: false,
             comment_focused: false,
@@ -242,6 +259,102 @@ impl BoardState {
                 Err(e) => BoardMessage::RefreshError(e),
             },
         )
+    }
+
+    /// Re-fetch the currently open ticket detail (periodic refresh).
+    ///
+    /// Fired alongside the ticket-list refresh so an open ticket window
+    /// always shows the latest phase/comments without close/reopen.
+    /// No-ops while the initial modal load is in flight, while a comment
+    /// send is in progress (the DB snapshot would predate the optimistic
+    /// comment push — `CommentSent` refetches on completion), or while a
+    /// previous periodic refresh is still in flight (so an older snapshot
+    /// cannot land after a newer one on slow reads).
+    ///
+    /// Carries the comment generation captured at dispatch; the
+    /// [`BoardMessage::TicketDetailsRefreshed`] handler drops stale
+    /// callbacks (modal closed or ticket switched while in flight).
+    pub fn refresh_selected_ticket(&mut self) -> Task<BoardMessage> {
+        if self.selected_loading || self.sending_comment || self.detail_refresh_in_flight {
+            return Task::none();
+        }
+        let Some(ticket) = &self.selected_ticket else {
+            return Task::none();
+        };
+        self.detail_refresh_in_flight = true;
+        let id = ticket.id.clone();
+        let generation = self.comment_generation;
+        Task::perform(
+            async move {
+                let board = crate::board::store();
+                board.get_ticket(&id).await.map_err(|e| e.to_string())
+            },
+            move |res| match res {
+                Ok(Some(ticket)) => {
+                    BoardMessage::TicketDetailsRefreshed(generation, Box::new(ticket))
+                }
+                Ok(None) => {
+                    BoardMessage::TicketDetailsRefreshError(generation, "Ticket not found".into())
+                }
+                Err(e) => BoardMessage::TicketDetailsRefreshError(generation, e),
+            },
+        )
+    }
+
+    /// Apply fresh ticket detail to the modal display state.
+    ///
+    /// Clears the stale error, rebuilds the description/comment markdown
+    /// caches, replaces the selected ticket, and reconciles the
+    /// commit-stats display with the incoming ticket:
+    ///
+    /// - a commit hash that appeared or changed triggers a fresh stats
+    ///   fetch (gated on the new hash being `Some`, so a hash can never
+    ///   leave the loading state stuck),
+    /// - an unchanged hash keeps the already-loaded stats (the periodic
+    ///   refresh runs every second — unconditional fetches would hammer
+    ///   the git CLI and flash "Loading commit stats" each tick),
+    /// - no hash clears stale stats and any stuck loading flag.
+    ///
+    /// Returns the task to run (stats fetch or none). Callers must have
+    /// verified the incoming ticket belongs to the open modal (id +
+    /// generation guards). Non-destructive by contract: the comment
+    /// input, undo stack, and generation counter are managed by the
+    /// caller.
+    fn apply_ticket_display(&mut self, ticket: Ticket) -> Task<BoardMessage> {
+        self.detail_error = None;
+        self.description_md = if ticket.description.is_empty() {
+            None
+        } else {
+            Some(markdown::parse(&ticket.description).collect())
+        };
+        self.comments_md = ticket
+            .comments
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, markdown::parse(&c.content).collect()))
+            .collect();
+        let hash_changed = self
+            .selected_ticket
+            .as_ref()
+            .and_then(|t| t.commit_hash.as_ref())
+            != ticket.commit_hash.as_ref();
+        let ticket_id = ticket.id.clone();
+        let has_hash = ticket.commit_hash.is_some();
+        self.selected_ticket = Some(ticket);
+
+        if hash_changed && has_hash {
+            self.commit_stats = None;
+            self.commit_stats_loading = true;
+            self.commit_stats_generation += 1;
+            Task::done(BoardMessage::FetchCommitStats(ticket_id))
+        } else if !has_hash {
+            self.commit_stats = None;
+            self.commit_stats_loading = false;
+            Task::none()
+        } else {
+            // Unchanged hash — keep the loaded stats (if any).
+            Task::none()
+        }
     }
 
     #[allow(clippy::unused_self)]
@@ -469,21 +582,7 @@ impl BoardState {
             }
             BoardMessage::TicketDetails(ticket) => {
                 let ticket = *ticket;
-                // Defensively clear any stale error; if we got details, we're good.
-                self.detail_error = None;
-                // Cache parsed markdown for description and comments
-                self.description_md = if ticket.description.is_empty() {
-                    None
-                } else {
-                    Some(markdown::parse(&ticket.description).collect())
-                };
-                self.comments_md = ticket
-                    .comments
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| (i, markdown::parse(&c.content).collect()))
-                    .collect();
-                self.selected_ticket = Some(ticket);
+                let stats_task = self.apply_ticket_display(ticket);
                 self.selected_loading = false;
                 // Bump generation to invalidate any in-flight comment
                 // callbacks for the previous ticket.
@@ -495,24 +594,40 @@ impl BoardState {
                 self.sending_comment = false;
                 self.comment_focused = false;
                 self.undo_stack.clear();
-
-                // Trigger commit stats fetch if commit_hash is set
-                if self
-                    .selected_ticket
-                    .as_ref()
-                    .and_then(|t| t.commit_hash.as_ref())
-                    .is_some()
-                {
-                    self.commit_stats = None;
-                    self.commit_stats_loading = true;
-                    self.commit_stats_generation += 1;
-                    let ticket_id = self.selected_ticket.as_ref().unwrap().id.clone();
-                    Task::done(BoardMessage::FetchCommitStats(ticket_id))
-                } else {
-                    self.commit_stats = None;
-                    self.commit_stats_loading = false;
-                    Task::none()
+                stats_task
+            }
+            BoardMessage::TicketDetailsRefreshed(generation, ticket) => {
+                let ticket = *ticket;
+                // The fetch completed — allow the next periodic refresh.
+                self.detail_refresh_in_flight = false;
+                // Stale callback: the modal closed or the user switched
+                // tickets while this fetch was in flight.
+                if generation != self.comment_generation {
+                    return Task::none();
                 }
+                // A comment send is in flight: the DB snapshot predates
+                // the optimistic comment push, so applying it would make
+                // the new comment flicker out of the list. `CommentSent`
+                // refetches on completion.
+                if self.sending_comment || self.selected_ticket.is_none() {
+                    return Task::none();
+                }
+                // Display state only — the comment input, undo stack, and
+                // generation counter stay untouched so a draft survives.
+                self.apply_ticket_display(ticket)
+            }
+            BoardMessage::TicketDetailsRefreshError(generation, e) => {
+                self.detail_refresh_in_flight = false;
+                // Stale callback: the modal context changed while the
+                // refresh was in flight — do not touch the display.
+                if generation != self.comment_generation {
+                    return Task::none();
+                }
+                // Keep the last known good detail visible; the next
+                // periodic refresh retries. Unlike `DetailError`, this
+                // never clears `selected_loading`.
+                self.detail_error = Some(e);
+                Task::none()
             }
             BoardMessage::DetailError(e) => {
                 self.detail_error = Some(e);
@@ -1789,6 +1904,246 @@ mod tests {
             state.comment_generation > gen_before,
             "comment_generation should be bumped on ticket switch"
         );
+    }
+
+    // ── TicketDetailsRefreshed (periodic refresh of the open modal) ─
+
+    fn make_ticket(id: &str, phase: TicketPhase) -> Ticket {
+        Ticket {
+            id: id.into(),
+            title: "Test ticket".into(),
+            description: String::new(),
+            phase,
+            assigned_to: None,
+            workspace_name: "test_ws".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            comments: Vec::new(),
+            prerequisites: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            commit_hash: None,
+            lines_added: None,
+            lines_removed: None,
+            reporter: "test".into(),
+            is_archived: false,
+            pipeline_reservation: false,
+            priority: 0,
+            reviewed_head: None,
+            reviewed_tree: None,
+            done_at: None,
+            bounce_count: 0,
+        }
+    }
+
+    /// Same-ticket refresh carrying a new phase plus an engineer comment.
+    fn refreshed_ticket(phase: TicketPhase) -> Ticket {
+        let mut ticket = make_ticket("T-1", phase);
+        ticket.comments = vec![crate::board::TicketComment {
+            role: "engineer".into(),
+            content: "fixed the flaky test".into(),
+            created_at: "2026-01-01T00:00:05Z".into(),
+        }];
+        ticket
+    }
+
+    #[test]
+    fn test_ticket_details_refreshed_updates_and_preserves_draft() {
+        let mut state = make_board_state(); // selected_ticket: T-1, Backlog
+        state.comment_input = text_editor::Content::with_text("draft comment");
+        let gen_before = state.comment_generation;
+
+        // The periodic refresh delivers the same ticket with a new phase
+        // and a new engineer comment — the exact staleness the feature fixes.
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+            gen_before,
+            Box::new(refreshed_ticket(TicketPhase::InReview)),
+        ));
+
+        let ticket = state.selected_ticket.as_ref().expect("modal still open");
+        assert_eq!(
+            ticket.phase,
+            TicketPhase::InReview,
+            "phase should update to the latest state"
+        );
+        assert_eq!(
+            ticket.comments.len(),
+            1,
+            "comments should include the engineer comment"
+        );
+        assert_eq!(
+            state.comment_input.text(),
+            "draft comment",
+            "an in-progress comment draft must survive the periodic refresh"
+        );
+        assert_eq!(
+            state.comment_generation, gen_before,
+            "periodic refresh must not bump the generation (would invalidate in-flight callbacks)"
+        );
+        assert!(!state.sending_comment);
+        assert!(!state.commit_stats_loading);
+    }
+
+    #[test]
+    fn test_ticket_details_refreshed_stale_generation_dropped() {
+        let mut state = make_board_state();
+        state.comment_generation = 42;
+        // Stale callback (generation 0 < 42): the modal closed or the user
+        // switched tickets while the fetch was in flight — must be dropped.
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+            0,
+            Box::new(refreshed_ticket(TicketPhase::InReview)),
+        ));
+
+        let ticket = state.selected_ticket.as_ref().expect("modal still open");
+        assert_eq!(
+            ticket.phase,
+            TicketPhase::Backlog,
+            "stale data must not apply"
+        );
+        assert!(ticket.comments.is_empty(), "stale comments must not apply");
+        assert!(
+            !state.detail_refresh_in_flight,
+            "the completed fetch must clear the in-flight flag even when stale"
+        );
+    }
+
+    #[test]
+    fn test_ticket_details_refreshed_skipped_while_sending_comment() {
+        let mut state = make_board_state();
+        state.sending_comment = true;
+        let generation = state.comment_generation;
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+            generation,
+            Box::new(refreshed_ticket(TicketPhase::InReview)),
+        ));
+
+        let ticket = state.selected_ticket.as_ref().expect("modal still open");
+        assert_eq!(
+            ticket.phase,
+            TicketPhase::Backlog,
+            "refresh must not clobber the optimistic comment send"
+        );
+    }
+
+    #[test]
+    fn test_ticket_details_refreshed_stats_reconciliation() {
+        const HASH: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+        // Hash appeared → fresh stats fetch dispatched.
+        let mut state = make_board_state();
+        let mut with_hash = make_ticket("T-1", TicketPhase::Done);
+        with_hash.commit_hash = Some(HASH.into());
+        let stats_gen_before = state.commit_stats_generation;
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+            state.comment_generation,
+            Box::new(with_hash),
+        ));
+        assert!(state.commit_stats_loading, "new hash should fetch stats");
+        assert!(
+            state.commit_stats_generation > stats_gen_before,
+            "stats generation should bump for the new fetch"
+        );
+
+        // Unchanged hash → keep the loaded stats, no refetch.
+        let mut state = make_board_state();
+        state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
+        state.commit_stats = Some(CommitStats { files: Vec::new() });
+        state.commit_stats_generation = 5;
+        let mut same_hash = make_ticket("T-1", TicketPhase::Done);
+        same_hash.commit_hash = Some(HASH.into());
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+            state.comment_generation,
+            Box::new(same_hash),
+        ));
+        assert_eq!(
+            state.commit_stats_generation, 5,
+            "unchanged hash must not re-run git numstat every tick"
+        );
+        assert!(
+            state.commit_stats.is_some(),
+            "already-loaded stats should be kept"
+        );
+
+        // Hash vanished (latent) → loading must not stay stuck.
+        let mut state = make_board_state();
+        state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
+        state.commit_stats_loading = true;
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+            state.comment_generation,
+            Box::new(make_ticket("T-1", TicketPhase::Done)),
+        ));
+        assert!(
+            !state.commit_stats_loading,
+            "a hash-less ticket must clear the stats loading state"
+        );
+    }
+
+    #[test]
+    fn test_ticket_details_refresh_error_is_non_destructive() {
+        let mut state = make_board_state();
+        let generation = state.comment_generation;
+
+        // A refresh error keeps the last known good detail visible and
+        // must not clear the modal loading state (that is `DetailError`'s
+        // job, for the initial modal load).
+        let _task = state.update(BoardMessage::TicketDetailsRefreshError(
+            generation,
+            "db hiccup".into(),
+        ));
+        assert_eq!(
+            state.selected_ticket.as_ref().unwrap().phase,
+            TicketPhase::Backlog,
+            "the displayed ticket must survive a refresh error"
+        );
+        assert_eq!(state.detail_error.as_deref(), Some("db hiccup"));
+        assert!(!state.detail_refresh_in_flight);
+
+        // Stale refresh error (generation mismatch) is dropped entirely.
+        state.comment_generation += 1; // simulate modal close/switch
+        let _task = state.update(BoardMessage::TicketDetailsRefreshError(0, "late".into()));
+        assert_eq!(
+            state.detail_error.as_deref(),
+            Some("db hiccup"),
+            "stale error must not overwrite the current error"
+        );
+    }
+
+    #[test]
+    fn test_refresh_selected_ticket_dispatch_gating() {
+        // No modal open → nothing dispatched.
+        let mut state = BoardState::new();
+        let _task = state.refresh_selected_ticket();
+        assert!(!state.detail_refresh_in_flight);
+
+        // Modal open → dispatched (in-flight flag set).
+        let mut state = make_board_state();
+        let _task = state.refresh_selected_ticket();
+        assert!(state.detail_refresh_in_flight);
+
+        // Another refresh while one is in flight → no-op.
+        let _task = state.refresh_selected_ticket();
+        assert!(state.detail_refresh_in_flight);
+
+        // In-flight flag cleared on completion.
+        let generation = state.comment_generation;
+        let _task = state.update(BoardMessage::TicketDetailsRefreshed(
+            generation,
+            Box::new(make_ticket("T-1", TicketPhase::Backlog)),
+        ));
+        assert!(!state.detail_refresh_in_flight);
+
+        // Initial modal load in flight → no periodic refresh dispatched.
+        let mut state = make_board_state();
+        state.selected_loading = true;
+        let _task = state.refresh_selected_ticket();
+        assert!(!state.detail_refresh_in_flight);
+
+        // Comment send in flight → no periodic refresh dispatched.
+        let mut state = make_board_state();
+        state.sending_comment = true;
+        let _task = state.refresh_selected_ticket();
+        assert!(!state.detail_refresh_in_flight);
     }
 
     // ── Escape: first blurs, second closes ────────────────────────
