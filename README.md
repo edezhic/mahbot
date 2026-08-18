@@ -38,40 +38,26 @@ Circuit breaker pauses the work if a ticket goes through too many bounces, escal
 
 ## Getting Started
 
-Currently there are two ways to start using mahbot:
-
-**Install from crates.io**:
+Currently mahbot can only be installed from `crates.io`:
 
 ```bash
 cargo install mahbot
 ```
 
-OR
-
-**Build from source**:
-
-```bash
-git clone https://github.com/edezhic/mahbot
-cd mahbot
-cargo run --release
-```
-
-Then run `mahbot` to start the dashboard and configure your OpenRouter key in **Settings**. OpenRouter API key and the [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment) are needed for full functionality — see [Prerequisites](#prerequisites) below. Also, the same binary can be run with `mahbot debug ...` to execute read-only SQL queries over the service's DBs, which is particularly useful for the agents working on mahbot itself.
-
-As of now mahbot is only regularly tested on macos, so it might have unexpected bugs on other platforms. However, all the core components are cross-platform so it should work just fine on windows & linux in the future.
-
-## Prerequisites
+Then run `mahbot` to start the service, and you'll be asked to configure:
 
 **Required:**
-
 - OpenRouter API key
+
+**Optional:**
+- Exa and/or Firecrawl API keys — for the `web_search` tool
+- Telegram bot token — remote chat on the same agent backend
 - [`chrome-use`](https://github.com/leeguooooo/chrome-use) CLI (browser tool and link enrichment)
   Install: `curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh`
   (Windows users: download the `.exe` from [Releases](https://github.com/leeguooooo/chrome-use/releases))
   Requires the [Chrome extension](https://chromewebstore.google.com/detail/chrome-use) and native messaging host
   (run `chrome-use extension install` after installing the binary)
 
-**Optional:**
+As of now mahbot is only regularly tested on macos, so it might have unexpected bugs on other platforms. However, all the core components are cross-platform so it should work just fine on windows & linux in the future.
 
-- Exa and/or Firecrawl API keys — for the `web_search` tool
-- Telegram bot token — remote chat on the same agent backend
+Also, the same binary can be run with `mahbot debug -h` to execute read-only SQL queries over the service's DBs in an agent-friendly way.

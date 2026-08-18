@@ -2462,7 +2462,7 @@ async fn post_set_my_commands(
 ) -> bool {
     match client.post(url).json(body).send().await {
         Ok(resp) if resp.status().is_success() => {
-            tracing::info!("Telegram bot commands registered successfully");
+            tracing::debug!("Telegram bot commands registered successfully");
             true
         }
         Ok(resp) => {
