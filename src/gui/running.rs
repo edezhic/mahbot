@@ -489,7 +489,7 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, Message> {
         .align_y(Alignment::Center);
     if let Some(len) = h.session_tokens {
         first_row = first_row.push(
-            text(format_compact_tokens(len))
+            text(theme::format_compact_tokens(len))
                 .size(11)
                 .color(theme::TEXT_SECONDARY),
         );
@@ -582,26 +582,6 @@ fn format_elapsed(started_at: DateTime<Utc>) -> String {
         format!("{}m {:02}s", secs / 60, secs % 60)
     } else {
         format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
-/// Compact session-length format: raw below 1,000 ("500"), one decimal in the
-/// k-range ("12.3k" for 12300), one decimal at/above one million ("1.2M") —
-/// sessions routinely exceed 200K tokens with context windows up to 1M.
-/// Values that would round up past a unit boundary are rendered in the next
-/// unit (999_999 → "1.0M", never "1000.0k").
-#[allow(clippy::cast_precision_loss)] // token counts are far below f64's 2^53 exact range
-fn format_compact_tokens(tokens: u64) -> String {
-    if tokens < 1_000 {
-        tokens.to_string()
-    } else if tokens < 999_950 {
-        // k-range stops below values that would round to "1000.0k"
-        // (999_950 / 1000 = 999.95).
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else if tokens < 999_950_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else {
-        format!("{:.1}G", tokens as f64 / 1_000_000_000.0)
     }
 }
 
@@ -1071,25 +1051,5 @@ mod tests {
                 "no workspace name in group headers: {title}"
             );
         }
-    }
-
-    #[test]
-    fn compact_token_format_edges() {
-        // Raw below 1,000; one decimal in the k-range; one decimal at/above
-        // 1M (sessions routinely exceed 200K with context windows up to 1M).
-        // Values rounding up past a unit boundary render in the next unit.
-        assert_eq!(format_compact_tokens(0), "0");
-        assert_eq!(format_compact_tokens(500), "500");
-        assert_eq!(format_compact_tokens(999), "999");
-        assert_eq!(format_compact_tokens(1_000), "1.0k");
-        assert_eq!(format_compact_tokens(12_300), "12.3k");
-        assert_eq!(format_compact_tokens(200_000), "200.0k");
-        assert_eq!(format_compact_tokens(999_949), "999.9k");
-        assert_eq!(format_compact_tokens(999_999), "1.0M");
-        assert_eq!(format_compact_tokens(1_000_000), "1.0M");
-        assert_eq!(format_compact_tokens(1_234_567), "1.2M");
-        assert_eq!(format_compact_tokens(999_949_999), "999.9M");
-        assert_eq!(format_compact_tokens(999_950_000), "1.0G");
-        assert_eq!(format_compact_tokens(1_000_000_000), "1.0G");
     }
 }

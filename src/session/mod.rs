@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     workspace_name TEXT,
     role          TEXT,
     active_models TEXT,
-    token_length  INTEGER
+    token_length  INTEGER,
+    message_count INTEGER NOT NULL DEFAULT 0
 );
 
 -- ── Durability/resume substrate (see src/jobs.rs) ─────────────────────
@@ -195,13 +196,20 @@ crate::columns! {
     }
 }
 
-// Session list with metadata (3-column SELECT: sm.agent_id, sm.last_activity,
-// COUNT(s.id))
+// Session list with metadata (4-column SELECT: sm.agent_id, sm.last_activity,
+// sm.message_count, sm.token_length). Counts are read from the denormalized
+// metadata column — NOT from a JOIN over the `sessions` message table (the
+// list query runs every second while the Sessions page is visible; scanning
+// the full message table per refresh was the largest repeated query in the
+// system). The count is maintained in the same transaction as message writes
+// (see `insert_messages_in_transaction`) and backfilled once by migration
+// 002 for pre-migration stores.
 crate::columns! {
     SESSION_LIST_COLUMNS [SL] {
-        AGENT_ID      => "sm.agent_id",
+        AGENT_ID       => "sm.agent_id",
         LAST_ACTIVITY  => "sm.last_activity",
-        MESSAGE_COUNT  => "COUNT(s.id)",
+        MESSAGE_COUNT  => "sm.message_count",
+        TOKEN_LENGTH   => "sm.token_length",
     }
 }
 
@@ -233,6 +241,10 @@ pub(crate) struct SessionMetadata {
     pub agent_id: String,
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
+    /// Real provider-reported session length (input + output tokens of the
+    /// last successful agent LLM call), if ever recorded. Older sessions are
+    /// intentionally never backfilled — `None` renders no token value.
+    pub token_length: Option<u64>,
 }
 
 /// Context data stored alongside a session for recovery purposes.
@@ -265,6 +277,7 @@ fn session_metadata_from_row(
     agent_id: &str,
     activity_str: &str,
     count: i64,
+    token_length: Option<i64>,
 ) -> Result<SessionMetadata> {
     let last_activity = turso::parse_utc_timestamp(activity_str).with_context(|| {
         format!("invalid last_activity {activity_str:?} for session {agent_id}")
@@ -273,6 +286,7 @@ fn session_metadata_from_row(
         agent_id: agent_id.to_string(),
         last_activity,
         message_count: usize::try_from(count).unwrap_or(0),
+        token_length: token_length.and_then(|t| u64::try_from(t).ok()),
     })
 }
 
@@ -283,11 +297,18 @@ fn session_metadata_from_row(
 /// are set atomically alongside the messages — closing the atomicity gap of separate
 /// context writes.  This is the preferred path for new sessions
 /// and subsequent turns.
+///
+/// `replace` selects the denormalized `session_metadata.message_count`
+/// semantics: `false` (append) increments the stored count by the batch
+/// length; `true` (replace — summarization compaction deletes then inserts)
+/// SETs it to the batch length. A naive shared increment would double-count
+/// the replace path, since the old rows are gone before the insert.
 async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
     agent_id: &str,
     messages: &[ChatMessage],
     context: Option<(&str, &str, &str, &str)>,
+    replace: bool,
 ) -> Result<()> {
     let now = turso::now();
     for msg in messages {
@@ -302,29 +323,56 @@ async fn insert_messages_in_transaction(
         )
         .await?;
     }
+    // Message count = the number of `sessions` rows for this agent (system
+    // prompts, tool-call frames, and tool results all count — one row per
+    // message, matching the historical COUNT(s.id) list semantics). On a
+    // fresh metadata row the INSERT branch carries the batch length directly;
+    // on an existing row the ON CONFLICT branch adds (append) or overwrites
+    // (replace). The INSERT branches rely on the `NOT NULL DEFAULT 0`
+    // declaration for rows created by other paths (e.g. `set_token_length`).
+    let count = i64::try_from(messages.len()).context("message batch exceeds i64")?;
+    let count_clause = if replace {
+        "message_count = excluded.message_count"
+    } else {
+        "message_count = message_count + excluded.message_count"
+    };
     match context {
         Some((channel, user_name, workspace_name, role)) => {
             tx.execute(
-                "INSERT INTO session_metadata (agent_id, last_activity, \
-                 channel, user_name, workspace_name, role) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 ON CONFLICT(agent_id) DO UPDATE SET \
-                 last_activity = excluded.last_activity, \
-                 channel = excluded.channel, \
-                 user_name = excluded.user_name, \
-                 workspace_name = excluded.workspace_name, \
-                 role = excluded.role",
-                params![agent_id, now, channel, user_name, workspace_name, role,],
+                &format!(
+                    "INSERT INTO session_metadata (agent_id, last_activity, message_count, \
+                     channel, user_name, workspace_name, role) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT(agent_id) DO UPDATE SET \
+                     last_activity = excluded.last_activity, \
+                     channel = excluded.channel, \
+                     user_name = excluded.user_name, \
+                     workspace_name = excluded.workspace_name, \
+                     role = excluded.role, \
+                     {count_clause}"
+                ),
+                params![
+                    agent_id,
+                    now,
+                    count,
+                    channel,
+                    user_name,
+                    workspace_name,
+                    role,
+                ],
             )
             .await?;
         }
         None => {
             tx.execute(
-                "INSERT INTO session_metadata (agent_id, last_activity) \
-                 VALUES (?1, ?2) \
-                 ON CONFLICT(agent_id) DO UPDATE SET \
-                 last_activity = excluded.last_activity",
-                params![agent_id, now],
+                &format!(
+                    "INSERT INTO session_metadata (agent_id, last_activity, message_count) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(agent_id) DO UPDATE SET \
+                     last_activity = excluded.last_activity, \
+                     {count_clause}"
+                ),
+                params![agent_id, now, count],
             )
             .await?;
         }
@@ -367,9 +415,17 @@ where
         .collect()
 }
 
-/// Run the session-listing query body (metadata + message count join) with an
-/// optional `WHERE` fragment. Shared by [`SessionStore::list_sessions_with_metadata`]
-/// and [`SessionStore::list_sessions_with_metadata_excluding`].
+/// Run the session-listing query body (metadata columns only, no message-table
+/// join) with an optional `WHERE` fragment. Shared by
+/// [`SessionStore::list_sessions_with_metadata`] and
+/// [`SessionStore::list_sessions_with_metadata_excluding`].
+///
+/// The message count is read from the denormalized `session_metadata.message_count`
+/// column (maintained in the same transaction as message writes, backfilled by
+/// migration 002) — the historical LEFT JOIN + GROUP BY over the full `sessions`
+/// table was the largest repeated query in the system (this list refreshes every
+/// second while the Sessions page is visible) and has been removed. Ordering and
+/// filtering are unchanged.
 async fn list_sessions_where(
     conn: &turso::Connection,
     where_clause: &str,
@@ -381,9 +437,7 @@ async fn list_sessions_where(
         &format!(
             "SELECT {SESSION_LIST_COLUMNS} \
              FROM session_metadata sm \
-             LEFT JOIN sessions s ON s.agent_id = sm.agent_id \
              {where_clause} \
-             GROUP BY sm.agent_id \
              ORDER BY sm.last_activity DESC",
         ),
         params,
@@ -392,6 +446,7 @@ async fn list_sessions_where(
                 &row.get::<String>(COL_SL_AGENT_ID)?,
                 &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
                 row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
+                row.get::<Option<i64>>(COL_SL_TOKEN_LENGTH)?,
             )
         },
         warn_context,
@@ -457,7 +512,7 @@ impl SessionStore {
             )
             .await?;
         }
-        insert_messages_in_transaction(&tx, agent_id, messages, context).await?;
+        insert_messages_in_transaction(&tx, agent_id, messages, context, replace).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1070,6 +1125,196 @@ mod tests {
         // Explicit clear (upsert keeps the metadata row, column goes NULL).
         store().set_token_length(&k, None).await.unwrap();
         assert_eq!(store().get_token_length(&k).await, None);
+    }
+
+    // ── Denormalized message_count consistency ─────────────────────────
+    //
+    // The Sessions page list reads counts from `session_metadata.message_count`
+    // instead of scanning the `sessions` table. The counter must match the
+    // historical COUNT(s.id) definition exactly — one row per message (system
+    // prompts, tool-call frames, and tool results all count) — across the
+    // append, replace, TTL-cleanup, and delete write paths.
+
+    #[tokio::test]
+    async fn message_count_append_matches_rows_and_token_length_flows() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+
+        // Append with context — creates the metadata row with a count of 1.
+        store()
+            .append_with_context(
+                &k,
+                &ChatMessage::user("u1"),
+                "test_channel",
+                "test_user",
+                "test_ws",
+                "engineer",
+            )
+            .await
+            .unwrap();
+        // Batch append 2 more (an assistant answer + a tool frame).
+        store()
+            .batch_append(
+                &k,
+                &[
+                    ChatMessage::assistant("a1"),
+                    ChatMessage::tool_result("t1", "r1"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mine = store()
+            .list_sessions_with_metadata()
+            .await
+            .into_iter()
+            .find(|s| s.agent_id == k)
+            .expect("session listed");
+        assert_eq!(
+            mine.message_count,
+            store().load(&k).await.len(),
+            "denormalized count must equal the session row count"
+        );
+        assert_eq!(mine.message_count, 3);
+        // No provider-reported length recorded yet → no token value.
+        assert_eq!(mine.token_length, None);
+
+        // Once recorded, the real length flows through the list (the value
+        // the Sessions card renders next to the message count).
+        store().set_token_length(&k, Some(12_300)).await.unwrap();
+        let mine = store()
+            .list_sessions_with_metadata()
+            .await
+            .into_iter()
+            .find(|s| s.agent_id == k)
+            .expect("session listed");
+        assert_eq!(mine.token_length, Some(12_300));
+        // The set_token_length upsert must not disturb the count.
+        assert_eq!(mine.message_count, 3);
+    }
+
+    #[tokio::test]
+    async fn message_count_replace_sets_not_increments() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+
+        store()
+            .batch_append(
+                &k,
+                &[
+                    ChatMessage::user("u1"),
+                    ChatMessage::assistant("a1"),
+                    ChatMessage::tool_result("t1", "r1"),
+                ],
+            )
+            .await
+            .unwrap();
+        let count = async |agent: &str| {
+            let s = store()
+                .list_sessions_with_metadata()
+                .await
+                .into_iter()
+                .find(|s| s.agent_id == agent)
+                .expect("session listed");
+            s.message_count
+        };
+        assert_eq!(count(&k).await, 3);
+
+        // Summarization compaction: delete-then-insert. The count must be SET
+        // to the new batch length (2), never incremented to 3 + 2 = 5.
+        store()
+            .replace_messages(
+                &k,
+                &[ChatMessage::system("prompt"), ChatMessage::user("u1")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(count(&k).await, 2);
+        assert_eq!(store().load(&k).await.len(), 2);
+
+        // A second compaction to a larger batch also SETs.
+        store()
+            .replace_messages(
+                &k,
+                &[
+                    ChatMessage::system("p"),
+                    ChatMessage::user("u"),
+                    ChatMessage::assistant("a"),
+                    ChatMessage::assistant("a2"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(count(&k).await, 4);
+        assert_eq!(store().load(&k).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn message_count_ttl_cleanup_and_delete_remove_counts_with_sessions() {
+        crate::util::test::init_test_stores().await;
+
+        // Delete path (e.g. `/new`): messages and metadata go in one
+        // transaction — the count vanishes with them, nothing to drift.
+        let transient = format!("ticket_{}", unique_key());
+        store()
+            .append_with_context(
+                &transient,
+                &ChatMessage::user("u1"),
+                "test_channel",
+                "test_user",
+                "test_ws",
+                "engineer",
+            )
+            .await
+            .unwrap();
+        store()
+            .batch_append(&transient, &[ChatMessage::assistant("a1")])
+            .await
+            .unwrap();
+        assert!(store().delete(&transient).await.unwrap());
+        assert!(
+            !store()
+                .list_sessions_with_metadata()
+                .await
+                .iter()
+                .any(|s| s.agent_id == transient),
+            "deleted session (and its count) must leave the list"
+        );
+
+        // TTL cleanup: a stale transient session is removed entirely — its
+        // count cannot linger because the metadata row goes in the same
+        // transaction as the messages.
+        let stale = format!("ticket_{}", unique_key());
+        store()
+            .append_with_context(
+                &stale,
+                &ChatMessage::user("u1"),
+                "test_channel",
+                "test_user",
+                "test_ws",
+                "engineer",
+            )
+            .await
+            .unwrap();
+        store()
+            .batch_append(
+                &stale,
+                &[ChatMessage::assistant("a1"), ChatMessage::assistant("a2")],
+            )
+            .await
+            .unwrap();
+        let deleted = cleanup_old_transient_sessions(&crate::turso::now())
+            .await
+            .unwrap();
+        assert!(deleted >= 1, "TTL cleanup must remove the stale session");
+        assert!(
+            !store()
+                .list_sessions_with_metadata()
+                .await
+                .iter()
+                .any(|s| s.agent_id == stale),
+            "TTL-cleaned session (and its count) must leave the list"
+        );
     }
 
     #[tokio::test]

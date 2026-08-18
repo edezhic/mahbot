@@ -120,6 +120,9 @@ struct CachedSessionItem {
     label: String,
     /// Pre-formatted message count string.
     msg_count_label: String,
+    /// Pre-formatted compact token count (same format as the Running Agents
+    /// card), when the session ever recorded a provider-reported length.
+    token_label: Option<String>,
     /// Pre-formatted timestamp string.
     timestamp_label: String,
 }
@@ -402,6 +405,7 @@ impl SessionsState {
                 key: s.agent_id.clone(),
                 label: s.agent_id.clone(),
                 msg_count_label: format!("{} msgs", s.message_count),
+                token_label: s.token_length.map(theme::format_compact_tokens),
                 timestamp_label: theme::format_timestamp(&s.last_activity.to_rfc3339()),
             })
             .collect();
@@ -893,16 +897,35 @@ impl SessionsState {
                                     container(
                                         column![
                                             text(&item.label).size(13).color(theme::TEXT_PRIMARY),
-                                            row![
-                                                text(&item.msg_count_label)
-                                                    .size(11)
-                                                    .color(theme::TEXT_MUTED),
-                                                Space::new().width(8),
-                                                text(&item.timestamp_label)
-                                                    .size(11)
-                                                    .color(theme::TEXT_MUTED),
-                                            ]
-                                            .spacing(4),
+                                            {
+                                                // Meta row: message count, then the
+                                                // token length when one was ever
+                                                // recorded (older sessions show no
+                                                // token value), then the timestamp.
+                                                // The 8px `Space` separators (with
+                                                // the row's 4px spacing) preserve
+                                                // the original msg-count → timestamp
+                                                // gap exactly.
+                                                let mut meta_row = row![
+                                                    text(&item.msg_count_label)
+                                                        .size(11)
+                                                        .color(theme::TEXT_MUTED)
+                                                ]
+                                                .spacing(4);
+                                                if let Some(token) = &item.token_label {
+                                                    meta_row =
+                                                        meta_row.push(Space::new().width(8)).push(
+                                                            text(token)
+                                                                .size(11)
+                                                                .color(theme::TEXT_MUTED),
+                                                        );
+                                                }
+                                                meta_row.push(Space::new().width(8)).push(
+                                                    text(&item.timestamp_label)
+                                                        .size(11)
+                                                        .color(theme::TEXT_MUTED),
+                                                )
+                                            },
                                         ]
                                         .spacing(2),
                                     )
