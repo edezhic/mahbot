@@ -264,9 +264,9 @@ const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
 /// Below this soft score a frame is treated as background noise: the rolling
 /// window is cleared to prevent slow accumulation from noise.
-/// Calibrated for the p99-floored soft-score space: with the floor (0.75)
-/// mapping confusables to ~0, genuine matches sit at soft ~0.60+, so 0.35
-/// cleanly separates "clearly not wake word" from "in-progress match".
+/// Calibrated for the p99-floored soft-score space: the floor (0.75) maps the
+/// confusable near-miss tail to ~0, so 0.35 sits above the floor-mapped noise
+/// band while staying below genuine-match soft scores.
 const NO_MATCH_RESET_THRESHOLD: f32 = 0.35;
 
 // Voice pipeline metrics — always-on atomic counters
@@ -428,7 +428,7 @@ const ROLLING_WINDOW_N: usize = 3;
 /// At 0.55 (threshold 1.65), calibrated for the 1024-dim cosine soft-score
 /// space with the p99 negative-sample floor (0.75).  The floor maps the
 /// confusable near-miss tail to ~0, so the remaining positive margin
-/// (enrollment utterances at cosine 0.94+ → soft ~0.60) sits above
+/// (enrollment utterances at cosine 0.94+ → soft ~0.76) sits above
 /// 3 × 0.55 = 1.65.  (Was 0.65 / 1.95 for the un-floored soft scores; the
 /// floor does the discrimination now, so the threshold tracks the compressed
 /// positive range.)
@@ -5139,7 +5139,7 @@ mod tests {
         // should be capped by the ceiling.  With alternating 1.0/0.0
         // scores: mean=0.5, std≈0.5, k=2.5:
         //   adaptive = (0.5 + 2.5 × 0.5) × 3 = 5.25
-        // Capped by ceiling 2.70 (re-calibrated for the cosine soft space).
+        // Capped by ceiling 2.60 (re-calibrated for the cosine soft space).
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.99, ADAPTIVE_K_DEFAULT);

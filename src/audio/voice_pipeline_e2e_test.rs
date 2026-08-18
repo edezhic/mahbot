@@ -2351,10 +2351,10 @@ struct PerVariantResult {
     variant: String,
     /// Whether the variant triggered wake word detection.
     detected: bool,
-    /// Peak per-frame total_score (cosine soft score, range [0,1])
-    /// achieved during processing. This is NOT the rolling sum — it's the
-    /// maximum single-frame score. For rolling sum analysis, use the
-    /// `per_frame_scores` field or `max_rolling_sum`.
+    /// Peak rolling-sum score achieved during processing (not a per-frame
+    /// soft score).  Mirrors [`DetectionInstrumentation::peak_score`] — the
+    /// running peak of the rolling sums recorded in `per_frame_scores`, so
+    /// [`max_rolling_sum`] over that field yields the same value.
     peak_score: f32,
     /// Maximum rolling sum (sum of 3 consecutive total_scores)
     /// achieved during processing. Derived from per_frame_scores.

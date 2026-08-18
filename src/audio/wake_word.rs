@@ -81,13 +81,10 @@ const MAX_TOKENS_PER_CHUNK: usize = 13;
 /// window (N=3) still spans ~0.5 s of speech.
 pub(crate) const SCORE_STRIDE_MEL_FRAMES: usize = 16;
 
-/// Maximum cosine floor — a floor at/above this would squash all matches to
-/// zero.  Calibrated on the bench's measured detection-time geometry: with
-/// floor 0.75, the FA'd confusable tail (cosine ≤0.877 in mean-pooled
-/// 1024-dim space) maps to soft ≤0.51 → rolling ≤1.53 < match_threshold
-/// (1.65), while detected positives (cosine ≥0.90) map to soft ≥0.60 →
-/// rolling ≥1.80.  Lower floors (0.70) let the confusable tail through
-/// (measured 24 FAs); higher floors (0.85) crush recall (measured 37.5%).
+/// Maximum cosine floor — the upper clamp bound for the calibrated floor.
+/// The soft-score mapping anchors the floor at score 0, so a floor set
+/// at/above a match's cosine would squash that match to zero; this constant
+/// keeps the calibrated floor below the match range.
 const MAX_SOFT_FLOOR: f32 = 0.75;
 
 /// Fallback cosine floor when no negative calibration exists (e.g. the
@@ -417,10 +414,9 @@ pub(crate) fn distill_negative_prototypes(negatives: &[Vec<f32>]) -> Vec<Vec<f32
 ///
 /// The floor is the **99th percentile** of the negative cosine distribution —
 /// the confusable near-miss tail ("madbot" vs "mahbot") is the discriminative
-/// signal, and p95 leaves ~5% of that tail above the floor (measured: FA'd
-/// confusables peak at rolling 1.96-2.22 vs positive 1.98-2.35 with the p95
-/// floor).  With fewer than 4 negatives, falls back to `mean + 2σ` (or the
-/// default floor when σ is degenerate).
+/// signal (a p95 floor would leave ~5% of that tail above it).  With fewer
+/// than 4 negatives, falls back to `mean + 2σ` (or the default floor when σ
+/// is degenerate).
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
