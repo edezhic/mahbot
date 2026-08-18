@@ -43,6 +43,12 @@
 //! - **Comment** ([`RetryPolicy::comment`]) — 3 attempts, 90 s cap; for
 //!   fail-open comment-only extraction, where a long retry would stall the
 //!   pipeline for a non-critical operation.
+//! - **Continuation** ([`RetryPolicy::continuation`]) — 3 attempts, 90 s
+//!   cap, no inter-attempt sleep; the reasoning-only-stop recovery budget
+//!   (appended-only re-requests, see
+//!   [`crate::agent::Agent::recover_reasoning_only_stop`]). Retryable
+//!   transport errors re-send the byte-identical request; non-retryable
+//!   errors break immediately.
 //!
 //! Per-attempt timeout semantics come from [`Provider::chat_scoped`]: the
 //! header wait (TTFB) is bounded by the 1-min idle timeout and the whole
@@ -79,6 +85,17 @@ pub(crate) const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_mins(12);
 pub(crate) const DEFAULT_SYNTHESIS_MAX_ATTEMPTS: u32 = 3;
 pub(crate) const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS: u64 = 30_000;
 pub(crate) const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS: u64 = 45_000;
+
+/// Dedicated reasoning-only-stop continuation schedule: up to 3 appended-only
+/// continuation re-requests after the original in-class response, bounded by a
+/// short wall-clock cap (90 s — the [`RetryPolicy::comment`] precedent) so a
+/// stuck reasoning-only model fails the turn safely instead of burning the
+/// 12-min agent budget. Each continuation attempt is a single `chat_scoped`
+/// call (no inner transport retry — the appended tail makes every new
+/// reasoning state a fresh request; retryable transport errors re-send the
+/// identical bytes; the wall-clock cap is the authority).
+pub(crate) const DEFAULT_CONTINUATION_MAX_ATTEMPTS: u32 = 3;
+pub(crate) const DEFAULT_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Idle (read) timeout for scoped calls — resets while data flows.
 pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_mins(1);
@@ -170,6 +187,31 @@ impl RetryPolicy {
             base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
             max_backoff_ms: DEFAULT_RETRY_MAX_BACKOFF_MS,
             operation_timeout: Duration::from_secs(90),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Build the reasoning-only-stop continuation policy: bounded recovery for
+    /// an empty-content/no-tool response (see
+    /// [`crate::agent::Agent::recover_reasoning_only_stop`]). Mirrors the
+    /// [`Self::comment`] budget — 3 attempts, 90 s wall-clock cap. No
+    /// inter-attempt sleep: the appended-only tail makes each new reasoning
+    /// state a fresh request with a byte-stable prefix (retryable transport
+    /// errors re-send the identical bytes; non-retryable errors break
+    /// immediately), and the wall-clock cap is the authority.
+    /// `base_backoff_ms`/`max_backoff_ms` are unused (the manual continuation
+    /// loop never sleeps between attempts).
+    #[must_use]
+    pub(crate) fn continuation() -> Self {
+        #[cfg(test)]
+        if let Some(p) = test_override() {
+            return p;
+        }
+        Self {
+            max_attempts: DEFAULT_CONTINUATION_MAX_ATTEMPTS,
+            base_backoff_ms: 0,
+            max_backoff_ms: 0,
+            operation_timeout: DEFAULT_CONTINUATION_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
@@ -590,7 +632,11 @@ impl RetryLoop {
 ///
 /// Byte-identical request across ALL attempts; retries provider failures of
 /// any retryable class and honors the operation wall-clock cap. Any `Ok`
-/// response is accepted — empty text is a valid tool-call turn.
+/// response is accepted — empty text is a valid tool-call turn. A reasoning-
+/// only stop (empty text, no tool calls) is NOT handled here: the agent-loop
+/// caller classifies and recovers it via bounded continuation
+/// ([`crate::agent::Agent::recover_reasoning_only_stop`]) before any
+/// persistence/display.
 pub(crate) async fn agent_chat(
     request: ChatRequest,
     policy: &RetryPolicy,

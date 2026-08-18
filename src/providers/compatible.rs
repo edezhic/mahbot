@@ -213,7 +213,9 @@ struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
-    /// in `reasoning_content` instead of `content`. Used as automatic fallback.
+    /// in `reasoning_content` instead of `content`. Preserved on the response
+    /// for replay/display — never promoted into visible text (see
+    /// [`effective_content_optional`](Self::effective_content_optional)).
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -225,28 +227,20 @@ struct ResponseMessage {
 }
 
 impl ResponseMessage {
-    /// Extract text content, falling back to `reasoning_content` when `content`
-    /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
-    /// often return their output solely in `reasoning_content`.
-    /// Strips `<think>...</think>` blocks that some models (e.g. `MiniMax`) embed
-    /// inline in `content` instead of using a separate field.
+    /// Extract the model's visible text content, stripping `<think>...</think>`
+    /// blocks that some models (e.g. `MiniMax`) embed inline in `content`.
+    ///
+    /// There is NO reasoning fallback here: a reasoning-only response (empty
+    /// content, no tool calls) stays empty so the agent loop can classify the
+    /// class early and recover via bounded continuation (see
+    /// [`crate::agent::Agent::recover_reasoning_only_stop`]) instead of
+    /// surfacing chain-of-thought as the visible answer. Reasoning fields are
+    /// preserved separately on the response for replay and display.
     fn effective_content_optional(&self) -> Option<String> {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty())
-            && let Some(stripped) = crate::providers::reasoning::strip_think_tags(content)
-        {
-            return Some(stripped);
-        }
-
-        crate::providers::reasoning::merged_reasoning_string(
-            self.reasoning_content
-                .as_ref()
-                .map(|c| c.trim().to_string())
-                .filter(|c| !c.is_empty()),
-            self.reasoning
-                .as_ref()
-                .map(|c| c.trim().to_string())
-                .filter(|c| !c.is_empty()),
-        )
+        self.content
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .and_then(|c| crate::providers::reasoning::strip_think_tags(c))
     }
 }
 
@@ -1273,8 +1267,9 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_fallback() {
-        // Empty content, reasoning present → uses reasoning
+    fn effective_content_optional_never_promotes_reasoning() {
+        // Empty content with reasoning → stays empty (the reasoning-only-stop
+        // class is recovered by the agent loop, never promoted to visible text).
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking output here"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
@@ -1282,9 +1277,9 @@ mod tests {
                 .message
                 .effective_content_optional()
                 .unwrap_or_default(),
-            "Thinking output here"
+            ""
         );
-        // Null content, reasoning present → uses reasoning
+        // Null content, reasoning present → stays empty
         let json =
             r#"{"choices":[{"message":{"content":null,"reasoning_content":"Fallback text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
@@ -1293,7 +1288,17 @@ mod tests {
                 .message
                 .effective_content_optional()
                 .unwrap_or_default(),
-            "Fallback text"
+            ""
+        );
+        // Reasoning present but no content field at all → stays empty
+        let json = r#"{"choices":[{"message":{"reasoning_content":"Only thinking"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.choices[0]
+                .message
+                .effective_content_optional()
+                .unwrap_or_default(),
+            ""
         );
         // Normal content, reasoning present → uses content (ignores reasoning)
         let json = r#"{"choices":[{"message":{"content":"Normal response","reasoning_content":"Should be ignored"}}]}"#;
@@ -1305,7 +1310,7 @@ mod tests {
                 .unwrap_or_default(),
             "Normal response"
         );
-        // Content only think tags → uses reasoning
+        // Content only think tags → empty (think tags are reasoning, not content)
         let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
@@ -1313,7 +1318,18 @@ mod tests {
                 .message
                 .effective_content_optional()
                 .unwrap_or_default(),
-            "Fallback text"
+            ""
+        );
+        // Think tags plus visible text → visible text only
+        let json =
+            r#"{"choices":[{"message":{"content":"<think>secret</think>\nVisible answer"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.choices[0]
+                .message
+                .effective_content_optional()
+                .unwrap_or_default(),
+            "Visible answer"
         );
         // Both absent → empty
         let json = r#"{"choices":[{"message":{}}]}"#;

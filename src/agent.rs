@@ -5,7 +5,6 @@ use std::time::Instant;
 use anyhow::Context;
 use tracing::Instrument;
 
-use crate::providers::plaintext_for_display;
 use crate::providers::reasoning_roundtrip::assistant_replay_payload;
 use crate::session::Session;
 use crate::tools::{
@@ -810,21 +809,209 @@ impl Agent {
     }
 
     async fn llm_call(&mut self) -> anyhow::Result<ChatResponse> {
-        let request = self.build_chat_request(
-            self.session.history().to_vec(),
-            self.role.requires_multimodal(),
-            "agent",
-        );
+        let messages = self.session.history().to_vec();
+        let request =
+            self.build_chat_request(messages.clone(), self.role.requires_multimodal(), "agent");
 
         let policy = crate::retry::RetryPolicy::current();
         let response = crate::retry::agent_chat(request, &policy)
             .await
             .with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
+        // Reasoning-only stop (empty content, no parsed tool calls): classified
+        // HERE, before any promotion/persistence/display. The provider-layer
+        // reasoning→text promotion is gone, so the response is the model's
+        // honest output. Recover via bounded continuation; on exhaustion the
+        // turn fails safely — nothing persisted, nothing displayed, the
+        // existing failure indicators (direct chat emoji / pipeline comment)
+        // fire. The continuation is appended-only and never touches the
+        // session transcript, so the thinking can never leak to the user.
+        let response = if is_reasoning_only_stop(&response) {
+            match self
+                .recover_reasoning_only_stop(messages, response, "agent-continuation")
+                .await
+            {
+                Ok(cont) => cont,
+                Err(exhausted) => {
+                    return Err(anyhow::Error::new(exhausted).context(
+                        "model returned only reasoning without an answer after continuation attempts",
+                    ));
+                }
+            }
+        } else {
+            response
+        };
+
         // A SUCCESSFUL agent-purpose call updates the session length; failures
-        // never reach here (the error above propagates).
+        // never reach here (the error above propagates), and a reasoning-only
+        // turn that exhausted its continuation returned early above without
+        // recording anything — so only the response actually returned to the
+        // loop updates the value.
         self.record_session_usage(&response).await;
         Ok(response)
+    }
+
+    /// Bounded continuation recovery for the reasoning-only-stop class
+    /// (empty content, no parsed tool calls — see [`is_reasoning_only_stop`]).
+    ///
+    /// Re-requests with the already-generated thinking attached as the
+    /// assistant's reasoning for that turn (empty content) plus an appended
+    /// continuation prompt. **Strictly appended-only**: the tail is seeded
+    /// with the first in-class response's reasoning, and each LATER in-class
+    /// response appends its own (assistant reasoning payload + nudge) pair —
+    /// a transport failure NEVER grows the tail (the next attempt re-sends
+    /// the PREVIOUS request object verbatim, byte-identical even across a
+    /// concurrent config hot-reload). The request prefix stays byte-stable
+    /// across attempts (prompt-prefix cache preserved). The tail exists only
+    /// in the re-request message list — it is never pushed to the session, so
+    /// a failed attempt leaves no transcript trace and the raw thinking can
+    /// never reach the user.
+    ///
+    /// Bounded by [`crate::retry::RetryPolicy::continuation`] (3 attempts,
+    /// 90 s wall clock), checked against [`crate::shutdown::aborting`], the
+    /// agent's cancel token, and the deadline between attempts. Each attempt
+    /// is a single [`crate::providers::chat_scoped`] call; retryable provider
+    /// errors re-send the same bytes, non-retryable errors break immediately
+    /// (a payload-rejecting 400 never burns the budget).
+    ///
+    /// Telemetry is operation-level — one `llm_requests` row per continuation
+    /// operation, matching the single-row-per-operation convention of the
+    /// other retry loops: a resolution records one success row with
+    /// `retry_attempts` = the resolving attempt index; exhaustion records one
+    /// failure row via the shared `fail_exhausted` tail with
+    /// `retry_attempts` = the total attempt count and the last attempt's
+    /// finish_reason carried on its failure record. Any response with visible
+    /// text or parsed tool calls resolves the turn and is persisted normally
+    /// by the caller.
+    ///
+    /// Exhaustion returns a [`crate::retry::RetryExhausted`] with
+    /// `last_raw: None` and a final class derived from the last recorded
+    /// failure ([`FailureClass::NoResponse`] for a pure thinking-only
+    /// exhaustion, [`FailureClass::Shutdown`] when the global abort fired,
+    /// [`FailureClass::WallClockExceeded`] when the budget ran out) — the
+    /// thinking text is never embedded in the error, so failure
+    /// comments/logs cannot leak it, and it is not misclassified as LLM
+    /// provider retry exhaustion (no
+    /// [`crate::agent::RETRY_EXHAUSTION_MARKER`]).
+    async fn recover_reasoning_only_stop(
+        &self,
+        base: Vec<ChatMessage>,
+        first: ChatResponse,
+        purpose: &'static str,
+    ) -> Result<ChatResponse, crate::retry::RetryExhausted> {
+        let policy = crate::retry::RetryPolicy::continuation();
+        let deadline = Instant::now() + policy.operation_timeout;
+        let operation_started = Instant::now();
+        let nudge = crate::prompt::load_prompt("resume_unfinished_turn.md")
+            .trim()
+            .to_string();
+        let mut failures: Vec<crate::retry::RetryFailureRecord> = Vec::new();
+        let mut last_request: Option<ChatRequest> = None;
+
+        // Seed the tail with the FIRST in-class response's reasoning (empty
+        // content) + the continuation nudge. Each LATER in-class response
+        // appends its own pair — the tail grows only when the model actually
+        // produced a new response, so a transport failure never duplicates
+        // the previous thinking.
+        let mut tail: Vec<ChatMessage> = vec![
+            ChatMessage::assistant(
+                assistant_replay_payload(None, &[], first.reasoning.as_ref()).to_string(),
+            ),
+            ChatMessage::user(nudge.clone()),
+        ];
+        // True when a new pair was appended since the last request was built:
+        // the request is rebuilt only then, otherwise the previous request
+        // object is re-sent verbatim (a retryable transport error must not
+        // pick up a concurrent config hot-reload).
+        let mut tail_grew = true;
+
+        for attempt in 1..=policy.max_attempts {
+            // The global abort dominates: it also cancels every per-agent
+            // token, so classify it as shutdown, not cancellation.
+            if crate::shutdown::aborting() {
+                failures.push(crate::retry::RetryFailureRecord::new_simple(
+                    crate::retry::FailureClass::Shutdown,
+                    &anyhow::anyhow!("global shutdown or drain during continuation recovery"),
+                    None,
+                ));
+                break;
+            }
+            if self.cancel_token.is_cancelled() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                failures.push(crate::retry::RetryFailureRecord::new_simple(
+                    crate::retry::FailureClass::WallClockExceeded,
+                    &anyhow::anyhow!("continuation wall-clock budget exceeded"),
+                    None,
+                ));
+                break;
+            }
+
+            let request = if tail_grew {
+                tail_grew = false;
+                let mut messages = base.clone();
+                messages.extend(tail.iter().cloned());
+                let built =
+                    self.build_chat_request(messages, self.role.requires_multimodal(), purpose);
+                last_request = Some(built.clone());
+                built
+            } else {
+                last_request
+                    .clone()
+                    .expect("the first iteration always builds a request")
+            };
+
+            match crate::providers::chat_scoped(request.clone(), policy.idle_timeout, deadline)
+                .await
+            {
+                // Still thinking with no answer — record the attempt (with its
+                // finish_reason, so the terminal failure row keeps it), append
+                // the NEW reasoning as the next tail pair, and continue.
+                Ok(resp) if is_reasoning_only_stop(&resp) => {
+                    failures.push(crate::retry::RetryFailureRecord::with_metadata(
+                        crate::retry::FailureClass::NoResponse,
+                        &anyhow::anyhow!(
+                            "model returned only reasoning with no answer \
+                             (continuation attempt {attempt})"
+                        ),
+                        resp.finish_reason.clone(),
+                        None,
+                    ));
+                    tail.push(ChatMessage::assistant(
+                        assistant_replay_payload(None, &[], resp.reasoning.as_ref()).to_string(),
+                    ));
+                    tail.push(ChatMessage::user(nudge.clone()));
+                    tail_grew = true;
+                }
+                // Real answer or tool calls — the turn resolves normally.
+                Ok(resp) => {
+                    crate::stats::record_llm_success(&request, operation_started, attempt, &resp)
+                        .await;
+                    return Ok(resp);
+                }
+                // Provider failure — break on non-retryable (a payload-rejecting
+                // 400 must not burn the budget); otherwise the next iteration
+                // re-sends the byte-identical request (tail untouched).
+                Err(err) => {
+                    failures.push(err.record);
+                    if !err.class.is_retryable() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let final_class = failures
+            .last()
+            .map_or(crate::retry::FailureClass::NoResponse, |r| r.class);
+        let exhausted = crate::retry::RetryExhausted::with_last_raw(failures, final_class, None);
+        match last_request {
+            Some(request) => {
+                crate::retry::fail_exhausted(&request, operation_started, exhausted).await
+            }
+            None => Err(exhausted),
+        }
     }
 
     /// Record the real provider-reported session length after a SUCCESSFUL
@@ -1074,11 +1261,35 @@ impl Agent {
 
         let policy = crate::retry::RetryPolicy::current();
         let chat_resp = crate::retry::agent_chat(
-            self.build_chat_request(history, self.role.requires_multimodal(), "summarize"),
+            self.build_chat_request(
+                history.clone(),
+                self.role.requires_multimodal(),
+                "summarize",
+            ),
             &policy,
         )
         .await
         .with_context(|| format!("summarization LLM call {RETRY_EXHAUSTION_MARKER}"))?;
+
+        // Reasoning-only stop: the same bounded continuation as the agent loop
+        // (the provider promotion is gone, so a reasoning-only summary has
+        // empty text). On exhaustion, fail open below — the empty-response
+        // error path warns and continues with the full history.
+        let chat_resp = if is_reasoning_only_stop(&chat_resp) {
+            match self
+                .recover_reasoning_only_stop(history, chat_resp, "summarize-continuation")
+                .await
+            {
+                Ok(resp) => resp,
+                Err(e) => {
+                    return Err(anyhow::Error::new(e).context(
+                        "summarization continuation exhausted — failing open with full history",
+                    ));
+                }
+            }
+        } else {
+            chat_resp
+        };
 
         if let Some(ref u) = chat_resp.usage {
             tracing::debug!(
@@ -1160,35 +1371,45 @@ struct PreparedAssistantTurn {
     history_content: String,
 }
 
+/// Classify the "reasoning-only stop" class: raw empty content (think tags
+/// stripped — they are reasoning, not content) with no parsed tool calls,
+/// REGARDLESS of finish reason. The provider-layer reasoning→text promotion
+/// is gone, so an empty `text` is the model's honest empty content.
+///
+/// Tool-call turns (empty text by design) are excluded by the tool-call
+/// check. Degenerate members — fully-empty responses (no reasoning attached)
+/// and think-tag-only content — are consciously in-class: the continuation
+/// then carries just the nudge, and a previously-`Ok("")` silent answer now
+/// resolves via the continuation or fails the turn safely (never CoT-as-text).
+#[must_use]
+fn is_reasoning_only_stop(response: &ChatResponse) -> bool {
+    response.tool_calls.is_empty() && response.text.as_deref().is_none_or(|t| t.trim().is_empty())
+}
+
 /// Prepare assistant response data from the LLM response.
 fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
-    let mut response_text = response.text_or_empty().to_string();
+    let response_text = response.text_or_empty().to_string();
     let tool_calls = response.tool_calls;
     let reasoning = response.reasoning.as_ref();
 
-    // Build structured payload BEFORE the reasoning fallback below, so the
-    // content field faithfully captures the model's original response (empty
-    // for reasoning-only returns like DeepSeek with content=null).
+    // The structured payload faithfully captures the model's original response
+    // (empty content for a reasoning-only return). Reasoning-only stops never
+    // reach this point — the agent loop classifies and recovers them in
+    // llm_call before any persistence/display — so this builder only ever
+    // serializes real answers and tool-call turns.
     let json_payload =
         assistant_replay_payload(Some(&response_text), &tool_calls, reasoning).to_string();
 
-    // When the model returns only reasoning (e.g. DeepSeek with content=null),
-    // fall back to plaintext reasoning as the display text.
-    if response_text.is_empty()
-        && tool_calls.is_empty()
-        && let Some(fb) = plaintext_for_display(reasoning)
-    {
-        response_text = fb;
-    }
-
     // Dispatch on whether tool calls and/or reasoning are present.
-    // Three arms: plain answer (no tools, no reasoning), reasoning-only
-    // (reasoning present but no tools), and tool calls (tools present).
+    // Three arms: plain answer (no tools, no reasoning), reasoning+text
+    // (reasoning present alongside visible text), and tool calls (tools
+    // present). Reasoning-only responses (reasoning present, empty text) are
+    // the recovered class and never arrive here.
     let (display_text, history_content) = match (tool_calls.is_empty(), reasoning.is_some()) {
         // Plain final answer — both display and history use response text directly.
         (true, false) => (response_text.clone(), response_text),
-        // Reasoning present — show reasoning/answer text to user,
-        // persist structured JSON payload with empty content + reasoning fields.
+        // Reasoning alongside visible text — show the text to the user,
+        // persist structured JSON payload with content + reasoning fields.
         (true, true) => (response_text, json_payload),
         // Tool calls — nothing to display, persist structured JSON payload.
         (false, _) => (String::new(), json_payload),
@@ -2288,6 +2509,542 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
             .await
             .expect("first-call signal must fire even when the call fails");
+    }
+
+    // ── Reasoning-only stop recovery ─────────────────────────────────
+
+    /// The class predicate: raw empty content + no parsed tool calls,
+    /// regardless of finish reason. Tool-call turns (empty text by design)
+    /// and real answers are excluded. Degenerate members (fully-empty, no
+    /// reasoning) are consciously in-class.
+    #[test]
+    fn reasoning_only_stop_classification() {
+        let reasoning = || {
+            Some(crate::Reasoning {
+                reasoning: Some("thinking".into()),
+                reasoning_content: Some("thinking".into()),
+                reasoning_details: None,
+            })
+        };
+
+        // Empty/absent content, no tools → in class for ANY finish reason.
+        for finish in [None, Some("stop"), Some("length"), Some("tool_calls")] {
+            let resp = crate::ChatResponse {
+                text: None,
+                reasoning: reasoning(),
+                finish_reason: finish.map(str::to_string),
+                ..crate::ChatResponse::default()
+            };
+            assert!(is_reasoning_only_stop(&resp), "finish_reason={finish:?}");
+        }
+        // Explicit empty-string content → in class.
+        let resp = crate::ChatResponse {
+            text: Some(String::new()),
+            reasoning: reasoning(),
+            ..crate::ChatResponse::default()
+        };
+        assert!(is_reasoning_only_stop(&resp));
+        // Whitespace-only content → in class.
+        let resp = crate::ChatResponse {
+            text: Some("   \n ".into()),
+            ..crate::ChatResponse::default()
+        };
+        assert!(is_reasoning_only_stop(&resp));
+        // Fully-empty response (no reasoning attached) → in class.
+        let resp = crate::ChatResponse::default();
+        assert!(is_reasoning_only_stop(&resp));
+        // Tool calls with empty text → NOT in class (valid tool-call turn).
+        let resp = crate::ChatResponse {
+            text: None,
+            tool_calls: vec![crate::ToolCall {
+                id: "t1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }],
+            ..crate::ChatResponse::default()
+        };
+        assert!(!is_reasoning_only_stop(&resp));
+        // Real visible text (even with reasoning present) → NOT in class.
+        let resp = crate::ChatResponse {
+            text: Some("real answer".into()),
+            reasoning: reasoning(),
+            ..crate::ChatResponse::default()
+        };
+        assert!(!is_reasoning_only_stop(&resp));
+    }
+
+    /// A reasoning-only stop resolves via the continuation: the final answer
+    /// is returned, the continuation request carries the appended tail
+    /// (assistant reasoning payload + the resume nudge), and the nudge never
+    /// appears in the original request.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn llm_call_recovers_reasoning_only_stop_via_continuation() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only("draft plan then execute tool", Some("stop"))
+                .ok("final answer"),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent(vec![]);
+        let resp = agent.llm_call().await.expect("continuation must resolve");
+        assert_eq!(resp.text_or_empty(), "final answer");
+
+        let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+        assert_eq!(fingerprints.len(), 2, "original call + one continuation");
+        assert!(
+            !fingerprints[0].contains("Resume your unfinished turn"),
+            "original request must not carry the continuation tail"
+        );
+        assert!(
+            fingerprints[1].contains("Resume your unfinished turn"),
+            "continuation request must carry the appended nudge"
+        );
+        assert!(
+            fingerprints[1].contains("draft plan then execute tool"),
+            "continuation must echo the previous reasoning as the assistant turn"
+        );
+    }
+
+    /// Consecutive reasoning-only responses accumulate: each failed attempt
+    /// appends its own (assistant reasoning + nudge) pair, so the request
+    /// prefix stays byte-stable and only the tail grows.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn llm_call_continuation_accumulates_tail_until_answer() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only("thinking 1", Some("stop"))
+                .ok_reasoning_only("thinking 2", Some("stop"))
+                .ok("answer after two continuations"),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent(vec![]);
+        let resp = agent.llm_call().await.expect("continuation must resolve");
+        assert_eq!(resp.text_or_empty(), "answer after two continuations");
+
+        let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+        assert_eq!(fingerprints.len(), 3);
+        // Strictly appended-only: one nudge after the first continuation, two
+        // after the second (the first pair is part of the byte-stable prefix).
+        assert_eq!(
+            fingerprints[1]
+                .matches("Resume your unfinished turn")
+                .count(),
+            1,
+            "attempt 2 carries exactly the first appended pair"
+        );
+        assert_eq!(
+            fingerprints[2]
+                .matches("Resume your unfinished turn")
+                .count(),
+            2,
+            "attempt 3 carries both appended pairs"
+        );
+        assert!(fingerprints[2].contains("thinking 1"));
+        assert!(fingerprints[2].contains("thinking 2"));
+
+        // Direct byte-prefix pin of the KV-cache property: attempt 3's message
+        // list begins with attempt 2's messages verbatim (append-only growth,
+        // nothing rewritten). The capture joins per-message Debug with NUL, so
+        // a plain prefix check holds.
+        let messages = fake.request_messages.lock().unwrap().clone();
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages[2].starts_with(&messages[1]),
+            "byte-stable prefix: attempt 3's messages begin with attempt 2's verbatim"
+        );
+    }
+
+    /// Continuation exhaustion fails the turn safely: a NoResponse
+    /// [`RetryExhausted`] with `last_raw: None`, no reasoning text in the
+    /// error, no provider-retry-exhaustion marker, no transcript trace, and
+    /// granular "no_response" classification.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn llm_call_continuation_exhaustion_fails_safely_without_leaking() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only("secret thinking alpha", Some("stop"))
+                .ok_reasoning_only("secret thinking beta", Some("stop"))
+                .ok_reasoning_only("secret thinking gamma", Some("stop"))
+                .ok_reasoning_only("secret thinking delta", Some("stop")),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent(vec![]);
+        let err = agent
+            .llm_call()
+            .await
+            .expect_err("continuation must exhaust");
+        let exhausted = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::retry::RetryExhausted>())
+            .expect("RetryExhausted must survive in the error chain");
+        assert_eq!(
+            exhausted.final_class,
+            crate::retry::FailureClass::NoResponse,
+            "granular no-response classification"
+        );
+        assert_eq!(
+            exhausted.last_raw, None,
+            "no raw text on the exhausted error"
+        );
+        let last_failure = exhausted
+            .failures
+            .last()
+            .expect("failure trail is non-empty");
+        assert_eq!(
+            last_failure.finish_reason.as_deref(),
+            Some("stop"),
+            "in-class NoResponse records carry the response finish_reason into the telemetry trail"
+        );
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("secret thinking"),
+            "the thinking must never leak into the failure error"
+        );
+        assert!(
+            !rendered.contains(RETRY_EXHAUSTION_MARKER),
+            "must not be misclassified as LLM provider retry exhaustion"
+        );
+        assert!(
+            agent.session.history().is_empty(),
+            "the continuation tail must never reach the session transcript"
+        );
+        assert_eq!(failure_classification(&agent, Some(&err)), "no_response");
+    }
+
+    /// A transport error mid-recovery never duplicates the thinking tail: the
+    /// retried request is byte-identical, and exhaustion derives the final
+    /// class from the last recorded failure (Transport, not NoResponse).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn llm_call_continuation_transport_error_does_not_duplicate_tail() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only("thinking 1", Some("stop"))
+                .err(crate::retry::FailureClass::Transport, "connection reset")
+                .err(crate::retry::FailureClass::Transport, "connection reset")
+                .err(crate::retry::FailureClass::Transport, "connection reset"),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent(vec![]);
+        let err = agent
+            .llm_call()
+            .await
+            .expect_err("continuation must exhaust");
+        let exhausted = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::retry::RetryExhausted>())
+            .expect("RetryExhausted must survive in the error chain");
+        assert_eq!(
+            exhausted.final_class,
+            crate::retry::FailureClass::Transport,
+            "final class derives from the last recorded failure, not NoResponse"
+        );
+
+        let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+        assert_eq!(
+            fingerprints.len(),
+            4,
+            "original call + 3 continuation attempts"
+        );
+        assert_eq!(
+            fingerprints[1], fingerprints[2],
+            "attempt 2 re-sends the byte-identical request after a transport error"
+        );
+        assert_eq!(fingerprints[2], fingerprints[3]);
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("thinking"),
+            "the thinking must never leak into the failure error"
+        );
+    }
+
+    /// A non-retryable provider error mid-recovery breaks immediately instead
+    /// of burning the remaining budget, and keeps the granular class.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn llm_call_continuation_non_retryable_error_breaks_immediately() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only("thinking 1", Some("stop"))
+                .err(crate::retry::FailureClass::NonRetryable, "invalid model"),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent(vec![]);
+        let err = agent.llm_call().await.expect_err("continuation must fail");
+        let exhausted = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::retry::RetryExhausted>())
+            .expect("RetryExhausted must survive in the error chain");
+        assert_eq!(
+            exhausted.final_class,
+            crate::retry::FailureClass::NonRetryable,
+            "non-retryable class survives to the terminal error"
+        );
+        assert_eq!(
+            fake.request_fingerprints.lock().unwrap().len(),
+            2,
+            "original call + exactly one continuation attempt (no budget burn)"
+        );
+    }
+
+    /// A global abort (drain) between recovery attempts classifies the
+    /// terminal error as Shutdown, not NoResponse — the real cause must not be
+    /// masked, even when the break happens before the first attempt (no
+    /// request was ever sent, so there is also nothing to record in telemetry).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn recover_reasoning_only_stop_abort_classifies_as_shutdown() {
+        let _guard = crate::util::test::retry_tests_lock();
+        let agent = make_agent(vec![]);
+        let first = crate::ChatResponse {
+            text: None,
+            reasoning: Some(crate::Reasoning {
+                reasoning: Some("thinking".into()),
+                reasoning_content: Some("thinking".into()),
+                reasoning_details: None,
+            }),
+            finish_reason: Some("stop".into()),
+            ..crate::ChatResponse::default()
+        };
+
+        // The drain flag is process-global — set it for the duration of the
+        // recovery, then restore (never fire the global token from a test).
+        crate::shutdown::drain_begin();
+        let exhausted = agent
+            .recover_reasoning_only_stop(vec![], first, "agent-continuation")
+            .await
+            .expect_err("the drain must break the continuation immediately");
+        crate::shutdown::drain_clear();
+
+        assert_eq!(
+            exhausted.final_class,
+            crate::retry::FailureClass::Shutdown,
+            "a global abort must classify as shutdown, never no_response"
+        );
+    }
+
+    /// A reasoning-only turn whose continuation exhausts is a FAILED call: it
+    /// must never update the session token length (the `maybe_summarize`
+    /// "a FAILED call never updates the value" invariant), even though the
+    /// invisible in-class response carried real usage.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn llm_call_continuation_exhaustion_does_not_update_session_length() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only_with_usage("thinking a", Some("stop"), 1_000, 500)
+                .ok_reasoning_only_with_usage("thinking b", Some("stop"), 1_000, 500)
+                .ok_reasoning_only_with_usage("thinking c", Some("stop"), 1_000, 500)
+                .ok_reasoning_only_with_usage("thinking d", Some("stop"), 1_000, 500),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent(vec![]);
+        assert_eq!(agent.session.token_length(), None);
+        let err = agent
+            .llm_call()
+            .await
+            .expect_err("continuation must exhaust");
+        assert_eq!(
+            agent.session.token_length(),
+            None,
+            "a failed turn (continuation exhaustion) must not update the session length"
+        );
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("thinking"),
+            "the thinking must never leak into the failure error"
+        );
+    }
+
+    /// On continuation success, the session length is updated from the
+    /// RESOLVING response only — the in-class response the continuation
+    /// consumed is never recorded (no inflated value, no wasted double write).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn llm_call_continuation_success_records_only_resolving_usage() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only_with_usage("thinking a", Some("stop"), 1_000, 500)
+                .ok_with_usage("final answer", 200, 300),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent(vec![]);
+        let resp = agent.llm_call().await.expect("continuation must resolve");
+        assert_eq!(resp.text_or_empty(), "final answer");
+        assert_eq!(
+            agent.session.token_length(),
+            Some(500),
+            "only the resolving continuation response (200 + 300) updates the session length"
+        );
+    }
+
+    /// A normal answer or a tool-call turn never enters the continuation path.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn llm_call_skips_continuation_for_normal_and_tool_call_turns() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+
+        {
+            let fake = std::sync::Arc::new(FakeProvider::new().ok("normal answer"));
+            let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+            let _provider_guard = install_fake_provider(provider);
+            let mut agent = make_agent(vec![]);
+            let resp = agent.llm_call().await.expect("normal answer");
+            assert_eq!(resp.text_or_empty(), "normal answer");
+            assert_eq!(
+                fake.request_fingerprints.lock().unwrap().len(),
+                1,
+                "normal answer must not trigger continuation"
+            );
+        }
+        {
+            let fake = std::sync::Arc::new(FakeProvider::new().ok_tool_call("read"));
+            let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+            let _provider_guard = install_fake_provider(provider);
+            let mut agent = make_agent(vec![]);
+            let resp = agent.llm_call().await.expect("tool-call turn");
+            assert!(resp.text_or_empty().is_empty());
+            assert_eq!(resp.tool_calls.len(), 1);
+            assert_eq!(
+                fake.request_fingerprints.lock().unwrap().len(),
+                1,
+                "tool-call turn (empty text) must not trigger continuation"
+            );
+        }
+    }
+
+    /// Summarize recovers a reasoning-only stop via the same bounded
+    /// continuation; the continuation answer becomes the summary.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn summarize_recovers_reasoning_only_stop_via_continuation() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only("thinking about the summary", Some("stop"))
+                .ok("the summary"),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let agent = make_agent(vec![]);
+        let summary = agent.summarize().await.expect("continuation must resolve");
+        assert_eq!(summary, "the summary");
+
+        let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+        assert_eq!(
+            fingerprints.len(),
+            2,
+            "original summary call + one continuation"
+        );
+        assert!(fingerprints[1].contains("Resume your unfinished turn"));
+    }
+
+    /// Summarize continuation exhaustion keeps the fail-open behavior: the
+    /// empty-response error fires (warn + full history in `maybe_summarize`),
+    /// and the thinking never leaks into the error.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn summarize_continuation_exhaustion_fails_open_without_leaking() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok_reasoning_only("summary thinking", Some("stop"))
+                .ok_reasoning_only("summary thinking", Some("stop"))
+                .ok_reasoning_only("summary thinking", Some("stop"))
+                .ok_reasoning_only("summary thinking", Some("stop")),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let agent = make_agent(vec![]);
+        let err = agent
+            .summarize()
+            .await
+            .expect_err("continuation must exhaust");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("summarization"),
+            "fail-open path surfaces the summarization error for maybe_summarize"
+        );
+        assert!(
+            !rendered.contains("summary thinking"),
+            "the thinking must never leak into the summarization error"
+        );
     }
 
     // ── Real provider-token session length semantics ───────────────────

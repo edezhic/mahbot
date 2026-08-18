@@ -1257,7 +1257,12 @@ pub(crate) struct ChatRequestMeta {
     /// Purpose tag: "agent" (agent loop incl. direct chat / discovery /
     /// sub-agents / maintainer), "extraction", "summarize", "consolidate",
     /// "research_wrap_up" (deadline wrap-up extraction), "media_transcription"
-    /// (vision-model transcription of inbound media / video tool results).
+    /// (vision-model transcription of inbound media / video tool results);
+    /// "agent-continuation" / "summarize-continuation" tag the operation-level
+    /// reasoning-only-stop recovery issued by
+    /// [`crate::agent::Agent::recover_reasoning_only_stop`] — one row per
+    /// continuation operation (success on resolution / failure on exhaustion;
+    /// `retry_attempts` carries the attempt count).
     pub purpose: &'static str,
     pub agent_id: String,
     pub role: String,

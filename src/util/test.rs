@@ -122,6 +122,12 @@ pub(crate) struct FakeProvider {
     >,
     /// `Debug` fingerprint of every request received (byte-identity checks).
     pub request_fingerprints: std::sync::Mutex<Vec<String>>,
+    /// `Debug` fingerprint of just each request's message list — the
+    /// byte-stable-prefix property (append-only growth of the continuation
+    /// tail) is asserted on this. Per-message `Debug` joined with NUL (which
+    /// cannot appear in `Debug` output — control chars are escaped), so a
+    /// plain `starts_with` prefix check holds for appended-only growth.
+    pub request_messages: std::sync::Mutex<Vec<String>>,
 }
 
 impl FakeProvider {
@@ -130,6 +136,7 @@ impl FakeProvider {
         Self {
             script: std::sync::Mutex::new(std::collections::VecDeque::new()),
             request_fingerprints: std::sync::Mutex::new(Vec::new()),
+            request_messages: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -149,6 +156,99 @@ impl FakeProvider {
             .push_back(Ok(crate::ChatResponse {
                 text: Some(text.to_string()),
                 finish_reason: finish_reason.map(str::to_string),
+                ..crate::ChatResponse::default()
+            }));
+        self
+    }
+
+    /// Push a scripted reasoning-only response (empty content, no tool calls,
+    /// reasoning fields set) — the reasoning-only-stop class. `reasoning` is
+    /// mirrored into both `reasoning` and `reasoning_content` (the DeepSeek
+    /// wire shape).
+    #[must_use]
+    pub(crate) fn ok_reasoning_only(self, reasoning: &str, finish_reason: Option<&str>) -> Self {
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(Ok(crate::ChatResponse {
+                text: None,
+                reasoning: Some(crate::Reasoning {
+                    reasoning: Some(reasoning.to_string()),
+                    reasoning_content: Some(reasoning.to_string()),
+                    reasoning_details: None,
+                }),
+                finish_reason: finish_reason.map(str::to_string),
+                ..crate::ChatResponse::default()
+            }));
+        self
+    }
+
+    /// Like [`Self::ok_reasoning_only`] but with real provider usage on the
+    /// envelope — a real reasoning-only response always carries usage, and the
+    /// session-length recording tests need usage-bearing fakes.
+    #[must_use]
+    pub(crate) fn ok_reasoning_only_with_usage(
+        self,
+        reasoning: &str,
+        finish_reason: Option<&str>,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Self {
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(Ok(crate::ChatResponse {
+                text: None,
+                reasoning: Some(crate::Reasoning {
+                    reasoning: Some(reasoning.to_string()),
+                    reasoning_content: Some(reasoning.to_string()),
+                    reasoning_details: None,
+                }),
+                finish_reason: finish_reason.map(str::to_string),
+                usage: Some(crate::ProviderUsage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(output_tokens),
+                    ..crate::ProviderUsage::default()
+                }),
+                ..crate::ChatResponse::default()
+            }));
+        self
+    }
+
+    /// Push a scripted successful response with the given text and real
+    /// provider usage (input/output tokens).
+    #[must_use]
+    pub(crate) fn ok_with_usage(self, text: &str, input_tokens: u64, output_tokens: u64) -> Self {
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(Ok(crate::ChatResponse {
+                text: Some(text.to_string()),
+                usage: Some(crate::ProviderUsage {
+                    input_tokens: Some(input_tokens),
+                    output_tokens: Some(output_tokens),
+                    ..crate::ProviderUsage::default()
+                }),
+                ..crate::ChatResponse::default()
+            }));
+        self
+    }
+
+    /// Push a scripted tool-call response (empty text, one tool call) — the
+    /// valid empty-text tool-call turn.
+    #[must_use]
+    pub(crate) fn ok_tool_call(self, name: &str) -> Self {
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(Ok(crate::ChatResponse {
+                text: None,
+                tool_calls: vec![crate::ToolCall {
+                    id: "call_test".to_string(),
+                    name: name.to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                finish_reason: Some("tool_calls".to_string()),
                 ..crate::ChatResponse::default()
             }));
         self
@@ -190,6 +290,14 @@ impl crate::Provider for FakeProvider {
             .lock()
             .unwrap()
             .push(format!("{request:?}"));
+        self.request_messages.lock().unwrap().push(
+            request
+                .messages
+                .iter()
+                .map(|m| format!("{m:?}"))
+                .collect::<Vec<_>>()
+                .join("\u{0}"),
+        );
         self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
             Ok(crate::ChatResponse {
                 text: Some("unscripted default".to_string()),
