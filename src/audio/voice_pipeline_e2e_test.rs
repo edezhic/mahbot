@@ -42,22 +42,12 @@
 //! contracts (e.g. the cooldown gate and accumulation cap in the cooldown
 //! phase).
 //!
-//! # Wake-word optimization sweep (bench-configurable)
+//! # Fixed benchmark phrase
 //!
-//! Every run is shaped by `MAHBOT_BENCH_*` env vars (one run per config,
-//! each run's report records its full config under
-//! `reproducibility.sweep_config`):
-//!
-//! - `MAHBOT_BENCH_WAKE_PHRASE` — phrase pin (takes precedence over the
-//!   deployed config-store phrase; the sweep pins "hey mahbot").
-//! - `MAHBOT_BENCH_GATE_MARGIN` — anti-prototype gate margin δ (f32).
-//! - `MAHBOT_BENCH_NEG_CAP` — distilled anti-prototype cap (usize; 8 vs 64).
-//! - `MAHBOT_BENCH_INJECT_K` — hard-negative injection count k (usize).
-//! - `MAHBOT_BENCH_INJECT_FA_LABELS` — comma-separated variant labels of the
-//!   pinned-phrase baseline's false accepts (from that run's report
-//!   `false_accept_list`); the crossing-frame embeddings of these variants
-//!   are replayed (mining pre-pass) and injected into the anti-prototype
-//!   construction.
+//! Every run tests the fixed bench phrase **"hey mahbot"** — never resolved
+//! from the live config store, never overridable via env.  This keeps
+//! benchmark numbers comparable across runs and guarantees the live personal
+//! enrollment phrase can never drive benchmark runs.
 //!
 //! `MAHBOT_FAPH=1` additionally runs the real-audio false-accept-per-hour
 //! phase (~54 min; corpus already cached).
@@ -65,11 +55,10 @@
 //! First run populates the TTS audio cache (subsequent runs hit it).  The
 //! encoder pipeline re-encodes raw audio through the shared Qwen3-ASR model
 //! per run — there is no embedding disk cache — so the wall clock is dominated
-//! by encoder forwards over the TEST surface (40-clip wake-only basis, SNR
-//! envelope over it, doubled negative pools, wake-over-babble,
-//! owner-negative detection, probe scale-up).  The exact wall clock is
-//! auditable from the top-level `total_wall_time_ms` key (whole run,
-//! report-assembly window included).
+//! by encoder forwards over the TEST surface (40-clip wake-only basis,
+//! doubled negative pools, wake-over-babble, owner-negative detection,
+//! probe scale-up).  The exact wall clock is auditable from the top-level
+//! `total_wall_time_ms` key (whole run, report-assembly window included).
 //!
 //! # Requirements
 //!
@@ -116,32 +105,6 @@ const TOTAL_SCORE_IDX: usize = 0;
 /// = 3 × 0.55 = 1.65.
 const MIN_GATE_THRESHOLD: f32 = super::match_threshold();
 
-// ── Threshold sweep / DET-style aggregate tables ───────────────────────────
-//
-// Calibration-analysis parameters for the report-only sweep sections.  These
-// are report-assembly constants only — the wake-word detection logic,
-// thresholds, and configuration are untouched (the sweep never feeds back
-// into the pipeline).
-
-/// Low end of the candidate-gate sweep range (1.20 ..= 2.00, step 0.01).
-/// Chosen to bracket the operating point with headroom on both sides:
-/// negatives rarely exceed ~1.9, so 2.00 is a clean zero-FA ceiling, and
-/// 1.20 sits well below any realistic deployment gate.
-const SWEEP_GATE_MIN: f32 = 1.20;
-/// High end of the candidate-gate sweep range.
-const SWEEP_GATE_MAX: f32 = 2.00;
-/// Step between candidate gates (0.01 — fine enough for calibration analysis
-/// without drowning the report).
-const SWEEP_GATE_STEP: f32 = 0.01;
-
-/// Absolute low bound of the FA near-miss band `[1.35, 1.65)`.
-///
-/// Negatives whose peak rolling sum lands in this band are within 0.30 of the
-/// operating point ([`MIN_GATE_THRESHOLD`]) without crossing it — the closest
-/// non-FA tail.  The band is absolute and documented (not derived from the
-/// per-run distribution) so runs are comparable.
-const FA_NEAR_MISS_BAND_LOW: f32 = 1.35;
-
 /// Number of samples in the warm-up audio prepended before each test
 /// utterance.
 ///
@@ -156,9 +119,8 @@ const WARMUP_PREPEND_SAMPLES: usize = 20480; // 1.28s × 16 kHz
 /// Speech-like harmonics guarantee the Earshot neural VAD triggers, producing
 /// embeddings for the pre-utterance ring.
 ///
-/// Must NOT contain the wake word ([`wake_word()`] — runtime-resolved from the
-/// deployed config store) or phonetically similar phrases that could trigger
-/// detection.
+/// Must NOT contain the wake word ([`BENCH_WAKE_PHRASE`]) or phonetically
+/// similar phrases that could trigger detection.
 const WARMUP_TTS_PHRASE: &str = "testing one two three";
 
 /// Cached TTS warm-up audio, populated on first successful synthesis.
@@ -168,265 +130,19 @@ const WARMUP_TTS_PHRASE: &str = "testing one two three";
 /// calls (avoids cache poisoning).
 static WARMUP_TTS_CACHE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 
-/// Resolved wake word phrase for this benchmark run (phrase alignment).
+/// The fixed wake phrase every benchmark run synthesizes and tests.
 ///
-/// Resolved once at first use: the bench synthesizes and tests the wake
-/// phrase persisted in the deployed model's config-store entry (the phrase
-/// production actually listens for), falling back to [`WAKE_WORD_FALLBACK`]
-/// only when the config store is unavailable.  The resolved phrase and its
-/// source are reported in the reproducibility section.
-static WAKE_WORD: std::sync::OnceLock<ResolvedPhrase> = std::sync::OnceLock::new();
+/// Pinned so benchmark numbers stay comparable across runs and the live
+/// personal enrollment phrase can never drive benchmark runs (the bench
+/// never reads the deployed config-store phrase).
+const BENCH_WAKE_PHRASE: &str = "hey mahbot";
 
-/// Fallback wake word used when the deployed phrase cannot be read.
-const WAKE_WORD_FALLBACK: &str = "hey mahbot";
-
-/// Resolved wake phrase plus its provenance label.
+/// Maximum number of timestamped report archives kept in `~/.mahbot/`.
 ///
-/// Sources: `"env_override"` (MAHBOT_BENCH_WAKE_PHRASE pin, highest
-/// precedence), `"config_db"` (deployed phrase), `"fallback"`.
-struct ResolvedPhrase {
-    phrase: String,
-    source: &'static str,
-}
-
-/// Resolve the wake phrase for this run (env pin → deployed config-store
-/// phrase → fallback).
-fn wake_word() -> &'static str {
-    WAKE_WORD.get_or_init(resolve_wake_phrase).phrase.as_str()
-}
-
-/// Provenance label for the resolved wake phrase
-/// (`"env_override" | "config_db" | "fallback"`).
-fn wake_phrase_source() -> &'static str {
-    WAKE_WORD.get_or_init(resolve_wake_phrase).source
-}
-
-/// Resolve the deployed wake phrase from the config store, falling back to
-/// the legacy constant when the store read fails or carries no phrase.
-///
-/// `MAHBOT_BENCH_WAKE_PHRASE` (bench phrase pin) takes
-/// precedence over BOTH the deployed config-store phrase and the fallback:
-/// the bench must test a pinned phrase (the user decision for the wake-word
-/// sweep is "hey mahbot" — the live personal enrollment phrase must never
-/// drive bench runs).  The override is normalized like every other phrase;
-/// only an empty/whitespace value falls through to the normal resolution
-/// (`normalize_phrase` never returns empty — it maps empty input to
-/// [`DEFAULT_WAKE_WORD_PHRASE`] — so emptiness is tested on the RAW value,
-/// and an explicit pin of the legacy default phrase "mahbot" is honored,
-/// not conflated with an unset pin).
-fn resolve_wake_phrase() -> ResolvedPhrase {
-    if let Ok(override_phrase) = std::env::var(ENV_BENCH_WAKE_PHRASE)
-        && !override_phrase.trim().is_empty()
-    {
-        return ResolvedPhrase {
-            phrase: super::normalize_phrase(&override_phrase),
-            source: "env_override",
-        };
-    }
-    match read_deployed_wake_phrase() {
-        Some(phrase) if !phrase.is_empty() => ResolvedPhrase {
-            phrase,
-            source: "config_db",
-        },
-        _ => ResolvedPhrase {
-            phrase: WAKE_WORD_FALLBACK.to_string(),
-            source: "fallback",
-        },
-    }
-}
-
-/// Read the deployed model's wake phrase from `config.db` (the
-/// `wake_word_templates` PersistedModel JSON) using the same read-only turso
-/// open the debug CLI uses — never stock sqlite3 on live stores (orphaned-WAL
-/// safety, see the README prevention rule).  Best-effort: any failure returns
-/// `None` and the caller falls back to [`WAKE_WORD_FALLBACK`].
-fn read_deployed_wake_phrase() -> Option<String> {
-    let config_db = crate::config::default_config_dir()
-        .ok()?
-        .join("db")
-        .join("config.db");
-    if !config_db.exists() {
-        return None;
-    }
-    let path = config_db.to_str()?;
-    // `::turso` = the external turso crate (voice.rs's `use crate::turso;`
-    // shadows the bare name in this module via `use super::*`).
-    let io: std::sync::Arc<dyn ::turso::core::IO> =
-        std::sync::Arc::new(::turso::core::PlatformIO::new().ok()?);
-    let db = ::turso::core::Database::open_file_with_flags(
-        io.clone(),
-        path,
-        ::turso::core::OpenFlags::ReadOnly | ::turso::core::OpenFlags::NoLock,
-        crate::turso::experimental_database_opts(),
-        None,
-    )
-    .ok()?;
-    let conn = db.connect().ok()?;
-    let mut stmt = conn
-        .query("SELECT value FROM config_kv WHERE key = 'wake_word_templates'")
-        .ok()??;
-    let mut row_found = false;
-    loop {
-        match stmt.step().ok()? {
-            ::turso::core::StepResult::Row => {
-                row_found = true;
-                break;
-            }
-            ::turso::core::StepResult::IO | ::turso::core::StepResult::Yield => {
-                io.step().ok()?;
-            }
-            ::turso::core::StepResult::Done
-            | ::turso::core::StepResult::Interrupt
-            | ::turso::core::StepResult::Busy => break,
-        }
-    }
-    if !row_found {
-        return None;
-    }
-    let raw: String = stmt.row()?.get_value(0).to_string();
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let phrase = v.get("phrase").and_then(serde_json::Value::as_str)?;
-    Some(super::normalize_phrase(phrase))
-}
-
-// ── Wake-word optimization sweep ─────────────────────────────────────────
-// Decision-level bench configuration: the anti-prototype gate margin δ, the
-// distilled anti-prototype cap, and the hard-negative injection count k with
-// the mined false-accept labels from the pinned-phrase baseline.  All knobs
-// are env-driven (MAHBOT_BENCH_* — the MAHBOT_FAPH precedent) so a sweep is
-// one-run-per-config with no code edits between runs, and every run records
-// its full config in the report's reproducibility.sweep_config section.
-
-/// Env var: bench wake phrase pin (see [`resolve_wake_phrase`]).
-const ENV_BENCH_WAKE_PHRASE: &str = "MAHBOT_BENCH_WAKE_PHRASE";
-/// Env var: anti-prototype gate margin δ (f32; default [`DEFAULT_GATE_MARGIN`]).
-const ENV_BENCH_GATE_MARGIN: &str = "MAHBOT_BENCH_GATE_MARGIN";
-/// Env var: distilled anti-prototype cap (usize; default
-/// [`MAX_NEGATIVE_PROTOTYPES`]).
-const ENV_BENCH_NEG_CAP: &str = "MAHBOT_BENCH_NEG_CAP";
-/// Env var: hard-negative injection count k (usize; 0 = no injection).
-const ENV_BENCH_INJECT_K: &str = "MAHBOT_BENCH_INJECT_K";
-/// Env var: comma-separated variant labels of the pinned-phrase baseline's
-/// false accepts (from the baseline report's `false_accept_list`); the
-/// crossing-frame embeddings of these variants are injected as
-/// anti-prototypes.
-const ENV_BENCH_INJECT_FA_LABELS: &str = "MAHBOT_BENCH_INJECT_FA_LABELS";
-
-/// Bench sweep configuration (env-parameterized, one run per config).
-///
-/// Parsed once per run from the `MAHBOT_BENCH_*` env vars; every knob is
-/// recorded in the report so each archived run is self-describing.  Invalid
-/// env values WARN at runtime and fall back to the production default
-/// (fail-open — a typo'd run still produces a report; the report records the
-/// RESULTING values, so a fallback is only distinguishable from an
-/// intentional default via the runtime warn).
-struct SweepConfig {
-    /// Anti-prototype gate margin δ (see [`WakeWordEnrollment::gate_margin`]).
-    gate_margin: f32,
-    /// Distilled anti-prototype cap (see
-    /// [`distill_negative_prototypes_capped`]).
-    neg_cap: usize,
-    /// Hard-negative injection count (0 = no injection).
-    inject_k: usize,
-    /// Mined false-accept variant labels (from the pinned-phrase baseline's
-    /// `false_accept_list`); empty when injection is disabled.
-    inject_labels: Vec<String>,
-}
-
-impl Default for SweepConfig {
-    fn default() -> Self {
-        Self {
-            gate_margin: crate::audio::wake_word::DEFAULT_GATE_MARGIN,
-            neg_cap: crate::audio::wake_word::MAX_NEGATIVE_PROTOTYPES,
-            inject_k: 0,
-            inject_labels: Vec::new(),
-        }
-    }
-}
-
-impl SweepConfig {
-    /// Parse the sweep config from the environment (fail-open on bad values).
-    fn from_env() -> Self {
-        let mut cfg = Self::default();
-        let mut overrides: Vec<(&'static str, String)> = Vec::new();
-
-        if let Ok(raw) = std::env::var(ENV_BENCH_GATE_MARGIN) {
-            match raw.trim().parse::<f32>() {
-                Ok(v) if v.is_finite() && v >= 0.0 => {
-                    cfg.gate_margin = v;
-                    overrides.push((ENV_BENCH_GATE_MARGIN, raw));
-                }
-                _ => warn!(
-                    "Ignoring invalid {ENV_BENCH_GATE_MARGIN}={raw:?} (expected a finite f32 >= 0) — \
-                     using default δ={}",
-                    cfg.gate_margin,
-                ),
-            }
-        }
-        if let Ok(raw) = std::env::var(ENV_BENCH_NEG_CAP) {
-            if let Ok(v) = raw.trim().parse::<usize>() {
-                cfg.neg_cap = v;
-                overrides.push((ENV_BENCH_NEG_CAP, raw));
-            } else {
-                warn!(
-                    "Ignoring invalid {ENV_BENCH_NEG_CAP}={raw:?} (expected a usize) — \
-                     using default cap={}",
-                    cfg.neg_cap,
-                );
-            }
-        }
-        if let Ok(raw) = std::env::var(ENV_BENCH_INJECT_K) {
-            if let Ok(v) = raw.trim().parse::<usize>() {
-                cfg.inject_k = v;
-                overrides.push((ENV_BENCH_INJECT_K, raw));
-            } else {
-                warn!(
-                    "Ignoring invalid {ENV_BENCH_INJECT_K}={raw:?} (expected a usize) — \
-                     using default k={}",
-                    cfg.inject_k,
-                );
-            }
-        }
-        if let Ok(raw) = std::env::var(ENV_BENCH_INJECT_FA_LABELS)
-            && !raw.trim().is_empty()
-        {
-            let labels: Vec<String> = raw
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-            cfg.inject_labels = labels;
-            overrides.push((ENV_BENCH_INJECT_FA_LABELS, raw));
-        }
-        // Injection with k=0 or no labels is a no-op — record it as such so
-        // the report is unambiguous (k=0 without labels is the standard run).
-        if cfg.inject_k > 0 && cfg.inject_labels.is_empty() {
-            warn!(
-                "{ENV_BENCH_INJECT_K}={} set without {ENV_BENCH_INJECT_FA_LABELS} — \
-                 injection is a no-op (no mined labels to inject)",
-                cfg.inject_k,
-            );
-            cfg.inject_k = 0;
-        }
-        if !overrides.is_empty() {
-            info!(
-                "Sweep config: {}",
-                overrides
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-        }
-        cfg
-    }
-
-    /// Whether the hard-negative injection pre-pass must run.
-    fn injection_enabled(&self) -> bool {
-        self.inject_k > 0 && !self.inject_labels.is_empty()
-    }
-}
+/// Old runs are explicitly not a reference for the current run (one run is
+/// sufficient), so archives older than the most recent [`ARCHIVE_RETENTION`]
+/// are deleted after each archive write.
+const ARCHIVE_RETENTION: usize = 10;
 
 /// Number of enrollment variants to generate.
 ///
@@ -566,11 +282,6 @@ impl GuidedPromptGroup {
 /// banner; the 0.2 granularity reflects the 40-clip wake-only held-out recall
 /// set, where each miss costs roughly 2.5 percentage points.
 const MIN_DETECTION_RATE: f64 = 0.60;
-
-/// Acceptance-basis prefix for the current report series.
-/// `cross_run_summary` filters archives by this so v3 (enlarged 40-clip basis)
-/// runs never mix with v2 16-clip archives in the ≥3-run spread.
-const ACCEPTANCE_BASIS_PREFIX: &str = "held_out_recall_v3";
 
 // Per-category false accept limits are now dynamic by tier — see
 // [`tier_limits`] and [`BenchTier`].
@@ -1056,7 +767,7 @@ fn generate_enrollment_variants_cached(
     for i in 0..NUM_ENROLLMENT_VARIANTS {
         let seed = 100 + i as u64;
         if let Some(pcm) = synthesize_wake_word_variant_cached(
-            wake_word(),
+            BENCH_WAKE_PHRASE,
             enrolled_style,
             seed,
             TARGET_SAMPLE_RATE,
@@ -1093,7 +804,7 @@ fn generate_held_out_recall_clips_cached(
     for i in 0..HELD_OUT_WAKE_ONLY_CLIPS {
         let seed = 3000 + i as u64;
         if let Some(pcm) = synthesize_wake_word_variant_cached(
-            wake_word(),
+            BENCH_WAKE_PHRASE,
             enrolled_style,
             seed,
             TARGET_SAMPLE_RATE,
@@ -1119,7 +830,7 @@ fn generate_canary_clips_cached(
     for (i, style) in canary_styles.iter().enumerate() {
         let seed = 6000 + i as u64 * 100;
         if let Some(pcm) = synthesize_wake_word_variant_cached(
-            wake_word(),
+            BENCH_WAKE_PHRASE,
             style,
             seed,
             TARGET_SAMPLE_RATE,
@@ -1146,7 +857,7 @@ fn generate_cross_speaker_probe_clips_cached(
         for s in 0..seeds_per_voice {
             let seed = 5000 + voice_idx as u64 * 100 + s as u64;
             if let Some(pcm) = synthesize_wake_word_variant_cached(
-                wake_word(),
+                BENCH_WAKE_PHRASE,
                 style,
                 seed,
                 TARGET_SAMPLE_RATE,
@@ -2758,11 +2469,12 @@ fn gt_to_json(gt: &GateTriggerMetrics) -> serde_json::Value {
     })
 }
 
-/// Full per-variant diagnostics for BOTH positive and negative variants.
-/// Negatives historically omitted per-frame scores, VAD detail and
-/// trigger-frame info — false-accept root-causing was impossible
-/// without them.  For positives (`category: None`) the exhaustive miss verdict
-/// and trigger-point evidence are added.
+/// Full per-variant diagnostics for BOTH positive and negative variants:
+/// per-variant scalars only (peak/rolling-sum scores, frame counts, VAD
+/// detail, trigger-frame evidence, latency) — the per-frame score arrays
+/// are intentionally NOT dumped into the report (they made reports multi-MB).
+/// For positives (`category: None`) the exhaustive miss verdict and
+/// trigger-point evidence are added.
 fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert(
@@ -2794,10 +2506,6 @@ fn pv_to_json(pv: &PerVariantResult, category: Option<&str>) -> serde_json::Valu
     obj.insert(
         "vad_speech_frames".to_string(),
         serde_json::json!(pv.vad_speech_frames),
-    );
-    obj.insert(
-        "per_frame_scores".to_string(),
-        serde_json::json!(pv.per_frame_scores),
     );
     obj.insert("per_hop_vad".to_string(), serde_json::json!(pv.per_hop_vad));
     obj.insert(
@@ -2876,226 +2584,6 @@ fn score_stats(scores: &[f32]) -> (f32, f32, f32, Option<[f32; 10]>) {
     let min = scores.iter().copied().fold(f32::MAX, f32::min);
     let max = scores.iter().copied().fold(f32::MIN, f32::max);
     (mean, min, max, deciles(scores))
-}
-
-// ── Threshold sweep / DET-style aggregate tables ──────────────────────────
-
-/// Candidate gate values for the threshold sweep: [`SWEEP_GATE_MIN`] ..=
-/// [`SWEEP_GATE_MAX`] in [`SWEEP_GATE_STEP`] steps.
-///
-/// Generated from an integer loop so the floating-point accumulation is exact
-/// (1.20 + i × 0.01), and the operating point ([`MIN_GATE_THRESHOLD`] = 1.65)
-/// always lands on a candidate (1.20 + 45 × 0.01).  That candidate is
-/// bit-exact with the real gate: the f32 multiply-add `1.20 + 45 × 0.01`
-/// rounds to the same value as `3 × 0.55` (both 1.6500001), so the
-/// operating-point sweep row uses exactly [`MIN_GATE_THRESHOLD`].  (The
-/// f32-nearest decimal 1.65 — the bare literal `1.65_f32` — is 1 ulp below
-/// the gate and is correctly NOT a crossing there, matching the real pipeline
-/// and the near-miss band.)
-fn sweep_gates() -> Vec<f32> {
-    let n = ((SWEEP_GATE_MAX - SWEEP_GATE_MIN) / SWEEP_GATE_STEP).round() as usize;
-    (0..=n)
-        .map(|i| SWEEP_GATE_MIN + i as f32 * SWEEP_GATE_STEP)
-        .collect()
-}
-
-/// DET-style sweep rows over a sample distribution.
-///
-/// For each candidate gate, the count (and rate) of samples whose value is
-/// `>=` the gate.  Monotonic: as the gate rises, crossings never increase —
-/// this is the score-gate (rolling-sum) series, DET-compatible by
-/// construction.  Empty samples yield all-zero rows with `rate: 0.0`.
-fn sweep_rows(gates: &[f32], samples: &[f32]) -> Vec<serde_json::Value> {
-    let total = samples.len();
-    gates
-        .iter()
-        .map(|&g| {
-            let crossings = samples.iter().filter(|&&s| s >= g).count();
-            serde_json::json!({
-                "gate": g,
-                "crossings": crossings,
-                "rate": if total > 0 {
-                    crossings as f64 / total as f64
-                } else {
-                    0.0
-                },
-            })
-        })
-        .collect()
-}
-
-/// The standard sweep-section shape: `{"n": <sample count>, "rows": <sweep rows>}`.
-///
-/// Every grouped sweep in the report (acceptance basis, per-SNR-cell cells,
-/// tiers, categories) wraps its rows this way; the helper keeps the wrapper
-/// defined once.  Callers that need extra fields (e.g. a `note`) insert them
-/// into the returned map.
-fn sweep_section(gates: &[f32], samples: &[f32]) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert("n".to_string(), serde_json::json!(samples.len()));
-    map.insert(
-        "rows".to_string(),
-        serde_json::Value::Array(sweep_rows(gates, samples)),
-    );
-    map
-}
-
-/// Distribution summary that supplements the midpoint-index deciles with the
-/// true tail: `{n, mean, min, max, deciles}`.
-///
-/// Midpoint-index deciles hide the extreme values (the negative tail and the
-/// FA/non-FA boundary), so every distribution reported for calibration
-/// analysis carries min/max alongside the kept deciles.  Empty input emits
-/// `null` mean/min/max and `null` deciles.
-fn distribution_stats(samples: &[f32]) -> serde_json::Value {
-    let (mean, min, max, deciles) = score_stats(samples);
-    serde_json::json!({
-        "n": samples.len(),
-        "mean": if samples.is_empty() { serde_json::Value::Null } else { serde_json::json!(mean) },
-        "min": if samples.is_empty() { serde_json::Value::Null } else { serde_json::json!(min) },
-        "max": if samples.is_empty() { serde_json::Value::Null } else { serde_json::json!(max) },
-        "deciles": deciles,
-    })
-}
-
-/// Peak rolling sum from a JSON per-frame `window_scores` array
-/// (`[total_score, rolling_sum, threshold]` triples — see [`ROLLING_SUM_IDX`]).
-///
-/// Used by the report assembly to re-derive the acceptance-basis peak rolling
-/// sum from the already-stored per-variant frame data (no new raw dumps).
-fn max_rolling_sum_json(window_scores: &[serde_json::Value]) -> f32 {
-    window_scores
-        .iter()
-        .filter_map(|frame| {
-            frame
-                .as_array()
-                .and_then(|tri| tri.get(ROLLING_SUM_IDX))
-                .and_then(serde_json::Value::as_f64)
-                .map(|v| v as f32)
-        })
-        .fold(0.0_f32, f32::max)
-}
-
-/// Peak rolling sums per variant from a JSON `per_variant` array whose
-/// entries carry either `max_rolling_sum` directly (pv_to_json shape) or
-/// `window_scores` (enrolled-speaker shape — re-derived via
-/// [`max_rolling_sum_json`]).
-fn peak_rolling_sums_from_json(per_variant: &[serde_json::Value]) -> Vec<f32> {
-    per_variant
-        .iter()
-        .filter_map(|v| {
-            if let Some(rs) = v.get("max_rolling_sum").and_then(serde_json::Value::as_f64) {
-                return Some(rs as f32);
-            }
-            v.get("window_scores")
-                .and_then(serde_json::Value::as_array)
-                .map(|ws| max_rolling_sum_json(ws))
-        })
-        .collect()
-}
-
-/// FA near-miss canary band: negatives whose peak rolling sum
-/// (`max_rolling_sum`) lands in the absolute band
-/// `[FA_NEAR_MISS_BAND_LOW, MIN_GATE_THRESHOLD)` — just below the operating
-/// point.
-///
-/// The report key for this is `fa_near_miss_band` — deliberately NOT in the
-/// `near_miss_canaries` name family used by [`safety_gate`] (which counts
-/// *negatives* whose peak rolling sum crossed the gate — `>=` the operating
-/// point — without an end-to-end detection); this band lists the negatives
-/// just BELOW the gate, the closest non-FA tail.
-///
-/// Returns `None` when no negative is in the band so the report key is absent
-/// (no empty stubs).  Otherwise reports the count plus the list of variant
-/// ids, sorted by peak rolling sum descending (closest to the gate first).
-fn fa_near_miss_band(all_neg_pv: &[(&PerVariantResult, String)]) -> Option<serde_json::Value> {
-    let mut near_misses: Vec<&PerVariantResult> = all_neg_pv
-        .iter()
-        .filter(|(pv, _)| {
-            pv.max_rolling_sum >= FA_NEAR_MISS_BAND_LOW && pv.max_rolling_sum < MIN_GATE_THRESHOLD
-        })
-        .map(|(pv, _)| *pv)
-        .collect();
-    if near_misses.is_empty() {
-        return None;
-    }
-    near_misses.sort_by(|a, b| {
-        b.max_rolling_sum
-            .partial_cmp(&a.max_rolling_sum)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Some(serde_json::json!({
-        "band": [FA_NEAR_MISS_BAND_LOW, MIN_GATE_THRESHOLD],
-        "count": near_misses.len(),
-        "variant_ids": near_misses.iter().map(|pv| pv.variant.clone()).collect::<Vec<_>>(),
-        "note": format!(
-            "Negatives whose peak rolling sum is in the absolute near-miss band \
-             [{FA_NEAR_MISS_BAND_LOW:.2}, {MIN_GATE_THRESHOLD:.2}) — below the operating \
-             point without crossing it.  These are the closest non-FA negatives to the \
-             gate; review them before lowering the threshold.  Sorted by peak rolling \
-             sum descending (closest to the gate first).  Distinct from \
-             safety_gate.near_miss_canaries (negatives that crossed the gate, >= the \
-             operating point, without an end-to-end detection) — this band is the \
-             negatives just BELOW the gate, the FA near-miss boundary."
-        ),
-    }))
-}
-
-/// Split a negative variant's all_neg_pv category tag into its condition
-/// parts: `(category, tier, seed_band)`, each optional.
-///
-/// Confusable tags are `"{band}_{tier}"` (e.g. `"confusable2_hard"`) — the
-/// tier is the remainder after the band prefix (tiers contain no `_`), the
-/// seed band is the label prefix (`"confusable"` / `"confusable2"`).  The
-/// other categories are bare (`"unrelated"`, `"silence"`, `"noise"`); seed
-/// bands for unrelated are recovered from the variant label prefix
-/// (`"unrelated2_"`).
-fn neg_condition<'a>(cat: &'a str, variant: &str) -> (&'static str, Option<&'a str>, &'static str) {
-    if let Some(tier) = cat.strip_prefix("confusable2_") {
-        return ("confusable", Some(tier), "confusable2");
-    }
-    if let Some(tier) = cat.strip_prefix("confusable_") {
-        return ("confusable", Some(tier), "confusable");
-    }
-    if cat == "unrelated" {
-        let band = if variant.starts_with("unrelated2_") {
-            "unrelated2"
-        } else {
-            "unrelated"
-        };
-        return ("unrelated", None, band);
-    }
-    // Bare categories: silence / noise (no tier, no seed band).  The tag set
-    // is closed (constructed in the benchmark's report-assembly caller), so
-    // an unknown tag is a coding error — surface it in the run log instead of
-    // silently absorbing it into "other".
-    match cat {
-        "silence" => ("silence", None, ""),
-        "noise" => ("noise", None, ""),
-        other => {
-            warn!(
-                "voice_pipeline_e2e report: unknown negative category tag {other:?} \
-                 (expected a closed set: silence/noise/confusable_*/confusable2_*/unrelated) — \
-                 grouped as 'other'"
-            );
-            ("other", None, "")
-        }
-    }
-}
-
-/// Peak rolling sums of the detected (`fa`) and non-detected (`non_fa`)
-/// negatives — the FA-vs-non-FA boundary evidence.
-fn neg_fa_split(all_neg_pv: &[(&PerVariantResult, String)]) -> (Vec<f32>, Vec<f32>) {
-    let mut fa = Vec::new();
-    let mut non_fa = Vec::new();
-    for (pv, _) in all_neg_pv {
-        if pv.detected {
-            fa.push(pv.max_rolling_sum);
-        } else {
-            non_fa.push(pv.max_rolling_sum);
-        }
-    }
-    (fa, non_fa)
 }
 
 /// Identify the PCM augmentation type from a variant label.
@@ -3226,22 +2714,11 @@ fn test_detection_samples(
     }
 }
 
-// ── Hard-negative mining + injection ─────────────────────────────────────
-// Two-phase workflow: the pinned-phrase BASELINE run (k=0, δ=0, cap 8)
-// identifies the phrase's own false accepts (report `false_accept_list`).
-// Injection runs pass those labels via MAHBOT_BENCH_INJECT_FA_LABELS + k via
-// MAHBOT_BENCH_INJECT_K; this pre-pass replays the negative corpus with the
-// PLAIN baseline enrollment (set globally), captures the crossing-frame
-// window embeddings of the labeled variants, and the final enrollment is
-// rebuilt with the injected anti-prototypes appended AFTER the cap-distilled
-// set (injection bypasses farthest-point distillation by construction).
-
 /// The full negative detection corpus, in the exact order the detection
 /// phases consume it (confusable band 800, confusable band 810, unrelated
 /// band 900, unrelated band 910, silence, noise profiles).  Built ONCE by
-/// [`build_negative_corpus`] and consumed by BOTH the detection phases
-/// (Phase 8-11) and the mining pre-pass, so the replay order can never
-/// silently desync from the live phases.
+/// [`build_negative_corpus`] and consumed by the detection phases
+/// (Phase 8-11).
 struct NegativeCorpus {
     /// Confusable band 800 + confusable2 band 810 (merged, phase order).
     confusable: Vec<(Vec<f32>, String)>,
@@ -3251,20 +2728,6 @@ struct NegativeCorpus {
     silence: Vec<(Vec<f32>, String)>,
     /// Noise profiles ([`all_noise_profiles`]).
     noise: Vec<(Vec<f32>, String)>,
-}
-
-impl NegativeCorpus {
-    /// Flat ordered view — the exact order the detection phases consume the
-    /// corpus (confusable, unrelated, silence, noise).  The mining pre-pass
-    /// replays THIS order so the shared adaptive threshold evolves through
-    /// the same variant sequence a real run's negative phases see.
-    fn variants(&self) -> impl Iterator<Item = &(Vec<f32>, String)> {
-        self.confusable
-            .iter()
-            .chain(&self.unrelated)
-            .chain(&self.silence)
-            .chain(&self.noise)
-    }
 }
 
 /// Build the negative detection corpus with the same generators and seed
@@ -3320,154 +2783,6 @@ fn build_negative_corpus(
         silence,
         noise,
     }
-}
-
-/// A single mined crossing-frame embedding candidate.
-struct MinedCrossingFrame {
-    /// 1024-dim L2-normalized window embedding of a crossing frame.
-    embedding: Vec<f32>,
-    /// The frame's soft total score — the anti-prototype relevance measure
-    /// used to order candidates (highest first = hardest false-accept frame).
-    total_score: f32,
-}
-
-/// Indices of a variant's "crossing frames" within the instrumentation's
-/// per-frame arrays.
-///
-/// Crossing frames = the frames whose rolling sum crossed the gate: the
-/// trigger frame plus the preceding [`ROLLING_WINDOW_N`]-1 frames (the
-/// score window at trigger time).  When the replay does not reproduce the
-/// trigger (adaptive-state drift vs the baseline run), falls back to the
-/// [`ROLLING_WINDOW_N`] frames with the highest rolling sums — the
-/// near-crossing frames, which are the same acoustic windows shifted by at
-/// most a stride or two.
-fn crossing_frame_indices(instr: &super::DetectionInstrumentation) -> Vec<usize> {
-    const N: usize = super::ROLLING_WINDOW_N;
-    if let Some(t) = instr.first_trigger_frame_idx {
-        let lo = t.saturating_sub(N - 1);
-        return (lo..=t)
-            .filter(|&i| i < instr.per_frame_scores.len())
-            .collect();
-    }
-    // No trigger reproduced: top-N frames by rolling sum (ties → earliest).
-    let mut idx: Vec<usize> = (0..instr.per_frame_scores.len()).collect();
-    idx.sort_by(|&a, &b| {
-        instr.per_frame_scores[b][ROLLING_SUM_IDX]
-            .partial_cmp(&instr.per_frame_scores[a][ROLLING_SUM_IDX])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
-    idx.truncate(N);
-    idx
-}
-
-/// Mining pre-pass: replay the full negative corpus with the PLAIN baseline
-/// enrollment (set globally for the replay — `handle_wake_word_detection`
-/// reads it from `voice_state()`), capture the crossing-frame embeddings of
-/// the labeled false-accept variants, and return the top-`k` candidates by
-/// frame soft score (hardest first).  Deterministic: the corpus, replay
-/// order, and shared warmed adaptive state are all fixed.
-///
-/// Fidelity note: the replay starts from a fresh [`AdaptiveThresholdState`]
-/// [`warmed()`](super::AdaptiveThresholdState::warmed()) while the baseline
-/// run's Phase 8 began AFTER Phase 7's warm pass had evolved the SHARED
-/// adaptive state — so the replay is an approximation of the baseline's
-/// negative phases (a labeled FA's trigger may not reproduce exactly).
-/// [`crossing_frame_indices`] falls back to the top-N near-crossing frames
-/// when that happens, and the final detection phases measure the honest
-/// outcome under the injected enrollment.
-///
-/// Selection note: candidates are NOT deduplicated across variants — when k
-/// exceeds the number of distinct labeled FAs, consecutive frames of one
-/// variant's crossing window can contribute several near-duplicate
-/// embeddings (a deliberate simplicity; the measured winner's results were
-/// produced with this selection).
-///
-/// The caller must restore the final (injected) enrollment afterwards
-/// (Phase 5 does this).
-fn mine_fa_crossing_embeddings(
-    labels: &std::collections::HashSet<String>,
-    k: usize,
-    enrollment: &crate::audio::wake_word::WakeWordEnrollment,
-    corpus: &NegativeCorpus,
-) -> Vec<MinedCrossingFrame> {
-    let total = corpus.variants().count();
-    info!(
-        "Mining pre-pass: replaying {total} negative variants with the PLAIN baseline \
-         enrollment (inject k={k}, {} labeled FAs)",
-        labels.len(),
-    );
-    super::set_enrollment(enrollment.clone());
-    // Same shared-state design as the negative phases: one warmed adaptive
-    // state carried across variants (boundary-fire snapshot propagation).
-    let mut shared_adaptive = super::AdaptiveThresholdState::warmed();
-    let mut candidates: Vec<MinedCrossingFrame> = Vec::new();
-
-    for (i, (samples, label)) in corpus.variants().enumerate() {
-        let mut ctx = super::PipelineCtx::new();
-        ctx.adaptive_threshold = shared_adaptive.clone();
-        consume_warmup(&mut ctx);
-        let result = run_streaming_detection(samples, &mut ctx);
-        // Propagate the adaptive state exactly like test_detection_samples.
-        let boundary_fired = !result.detected && ctx.score_window.is_empty();
-        shared_adaptive = if boundary_fired {
-            result.adaptive_state_pre_flush.clone()
-        } else {
-            ctx.adaptive_threshold.clone()
-        };
-        if labels.contains(label) {
-            for idx in crossing_frame_indices(&ctx.instrumentation) {
-                let Some(emb) = ctx.instrumentation.per_frame_embeddings.get(idx) else {
-                    // Alignment guard: per_frame_embeddings must mirror
-                    // per_frame_scores; a mismatch is a coding error.
-                    warn!(
-                        "Mining: variant {label} frame {idx} missing embedding \
-                         (scores={}, embeddings={}) — skipping frame",
-                        ctx.instrumentation.per_frame_scores.len(),
-                        ctx.instrumentation.per_frame_embeddings.len(),
-                    );
-                    continue;
-                };
-                candidates.push(MinedCrossingFrame {
-                    embedding: emb.clone(),
-                    total_score: ctx.instrumentation.per_frame_scores[idx][TOTAL_SCORE_IDX],
-                });
-            }
-        }
-        if (i + 1).is_multiple_of(50) {
-            info!(
-                "  Mining replay: {}/{} variants, {} crossing-frame candidates so far",
-                i + 1,
-                total,
-                candidates.len(),
-            );
-        }
-    }
-
-    if candidates.is_empty() {
-        warn!(
-            "Mining pre-pass produced NO crossing-frame candidates from {} labeled FAs \
-             (k={k}) — injection is a no-op despite being requested; verify the FA labels \
-             come from THIS phrase's baseline report",
-            labels.len(),
-        );
-    }
-
-    // Hardest first: frame soft score descending, ties by variant order.
-    candidates.sort_by(|a, b| {
-        b.total_score
-            .partial_cmp(&a.total_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mined = candidates.len();
-    candidates.truncate(k);
-    let selected = candidates.len();
-    info!(
-        "Mining pre-pass: {mined} crossing-frame candidates from {} labeled FAs, \
-         selected {selected} (k={k} requested, capped at available) by frame soft score",
-        labels.len(),
-    );
-    candidates
 }
 
 // ── Noise-overlapped detection test ─────────────────────────
@@ -3882,7 +3197,6 @@ fn run_enrolled_speaker_phase(held_out_clips: &[(Vec<f32>, String)]) -> serde_js
                 "variant": v.variant,
                 "detected": v.detected,
                 "latency_ms": v.latency_ms,
-                "window_scores": v.per_frame_scores,
                 "miss_verdict": v.miss_verdict.map(MissVerdict::as_str),
             })
         })
@@ -3931,9 +3245,8 @@ fn run_enrolled_speaker_phase(held_out_clips: &[(Vec<f32>, String)]) -> serde_js
                     for the held-out recall binomial proportion."})
             }),
             "target": format!(
-                "mean held-out recall >= {:.0}% (MIN_DETECTION_RATE) across >= 3 FRESH runs \
-                 of the final staged code — per-run end-to-end detection (detected_live) on \
-                 unseen enrolled-voice wake-only renderings",
+                "held-out recall >= {:.0}% (MIN_DETECTION_RATE) per run — end-to-end \
+                 detection (detected_live) on unseen enrolled-voice wake-only renderings",
                 MIN_DETECTION_RATE * 100.0,
             ),
             "note": "detected_live = end-to-end through the real cold pass (the \
@@ -3945,8 +3258,8 @@ fn run_enrolled_speaker_phase(held_out_clips: &[(Vec<f32>, String)]) -> serde_js
             "note": "The encoder pipeline has a SINGLE scoring path (the \
                      stride-gated trailing-window encode + rolling-sum gate); \
                      every end-to-end detection goes through it.  Acceptance \
-                     compares mean held-out recall against MIN_DETECTION_RATE \
-                     across >= 3 fresh runs via this single path.",
+                     compares per-run held-out recall against MIN_DETECTION_RATE \
+                     via this single path.",
         },
         "latency": {
             "detected_path_ms": detected_latencies,
@@ -4002,8 +3315,8 @@ fn safety_gate(all_neg_pv: &[(&PerVariantResult, String)]) -> serde_json::Value 
         "end_to_end_false_accepts": false_accepts.len(),
         "false_accept_list": false_accepts,
         "acceptance": format!(
-            "<= {allowance} false accepts (5% of the {total}-negative corpus) across \
-             >= 3 fresh runs.  Gate crossings without an end-to-end detection do NOT \
+            "<= {allowance} false accepts (5% of the {total}-negative corpus) in a single \
+             fresh run.  Gate crossings without an end-to-end detection do NOT \
              count as false accepts.",
             allowance = (total as f64 * 0.05).ceil() as usize,
             total = total,
@@ -4120,165 +3433,6 @@ fn deployability_json(
         }),
         (passed, total, required, would_pass),
     )
-}
-
-/// Numeric distribution summary (n / values / mean / min / max / p50 / p90).
-/// Non-finite values (NaN from a "not measured" metric) are dropped; empty
-/// input yields `{"n": 0}` — callers treat that as "not measured".
-fn numeric_distribution(values: &[f64]) -> serde_json::Value {
-    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
-    if finite.is_empty() {
-        return serde_json::json!({"n": 0});
-    }
-    let mut sorted = finite.clone();
-    sorted.sort_by(f64::total_cmp);
-    let pct = |q: f64| -> f64 {
-        let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
-        sorted[idx]
-    };
-    serde_json::json!({
-        "n": sorted.len(),
-        "values": sorted,
-        "mean": sorted.iter().sum::<f64>() / sorted.len() as f64,
-        "min": sorted[0],
-        "max": sorted[sorted.len() - 1],
-        "p50": pct(0.5),
-        "p90": pct(0.9),
-    })
-}
-
-/// Summarize the last N archived benchmark reports so the documented ≥3-run
-/// acceptance protocol is self-documenting in every report (no manual archive
-/// digging).
-///
-/// Bounded to the 3 most recent PRE-EXISTING timestamped archives (the
-/// current run's archive is written after this summary is computed) so the
-/// default-run budget is unaffected — 3 × ~3 MB JSON parses, tens of ms.
-/// Corrupt/unreadable archives are skipped (the count says how many were
-/// usable).  Archives are additionally filtered by acceptance basis
-/// ([`ACCEPTANCE_BASIS_PREFIX`]) so v3 enlarged-basis runs never mix with v2
-/// 16-clip archives in the ≥3-run spread, and by the CURRENT run's resolved
-/// wake phrase so runs of a different phrase (e.g. the pinned 'hey mahbot'
-/// sweep vs the live personal enrollment phrase) never mix in the ≥3-run
-/// spread either.
-#[expect(clippy::too_many_lines)]
-fn cross_run_summary(current_phrase: &str) -> serde_json::Value {
-    let Ok(report_dir) = crate::config::default_config_dir() else {
-        return serde_json::json!({"archives_found": 0, "note": "report dir unavailable"});
-    };
-    let mut archives: Vec<std::path::PathBuf> = std::fs::read_dir(&report_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                // Timestamped archives only (`.20<yy><mm><dd>-<hh><mm><ss>`);
-                // the live report.json and .prior.json are not per-run archives.
-                n.starts_with("voice_pipeline_e2e_report.20")
-                    && std::path::Path::new(n)
-                        .extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("json"))
-            })
-        })
-        .collect();
-    archives.sort();
-    // Keep only the most recent 3 (timestamped names sort chronologically) —
-    // capture the pre-drain count so `archives_total_on_disk` reflects the
-    // true on-disk count, not the bounded subset.
-    let archives_total_on_disk = archives.len();
-    if archives.len() > 3 {
-        archives.drain(..archives.len() - 3);
-    }
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-    let mut fracs: Vec<f64> = Vec::new();
-    let mut fas: Vec<f64> = Vec::new();
-    let mut self_test_passed: Vec<bool> = Vec::new();
-    let mut phrases: Vec<String> = Vec::new();
-    for path in &archives {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?")
-            .to_string();
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let basis = v
-            .pointer("/enrolled_speaker/acceptance/basis")
-            .and_then(serde_json::Value::as_str);
-        // Basis filter: only archives from the current acceptance
-        // series enter the ≥3-run spread — v2 wake-only runs never mix with v1
-        // 24-clip archives.
-        if !basis.is_some_and(|b| b.starts_with(ACCEPTANCE_BASIS_PREFIX)) {
-            continue;
-        }
-        let phrase = v
-            .pointer("/reproducibility/wake_phrase/used")
-            .and_then(serde_json::Value::as_str);
-        // Phrase filter: only archives of the CURRENT run's phrase enter the
-        // spread (the pinned 'hey mahbot' sweep must not mix with runs of the
-        // live personal enrollment phrase — acoustic targets differ).
-        if phrase.is_none_or(|p| p != current_phrase) {
-            continue;
-        }
-        let frac = v
-            .pointer("/enrolled_speaker/acceptance/detected_live_frac")
-            .and_then(serde_json::Value::as_f64);
-        let total_fa = v
-            .get("total_false_accepts")
-            .and_then(serde_json::Value::as_u64);
-        let st = v
-            .get("self_test")
-            .and_then(|s| s.get("passed"))
-            .and_then(serde_json::Value::as_bool);
-        if let Some(f) = frac {
-            fracs.push(f);
-        }
-        if let Some(f) = total_fa {
-            fas.push(f as f64);
-        }
-        if let Some(b) = st {
-            self_test_passed.push(b);
-        }
-        if let Some(s) = phrase {
-            phrases.push(s.to_string());
-        }
-        rows.push(serde_json::json!({
-            "archive": name,
-            "enrolled_detected_live_frac": frac,
-            "acceptance_basis": basis,
-            "total_false_accepts": total_fa,
-            "self_test_passed": st,
-            "wake_phrase_used": phrase,
-        }));
-    }
-    serde_json::json!({
-        "archives_found": rows.len(),
-        "archives_total_on_disk": archives_total_on_disk,
-        "per_run": rows,
-        "distribution": {
-            "enrolled_detected_live_frac": numeric_distribution(&fracs),
-            "total_false_accepts": numeric_distribution(&fas),
-            "self_test_passed": serde_json::json!({
-                "n": self_test_passed.len(),
-                "values": self_test_passed,
-            }),
-            "wake_phrase_used": serde_json::json!({
-                "n": phrases.len(),
-                "values": phrases,
-            }),
-        },
-        "note": "Last 3 pre-existing timestamped archives, filtered to the current \
-                 acceptance basis (ACCEPTANCE_BASIS_PREFIX) AND the current run's \
-                 wake phrase (different-phrase runs — e.g. the pinned 'hey mahbot' \
-                 sweep vs the live personal enrollment phrase — never mix).  Until \
-                 3 runs with the current basis+phrase accumulate, the spread is \
-                 partial.",
-    })
 }
 
 /// Env-gated FAPH phase: real-audio false-acceptance-per-hour bench.
@@ -4791,7 +3945,6 @@ fn faph_merge_events(events: &[f64], cooldown_secs: f64) -> usize {
 /// keep this clear list exhaustive when the instrumentation struct grows.
 fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
     ctx.instrumentation.per_frame_scores.clear();
-    ctx.instrumentation.per_frame_embeddings.clear();
     ctx.instrumentation.adaptive_threshold_trajectory.clear();
     ctx.instrumentation.per_hop_vad.clear();
     ctx.instrumentation.n_frames_below_reset = 0;
@@ -4883,6 +4036,42 @@ fn normal_quantile(p: f64) -> f64 {
     }
 }
 
+/// Delete timestamped report archives beyond the most recent
+/// [`ARCHIVE_RETENTION`] (timestamped names sort chronologically).
+///
+/// Best-effort: unreadable/unremovable archives are skipped with a warning —
+/// the cap is a housekeeping nicety, not a hard invariant.
+fn trim_old_archives(report_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(report_dir) else {
+        return;
+    };
+    let mut archives: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_str()?;
+            (name.starts_with("voice_pipeline_e2e_report.20")
+                && path
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("json")))
+            .then_some(path)
+        })
+        .collect();
+    if archives.len() <= ARCHIVE_RETENTION {
+        return;
+    }
+    archives.sort();
+    let overflow = archives.len() - ARCHIVE_RETENTION;
+    for path in archives.into_iter().take(overflow) {
+        if let Err(e) = std::fs::remove_file(&path) {
+            warn!(
+                "Could not remove old benchmark report archive {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Run the full voice pipeline E2E benchmark.
 ///
 /// This is called from `voice::run_voice_pipeline_benchmark()` which is the
@@ -4932,11 +4121,6 @@ pub(crate) fn run_internal() {
                 .expect("info env filter"),
         )
         .try_init();
-
-    // ── Sweep configuration ─────────────────────────────────────────────
-    // Parsed once per run; every knob is recorded in the report's
-    // reproducibility.sweep_config so each archived run is self-describing.
-    let sweep_config = SweepConfig::from_env();
 
     // ── Phase timing ─────────────────────────────────────────────────
     // We measure each named phase with Instant timestamps.  Phase 13's
@@ -5232,10 +4416,9 @@ pub(crate) fn run_internal() {
 
     phase_times[P_NEG_TRAINING_DATA] = phase_end_ms!();
 
-    // ── Shared negative detection corpus (Phases 8-11 + mining replay) ──
-    // Built ONCE here (TTS cache-backed, deterministic) and consumed by both
-    // the detection phases and the mining pre-pass so the replay order can
-    // never desync from the live phases (single source of truth).
+    // ── Shared negative detection corpus (Phases 8-11) ──
+    // Built ONCE here (TTS cache-backed, deterministic) and consumed by the
+    // detection phases (single source of truth).
     let negative_corpus =
         build_negative_corpus(&available_styles, &model_version_hash, &cache_dir_path);
 
@@ -5262,63 +4445,24 @@ pub(crate) fn run_internal() {
     };
 
     // ── Build the enrollment (prototype + negative calibration) ──
-    // The sweep applies: (1) the distilled anti-prototype cap
-    // (MAHBOT_BENCH_NEG_CAP, default MAX_NEGATIVE_PROTOTYPES), (2) the
-    // hard-negative injection (mined crossing-frame embeddings of the
-    // pinned-phrase baseline's false accepts, appended AFTER the distilled
-    // set — the cap bounds only the distilled set), and (3) the anti-
-    // prototype gate margin δ (MAHBOT_BENCH_GATE_MARGIN).
-    let mut injected_embedding_count = 0usize;
+    // The production path: prototype from the consistency-checked utterance
+    // embeddings, calibration from the negative pool, anti-prototypes
+    // distilled with the shipped cap — no bench-side parameterization.
     let enrollment: Option<crate::audio::wake_word::WakeWordEnrollment> = match &prototype {
         Some(proto) => {
             let calibration =
                 crate::audio::wake_word::calibrate_negatives(proto, &negative_embeddings);
             let created_at = crate::turso::now();
             let trained_at = crate::turso::now();
-            let phrase = super::normalize_phrase(wake_word());
-            // Plain baseline enrollment (cap 8, δ 0, no injection) — the
-            // mining pre-pass replays WITH THIS so the labeled FAs reproduce.
-            match crate::audio::wake_word::WakeWordEnrollment::build(
+            let phrase = super::normalize_phrase(BENCH_WAKE_PHRASE);
+            crate::audio::wake_word::WakeWordEnrollment::build(
                 phrase,
                 &utterance_embeddings,
                 calibration,
                 &negative_embeddings,
                 created_at,
                 trained_at,
-            ) {
-                Some(plain) => {
-                    // ── Mining pre-pass (injection runs only) ──
-                    // Replays the negative corpus with the plain enrollment
-                    // (set globally for the replay) and captures the
-                    // crossing-frame embeddings of the baseline's
-                    // false-accept variants.
-                    let mined: Vec<MinedCrossingFrame> = if sweep_config.injection_enabled() {
-                        let labels: std::collections::HashSet<String> =
-                            sweep_config.inject_labels.iter().cloned().collect();
-                        mine_fa_crossing_embeddings(
-                            &labels,
-                            sweep_config.inject_k,
-                            &plain,
-                            &negative_corpus,
-                        )
-                    } else {
-                        Vec::new()
-                    };
-                    injected_embedding_count = mined.len();
-                    // ── Final enrollment: sweep cap + injected + δ ──
-                    let mut final_enr = plain;
-                    final_enr.negative_prototypes =
-                        crate::audio::wake_word::distill_negative_prototypes_capped(
-                            &negative_embeddings,
-                            sweep_config.neg_cap,
-                        );
-                    final_enr
-                        .negative_prototypes
-                        .extend(mined.into_iter().map(|m| m.embedding));
-                    Some(final_enr.with_gate_margin(sweep_config.gate_margin))
-                }
-                None => None,
-            }
+            )
         }
         None => None,
     };
@@ -5542,7 +4686,6 @@ pub(crate) fn run_internal() {
 
     // Expanded TEST-surface report sections (report-only; filled inside the
     // `!degenerate` block, emitted as `null`-free keys only when present).
-    let mut held_out_snr_envelope: Option<serde_json::Value> = None;
     let mut overlapping_speech: Option<serde_json::Value> = None;
     let mut owner_negative_detection: Option<serde_json::Value> = None;
 
@@ -5654,8 +4797,7 @@ pub(crate) fn run_internal() {
         // pass + adaptive bootstrap).  The acceptance basis:
         // all 10 enrollment clips train, so detection control is entirely this
         // held-out recall set.  Measurement-only — the report is not pass/fail
-        // gated, but the acceptance protocol judges the mean
-        // across ≥ 3 runs.
+        // gated; a single fresh run is sufficient.
         eprintln!("─── Phase 7d: enrolled-speaker benchmark (held-out recall) ───");
         info!("─── Phase 7d: enrolled-speaker benchmark (held-out recall) ───");
         let enrolled_start = Instant::now();
@@ -5668,7 +4810,7 @@ pub(crate) fn run_internal() {
         // prefix (the band must not re-key existing 800+ clips).  Both bands
         // feed the same confusable false-accept tally and per-tier split.
         // The variants come from the shared [`NegativeCorpus`] (built before
-        // Phase 4) — the same list the mining pre-pass replays.
+        // Phase 4).
         phase_start!("Phase 8: Negative — confusable phrases");
         info!(
             "Confusable negative corpus: {} variants (2 seed bands: 800+, 810+)",
@@ -5689,7 +4831,7 @@ pub(crate) fn run_internal() {
         }
         phase_times[P_CONFUSABLE_NEGATIVES] = phase_end_ms!();
 
-        // ── Phase 10: Detection — Unrelated phrases ───────────────────────
+        // ── Phase 9: Detection — Unrelated phrases ───────────────────────
         // The unrelated detection pool spans two seed bands: band 1 (900+)
         // with the "unrelated" prefix, band 2 (910+) with the distinct
         // "unrelated2" prefix.  Variants from the shared [`NegativeCorpus`].
@@ -5707,7 +4849,7 @@ pub(crate) fn run_internal() {
         );
         phase_times[P_UNRELATED_NEGATIVES] = phase_end_ms!();
 
-        // ── Phase 11: Detection — Silence ────────────────────────────────
+        // ── Phase 10: Detection — Silence ────────────────────────────────
         // Silence becomes a small matrix (three durations); variants from the
         // shared [`NegativeCorpus`].
         phase_start!("Phase 10: Negative — silence");
@@ -5720,7 +4862,7 @@ pub(crate) fn run_internal() {
         );
         phase_times[P_SILENCE_NEGATIVES] = phase_end_ms!();
 
-        // ── Phase 12: Detection — Noise profiles ─────────────────────────
+        // ── Phase 11: Detection — Noise profiles ─────────────────────────
         // The 4 detection-only profiles join the phase but NEVER the training
         // list (NOISE_PROFILES — see NOISE_PROFILES_DETECTION_ONLY).  Samples
         // from the shared [`NegativeCorpus`].
@@ -5856,8 +4998,7 @@ pub(crate) fn run_internal() {
             // measures only the wake word).
             // NOTE: this is a WARM pass (consume_warmup + warmed shared
             // adaptive state), unlike Phase 7d's cold pass — the acceptance
-            // criterion "assertions actually fire" carries residual risk until
-            // measured across ≥3 warm runs; a
+            // criterion "assertions actually fire" carries residual risk; a
             // failure here becomes a VISIBLE skip (skip_reason), never silent.
             consume_warmup(&mut ctx);
             let t0 = Instant::now();
@@ -6094,38 +5235,6 @@ pub(crate) fn run_internal() {
             .map(|(_, _, detected, _)| *detected)
             .sum();
         phase_times[P_NOISE_OVERLAP] = phase_end_ms!();
-
-        // ── Held-out SNR envelope ─────────────────────────────────────────
-        // The enlarged held-out wake-only basis is tested clean only in
-        // Phase 7d.  This section re-runs the FULL enlarged set through the
-        // existing noise-overlap matrix (white/pink/brown × 20/10/5/0 dB +
-        // clean — 13 cells) as an in-memory report section — no cache growth.
-        // Exercises the encoder pipeline's behaviour under noise.
-        // Report-only; warm pass with a shared adaptive state (same
-        // methodology as the canary matrix).
-        eprintln!("─── Held-out SNR envelope (report-only) ───");
-        let snr_start = Instant::now();
-        let snr_results = run_noise_overlap_test(&held_out_recall_clips);
-        let snr_ms = snr_start.elapsed().as_secs_f64() * 1000.0;
-        let snr_total: usize = snr_results.iter().map(|(_, _, _, d)| d.len()).sum();
-        let snr_detected: usize = snr_results
-            .iter()
-            .map(|(_, _, detected, _)| *detected)
-            .sum();
-        eprintln!("  Held-out SNR envelope: {snr_detected}/{snr_total} detected ({snr_ms:.0}ms)");
-        held_out_snr_envelope = Some(serde_json::json!({
-            "cells": serde_json::Value::Object(
-                snr_results.iter().map(&cell_json).collect(),
-            ),
-            "n_cells": snr_results.len(),
-            "total_variants": snr_total,
-            "detected": snr_detected,
-            "phase_ms": snr_ms,
-            "note": "The ENLARGED held-out wake-only basis (all 40 clips, seeds \
-                     3000-3039) through the existing 13-cell noise matrix \
-                     (white/pink/brown x 20/10/5/0 dB + clean).  In-memory mixing, \
-                     no cache growth.  Report-only.",
-        }));
     } else {
         // Degenerate enrollment — skip all detection phases
         phase_times[P_POSITIVE_VARIANTS] = 0;
@@ -6581,54 +5690,6 @@ pub(crate) fn run_internal() {
         })
     };
 
-    // Production metrics snapshot — the only production diagnostics
-    // surface with zero bench coverage.  The offline bench
-    // never runs the mic loop (chunks_received/dropped_chunks stay 0); the
-    // plausibility contract is: embeddings WERE computed by the production
-    // streaming path (the enrolled-speaker phase / main detection phases) and
-    // the drop rate is 0.
-    let production_metrics_probe = {
-        let metrics = super::get_voice_metrics();
-        let drop_rate = metrics.drop_rate(); // guards the 0/0 denominator
-        let plausible = metrics.embeddings_computed > 0 && drop_rate == 0.0;
-        if !plausible {
-            warn!(
-                "Production metrics implausible — \
-                 embeddings_computed={}, drop_rate={drop_rate}",
-                metrics.embeddings_computed,
-            );
-        }
-        // Real-time CPU budget probe: the scoring stride is 160 ms of audio
-        // (SCORE_STRIDE_SAMPLES = 2560 samples at 16 kHz), so a per-window
-        // encoder forward must stay under ~160 ms for the pipeline to keep up
-        // with a live mic.  The offline bench feeds audio faster than
-        // real-time, but the production encode path
-        // (handle_wake_word_detection → encode_window) is executed under
-        // release codegen, so the measured latency is the per-window encode
-        // cost.
-        let stride_budget_ns = super::SCORE_STRIDE_SAMPLES as u64 * 1_000_000_000 / 16_000;
-        let rolling_latency_ns = metrics.avg_embedding_latency_ns;
-        serde_json::json!({
-            "probe": "production metrics",
-            "chunks_received": metrics.chunks_received,
-            "dropped_chunks": metrics.dropped_chunks,
-            "embeddings_computed": metrics.embeddings_computed,
-            "drop_rate": drop_rate,
-            "plausible": plausible,
-            "rolling_avg_embedding_latency_ns": rolling_latency_ns,
-            "lifetime_avg_embedding_latency_ns": metrics.lifetime_avg_embedding_latency_ns(),
-            "stride_budget_ns": stride_budget_ns,
-            "within_stride_budget": rolling_latency_ns > 0 && rolling_latency_ns <= stride_budget_ns,
-            "note": "drop_rate guards the zero denominator (0/0 → 0.0); \
-                     chunks_received/dropped_chunks are mic-loop-only and stay 0 in \
-                     the offline bench by construction.  The latency fields measure \
-                     the production encode path (rolling avg of the last 100 window \
-                     encodings) against the 160 ms scoring stride budget — a \
-                     report-only real-time budget probe; the offline bench cannot \
-                     measure live-mic drop behaviour.",
-        })
-    };
-
     // Embedding cache probe: there is no embedding disk cache — the encoder
     // pipeline re-encodes from raw audio on each run (the PCM cache keeps TTS
     // synthesis cheap).  The probe documents the absence.
@@ -6677,42 +5738,17 @@ pub(crate) fn run_internal() {
                      the enrollment is deterministic given the TTS PCM cache.",
         },
         "wake_phrase": {
-            "used": wake_word(),
-            "source": wake_phrase_source(),
-            "note": "The bench synthesizes and tests the wake phrase persisted in the \
-                     deployed model's config-store entry (production's actual listening \
-                     phrase); 'fallback' means the config store was unavailable and the \
-                     legacy constant was used; 'env_override' means MAHBOT_BENCH_WAKE_PHRASE \
-                     pinned the phrase (the bench pins 'hey mahbot' so the \
-                     live personal enrollment phrase never drives bench runs).  A phrase \
-                     change invalidates the TTS PCM cache (one re-synthesis run) and \
-                     shifts the acoustic target — numbers are only comparable across runs \
-                     with the same phrase.  The confusable negative tier stays the \
-                     mahbot-family canonical list regardless of the deployed phrase \
-                     (production itself skips mahbot confusables for non-mahbot phrases) — \
-                     for a non-mahbot deployed phrase that tier is informational only.",
-        },
-        // Wake-word optimization sweep config: every knob that
-        // shaped this run's enrollment (anti-prototype gate margin δ,
-        // distilled anti-prototype cap, hard-negative injection k + mined
-        // FA labels).  The FA frontier across swept configs is assembled
-        // from these per-run records (recall = enrolled_speaker.acceptance,
-        // FA = total_false_accepts / false_accept_list).
-        "sweep_config": {
-            "gate_margin": sweep_config.gate_margin,
-            "neg_cap": sweep_config.neg_cap,
-            // `inject_k` is already clamped to 0 by `from_env` when no labels
-            // are provided, so the plain value is unambiguous.
-            "inject_k": sweep_config.inject_k,
-            "inject_labels": sweep_config.inject_labels,
-            "injected_embeddings": injected_embedding_count,
-            "note": "k bounds the INJECTED embeddings only (mined crossing-frame \
-                     windows of the pinned-phrase baseline's false accepts, ordered \
-                     by frame soft score descending); the cap bounds only the \
-                     cap-DISTILLED set — the total anti-prototype count is \
-                     min(negatives, cap) + k.  Injection self-suppresses the injected \
-                     negatives by construction, so the honest held-out FA signal is \
-                     the NON-injected negatives plus FAPH.",
+            "used": BENCH_WAKE_PHRASE,
+            "source": "fixed constant",
+            "note": "Every benchmark run tests the fixed bench phrase 'hey mahbot' \
+                     (a fixed constant — never resolved from the live config store, \
+                     never overridable via env), so numbers stay comparable across \
+                     runs and the live personal enrollment phrase can never drive \
+                     benchmark runs.  A phrase change would invalidate the TTS PCM \
+                     cache (one re-synthesis run) and shift the acoustic target.  The \
+                     confusable negative tier stays the mahbot-family canonical list \
+                     regardless of the deployed phrase (production itself skips mahbot \
+                     confusables for non-mahbot phrases).",
         },
         "model_hashes": {
             "tts_model_version_hash": model_version_hash,
@@ -6736,7 +5772,6 @@ pub(crate) fn run_internal() {
         "warmup_source": warmup_source,
         // Phase-B alignment probes (report-only, additive).
         "tts_echo_gate": tts_echo_gate_probe,
-        "production_metrics": production_metrics_probe,
         "embedding_cache": embedding_cache_probe,
         "enrollment_quality": enrollment_quality_probe_value,
         "vad_feed_cross_check": vad_feed_cross_check_probe_value,
@@ -6829,44 +5864,6 @@ pub(crate) fn run_internal() {
         },
     });
 
-    // ── Tail-aware summary statistics (additive) ─────────────
-    // The existing midpoint-index deciles hide the distribution tail, so the
-    // calibration sections supplement them with min/max and FA-split
-    // distributions over the acceptance basis and the negative corpus:
-    //  - pos_acceptance_basis_max_rolling_sum: peak rolling sums of the
-    //    held-out wake-only acceptance basis (re-derived from the
-    //    already-stored per-variant window_scores — no new raw dumps).
-    //  - neg_max_rolling_sum: peak rolling sums of the negative corpus.
-    //  - neg_fa_split: the same distribution split into end-to-end false
-    //    accepts (detected) vs non-FA — the FA/non-FA boundary.
-    let pos_basis_max_rs: Vec<f32> = enrolled_report
-        .as_ref()
-        .and_then(|r| r.get("per_variant"))
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| peak_rolling_sums_from_json(arr))
-        .unwrap_or_default();
-    let neg_max_rs: Vec<f32> = all_neg_pv
-        .iter()
-        .map(|(pv, _)| pv.max_rolling_sum)
-        .collect();
-    let (neg_fa_max_rs, neg_non_fa_max_rs) = neg_fa_split(&all_neg_pv);
-    let distribution_tail_json = serde_json::json!({
-        "note": format!(
-            "Tail-aware supplements to the midpoint-index deciles: min/max make \
-             the true tail visible (midpoint deciles mask it), and the FA split \
-             exposes the FA-vs-non-FA boundary on the gate-relevant quantity \
-             (peak rolling sum).  pos_acceptance_basis = the {}-clip held-out \
-             wake-only acceptance basis (cold pass, seeds 3000+).",
-            pos_basis_max_rs.len(),
-        ),
-        "pos_acceptance_basis_max_rolling_sum": distribution_stats(&pos_basis_max_rs),
-        "neg_max_rolling_sum": distribution_stats(&neg_max_rs),
-        "neg_fa_split": {
-            "fa": distribution_stats(&neg_fa_max_rs),
-            "non_fa": distribution_stats(&neg_non_fa_max_rs),
-        },
-    });
-
     let gate_diagnostics_json = serde_json::json!({
         "pipeline": "qwen3-asr-encoder",
         // With no trainable head, the "soft scores" are the enrollment
@@ -6893,10 +5890,14 @@ pub(crate) fn run_internal() {
             }).collect()
         ),
         "discrimination": {
-            // Backward-compatible supplement: the midpoint-index deciles stay,
-            // min/max are added so the true tail is visible.
-            "pos_peak_scores": distribution_stats(&pos_peak_scores),
-            "neg_peak_scores": distribution_stats(&neg_peak_scores),
+            "pos_peak_scores": {
+                "deciles": deciles(&pos_peak_scores),
+                "n": pos_peak_scores.len(),
+            },
+            "neg_peak_scores": {
+                "deciles": deciles(&neg_peak_scores),
+                "n": neg_peak_scores.len(),
+            },
             "pos_frames_below_min_threshold_frac": if pos_frame_crossing.0 > 0 {
                 pos_frame_crossing.1 as f64 / pos_frame_crossing.0 as f64
             } else {
@@ -6910,7 +5911,6 @@ pub(crate) fn run_internal() {
             "pos_total_frames": pos_frame_crossing.0,
             "neg_total_frames": neg_frame_crossing.0,
         },
-        "distribution_tail": distribution_tail_json,
     });
 
     // noise_overlap restructured into two labeled sections — the trained-in
@@ -6953,237 +5953,7 @@ pub(crate) fn run_internal() {
     // assembly window included, so run-time claims are auditable from the JSON.
     let total_wall_time_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Cross-run statistics (Phase 0): last 3 archived reports summarized so
-    // the >=3-run acceptance protocol is self-documenting.  Computed BEFORE
-    // the current archive is written so it never includes this run.
-    let cross_run = cross_run_summary(wake_word());
-
-    // ── Threshold sweep / DET-style tables (additive, report-only) ────────
-    // Computed from the already-stored per-variant peak rolling sums — no new
-    // raw per-frame/per-event dumps.  FAPH is explicitly excluded: it stores
-    // no peak rolling sums and no new collection may be added for it.
-    let sweep_gates_vec = sweep_gates();
-    let neg_corpus_n = all_neg_pv.len();
-    let acceptance_basis_n = pos_basis_max_rs.len();
-
-    // Recall side: the held-out acceptance basis (cold pass) plus the
-    // per-SNR-cell recall sweeps over the same clips.
-    let mut acceptance_basis_section = sweep_section(&sweep_gates_vec, &pos_basis_max_rs);
-    acceptance_basis_section.insert(
-        "note".to_string(),
-        serde_json::json!(format!(
-            "{acceptance_basis_n}-clip held-out wake-only acceptance basis (cold pass, \
-             seeds 3000+, single enrolled voice — uniform, no tier structure on the \
-             positive side)."
-        )),
-    );
-    // Degenerate runs (no held-out SNR envelope) emit an empty cells object —
-    // consistent with the "always emitted, empty inputs produce zero-row/empty
-    // tables" contract for the calibration sections.
-    let snr_cell_sweeps: serde_json::Value = match &held_out_snr_envelope {
-        Some(env) => {
-            let cells = env.get("cells").and_then(serde_json::Value::as_object);
-            serde_json::Value::Object(
-                cells
-                    .map(|cells| {
-                        cells
-                            .iter()
-                            .map(|(cell_key, cell)| {
-                                let per_variant = cell
-                                    .get("per_variant")
-                                    .and_then(serde_json::Value::as_array);
-                                let samples: Vec<f32> = per_variant
-                                    .map(|arr| peak_rolling_sums_from_json(arr))
-                                    .unwrap_or_default();
-                                (
-                                    cell_key.clone(),
-                                    serde_json::Value::Object(sweep_section(
-                                        &sweep_gates_vec,
-                                        &samples,
-                                    )),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
-        }
-        None => serde_json::Value::Object(serde_json::Map::new()),
-    };
-    // Cell count from the source envelope (not from the emitted object, so a
-    // degenerate run yields None rather than a misleading 0).
-    let snr_cell_n = held_out_snr_envelope
-        .as_ref()
-        .and_then(|env| env.get("cells"))
-        .and_then(serde_json::Value::as_object)
-        .map(serde_json::Map::len);
-
-    // FA side: the negative corpus, grouped per tier (confusable tiers only)
-    // and per negative category (confusable/unrelated/silence/noise).  The
-    // same single pass over the corpus also tallies seed-band false accepts
-    // (confusable bands 800+/810+ and unrelated bands 900+/910+, recovered
-    // from the variant labels / category tags; silence and noise have no seed
-    // bands) so the grouping and the FA-by-condition breakdown share one loop.
-    let neg_total_sweep_rows = sweep_rows(&sweep_gates_vec, &neg_max_rs);
-    let mut neg_by_tier: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    let mut neg_by_category: std::collections::BTreeMap<&'static str, Vec<f32>> =
-        std::collections::BTreeMap::new();
-    let mut fa_by_seed_band: std::collections::BTreeMap<&'static str, usize> =
-        std::collections::BTreeMap::new();
-    for (pv, cat) in &all_neg_pv {
-        let (category, tier, band) = neg_condition(cat, &pv.variant);
-        if let Some(tier) = tier {
-            let idx = match tier {
-                "easy" => Some(0),
-                "medium" => Some(1),
-                "hard" => Some(2),
-                other => {
-                    // Same loud-failure pattern as neg_condition's unknown
-                    // category: tiers come from the closed BenchTier enum, so
-                    // an unknown tier is a coding error.  Warn and exclude the
-                    // variant from the per-tier sweep only — it still lands in
-                    // per_category and the seed-band tally below.
-                    warn!(
-                        "voice_pipeline_e2e report: unknown confusable tier {other:?} \
-                         (expected easy/medium/hard) — excluded from the per-tier sweep \
-                         only, still counted in per_category"
-                    );
-                    None
-                }
-            };
-            if let Some(idx) = idx {
-                neg_by_tier[idx].push(pv.max_rolling_sum);
-            }
-        }
-        neg_by_category
-            .entry(category)
-            .or_default()
-            .push(pv.max_rolling_sum);
-        if pv.detected && (category == "confusable" || category == "unrelated") {
-            *fa_by_seed_band.entry(band).or_insert(0) += 1;
-        }
-    }
-    let tier_sweep_rows: Vec<serde_json::Value> = neg_by_tier
-        .iter()
-        .map(|samples| serde_json::Value::Object(sweep_section(&sweep_gates_vec, samples)))
-        .collect();
-    let category_sweep_rows: serde_json::Map<String, serde_json::Value> = neg_by_category
-        .iter()
-        .map(|(category, samples)| {
-            (
-                (*category).to_string(),
-                serde_json::Value::Object(sweep_section(&sweep_gates_vec, samples)),
-            )
-        })
-        .collect();
-
-    // The fixed end-to-end FA count at the current operating point — a
-    // reference series (constant across all candidate gates), explicitly
-    // separated from the score-gate crossing series.
-    let e2e_fa_reference_rows: Vec<serde_json::Value> = sweep_gates_vec
-        .iter()
-        .map(|&g| serde_json::json!({ "gate": g, "fa": total_false_accepts }))
-        .collect();
-
-    let (snr_cell_count_note, snr_cell_note) = match snr_cell_n {
-        Some(n) => (
-            format!("{n}-cell noise matrix"),
-            format!(
-                "Per-SNR-cell recall sweeps (peak rolling sum >= candidate gate) over the \
-                 {acceptance_basis_n}-clip basis under the {n}-cell noise matrix (clean + \
-                 white/pink/brown at 20/10/5/0 dB) — the difficulty-tiered recall view."
-            ),
-        ),
-        None => (
-            "no SNR envelope this run (degenerate enrollment)".to_string(),
-            "Per-SNR-cell recall sweeps: no SNR envelope this run.".to_string(),
-        ),
-    };
-
-    let e2e_fa_note = format!(
-        "The fixed end-to-end false-accept count measured at the current operating \
-         point (gate {MIN_GATE_THRESHOLD:.2}), repeated across candidate gates for \
-         reference only — NOT a sweep prediction."
-    );
-
-    let threshold_sweep_json = serde_json::json!({
-        "note": format!(
-            "DET-style calibration tables computed from the already-stored per-variant \
-             peak rolling sums.  Two series are reported separately: (a) \
-             score_gate_crossings — rolling-sum >= candidate gate, monotonic, \
-             DET-compatible; (b) e2e_fa_at_operating_point — the fixed end-to-end \
-             false-accept count at the current operating point \
-             ({MIN_GATE_THRESHOLD:.2}), for reference only.  Recall side: the \
-             {acceptance_basis_n}-clip held-out wake-only acceptance basis (cold pass) \
-             plus per-SNR-cell recall sweeps over the same clips \
-             ({snr_cell_count_note}).  FA side: the {neg_corpus_n}-negative corpus \
-             grouped per tier (confusable tiers only) and per negative category.  \
-             FAPH is excluded: it stores no peak rolling sums and no new collection \
-             may be added for it."
-        ),
-        "candidate_gates": {
-            "min": SWEEP_GATE_MIN,
-            "max": SWEEP_GATE_MAX,
-            "step": SWEEP_GATE_STEP,
-            "n": sweep_gates_vec.len(),
-            "operating_point": MIN_GATE_THRESHOLD,
-        },
-        "series": {
-            "score_gate_crossings": {
-                "note": "Negatives whose max_rolling_sum >= candidate gate \
-                         (monotonic, DET-compatible).  This is the whole-corpus \
-                         sweep; false_accepts.total references it rather than \
-                         duplicating the rows.",
-                "rows": neg_total_sweep_rows,
-            },
-            "e2e_fa_at_operating_point": {
-                "note": e2e_fa_note,
-                "total_false_accepts": total_false_accepts,
-                "rows": e2e_fa_reference_rows,
-            },
-        },
-        "recall": {
-            // Neutral key (no embedded corpus size): the section's `n` and
-            // notes carry the live counts, so the key cannot go stale.
-            "acceptance_basis": serde_json::Value::Object(acceptance_basis_section),
-            "per_snr_cell": {
-                "note": snr_cell_note,
-                "cells": snr_cell_sweeps,
-            },
-        },
-        "false_accepts": {
-            "total": {
-                "n": neg_corpus_n,
-                "sweep_series": "series.score_gate_crossings.rows",
-            },
-            "per_tier": {
-                "easy": &tier_sweep_rows[0],
-                "medium": &tier_sweep_rows[1],
-                "hard": &tier_sweep_rows[2],
-            },
-            "per_category": serde_json::Value::Object(category_sweep_rows),
-        },
-    });
-
     // ── FA breakdown by condition (additive, report-only) ────────────────
-    // Owner-negative compact summary for the FA breakdown: reported separately
-    // with the existing "diagnostic, not FA" labeling — the enrolled voice's
-    // own non-wake speech is trained in, so any detection is a canary-style
-    // in-distribution signal, excluded from total_false_accepts.  `None` when
-    // the block did not run (degenerate enrollment).
-    let owner_negative_fa_summary: Option<serde_json::Value> =
-        owner_negative_detection.as_ref().map(|v| {
-            serde_json::json!({
-                "n_clips": v["n_clips"].clone(),
-                "detected": v["detected"].clone(),
-                "note": "diagnostic, not FA — the enrolled voice's own non-wake \
-                         speech (OWNER_NEGATIVE_PHRASES, seeds 9000+) is trained \
-                         in, so any detection is a canary-style in-distribution \
-                         misclassification signal; excluded from \
-                         total_false_accepts (consistent with the existing \
-                         owner_negative_detection semantics).",
-            })
-        });
 
     let json = serde_json::json!({
         "benchmark": "voice_pipeline_e2e",
@@ -7208,8 +5978,7 @@ pub(crate) fn run_internal() {
              pool is encoded directly from raw audio (ambient noise profiles × 2 \
              levels, owner-negative VAD-gated speech + brown-10, \
              confusable/unrelated VAD-gated TTS).  The TEST side: 40-clip \
-             wake-only basis (seeds 3000-3039), a held-out SNR envelope over it \
-             (13-cell noise matrix, in-memory), doubled confusable/unrelated \
+             wake-only basis (seeds 3000-3039), doubled confusable/unrelated \
              detection pools (new seed bands 810+/910+ with distinct label \
              prefixes), a three-duration silence matrix, 4 detection-only noise \
              profiles (fresh seeds 52-55), wake-over-babble cells (TTS-voice \
@@ -7270,45 +6039,6 @@ pub(crate) fn run_internal() {
             "unrelated": unrelated_metrics.false_accepts.len(),
             "silence": silence_metric.false_accepts.len(),
             "noise": noise_false_accepts.len(),
-            // FA breakdown by condition (additive, report-only): tier, seed
-            // band, and negative category.  by_tier / by_category deliberately
-            // restate the flat keys above them (confusable_easy/medium/hard,
-            // unrelated, silence, noise) as a grouped view — required by the
-            // calibration-analysis scope and kept alongside the flat keys for
-            // archive comparability; the counts are the same end-to-end FA
-            // tallies.  (These differ from threshold_sweep.false_accepts
-            // per_tier / per_category, which sweep ALL negatives' peak rolling
-            // sums, detected or not — two shapes, not a duplicate.)
-            // Owner-negative variants are reported separately with the
-            // "diagnostic, not FA" labeling and excluded from the total
-            // (consistent with the existing owner_negative_detection
-            // semantics).
-            "by_tier": {
-                "easy": conf_fa_counts[0],
-                "medium": conf_fa_counts[1],
-                "hard": conf_fa_counts[2],
-            },
-            // Seed-band FA counts keyed by the label-prefix band names — the
-            // same prefixes the benchmark's detection phases use for the clip
-            // labels.  The full seed-base mapping is: confusable=800+,
-            // confusable2=810+, unrelated=900+, unrelated2=910+ (the 810+ and
-            // 910+ doubled bands are also noted in the report _note).
-            // Keying on the prefixes (derived from the category tags) rather
-            // than the numeric bases keeps the keys correct even if a seed
-            // base changes.
-            "by_seed_band": {
-                "confusable": fa_by_seed_band.get("confusable").copied().unwrap_or(0),
-                "confusable2": fa_by_seed_band.get("confusable2").copied().unwrap_or(0),
-                "unrelated": fa_by_seed_band.get("unrelated").copied().unwrap_or(0),
-                "unrelated2": fa_by_seed_band.get("unrelated2").copied().unwrap_or(0),
-            },
-            "by_category": {
-                "confusable": conf_fa_counts.iter().sum::<usize>(),
-                "unrelated": unrelated_metrics.false_accepts.len(),
-                "silence": silence_metric.false_accepts.len(),
-                "noise": noise_false_accepts.len(),
-            },
-            "owner_negative": owner_negative_fa_summary,
             // Speaker-blindness DIAGNOSTICS (not false accepts): cross-speaker
             // wake-word detections are correct behaviour, so these counts do
             // NOT feed total_false_accepts.
@@ -7397,27 +6127,13 @@ pub(crate) fn run_internal() {
     // Phase 0 additive default-run keys (added post-macro — the main json!
     // block is already at serde_json's recursion limit).
     json["deployability"] = deployability.clone();
-    json["cross_run"] = cross_run;
     // Expanded TEST-surface report sections (absent when degenerate — the keys
     // are only inserted when the corresponding phase ran).
-    if let Some(v) = held_out_snr_envelope {
-        json["held_out_snr_envelope"] = v;
-    }
     if let Some(v) = overlapping_speech {
         json["overlapping_speech"] = v;
     }
     if let Some(v) = owner_negative_detection {
         json["owner_negative_detection"] = v;
-    }
-    // Calibration-analysis sections (additive; always emitted — empty inputs
-    // produce zero-row/empty tables so consumers never see missing keys).
-    json["threshold_sweep"] = threshold_sweep_json;
-    // FA near-miss canary band: absent when no negative is in the band (no
-    // empty stubs).  Named `fa_near_miss_band` (NOT `near_miss_canaries` —
-    // that family belongs to safety_gate's negatives-that-crossed-the-gate
-    // canaries; this band is the negatives just below the gate).
-    if let Some(canary) = fa_near_miss_band(&all_neg_pv) {
-        json["fa_near_miss_band"] = canary;
     }
     // Wall-clock measurement: the whole run (start → report emission),
     // report-assembly window included, so run-time is auditable from the JSON.
@@ -7444,24 +6160,22 @@ pub(crate) fn run_internal() {
     if let Ok(report_dir) = crate::config::default_config_dir() {
         let report_path = report_dir.join("voice_pipeline_e2e_report.json");
         // ── Per-run timestamped archive ──────
-        // The ≥3-run acceptance protocol computes spread from ACTUAL runs.
         // Every run is archived with a UTC timestamp before the main report
-        // path is overwritten, so the acceptance review has all runs' reports.
-        // No .prior.json copy is written: the old copy
-        // was byte-identical to a timestamped archive and misled comparisons.
+        // path is overwritten.  Archives are capped to the most recent
+        // [`ARCHIVE_RETENTION`] (older timestamped archives are deleted), so
+        // the runtime dir cannot grow unboundedly; nothing references or
+        // compares against old runs.
         let archive_stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
         let archive_path =
             report_dir.join(format!("voice_pipeline_e2e_report.{archive_stamp}.json"));
         match std::fs::write(&archive_path, &json_text) {
-            Ok(()) => info!(
-                "Benchmark report archived to {} (acceptance spread computed from timestamped per-run archives)",
-                archive_path.display()
-            ),
+            Ok(()) => info!("Benchmark report archived to {}", archive_path.display()),
             Err(e) => warn!(
                 "Could not write benchmark report archive to {}: {e}",
                 archive_path.display()
             ),
         }
+        trim_old_archives(&report_dir);
         match std::fs::write(&report_path, json_text) {
             Ok(()) => info!("Benchmark report written to {}", report_path.display()),
             Err(e) => warn!(
@@ -7622,11 +6336,7 @@ pub(crate) fn run_internal() {
             super::ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION * 100.0,
         ),
     }
-    eprintln!(
-        "         Wake phrase: '{}' (source: {})",
-        wake_word(),
-        wake_phrase_source(),
-    );
+    eprintln!("         Wake phrase: '{BENCH_WAKE_PHRASE}' (source: fixed constant)");
 
     // Catastrophic regression guard: at least 1 positive detection must occur.
     // Without this, a pipeline that detects nothing would pass all FA assertions
@@ -7912,456 +6622,5 @@ mod tests {
                 && a.canaries.iter().all(|s| !a.reserved.contains(s)),
             "reserved voices must be disjoint from every training pool"
         );
-    }
-
-    // ── Threshold sweep / DET-style aggregation ────────────────
-
-    /// Minimal [`PerVariantResult`] fixture for the aggregation tests: only the
-    /// fields the calibration logic reads (`variant`, `detected`,
-    /// `max_rolling_sum`) are set; everything else is a default/zero filler.
-    fn pv_fixture(label: &str, max_rolling_sum: f32, detected: bool) -> PerVariantResult {
-        PerVariantResult {
-            variant: label.to_string(),
-            detected,
-            peak_score: 0.0,
-            max_rolling_sum,
-            n_embeddings: 0,
-            n_frames_below_reset: 0,
-            vad_speech_frames: 0,
-            per_frame_scores: Vec::new(),
-            first_trigger_frame_idx: None,
-            n_test_embeddings: 0,
-            adaptive_threshold_trajectory: Vec::new(),
-            ceiling_limited_frames: 0,
-            latency_ms: None,
-            per_hop_vad: Vec::new(),
-        }
-    }
-
-    /// Candidate gates: 1.20..=2.00 in 0.01 steps (81 values), strictly
-    /// increasing, always including the current operating point (1.65).
-    #[test]
-    fn sweep_gates_covers_range_and_operating_point() {
-        let gates = sweep_gates();
-        assert_eq!(gates.len(), 81, "1.20..=2.00 step 0.01 → 81 gates");
-        assert_eq!(gates[0], SWEEP_GATE_MIN);
-        assert_eq!(*gates.last().unwrap(), SWEEP_GATE_MAX);
-        for pair in gates.windows(2) {
-            let step = pair[1] - pair[0];
-            assert!(
-                (step - SWEEP_GATE_STEP).abs() < 1e-6 && pair[1] > pair[0],
-                "strictly increasing 0.01 steps, got {pair:?}"
-            );
-        }
-        let op_idx = gates
-            .iter()
-            .position(|&g| (g - MIN_GATE_THRESHOLD).abs() < 1e-6);
-        assert_eq!(op_idx, Some(45), "operating point 1.65 must be a candidate");
-        // Bit-exactness with the real gate: the f32 multiply-add
-        // 1.20 + 45 × 0.01 rounds to the SAME value as 3 × 0.55 (both
-        // 1.6500001), so the operating-point candidate is exactly
-        // MIN_GATE_THRESHOLD — a sample at the f32-nearest decimal 1.65
-        // (1 ulp below) is NOT a sweep crossing there, matching the real
-        // pipeline and the near-miss band.
-        assert_eq!(
-            gates[op_idx.unwrap()],
-            MIN_GATE_THRESHOLD,
-            "operating-point candidate must be the exact computed gate"
-        );
-    }
-
-    /// Sweep rows: monotonic non-increasing crossings as the gate rises,
-    /// rates equal crossings/n, and the operating-point row matches the
-    /// expected crossing count.  Empty samples yield all-zero rows.
-    #[test]
-    fn sweep_rows_monotonic_and_operating_point_exact() {
-        let gates = sweep_gates();
-        // Bit-exactness with the real gate: the sweep's operating-point gate
-        // is exactly MIN_GATE_THRESHOLD (the f32 multiply-add 1.20 + 45 × 0.01
-        // rounds to the same value as 3 × 0.55), so a sample at the bare f32
-        // literal 1.65 — which is 1 ulp BELOW the exact gate — is NOT counted
-        // as a crossing there, exactly like the real pipeline (and like the
-        // fa_near_miss_band, which uses the exact gate).  Real pipeline data
-        // never produces that exact literal value, so this is a fixture-only
-        // edge case.
-        let samples = vec![
-            1.20,
-            1.35,
-            1.50,
-            1.64,
-            1.65_f32, // f32-nearest decimal 1.65: below the exact gate
-            MIN_GATE_THRESHOLD,
-            1.70,
-            1.90,
-            2.10,
-        ];
-        let rows = sweep_rows(&gates, &samples);
-        assert_eq!(rows.len(), gates.len());
-        let mut prev = usize::MAX;
-        for (row, &g) in rows.iter().zip(&gates) {
-            let crossings = row["crossings"].as_u64().unwrap() as usize;
-            assert!(
-                crossings <= prev,
-                "crossings must be monotonic non-increasing at gate {g}"
-            );
-            prev = crossings;
-            let expected = samples.iter().filter(|&&s| s >= g).count();
-            assert_eq!(crossings, expected, "crossing count at gate {g}");
-            assert!(
-                (row["rate"].as_f64().unwrap() - crossings as f64 / samples.len() as f64).abs()
-                    < 1e-9,
-                "rate at gate {g}"
-            );
-        }
-        // At the operating point: {MIN_GATE_THRESHOLD, 1.70, 1.90, 2.10} → 4
-        // (the bare 1.65 literal is below the exact gate — not a crossing).
-        let op_row = rows
-            .iter()
-            .find(|r| (r["gate"].as_f64().unwrap() - MIN_GATE_THRESHOLD as f64).abs() < 1e-6)
-            .expect("operating-point row");
-        assert_eq!(op_row["crossings"].as_u64().unwrap(), 4);
-        // Empty samples → all-zero rows (rate 0.0, never NaN).
-        let empty = sweep_rows(&gates, &[]);
-        assert!(empty.iter().all(|r| {
-            r["crossings"].as_u64().unwrap() == 0 && r["rate"].as_f64().unwrap() == 0.0
-        }));
-    }
-
-    /// Distribution stats: min/max make the true tail visible alongside the
-    /// kept midpoint deciles; empty input emits nulls (not NaN).
-    #[test]
-    fn distribution_stats_exposes_true_tail() {
-        let samples = vec![0.1, 0.5, 1.0, 1.5, 1.9];
-        let stats = distribution_stats(&samples);
-        assert_eq!(stats["n"].as_u64().unwrap(), 5);
-        assert!((stats["min"].as_f64().unwrap() - 0.1).abs() < 1e-6);
-        assert!((stats["max"].as_f64().unwrap() - 1.9).abs() < 1e-6);
-        assert!((stats["mean"].as_f64().unwrap() - 1.0).abs() < 1e-6);
-        let deciles = stats["deciles"].as_array().expect("deciles kept");
-        assert_eq!(deciles.len(), 10);
-        assert!(
-            (deciles[0].as_f64().unwrap() - 0.1).abs() < 1e-6
-                && (deciles[9].as_f64().unwrap() - 1.9).abs() < 1e-6,
-            "decile endpoints must match min/max for a small sample"
-        );
-        let empty = distribution_stats(&[]);
-        assert_eq!(empty["n"].as_u64().unwrap(), 0);
-        assert!(empty["min"].is_null() && empty["max"].is_null() && empty["deciles"].is_null());
-    }
-
-    /// FA near-miss band: band semantics are `[1.35, 1.65)` — the lower
-    /// bound is included, the operating point is NOT; the result is absent
-    /// (None) when no negative is in the band; the variant-id list is sorted
-    /// by peak rolling sum descending (closest to the gate first).
-    #[test]
-    fn fa_near_miss_band_semantics() {
-        let below = pv_fixture("below_1.30", 1.30, false);
-        let band_135 = pv_fixture("band_1.35", 1.35, false);
-        let band_150 = pv_fixture("band_1.50", 1.50, false);
-        let band_164 = pv_fixture("band_1.64", 1.64, false);
-        let at_op = pv_fixture("at_op_1.65", MIN_GATE_THRESHOLD, true);
-        let above = pv_fixture("above_1.80", 1.80, true);
-        let all_neg: Vec<(&PerVariantResult, String)> = vec![
-            (&below, "confusable_easy".to_string()),
-            (&band_135, "confusable_medium".to_string()),
-            (&band_150, "unrelated".to_string()),
-            (&band_164, "noise".to_string()),
-            (&at_op, "confusable2_hard".to_string()),
-            (&above, "confusable2_hard".to_string()),
-        ];
-        let canary = fa_near_miss_band(&all_neg).expect("near misses present");
-        assert_eq!(
-            canary["count"].as_u64().unwrap(),
-            3,
-            "1.35/1.50/1.64 in band"
-        );
-        let band = canary["band"].as_array().unwrap();
-        assert!((band[0].as_f64().unwrap() - 1.35).abs() < 1e-6);
-        assert!((band[1].as_f64().unwrap() - 1.65).abs() < 1e-6);
-        let ids = canary["variant_ids"].as_array().unwrap();
-        assert_eq!(
-            ids.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>(),
-            vec!["band_1.64", "band_1.50", "band_1.35"],
-            "sorted by peak rolling sum descending"
-        );
-
-        // No negatives in the band → None (report key absent — no empty stub).
-        let low = pv_fixture("below_1.20", 1.20, false);
-        let at_op2 = pv_fixture("at_op_1.65", MIN_GATE_THRESHOLD, true);
-        let high = pv_fixture("above_1.90", 1.90, true);
-        let none_case: Vec<(&PerVariantResult, String)> = vec![
-            (&low, "unrelated".to_string()),
-            (&at_op2, "confusable2_hard".to_string()),
-            (&high, "noise".to_string()),
-        ];
-        assert!(fa_near_miss_band(&none_case).is_none());
-    }
-
-    /// Condition tag parsing: confusable band+tier, unrelated seed bands, and
-    /// the bare categories all split correctly.
-    #[test]
-    fn neg_condition_parses_tags() {
-        assert_eq!(
-            neg_condition("confusable_hard", "confusable_hey madbot_s0"),
-            ("confusable", Some("hard"), "confusable")
-        );
-        assert_eq!(
-            neg_condition("confusable2_easy", "confusable2_madbot_s0"),
-            ("confusable", Some("easy"), "confusable2")
-        );
-        assert_eq!(
-            neg_condition("unrelated", "unrelated2_what time is it_s0"),
-            ("unrelated", None, "unrelated2")
-        );
-        assert_eq!(
-            neg_condition("unrelated", "unrelated_hello world_s0"),
-            ("unrelated", None, "unrelated")
-        );
-        assert_eq!(
-            neg_condition("silence", "silence_0_5s"),
-            ("silence", None, "")
-        );
-        assert_eq!(neg_condition("noise", "pink noise"), ("noise", None, ""));
-    }
-
-    /// JSON peak-rolling-sum extraction: `max_rolling_sum` fields are read
-    /// directly, `window_scores` triples are re-derived via the rolling-sum
-    /// index (the no-new-raw-dumps rule keeps both shapes parseable).
-    #[test]
-    fn peak_rolling_sums_from_json_handles_both_shapes() {
-        // pv_to_json shape: max_rolling_sum present.
-        let direct = serde_json::json!([
-            {"variant": "a", "max_rolling_sum": 1.72},
-            {"variant": "b", "max_rolling_sum": 0.9},
-        ]);
-        let sums = peak_rolling_sums_from_json(direct.as_array().unwrap());
-        assert!((sums[0] - 1.72).abs() < 1e-6 && (sums[1] - 0.9).abs() < 1e-6);
-
-        // enrolled-speaker shape: window_scores `[total, rolling_sum, thr]`.
-        let ws = serde_json::json!([
-            {"variant": "c", "window_scores": [
-                [0.5, 0.9, 1.65],
-                [0.6, 1.40, 1.65],
-                [0.7, 1.71, 1.65],
-                [0.4, 0.80, 1.65],
-            ]},
-        ]);
-        let sums = peak_rolling_sums_from_json(ws.as_array().unwrap());
-        assert_eq!(sums.len(), 1);
-        assert!((sums[0] - 1.71).abs() < 1e-6, "peak rolling sum = 1.71");
-
-        // Entries with neither field contribute nothing.
-        let empty = peak_rolling_sums_from_json(&[serde_json::json!({"variant": "d"})]);
-        assert!(empty.is_empty());
-    }
-
-    /// End-to-end aggregation shape: the sweep, the near-miss canary, and the
-    /// FA split agree on a synthetic corpus at the operating point.
-    #[test]
-    fn sweep_canary_and_fa_split_agree_on_synthetic_corpus() {
-        let fa190 = pv_fixture("fa_1.90", 1.90, true);
-        let fa170 = pv_fixture("fa_1.70", 1.70, true);
-        let fa165 = pv_fixture("fa_1.65", MIN_GATE_THRESHOLD, true);
-        // Crosses the score gate (1.68 >= 1.65) without an end-to-end
-        // detection — the FA/non-FA boundary lives in this gap.
-        let gate_no_fa = pv_fixture("gate_crossed_not_detected", 1.68, false);
-        // Near misses: below the gate, inside the canary band.
-        let near164 = pv_fixture("near_1.64", 1.64, false);
-        let near150 = pv_fixture("near_1.50", 1.50, false);
-        let near135 = pv_fixture("near_1.35", 1.35, false);
-        let clean08 = pv_fixture("clean_0.8", 0.8, false);
-        let clean05 = pv_fixture("clean_0.5", 0.5, false);
-        let clean02 = pv_fixture("clean_0.2", 0.2, false);
-        let clean01 = pv_fixture("clean_0.1", 0.1, false);
-        let all_neg: Vec<(&PerVariantResult, String)> = vec![
-            // 3 detected FAs + 1 gate-crossing non-FA + 3 near-miss non-FAs
-            // + 4 clean non-FAs.
-            (&fa190, "confusable_hard".to_string()),
-            (&fa170, "confusable2_medium".to_string()),
-            (&fa165, "unrelated".to_string()),
-            (&gate_no_fa, "confusable_easy".to_string()),
-            (&near164, "confusable_easy".to_string()),
-            (&near150, "unrelated".to_string()),
-            (&near135, "silence".to_string()),
-            (&clean08, "noise".to_string()),
-            (&clean05, "unrelated".to_string()),
-            (&clean02, "silence".to_string()),
-            (&clean01, "noise".to_string()),
-        ];
-        let gates = sweep_gates();
-        let samples: Vec<f32> = all_neg.iter().map(|(pv, _)| pv.max_rolling_sum).collect();
-        let rows = sweep_rows(&gates, &samples);
-        let op_row = rows
-            .iter()
-            .find(|r| (r["gate"].as_f64().unwrap() - MIN_GATE_THRESHOLD as f64).abs() < 1e-6)
-            .expect("operating-point row");
-        assert_eq!(
-            op_row["crossings"].as_u64().unwrap(),
-            4,
-            "1.90/1.70/1.65/1.68 >= 1.65 → 4 score-gate crossings at the operating point"
-        );
-        // End-to-end FAs (detected) = 3 — the crossing count exceeds the
-        // e2e count because gate_crossed_not_detected (1.68) crossed the
-        // score gate without a full pipeline detection (the FA/non-FA
-        // boundary is exactly this gap).
-        let (fa, non_fa) = neg_fa_split(&all_neg);
-        assert_eq!(fa.len(), 3);
-        assert_eq!(non_fa.len(), 8);
-        let canary = fa_near_miss_band(&all_neg).expect("3 near misses");
-        assert_eq!(canary["count"].as_u64().unwrap(), 3);
-        assert!(
-            canary["variant_ids"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|v| v.as_str().unwrap() != "gate_crossed_not_detected"),
-            "the 1.68 gate crossing is above the band and must not be a near miss"
-        );
-    }
-
-    // ── Sweep machinery ─────────────────────────────────────────
-
-    /// Set sweep env vars under the shared env lock, run `f`, and restore the
-    /// previous values on drop — RAII, so a panicking closure cannot leak
-    /// vars into subsequent tests.
-    ///
-    /// [`EnvVarGuard`](crate::util::test::EnvVarGuard) can only hold ONE var
-    /// at a time (it owns the env lock for its whole lifetime), so the
-    /// multi-var cases follow the precedent of the EnvVarGuard's own tests
-    /// (`util/test.rs`): `unsafe` `set_var`/`remove_var` under `env_lock()`.
-    fn with_sweep_env(kvs: &[(&str, &str)], f: impl FnOnce() -> SweepConfig) -> SweepConfig {
-        let _guard = SweepEnvGuard::set(kvs);
-        f()
-    }
-
-    /// RAII guard restoring the env vars that existed before
-    /// [`SweepEnvGuard::set`] (holding the shared env lock for its lifetime).
-    struct SweepEnvGuard<'a> {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved: Vec<(&'a str, Option<std::ffi::OsString>)>,
-    }
-
-    impl<'a> SweepEnvGuard<'a> {
-        /// Record the current values of `kvs`, then set them; the original
-        /// values are restored on drop (removed if they were unset).  Uses
-        /// `var_os` so a non-UTF-8 prior value round-trips unchanged.
-        fn set(kvs: &[(&'a str, &'a str)]) -> Self {
-            let lock = crate::util::test::env_lock().lock().unwrap_poison();
-            let saved = kvs.iter().map(|&(k, _)| (k, std::env::var_os(k))).collect();
-            unsafe {
-                for &(k, v) in kvs {
-                    std::env::set_var(k, v);
-                }
-            }
-            Self { _lock: lock, saved }
-        }
-    }
-
-    impl Drop for SweepEnvGuard<'_> {
-        fn drop(&mut self) {
-            unsafe {
-                for (k, prev) in &self.saved {
-                    match prev {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Sweep config parsing: env values are honored, invalid values fall
-    /// back with a warning, and k>0 without labels is clamped to a no-op.
-    #[test]
-    fn sweep_config_from_env_parses_and_clamps() {
-        // gate_margin honored.
-        let cfg = with_sweep_env(&[(ENV_BENCH_GATE_MARGIN, "0.04")], SweepConfig::from_env);
-        assert!((cfg.gate_margin - 0.04).abs() < 1e-6);
-        assert_eq!(
-            cfg.neg_cap,
-            crate::audio::wake_word::MAX_NEGATIVE_PROTOTYPES
-        );
-
-        // neg_cap honored.
-        let cfg = with_sweep_env(&[(ENV_BENCH_NEG_CAP, "64")], SweepConfig::from_env);
-        assert_eq!(cfg.neg_cap, 64);
-        assert_eq!(
-            cfg.gate_margin,
-            crate::audio::wake_word::DEFAULT_GATE_MARGIN
-        );
-
-        // k + labels together → injection enabled.
-        let cfg = with_sweep_env(
-            &[
-                (ENV_BENCH_INJECT_K, "6"),
-                (
-                    ENV_BENCH_INJECT_FA_LABELS,
-                    "confusable_madbot_s0, confusable2_hey mahbot_s0",
-                ),
-            ],
-            SweepConfig::from_env,
-        );
-        assert_eq!(cfg.inject_k, 6);
-        assert_eq!(
-            cfg.inject_labels,
-            vec!["confusable_madbot_s0", "confusable2_hey mahbot_s0"]
-        );
-        assert!(cfg.injection_enabled());
-
-        // k>0 without labels is clamped to a no-op (injection disabled).
-        let cfg2 = with_sweep_env(&[(ENV_BENCH_INJECT_K, "4")], SweepConfig::from_env);
-        assert_eq!(cfg2.inject_k, 0, "k>0 without labels is clamped to 0");
-        assert!(!cfg2.injection_enabled());
-
-        // Invalid values fall back to the defaults.
-        let cfg3 = with_sweep_env(&[(ENV_BENCH_GATE_MARGIN, "banana")], SweepConfig::from_env);
-        assert_eq!(
-            cfg3.gate_margin,
-            crate::audio::wake_word::DEFAULT_GATE_MARGIN
-        );
-        let cfg4 = with_sweep_env(&[(ENV_BENCH_NEG_CAP, "-1")], SweepConfig::from_env);
-        assert_eq!(
-            cfg4.neg_cap,
-            crate::audio::wake_word::MAX_NEGATIVE_PROTOTYPES
-        );
-    }
-
-    /// Crossing-frame selection: a reproduced trigger returns the trigger
-    /// window (trigger frame + the preceding ROLLING_WINDOW_N-1 frames);
-    /// without a trigger it falls back to the top-N frames by rolling sum
-    /// (ties earliest-first).
-    #[test]
-    fn crossing_frame_indices_trigger_window_and_fallback() {
-        let n = super::ROLLING_WINDOW_N;
-        // Trigger at index 5 → frames 3..=5 (window of N).
-        let mut instr = super::DetectionInstrumentation::new();
-        for i in 0..8 {
-            instr.per_frame_scores.push([0.5, i as f32 * 0.1, 1.65]);
-        }
-        instr.first_trigger_frame_idx = Some(5);
-        let idx = crossing_frame_indices(&instr);
-        assert_eq!(idx, vec![5 - (n - 1), 5 - (n - 2), 5], "trigger window");
-        assert!(idx.iter().all(|&i| i < instr.per_frame_scores.len()));
-
-        // Early trigger (index 0) clamps at 0 — no underflow.
-        instr.first_trigger_frame_idx = Some(0);
-        assert_eq!(crossing_frame_indices(&instr), vec![0]);
-
-        // No trigger → top-N frames by rolling sum (desc), ties earliest.
-        instr.first_trigger_frame_idx = None;
-        let fallback = crossing_frame_indices(&instr);
-        assert_eq!(fallback.len(), n);
-        let top_rs: Vec<f32> = fallback
-            .iter()
-            .map(|&i| instr.per_frame_scores[i][ROLLING_SUM_IDX])
-            .collect();
-        assert!(
-            top_rs.windows(2).all(|w| w[0] >= w[1]),
-            "fallback frames ordered by rolling sum descending"
-        );
-
-        // Empty instrumentation → empty indices (no panic).
-        let empty = super::DetectionInstrumentation::new();
-        assert!(crossing_frame_indices(&empty).is_empty());
     }
 }

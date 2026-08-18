@@ -65,8 +65,8 @@ use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -275,154 +275,6 @@ const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 /// confusable near-miss tail to ~0, so 0.35 sits above the floor-mapped noise
 /// band while staying below genuine-match soft scores.
 const NO_MATCH_RESET_THRESHOLD: f32 = 0.35;
-
-// Voice pipeline metrics — always-on atomic counters
-
-/// Total audio chunks received from the microphone channel by the pipeline
-/// loop (incremented after each successful `rx.recv()`).
-pub(crate) static CHUNKS_RECEIVED: AtomicU64 = AtomicU64::new(0);
-
-/// Audio chunks dropped at the mic channel boundary (`try_send` failure).
-/// These chunks were discarded because the pipeline was not consuming fast
-/// enough and the bounded channel (`MIC_CHANNEL_CAPACITY` = 32 chunks) was
-/// full.  This is the primary indicator of the pipeline falling behind
-/// real-time audio.
-pub(crate) static DROPPED_CHUNKS: AtomicU64 = AtomicU64::new(0);
-
-/// Total window embeddings computed during wake word processing.  Each
-/// embedding corresponds to one bounded ≤1 s window encoding through the
-/// shared Qwen3-ASR encoder ([`crate::audio::wake_word::encode_window`]).
-/// Monotonically increasing — never reset.
-pub(crate) static EMBEDDINGS_COMPUTED: AtomicU64 = AtomicU64::new(0);
-
-/// Total wall-clock time spent computing window embeddings (nanoseconds).
-/// Divide by [`EMBEDDINGS_COMPUTED`] for the lifetime average per-embedding
-/// latency.  Tracked via `Instant::now()` around [`encode_window`].
-pub(crate) static TOTAL_EMBEDDING_TIME_NS: AtomicU64 = AtomicU64::new(0);
-
-// ── Rolling average ring buffer for embedding latency ────────────────────
-//
-// The design calls for "rolling average (last N frames)" of processing
-// latency.  Rather than an exponential moving average (which is an
-// approximation) or a lifetime cumulative average (which becomes diagnostically
-// inert as embeddings accumulate), we use a lock-free ring buffer of the most
-// recent 100 window-encoding times.  N=100 covers ~16 s of audio at the
-// 160 ms scoring stride — large enough to smooth noise, small enough for
-// O(100) reads on the diagnostic path.
-//
-// Lock-free: single writer (pipeline task) stores to the ring with an atomic
-// head index; readers sum O(N) entries on the diagnostic/debug path only.
-// No mutex is involved on any path.
-
-/// Number of recent window-encoding latencies tracked in the rolling average
-/// ring buffer.
-const EMBEDDING_LATENCY_RING_SIZE: usize = 100;
-
-/// Lock-free ring buffer of the most recent [`EMBEDDING_LATENCY_RING_SIZE`]
-/// window-encoding times (nanoseconds).  Written by the pipeline task
-/// (single writer), read by diagnostic/logging code.  Never cleared — wraps
-/// around on overflow.
-static EMBEDDING_LATENCY_RING: [AtomicU64; EMBEDDING_LATENCY_RING_SIZE] =
-    [const { AtomicU64::new(0) }; EMBEDDING_LATENCY_RING_SIZE];
-
-/// Total number of writes to [`EMBEDDING_LATENCY_RING`].  Monotonically
-/// increasing — the number of valid entries in the ring is
-/// `min(writes, EMBEDDING_LATENCY_RING_SIZE)`.
-static EMBEDDING_LATENCY_RING_WRITES: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot of voice pipeline metrics for diagnostics and logging.
-///
-/// Returned by [`get_voice_metrics()`].  All fields are atomically-sampled
-/// Relaxed reads — not guaranteed to be mutually consistent across fields in
-/// the presence of concurrent increments, but good enough for diagnostic use.
-///
-/// The `avg_embedding_latency_ns` field is computed from the lock-free ring
-/// buffer of the last [`EMBEDDING_LATENCY_RING_SIZE`] window encodings,
-/// providing a true rolling average that reflects recent pipeline performance.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct VoiceMetricsSnapshot {
-    /// Total audio chunks received from the mic channel.
-    pub chunks_received: u64,
-    /// Chunks dropped at the mic channel boundary (try_send full).
-    pub dropped_chunks: u64,
-    /// Total window embeddings computed.
-    pub embeddings_computed: u64,
-    /// Cumulative window-encoding time (nanoseconds) — for lifetime
-    /// average via [`Self::lifetime_avg_embedding_latency_ns`].
-    pub total_embedding_time_ns: u64,
-    /// Rolling average window-encoding latency in nanoseconds (last 100).
-    /// Prefer this over the lifetime average for detecting recent performance
-    /// changes — the lifetime average becomes diagnostically inert as the
-    /// pipeline accumulates millions of embeddings.
-    pub avg_embedding_latency_ns: u64,
-}
-
-impl VoiceMetricsSnapshot {
-    /// Lifetime average window-encoding latency in nanoseconds (total ÷ count).
-    ///
-    /// Useful for overall diagnostic ("has the model gotten slower since
-    /// startup?"), but becomes insensitive to recent changes after many
-    /// embeddings.  Use the rolling average
-    /// [`avg_embedding_latency_ns`](Self::avg_embedding_latency_ns) for
-    /// detecting recent performance shifts.
-    ///
-    /// Returns 0 when no embeddings have been computed.
-    #[must_use]
-    pub fn lifetime_avg_embedding_latency_ns(&self) -> u64 {
-        self.total_embedding_time_ns
-            .checked_div(self.embeddings_computed)
-            .unwrap_or(0)
-    }
-
-    /// Fraction of chunks dropped at the mic channel boundary (0.0 – 1.0).
-    /// Returns 0.0 when no chunks have been received.
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn drop_rate(&self) -> f64 {
-        let total = self.chunks_received + self.dropped_chunks;
-        if total == 0 {
-            0.0
-        } else {
-            self.dropped_chunks as f64 / total as f64
-        }
-    }
-}
-
-/// Read a consistent snapshot of all voice pipeline metrics.
-///
-/// The `avg_embedding_latency_ns` field is computed by summing the lock-free
-/// ring buffer entries — O(100) relaxed atomic loads, negligible for any
-/// diagnostic path.
-pub(crate) fn get_voice_metrics() -> VoiceMetricsSnapshot {
-    // Compute the rolling average from the lock-free ring buffer.
-    // Both truncation sites (u64 → usize for indexing, usize → u64 for
-    // division) are safe: the ring is 100 entries, and writes won't overflow
-    // usize on any target within the pipeline's lifetime.
-    #[allow(clippy::cast_possible_truncation)]
-    let valid = usize::try_from(EMBEDDING_LATENCY_RING_WRITES.load(Ordering::Relaxed))
-        .map_or(0, |w| w.min(EMBEDDING_LATENCY_RING_SIZE));
-    let avg_ns = if valid > 0 {
-        #[allow(clippy::needless_range_loop)]
-        let sum: u64 = EMBEDDING_LATENCY_RING[..valid]
-            .iter()
-            .map(|a| a.load(Ordering::Relaxed))
-            .sum();
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            sum / valid as u64
-        }
-    } else {
-        0
-    };
-
-    VoiceMetricsSnapshot {
-        chunks_received: CHUNKS_RECEIVED.load(Ordering::Relaxed),
-        dropped_chunks: DROPPED_CHUNKS.load(Ordering::Relaxed),
-        embeddings_computed: EMBEDDINGS_COMPUTED.load(Ordering::Relaxed),
-        total_embedding_time_ns: TOTAL_EMBEDDING_TIME_NS.load(Ordering::Relaxed),
-        avg_embedding_latency_ns: avg_ns,
-    }
-}
 
 /// A single embedding decision recorded in the activation trace.
 /// Each frame represents ~160 ms of audio (one [`SCORE_STRIDE_SAMPLES`]
@@ -1154,146 +1006,10 @@ fn is_mic_permission_error(err: &anyhow::Error) -> bool {
 
 // ── Voice PCM disk cache helpers ─────────────────────────────
 //
-// Cache bounding: two-phase eviction — age-based (stale entries
-// older than voice_cache_max_age_days) followed by size-based (oldest-first
-// via mtime, FIFO).  Either phase can be disabled via config (None).
-//
 // These helpers are consumed by the unit tests below and by the voice-tests
 // e2e benchmark (`synthesize_with_pcm_cache`); nothing in the production
 // detection path synthesises TTS PCM anymore, so the whole section is
 // dead-code-allowed in default builds.
-
-/// Evict stale/oversized entries from the PCM cache directory.
-#[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
-pub(crate) fn evict_pcm_cache(cache_dir: &Path) {
-    use std::time::SystemTime;
-
-    struct CacheEntry {
-        path: PathBuf,
-        size: u64,
-        modified: SystemTime,
-    }
-
-    let max_size = crate::config::CONFIG.voice_cache_max_size_bytes();
-    let max_age = crate::config::CONFIG.voice_cache_max_age();
-
-    if max_size.is_none() && max_age.is_none() {
-        return; // both limits disabled — nothing to evict
-    }
-
-    let dir = match std::fs::read_dir(cache_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                return; // cache directory doesn't exist yet
-            }
-            warn!(
-                "PCM cache: failed to read directory {}: {e}",
-                cache_dir.display(),
-            );
-            return;
-        }
-    };
-
-    let mut entries: Vec<CacheEntry> = Vec::new();
-    let mut total_size: u64 = 0;
-    let now = SystemTime::now();
-
-    for entry in dir.flatten() {
-        let path = entry.path();
-
-        // Skip transient .tmp files (atomic writes in progress)
-        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
-            continue;
-        }
-
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-
-        let size = metadata.len();
-        // Skip entries with unreadable mtime — treating them as 1970 would
-        // guarantee eviction on the first age check, which is surprising.
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        total_size += size;
-        entries.push(CacheEntry {
-            path,
-            size,
-            modified,
-        });
-    }
-
-    if entries.is_empty() {
-        return;
-    }
-
-    let mut evicted_count: u64 = 0;
-    let mut evicted_bytes: u64 = 0;
-
-    // ── Phase 1: age-based eviction ──────────────────────────────
-    if let Some(max_age) = max_age {
-        entries.retain(|e| {
-            let Ok(age) = now.duration_since(e.modified) else {
-                return true; // clock skew — keep the entry
-            };
-            if age <= max_age {
-                return true; // young enough — keep
-            }
-            // Stale entry — remove
-            if std::fs::remove_file(&e.path).is_ok() {
-                total_size = total_size.saturating_sub(e.size);
-                evicted_bytes += e.size;
-                evicted_count += 1;
-            } else {
-                // Best-effort: if the file can't be deleted, we still remove it
-                // from our tracking list (the entry is logically gone from the
-                // cache's perspective).  The file's size remains in total_size,
-                // which may cause Phase 2 to over-evict slightly.  This is
-                // acceptable under best-effort semantics.
-                warn!(
-                    "PCM cache: failed to remove stale entry {}",
-                    e.path.display()
-                );
-            }
-            false // remove from our tracking list
-        });
-    }
-
-    // ── Phase 2: size-based eviction (oldest-first via mtime, FIFO) ─────
-    if let Some(max_size) = max_size
-        && total_size > max_size
-    {
-        // Sort remaining entries by mtime (oldest first) for FIFO eviction
-        entries.sort_by_key(|e| e.modified);
-
-        for e in &entries {
-            if total_size <= max_size {
-                break;
-            }
-            if std::fs::remove_file(&e.path).is_ok() {
-                total_size = total_size.saturating_sub(e.size);
-                evicted_bytes += e.size;
-                evicted_count += 1;
-            } else {
-                warn!(
-                    "PCM cache: failed to remove excess entry {}",
-                    e.path.display()
-                );
-            }
-        }
-    }
-
-    if evicted_count > 0 {
-        #[allow(clippy::cast_precision_loss)]
-        let mb = evicted_bytes as f64 / 1_048_576.0;
-        info!("PCM cache: evicted {evicted_count} entries ({:.1} MB)", mb,);
-    }
-}
 
 /// Deterministic cache key for one TTS-synthesised PCM utterance.
 ///
@@ -1390,11 +1106,6 @@ pub(crate) fn read_pcm_cache(path: &Path) -> Option<Vec<f32>> {
     Some(samples)
 }
 
-/// One-shot guard for the per-miss [`evict_pcm_cache`] scan in
-/// [`synthesize_with_pcm_cache`].
-#[cfg_attr(not(feature = "voice-tests"), allow(dead_code))]
-static PCM_EVICTION_RAN: AtomicBool = AtomicBool::new(false);
-
 /// Synthesise a phrase via TTS, caching PCM audio to disk.
 ///
 /// Checks the voice PCM disk cache first (keyed by text + style + seed +
@@ -1417,38 +1128,18 @@ pub(crate) fn synthesize_with_pcm_cache(
     let key = pcm_cache_key(text, style, seed, sample_rate, model_hash);
     let cache_path = cache_dir.join(&key);
 
-    // Allow manual cache invalidation without deleting files.
-    // When set, every read is treated as a miss, forcing re-synthesis.
-    let cache_bust = std::env::var("MAHBOT_TEST_CACHE_BUST").as_deref() == Ok("1");
-
-    // Fast path: cache hit (skipped entirely when busting)
-    if !cache_bust && let Some(pcm) = read_pcm_cache(&cache_path) {
+    // Fast path: cache hit.
+    if let Some(pcm) = read_pcm_cache(&cache_path) {
         debug!("PCM cache HIT for key {key} ({text}, style={style}, seed={seed})");
         return Some(pcm);
     }
 
-    if cache_bust {
-        debug!(
-            "PCM cache BYPASSED by MAHBOT_TEST_CACHE_BUST=1 ({text}, style={style}, seed={seed}) — synthesising"
-        );
-    } else {
-        debug!("PCM cache MISS for key {key} ({text}, style={style}, seed={seed}) — synthesising");
-    }
+    debug!("PCM cache MISS for key {key} ({text}, style={style}, seed={seed}) — synthesising");
 
     // Cache miss — synthesise via TTS
     let Ok(pcm) = crate::audio::tts::synthesize(text, style, seed, sample_rate) else {
         return None;
     };
-
-    // Evict stale/excess entries before writing to keep cache bounded.
-    //
-    // This performs a full directory scan on every cache miss.  The scan is
-    // gated to run ONCE per process: the first miss still evicts, preserving
-    // the safety net, while subsequent per-write scans are strictly
-    // redundant.
-    if !PCM_EVICTION_RAN.swap(true, Ordering::Relaxed) {
-        evict_pcm_cache(cache_dir);
-    }
 
     // Write to disk cache atomically
     write_pcm_cache(&cache_path, &pcm);
@@ -1485,9 +1176,7 @@ fn convert_and_send_audio_to_pipeline<T, F>(
         };
         // try_send: drop-newest policy when the bounded channel is full
         // (see MIC_CHANNEL_CAPACITY docs).
-        if tx.try_send(resampled).is_err() {
-            DROPPED_CHUNKS.fetch_add(1, Ordering::Relaxed);
-        }
+        let _ = tx.try_send(resampled);
         return;
     }
 
@@ -1503,9 +1192,9 @@ fn convert_and_send_audio_to_pipeline<T, F>(
     } else {
         crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
     };
-    if tx.try_send(resampled).is_err() {
-        DROPPED_CHUNKS.fetch_add(1, Ordering::Relaxed);
-    }
+    // try_send: drop-newest policy when the bounded channel is full
+    // (see MIC_CHANNEL_CAPACITY docs).
+    let _ = tx.try_send(resampled);
 }
 
 /// Log a microphone stream error and update the pipeline status.
@@ -2394,16 +2083,6 @@ pub(crate) struct DetectionInstrumentation {
     /// (detection trigger).  `None` if detection never triggered on
     /// test-utterance frames.
     pub first_trigger_frame_idx: Option<usize>,
-    /// Per-frame window embeddings (1024-dim, L2-normalized), one per scored
-    /// window, index-aligned with [`per_frame_scores`](Self::per_frame_scores).
-    ///
-    /// Captured only for the benchmark's hard-negative mining pre-pass
-    /// (crossing-frame embeddings of false-accept variants are injected into
-    /// the anti-prototype construction).  NOT copied into per-variant
-    /// reports — raw 1024-dim dumps would bloat the JSON; the only consumer
-    /// is the mining pre-pass, which reads them transiently.  Kept off the
-    /// per-frame hot path in production builds by the `voice-tests` gate.
-    pub per_frame_embeddings: Vec<Vec<f32>>,
     /// Per-hop VAD decisions during streaming detection, in order — one entry
     /// per VAD decision (each 512-sample frame processed, feeding its new
     /// 256-sample half to the VAD).
@@ -2421,7 +2100,6 @@ impl DetectionInstrumentation {
             adaptive_threshold_trajectory: Vec::new(),
             ceiling_limited_frames: 0,
             first_trigger_frame_idx: None,
-            per_frame_embeddings: Vec::new(),
             per_hop_vad: Vec::new(),
         }
     }
@@ -3743,10 +3421,6 @@ pub async fn run_voice_pipeline() {
     // for the select! timeout on the first iteration).
     ctx.check_auto_start();
 
-    // Periodic metrics log via tokio::time::Interval.  Fires
-    // every 60 seconds on wall-clock time regardless of audio activity.
-    let mut metrics_interval = tokio::time::interval(Duration::from_mins(1));
-
     loop {
         tokio::select! {
             () = shutdown_token.cancelled() => {
@@ -3826,8 +3500,6 @@ pub async fn run_voice_pipeline() {
                     continue;
                 };
 
-                CHUNKS_RECEIVED.fetch_add(1, Ordering::Relaxed);
-
                 // ── TTS playback gate ──
                 // If TTS audio is actively playing through the speakers, skip
                 // ALL audio processing for this chunk.  This prevents TTS echo
@@ -3895,24 +3567,6 @@ pub async fn run_voice_pipeline() {
                 }
             }
 
-            // Periodic metrics log every ~60 seconds.
-            _ = metrics_interval.tick() => {
-                let m = get_voice_metrics();
-                let roll_avg = m.avg_embedding_latency_ns;
-                let life_avg = m.lifetime_avg_embedding_latency_ns();
-                debug!(
-                    target: "mahbot::voice::metrics",
-                    "Pipeline metrics: chunks_received={0} dropped_chunks={1} ({2:.2}%) \
-                     embeddings_computed={3} rolling_avg_latency={4}ns \
-                     lifetime_avg_latency={5}ns",
-                    m.chunks_received,
-                    m.dropped_chunks,
-                    m.drop_rate() * 100.0,
-                    m.embeddings_computed,
-                    roll_avg,
-                    life_avg,
-                );
-            }
         }
 
         // Periodic auto-recovery: if the transcriber is in Failed state,
@@ -4401,19 +4055,9 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             .saturating_sub(WAKE_WORD_WINDOW_SAMPLES);
         let window = &ctx.speech_window[start..];
 
-        let embed_start = Instant::now();
         let embedding = crate::util::with_block_in_place(|| encode_window(&model, window));
         match embedding {
             Ok(embedding) => {
-                let elapsed = embed_start.elapsed();
-                let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-                TOTAL_EMBEDDING_TIME_NS.fetch_add(elapsed_ns, Ordering::Relaxed);
-                EMBEDDINGS_COMPUTED.fetch_add(1, Ordering::Relaxed);
-                #[allow(clippy::cast_possible_truncation)]
-                let head = EMBEDDING_LATENCY_RING_WRITES.fetch_add(1, Ordering::Relaxed) as usize
-                    % EMBEDDING_LATENCY_RING_SIZE;
-                EMBEDDING_LATENCY_RING[head].store(elapsed_ns, Ordering::Relaxed);
-
                 let (detected, _rolling_sum, _total_score, _effective_threshold) =
                     score_single_embedding(
                         &embedding,
@@ -4436,9 +4080,6 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                         _rolling_sum,
                         _effective_threshold,
                     ]);
-                    ctx.instrumentation
-                        .per_frame_embeddings
-                        .push(embedding.clone());
                     if _total_score < NO_MATCH_RESET_THRESHOLD {
                         ctx.instrumentation.n_frames_below_reset += 1;
                     }
@@ -4930,8 +4571,6 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::test::set_env_var;
-    use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
     // ── VAD-gated utterance segmentation tests ────────────────────────────
@@ -5908,68 +5547,6 @@ mod tests {
         assert!(state.enrollment_embeddings.is_empty());
     }
 
-    // ── Voice metrics tests ────────────────────────────────────────────────
-
-    #[test]
-    fn voice_metrics_empty_snapshot_has_zero_average() {
-        // Snapshot with zero embeddings should report 0ns average and 0%
-        // drop rate, not NaN or a panic from division by zero.
-        let snap = VoiceMetricsSnapshot {
-            chunks_received: 0,
-            dropped_chunks: 0,
-            embeddings_computed: 0,
-            total_embedding_time_ns: 0,
-            avg_embedding_latency_ns: 0,
-        };
-        assert_eq!(snap.lifetime_avg_embedding_latency_ns(), 0);
-        assert_eq!(snap.avg_embedding_latency_ns, 0);
-        assert_eq!(snap.drop_rate(), 0.0);
-    }
-
-    #[test]
-    fn voice_metrics_drop_rate_saturates() {
-        // With no chunks received and 0 dropped, drop_rate should be 0.0,
-        // not NaN or panic.
-        let snap = VoiceMetricsSnapshot {
-            chunks_received: 0,
-            dropped_chunks: 0,
-            embeddings_computed: 0,
-            total_embedding_time_ns: 0,
-            avg_embedding_latency_ns: 0,
-        };
-        assert_eq!(snap.drop_rate(), 0.0);
-        // All chunks dropped → drop_rate = 1.0
-        let snap = VoiceMetricsSnapshot {
-            chunks_received: 0,
-            dropped_chunks: 42,
-            ..snap
-        };
-        assert!((snap.drop_rate() - 1.0).abs() < f64::EPSILON);
-        // Half dropped → drop_rate = 0.5
-        let snap = VoiceMetricsSnapshot {
-            chunks_received: 50,
-            dropped_chunks: 50,
-            ..snap
-        };
-        assert!((snap.drop_rate() - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn voice_metrics_lifetime_average_computation() {
-        let snap = VoiceMetricsSnapshot {
-            chunks_received: 0,
-            dropped_chunks: 0,
-            embeddings_computed: 10,
-            total_embedding_time_ns: 1_000_000, // 1ms total for 10 embeddings
-            avg_embedding_latency_ns: 0,
-        };
-        assert_eq!(
-            snap.lifetime_avg_embedding_latency_ns(),
-            100_000,
-            "1ms / 10 embeddings = 100µs per embedding"
-        );
-    }
-
     // ── samples_to_ms / quality helpers ────────────────────────────────────
 
     #[test]
@@ -6651,325 +6228,23 @@ mod tests {
         assert!(ctx.score_window.is_empty());
     }
 
-    // ── PCM cache eviction tests ───────────────────────────────────────────
-
-    static EVICTION_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Write synthetic PCM data (16 KB) to `path` and optionally backdate its
-    /// mtime by `age` (None = leave current).  Returns the entry size.
-    fn seed_test_pcm(path: &Path, age: Option<Duration>) -> u64 {
-        let samples: Vec<f32> = vec![0.0; 4096]; // 16 KB
-        write_pcm_cache(path, &samples);
-        if let Some(age) = age {
-            let mtime = std::time::SystemTime::now() - age;
-            let times = std::fs::FileTimes::new().set_modified(mtime);
-            let _ = std::fs::File::open(path).and_then(|f| f.set_times(times));
-        }
-        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-    }
-
-    /// Set config fields for the duration of a test, restoring defaults on drop.
-    /// Acquires [`EVICTION_TEST_LOCK`] so that parallel tests do not race on the
-    /// global CONFIG singleton.
-    struct EvictionConfigGuard {
-        _guard: MutexGuard<'static, ()>,
-    }
-    impl EvictionConfigGuard {
-        fn set(size_mb: &str, age_days: &str) -> Self {
-            let lock = EVICTION_TEST_LOCK.lock().unwrap();
-            let _ = crate::config::CONFIG.set_string_field("voice_cache_max_size_mb", size_mb);
-            let _ = crate::config::CONFIG.set_string_field("voice_cache_max_age_days", age_days);
-            EvictionConfigGuard { _guard: lock }
-        }
-    }
-    impl Drop for EvictionConfigGuard {
-        fn drop(&mut self) {
-            let _ = crate::config::CONFIG.set_string_field("voice_cache_max_size_mb", "");
-            let _ = crate::config::CONFIG.set_string_field("voice_cache_max_age_days", "");
-        }
-    }
-
-    #[test]
-    fn evict_pcm_cache_nonexistent_dir_does_not_panic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let nonexistent = tmp.path().join("does_not_exist");
-        evict_pcm_cache(&nonexistent);
-    }
-
-    #[test]
-    fn evict_pcm_cache_ignores_tmp_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Create a .tmp file (should be ignored by eviction)
-        let tmp_path = tmp.path().join("abcdef0123456789abcdef0123456789.tmp");
-        let _ = std::fs::write(&tmp_path, &[0u8; 4096]);
-        assert!(tmp_path.exists());
-
-        // Also create 3 real entries (16 KB each) that are old enough to
-        // trigger age-based eviction.
-        let old_age = Duration::from_secs(2 * 86400);
-        for i in 0..3u8 {
-            let name = format!("{:064x}", i);
-            seed_test_pcm(&tmp.path().join(&name), Some(old_age));
-        }
-
-        // age = 1 day triggers eviction of the old entries; .tmp file must survive
-        let _guard = EvictionConfigGuard::set("0", "1");
-        evict_pcm_cache(tmp.path());
-        assert!(tmp_path.exists(), ".tmp files must survive eviction");
-        // Verify non-tmp files were processed (old entries removed)
-        for i in 0..3u8 {
-            assert!(
-                !tmp.path().join(format!("{:064x}", i)).exists(),
-                "old entry {i} must be evicted"
-            );
-        }
-    }
-
-    #[test]
-    fn evict_pcm_cache_age_based_removes_stale_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Create a "recent" entry
-        let recent_path = tmp.path().join("a".repeat(64));
-        seed_test_pcm(&recent_path, None);
-
-        // Create an "old" entry by backdating its mtime far in the past
-        let old_path = tmp.path().join("b".repeat(64));
-        seed_test_pcm(&old_path, Some(Duration::from_secs(2 * 86400)));
-
-        assert!(recent_path.exists());
-        assert!(old_path.exists());
-
-        // Evict with 1 day max age — old entry should be removed, recent kept
-        let _guard = EvictionConfigGuard::set("0", "1"); // size disabled, age = 1 day
-        evict_pcm_cache(tmp.path());
-
-        assert!(
-            recent_path.exists(),
-            "recent entry must survive age-based eviction"
-        );
-        assert!(!old_path.exists(), "old entry must be evicted by age limit");
-    }
-
-    #[test]
-    fn evict_pcm_cache_age_zero_disables_age_eviction() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let path = tmp.path().join("a".repeat(64));
-        // Set mtime to 2 days ago
-        seed_test_pcm(&path, Some(Duration::from_secs(2 * 86400)));
-
-        // age = 0 means disabled — even old entries should survive
-        let _guard = EvictionConfigGuard::set("0", "0"); // both disabled
-        evict_pcm_cache(tmp.path());
-        assert!(
-            path.exists(),
-            "entry must survive when age limit is disabled (0)"
-        );
-    }
-
-    #[test]
-    fn evict_pcm_cache_size_zero_disables_size_eviction() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Create several entries totalling ~48 KB
-        for i in 0..3u8 {
-            let name = format!("{:064x}", i);
-            seed_test_pcm(&tmp.path().join(&name), None);
-        }
-
-        // size = 0 means disabled — all entries survive regardless of total size
-        let _guard = EvictionConfigGuard::set("0", "0"); // both disabled
-        evict_pcm_cache(tmp.path());
-        for i in 0..3u8 {
-            let name = format!("{:064x}", i);
-            assert!(
-                tmp.path().join(&name).exists(),
-                "entry {name} must survive when size limit is disabled (0)"
-            );
-        }
-    }
-
-    #[test]
-    fn evict_pcm_cache_within_limit_keeps_all_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Create 3 entries totalling ~48 KB
-        for i in 0..3u8 {
-            let name = format!("{:064x}", i);
-            seed_test_pcm(&tmp.path().join(&name), None);
-        }
-
-        // Default max size (100 MB) is well above 48 KB — all entries survive.
-        // age = 0 disables age-based eviction so it doesn't interfere.
-        let _guard = EvictionConfigGuard::set("100", "0");
-        evict_pcm_cache(tmp.path());
-        for i in 0..3u8 {
-            let name = format!("{:064x}", i);
-            assert!(
-                tmp.path().join(&name).exists(),
-                "entry {name} must survive when under size limit"
-            );
-        }
-    }
-
-    #[test]
-    fn evict_pcm_cache_size_based_removes_oldest_entry_first() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Create 68 entries (~16 KB each = ~1088 KB total, exceeding 1 MB limit)
-        let count = 68;
-        for i in 0..count {
-            let name = format!("{:064x}", i);
-            // Stagger mtime: entry 0 is oldest (67 hours ago), entry 67 is newest
-            let age_hours = (count - 1 - i) as u64;
-            seed_test_pcm(
-                &tmp.path().join(&name),
-                Some(Duration::from_secs(age_hours * 3600)),
-            );
-        }
-
-        // Max size = 1 MB, age disabled
-        let _guard = EvictionConfigGuard::set("1", "0");
-        evict_pcm_cache(tmp.path());
-
-        // Remaining size must be ≤ 1 MB
-        let remaining: u64 = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|s| s.to_str()) != Some("tmp"))
-            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
-            .sum();
-        assert!(
-            remaining <= 1_048_576,
-            "remaining size {remaining} exceeds 1 MB limit"
-        );
-
-        // The oldest entry (index 0) must be evicted
-        assert!(
-            !tmp.path().join(format!("{:064x}", 0)).exists(),
-            "oldest entry (0) must be evicted by size limit"
-        );
-
-        // The newest entry (index 67) must survive
-        assert!(
-            tmp.path().join(format!("{:064x}", 67)).exists(),
-            "newest entry (67) must survive size-based eviction"
-        );
-    }
-
-    #[test]
-    fn evict_pcm_cache_combined_age_and_size_eviction() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Create 5 old entries (2 days old — stale)
-        let old_age = Duration::from_secs(2 * 86400);
-        for i in 0..5u8 {
-            let name = format!("old_{:064x}", i);
-            seed_test_pcm(&tmp.path().join(&name), Some(old_age));
-        }
-
-        // Create 68 recent entries (~16 KB each, totalling ~1088 KB).
-        // All within the last hour so the 1-day age limit does NOT touch them.
-        for i in 0..68u8 {
-            let name = format!("recent_{:064x}", i);
-            // Stagger mtime from 0 to 67 minutes ago (all well under 1 day)
-            let age_minutes = (67 - i) as u64;
-            seed_test_pcm(
-                &tmp.path().join(&name),
-                Some(Duration::from_secs(age_minutes * 60)),
-            );
-        }
-
-        // Age = 1 day, size = 1 MB — both limits active
-        let _guard = EvictionConfigGuard::set("1", "1");
-        evict_pcm_cache(tmp.path());
-
-        // All old entries must be gone (age-based eviction)
-        for i in 0..5u8 {
-            let name = format!("old_{:064x}", i);
-            assert!(
-                !tmp.path().join(&name).exists(),
-                "stale entry {name} must be evicted by age limit"
-            );
-        }
-
-        // The newest recent entry must survive (proves size eviction didn't
-        // remove everything — combined test would pass vacuously otherwise)
-        assert!(
-            tmp.path().join(format!("recent_{:064x}", 67)).exists(),
-            "newest recent entry must survive combined eviction"
-        );
-
-        // Remaining size (recent entries only) must be ≤ 1 MB
-        let remaining: u64 = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|s| s.to_str()) != Some("tmp"))
-            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
-            .sum();
-        assert!(
-            remaining <= 1_048_576,
-            "remaining size {remaining} exceeds 1 MB limit after combined eviction"
-        );
-    }
-
     // ── PCM cache read/write tests ─────────────────────────────────────────
 
-    /// Seed the PCM cache with one 16 KB entry keyed by `(text, style, seed)`.
-    fn seed_pcm_cache(cache_dir: &Path, text: &str, style: &str, seed: u64) {
-        let key = pcm_cache_key(text, style, seed, SAMPLE_RATE, "hash");
-        let path = cache_dir.join(&key);
-        write_pcm_cache(&path, &[0.0f32; 4096]); // valid PCM, 16 KB
-        assert!(path.exists());
+    /// Write synthetic PCM data (16 KB) to `path`.
+    fn seed_test_pcm(path: &Path) -> u64 {
+        let samples: Vec<f32> = vec![0.0; 4096]; // 16 KB
+        write_pcm_cache(path, &samples);
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     }
 
     #[test]
     fn pcm_cache_read_normal_returns_some() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a".repeat(64));
-        seed_test_pcm(&path, None);
+        seed_test_pcm(&path);
         assert!(path.exists());
 
         let result = read_pcm_cache(&path);
         assert!(result.is_some(), "normal read should return cached PCM");
-    }
-
-    #[test]
-    fn pcm_cache_bust_skips_cache_and_returns_none_when_tts_unavailable() {
-        let tmp = tempfile::tempdir().unwrap();
-        seed_pcm_cache(tmp.path(), "hello", "style", 42);
-
-        // With bust=1: skip cache, attempt TTS (fails→None)
-        let _guard = set_env_var("MAHBOT_TEST_CACHE_BUST", Some("1"));
-        let result =
-            synthesize_with_pcm_cache("hello", "style", 42, SAMPLE_RATE, "hash", tmp.path());
-        assert!(
-            result.is_none(),
-            "bust=1 should bypass cache and attempt TTS (which fails without models)"
-        );
-        drop(_guard);
-        // Without bust: cache hit → Some
-        let result =
-            synthesize_with_pcm_cache("hello", "style", 42, SAMPLE_RATE, "hash", tmp.path());
-        assert!(
-            result.is_some(),
-            "without bust, cached PCM should be returned directly"
-        );
-    }
-
-    #[test]
-    fn pcm_cache_bust_requires_exact_value_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        seed_pcm_cache(tmp.path(), "world", "style", 99);
-
-        // Setting to "true" should NOT bypass the cache
-        let _guard = set_env_var("MAHBOT_TEST_CACHE_BUST", Some("true"));
-        let result =
-            synthesize_with_pcm_cache("world", "style", 99, SAMPLE_RATE, "hash", tmp.path());
-        assert!(
-            result.is_some(),
-            "MAHBOT_TEST_CACHE_BUST=true should NOT bypass cache"
-        );
     }
 }

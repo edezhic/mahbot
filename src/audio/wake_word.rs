@@ -181,18 +181,6 @@ fn l2_normalize_in_place(v: &mut [f32]) {
 /// records are rejected at load — there is no migration path.
 pub(crate) const ENROLLMENT_SCHEMA_VERSION: u32 = 2;
 
-/// Default anti-prototype gate margin δ (schema-compatible default).
-///
-/// `soft_score` vetoes a window only when its max anti-prototype cosine
-/// exceeds the prototype cosine by MORE than δ.  δ = 0 is the historical
-/// hard veto.  The voice-pipeline benchmark can override this per run
-/// (`MAHBOT_BENCH_GATE_MARGIN`); the bench's tuned winner was δ = 0.0 —
-/// identical to this historical default, so the constant needed no
-/// post-tuning write-back and remains the default for both new enrollments
-/// ([`WakeWordEnrollment::build`]) and existing v2 records that lack the
-/// field ([`serde`] default).
-pub(crate) const DEFAULT_GATE_MARGIN: f32 = 0.0;
-
 /// Negative-sample calibration stats: cosine distribution of negative
 /// material against the prototype, measured at enrollment time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,8 +250,7 @@ pub(crate) struct WakeWordEnrollment {
     /// cluster centroids of the negative-sample embeddings.
     ///
     /// Scoring vetoes a window that is closer to ANY anti-prototype than to
-    /// the wake-word prototype by more than [`gate_margin`](Self::gate_margin)
-    /// (δ = 0 default: the historical hard veto; see
+    /// the wake-word prototype (the historical hard veto; see
     /// [`WakeWordEnrollment::soft_score`]), so a window that resembles the
     /// enrolled wake word AND a calibration negative (e.g. a confusable
     /// near-miss like "madbot" vs "mahbot") is suppressed — the
@@ -278,26 +265,6 @@ pub(crate) struct WakeWordEnrollment {
     /// RFC 3339 timestamp of most recent training/persist operation.
     #[serde(default)]
     pub(crate) trained_at: String,
-    /// Anti-prototype gate margin δ: a window is vetoed only when its max
-    /// anti-prototype cosine EXCEEDS the prototype cosine by more than δ.
-    ///
-    /// δ = 0 preserves the historical hard veto (closer to ANY negative →
-    /// score 0); δ > 0 lets a window that is only slightly closer to a
-    /// negative survive — the discriminative margin must exceed δ before
-    /// the veto fires.  Persisted with a serde default so existing v2
-    /// enrollments load unchanged; the default tracks
-    /// [`DEFAULT_GATE_MARGIN`] (the bench's tuned winner δ = 0.0 matched
-    /// the shipped default, so no schema-version bump or write-back was
-    /// needed).
-    #[serde(default = "default_gate_margin")]
-    pub(crate) gate_margin: f32,
-}
-
-/// Serde default for [`WakeWordEnrollment::gate_margin`] — tracks
-/// [`DEFAULT_GATE_MARGIN`] so existing v2 records (no `gate_margin` key)
-/// load with the tuned default without a schema bump.
-fn default_gate_margin() -> f32 {
-    DEFAULT_GATE_MARGIN
 }
 
 impl WakeWordEnrollment {
@@ -349,26 +316,7 @@ impl WakeWordEnrollment {
             negative_prototypes: distill_negative_prototypes(negative_embeddings),
             created_at,
             trained_at,
-            gate_margin: DEFAULT_GATE_MARGIN,
         })
-    }
-
-    /// Set the anti-prototype gate margin (bench sweep override).
-    ///
-    /// Production enrollments use the [`DEFAULT_GATE_MARGIN`] set by
-    /// [`build`](Self::build); the voice-pipeline benchmark applies the
-    /// sweep's δ via this builder before detection phases so the persisted
-    /// field never needs a schema bump per config.
-    //
-    // Gated on `any(feature = "voice-tests", test)`: present for the bench
-    // (voice-tests) and for the lib test target (`cfg(test)` is set during
-    // `cargo test`, where the inline margin-semantics tests call it), absent
-    // in plain production builds so it never trips dead-code.
-    #[cfg(any(feature = "voice-tests", test))]
-    #[must_use]
-    pub(crate) fn with_gate_margin(mut self, margin: f32) -> Self {
-        self.gate_margin = margin;
-        self
     }
 
     /// Cosine similarity of a window embedding (L2-normalized) against the
@@ -391,22 +339,19 @@ impl WakeWordEnrollment {
     /// Soft score in [0,1] for a window embedding.
     ///
     /// Discriminative scoring with the negative-sample anti-prototypes:
-    /// a window whose max anti-prototype cosine exceeds the wake-word
-    /// prototype cosine by more than [`gate_margin`](Self::gate_margin) is
-    /// rejected outright (score 0) — the confusable near-miss "madbot"
-    /// resembles the enrolled "mahbot" prototype AND the "madbot"
-    /// anti-prototype, but it is closer to the latter, so the comparison
-    /// collapses it.  With δ = 0 (the default) this is the historical hard
-    /// veto; with δ > 0 a window that is only slightly closer to a negative
-    /// survives.  Windows closer to the prototype are scored by the
-    /// plain positive cosine through the calibration floor.
+    /// a window whose max anti-prototype cosine EXCEEDS the wake-word
+    /// prototype cosine is rejected outright (score 0) — the historical hard
+    /// veto.  The confusable near-miss "madbot" resembles the enrolled
+    /// "mahbot" prototype AND the "madbot" anti-prototype, but it is closer
+    /// to the latter, so the comparison collapses it.  Windows closer to the
+    /// prototype are scored by the plain positive cosine through the
+    /// calibration floor.
     #[must_use]
     pub(crate) fn soft_score(&self, embedding: &[f32]) -> f32 {
         let pos = self.cosine(embedding);
         let neg = self.max_negative_cosine(embedding);
-        if !self.negative_prototypes.is_empty() && neg - pos > self.gate_margin {
-            // Closer to a negative prototype than to the wake word by more
-            // than the gate margin — reject.
+        if !self.negative_prototypes.is_empty() && neg > pos {
+            // Closer to a negative prototype than to the wake word — reject.
             return 0.0;
         }
         self.calibration.soft_score(pos)
@@ -415,47 +360,26 @@ impl WakeWordEnrollment {
 
 /// Maximum number of anti-prototype centroids distilled from the negative
 /// pool at enrollment (farthest-point sampling keeps the set spread).
-///
-/// The voice-pipeline benchmark can override this per run
-/// (`MAHBOT_BENCH_NEG_CAP`); the bench's tuned winner was cap 8 — identical
-/// to this default, so the constant needed no post-tuning write-back
-/// (production builds use this default).
 pub(crate) const MAX_NEGATIVE_PROTOTYPES: usize = 8;
 
 /// Distill the negative-sample pool into up to [`MAX_NEGATIVE_PROTOTYPES`]
 /// L2-normalized anti-prototypes via farthest-point sampling.
 ///
-/// Delegates to [`distill_negative_prototypes_capped`] with the production
-/// cap; kept as the named entry point so existing callers (enrollment
-/// build, tests) are unchanged while the bench can sweep the cap.
-#[must_use]
-pub(crate) fn distill_negative_prototypes(negatives: &[Vec<f32>]) -> Vec<Vec<f32>> {
-    distill_negative_prototypes_capped(negatives, MAX_NEGATIVE_PROTOTYPES)
-}
-
-/// Distill the negative-sample pool into up to `cap` L2-normalized
-/// anti-prototypes via farthest-point sampling.
-///
 /// Farthest-point (max-min) sampling picks the negative that is least similar
 /// to the already-chosen anti-prototypes each round, so the small set covers
 /// the full negative manifold (owner speech, ambient, confusables, unrelated)
 /// rather than clustering on the densest region.  With ≤1 negative, returns
-/// that single prototype; with none (or `cap == 0`), returns an empty set
-/// (scoring falls back to the plain positive cosine).  The cap bounds only
-/// this DISTILLED set — the benchmark's hard-negative injection appends
-/// mined embeddings after distillation, so injected count is not capped here.
+/// that single prototype; with none, returns an empty set (scoring falls back
+/// to the plain positive cosine).
 #[must_use]
-pub(crate) fn distill_negative_prototypes_capped(
-    negatives: &[Vec<f32>],
-    cap: usize,
-) -> Vec<Vec<f32>> {
-    if negatives.is_empty() || cap == 0 {
+pub(crate) fn distill_negative_prototypes(negatives: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    if negatives.is_empty() {
         return Vec::new();
     }
     if negatives.len() == 1 {
         return vec![negatives[0].clone()];
     }
-    let k = negatives.len().min(cap);
+    let k = negatives.len().min(MAX_NEGATIVE_PROTOTYPES);
     let mut chosen: Vec<usize> = Vec::with_capacity(k);
     // Seed with the negative farthest from the origin-ish first candidate:
     // simply start with index 0 (deterministic).
@@ -721,94 +645,6 @@ mod tests {
         assert_eq!(single.len(), 1);
         assert!((cosine_similarity(&single[0], &negatives[0]) - 1.0).abs() < 1e-4);
         assert!(distill_negative_prototypes(&[]).is_empty());
-    }
-
-    #[test]
-    fn distill_negative_prototypes_capped_honors_cap() {
-        let proto = norm(
-            &(0..WAKE_WORD_EMBEDDING_DIM)
-                .map(|i| i as f32)
-                .collect::<Vec<_>>(),
-        );
-        let negatives: Vec<Vec<f32>> = (0..24)
-            .map(|i| unit_with_cosine(&proto, 0.30 + i as f32 * 0.01, 4000 + i as u64))
-            .collect();
-        // cap 0 → empty (scoring falls back to the plain positive cosine).
-        assert!(distill_negative_prototypes_capped(&negatives, 0).is_empty());
-        // cap 1 → exactly the seed prototype (index 0).
-        let one = distill_negative_prototypes_capped(&negatives, 1);
-        assert_eq!(one.len(), 1);
-        assert!((cosine_similarity(&one[0], &negatives[0]) - 1.0).abs() < 1e-4);
-        // cap 2 → exactly two, and the second is the farthest from the first
-        // (farthest-point sampling determinism).
-        let two = distill_negative_prototypes_capped(&negatives, 2);
-        assert_eq!(two.len(), 2);
-        // cap above the pool size → the whole pool.
-        assert_eq!(
-            distill_negative_prototypes_capped(&negatives, 10_000).len(),
-            negatives.len(),
-        );
-        // The default entry point delegates with MAX_NEGATIVE_PROTOTYPES.
-        assert_eq!(
-            distill_negative_prototypes(&negatives).len(),
-            distill_negative_prototypes_capped(&negatives, MAX_NEGATIVE_PROTOTYPES).len(),
-        );
-        // Empty pool → empty regardless of cap.
-        assert!(distill_negative_prototypes_capped(&[], 8).is_empty());
-    }
-
-    #[test]
-    fn gate_margin_relaxes_hard_veto() {
-        let proto = norm(
-            &(0..WAKE_WORD_EMBEDDING_DIM)
-                .map(|i| i as f32)
-                .collect::<Vec<_>>(),
-        );
-        // A confusable that sits closer to the anti-prototype (cosine 1.0 to
-        // the anti) than to the prototype (cosine 0.85): the discriminative
-        // gap is 0.15.  The anti-prototype vector itself is that confusable
-        // (unit-length), so the assertions score the exact anti embedding.
-        let anti = unit_with_cosine(&proto, 0.85, 5001);
-        let five: Vec<Vec<f32>> = vec![proto.clone(); MIN_ENROLLMENT_UTTERANCES];
-        let enr = WakeWordEnrollment::build(
-            "mahbot".into(),
-            &five,
-            Calibration::default(),
-            &[anti.clone()],
-            String::new(),
-            String::new(),
-        )
-        .expect("enrollment");
-
-        // δ = 0 (default): hard veto — closer to a negative → score 0.
-        assert_eq!(enr.gate_margin, DEFAULT_GATE_MARGIN);
-        assert_eq!(enr.soft_score(&anti), 0.0);
-        // δ larger than the gap: the veto no longer fires (the window is
-        // only "slightly" closer to the negative).
-        let relaxed = enr.clone().with_gate_margin(0.20);
-        assert!(relaxed.soft_score(&anti) > 0.0);
-        // δ smaller than the gap: still vetoed (self-cosine 1.0 vs prototype
-        // cosine 0.85 — gap 0.15; δ 0.10 < gap vetoes, δ 0.20 > gap does not).
-        let strict = enr.clone().with_gate_margin(0.10);
-        assert_eq!(strict.soft_score(&anti), 0.0);
-    }
-
-    #[test]
-    fn gate_margin_serde_default_keeps_v2_loadable() {
-        // An existing v2 record WITHOUT the gate_margin key must load with
-        // the default (no schema bump, live personal enrollments survive).
-        let v2_no_margin = r#"{
-            "schema_version": 2,
-            "phrase": "mahbot",
-            "embedding_dim": 1024,
-            "prototype": [1.0, 0.0],
-            "utterance_count": 5,
-            "calibration": {"neg_mean": 0.1, "neg_std": 0.05, "neg_p99": 0.55, "n_negatives": 20}
-        }"#;
-        let enr: WakeWordEnrollment =
-            serde_json::from_str(v2_no_margin).expect("v2 record without gate_margin loads");
-        assert_eq!(enr.gate_margin, DEFAULT_GATE_MARGIN);
-        assert_eq!(enr.negative_prototypes.len(), 0);
     }
 
     #[test]
