@@ -513,7 +513,7 @@ pub async fn init_tracing(
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
-            "info,turso_core=warn,tantivy=warn,ort=warn,fff_search=warn,fff_search::grep=error",
+            "info,turso_core=warn,tantivy=warn,ort=warn,fff_search=error,fff_search::grep=error",
         )
     });
 
