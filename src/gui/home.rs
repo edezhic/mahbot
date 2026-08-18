@@ -833,6 +833,11 @@ impl HomeState {
                 | crate::audio::voice::VoiceStatus::RecordingManual
                 | crate::audio::voice::VoiceStatus::Transcribing
         );
+        // With local transcription disabled the shared ASR model never loads,
+        // so a mic-button recording can never start — present the control as
+        // unavailable instead of a loading state that can never complete.
+        let transcription_disabled = crate::audio::voice::is_transcription_disabled();
+        let recording_unavailable = mic_busy || transcription_disabled;
 
         // Right-edge controls column: role selector + mic button.
         let mut controls: Vec<Element<'_, HomeMessage>> = Vec::new();
@@ -896,22 +901,25 @@ impl HomeState {
         );
 
         let mic_btn = tooltip(
-            button(
-                lucide::mic::<iced::Theme, iced::Renderer>()
-                    .size(14)
-                    .color(if mic_busy {
-                        theme::TEXT_MUTED
-                    } else {
-                        theme::TEXT_SECONDARY
-                    }),
-            )
+            button(lucide::mic::<iced::Theme, iced::Renderer>().size(14).color(
+                if recording_unavailable {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::TEXT_SECONDARY
+                },
+            ))
             .on_press_maybe(
-                (self.selected_user.is_some() && !mic_busy)
+                (self.selected_user.is_some() && !recording_unavailable)
                     .then_some(HomeMessage::StartVoiceRecording),
             )
-            .style(theme::icon_button_style(mic_busy))
+            .style(theme::icon_button_style(recording_unavailable))
             .padding(3),
-            text("record voice message").size(11),
+            text(if transcription_disabled {
+                "voice recording unavailable — local transcription is disabled"
+            } else {
+                "record voice message"
+            })
+            .size(11),
             tooltip::Position::Top,
         )
         .style(theme::tooltip_style);

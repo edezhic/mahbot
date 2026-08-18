@@ -678,6 +678,52 @@ pub fn models_ready() -> bool {
     crate::audio::local_transcriber::is_loaded()
 }
 
+/// Whether local audio transcription is disabled by config
+/// (`audio_transcription_use_local == "false"`).
+///
+/// The voice pipeline (wake word AND mic-button recording) shares the local
+/// ASR transcriber, so with transcription disabled the model never loads and
+/// the whole voice stack is unavailable — callers must surface the
+/// configuration rather than a loading state that can never complete.
+#[must_use]
+pub fn is_transcription_disabled() -> bool {
+    crate::config::CONFIG
+        .audio_transcription_use_local()
+        .as_deref()
+        == Some("false")
+}
+
+/// Resolve the voice status once the shared ASR transcriber's state has
+/// settled.  Pure helper shared by the pipeline's startup block and its
+/// periodic wake-up so the two can never drift apart:
+///
+/// - transcriber failed → [`VoiceStatus::ModelError`] (terminal);
+/// - transcriber loaded → [`VoiceStatus::Listening`] when voice is enabled,
+///   [`VoiceStatus::Disabled`] (indicator hidden) otherwise;
+/// - still loading → [`VoiceStatus::LoadingModels`] (transient — the
+///   periodic wake-up keeps polling until a terminal state is reached).
+///
+/// `loaded` and `failed` are mutually exclusive states of the transcriber's
+/// atomic state machine; failure is still checked first as a defensive
+/// priority so a failed model can never be reported as listening.
+fn resolved_model_status(
+    transcriber_loaded: bool,
+    transcriber_failed: bool,
+    voice_enabled: bool,
+) -> VoiceStatus {
+    if transcriber_failed {
+        VoiceStatus::ModelError
+    } else if transcriber_loaded {
+        if voice_enabled {
+            VoiceStatus::Listening
+        } else {
+            VoiceStatus::Disabled
+        }
+    } else {
+        VoiceStatus::LoadingModels
+    }
+}
+
 // Voice pipeline status (shared between pipeline task and GUI)
 
 /// Voice pipeline status.
@@ -935,9 +981,16 @@ pub fn is_manual_recording() -> bool {
 /// (None = allowed). Mirrors the field-based guards in
 /// [`PipelineCtx::handle_start_manual_recording`] for the GUI's pre-flight
 /// toast; the pipeline remains the authoritative check and this mapping can
-/// drift on transient transitions.
+/// drift on transient transitions.  The transcription-disabled configuration
+/// is permanent rather than transient, so it is checked here directly.
 #[must_use]
 pub fn manual_recording_blocked_reason() -> Option<&'static str> {
+    // Local transcription disabled ⇒ the shared ASR model never loads, so a
+    // mic-button recording can never start.  Surface the configuration
+    // rather than a loading state that can never complete.
+    if is_transcription_disabled() {
+        return Some("Voice recording unavailable — local transcription is disabled");
+    }
     match get_status() {
         VoiceStatus::Recording | VoiceStatus::Transcribing => {
             Some("A voice message is already being processed")
@@ -2850,12 +2903,7 @@ impl PipelineCtx {
         }
         // Wake word shares the ASR transcriber: with transcription disabled
         // the shared model never loads, so wake word is disabled too.
-        if crate::config::CONFIG
-            .snapshot()
-            .audio_transcription_use_local
-            .as_deref()
-            == Some("false")
-        {
+        if is_transcription_disabled() {
             self.auto_start_pending = false;
             warn!(
                 "Ignoring start_listening — local transcription disabled (wake word requires ASR)"
@@ -3089,6 +3137,15 @@ impl PipelineCtx {
         if self.enrollment_mode || self.collecting_negatives {
             warn!("Cannot start manual recording during enrollment");
             return None;
+        }
+        // With local transcription disabled the shared ASR model never loads
+        // (or is unavailable after a restart) — surface the configuration,
+        // not a loading state that can never complete.  Unconditional guard
+        // mirroring [`manual_recording_blocked_reason`], so a still-loaded
+        // in-memory model cannot contradict the disabled configuration.
+        if is_transcription_disabled() {
+            warn!("Cannot start manual recording — local transcription disabled");
+            return Some("Voice recording unavailable — local transcription is disabled");
         }
 
         // Save whether wake-word listening should resume after the recording.
@@ -3623,32 +3680,27 @@ pub async fn run_voice_pipeline() {
 
     // ── Model gating: wake word shares the ASR transcriber ──
     // No download machinery — the transcriber's background init owns the
-    // load.  If it is already loaded, transition to Listening/Disabled; else
-    // show LoadingModels and let the periodic wake-up (below) poll until the
-    // transcriber becomes ready or fails.
+    // load.  The status is resolved from the transcriber's state via
+    // [`resolved_model_status`]; the periodic wake-up below re-resolves it
+    // once loading finishes so the UI can never hang on LoadingModels.
     //
     // Transcription disabled ⇒ wake word disabled: the shared ASR model is
     // never loaded when `audio_transcription_use_local == "false"`, so wake
     // word cannot function.  Surface Disabled (not LoadingModels — that would
     // hang forever) and skip auto-start.
-    let transcription_disabled =
-        CONFIG.snapshot().audio_transcription_use_local.as_deref() == Some("false");
+    let transcription_disabled = is_transcription_disabled();
     if transcription_disabled {
         warn!(
             "Voice assistant: local transcription disabled — wake word is disabled too \
              (shared ASR model required)"
         );
         set_status(VoiceStatus::Disabled);
-    } else if crate::audio::local_transcriber::is_loaded() {
-        set_status(if is_enabled() {
-            VoiceStatus::Listening
-        } else {
-            VoiceStatus::Disabled
-        });
-    } else if crate::audio::local_transcriber::is_failed() {
-        set_status(VoiceStatus::ModelError);
     } else {
-        set_status(VoiceStatus::LoadingModels);
+        set_status(resolved_model_status(
+            crate::audio::local_transcriber::is_loaded(),
+            crate::audio::local_transcriber::is_failed(),
+            is_enabled(),
+        ));
     }
 
     let mut ctx = PipelineCtx::new();
@@ -3786,18 +3838,30 @@ pub async fn run_voice_pipeline() {
             // post-select section below so we don't duplicate it here.
             () = tokio::time::sleep(Duration::from_secs(1)) => {
                 // ── Transcriber state transition ──
-                // Light polling: when the transcriber becomes ready and voice
-                // is enabled, transition to Listening; on terminal failure,
-                // surface ModelError.
+                // Light polling.  A transcriber failure surfaces ModelError
+                // from ANY status (pre-existing behavior — e.g. an
+                // externally-initiated load via providers::recreate_all
+                // failing while voice is off must not silently hide).
+                // Otherwise, resolve a LoadingModels status to its terminal
+                // state once loading finishes, using the same
+                // [`resolved_model_status`] as the startup block so the
+                // footer can never hang on "Loading…": Listening when voice
+                // is enabled, Disabled (indicator hidden) when it is
+                // disabled — regardless of which path initiated the loading
+                // (pipeline start, automatic retry, or the GUI Retry button).
                 if crate::audio::local_transcriber::is_failed() {
                     if !matches!(get_status(), VoiceStatus::ModelError) {
                         set_status(VoiceStatus::ModelError);
                     }
-                } else if crate::audio::local_transcriber::is_loaded()
-                    && matches!(get_status(), VoiceStatus::LoadingModels)
-                    && is_enabled()
-                {
-                    set_status(VoiceStatus::Listening);
+                } else if matches!(get_status(), VoiceStatus::LoadingModels) {
+                    let resolved = resolved_model_status(
+                        crate::audio::local_transcriber::is_loaded(),
+                        crate::audio::local_transcriber::is_failed(),
+                        is_enabled(),
+                    );
+                    if !matches!(resolved, VoiceStatus::LoadingModels) {
+                        set_status(resolved);
+                    }
                 }
             }
 
@@ -5051,6 +5115,57 @@ mod tests {
         assert!(!ctx.resume_listening_after_recording);
         assert!(ctx.command_buffer.is_empty());
         assert!(ctx.enrollment_mode);
+    }
+
+    // ── Model-status resolution tests ────────────────────────────────────
+    // The pure [`resolved_model_status`] helper is the single source of truth
+    // for the startup block AND the periodic wake-up — the wake-up bug that
+    // stranded the footer on "Loading…" was an asymmetry between the two.
+    // No serial marker needed: the helper reads no global state.
+
+    #[test]
+    fn resolved_model_status_failure_is_terminal() {
+        // Reachable failure state (not loaded, failed) → ModelError — never
+        // Disabled, never LoadingModels, regardless of the voice toggle.
+        // (loaded+failed together is unreachable: the transcriber's atomic
+        // state machine has no Ready → Failed transition.)
+        assert!(matches!(
+            resolved_model_status(false, true, true),
+            VoiceStatus::ModelError
+        ));
+        assert!(matches!(
+            resolved_model_status(false, true, false),
+            VoiceStatus::ModelError
+        ));
+    }
+
+    #[test]
+    fn resolved_model_status_loaded_resolves_by_enabled() {
+        // Loaded + enabled → Listening (unchanged behavior).
+        assert!(matches!(
+            resolved_model_status(true, false, true),
+            VoiceStatus::Listening
+        ));
+        // Loaded + disabled → Disabled (the LoadingModels hang fix: the
+        // footer indicator must clear once loading finishes).
+        assert!(matches!(
+            resolved_model_status(true, false, false),
+            VoiceStatus::Disabled
+        ));
+    }
+
+    #[test]
+    fn resolved_model_status_still_loading_is_transient() {
+        // Neither loaded nor failed → LoadingModels; the periodic wake-up
+        // keeps polling until a terminal state is reached.
+        assert!(matches!(
+            resolved_model_status(false, false, true),
+            VoiceStatus::LoadingModels
+        ));
+        assert!(matches!(
+            resolved_model_status(false, false, false),
+            VoiceStatus::LoadingModels
+        ));
     }
 
     // ── Rate-limiting debounce tests ─────────────────────────────────────
