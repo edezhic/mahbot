@@ -7,11 +7,12 @@ use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::agent::run_default_agent;
+use crate::config_db::ConfigStore;
 use crate::role::DIAGNOSTICS_ROLE;
 use crate::session::discovery_agent_id;
 use crate::turso::{self, Value};
 use anyhow::{Context, Result};
-use chrono::Timelike;
+use chrono::{DateTime, Timelike, Utc};
 use futures_util::future::join_all;
 use std::time::Duration;
 use strum::IntoEnumIterator;
@@ -1134,10 +1135,106 @@ pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
     store.list().await
 }
 
+/// `config_kv` key holding the RFC 3339 UTC timestamp of the last nightly
+/// rediscovery pass start.
+///
+/// Deliberately stored in `config_kv` (config.db) rather than in the
+/// workspaces table: the schema has no migration path (new columns are
+/// invisible on existing live databases) and workspace rows are deleted
+/// during rediscovery, so the timestamp must live in a table that outlives
+/// workspace churn. Orphaned `config_kv` keys are ignored by the config
+/// reload path, so this key is invisible to the settings system.
+const NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY: &str = "nightly_discovery_last_pass_at";
+
 /// Returns `true` when the given local hour falls within the nightly
-/// re-analysis window (3:00–4:00 AM, inclusive of 3, exclusive of 4).
+/// re-analysis window (2:00–3:00 AM, inclusive of 2, exclusive of 3).
 fn is_nightly_check_hour(local_hour: u32) -> bool {
-    (3..4).contains(&local_hour)
+    (2..3).contains(&local_hour)
+}
+
+/// Returns `true` when the rolling 7-day frequency gate allows a nightly pass.
+///
+/// A pass is allowed when no pass has been recorded yet (`None` — first night
+/// ever), when the stored timestamp is unparseable (fail-open, mirroring the
+/// maintainer-debounce precedent; the pass-start write then records a fresh
+/// timestamp and self-heals the stored state), or when at least 7 × 24 h
+/// (wall-clock duration, DST-safe, no fixed weekday pinning) have elapsed
+/// since the recorded pass start.
+///
+/// A well-formed timestamp less than 7 days old blocks the pass — including
+/// a future timestamp (clock skew → negative elapsed), which stays blocked
+/// until 7 days after that timestamp — so per-workspace regeneration happens
+/// at most once per 7 days.
+fn nightly_gate_allows(last_pass_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    match last_pass_at {
+        None => true,
+        Some(raw) => match turso::parse_utc_timestamp(raw) {
+            Ok(last) => now.signed_duration_since(last) >= chrono::Duration::days(7),
+            Err(e) => {
+                warn!(
+                    nightly_discovery_last_pass_at = %raw,
+                    error = %e,
+                    "Failed to parse nightly discovery last-pass timestamp, letting through"
+                );
+                true
+            }
+        },
+    }
+}
+
+/// Evaluate the rolling 7-day frequency gate and, when the pass is allowed,
+/// record the pass start in `config_kv` BEFORE any workspace processing: a
+/// pass that starts counts as the last pass even if it finds zero eligible
+/// workspaces or is interrupted mid-way.
+///
+/// Returns `true` when the nightly pass should run. Failure policy:
+///
+/// * **Read** (missing store, read error, unparseable stored value):
+///   fail-open — the pass runs and the pass-start write records a fresh
+///   timestamp, self-healing the state (maintainer-debounce precedent).
+/// * **Pass-start write failure**: fail-closed — the pass is skipped so the
+///   at-most-once-per-7-days invariant holds (running without recording would
+///   allow a second pass within the same 7-day window on a later night).
+async fn nightly_gate_should_run(config_store: Option<&ConfigStore>) -> bool {
+    // Fail-open on read.
+    let last_pass_at = if let Some(store) = config_store {
+        match store.get_kv(NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Nightly check: failed to read last-pass timestamp — running pass ungated"
+                );
+                None
+            }
+        }
+    } else {
+        tracing::warn!("Nightly check: CONFIG_STORE not initialized — running pass ungated");
+        None
+    };
+
+    if !nightly_gate_allows(last_pass_at.as_deref(), Utc::now()) {
+        tracing::debug!("Nightly check: last pass is less than 7 days old — skipping this night");
+        return false;
+    }
+
+    // Record the pass start. Fail-closed: skip the pass when the timestamp
+    // cannot be recorded.
+    if let Some(store) = config_store {
+        let started_at = turso::now();
+        if let Err(e) = store
+            .set_kv(NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY, &started_at)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                "Nightly check: failed to record pass start — skipping this pass"
+            );
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Returns `true` when rediscovery should be triggered because the
@@ -1151,22 +1248,37 @@ fn has_new_commits(last_analyzed_commit: Option<&str>, current_hash: &str) -> bo
 
 /// Run the nightly re-analysis loop.
 ///
-/// Wakes every 30 minutes. During the 3:00–4:00 AM local time window,
-/// checks each Ready workspace for new git commits. When a workspace
-/// has a new HEAD commit (or `last_analyzed_commit` is NULL and the
-/// workspace IS a git repo with commits), triggers [`WorkspaceStore::rediscover`]
-/// to re-analyse the workspace.
+/// Wakes every 30 minutes. During the 2:00–3:00 AM local time window, runs a
+/// single discovery pass: each Ready workspace is checked for new git commits
+/// and rediscovered when its HEAD differs from the stored analysis commit.
+/// The pass is gated by a rolling 7-day frequency limit — a pass runs only if
+/// the previous pass started at least 7 days ago (timestamp recorded in
+/// `config_kv` at pass start), so per-workspace regeneration happens at most
+/// once per 7 days. Missed windows do not accumulate: the next eligible night
+/// simply runs the pass (no fixed weekday pinning).
 ///
 /// Workspaces are processed sequentially — each discovery must complete
 /// before the next workspace is checked, avoiding resource spikes.
 ///
 /// ## Edge-case handling
 ///
+/// * **First run / no stored timestamp**: the gate lets the first pass
+///   through; the pass-start timestamp is then recorded in `config_kv`.
+/// * **Empty pass (all workspaces paused / no new commits)**: still counts as
+///   a pass — the timestamp is written before any workspace is inspected, so
+///   an unpause right after an empty pass waits for the next eligible night
+///   (manual Reanalyze stays available and ungated).
+/// * **Pass-start timestamp write failure**: fail-closed — the pass is
+///   skipped so the at-most-once-per-7-days invariant holds; the next
+///   eligible night retries.
+/// * **Unparseable timestamp / config store read failure**: fail-open — the
+///   pass runs and the pass-start write self-heals the stored value
+///   (maintainer-debounce precedent).
 /// * **Non-git workspaces / no commits**: `git rev-parse HEAD` fails,
 ///   these workspaces are skipped with a warning. No infinite re-discovery
 ///   loop because `last_analyzed_commit` stays NULL and git keeps failing.
-/// * **Mid-window processing**: if the machine wakes at 3:55 and processing
-///   extends past 4:00, all workspaces in the current batch are still
+/// * **Mid-window processing**: if the machine wakes at 2:55 and processing
+///   extends past 3:00, all workspaces in the current batch are still
 ///   processed (the time window is checked once per 30-minute wake cycle).
 ///   No new processing starts in subsequent wake cycles outside the window.
 /// * **Workspace path gone / git missing**: logged as a warning, the
@@ -1180,8 +1292,16 @@ pub async fn run_nightly_check_loop() {
             break;
         }
 
-        // Only proceed during the 3:00–4:00 AM local time window.
+        // Only proceed during the 2:00–3:00 AM local time window.
         if !is_nightly_check_hour(chrono::Local::now().hour()) {
+            continue;
+        }
+
+        // Rolling frequency gate: at most one pass per 7 days, measured from
+        // pass start. Fail-open on read (missing store / read error /
+        // unparseable value), fail-closed on the pass-start write — see
+        // [`nightly_gate_should_run`].
+        if !nightly_gate_should_run(crate::config_db::CONFIG_STORE.get()).await {
             continue;
         }
 
@@ -2050,28 +2170,28 @@ mod tests {
 
     #[test]
     fn nightly_check_hour_before_window() {
-        assert!(!is_nightly_check_hour(2), "2:00 AM is before the window");
+        assert!(!is_nightly_check_hour(1), "1:00 AM is before the window");
     }
 
     #[test]
     fn nightly_check_hour_start_inclusive() {
         assert!(
-            is_nightly_check_hour(3),
-            "3:00 AM is the start of the window"
+            is_nightly_check_hour(2),
+            "2:00 AM is the start of the window"
         );
     }
 
     #[test]
     fn nightly_check_hour_end_exclusive() {
         assert!(
-            !is_nightly_check_hour(4),
-            "4:00 AM is excluded from the window"
+            !is_nightly_check_hour(3),
+            "3:00 AM is excluded from the window"
         );
     }
 
     #[test]
     fn nightly_check_hour_after_window() {
-        assert!(!is_nightly_check_hour(5), "5:00 AM is after the window");
+        assert!(!is_nightly_check_hour(4), "4:00 AM is after the window");
     }
 
     #[test]
@@ -2079,6 +2199,124 @@ mod tests {
         assert!(!is_nightly_check_hour(0), "Midnight is outside the window");
         assert!(!is_nightly_check_hour(12), "Noon is outside the window");
         assert!(!is_nightly_check_hour(23), "11 PM is outside the window");
+    }
+
+    // ── nightly_gate_allows — rolling 7-day frequency gate tests ──
+
+    #[test]
+    fn nightly_gate_allows_first_pass() {
+        assert!(
+            nightly_gate_allows(None, Utc::now()),
+            "No recorded pass (first night ever) must be allowed",
+        );
+    }
+
+    #[test]
+    fn nightly_gate_allows_exactly_seven_days() {
+        // 'at least 7 days old' → elapsed >= 7 × 24 h, so the exact boundary
+        // is allowed.
+        let now = Utc::now();
+        let last = (now - chrono::Duration::days(7)).to_rfc3339();
+        assert!(
+            nightly_gate_allows(Some(&last), now),
+            "Exactly 7 days elapsed must be allowed (>= 7 days)",
+        );
+    }
+
+    #[test]
+    fn nightly_gate_blocks_before_seven_days() {
+        let now = Utc::now();
+        // 6 days 23 h 59 m 59 s elapsed — one second short of the boundary.
+        let last = (now - chrono::Duration::days(7) + chrono::Duration::seconds(1)).to_rfc3339();
+        assert!(
+            !nightly_gate_allows(Some(&last), now),
+            "6d23h59m59s elapsed must be blocked",
+        );
+        // Pass recorded just now — elapsed ~0.
+        let just_ran = now.to_rfc3339();
+        assert!(
+            !nightly_gate_allows(Some(&just_ran), now),
+            "A just-recorded pass must block",
+        );
+    }
+
+    #[test]
+    fn nightly_gate_allows_after_seven_days() {
+        let now = Utc::now();
+        let last = (now - chrono::Duration::days(8)).to_rfc3339();
+        assert!(
+            nightly_gate_allows(Some(&last), now),
+            "8 days elapsed must be allowed",
+        );
+    }
+
+    #[test]
+    fn nightly_gate_blocks_future_timestamp() {
+        // Clock skew / corrupted-but-well-formed value: negative elapsed
+        // duration stays blocked (fail-closed) until 7 days after it.
+        let now = Utc::now();
+        let last = (now + chrono::Duration::hours(1)).to_rfc3339();
+        assert!(
+            !nightly_gate_allows(Some(&last), now),
+            "A future timestamp must block the pass",
+        );
+    }
+
+    #[test]
+    fn nightly_gate_allows_unparseable_timestamp() {
+        // Fail-open on corrupt values (maintainer-debounce precedent): the
+        // pass runs and the pass-start write self-heals the stored value.
+        assert!(
+            nightly_gate_allows(Some("not-a-timestamp"), Utc::now()),
+            "An unparseable timestamp must let the pass through",
+        );
+    }
+
+    // ── nightly_gate_should_run — end-to-end config_kv behaviour ──
+
+    #[tokio::test]
+    async fn nightly_gate_records_pass_start_and_blocks() {
+        let (store, _tmp) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+
+        // First pass: no stored timestamp → allowed, pass start recorded.
+        assert!(
+            nightly_gate_should_run(Some(&store)).await,
+            "First pass (no stored timestamp) must run",
+        );
+        assert!(
+            store
+                .get_kv(NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY)
+                .await
+                .unwrap()
+                .is_some(),
+            "Pass start must be recorded in config_kv",
+        );
+
+        // Immediately after: the recorded pass start blocks the next pass.
+        assert!(
+            !nightly_gate_should_run(Some(&store)).await,
+            "A second pass within the same 7-day window must be blocked",
+        );
+
+        // Corrupt stored value: fail-open, then the pass-start write
+        // self-heals with a fresh parseable timestamp.
+        store
+            .set_kv(NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY, "garbage")
+            .await
+            .unwrap();
+        assert!(
+            nightly_gate_should_run(Some(&store)).await,
+            "An unparseable stored value must let the pass through",
+        );
+        let healed = store
+            .get_kv(NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY)
+            .await
+            .unwrap()
+            .expect("pass-start write must store a value");
+        assert!(
+            crate::turso::parse_utc_timestamp(&healed).is_ok(),
+            "pass-start write must self-heal the stored value",
+        );
     }
 
     // ── has_new_commits — commit comparison tests ────────────────
