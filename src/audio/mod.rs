@@ -24,17 +24,13 @@ use tracing::{info, warn};
 
 use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
 
-pub(crate) fn onnx_output_name(model: &candle_onnx::onnx::ModelProto) -> String {
-    model
-        .graph
-        .as_ref()
-        .and_then(|g| g.output.first())
-        .map_or_else(|| "output".to_string(), |o| o.name.clone())
+pub(crate) fn onnx_output_name(model: &crate::onnx::Model) -> String {
+    model.output_name().to_string()
 }
 
 pub(crate) fn extract_output(
     mut outputs: HashMap<String, Tensor>,
-    model: &candle_onnx::onnx::ModelProto,
+    model: &crate::onnx::Model,
     label: &str,
 ) -> Result<Tensor> {
     let name = onnx_output_name(model);

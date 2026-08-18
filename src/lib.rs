@@ -35,6 +35,7 @@ pub mod maintainer;
 pub mod management;
 pub mod message_router;
 pub(crate) mod migrations;
+pub(crate) mod onnx;
 pub(crate) mod prompt;
 pub mod providers;
 pub mod registry;

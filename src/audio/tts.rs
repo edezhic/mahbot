@@ -41,11 +41,11 @@ use crate::audio::{
     MAX_DOWNLOAD_RETRIES, ensure_downloaded, extract_output, models_subdir, run_download_retry_loop,
 };
 use crate::config::CONFIG;
+use crate::onnx::simple_eval;
 use crate::util::UnwrapPoison;
 use crate::util::model_state::{AtomicModelState, ModelState};
 use anyhow::{Context, Result, anyhow};
 use candle_core::{Device, Tensor};
-use candle_onnx::simple_eval;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -221,10 +221,10 @@ struct AeConfig {
 // ── TTS engine ───────────────────────────────────────────────────────
 
 struct TtsEngine {
-    dp_model: candle_onnx::onnx::ModelProto,
-    text_enc_model: candle_onnx::onnx::ModelProto,
-    vector_est_model: candle_onnx::onnx::ModelProto,
-    vocoder_model: candle_onnx::onnx::ModelProto,
+    dp_model: crate::onnx::Model,
+    text_enc_model: crate::onnx::Model,
+    vector_est_model: crate::onnx::Model,
+    vocoder_model: crate::onnx::Model,
     unicode_indexer: Vec<i32>,
     sample_rate: u32,
     latent_dim: usize,
@@ -735,10 +735,10 @@ fn load_engine(dir: &Path) -> Result<TtsEngine> {
     let chunk_compress_factor = config.ttl.chunk_compress_factor;
     let base_chunk_size = config.ae.base_chunk_size;
 
-    let dp_model = candle_onnx::read_file(onnx_dir.join(DP_ONNX_NAME))?;
-    let text_enc_model = candle_onnx::read_file(onnx_dir.join(TEXT_ENC_ONNX_NAME))?;
-    let vector_est_model = candle_onnx::read_file(onnx_dir.join(VECTOR_EST_ONNX_NAME))?;
-    let vocoder_model = candle_onnx::read_file(onnx_dir.join(VOCODER_ONNX_NAME))?;
+    let dp_model = crate::onnx::read_file(onnx_dir.join(DP_ONNX_NAME))?;
+    let text_enc_model = crate::onnx::read_file(onnx_dir.join(TEXT_ENC_ONNX_NAME))?;
+    let vector_est_model = crate::onnx::read_file(onnx_dir.join(VECTOR_EST_ONNX_NAME))?;
+    let vocoder_model = crate::onnx::read_file(onnx_dir.join(VOCODER_ONNX_NAME))?;
 
     let indexer_content = std::fs::read_to_string(onnx_dir.join(UNICODE_INDEXER_NAME))
         .context("Failed to read unicode_indexer.json")?;
@@ -2826,6 +2826,56 @@ mod tests {
              Transcribed:  {transcription}\n\
              Input words:  {input_words:#?}\n\
              ASR words:    {transcribed_words:#?}"
+        );
+    }
+}
+
+// ── Full-pipeline golden test (voice-tests feature) ───────────────────
+//
+// Regenerates the complete synthesis pipeline (duration predictor → text
+// encoder → 8 flow-matching vector-estimator steps → vocoder) and asserts the
+// PCM is bit-identical to the reference captured from the removed
+// candle-onnx-mahbot fork (mahbot-1776).  The SHA-256 below is the digest of
+// that reference PCM: 147456 f32 samples at 44.1 kHz for the fixed
+// text/style/seed.  Requires the model files on disk (skips otherwise).
+#[cfg(all(test, feature = "voice-tests"))]
+mod pcm_golden {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    const FORK_PCM_SHA256: &str =
+        "a0871b5b7d408bd2ac8b1abb6914db5ecd1b4539713e6e8fd6bfe5706fc55c79";
+
+    #[test]
+    fn pcm_bit_exact_vs_fork() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dir = PathBuf::from(home).join(".mahbot/models/supertonic3");
+        let onnx_dir = dir.join(ONNX_DIR);
+        if !onnx_dir.join(DP_ONNX_NAME).exists() {
+            eprintln!("TTS PCM golden test skipped (models not on disk)");
+            return;
+        }
+        let engine = load_engine(&dir).expect("load TTS engine");
+        let (style_dp, style_ttl) = load_voice_style(&dir, "M1.json").expect("load voice style");
+        let text = "Hello, this is a speech synthesis test.";
+        let processed = preprocess_text(text);
+        let pcm = synthesize_internal(&engine, &processed, &style_dp, &style_ttl, 42)
+            .expect("synthesize");
+        assert_eq!(
+            pcm.len(),
+            147_456,
+            "PCM sample count changed — reference must be re-captured"
+        );
+        let mut hasher = Sha256::new();
+        for v in &pcm {
+            hasher.update(v.to_le_bytes());
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        assert_eq!(
+            digest, FORK_PCM_SHA256,
+            "TTS PCM is not bit-identical to the fork reference \
+             (runtime regression or deliberate change — re-capture the \
+             reference from the fork before updating this hash)"
         );
     }
 }

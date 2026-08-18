@@ -12,11 +12,12 @@ keywords = ["ai", "agent"]
 categories = ["development-tools"]
 rust-version = "1.96"
 resolver = "2"
-# `vendor/candle-onnx` is the canonical source of the published
-# candle-onnx-mahbot fork (releases are cut from it). It must never be packed
-# into mahbot's published .crate: this exclude keeps the tracked directory out
-# (the dependency itself resolves from crates.io, not from the vendor dir).
-exclude = [".DS_Store", "vendor/candle-onnx"]
+# `vendor/` holds canonical sources of pinned forks that cannot be published
+# with mahbot.  The last such fork (candle-onnx-mahbot) was removed in
+# mahbot-1776 (replaced by the in-repo runtime in src/onnx), so the directory
+# is currently unused; the exclude keeps any future vendored tree out of the
+# published .crate.
+exclude = [".DS_Store", "vendor/"]
 
 [features]
 # `full` is a default-on marker feature used by `required-features` on the app
@@ -158,14 +159,6 @@ strum = { version = "0.27", features = ["derive"] }
 # Embeddings
 tokenizers = "0.22"
 candle-core = "0.11.0"
-# ONNX runtime for the voice pipeline (mel-spectrogram, embeddings, wake word,
-# TTS). candle-onnx-mahbot is the MahBot fork of candle-onnx 0.11.0 — canonical
-# source: vendor/candle-onnx/ (patch list: vendor/candle-onnx/README.md; fork
-# releases are cut from there, so a bump here must match a fork publish).
-# Exact-pinned like the other behavior-critical deps (turso, tree-sitter).
-# `vendor/candle-onnx` stays excluded from mahbot's published crate via the
-# `exclude` list in [package].
-candle-onnx-mahbot = { version = "=0.11.0" }
 
 # Neural voice activity detection (replaces RMS-based VAD)
 earshot = "1.2"
