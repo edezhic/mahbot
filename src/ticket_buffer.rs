@@ -109,7 +109,7 @@ pub(crate) fn drain(workspace_name: &str) -> String {
     let Some(entries) = map.remove(workspace_name) else {
         return String::new();
     };
-    let mut out = String::from("Ticket updates:\n");
+    let mut out = String::from("<ticket-updates>");
     for entry in entries {
         let _ = writeln!(
             out,
@@ -117,6 +117,7 @@ pub(crate) fn drain(workspace_name: &str) -> String {
             entry.id, entry.source, entry.target, entry.origin, entry.at
         );
     }
+    let _ = writeln!(out, "</ticket-updates>");
     out
 }
 
