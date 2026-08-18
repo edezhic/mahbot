@@ -4072,6 +4072,817 @@ fn trim_old_archives(report_dir: &std::path::Path) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Simple benchmark baseline (mahbot-1804): three plain metrics
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The whole report is exactly three metrics:
+//   1. Recognition — X of 40 phrase utterances recognized (fixed bench
+//      phrase BENCH_WAKE_PHRASE, the existing 40-clip held-out basis).
+//   2. False reactions — N on the 113 non-phrase set + a rate per hour on
+//      real audio (parallel feed of the pinned subset below).
+//   3. Data coverage — 40 utterances + 113 non-phrases + the real-audio
+//      hours (speech + noise) + run wall time.
+// plus the worker count and the FA/h basis note.  No per-frame arrays, no
+// analysis sections, no old-run comparisons.
+
+/// Pinned real-audio subset for the simple benchmark's FA-per-hour metric.
+///
+/// Selection heuristic (RESOLVED in mahbot-1804): the longest librivox
+/// speech files up to a target + ALL us-gov speech files + a fixed noise
+/// selection (the longest free-sound and sound-bible clips), covering both
+/// false-reaction regimes (spontaneous confusables in continuous speech;
+/// noise-triggered triggers).  The result is PINNED — paths in fixed order,
+/// so the file order, the round-robin worker assignment, and therefore the
+/// merged outcome are run-to-run reproducible at the outcome level.
+///
+/// Measured durations at pin time (16 kHz mono WAV): the 6 longest librivox
+/// files total ≈ 31.2 min, the 12 us-gov files ≈ 25.0 min, the 10
+/// free-sound clips ≈ 5.3 min, and the 5 sound-bible clips ≈ 2.4 min — 33
+/// files, ≈ 63.9 min ≈ 1.07 h (0.94 h speech + 0.13 h noise).
+///
+/// Budget note (RESOLVED): the ≤10-minute cap applies to the whole warm
+/// run.  The parallel feed is memory-bandwidth-bound on the encoder (8
+/// workers measured ≈ 1.5× serial throughput on the M3 Pro validation
+/// machine), so the first pinned list (~2.63 h) exceeded the cap and was
+/// shrunk to this list; the report discloses the final coverage.
+const SIMPLE_BENCH_REAL_AUDIO_SUBSET: &[&str] = &[
+    // 6 longest librivox speech files (≈31.2 min)
+    "speech/librivox/speech-librivox-0027.wav",
+    "speech/librivox/speech-librivox-0051.wav",
+    "speech/librivox/speech-librivox-0093.wav",
+    "speech/librivox/speech-librivox-0075.wav",
+    "speech/librivox/speech-librivox-0103.wav",
+    "speech/librivox/speech-librivox-0088.wav",
+    // All 12 us-gov speech files (≈25.0 min)
+    "speech/us-gov/speech-us-gov-0252.wav",
+    "speech/us-gov/speech-us-gov-0147.wav",
+    "speech/us-gov/speech-us-gov-0082.wav",
+    "speech/us-gov/speech-us-gov-0159.wav",
+    "speech/us-gov/speech-us-gov-0067.wav",
+    "speech/us-gov/speech-us-gov-0250.wav",
+    "speech/us-gov/speech-us-gov-0210.wav",
+    "speech/us-gov/speech-us-gov-0229.wav",
+    "speech/us-gov/speech-us-gov-0201.wav",
+    "speech/us-gov/speech-us-gov-0130.wav",
+    "speech/us-gov/speech-us-gov-0005.wav",
+    "speech/us-gov/speech-us-gov-0109.wav",
+    // 10 longest free-sound noise clips (≈5.3 min)
+    "noise/free-sound/noise-free-sound-0640.wav",
+    "noise/free-sound/noise-free-sound-0184.wav",
+    "noise/free-sound/noise-free-sound-0761.wav",
+    "noise/free-sound/noise-free-sound-0012.wav",
+    "noise/free-sound/noise-free-sound-0605.wav",
+    "noise/free-sound/noise-free-sound-0298.wav",
+    "noise/free-sound/noise-free-sound-0251.wav",
+    "noise/free-sound/noise-free-sound-0733.wav",
+    "noise/free-sound/noise-free-sound-0035.wav",
+    "noise/free-sound/noise-free-sound-0709.wav",
+    // 5 longest sound-bible noise clips (≈2.4 min)
+    "noise/sound-bible/noise-sound-bible-0075.wav",
+    "noise/sound-bible/noise-sound-bible-0044.wav",
+    "noise/sound-bible/noise-sound-bible-0067.wav",
+    "noise/sound-bible/noise-sound-bible-0014.wav",
+    "noise/sound-bible/noise-sound-bible-0032.wav",
+];
+
+/// Worker count for the simple benchmark's parallel real-audio feed — a
+/// pinned bench constant (NOT an env knob).
+const SIMPLE_BENCH_WORKERS: usize = 8;
+
+/// File→worker assignment shape for the parallel real-audio feed: round-robin
+/// over [`SIMPLE_BENCH_REAL_AUDIO_SUBSET`] in pinned order (worker `i` feeds
+/// files `i`, `i + SIMPLE_BENCH_WORKERS`, `i + 2·SIMPLE_BENCH_WORKERS`, …).
+/// Pinned as a bench constant — deterministic per run.
+const SIMPLE_BENCH_ASSIGNMENT: &str = "round_robin";
+
+/// Inter-file silence gap for each worker's continuous-listening stream
+/// (2 s at 16 kHz — same as the full-corpus FAPH feed, so the natural
+/// segment-boundary reset fires between files).
+const SIMPLE_BENCH_FILE_GAP_SAMPLES: usize = 32_000;
+
+/// Per-worker real-audio feed totals for the simple benchmark.
+///
+/// Cooldown merge applies PER WORKER: events on different workers are
+/// independent continuous-listening streams and are never merged across
+/// workers.  Totals are summed across workers afterwards.
+#[derive(Default)]
+struct SimpleWorkerTotals {
+    files_fed: u64,
+    files_decode_failed: u64,
+    audio_secs: f64,
+    speech_audio_secs: f64,
+    noise_audio_secs: f64,
+    vad_active_secs: f64,
+    raw_events: Vec<f64>,
+    merged_events: usize,
+}
+
+impl SimpleWorkerTotals {
+    fn merge(&mut self, other: SimpleWorkerTotals) {
+        self.files_fed += other.files_fed;
+        self.files_decode_failed += other.files_decode_failed;
+        self.audio_secs += other.audio_secs;
+        self.speech_audio_secs += other.speech_audio_secs;
+        self.noise_audio_secs += other.noise_audio_secs;
+        self.vad_active_secs += other.vad_active_secs;
+        self.raw_events.extend(other.raw_events);
+        self.merged_events += other.merged_events;
+    }
+}
+
+/// Feed one worker's assigned real-audio files through the SHARED production
+/// detection path — `handle_wake_word_detection` via [`faph_feed_file_continuous`]
+/// — in a per-worker continuous-listening [`PipelineCtx`] with its OWN
+/// injected VAD detector (`ctx.injected_vad`, the voice-tests seam).  The
+/// global [`VAD_DETECTOR`](super::VAD_DETECTOR) singleton is never touched by
+/// parallel workers, so the streams stay independent.  Detection LOGIC is
+/// unchanged — only the detector instance differs.
+fn simple_worker_feed(
+    files: &[(String, String, u64)],
+    cache_root: &std::path::Path,
+) -> SimpleWorkerTotals {
+    const GAP_SAMPLES: usize = SIMPLE_BENCH_FILE_GAP_SAMPLES;
+    let gap: Vec<f32> = vec![0.0; GAP_SAMPLES];
+    let mut ctx = super::PipelineCtx::new();
+    // Per-worker detector instance (the voice-tests seam).  Preserved across
+    // the Soft resets the feed performs after each event (see the field's
+    // doc comment in voice.rs).
+    ctx.injected_vad = Some(earshot::Detector::default());
+    let mut audio_pos = 0.0f64;
+    let mut totals = SimpleWorkerTotals::default();
+    for (path, _sha256, _size) in files {
+        let p = cache_root.join(path);
+        let samples = match crate::audio::local_transcriber::decode_audio_to_mono_f32(&p) {
+            Ok(s) => s,
+            Err(e) => {
+                totals.files_decode_failed += 1;
+                warn!("simple bench: decode failed for {path}: {e}");
+                continue;
+            }
+        };
+        let audio_secs = samples.len() as f64 / f64::from(super::SAMPLE_RATE);
+        totals.audio_secs += audio_secs;
+        if path.starts_with("speech/") {
+            totals.speech_audio_secs += audio_secs;
+        } else {
+            totals.noise_audio_secs += audio_secs;
+        }
+        totals
+            .raw_events
+            .extend(faph_feed_file_continuous(&samples, &mut ctx, &mut audio_pos));
+        totals.files_fed += 1;
+        // Inter-file silence gap: fires the natural segment-boundary reset
+        // (fresh detector state, adaptive bootstrap, cleared ring) — matches
+        // the full-corpus FAPH continuous-listening semantics.
+        totals
+            .raw_events
+            .extend(faph_feed_file_continuous(&gap, &mut ctx, &mut audio_pos));
+        // VAD-active seconds for the file+gap window from the CONTINUOUS feed
+        // (per-worker detector): the FA/h denominator basis — same capture
+        // order as the full-corpus FAPH phase (the gap is digital silence,
+        // ~0 contribution).
+        totals.vad_active_secs += ctx.instrumentation.vad_speech_frames as f64
+            * super::HOP_LENGTH as f64
+            / f64::from(super::SAMPLE_RATE);
+        // Bound memory: drop the per-file diagnostic vectors (never read in
+        // this phase) while preserving the continuous acoustic state.
+        faph_clear_instrumentation(&mut ctx);
+    }
+    totals.merged_events = faph_merge_events(
+        &totals.raw_events,
+        super::WAKE_WORD_COOLDOWN.as_secs_f64(),
+    );
+    totals
+}
+
+/// Build a documented-skip report for the simple bench's real-audio phase
+/// (degraded-skip contract — a loud 'not measured' marker, never a silent
+/// drop).
+fn simple_skip_json(reason_key: &str, detail: &str) -> serde_json::Value {
+    warn!("Simple bench real-audio phase skipped: {reason_key} — {detail}");
+    eprintln!(
+        "         Simple bench real-audio phase skipped: {reason_key} — {detail}"
+    );
+    serde_json::json!({
+        "status": "skipped",
+        "metric": "FA rate per hour on real audio — NOT MEASURED (degraded skip)",
+        "skip_reason": reason_key,
+        "skip_detail": detail,
+    })
+}
+
+/// Run the simple bench's real-audio phase: feed the pinned subset in
+/// parallel ([`SIMPLE_BENCH_WORKERS`] workers, round-robin file assignment),
+/// each worker through its own [`PipelineCtx`] + injected detector, using the
+/// SAME production detection path as the full-corpus FAPH phase.
+///
+/// Always returns a report (ran or documented-skip — never a silent drop)
+/// when the phase cannot run:
+/// - `MAHBOT_FAPH=1` — the env-gated full-corpus phase is the operator's
+///   selection; the fixed-subset phase does NOT run (no double-feeding).
+/// - corpus files are missing/unverifiable — download-on-demand is attempted
+///   first (the existing FAPH contract), then a loud skip.
+#[expect(clippy::too_many_lines)]
+fn run_simple_real_audio_phase() -> serde_json::Value {
+    if std::env::var("MAHBOT_FAPH").as_deref() == Ok("1") {
+        return simple_skip_json(
+            "faph_mode_overrides_subset",
+            "MAHBOT_FAPH=1 selects the env-gated full-corpus FAPH phase — the \
+             fixed-subset real-audio phase does not run (no double-feeding)",
+        );
+    }
+    let phase_start = Instant::now();
+
+    // ── Corpus manifest (pinned, embedded at compile time — same source of
+    // truth as the full-corpus FAPH phase; the subset is the pinned path
+    // list above). ──
+    let manifest: serde_json::Value =
+        match serde_json::from_str(include_str!("faph_corpus_manifest.json")) {
+            Ok(m) => m,
+            Err(e) => {
+                return simple_skip_json(
+                    "manifest_parse_failed",
+                    &format!("embedded manifest failed to parse: {e}"),
+                );
+            }
+        };
+    let manifest_files: Vec<(String, String, u64)> = match manifest["files"].as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|f| {
+                Some((
+                    f[0].as_str()?.to_string(),
+                    f[1].as_str()?.to_string(),
+                    f[2].as_u64()?,
+                ))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let repo = manifest["repo"].as_str().unwrap_or("alexwengg/musan_mini");
+    let revision = manifest["revision"].as_str().unwrap_or("");
+    if manifest_files.is_empty() {
+        return simple_skip_json("manifest_empty", "manifest file list is empty");
+    }
+
+    // ── Resolve the pinned subset against the manifest, preserving the
+    // pinned order (run-to-run reproducible file order). ──
+    let mut subset: Vec<(String, String, u64)> =
+        Vec::with_capacity(SIMPLE_BENCH_REAL_AUDIO_SUBSET.len());
+    for &path in SIMPLE_BENCH_REAL_AUDIO_SUBSET {
+        match manifest_files.iter().find(|(p, _, _)| p == path) {
+            Some((p, sha, size)) => subset.push((p.clone(), sha.clone(), *size)),
+            None => {
+                return simple_skip_json(
+                    "subset_path_not_in_manifest",
+                    &format!("pinned subset path missing from manifest: {path}"),
+                );
+            }
+        }
+    }
+
+    // ── Corpus cache root (self-contained, persistent, under ~/.mahbot/) ──
+    let cache_root = match crate::config::default_config_dir() {
+        Ok(d) => d.join("faph_corpus"),
+        Err(e) => {
+            return simple_skip_json(
+                "cache_root_unavailable",
+                &format!("cannot resolve ~/.mahbot for corpus cache: {e}"),
+            );
+        }
+    };
+
+    // ── Self-contained download/verify (the existing FAPH contract) ──
+    let mut download_errors: Vec<String> = Vec::new();
+    for (path, sha256, size) in &subset {
+        let dest = cache_root.join(path);
+        if dest.exists() && std::fs::metadata(&dest).is_ok_and(|m| m.len() == *size) {
+            match faph_sha256_file(&dest) {
+                Ok(h) if h == *sha256 => continue,
+                Ok(_) => {
+                    download_errors.push(format!("{path}: hash mismatch on cached file"));
+                    continue;
+                }
+                Err(e) => {
+                    download_errors.push(format!("{path}: read error {e}"));
+                    continue;
+                }
+            }
+        }
+        let url = format!("https://huggingface.co/datasets/{repo}/resolve/{revision}/{path}");
+        match faph_download_file(&url, &dest, sha256) {
+            Ok(()) => {
+                info!("simple bench corpus: downloaded {path} ({size} bytes)");
+            }
+            Err(e) => {
+                download_errors.push(format!("{path}: {e}"));
+            }
+        }
+    }
+    if !download_errors.is_empty() {
+        let reason = format!(
+            "corpus subset incomplete — {} file(s) failed download/verify (first: {})",
+            download_errors.len(),
+            download_errors[0],
+        );
+        return simple_skip_json("corpus_download_failed", &reason);
+    }
+
+    // ── Parallel feed: round-robin assignment over the pinned order ──
+    let worker_files: Vec<Vec<(String, String, u64)>> = (0..SIMPLE_BENCH_WORKERS)
+        .map(|w| subset.iter().skip(w).step_by(SIMPLE_BENCH_WORKERS).cloned().collect())
+        .collect();
+    let mut handles = Vec::with_capacity(SIMPLE_BENCH_WORKERS);
+    for wf in worker_files {
+        let cr = cache_root.clone();
+        handles.push(std::thread::spawn(move || simple_worker_feed(&wf, &cr)));
+    }
+    let mut totals = SimpleWorkerTotals::default();
+    for handle in handles {
+        match handle.join() {
+            Ok(wt) => totals.merge(wt),
+            Err(e) => {
+                return simple_skip_json(
+                    "worker_panicked",
+                    &format!("a real-audio worker thread panicked: {e:?}"),
+                );
+            }
+        }
+    }
+
+    let wall_secs = phase_start.elapsed().as_secs_f64();
+    let audio_hours = totals.audio_secs / 3600.0;
+    let vad_active_hours = totals.vad_active_secs / 3600.0;
+    let merged_events = totals.merged_events;
+    let raw_events = totals.raw_events.len();
+    let fa_per_hour_raw = if audio_hours > 0.0 {
+        merged_events as f64 / audio_hours
+    } else {
+        f64::NAN
+    };
+    let fa_per_hour_vad = if vad_active_hours > 0.0 {
+        merged_events as f64 / vad_active_hours
+    } else {
+        f64::NAN
+    };
+
+    info!(
+        "Simple bench real audio: {files_fed} files fed, {audio_hours:.2} h audio \
+         ({vad_active_hours:.2} h VAD-active), {merged_events} cooldown-merged FA events \
+         (raw {raw_events}), {fa_per_hour_vad:.4} FA/h VAD-active, {wall_secs:.1}s wall \
+         ({workers} parallel workers, {SIMPLE_BENCH_ASSIGNMENT})",
+        files_fed = totals.files_fed,
+        workers = SIMPLE_BENCH_WORKERS,
+    );
+    eprintln!(
+        "         Simple bench real audio: {files_fed} files fed, {audio_hours:.2} h audio \
+         ({vad_active_hours:.2} h VAD-active), {merged_events} cooldown-merged FA events \
+         (raw {raw_events}), {fa_per_hour_vad:.4} FA/h VAD-active, {wall_secs:.1}s wall \
+         ({workers} parallel workers, {SIMPLE_BENCH_ASSIGNMENT})",
+        files_fed = totals.files_fed,
+        workers = SIMPLE_BENCH_WORKERS,
+    );
+
+    serde_json::json!({
+        "status": "ran",
+        "metric": "SPONTANEOUS-CONFUSABLE FA rate on real audio — the pinned subset \
+                   contains ~zero wake-word utterances, so every detection is a \
+                   spontaneous false accept",
+        "subset": {
+            "files_total": SIMPLE_BENCH_REAL_AUDIO_SUBSET.len(),
+            "speech_files": SIMPLE_BENCH_REAL_AUDIO_SUBSET
+                .iter()
+                .filter(|p| p.starts_with("speech/"))
+                .count(),
+            "noise_files": SIMPLE_BENCH_REAL_AUDIO_SUBSET
+                .iter()
+                .filter(|p| p.starts_with("noise/"))
+                .count(),
+            "selection_heuristic": "longest librivox speech files up to a target + ALL \
+                                    us-gov speech files + a fixed noise selection (longest \
+                                    free-sound + sound-bible clips) — pinned as a bench \
+                                    constant",
+        },
+        "feed": {
+            "workers": SIMPLE_BENCH_WORKERS,
+            "assignment": SIMPLE_BENCH_ASSIGNMENT,
+            "files_fed": totals.files_fed,
+            "files_decode_failed": totals.files_decode_failed,
+            "audio_hours_fed": audio_hours,
+            "speech_hours_fed": totals.speech_audio_secs / 3600.0,
+            "noise_hours_fed": totals.noise_audio_secs / 3600.0,
+            "vad_active_hours_fed": vad_active_hours,
+            "wall_secs": wall_secs,
+            "realtime_factor": if wall_secs > 0.0 {
+                totals.audio_secs / wall_secs
+            } else {
+                f64::NAN
+            },
+            "continuous_listening": true,
+            "inter_file_silence_gap_secs": SIMPLE_BENCH_FILE_GAP_SAMPLES as f64
+                / f64::from(super::SAMPLE_RATE),
+            "cooldown_merge_audio_secs": super::WAKE_WORD_COOLDOWN.as_secs_f64(),
+        },
+        "fa": {
+            "raw_events": raw_events,
+            "cooldown_merged_events": merged_events,
+            "fa_per_hour_raw_audio": fa_per_hour_raw,
+            "fa_per_hour_vad_active": fa_per_hour_vad,
+            "basis_note": "Denominators are PER-WORKER sums: raw audio hours and \
+                           VAD-active hours, each accumulated per worker over its own \
+                           continuous-listening stream, then summed across workers.  \
+                           Cooldown merge applies PER WORKER (events on different \
+                           workers are independent streams and are never merged across \
+                           workers).  The FA/h number is NOT comparable to the serial \
+                           full-corpus FAPH figure: different corpus subset, parallel \
+                           per-worker streams, fixed pinned selection.",
+        },
+    })
+}
+
+/// Run the simple voice pipeline benchmark (three plain metrics).
+///
+/// Called from `voice::run_simple_voice_pipeline_benchmark()` which is the
+/// entry point for `benches/voice_pipeline_simple.rs`.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::too_many_lines
+)]
+pub(crate) fn run_simple_benchmark() {
+    // ── Heartbeat drop guard ──────────────────────────────
+    // Same pattern as run_internal: a pulse every 60 s so the operator can
+    // confirm progress (the whole warm run is capped at ~10 min).
+    struct HeartbeatGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for HeartbeatGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .parse("info")
+                .expect("info env filter"),
+        )
+        .try_init();
+
+    let overall_start = Instant::now();
+    info!("═══ Simple Voice Pipeline Benchmark (three metrics) ═══");
+
+    let heartbeat_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _heartbeat_guard = HeartbeatGuard(heartbeat_stop.clone());
+    let heartbeat_handle = {
+        let stop = heartbeat_stop.clone();
+        let start = overall_start;
+        std::thread::spawn(move || {
+            let mut counter: u64 = 0;
+            loop {
+                if counter.is_multiple_of(60) {
+                    eprintln!(
+                        "[heartbeat] simple benchmark still running — elapsed: {}m{:02}s",
+                        start.elapsed().as_secs() / 60,
+                        start.elapsed().as_secs() % 60,
+                    );
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                counter += 1;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
+        })
+    };
+
+    // ── 0. Initialize global state (same bootstrap as run_internal) ──
+    if crate::config::CONFIG.try_storage_root().is_none() {
+        let mahbot_dir = crate::config::default_config_dir()
+            .expect("Cannot resolve home directory for ~/.mahbot");
+        crate::config::CONFIG.set_storage_root(mahbot_dir.clone());
+        info!("CONFIG storage root set to: {}", mahbot_dir.display());
+    }
+    let cache_dir_path = cache_dir();
+    if let Err(e) = std::fs::create_dir_all(&cache_dir_path) {
+        eprintln!(
+            "WARNING: Cannot create cache directory {}: {e}",
+            cache_dir_path.display()
+        );
+    }
+    let model_version_hash = super::tts_model_version_hash();
+    info!("TTS model version hash: {}", &model_version_hash[..16]);
+    crate::audio::tts::init_global()
+        .unwrap_or_else(|e| warn!("tts::init_global() already called: {e}"));
+    super::init_global().unwrap_or_else(|e| warn!("voice::init_global() already called: {e}"));
+
+    // ── Prerequisites ───────────────────────────────────────────────
+    if let Err(msg) = crate::audio::tts::ensure_ready() {
+        panic!("{msg}\nRun the application first to download TTS models (~400 MB).");
+    }
+    if let Err(msg) = ensure_voice_models_loaded() {
+        panic!("{msg}\nRun the application first to download voice models.");
+    }
+    let available_styles = tts::list_voice_styles();
+    info!(
+        "TTS ready with {} voice styles: {:?}",
+        available_styles.len(),
+        available_styles
+    );
+
+    // ── Enrollment (shared machinery — same helpers as run_internal) ──
+    let voice_allocation = allocate_voices(&available_styles);
+    info!(
+        "Voice allocation: enrolled={} negative_pool={:?}",
+        voice_allocation.enrolled, voice_allocation.negative_pool,
+    );
+    let enrollment_variants = generate_enrollment_variants_cached(
+        &voice_allocation.enrolled,
+        &model_version_hash,
+        &cache_dir_path,
+    );
+    if enrollment_variants.is_empty() {
+        eprintln!(
+            "FATAL: Need at least one enrollment variant. TTS synthesis may have failed for all styles."
+        );
+        return;
+    }
+    let train_clips = enrollment_variants;
+    let utterance_embeddings = vad_segment_and_enroll(&train_clips);
+    if utterance_embeddings.is_empty() {
+        eprintln!(
+            "FATAL: VAD-gated enrollment produced no utterances from {} training clips",
+            train_clips.len(),
+        );
+        return;
+    }
+    info!(
+        "VAD-gated enrollment: {} utterance embeddings from {} clips",
+        utterance_embeddings.len(),
+        train_clips.len(),
+    );
+
+    // Negative calibration pool (ambient → owner → confusable → unrelated).
+    let confusable_neg_embeddings = generate_restricted_phrase_negatives(
+        "confusable",
+        CONFUSABLE_PHRASES,
+        CONFUSABLE_SEEDS_PER_PHRASE,
+        CONFUSABLE_SEED_BASE,
+        &voice_allocation.negative_pool,
+        &model_version_hash,
+        &cache_dir_path,
+    );
+    let unrelated_neg_embeddings = generate_restricted_phrase_negatives(
+        "unrelated",
+        UNRELATED_PHRASES,
+        UNRELATED_SEEDS_PER_PHRASE,
+        UNRELATED_SEED_BASE,
+        &voice_allocation.negative_pool,
+        &model_version_hash,
+        &cache_dir_path,
+    );
+    let ambient_neg_embeddings = generate_ambient_noise_sequences();
+    let owner_neg_embeddings = generate_owner_negative_sequences(
+        &voice_allocation.enrolled,
+        &model_version_hash,
+        &cache_dir_path,
+    );
+    let mut negative_embeddings: Vec<Vec<f32>> = Vec::new();
+    negative_embeddings.extend(ambient_neg_embeddings);
+    negative_embeddings.extend(owner_neg_embeddings);
+    negative_embeddings.extend(confusable_neg_embeddings);
+    negative_embeddings.extend(unrelated_neg_embeddings);
+    assert!(
+        !negative_embeddings.is_empty(),
+        "Simple bench negative pool must be non-empty — an all-skip run would \
+         silently calibrate a weaker enrollment"
+    );
+
+    let enrollment: Option<crate::audio::wake_word::WakeWordEnrollment> =
+        match super::enrollment_consistency_check(&utterance_embeddings) {
+            Ok(proto) => {
+                let calibration =
+                    crate::audio::wake_word::calibrate_negatives(&proto, &negative_embeddings);
+                let created_at = crate::turso::now();
+                let trained_at = crate::turso::now();
+                let phrase = super::normalize_phrase(BENCH_WAKE_PHRASE);
+                crate::audio::wake_word::WakeWordEnrollment::build(
+                    phrase,
+                    &utterance_embeddings,
+                    calibration,
+                    &negative_embeddings,
+                    created_at,
+                    trained_at,
+                )
+            }
+            Err(err) => {
+                warn!(
+                    "enrollment_consistency_check FAILED: {err} — no enrollment to evaluate"
+                );
+                None
+            }
+        };
+    let Some(enrollment) = enrollment else {
+        eprintln!("FATAL: no enrollment (consistency gate failed) — cannot run the simple benchmark");
+        return;
+    };
+    info!(
+        "Enrollment built: phrase='{}', {} utterances, calibration neg_mean={:.4} (p99={:.4}, n={})",
+        enrollment.phrase,
+        enrollment.utterance_count,
+        enrollment.calibration.neg_mean,
+        enrollment.calibration.neg_p99,
+        enrollment.calibration.n_negatives,
+    );
+    super::set_enrollment(enrollment);
+
+    // ── Metric 1: Recognition — the 40-clip held-out wake-only basis ──
+    // Same generation and the SAME real streaming cold pass as the
+    // enrolled-speaker phase in run_internal (run_enrolled_cold_variant →
+    // run_streaming_detection → handle_wake_word_detection).
+    let held_out_recall_clips = generate_held_out_recall_clips_cached(
+        &voice_allocation.enrolled,
+        &model_version_hash,
+        &cache_dir_path,
+    );
+    info!(
+        "Recognition basis: {} held-out wake-only clips (enrolled voice, seeds 3000+)",
+        held_out_recall_clips.len(),
+    );
+    let mut recognized = 0usize;
+    for (pcm, label) in &held_out_recall_clips {
+        let v = run_enrolled_cold_variant(label, pcm);
+        if v.detected {
+            recognized += 1;
+        }
+    }
+    let recognition_total = held_out_recall_clips.len();
+    let recognition_rate = if recognition_total > 0 {
+        recognized as f64 / recognition_total as f64
+    } else {
+        f64::NAN
+    };
+    info!(
+        "Recognition: {recognized}/{recognition_total} ({:.1}%)",
+        recognition_rate * 100.0,
+    );
+    eprintln!(
+        "  Recognition: {recognized}/{recognition_total} wake-word utterances recognized",
+    );
+
+    // ── Metric 2a: False reactions — the 113 non-phrase set ──
+    // Same shared negative corpus + the same shared warm detection pass
+    // (test_detection_samples) as the run_internal negative phases.
+    let negative_corpus =
+        build_negative_corpus(&available_styles, &model_version_hash, &cache_dir_path);
+    let non_phrase_total = negative_corpus.confusable.len()
+        + negative_corpus.unrelated.len()
+        + negative_corpus.silence.len()
+        + negative_corpus.noise.len();
+    if non_phrase_total != 113 {
+        warn!(
+            "Simple bench non-phrase set size is {non_phrase_total}, not the pinned 113 \
+             (likely TTS synthesis misses on a cold cache) — reporting the actual count",
+        );
+    }
+    let mut fa_metrics = DetectionMetrics {
+        total: 0,
+        detected: 0,
+        false_accepts: Vec::new(),
+        per_variant: Vec::new(),
+    };
+    let mut shared_adaptive = super::AdaptiveThresholdState::warmed();
+    test_detection_samples(
+        &negative_corpus.confusable,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
+    test_detection_samples(
+        &negative_corpus.unrelated,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
+    test_detection_samples(
+        &negative_corpus.silence,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
+    test_detection_samples(
+        &negative_corpus.noise,
+        &mut fa_metrics,
+        |m, l| m.false_accepts.push(l.to_string()),
+        Some(&mut shared_adaptive),
+        false, // warm pass only (negative phase)
+    );
+    let false_reactions = fa_metrics.false_accepts.len();
+    let non_phrase_rate = if non_phrase_total > 0 {
+        false_reactions as f64 / non_phrase_total as f64
+    } else {
+        f64::NAN
+    };
+    info!("False reactions: {false_reactions}/{non_phrase_total} ({:.1}%)", non_phrase_rate * 100.0);
+    eprintln!(
+        "  False reactions: {false_reactions}/{non_phrase_total} on the non-phrase set",
+    );
+
+    // ── Metric 2b: Real-audio FA/h (parallel, pinned subset) ──
+    let real_audio = run_simple_real_audio_phase();
+    // Coverage numbers are read from the real-audio section BEFORE the json!
+    // macro moves `real_audio` into the report.
+    let real_audio_audio_hours = real_audio["feed"]["audio_hours_fed"].as_f64();
+    let real_audio_speech_hours = real_audio["feed"]["speech_hours_fed"].as_f64();
+    let real_audio_noise_hours = real_audio["feed"]["noise_hours_fed"].as_f64();
+
+    // ── Report: the three metrics + coverage + worker count + wall time ──
+    let wall_clock_secs = overall_start.elapsed().as_secs_f64();
+    let report = serde_json::json!({
+        "benchmark": "voice_pipeline_simple",
+        "wake_phrase": BENCH_WAKE_PHRASE,
+        "recognition": {
+            "detected": recognized,
+            "of": recognition_total,
+            "rate": recognition_rate,
+            "basis": "existing 40-clip held-out wake-only basis (enrolled voice, \
+                      seeds 3000+, fixed bench phrase)",
+        },
+        "false_reactions": {
+            "non_phrase_set": {
+                "false_reactions": false_reactions,
+                "of": non_phrase_total,
+                "rate": non_phrase_rate,
+                "basis": "the 113 non-phrase set (56 confusable + 40 unrelated + 3 \
+                          silence + 14 noise profiles)",
+            },
+            "real_audio": real_audio,
+        },
+        "coverage": {
+            "phrase_utterances": recognition_total,
+            "non_phrase_set": non_phrase_total,
+            "real_audio_audio_hours": real_audio_audio_hours,
+            "real_audio_speech_hours": real_audio_speech_hours,
+            "real_audio_noise_hours": real_audio_noise_hours,
+        },
+        "workers": SIMPLE_BENCH_WORKERS,
+        "wall_clock_secs": wall_clock_secs,
+        "fa_per_hour_basis_note": "FA-per-hour denominators are reported as BOTH raw \
+                                    audio hours and VAD-active hours (per-worker sums); \
+                                    cooldown merge applies per worker; the number is NOT \
+                                    comparable to the serial full-corpus FAPH figure.",
+    });
+
+    // Stop the heartbeat thread.
+    heartbeat_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = heartbeat_handle.join();
+
+    println!("--- BENCHMARK_JSON_BEGIN ---");
+    let json_text = serde_json::to_string_pretty(&report).expect("JSON serialization");
+    println!("{json_text}");
+    println!("--- BENCHMARK_JSON_END ---");
+
+    // Persist the report (same directory as the benchmark lock file) so a run
+    // survives regardless of how the process ends.
+    if let Ok(report_dir) = crate::config::default_config_dir() {
+        let report_path = report_dir.join("voice_pipeline_simple_report.json");
+        match std::fs::write(&report_path, &json_text) {
+            Ok(()) => info!("Simple benchmark report written to {}", report_path.display()),
+            Err(e) => warn!(
+                "Could not write simple benchmark report to {}: {e}",
+                report_path.display()
+            ),
+        }
+    }
+
+    // ── Human-readable report (stderr) ────────────────────────
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    eprintln!(
+        "\n\
+         ═══════════════════════════════════════════════════════════\n\
+                 Simple Voice Pipeline Benchmark Report\n\
+         ═══════════════════════════════════════════════════════════\n\
+         Date/Time:      {timestamp}\n\
+         Wake phrase:    {wake}\n\
+         1. Recognition:        {recognized}/{recognition_total} of 40 phrase utterances\n\
+         2. False reactions:    {false_reactions}/{non_phrase_total} on the 113 non-phrase set\n\
+         \x20  Real-audio FA/h:   see real_audio section ({workers} parallel workers, {assignment})\n\
+         3. Coverage:    {recognition_total} utterances + {non_phrase_total} non-phrases + real audio ({audio_hours:.2} h speech+noise)\n\
+         Wall time:      {wall:.1}s ({wall_min:.1} min)\n\
+         FA/h basis:     raw audio hours AND VAD-active hours (per-worker sums);\n\
+         \x20               NOT comparable to the serial full-corpus FAPH figure",
+        wake = BENCH_WAKE_PHRASE,
+        workers = SIMPLE_BENCH_WORKERS,
+        assignment = SIMPLE_BENCH_ASSIGNMENT,
+        audio_hours = real_audio_audio_hours.unwrap_or(f64::NAN),
+        wall = wall_clock_secs,
+        wall_min = wall_clock_secs / 60.0,
+    );
+}
+
 /// Run the full voice pipeline E2E benchmark.
 ///
 /// This is called from `voice::run_voice_pipeline_benchmark()` which is the

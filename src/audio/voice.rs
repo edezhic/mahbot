@@ -86,6 +86,16 @@ pub fn run_voice_pipeline_benchmark() {
     voice_pipeline_e2e_test::run_internal();
 }
 
+/// Public entry point for the simple voice pipeline benchmark (three plain
+/// metrics).
+///
+/// Called by `benches/voice_pipeline_simple.rs`.  Only compiled when the
+/// `voice-tests` feature is enabled.
+#[cfg(feature = "voice-tests")]
+pub fn run_simple_voice_pipeline_benchmark() {
+    voice_pipeline_e2e_test::run_simple_benchmark();
+}
+
 // Constants
 
 /// Target sample rate: 16 kHz mono.
@@ -2165,6 +2175,24 @@ pub(crate) struct PipelineCtx {
     /// `Some(earshot::Detector::default())` when enrollment starts and cleared
     /// to `None` when enrollment ends or is cancelled.
     enrollment_vad: Option<earshot::Detector>,
+    /// Injected Earshot VAD detector for the voice-tests benchmark's parallel
+    /// real-audio feed.
+    ///
+    /// The streaming detection path normally uses the global [`VAD_DETECTOR`]
+    /// singleton so noise-floor/ring-buffer state persists across the live mic
+    /// stream.  The voice-tests bench drives independent per-worker pipeline
+    /// contexts in parallel; each worker injects its own detector instance
+    /// here so the workers never contend on — or cross-contaminate — the
+    /// global singleton.  Follows the [`enrollment_vad`] precedent (a
+    /// per-context detector instance consumed through
+    /// [`is_speech_with_detector`]); detection LOGIC is unchanged — only the
+    /// detector instance differs.
+    ///
+    /// Unlike [`enrollment_vad`], this field is PRESERVED across all pipeline
+    /// reset levels ([`ResetLevel`]): a bench worker's injected detector must
+    /// survive the inter-event Soft resets the real-audio feed performs.
+    #[cfg(feature = "voice-tests")]
+    pub(crate) injected_vad: Option<earshot::Detector>,
     /// Raw audio ring for wake-word detection.  Accumulates raw mic samples
     /// (no AGC/NS) capped at [`AUDIO_BUFFER_MAX`]; the trailing ≤1 s window
     /// is encoded for scoring.
@@ -2322,6 +2350,8 @@ impl PipelineCtx {
             phase3_start_time: None,
             vad_threshold: VAD_THRESHOLD,
             enrollment_vad: None,
+            #[cfg(feature = "voice-tests")]
+            injected_vad: None,
             negative_audio_buf: Vec::new(),
             refractory_until: None,
             last_error_message_time: None,
@@ -2367,6 +2397,7 @@ impl PipelineCtx {
     /// | Phase 3 (`collecting_negatives`, `phase3_audio_buf`, `phase3_silence_samples`, `negatives_speech_samples`, `phase3_processed`, `phase3_start_time`) | cleared | cleared | cleared |
     /// | `vad_threshold` | `VAD_THRESHOLD` | preserved | `VAD_THRESHOLD` |
     /// | `enrollment_vad` | `None` | `None` | `None` |
+    /// | `injected_vad` (voice-tests bench seam) | preserved | preserved | preserved |
     /// | `last_wake_word_detection` | `None` | preserved | `None` |
     /// | `auto_start_pending` | `false` | preserved | preserved |
     /// | `is_recording` | `false` | preserved | preserved |
@@ -2410,6 +2441,10 @@ impl PipelineCtx {
         // Separate VAD instance prevents state contamination between
         // enrollment and streaming modes.
         self.enrollment_vad = None;
+        // NOTE: `injected_vad` (voice-tests bench seam) is deliberately NOT
+        // touched here — it must survive every ResetLevel so a bench worker's
+        // per-context detector persists across the feed's inter-event Soft
+        // resets (see the field's doc comment).
 
         match level {
             ResetLevel::Full => {
@@ -3986,6 +4021,21 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
 
     while ctx.vad_cursor + FRAME_LENGTH <= ctx.audio_buffer.len() {
         let frame = &ctx.audio_buffer[ctx.vad_cursor..ctx.vad_cursor + FRAME_LENGTH];
+        // ── VAD check ──
+        // Production path: the global VAD_DETECTOR singleton (continuous
+        // noise-floor/ring state across the live mic stream).  voice-tests
+        // parallel bench workers inject a per-context detector
+        // (`injected_vad`) so independent workers never contend on — or
+        // cross-contaminate — the global singleton.  Detection logic is
+        // identical (`is_speech_with_detector`); only the detector instance
+        // differs (approved seam, not a logic change).
+        #[cfg(feature = "voice-tests")]
+        let is_speech = if let Some(ref mut det) = ctx.injected_vad {
+            is_speech_with_detector(&frame[..HOP_LENGTH], det, VAD_THRESHOLD)
+        } else {
+            is_speech_with_threshold(&frame[..HOP_LENGTH], VAD_THRESHOLD)
+        };
+        #[cfg(not(feature = "voice-tests"))]
         let is_speech = is_speech_with_threshold(&frame[..HOP_LENGTH], VAD_THRESHOLD);
         if is_speech {
             speech_seen_this_call = true;
@@ -5829,6 +5879,28 @@ mod tests {
 
         assert!(ctx.is_listening);
         assert!(ctx.enrollment_mode);
+    }
+
+    /// The voice-tests bench seam: `injected_vad` must survive EVERY
+    /// [`ResetLevel`] — a parallel bench worker's per-context detector persists
+    /// across the inter-event Soft resets its continuous-listening feed
+    /// performs (and Full/Cancel must not drop it either, so a worker context
+    /// is never left sharing the global VAD_DETECTOR by accident).
+    #[cfg(feature = "voice-tests")]
+    #[test]
+    #[serial_test::serial(voice)]
+    fn injected_vad_preserved_across_all_reset_levels() {
+        let _ = init_global();
+        for level in [ResetLevel::Full, ResetLevel::Soft, ResetLevel::Cancel] {
+            let mut ctx = ctx_with_populated_buffers();
+            ctx.injected_vad = Some(earshot::Detector::default());
+            ctx.reset_pipeline_state(level);
+            assert!(
+                ctx.injected_vad.is_some(),
+                "injected_vad must be preserved across {level:?} — the voice-tests \
+                 parallel feed depends on the per-context detector surviving resets",
+            );
+        }
     }
 
     #[test]

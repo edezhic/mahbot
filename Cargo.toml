@@ -222,6 +222,11 @@ harness = false
 required-features = ["voice-tests"]
 
 [[bench]]
+name = "voice_pipeline_simple"
+harness = false
+required-features = ["voice-tests"]
+
+[[bench]]
 name = "wal_race_repro"
 harness = false
 required-features = ["wal-repro"]
