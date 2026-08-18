@@ -2394,6 +2394,16 @@ pub(crate) struct DetectionInstrumentation {
     /// (detection trigger).  `None` if detection never triggered on
     /// test-utterance frames.
     pub first_trigger_frame_idx: Option<usize>,
+    /// Per-frame window embeddings (1024-dim, L2-normalized), one per scored
+    /// window, index-aligned with [`per_frame_scores`](Self::per_frame_scores).
+    ///
+    /// Captured only for the benchmark's hard-negative mining pre-pass
+    /// (crossing-frame embeddings of false-accept variants are injected into
+    /// the anti-prototype construction).  NOT copied into per-variant
+    /// reports — raw 1024-dim dumps would bloat the JSON; the only consumer
+    /// is the mining pre-pass, which reads them transiently.  Kept off the
+    /// per-frame hot path in production builds by the `voice-tests` gate.
+    pub per_frame_embeddings: Vec<Vec<f32>>,
     /// Per-hop VAD decisions during streaming detection, in order — one entry
     /// per VAD decision (each 512-sample frame processed, feeding its new
     /// 256-sample half to the VAD).
@@ -2411,6 +2421,7 @@ impl DetectionInstrumentation {
             adaptive_threshold_trajectory: Vec::new(),
             ceiling_limited_frames: 0,
             first_trigger_frame_idx: None,
+            per_frame_embeddings: Vec::new(),
             per_hop_vad: Vec::new(),
         }
     }
@@ -4425,6 +4436,9 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
                         _rolling_sum,
                         _effective_threshold,
                     ]);
+                    ctx.instrumentation
+                        .per_frame_embeddings
+                        .push(embedding.clone());
                     if _total_score < NO_MATCH_RESET_THRESHOLD {
                         ctx.instrumentation.n_frames_below_reset += 1;
                     }

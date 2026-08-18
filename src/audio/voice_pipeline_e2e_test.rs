@@ -42,6 +42,26 @@
 //! contracts (e.g. the cooldown gate and accumulation cap in the cooldown
 //! phase).
 //!
+//! # Wake-word optimization sweep (bench-configurable)
+//!
+//! Every run is shaped by `MAHBOT_BENCH_*` env vars (one run per config,
+//! each run's report records its full config under
+//! `reproducibility.sweep_config`):
+//!
+//! - `MAHBOT_BENCH_WAKE_PHRASE` — phrase pin (takes precedence over the
+//!   deployed config-store phrase; the sweep pins "hey mahbot").
+//! - `MAHBOT_BENCH_GATE_MARGIN` — anti-prototype gate margin δ (f32).
+//! - `MAHBOT_BENCH_NEG_CAP` — distilled anti-prototype cap (usize; 8 vs 64).
+//! - `MAHBOT_BENCH_INJECT_K` — hard-negative injection count k (usize).
+//! - `MAHBOT_BENCH_INJECT_FA_LABELS` — comma-separated variant labels of the
+//!   pinned-phrase baseline's false accepts (from that run's report
+//!   `false_accept_list`); the crossing-frame embeddings of these variants
+//!   are replayed (mining pre-pass) and injected into the anti-prototype
+//!   construction.
+//!
+//! `MAHBOT_FAPH=1` additionally runs the real-audio false-accept-per-hour
+//! phase (~54 min; corpus already cached).
+//!
 //! First run populates the TTS audio cache (subsequent runs hit it).  The
 //! encoder pipeline re-encodes raw audio through the shared Qwen3-ASR model
 //! per run — there is no embedding disk cache — so the wall clock is dominated
@@ -161,24 +181,48 @@ static WAKE_WORD: std::sync::OnceLock<ResolvedPhrase> = std::sync::OnceLock::new
 const WAKE_WORD_FALLBACK: &str = "hey mahbot";
 
 /// Resolved wake phrase plus its provenance label.
+///
+/// Sources: `"env_override"` (MAHBOT_BENCH_WAKE_PHRASE pin, highest
+/// precedence), `"config_db"` (deployed phrase), `"fallback"`.
 struct ResolvedPhrase {
     phrase: String,
     source: &'static str,
 }
 
-/// Resolve the wake phrase for this run (deployed config-store phrase first).
+/// Resolve the wake phrase for this run (env pin → deployed config-store
+/// phrase → fallback).
 fn wake_word() -> &'static str {
     WAKE_WORD.get_or_init(resolve_wake_phrase).phrase.as_str()
 }
 
-/// Provenance label for the resolved wake phrase ("config_db" | "fallback").
+/// Provenance label for the resolved wake phrase
+/// (`"env_override" | "config_db" | "fallback"`).
 fn wake_phrase_source() -> &'static str {
     WAKE_WORD.get_or_init(resolve_wake_phrase).source
 }
 
 /// Resolve the deployed wake phrase from the config store, falling back to
 /// the legacy constant when the store read fails or carries no phrase.
+///
+/// `MAHBOT_BENCH_WAKE_PHRASE` (bench phrase pin) takes
+/// precedence over BOTH the deployed config-store phrase and the fallback:
+/// the bench must test a pinned phrase (the user decision for the wake-word
+/// sweep is "hey mahbot" — the live personal enrollment phrase must never
+/// drive bench runs).  The override is normalized like every other phrase;
+/// only an empty/whitespace value falls through to the normal resolution
+/// (`normalize_phrase` never returns empty — it maps empty input to
+/// [`DEFAULT_WAKE_WORD_PHRASE`] — so emptiness is tested on the RAW value,
+/// and an explicit pin of the legacy default phrase "mahbot" is honored,
+/// not conflated with an unset pin).
 fn resolve_wake_phrase() -> ResolvedPhrase {
+    if let Ok(override_phrase) = std::env::var(ENV_BENCH_WAKE_PHRASE)
+        && !override_phrase.trim().is_empty()
+    {
+        return ResolvedPhrase {
+            phrase: super::normalize_phrase(&override_phrase),
+            source: "env_override",
+        };
+    }
     match read_deployed_wake_phrase() {
         Some(phrase) if !phrase.is_empty() => ResolvedPhrase {
             phrase,
@@ -243,6 +287,145 @@ fn read_deployed_wake_phrase() -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let phrase = v.get("phrase").and_then(serde_json::Value::as_str)?;
     Some(super::normalize_phrase(phrase))
+}
+
+// ── Wake-word optimization sweep ─────────────────────────────────────────
+// Decision-level bench configuration: the anti-prototype gate margin δ, the
+// distilled anti-prototype cap, and the hard-negative injection count k with
+// the mined false-accept labels from the pinned-phrase baseline.  All knobs
+// are env-driven (MAHBOT_BENCH_* — the MAHBOT_FAPH precedent) so a sweep is
+// one-run-per-config with no code edits between runs, and every run records
+// its full config in the report's reproducibility.sweep_config section.
+
+/// Env var: bench wake phrase pin (see [`resolve_wake_phrase`]).
+const ENV_BENCH_WAKE_PHRASE: &str = "MAHBOT_BENCH_WAKE_PHRASE";
+/// Env var: anti-prototype gate margin δ (f32; default [`DEFAULT_GATE_MARGIN`]).
+const ENV_BENCH_GATE_MARGIN: &str = "MAHBOT_BENCH_GATE_MARGIN";
+/// Env var: distilled anti-prototype cap (usize; default
+/// [`MAX_NEGATIVE_PROTOTYPES`]).
+const ENV_BENCH_NEG_CAP: &str = "MAHBOT_BENCH_NEG_CAP";
+/// Env var: hard-negative injection count k (usize; 0 = no injection).
+const ENV_BENCH_INJECT_K: &str = "MAHBOT_BENCH_INJECT_K";
+/// Env var: comma-separated variant labels of the pinned-phrase baseline's
+/// false accepts (from the baseline report's `false_accept_list`); the
+/// crossing-frame embeddings of these variants are injected as
+/// anti-prototypes.
+const ENV_BENCH_INJECT_FA_LABELS: &str = "MAHBOT_BENCH_INJECT_FA_LABELS";
+
+/// Bench sweep configuration (env-parameterized, one run per config).
+///
+/// Parsed once per run from the `MAHBOT_BENCH_*` env vars; every knob is
+/// recorded in the report so each archived run is self-describing.  Invalid
+/// env values WARN at runtime and fall back to the production default
+/// (fail-open — a typo'd run still produces a report; the report records the
+/// RESULTING values, so a fallback is only distinguishable from an
+/// intentional default via the runtime warn).
+struct SweepConfig {
+    /// Anti-prototype gate margin δ (see [`WakeWordEnrollment::gate_margin`]).
+    gate_margin: f32,
+    /// Distilled anti-prototype cap (see
+    /// [`distill_negative_prototypes_capped`]).
+    neg_cap: usize,
+    /// Hard-negative injection count (0 = no injection).
+    inject_k: usize,
+    /// Mined false-accept variant labels (from the pinned-phrase baseline's
+    /// `false_accept_list`); empty when injection is disabled.
+    inject_labels: Vec<String>,
+}
+
+impl Default for SweepConfig {
+    fn default() -> Self {
+        Self {
+            gate_margin: crate::audio::wake_word::DEFAULT_GATE_MARGIN,
+            neg_cap: crate::audio::wake_word::MAX_NEGATIVE_PROTOTYPES,
+            inject_k: 0,
+            inject_labels: Vec::new(),
+        }
+    }
+}
+
+impl SweepConfig {
+    /// Parse the sweep config from the environment (fail-open on bad values).
+    fn from_env() -> Self {
+        let mut cfg = Self::default();
+        let mut overrides: Vec<(&'static str, String)> = Vec::new();
+
+        if let Ok(raw) = std::env::var(ENV_BENCH_GATE_MARGIN) {
+            match raw.trim().parse::<f32>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => {
+                    cfg.gate_margin = v;
+                    overrides.push((ENV_BENCH_GATE_MARGIN, raw));
+                }
+                _ => warn!(
+                    "Ignoring invalid {ENV_BENCH_GATE_MARGIN}={raw:?} (expected a finite f32 >= 0) — \
+                     using default δ={}",
+                    cfg.gate_margin,
+                ),
+            }
+        }
+        if let Ok(raw) = std::env::var(ENV_BENCH_NEG_CAP) {
+            if let Ok(v) = raw.trim().parse::<usize>() {
+                cfg.neg_cap = v;
+                overrides.push((ENV_BENCH_NEG_CAP, raw));
+            } else {
+                warn!(
+                    "Ignoring invalid {ENV_BENCH_NEG_CAP}={raw:?} (expected a usize) — \
+                     using default cap={}",
+                    cfg.neg_cap,
+                );
+            }
+        }
+        if let Ok(raw) = std::env::var(ENV_BENCH_INJECT_K) {
+            if let Ok(v) = raw.trim().parse::<usize>() {
+                cfg.inject_k = v;
+                overrides.push((ENV_BENCH_INJECT_K, raw));
+            } else {
+                warn!(
+                    "Ignoring invalid {ENV_BENCH_INJECT_K}={raw:?} (expected a usize) — \
+                     using default k={}",
+                    cfg.inject_k,
+                );
+            }
+        }
+        if let Ok(raw) = std::env::var(ENV_BENCH_INJECT_FA_LABELS)
+            && !raw.trim().is_empty()
+        {
+            let labels: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            cfg.inject_labels = labels;
+            overrides.push((ENV_BENCH_INJECT_FA_LABELS, raw));
+        }
+        // Injection with k=0 or no labels is a no-op — record it as such so
+        // the report is unambiguous (k=0 without labels is the standard run).
+        if cfg.inject_k > 0 && cfg.inject_labels.is_empty() {
+            warn!(
+                "{ENV_BENCH_INJECT_K}={} set without {ENV_BENCH_INJECT_FA_LABELS} — \
+                 injection is a no-op (no mined labels to inject)",
+                cfg.inject_k,
+            );
+            cfg.inject_k = 0;
+        }
+        if !overrides.is_empty() {
+            info!(
+                "Sweep config: {}",
+                overrides
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+        cfg
+    }
+
+    /// Whether the hard-negative injection pre-pass must run.
+    fn injection_enabled(&self) -> bool {
+        self.inject_k > 0 && !self.inject_labels.is_empty()
+    }
 }
 
 /// Number of enrollment variants to generate.
@@ -3043,6 +3226,250 @@ fn test_detection_samples(
     }
 }
 
+// ── Hard-negative mining + injection ─────────────────────────────────────
+// Two-phase workflow: the pinned-phrase BASELINE run (k=0, δ=0, cap 8)
+// identifies the phrase's own false accepts (report `false_accept_list`).
+// Injection runs pass those labels via MAHBOT_BENCH_INJECT_FA_LABELS + k via
+// MAHBOT_BENCH_INJECT_K; this pre-pass replays the negative corpus with the
+// PLAIN baseline enrollment (set globally), captures the crossing-frame
+// window embeddings of the labeled variants, and the final enrollment is
+// rebuilt with the injected anti-prototypes appended AFTER the cap-distilled
+// set (injection bypasses farthest-point distillation by construction).
+
+/// The full negative detection corpus, in the exact order the detection
+/// phases consume it (confusable band 800, confusable band 810, unrelated
+/// band 900, unrelated band 910, silence, noise profiles).  Built ONCE by
+/// [`build_negative_corpus`] and consumed by BOTH the detection phases
+/// (Phase 8-11) and the mining pre-pass, so the replay order can never
+/// silently desync from the live phases.
+struct NegativeCorpus {
+    /// Confusable band 800 + confusable2 band 810 (merged, phase order).
+    confusable: Vec<(Vec<f32>, String)>,
+    /// Unrelated band 900 + unrelated2 band 910 (merged, phase order).
+    unrelated: Vec<(Vec<f32>, String)>,
+    /// Silence profiles ([`SILENCE_DURATIONS`]).
+    silence: Vec<(Vec<f32>, String)>,
+    /// Noise profiles ([`all_noise_profiles`]).
+    noise: Vec<(Vec<f32>, String)>,
+}
+
+impl NegativeCorpus {
+    /// Flat ordered view — the exact order the detection phases consume the
+    /// corpus (confusable, unrelated, silence, noise).  The mining pre-pass
+    /// replays THIS order so the shared adaptive threshold evolves through
+    /// the same variant sequence a real run's negative phases see.
+    fn variants(&self) -> impl Iterator<Item = &(Vec<f32>, String)> {
+        self.confusable
+            .iter()
+            .chain(&self.unrelated)
+            .chain(&self.silence)
+            .chain(&self.noise)
+    }
+}
+
+/// Build the negative detection corpus with the same generators and seed
+/// bands as the detection phases (Phase 8-11) — the single source of truth
+/// for the negative corpus.  Deterministic given the TTS PCM cache.
+fn build_negative_corpus(
+    available_styles: &[String],
+    model_version_hash: &str,
+    cache_dir_path: &std::path::Path,
+) -> NegativeCorpus {
+    let conf_seed = |band: u64, prefix: &str| {
+        generate_phrase_variants_cached(
+            CONFUSABLE_PHRASES,
+            available_styles,
+            SeedConfig {
+                base_seed: band,
+                num_variants: 1, // single seed per phrase (detection test)
+                seed_variant: 0,
+            },
+            prefix,
+            model_version_hash,
+            cache_dir_path,
+        )
+    };
+    let mut confusable = conf_seed(800, "confusable");
+    confusable.extend(conf_seed(810, "confusable2"));
+    let unrel_seed = |band: u64, prefix: &str| {
+        generate_phrase_variants_cached(
+            UNRELATED_PHRASES,
+            available_styles,
+            SeedConfig {
+                base_seed: band,
+                num_variants: 1,
+                seed_variant: 0,
+            },
+            prefix,
+            model_version_hash,
+            cache_dir_path,
+        )
+    };
+    let mut unrelated = unrel_seed(900, "unrelated");
+    unrelated.extend(unrel_seed(910, "unrelated2"));
+    let silence: Vec<(Vec<f32>, String)> = SILENCE_DURATIONS
+        .iter()
+        .map(|(label, len)| (vec![0.0f32; *len], label.to_string()))
+        .collect();
+    let noise: Vec<(Vec<f32>, String)> = all_noise_profiles()
+        .map(|(label, generator)| (generator(), (*label).to_string()))
+        .collect();
+    NegativeCorpus {
+        confusable,
+        unrelated,
+        silence,
+        noise,
+    }
+}
+
+/// A single mined crossing-frame embedding candidate.
+struct MinedCrossingFrame {
+    /// 1024-dim L2-normalized window embedding of a crossing frame.
+    embedding: Vec<f32>,
+    /// The frame's soft total score — the anti-prototype relevance measure
+    /// used to order candidates (highest first = hardest false-accept frame).
+    total_score: f32,
+}
+
+/// Indices of a variant's "crossing frames" within the instrumentation's
+/// per-frame arrays.
+///
+/// Crossing frames = the frames whose rolling sum crossed the gate: the
+/// trigger frame plus the preceding [`ROLLING_WINDOW_N`]-1 frames (the
+/// score window at trigger time).  When the replay does not reproduce the
+/// trigger (adaptive-state drift vs the baseline run), falls back to the
+/// [`ROLLING_WINDOW_N`] frames with the highest rolling sums — the
+/// near-crossing frames, which are the same acoustic windows shifted by at
+/// most a stride or two.
+fn crossing_frame_indices(instr: &super::DetectionInstrumentation) -> Vec<usize> {
+    const N: usize = super::ROLLING_WINDOW_N;
+    if let Some(t) = instr.first_trigger_frame_idx {
+        let lo = t.saturating_sub(N - 1);
+        return (lo..=t)
+            .filter(|&i| i < instr.per_frame_scores.len())
+            .collect();
+    }
+    // No trigger reproduced: top-N frames by rolling sum (ties → earliest).
+    let mut idx: Vec<usize> = (0..instr.per_frame_scores.len()).collect();
+    idx.sort_by(|&a, &b| {
+        instr.per_frame_scores[b][ROLLING_SUM_IDX]
+            .partial_cmp(&instr.per_frame_scores[a][ROLLING_SUM_IDX])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    idx.truncate(N);
+    idx
+}
+
+/// Mining pre-pass: replay the full negative corpus with the PLAIN baseline
+/// enrollment (set globally for the replay — `handle_wake_word_detection`
+/// reads it from `voice_state()`), capture the crossing-frame embeddings of
+/// the labeled false-accept variants, and return the top-`k` candidates by
+/// frame soft score (hardest first).  Deterministic: the corpus, replay
+/// order, and shared warmed adaptive state are all fixed.
+///
+/// Fidelity note: the replay starts from a fresh [`AdaptiveThresholdState`]
+/// [`warmed()`](super::AdaptiveThresholdState::warmed()) while the baseline
+/// run's Phase 8 began AFTER Phase 7's warm pass had evolved the SHARED
+/// adaptive state — so the replay is an approximation of the baseline's
+/// negative phases (a labeled FA's trigger may not reproduce exactly).
+/// [`crossing_frame_indices`] falls back to the top-N near-crossing frames
+/// when that happens, and the final detection phases measure the honest
+/// outcome under the injected enrollment.
+///
+/// Selection note: candidates are NOT deduplicated across variants — when k
+/// exceeds the number of distinct labeled FAs, consecutive frames of one
+/// variant's crossing window can contribute several near-duplicate
+/// embeddings (a deliberate simplicity; the measured winner's results were
+/// produced with this selection).
+///
+/// The caller must restore the final (injected) enrollment afterwards
+/// (Phase 5 does this).
+fn mine_fa_crossing_embeddings(
+    labels: &std::collections::HashSet<String>,
+    k: usize,
+    enrollment: &crate::audio::wake_word::WakeWordEnrollment,
+    corpus: &NegativeCorpus,
+) -> Vec<MinedCrossingFrame> {
+    let total = corpus.variants().count();
+    info!(
+        "Mining pre-pass: replaying {total} negative variants with the PLAIN baseline \
+         enrollment (inject k={k}, {} labeled FAs)",
+        labels.len(),
+    );
+    super::set_enrollment(enrollment.clone());
+    // Same shared-state design as the negative phases: one warmed adaptive
+    // state carried across variants (boundary-fire snapshot propagation).
+    let mut shared_adaptive = super::AdaptiveThresholdState::warmed();
+    let mut candidates: Vec<MinedCrossingFrame> = Vec::new();
+
+    for (i, (samples, label)) in corpus.variants().enumerate() {
+        let mut ctx = super::PipelineCtx::new();
+        ctx.adaptive_threshold = shared_adaptive.clone();
+        consume_warmup(&mut ctx);
+        let result = run_streaming_detection(samples, &mut ctx);
+        // Propagate the adaptive state exactly like test_detection_samples.
+        let boundary_fired = !result.detected && ctx.score_window.is_empty();
+        shared_adaptive = if boundary_fired {
+            result.adaptive_state_pre_flush.clone()
+        } else {
+            ctx.adaptive_threshold.clone()
+        };
+        if labels.contains(label) {
+            for idx in crossing_frame_indices(&ctx.instrumentation) {
+                let Some(emb) = ctx.instrumentation.per_frame_embeddings.get(idx) else {
+                    // Alignment guard: per_frame_embeddings must mirror
+                    // per_frame_scores; a mismatch is a coding error.
+                    warn!(
+                        "Mining: variant {label} frame {idx} missing embedding \
+                         (scores={}, embeddings={}) — skipping frame",
+                        ctx.instrumentation.per_frame_scores.len(),
+                        ctx.instrumentation.per_frame_embeddings.len(),
+                    );
+                    continue;
+                };
+                candidates.push(MinedCrossingFrame {
+                    embedding: emb.clone(),
+                    total_score: ctx.instrumentation.per_frame_scores[idx][TOTAL_SCORE_IDX],
+                });
+            }
+        }
+        if (i + 1).is_multiple_of(50) {
+            info!(
+                "  Mining replay: {}/{} variants, {} crossing-frame candidates so far",
+                i + 1,
+                total,
+                candidates.len(),
+            );
+        }
+    }
+
+    if candidates.is_empty() {
+        warn!(
+            "Mining pre-pass produced NO crossing-frame candidates from {} labeled FAs \
+             (k={k}) — injection is a no-op despite being requested; verify the FA labels \
+             come from THIS phrase's baseline report",
+            labels.len(),
+        );
+    }
+
+    // Hardest first: frame soft score descending, ties by variant order.
+    candidates.sort_by(|a, b| {
+        b.total_score
+            .partial_cmp(&a.total_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mined = candidates.len();
+    candidates.truncate(k);
+    let selected = candidates.len();
+    info!(
+        "Mining pre-pass: {mined} crossing-frame candidates from {} labeled FAs, \
+         selected {selected} (k={k} requested, capped at available) by frame soft score",
+        labels.len(),
+    );
+    candidates
+}
+
 // ── Noise-overlapped detection test ─────────────────────────
 
 /// Mix speech and noise at a given SNR (in dB).
@@ -3730,8 +4157,12 @@ fn numeric_distribution(values: &[f64]) -> serde_json::Value {
 /// Corrupt/unreadable archives are skipped (the count says how many were
 /// usable).  Archives are additionally filtered by acceptance basis
 /// ([`ACCEPTANCE_BASIS_PREFIX`]) so v3 enlarged-basis runs never mix with v2
-/// 16-clip archives in the ≥3-run spread.
-fn cross_run_summary() -> serde_json::Value {
+/// 16-clip archives in the ≥3-run spread, and by the CURRENT run's resolved
+/// wake phrase so runs of a different phrase (e.g. the pinned 'hey mahbot'
+/// sweep vs the live personal enrollment phrase) never mix in the ≥3-run
+/// spread either.
+#[expect(clippy::too_many_lines)]
+fn cross_run_summary(current_phrase: &str) -> serde_json::Value {
     let Ok(report_dir) = crate::config::default_config_dir() else {
         return serde_json::json!({"archives_found": 0, "note": "report dir unavailable"});
     };
@@ -3785,6 +4216,15 @@ fn cross_run_summary() -> serde_json::Value {
         if !basis.is_some_and(|b| b.starts_with(ACCEPTANCE_BASIS_PREFIX)) {
             continue;
         }
+        let phrase = v
+            .pointer("/reproducibility/wake_phrase/used")
+            .and_then(serde_json::Value::as_str);
+        // Phrase filter: only archives of the CURRENT run's phrase enter the
+        // spread (the pinned 'hey mahbot' sweep must not mix with runs of the
+        // live personal enrollment phrase — acoustic targets differ).
+        if phrase.is_none_or(|p| p != current_phrase) {
+            continue;
+        }
         let frac = v
             .pointer("/enrolled_speaker/acceptance/detected_live_frac")
             .and_then(serde_json::Value::as_f64);
@@ -3795,9 +4235,6 @@ fn cross_run_summary() -> serde_json::Value {
             .get("self_test")
             .and_then(|s| s.get("passed"))
             .and_then(serde_json::Value::as_bool);
-        let phrase = v
-            .pointer("/reproducibility/wake_phrase/used")
-            .and_then(serde_json::Value::as_str);
         if let Some(f) = frac {
             fracs.push(f);
         }
@@ -3836,8 +4273,11 @@ fn cross_run_summary() -> serde_json::Value {
             }),
         },
         "note": "Last 3 pre-existing timestamped archives, filtered to the current \
-                 acceptance basis (ACCEPTANCE_BASIS_PREFIX).  Until 3 runs with the \
-                 current basis accumulate, the spread is partial.",
+                 acceptance basis (ACCEPTANCE_BASIS_PREFIX) AND the current run's \
+                 wake phrase (different-phrase runs — e.g. the pinned 'hey mahbot' \
+                 sweep vs the live personal enrollment phrase — never mix).  Until \
+                 3 runs with the current basis+phrase accumulate, the spread is \
+                 partial.",
     })
 }
 
@@ -4351,6 +4791,7 @@ fn faph_merge_events(events: &[f64], cooldown_secs: f64) -> usize {
 /// keep this clear list exhaustive when the instrumentation struct grows.
 fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
     ctx.instrumentation.per_frame_scores.clear();
+    ctx.instrumentation.per_frame_embeddings.clear();
     ctx.instrumentation.adaptive_threshold_trajectory.clear();
     ctx.instrumentation.per_hop_vad.clear();
     ctx.instrumentation.n_frames_below_reset = 0;
@@ -4491,6 +4932,11 @@ pub(crate) fn run_internal() {
                 .expect("info env filter"),
         )
         .try_init();
+
+    // ── Sweep configuration ─────────────────────────────────────────────
+    // Parsed once per run; every knob is recorded in the report's
+    // reproducibility.sweep_config so each archived run is self-describing.
+    let sweep_config = SweepConfig::from_env();
 
     // ── Phase timing ─────────────────────────────────────────────────
     // We measure each named phase with Instant timestamps.  Phase 13's
@@ -4786,6 +5232,13 @@ pub(crate) fn run_internal() {
 
     phase_times[P_NEG_TRAINING_DATA] = phase_end_ms!();
 
+    // ── Shared negative detection corpus (Phases 8-11 + mining replay) ──
+    // Built ONCE here (TTS cache-backed, deterministic) and consumed by both
+    // the detection phases and the mining pre-pass so the replay order can
+    // never desync from the live phases (single source of truth).
+    let negative_corpus =
+        build_negative_corpus(&available_styles, &model_version_hash, &cache_dir_path);
+
     // ── Phase 4: finalize_enrollment (consistency check + prototype + calibration) ──
     phase_start!("Phase 4: finalize_enrollment");
     // `utterance_embeddings` from Phase 2 (one 1024-dim embedding per VAD
@@ -4809,6 +5262,13 @@ pub(crate) fn run_internal() {
     };
 
     // ── Build the enrollment (prototype + negative calibration) ──
+    // The sweep applies: (1) the distilled anti-prototype cap
+    // (MAHBOT_BENCH_NEG_CAP, default MAX_NEGATIVE_PROTOTYPES), (2) the
+    // hard-negative injection (mined crossing-frame embeddings of the
+    // pinned-phrase baseline's false accepts, appended AFTER the distilled
+    // set — the cap bounds only the distilled set), and (3) the anti-
+    // prototype gate margin δ (MAHBOT_BENCH_GATE_MARGIN).
+    let mut injected_embedding_count = 0usize;
     let enrollment: Option<crate::audio::wake_word::WakeWordEnrollment> = match &prototype {
         Some(proto) => {
             let calibration =
@@ -4816,14 +5276,49 @@ pub(crate) fn run_internal() {
             let created_at = crate::turso::now();
             let trained_at = crate::turso::now();
             let phrase = super::normalize_phrase(wake_word());
-            crate::audio::wake_word::WakeWordEnrollment::build(
+            // Plain baseline enrollment (cap 8, δ 0, no injection) — the
+            // mining pre-pass replays WITH THIS so the labeled FAs reproduce.
+            match crate::audio::wake_word::WakeWordEnrollment::build(
                 phrase,
                 &utterance_embeddings,
                 calibration,
                 &negative_embeddings,
                 created_at,
                 trained_at,
-            )
+            ) {
+                Some(plain) => {
+                    // ── Mining pre-pass (injection runs only) ──
+                    // Replays the negative corpus with the plain enrollment
+                    // (set globally for the replay) and captures the
+                    // crossing-frame embeddings of the baseline's
+                    // false-accept variants.
+                    let mined: Vec<MinedCrossingFrame> = if sweep_config.injection_enabled() {
+                        let labels: std::collections::HashSet<String> =
+                            sweep_config.inject_labels.iter().cloned().collect();
+                        mine_fa_crossing_embeddings(
+                            &labels,
+                            sweep_config.inject_k,
+                            &plain,
+                            &negative_corpus,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    injected_embedding_count = mined.len();
+                    // ── Final enrollment: sweep cap + injected + δ ──
+                    let mut final_enr = plain;
+                    final_enr.negative_prototypes =
+                        crate::audio::wake_word::distill_negative_prototypes_capped(
+                            &negative_embeddings,
+                            sweep_config.neg_cap,
+                        );
+                    final_enr
+                        .negative_prototypes
+                        .extend(mined.into_iter().map(|m| m.embedding));
+                    Some(final_enr.with_gate_margin(sweep_config.gate_margin))
+                }
+                None => None,
+            }
         }
         None => None,
     };
@@ -5172,37 +5667,15 @@ pub(crate) fn run_internal() {
         // "confusable" prefix, band 2 (810+) with the distinct "confusable2"
         // prefix (the band must not re-key existing 800+ clips).  Both bands
         // feed the same confusable false-accept tally and per-tier split.
+        // The variants come from the shared [`NegativeCorpus`] (built before
+        // Phase 4) — the same list the mining pre-pass replays.
         phase_start!("Phase 8: Negative — confusable phrases");
-        let mut confusable_variants = generate_phrase_variants_cached(
-            CONFUSABLE_PHRASES,
-            &available_styles,
-            SeedConfig {
-                base_seed: 800,
-                num_variants: 1, // single seed per phrase (detection test, not training)
-                seed_variant: 0,
-            },
-            "confusable",
-            &model_version_hash,
-            &cache_dir_path,
-        );
-        confusable_variants.extend(generate_phrase_variants_cached(
-            CONFUSABLE_PHRASES,
-            &available_styles,
-            SeedConfig {
-                base_seed: 810,
-                num_variants: 1,
-                seed_variant: 0,
-            },
-            "confusable2",
-            &model_version_hash,
-            &cache_dir_path,
-        ));
         info!(
-            "Generated {} confusable phrase variants (2 seed bands: 800+, 810+)",
-            confusable_variants.len()
+            "Confusable negative corpus: {} variants (2 seed bands: 800+, 810+)",
+            negative_corpus.confusable.len()
         );
         test_detection_samples(
-            &confusable_variants,
+            &negative_corpus.confusable,
             &mut conf_metrics,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
@@ -5219,38 +5692,14 @@ pub(crate) fn run_internal() {
         // ── Phase 10: Detection — Unrelated phrases ───────────────────────
         // The unrelated detection pool spans two seed bands: band 1 (900+)
         // with the "unrelated" prefix, band 2 (910+) with the distinct
-        // "unrelated2" prefix.
+        // "unrelated2" prefix.  Variants from the shared [`NegativeCorpus`].
         phase_start!("Phase 9: Negative — unrelated phrases");
-        let mut unrelated_variants = generate_phrase_variants_cached(
-            UNRELATED_PHRASES,
-            &available_styles,
-            SeedConfig {
-                base_seed: 900,
-                num_variants: 1, // single seed per phrase (detection test, not training)
-                seed_variant: 0,
-            },
-            "unrelated",
-            &model_version_hash,
-            &cache_dir_path,
-        );
-        unrelated_variants.extend(generate_phrase_variants_cached(
-            UNRELATED_PHRASES,
-            &available_styles,
-            SeedConfig {
-                base_seed: 910,
-                num_variants: 1,
-                seed_variant: 0,
-            },
-            "unrelated2",
-            &model_version_hash,
-            &cache_dir_path,
-        ));
         info!(
-            "Generated {} unrelated phrase variants (2 seed bands: 900+, 910+)",
-            unrelated_variants.len()
+            "Unrelated negative corpus: {} variants (2 seed bands: 900+, 910+)",
+            negative_corpus.unrelated.len()
         );
         test_detection_samples(
-            &unrelated_variants,
+            &negative_corpus.unrelated,
             &mut unrelated_metrics,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
@@ -5259,14 +5708,11 @@ pub(crate) fn run_internal() {
         phase_times[P_UNRELATED_NEGATIVES] = phase_end_ms!();
 
         // ── Phase 11: Detection — Silence ────────────────────────────────
-        // Silence becomes a small matrix (three durations).
+        // Silence becomes a small matrix (three durations); variants from the
+        // shared [`NegativeCorpus`].
         phase_start!("Phase 10: Negative — silence");
-        let silence_variants: Vec<(Vec<f32>, String)> = SILENCE_DURATIONS
-            .iter()
-            .map(|(label, len)| (vec![0.0f32; *len], label.to_string()))
-            .collect();
         test_detection_samples(
-            &silence_variants,
+            &negative_corpus.silence,
             &mut silence_metric,
             |m, l| m.false_accepts.push(l.to_string()),
             Some(&mut shared_adaptive),
@@ -5276,14 +5722,14 @@ pub(crate) fn run_internal() {
 
         // ── Phase 12: Detection — Noise profiles ─────────────────────────
         // The 4 detection-only profiles join the phase but NEVER the training
-        // list (NOISE_PROFILES — see NOISE_PROFILES_DETECTION_ONLY).
+        // list (NOISE_PROFILES — see NOISE_PROFILES_DETECTION_ONLY).  Samples
+        // from the shared [`NegativeCorpus`].
         phase_start!("Phase 11: Negative — noise profiles");
-        for (label, generator) in all_noise_profiles() {
+        for (noise, label) in &negative_corpus.noise {
             info!("  Testing noise profile: {label}");
-            let noise = generator();
             let mut metric = DetectionMetrics::default();
             test_detection_samples(
-                &[(noise, (*label).to_string())],
+                &[(noise.clone(), label.clone())],
                 &mut metric,
                 |m, l| m.false_accepts.push(l.to_string()),
                 Some(&mut shared_adaptive),
@@ -6236,13 +6682,37 @@ pub(crate) fn run_internal() {
             "note": "The bench synthesizes and tests the wake phrase persisted in the \
                      deployed model's config-store entry (production's actual listening \
                      phrase); 'fallback' means the config store was unavailable and the \
-                     legacy constant was used.  A phrase change invalidates the TTS PCM \
-                     cache (one re-synthesis run) and shifts the acoustic target — \
-                     numbers are only comparable across runs with the same phrase.  The \
-                     confusable negative tier stays the mahbot-family canonical list \
-                     regardless of the deployed phrase (production itself skips mahbot \
-                     confusables for non-mahbot phrases) — for a non-mahbot deployed \
-                     phrase that tier is informational only.",
+                     legacy constant was used; 'env_override' means MAHBOT_BENCH_WAKE_PHRASE \
+                     pinned the phrase (the bench pins 'hey mahbot' so the \
+                     live personal enrollment phrase never drives bench runs).  A phrase \
+                     change invalidates the TTS PCM cache (one re-synthesis run) and \
+                     shifts the acoustic target — numbers are only comparable across runs \
+                     with the same phrase.  The confusable negative tier stays the \
+                     mahbot-family canonical list regardless of the deployed phrase \
+                     (production itself skips mahbot confusables for non-mahbot phrases) — \
+                     for a non-mahbot deployed phrase that tier is informational only.",
+        },
+        // Wake-word optimization sweep config: every knob that
+        // shaped this run's enrollment (anti-prototype gate margin δ,
+        // distilled anti-prototype cap, hard-negative injection k + mined
+        // FA labels).  The FA frontier across swept configs is assembled
+        // from these per-run records (recall = enrolled_speaker.acceptance,
+        // FA = total_false_accepts / false_accept_list).
+        "sweep_config": {
+            "gate_margin": sweep_config.gate_margin,
+            "neg_cap": sweep_config.neg_cap,
+            // `inject_k` is already clamped to 0 by `from_env` when no labels
+            // are provided, so the plain value is unambiguous.
+            "inject_k": sweep_config.inject_k,
+            "inject_labels": sweep_config.inject_labels,
+            "injected_embeddings": injected_embedding_count,
+            "note": "k bounds the INJECTED embeddings only (mined crossing-frame \
+                     windows of the pinned-phrase baseline's false accepts, ordered \
+                     by frame soft score descending); the cap bounds only the \
+                     cap-DISTILLED set — the total anti-prototype count is \
+                     min(negatives, cap) + k.  Injection self-suppresses the injected \
+                     negatives by construction, so the honest held-out FA signal is \
+                     the NON-injected negatives plus FAPH.",
         },
         "model_hashes": {
             "tts_model_version_hash": model_version_hash,
@@ -6486,7 +6956,7 @@ pub(crate) fn run_internal() {
     // Cross-run statistics (Phase 0): last 3 archived reports summarized so
     // the >=3-run acceptance protocol is self-documenting.  Computed BEFORE
     // the current archive is written so it never includes this run.
-    let cross_run = cross_run_summary();
+    let cross_run = cross_run_summary(wake_word());
 
     // ── Threshold sweep / DET-style tables (additive, report-only) ────────
     // Computed from the already-stored per-variant peak rolling sums — no new
@@ -7747,5 +8217,151 @@ mod tests {
                 .all(|v| v.as_str().unwrap() != "gate_crossed_not_detected"),
             "the 1.68 gate crossing is above the band and must not be a near miss"
         );
+    }
+
+    // ── Sweep machinery ─────────────────────────────────────────
+
+    /// Set sweep env vars under the shared env lock, run `f`, and restore the
+    /// previous values on drop — RAII, so a panicking closure cannot leak
+    /// vars into subsequent tests.
+    ///
+    /// [`EnvVarGuard`](crate::util::test::EnvVarGuard) can only hold ONE var
+    /// at a time (it owns the env lock for its whole lifetime), so the
+    /// multi-var cases follow the precedent of the EnvVarGuard's own tests
+    /// (`util/test.rs`): `unsafe` `set_var`/`remove_var` under `env_lock()`.
+    fn with_sweep_env(kvs: &[(&str, &str)], f: impl FnOnce() -> SweepConfig) -> SweepConfig {
+        let _guard = SweepEnvGuard::set(kvs);
+        f()
+    }
+
+    /// RAII guard restoring the env vars that existed before
+    /// [`SweepEnvGuard::set`] (holding the shared env lock for its lifetime).
+    struct SweepEnvGuard<'a> {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'a str, Option<std::ffi::OsString>)>,
+    }
+
+    impl<'a> SweepEnvGuard<'a> {
+        /// Record the current values of `kvs`, then set them; the original
+        /// values are restored on drop (removed if they were unset).  Uses
+        /// `var_os` so a non-UTF-8 prior value round-trips unchanged.
+        fn set(kvs: &[(&'a str, &'a str)]) -> Self {
+            let lock = crate::util::test::env_lock().lock().unwrap_poison();
+            let saved = kvs.iter().map(|&(k, _)| (k, std::env::var_os(k))).collect();
+            unsafe {
+                for &(k, v) in kvs {
+                    std::env::set_var(k, v);
+                }
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for SweepEnvGuard<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                for (k, prev) in &self.saved {
+                    match prev {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sweep config parsing: env values are honored, invalid values fall
+    /// back with a warning, and k>0 without labels is clamped to a no-op.
+    #[test]
+    fn sweep_config_from_env_parses_and_clamps() {
+        // gate_margin honored.
+        let cfg = with_sweep_env(&[(ENV_BENCH_GATE_MARGIN, "0.04")], SweepConfig::from_env);
+        assert!((cfg.gate_margin - 0.04).abs() < 1e-6);
+        assert_eq!(
+            cfg.neg_cap,
+            crate::audio::wake_word::MAX_NEGATIVE_PROTOTYPES
+        );
+
+        // neg_cap honored.
+        let cfg = with_sweep_env(&[(ENV_BENCH_NEG_CAP, "64")], SweepConfig::from_env);
+        assert_eq!(cfg.neg_cap, 64);
+        assert_eq!(
+            cfg.gate_margin,
+            crate::audio::wake_word::DEFAULT_GATE_MARGIN
+        );
+
+        // k + labels together → injection enabled.
+        let cfg = with_sweep_env(
+            &[
+                (ENV_BENCH_INJECT_K, "6"),
+                (
+                    ENV_BENCH_INJECT_FA_LABELS,
+                    "confusable_madbot_s0, confusable2_hey mahbot_s0",
+                ),
+            ],
+            SweepConfig::from_env,
+        );
+        assert_eq!(cfg.inject_k, 6);
+        assert_eq!(
+            cfg.inject_labels,
+            vec!["confusable_madbot_s0", "confusable2_hey mahbot_s0"]
+        );
+        assert!(cfg.injection_enabled());
+
+        // k>0 without labels is clamped to a no-op (injection disabled).
+        let cfg2 = with_sweep_env(&[(ENV_BENCH_INJECT_K, "4")], SweepConfig::from_env);
+        assert_eq!(cfg2.inject_k, 0, "k>0 without labels is clamped to 0");
+        assert!(!cfg2.injection_enabled());
+
+        // Invalid values fall back to the defaults.
+        let cfg3 = with_sweep_env(&[(ENV_BENCH_GATE_MARGIN, "banana")], SweepConfig::from_env);
+        assert_eq!(
+            cfg3.gate_margin,
+            crate::audio::wake_word::DEFAULT_GATE_MARGIN
+        );
+        let cfg4 = with_sweep_env(&[(ENV_BENCH_NEG_CAP, "-1")], SweepConfig::from_env);
+        assert_eq!(
+            cfg4.neg_cap,
+            crate::audio::wake_word::MAX_NEGATIVE_PROTOTYPES
+        );
+    }
+
+    /// Crossing-frame selection: a reproduced trigger returns the trigger
+    /// window (trigger frame + the preceding ROLLING_WINDOW_N-1 frames);
+    /// without a trigger it falls back to the top-N frames by rolling sum
+    /// (ties earliest-first).
+    #[test]
+    fn crossing_frame_indices_trigger_window_and_fallback() {
+        let n = super::ROLLING_WINDOW_N;
+        // Trigger at index 5 → frames 3..=5 (window of N).
+        let mut instr = super::DetectionInstrumentation::new();
+        for i in 0..8 {
+            instr.per_frame_scores.push([0.5, i as f32 * 0.1, 1.65]);
+        }
+        instr.first_trigger_frame_idx = Some(5);
+        let idx = crossing_frame_indices(&instr);
+        assert_eq!(idx, vec![5 - (n - 1), 5 - (n - 2), 5], "trigger window");
+        assert!(idx.iter().all(|&i| i < instr.per_frame_scores.len()));
+
+        // Early trigger (index 0) clamps at 0 — no underflow.
+        instr.first_trigger_frame_idx = Some(0);
+        assert_eq!(crossing_frame_indices(&instr), vec![0]);
+
+        // No trigger → top-N frames by rolling sum (desc), ties earliest.
+        instr.first_trigger_frame_idx = None;
+        let fallback = crossing_frame_indices(&instr);
+        assert_eq!(fallback.len(), n);
+        let top_rs: Vec<f32> = fallback
+            .iter()
+            .map(|&i| instr.per_frame_scores[i][ROLLING_SUM_IDX])
+            .collect();
+        assert!(
+            top_rs.windows(2).all(|w| w[0] >= w[1]),
+            "fallback frames ordered by rolling sum descending"
+        );
+
+        // Empty instrumentation → empty indices (no panic).
+        let empty = super::DetectionInstrumentation::new();
+        assert!(crossing_frame_indices(&empty).is_empty());
     }
 }
