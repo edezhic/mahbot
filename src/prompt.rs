@@ -200,6 +200,12 @@ fn push_truncated(out: &mut String, text: &str) {
 }
 
 /// Discover `.claude/rules/*.md` files and return their relative paths + content.
+///
+/// Files are returned in deterministic raw file-name order (byte sort), not in
+/// `read_dir` enumeration order, so identical rules always render
+/// byte-identically — keeping the workspace-context block (and therefore the
+/// agent system prompt) stable across renders. File names within a single
+/// directory are unique, so the sort cannot tie.
 async fn discover_claude_rules(workspace: &Path) -> Vec<(String, String)> {
     let rules_dir = workspace.join(".claude").join("rules");
 
@@ -207,12 +213,18 @@ async fn discover_claude_rules(workspace: &Path) -> Vec<(String, String)> {
         return Vec::new();
     };
 
-    let mut rules = Vec::new();
+    let mut files = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "md")
-            && let Ok(content) = tokio::fs::read_to_string(&path).await
-        {
+        if path.extension().is_some_and(|e| e == "md") {
+            files.push(path);
+        }
+    }
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    let mut rules = Vec::new();
+    for path in files {
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
             let rel_path = path
                 .strip_prefix(workspace)
                 .unwrap_or(&path)
@@ -364,6 +376,35 @@ mod tests {
         let rules = discover_claude_rules(dir.path()).await;
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].1.len(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn discover_claude_rules_returns_sorted_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join(".claude").join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        // Scrambled creation order — `read_dir` order is not guaranteed, so the
+        // loader must return rules in deterministic byte-sorted name order for
+        // a stable render (a two-render byte-identity test would pass even
+        // pre-fix on APFS's stable-enough order).
+        for name in ["zebra", "alpha", "middle"] {
+            std::fs::write(
+                rules_dir.join(format!("{name}.md")),
+                format!("{name} rules"),
+            )
+            .unwrap();
+        }
+
+        let rules = discover_claude_rules(dir.path()).await;
+        let paths: Vec<&str> = rules.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                ".claude/rules/alpha.md",
+                ".claude/rules/middle.md",
+                ".claude/rules/zebra.md",
+            ]
+        );
     }
 
     #[test]

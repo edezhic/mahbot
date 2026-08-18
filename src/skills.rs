@@ -8,6 +8,11 @@
 //! Each SKILL.md is markdown with optional YAML frontmatter for `name` and
 //! `description`. Loaded skills are rendered into the system prompt as name +
 //! description, with a `<location>` path the model can `read` for full content.
+//!
+//! Within each location, skill subdirectories are scanned in deterministic
+//! byte-sorted directory-name order (never `read_dir` enumeration order), so
+//! identical directories always render byte-identically — keeping the provider
+//! prompt-prefix cache stable across renders.
 
 use crate::Skill;
 use anyhow::{Context, Result};
@@ -91,13 +96,19 @@ pub async fn load_skills(ws: &crate::Workspace) -> Vec<Skill> {
 }
 
 /// Scan a single directory for skill subdirectories (each containing `SKILL.md`).
+///
+/// Entries are processed in deterministic raw directory-name order (byte
+/// sort), not in `read_dir` enumeration order, so identical directories always
+/// render byte-identically. Directory names within a single directory are
+/// unique, so the sort cannot tie — case-only differences (e.g. `A` vs `a`)
+/// order cleanly and two subdirs declaring the same frontmatter name resolve
+/// to the byte-earliest directory name.
 async fn scan_skills_dir(dir: &Path) -> Vec<Skill> {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
     };
 
-    let mut skills = Vec::new();
-
+    let mut subdirs = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let Ok(file_type) = entry.file_type().await else {
             continue;
@@ -107,16 +118,22 @@ async fn scan_skills_dir(dir: &Path) -> Vec<Skill> {
         }
 
         let path = entry.path();
-        let md_path = path.join("SKILL.md");
-        if !tokio::fs::try_exists(&md_path).await.unwrap_or(false) {
+        if !tokio::fs::try_exists(&path.join("SKILL.md"))
+            .await
+            .unwrap_or(false)
+        {
             continue;
         }
+        subdirs.push(path);
+    }
+    subdirs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-        if let Ok(skill) = load_skill(&md_path, &path).await {
+    let mut skills = Vec::new();
+    for path in subdirs {
+        if let Ok(skill) = load_skill(&path.join("SKILL.md"), &path).await {
             skills.push(skill);
         }
     }
-
     skills
 }
 
@@ -356,6 +373,59 @@ mod tests {
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "From .claude/skills");
+    }
+
+    #[tokio::test]
+    async fn load_skills_returns_deterministic_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+
+        // Create subdirs in deliberately scrambled order — `read_dir` order is
+        // not guaranteed, so the loader must byte-sort by directory name for a
+        // stable render. This asserts the sorted order directly (a byte-identical
+        // two-render test would pass even pre-fix on APFS's stable-enough order).
+        for name in ["zeta", "alpha", "middle"] {
+            let sd = skills_dir.join(name);
+            std::fs::create_dir_all(&sd).unwrap();
+            std::fs::write(
+                sd.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Skill {name}\n---\n\nContent"),
+            )
+            .unwrap();
+        }
+
+        let skills = load_skills(&test_ws(dir.path())).await;
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "middle", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn load_skills_duplicate_frontmatter_name_uses_sorted_dir_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+
+        // Two subdirs declaring the same frontmatter name: the winner used to
+        // be whatever `read_dir` yielded first (nondeterministic); with the
+        // deterministic scan it is the byte-earliest directory name.
+        let sd_late = skills_dir.join("z-late");
+        std::fs::create_dir_all(&sd_late).unwrap();
+        std::fs::write(
+            sd_late.join("SKILL.md"),
+            "---\nname: common\ndescription: From z-late\n---\n\nContent",
+        )
+        .unwrap();
+
+        let sd_early = skills_dir.join("a-early");
+        std::fs::create_dir_all(&sd_early).unwrap();
+        std::fs::write(
+            sd_early.join("SKILL.md"),
+            "---\nname: common\ndescription: From a-early\n---\n\nContent",
+        )
+        .unwrap();
+
+        let skills = load_skills(&test_ws(dir.path())).await;
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description, "From a-early");
     }
 
     #[tokio::test]
