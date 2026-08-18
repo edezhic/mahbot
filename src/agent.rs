@@ -507,6 +507,48 @@ impl Agent {
                     notify.notify_one();
                 }
 
+                // Provider input-image content-inspection rejection (e.g.
+                // OpenRouter HTTP 400 `data_inspection_failed`): the rejected
+                // image must not fail the run wholesale nor stay sticky in the
+                // session. Strip the image markers from the most recent user
+                // message (durable-first) and continue the loop — the next
+                // iteration re-runs `llm_call` with the corrected message as
+                // part of the NORMAL loop, not a dedicated retry step. No
+                // retry guard: a subsequent failure whose most recent user
+                // message no longer contains image markers takes the normal
+                // failure path (no repeated stripping).
+                //
+                // The leader-stagger signal above has already fired (first
+                // call completed, success or failure): a stripped leader's next
+                // request diverges from its followers' byte-stable prefix —
+                // fail-open by design, and moot for the direct-chat Artist
+                // scenario that exercises this path (management rounds never
+                // send images). Note: the retried call re-runs the iteration-0
+                // `notify_one` above, but the stagger has a single waiter (the
+                // `select!` in `spawn_staggered_round`, already consumed) — the
+                // second notification stores an unconsumed permit and is
+                // dropped with the Notify. No follower is released twice.
+                //
+                // The downcast is extracted to a local first: `anyhow::Chain`
+                // is not `Send`, so it must not be held across the await below
+                // (the agent runs inside a spawned, Send-bound task).
+                let image_rejection = llm_result.as_ref().err().and_then(|e| {
+                    e.chain()
+                        .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
+                });
+                if let Some(exhausted) = image_rejection
+                    && self.strip_rejected_input_image(exhausted).await
+                {
+                    tracing::info!(
+                        agent_id = %self.agent_id,
+                        role = %self.role,
+                        iteration,
+                        "Stripped provider-rejected input image from the most recent user \
+                         message — continuing the normal loop"
+                    );
+                    continue;
+                }
+
                 let PreparedAssistantTurn {
                     mut display_text,
                     tool_calls,
@@ -849,6 +891,78 @@ impl Agent {
         // loop updates the value.
         self.record_session_usage(&response).await;
         Ok(response)
+    }
+
+    /// Detect a provider input-image content-inspection rejection on the error
+    /// trail and durably strip the image from the most recent user message.
+    /// Returns `true` when the strip was applied (the caller continues the
+    /// normal loop with the corrected message), `false` for a conservative
+    /// no-op (the caller keeps the original error path).
+    ///
+    /// Persist ordering: the store rewrite completes before the in-memory
+    /// swap, so a persist failure (or an unpersisted-tail target) leaves the
+    /// session untouched and the original LLM error propagates — no
+    /// half-stripped continuation, no swallowed errors. Telemetry note: the
+    /// rejected attempt already recorded one `non_retryable` `llm_requests`
+    /// row (from the retry loop's `fail_exhausted` tail) before this runs;
+    /// the corrected call records its own success row — by design, not a
+    /// swallowed error.
+    async fn strip_rejected_input_image(
+        &mut self,
+        exhausted: &crate::retry::RetryExhausted,
+    ) -> bool {
+        let Some(idx) =
+            crate::image_strip::detect_input_image_rejection(exhausted, self.session.history())
+        else {
+            return false;
+        };
+        let reason = crate::image_strip::extract_provider_reason(exhausted);
+        // Invariant guard: detection and the strip share one marker predicate
+        // (see `image_strip::has_image_marker`), so a detected rejection always
+        // changes the content. If they ever drift — e.g. a malformed `[IMAGE:`
+        // fragment passes detection but the regex leaves it verbatim — a
+        // no-change rewrite would report `Rewritten` and the loop `continue`
+        // below would skip `iteration += 1`, an unbounded retry loop. Treat a
+        // no-change strip as a non-strip: keep the original error path.
+        let content = {
+            let original = &self.session.history()[idx].content;
+            let stripped = crate::image_strip::strip_image_markers(original, reason.as_deref());
+            if stripped == *original {
+                tracing::warn!(
+                    agent_id = %self.agent_id,
+                    role = %self.role,
+                    "Input-image rejection detected but stripping produced no change — \
+                     treating as a non-strip (normal failure path)"
+                );
+                return false;
+            }
+            stripped
+        };
+        match self
+            .session
+            .rewrite_last_user_message(&self.agent_id, content)
+            .await
+        {
+            Ok(crate::session::RewriteOutcome::Rewritten) => true,
+            Ok(crate::session::RewriteOutcome::UnpersistedTailNoop) => {
+                tracing::info!(
+                    agent_id = %self.agent_id,
+                    role = %self.role,
+                    "Input-image rejection detected but the most recent user message is in the \
+                     unpersisted tail — conservative no-op, normal failure path applies"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::error!(
+                    agent_id = %self.agent_id,
+                    role = %self.role,
+                    error = %e,
+                    "Failed to persist stripped user message — keeping the original error path"
+                );
+                false
+            }
+        }
     }
 
     /// Bounded continuation recovery for the reasoning-only-stop class
@@ -1759,10 +1873,14 @@ mod tests {
     const SCRUBBABLE_LINE: &str = "API_KEY=sk-1234567890abcdef";
 
     fn make_agent(tools: Vec<Box<dyn Tool>>) -> Agent {
+        make_agent_with_role(tools, crate::Role::Engineer)
+    }
+
+    fn make_agent_with_role(tools: Vec<Box<dyn Tool>>, role: crate::Role) -> Agent {
         let tool_specs = tools.iter().map(|t| t.spec()).collect();
         Agent {
             agent_id: "test-agent".into(),
-            role: crate::Role::Engineer,
+            role,
             session: Session::default(),
             workspace: std::sync::Arc::new(crate::Workspace::default()),
             tools,
@@ -3142,5 +3260,225 @@ mod tests {
             .session
             .set_token_length(Some(crate::session::SUMMARIZATION_THRESHOLD / 2));
         agent.maybe_summarize().await;
+    }
+
+    // ── Provider input-image rejection strip (ticket mahbot-1788) ────────
+
+    /// The observed provider rejection body (OpenRouter HTTP 400
+    /// `data_inspection_failed`, image variant).
+    const IMAGE_REJECTION_BODY: &str = r#"{"error":{"message":"Input image data may contain inappropriate content.","code":"data_inspection_failed","type":"invalid_request_error"}}"#;
+
+    /// Same code, text variant — must NOT trigger the strip.
+    const TEXT_REJECTION_BODY: &str = r#"{"error":{"message":"Input data may contain inappropriate content.","code":"data_inspection_failed","type":"invalid_request_error"}}"#;
+
+    /// Seed empty model catalogs so the Artist active-models block renders
+    /// nothing and performs no network fetch (hermetic e2e).
+    fn seed_empty_catalogs() {
+        crate::tools::image_catalog::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::image_catalog::ImageCatalog::default(),
+        )));
+        crate::tools::video_catalog::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::video_catalog::VideoCatalog::default(),
+        )));
+    }
+
+    /// A rejected input image must not fail the run: the image is durably
+    /// stripped from the most recent user message (replaced by the explanatory
+    /// phrase) and the run continues through its normal loop — the retried
+    /// call carries the corrected message and the agent answers.
+    #[tokio::test]
+    #[serial_test::serial(active_models)] // seeds the process-global catalog caches
+    #[allow(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    async fn rejected_input_image_is_stripped_and_run_continues() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        seed_empty_catalogs();
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+
+        let agent_id = "e2e_artist_image_reject";
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .err_http(400, IMAGE_REJECTION_BODY)
+                .ok("The image was rejected by the provider's content check."),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent_with_role(vec![], crate::Role::Artist);
+        agent.agent_id = agent_id.to_string();
+        let resp = agent
+            .work("[IMAGE:/tmp/photo.png] describe this photo", false)
+            .await
+            .expect("the run must not fail wholesale on a rejected input image");
+        assert_eq!(
+            resp,
+            "The image was rejected by the provider's content check."
+        );
+
+        // The corrected message reached the model: the second request's
+        // message list carries the phrase and no image marker in the user
+        // message (the Artist system prompt mentions "[IMAGE:path]" markers
+        // literally — the assertion must target the user segment).
+        let messages = fake.request_messages.lock().unwrap().clone();
+        assert_eq!(messages.len(), 2, "rejected attempt + normal-loop retry");
+        assert!(
+            messages[0].contains("[IMAGE:/tmp/photo.png]"),
+            "first request carried the image"
+        );
+        let retried_user = messages[1]
+            .split('\u{0}')
+            .last()
+            .expect("retried request has a user segment");
+        assert!(
+            !retried_user.contains("[IMAGE:"),
+            "retried user message no longer carries the image"
+        );
+        assert!(
+            retried_user.contains("rejected by the provider's content-inspection check"),
+            "retried user message carries the explanatory phrase"
+        );
+        assert!(
+            retried_user.contains("Input image data may contain inappropriate content."),
+            "phrase embeds the provider reason"
+        );
+
+        // Durable rewrite: the session DB no longer holds the rejected image.
+        let history = crate::session::store().load(agent_id).await;
+        let last_user = history
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::ChatRole::User)
+            .expect("user message exists");
+        assert!(
+            !last_user.content.contains("[IMAGE:"),
+            "rejected image durably removed from the session"
+        );
+        assert!(
+            last_user.content.contains("describe this photo"),
+            "user's accompanying text preserved"
+        );
+        // The user's original text plus the phrase, and NO extra assistant/system
+        // message was injected for the rejection (single phrase inside the
+        // user's own message).
+        assert_eq!(
+            history
+                .iter()
+                .filter(|m| m.role == crate::ChatRole::User)
+                .count(),
+            1,
+            "no separate notification message was added"
+        );
+    }
+
+    /// A text-content rejection with the same provider code ("Input data ..."
+    /// without "image") does not trigger the strip — the run takes the normal
+    /// failure path and the image stays in the session.
+    #[tokio::test]
+    #[serial_test::serial(active_models)] // seeds the process-global catalog caches
+    #[allow(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    async fn text_content_rejection_follows_normal_failure_path() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        seed_empty_catalogs();
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+
+        let agent_id = "e2e_artist_text_reject";
+        let fake = std::sync::Arc::new(FakeProvider::new().err_http(400, TEXT_REJECTION_BODY));
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent_with_role(vec![], crate::Role::Artist);
+        agent.agent_id = agent_id.to_string();
+        let result = agent
+            .work("[IMAGE:/tmp/photo.png] describe this photo", false)
+            .await;
+        assert!(
+            result.is_err(),
+            "text-content rejection must fail the run normally"
+        );
+
+        // No strip: the image marker survives in the session.
+        let history = crate::session::store().load(agent_id).await;
+        let last_user = history
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::ChatRole::User)
+            .expect("user message exists");
+        assert!(
+            last_user.content.contains("[IMAGE:/tmp/photo.png]"),
+            "image untouched on a text-content rejection"
+        );
+    }
+
+    /// After a successful strip, a subsequent failure in the same run does NOT
+    /// re-strip: the most recent user message no longer contains image markers,
+    /// so the normal failure path applies (no repeated stripping, no infinite
+    /// retry loop).
+    #[tokio::test]
+    #[serial_test::serial(active_models)] // seeds the process-global catalog caches
+    #[allow(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    async fn subsequent_failure_after_strip_takes_normal_failure_path() {
+        use crate::util::test::{
+            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+        };
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        seed_empty_catalogs();
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+
+        let agent_id = "e2e_artist_second_failure";
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .err_http(400, IMAGE_REJECTION_BODY)
+                .err_http(400, IMAGE_REJECTION_BODY),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent_with_role(vec![], crate::Role::Artist);
+        agent.agent_id = agent_id.to_string();
+        let result = agent
+            .work("[IMAGE:/tmp/photo.png] describe this photo", false)
+            .await;
+        assert!(
+            result.is_err(),
+            "a second failure after the strip must fail normally"
+        );
+
+        let messages = fake.request_messages.lock().unwrap().clone();
+        assert_eq!(
+            messages.len(),
+            2,
+            "exactly one strip, then the normal failure"
+        );
+        let retried_user = messages[1]
+            .split('\u{0}')
+            .last()
+            .expect("retried request has a user segment");
+        assert!(
+            !retried_user.contains("[IMAGE:"),
+            "retried user message is already stripped"
+        );
+
+        // The message was stripped exactly once (phrase present, no marker).
+        let history = crate::session::store().load(agent_id).await;
+        let last_user = history
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::ChatRole::User)
+            .expect("user message exists");
+        assert!(!last_user.content.contains("[IMAGE:"));
+        assert!(
+            last_user
+                .content
+                .contains("rejected by the provider's content-inspection check"),
+            "phrase present after a single strip"
+        );
     }
 }

@@ -888,6 +888,74 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// Extract a provider error detail string from an error-body JSON value with
+/// a conservative cascade over the envelope fields providers actually use.
+///
+/// Handles both the wrapped shape (`{"error": {...}}` / `{"error": "msg"}`)
+/// and the bare error object (`{"code": ..., "message": ...}`), plus a bare
+/// JSON string. Cascade:
+/// 1. `message` — the standard field (the existing output contract: callers
+///    that previously surfaced `error.message` keep their exact behavior).
+/// 2. `metadata.raw` — OpenRouter forwards the upstream provider's raw error
+///    body here when the top-level message is generic; the raw text is often
+///    itself JSON, whose detail is preferred over the raw text.
+/// 3. `metadata.provider_error_code` — the upstream provider's error code.
+/// 4. `code`, then `type` — bare identifiers when nothing richer exists.
+///
+/// Used by the image-generation and web-search tool error paths (so the full
+/// provider code/message reaches the model even in a nested envelope) and by
+/// the input-image-rejection phrase builder.
+#[must_use]
+pub fn extract_provider_error_detail(error: &serde_json::Value) -> Option<String> {
+    if let serde_json::Value::String(s) = error
+        && !s.trim().is_empty()
+    {
+        return Some(s.clone());
+    }
+
+    // Unwrap a top-level `error` wrapper when present (the common envelope
+    // shape across providers) — the string form is a complete message.
+    match error.get("error") {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => return Some(s.clone()),
+        Some(inner) if !inner.is_null() => {
+            if let Some(detail) = extract_provider_error_detail(inner) {
+                return Some(detail);
+            }
+        }
+        _ => {}
+    }
+
+    let text = |v: Option<&serde_json::Value>| -> Option<String> {
+        v.and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+
+    if let Some(msg) = text(error.get("message")) {
+        return Some(msg);
+    }
+    if let Some(raw) = text(error.get("metadata").and_then(|m| m.get("raw"))) {
+        if let Ok(raw_json) = serde_json::from_str::<serde_json::Value>(&raw)
+            && let Some(detail) = extract_provider_error_detail(&raw_json)
+        {
+            return Some(detail);
+        }
+        return Some(raw);
+    }
+    if let Some(code) = text(
+        error
+            .get("metadata")
+            .and_then(|m| m.get("provider_error_code")),
+    ) {
+        return Some(code);
+    }
+    if let Some(code) = text(error.get("code")) {
+        return Some(code);
+    }
+    text(error.get("type"))
+}
+
 /// True when `path` can be executed: on Unix, a file with at least one
 /// execute bit set (owner, group, or other — `PermissionsExt::mode() &
 /// 0o111`); on Windows, a file with a `.exe` extension (Windows
@@ -1352,6 +1420,118 @@ mod scrub_tests {
         for &(name, input) in CASES {
             assert_eq!(scrub_credentials(input), input, "{name}");
         }
+    }
+}
+
+// ── extract_provider_error_detail tests ─────────────────────────────────
+
+#[cfg(test)]
+mod extract_provider_error_detail_tests {
+    use super::extract_provider_error_detail;
+    use serde_json::json;
+
+    #[test]
+    fn standard_message_field() {
+        // Wrapped envelope — the common shape.
+        let body = json!({"error": {"message": "upstream busy"}});
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("upstream busy")
+        );
+        // Bare object without the `error` wrapper.
+        let body = json!({"message": "bare detail"});
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("bare detail")
+        );
+    }
+
+    #[test]
+    fn string_error_field() {
+        let body = json!({"error": "plain message"});
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("plain message")
+        );
+    }
+
+    #[test]
+    fn nested_envelope_raw_field() {
+        let body = json!({
+            "error": {
+                "code": "data_inspection_failed",
+                "metadata": {"raw": "Input image data may contain inappropriate content."}
+            }
+        });
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("Input image data may contain inappropriate content.")
+        );
+    }
+
+    #[test]
+    fn nested_raw_is_itself_json_preferred() {
+        let body = json!({
+            "error": {
+                "message": "generic",
+                "metadata": {"raw": r#"{"error":{"message":"deep upstream detail"}}"#}
+            }
+        });
+        // `message` exists — it wins (existing output contract).
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("generic")
+        );
+
+        // Without a top-level message, the nested raw JSON's detail wins.
+        let body = json!({
+            "error": {
+                "metadata": {"raw": r#"{"error":{"message":"deep upstream detail"}}"#}
+            }
+        });
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("deep upstream detail")
+        );
+    }
+
+    #[test]
+    fn provider_error_code_field() {
+        let body = json!({
+            "error": {
+                "metadata": {"provider_error_code": "upstream_shared_pool"}
+            }
+        });
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("upstream_shared_pool")
+        );
+    }
+
+    #[test]
+    fn bare_code_then_type_fallbacks() {
+        let body = json!({"error": {"code": "invalid_request_error"}});
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("invalid_request_error")
+        );
+        let body = json!({"error": {"type": "rate_limit_exceeded"}});
+        assert_eq!(
+            extract_provider_error_detail(&body).as_deref(),
+            Some("rate_limit_exceeded")
+        );
+    }
+
+    #[test]
+    fn empty_and_absent_fields_yield_none() {
+        assert_eq!(extract_provider_error_detail(&json!({})), None);
+        assert_eq!(extract_provider_error_detail(&json!({"error": null})), None);
+        assert_eq!(extract_provider_error_detail(&json!({"error": {}})), None);
+        // A blank message is skipped, not surfaced.
+        assert_eq!(
+            extract_provider_error_detail(&json!({"error": {"message": "  "}})),
+            None
+        );
     }
 }
 

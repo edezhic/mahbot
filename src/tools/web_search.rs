@@ -173,7 +173,9 @@ impl WebSearchCache {
 /// JSON error messages when available.
 ///
 /// Both Firecrawl and Exa return structured JSON errors — this reads the
-/// response body, tries to extract an `"error"` field, and bails with a
+/// response body, extracts the error detail (string `error` field or the
+/// nested-envelope cascade — see
+/// [`crate::util::extract_provider_error_detail`]), and bails with a
 /// descriptive message.  Returns the response on success (2xx) so the
 /// caller can continue processing it.
 pub(crate) async fn check_search_error(
@@ -187,13 +189,20 @@ pub(crate) async fn check_search_error(
     let body = crate::util::http::read_error_body(response, "search").await;
 
     // APIs return structured JSON errors — try to extract for a better message.
-    if let Ok(err_resp) = serde_json::from_str::<serde_json::Value>(&body)
-        && let Some(error_msg) = err_resp.get("error").and_then(|e| e.as_str())
-    {
+    if let Some(error_msg) = search_error_detail(&body) {
         anyhow::bail!("search failed: {error_msg}");
     }
 
     anyhow::bail!("search failed with status {status}: {body}");
+}
+
+/// Extract a descriptive error message from a web-search error response body
+/// (string `error` field or the nested-envelope cascade).
+#[must_use]
+fn search_error_detail(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| crate::util::extract_provider_error_detail(&v))
 }
 
 impl WebSearchCache {
@@ -273,6 +282,31 @@ mod tests {
             result.unwrap_err().to_string().contains("either `query`"),
             "Error should mention both args"
         );
+    }
+
+    #[test]
+    fn test_search_error_detail_string_and_nested_envelope() {
+        // String error field (Firecrawl's `{"success": false, "error": "..."}`).
+        assert_eq!(
+            search_error_detail(r#"{"success":false,"error":"upstream down"}"#).as_deref(),
+            Some("upstream down")
+        );
+        // Nested-envelope object error.
+        assert_eq!(
+            search_error_detail(r#"{"error":{"message":"invalid API key"}}"#).as_deref(),
+            Some("invalid API key")
+        );
+        // Nested raw field when no top-level message exists.
+        assert_eq!(
+            search_error_detail(
+                r#"{"error":{"code":"rate_limited","metadata":{"raw":"too many requests"}}}"#
+            )
+            .as_deref(),
+            Some("too many requests")
+        );
+        // Non-JSON body yields no detail (caller falls back to status+body).
+        assert_eq!(search_error_detail("plain text"), None);
+        assert_eq!(search_error_detail(""), None);
     }
 
     #[test]

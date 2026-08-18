@@ -24,7 +24,7 @@ use crate::workspace::truncate_workspace_notes;
 
 use crate::skills;
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
-use crate::{ChatMessage, Role, Workspace};
+use crate::{ChatMessage, ChatRole, Role, Workspace};
 
 /// Coordinates session persistence and prompt building across a single
 /// agent turn.
@@ -64,6 +64,19 @@ pub(crate) enum FinalizeOutcome {
     /// committed state is already durable; the caller decides whether the
     /// no-op is expected (drain) or a genuine anomaly.
     NoUnpersistedTail,
+}
+
+/// Outcome of [`Session::rewrite_last_user_message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewriteOutcome {
+    /// The most recent User-role message was durably rewritten and the
+    /// in-memory history entry swapped.
+    Rewritten,
+    /// The most recent User-role message is in the unpersisted tail
+    /// (index >= `persisted_len`): the positional store UPDATE would target a
+    /// different row, so the rewrite is skipped (conservative no-op — the
+    /// caller keeps the original error path).
+    UnpersistedTailNoop,
 }
 
 impl Session {
@@ -255,6 +268,40 @@ impl Session {
     /// successful persist flushes them in order.
     pub(crate) fn push_messages_unpersisted(&mut self, messages: &[ChatMessage]) {
         self.history.extend_from_slice(messages);
+    }
+
+    /// Durable rewrite of the most recent User-role message: persist the new
+    /// content to the store FIRST, then swap the in-memory history entry.
+    ///
+    /// Ordering invariant: the store write happens before the in-memory swap,
+    /// so a persist failure leaves the in-memory history untouched and the
+    /// caller can fall back to the original error path without a half-stripped
+    /// continuation or a swallowed error.
+    ///
+    /// The store UPDATE targets the last `user`-role row, which corresponds to
+    /// the most recent User-role message **only while that message is within
+    /// the persisted prefix** (`index < persisted_len`) — `history[..persisted_len]`
+    /// mirrors the DB contiguously. A message in the unpersisted tail returns
+    /// [`RewriteOutcome::UnpersistedTailNoop`] instead of corrupting an earlier
+    /// row. The target message is re-derived here (authoritative), not taken
+    /// from the caller.
+    pub(crate) async fn rewrite_last_user_message(
+        &mut self,
+        agent_id: &str,
+        content: String,
+    ) -> Result<RewriteOutcome> {
+        debug_assert!(self.persisted_len <= self.history.len());
+        let Some(idx) = self.history.iter().rposition(|m| m.role == ChatRole::User) else {
+            anyhow::bail!("no user message in history to rewrite");
+        };
+        if idx >= self.persisted_len {
+            return Ok(RewriteOutcome::UnpersistedTailNoop);
+        }
+        crate::session::store()
+            .rewrite_last_user_message(agent_id, &content)
+            .await?;
+        self.history[idx].content = content;
+        Ok(RewriteOutcome::Rewritten)
     }
 
     // ── Summarization — apply summary produced by Agent ─────────────────
@@ -796,5 +843,132 @@ mod tests {
         let merged =
             Session::merge_active_models_snapshot("test_artist_no_merge_baseline", &rendered).await;
         assert_eq!(merged, rendered);
+    }
+
+    // ── rewrite_last_user_message (input-image-rejection strip durability) ─
+
+    #[tokio::test]
+    async fn rewrite_last_user_message_persists_then_swaps() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = "test_rewrite_ok";
+        // The in-memory history must mirror the store (persisted prefix).
+        let seed = vec![
+            ChatMessage::system("role"),
+            ChatMessage::user("[IMAGE:/tmp/a.png] first"),
+            ChatMessage::user("[IMAGE:/tmp/b.png] second"),
+        ];
+        crate::session::store()
+            .batch_append(agent_id, &seed)
+            .await
+            .unwrap();
+        let mut session = Session::default();
+        session.history = seed;
+        session.persisted_len = session.history.len();
+
+        let outcome = session
+            .rewrite_last_user_message(agent_id, "rewritten".to_string())
+            .await
+            .unwrap();
+        assert_eq!(outcome, RewriteOutcome::Rewritten);
+
+        // In-memory swap happened AFTER the durable write.
+        assert_eq!(session.history[2].content, "rewritten");
+        assert_eq!(
+            session.history[1].content, "[IMAGE:/tmp/a.png] first",
+            "earlier user row untouched"
+        );
+
+        // Durable: the store row reflects the rewrite.
+        let msgs = crate::session::store().load(agent_id).await;
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2].content, "rewritten");
+    }
+
+    #[tokio::test]
+    async fn rewrite_last_user_message_unpersisted_tail_is_conservative_noop() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = "test_rewrite_noop";
+        // Seed the DB with one persisted user row.
+        crate::session::store()
+            .batch_append(
+                agent_id,
+                &[ChatMessage::user("[IMAGE:/tmp/a.png] persisted")],
+            )
+            .await
+            .unwrap();
+
+        // The most recent user message lives in the UNPERSISTED tail
+        // (index 1 >= persisted_len 1): a positional UPDATE would rewrite the
+        // persisted row instead — conservative no-op.
+        let mut session = Session::default();
+        session.history = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png] persisted"),
+            ChatMessage::user("[IMAGE:/tmp/b.png] unpersisted"),
+        ];
+        session.persisted_len = 1;
+
+        let outcome = session
+            .rewrite_last_user_message(agent_id, "rewritten".to_string())
+            .await
+            .unwrap();
+        assert_eq!(outcome, RewriteOutcome::UnpersistedTailNoop);
+        assert_eq!(
+            session.history[1].content, "[IMAGE:/tmp/b.png] unpersisted",
+            "in-memory history untouched"
+        );
+
+        // Durable row untouched.
+        let msgs = crate::session::store().load(agent_id).await;
+        assert_eq!(msgs[0].content, "[IMAGE:/tmp/a.png] persisted");
+    }
+
+    #[tokio::test]
+    async fn rewrite_last_user_message_no_user_message_errors() {
+        crate::util::test::init_test_stores().await;
+        let mut session = Session::default();
+        session.history = vec![ChatMessage::system("role")];
+        session.persisted_len = 1;
+        let err = session
+            .rewrite_last_user_message("test_rewrite_err", "x".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no user message"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rewrite_last_user_message_persist_failure_leaves_history_untouched() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = "test_rewrite_persist_fail";
+        // Seed a DIFFERENT agent's row so the sessions table is non-empty:
+        // the positional UPDATE for `agent_id` targets only that agent's last
+        // `user` row — none exists, so the store reports 0 rows affected and
+        // errors.
+        crate::session::store()
+            .batch_append(
+                "other_agent",
+                &[ChatMessage::user("[IMAGE:/tmp/a.png] other")],
+            )
+            .await
+            .unwrap();
+
+        let mut session = Session::default();
+        session.history = vec![
+            ChatMessage::system("role"),
+            ChatMessage::user("[IMAGE:/tmp/a.png] mine"),
+        ];
+        session.persisted_len = 2; // idx 1 < persisted_len → the guard passes
+
+        let err = session
+            .rewrite_last_user_message(agent_id, "rewritten".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no user message row"),
+            "store error propagates: {err}"
+        );
+        assert_eq!(
+            session.history[1].content, "[IMAGE:/tmp/a.png] mine",
+            "in-memory history untouched on persist failure (ordering invariant)"
+        );
     }
 }

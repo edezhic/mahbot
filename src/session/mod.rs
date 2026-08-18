@@ -3,6 +3,7 @@
 pub mod dead_session;
 pub mod manager;
 pub(crate) use manager::FinalizeOutcome;
+pub(crate) use manager::RewriteOutcome;
 pub use manager::Session;
 
 use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
@@ -576,6 +577,36 @@ impl SessionStore {
         self.append_messages(agent_id, messages, true, None).await
     }
 
+    /// Rewrite the content of the most recent `user`-role message row for the
+    /// agent — the durable half of the input-image-rejection strip (see
+    /// [`crate::image_strip`]). A single-row positional UPDATE: the caller's
+    /// in-memory "most recent User-role message" corresponds to this row only
+    /// while that message is within the persisted prefix; the in-memory guard
+    /// lives in [`crate::session::Session::rewrite_last_user_message`].
+    ///
+    /// Returns an error when no `user`-role row exists (0 rows affected), so
+    /// a caller that believes it found one learns the write did not land.
+    pub(crate) async fn rewrite_last_user_message(
+        &self,
+        agent_id: &str,
+        content: &str,
+    ) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        let changed = tx
+            .execute(
+                "UPDATE sessions SET content = ?1 WHERE agent_id = ?2 AND id = (
+                    SELECT MAX(id) FROM sessions WHERE agent_id = ?2 AND role = 'user'
+                )",
+                params![content, agent_id],
+            )
+            .await?;
+        tx.commit().await?;
+        if changed == 0 {
+            anyhow::bail!("no user message row to rewrite for agent {agent_id}");
+        }
+        Ok(())
+    }
+
     pub(crate) async fn delete(&self, agent_id: &str) -> Result<bool> {
         let tx = self.conn.begin_tx().await?;
         let deleted = tx
@@ -1010,6 +1041,78 @@ mod tests {
         let msgs = store().load(&k).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "new");
+    }
+
+    #[tokio::test]
+    async fn session_store_rewrite_last_user_message() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        store()
+            .batch_append(
+                &k,
+                &[
+                    ChatMessage::system("role"),
+                    ChatMessage::user("[IMAGE:/tmp/a.png] first"),
+                    ChatMessage::assistant("answer"),
+                    ChatMessage::user("[IMAGE:/tmp/b.png] second"),
+                ],
+            )
+            .await
+            .unwrap();
+        store()
+            .rewrite_last_user_message(&k, "rewritten")
+            .await
+            .unwrap();
+        let msgs = store().load(&k).await;
+        assert_eq!(msgs[3].role, crate::ChatRole::User);
+        assert_eq!(msgs[3].content, "rewritten", "last user row rewritten");
+        assert_eq!(
+            msgs[1].content, "[IMAGE:/tmp/a.png] first",
+            "earlier user row untouched"
+        );
+        assert_eq!(msgs[2].content, "answer", "assistant row untouched");
+    }
+
+    #[tokio::test]
+    async fn session_store_rewrite_last_user_message_targets_only_user_rows() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        store()
+            .batch_append(
+                &k,
+                &[
+                    ChatMessage::system("role"),
+                    ChatMessage::user("only user"),
+                    ChatMessage::assistant("last row is assistant"),
+                ],
+            )
+            .await
+            .unwrap();
+        store()
+            .rewrite_last_user_message(&k, "rewritten")
+            .await
+            .unwrap();
+        let msgs = store().load(&k).await;
+        assert_eq!(
+            msgs[1].content, "rewritten",
+            "last USER row rewritten, not the trailing assistant row"
+        );
+        assert_eq!(msgs[2].content, "last row is assistant");
+    }
+
+    #[tokio::test]
+    async fn session_store_rewrite_last_user_message_no_user_row_errors() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        store()
+            .batch_append(&k, &[ChatMessage::assistant("only assistant")])
+            .await
+            .unwrap();
+        let err = store()
+            .rewrite_last_user_message(&k, "x")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no user message row"), "{err}");
     }
 
     #[tokio::test]

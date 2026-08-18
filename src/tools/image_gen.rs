@@ -438,6 +438,12 @@ fn build_terminal_message(failures: &[AttemptFailure]) -> String {
 
 /// Map an HTTP status to the typed provider error description, including the
 /// provider's embedded error message when the body is parseable JSON.
+///
+/// The provider detail is extracted with a conservative cascade over the
+/// envelope fields providers actually use (standard `error.message`, then the
+/// nested-envelope fields — `metadata.raw`, `provider_error_code`, `code`,
+/// `type` — see [`crate::util::extract_provider_error_detail`]), so the full
+/// provider code/message reaches the model even when the detail is nested.
 fn describe_http_failure(status: u16, body: &str) -> String {
     let typed = match status {
         400 => "content policy violation or refusal (HTTP 400)".to_string(),
@@ -452,8 +458,7 @@ fn describe_http_failure(status: u16, body: &str) -> String {
     };
     let provider_msg = serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| v.get("error").cloned())
-        .and_then(|e| e.get("message").and_then(|m| m.as_str()).map(String::from));
+        .and_then(|v| crate::util::extract_provider_error_detail(&v));
     match provider_msg {
         Some(msg) => format!("{typed}: {msg}"),
         None => typed,
@@ -1130,6 +1135,31 @@ mod tests {
         let msg = describe_http_failure(504, "plain text");
         assert!(msg.contains("provider timeout (HTTP 504)"));
         assert_eq!(describe_http_failure(418, "{}"), "HTTP 418");
+    }
+
+    #[test]
+    fn test_describe_http_failure_nested_envelope_detail() {
+        // Provider places the detail in a nested envelope field (no top-level
+        // `error.message`) — the full code/message must still reach the model.
+        let msg = describe_http_failure(
+            400,
+            r#"{"error":{"code":"data_inspection_failed","metadata":{"raw":"Input image data may contain inappropriate content."}}}"#,
+        );
+        assert!(msg.contains("content policy violation or refusal (HTTP 400)"));
+        assert!(
+            msg.contains("Input image data may contain inappropriate content."),
+            "nested metadata.raw must surface: {msg}"
+        );
+
+        // Bare code/type fallbacks.
+        let msg = describe_http_failure(
+            400,
+            r#"{"error":{"code":"data_inspection_failed","type":"invalid_request_error"}}"#,
+        );
+        assert!(
+            msg.contains("data_inspection_failed"),
+            "code fallback: {msg}"
+        );
     }
 
     #[test]

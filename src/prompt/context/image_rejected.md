@@ -1,0 +1,1 @@
+The image you attached was rejected by the provider's content-inspection check and could not be sent: {{reason}}. It is unavailable for this response.

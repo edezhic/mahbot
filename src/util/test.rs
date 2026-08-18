@@ -267,6 +267,17 @@ impl FakeProvider {
             )));
         self
     }
+
+    /// Push a scripted non-retryable HTTP failure with a raw provider body,
+    /// formatted exactly like the production `HttpError` display
+    /// (`"{context} API error ({status}): {body}"`), so detection logic that
+    /// scans the error-trail text (e.g. the input-image-rejection strip) sees
+    /// the same shape as a real provider rejection.
+    #[must_use]
+    pub(crate) fn err_http(self, status: u16, body: &str) -> Self {
+        let msg = format!("OpenRouter API error ({status}): {body}");
+        self.err(crate::retry::FailureClass::NonRetryable, &msg)
+    }
 }
 
 #[async_trait::async_trait]
