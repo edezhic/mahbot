@@ -1,6 +1,10 @@
 # MahBot
 
-Mahbot(i.e. __my bot__) is an agentic development environment built for **reliability** and **autonomy**. It treats software work as a managed pipeline, not a chat session: you talk to the **Manager** about intent and scope; specialist agents research, implement, review and test. The Manager creates and refines work on the ticket board and only escalates real product decisions to you. Efficiency comes from **orchestration and process**, not based on the expectation that the current frontier model will one-shot any task. 
+Mahbot(i.e. __my bot__) is an agentic development environment built for **reliability** and **autonomy**. It treats software work as a managed pipeline, not a chat session: you talk to the **Manager** about intent and scope; specialist agents do the actual work. Manager creates and refines tickets on the board, and only escalates real product decisions to you. 
+
+Reliability comes from orchestration and process, not based on the expectation that the current frontier model will one-shot any task. 
+
+Autonomy is achieved using the pipeline - you can request a large amount of work and manager will ensure that every piece is analyzed, implemented, reviewed, tested and commited.
 
 Batteries included:
 - **Smooth native GUI** for the core pipeline management as well as code editor, diff viewer and shell
