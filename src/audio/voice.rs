@@ -196,9 +196,16 @@ const MAX_AUTO_MODEL_RETRY_CYCLES: u32 = 3;
 // ── Phase 3 (owner-negative) enrollment constants ────────────
 
 /// Target VAD-positive speech seconds for Phase 3 owner-negative collection.
-const NEGATIVES_TARGET_SECONDS: usize = 60;
+///
+/// 15 s of real VAD-positive speech is sufficient to collect calibration data
+/// and anti-prototypes while keeping the per-user negative phase short.  The
+/// phase still collects owner-negative chunks for calibration and
+/// anti-prototypes as designed.  The wall-clock timeout ([`PHASE3_TIMEOUT_SECS`])
+/// is unchanged.
+const NEGATIVES_TARGET_SECONDS: usize = 15;
 
-/// Memory cap for owner-negative chunks (~90 s of 16 kHz f32 audio).
+/// Memory cap for owner-negative chunks (~22.5 s of 16 kHz f32 audio).
+/// Auto-derived from [`NEGATIVES_TARGET_SECONDS`] (× 1.5 headroom).
 const MAX_OWNER_NEGATIVE_SAMPLES: usize = SAMPLE_RATE as usize * NEGATIVES_TARGET_SECONDS * 3 / 2;
 
 /// Wall-clock timeout for Phase 3 owner-negative collection.
@@ -763,8 +770,8 @@ pub enum VoiceStatus {
     /// Collecting owner-general speech as negative examples
     /// (Phase 3 enrollment).  `accumulated_secs` is the
     /// VAD-positive speech time collected so far, `target_secs` is the
-    /// target (typically 60), `wall_clock_elapsed` is the wall-clock
-    /// seconds since Phase 3 started.
+    /// target (15 s of VAD-positive speech), `wall_clock_elapsed` is
+    /// the wall-clock seconds since Phase 3 started.
     EnrollingNegatives {
         accumulated_secs: usize,
         target_secs: usize,
@@ -867,7 +874,7 @@ struct VoicePipelineState {
     /// examples.
     negative_audio_chunks: Vec<Vec<f32>>,
     /// Owner-negative audio chunks collected during Phase 3 enrollment.
-    /// ~60 seconds of VAD-positive general speech from the user,
+    /// ~15 seconds of VAD-positive general speech from the user,
     /// stored as audio chunks for embedding extraction at finalization.
     /// Preserved across Full/Soft pipeline resets (same as `negative_audio_chunks`)
     /// but cleared on Cancel (via `reset_enrollment`).
@@ -2533,9 +2540,18 @@ pub(crate) struct PipelineCtx {
     /// to detect chunk boundaries.
     phase3_silence_samples: usize,
     /// Accumulated VAD-positive speech samples collected during Phase 3.
+    /// Monotone 1:1 record of real audio: each VAD-positive hop contributes
+    /// exactly [`HOP_LENGTH`] samples, exactly once (see [`phase3_processed`]).
     /// When `negatives_speech_samples >= SAMPLE_RATE * NEGATIVES_TARGET_SECONDS`,
     /// Phase 3 is complete and the pipeline transitions to finalization.
     negatives_speech_samples: usize,
+    /// Watermark into [`phase3_audio_buf`]: number of samples at the head of
+    /// the buffer already fed to the VAD.  The frame loop resumes at this
+    /// index on the next mic chunk so each hop reaches the stateful VAD
+    /// exactly once.  Without it, an un-drained buffer re-processes (and
+    /// re-counts) every prior frame on each chunk — the quadratic Phase-3
+    /// counter defect (mahbot-1782).
+    phase3_processed: usize,
     /// Wall-clock start time of Phase 3 owner-negative collection.  Used for
     /// timeout — if [`PHASE3_TIMEOUT_SECS`] elapses, finalize with whatever
     /// was collected.
@@ -2613,6 +2629,7 @@ impl PipelineCtx {
             phase3_audio_buf: Vec::new(),
             phase3_silence_samples: 0,
             negatives_speech_samples: 0,
+            phase3_processed: 0,
             phase3_start_time: None,
             vad_threshold: VAD_THRESHOLD,
             enrollment_vad: None,
@@ -2658,6 +2675,7 @@ impl PipelineCtx {
     /// | `audio_buffer`, `command_buffer`, `score_window`, `negative_audio_buf`, `frame_vad`, `frame_raw_audio` | cleared | cleared | cleared |
     /// | `silence_sample_count`, `segment_silence_hops`, `last_score_sample_count` | = 0 | = 0 | = 0 |
     /// | `utterance_had_speech`, `utterance_silence_samples`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `emitted_utterances`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
+    /// | Phase 3 (`collecting_negatives`, `phase3_audio_buf`, `phase3_silence_samples`, `negatives_speech_samples`, `phase3_processed`, `phase3_start_time`) | cleared | cleared | cleared |
     /// | `vad_threshold` | `VAD_THRESHOLD` | preserved | `VAD_THRESHOLD` |
     /// | `enrollment_vad` | `None` | `None` | `None` |
     /// | `last_wake_word_detection` | `None` | preserved | `None` |
@@ -2696,6 +2714,7 @@ impl PipelineCtx {
         self.phase3_audio_buf.clear();
         self.phase3_silence_samples = 0;
         self.negatives_speech_samples = 0;
+        self.phase3_processed = 0;
         self.phase3_start_time = None;
 
         // ── Enrollment VAD detector (cleared by all levels) ──
@@ -3921,8 +3940,15 @@ pub async fn run_voice_pipeline() {
                         "residual",
                     );
                 }
+                // The residual take emptied the buffer: reset the state-machine
+                // indices so a failed finalization (which leaves
+                // collecting_negatives=true until the user retries/cancels)
+                // cannot resume processing against a stale watermark into an
+                // empty buffer.
+                ctx.phase3_processed = 0;
+                ctx.phase3_silence_samples = 0;
 
-                // Cap is ~1.4M at 16kHz, well within f64 mantissa precision.
+                // Cap is ~360k at 16kHz, well within f64 mantissa precision.
                 let collected_secs = {
                     #[allow(clippy::cast_precision_loss)]
                     {
@@ -4712,13 +4738,137 @@ fn push_owner_negative_chunk(chunk: Vec<f32>, label: &str) {
     }
 }
 
+/// Outcome of one [`process_phase3_frames`] pass.
+///
+/// Carries the Phase-3 accumulation state forward (so it survives across mic
+/// chunks) plus any completed speech segments finalized during the pass.
+struct Phase3Progress {
+    /// Post-drain watermark: number of samples at the head of the buffer
+    /// already fed to the VAD (index of the next unprocessed frame start).
+    processed: usize,
+    /// Silence-run accumulator (VAD-negative samples since the last
+    /// VAD-positive frame or chunk boundary).
+    silence_samples: usize,
+    /// Monotone 1:1 VAD-positive speech counter.
+    negatives_speech_samples: usize,
+    /// Completed speech segments finalized this pass (full segments — never
+    /// hop slivers).  The caller decides where they land (production pushes
+    /// them via [`push_owner_negative_chunk`]).
+    completed_chunks: Vec<Vec<f32>>,
+}
+
+/// Process new Phase-3 audio frames against caller-supplied VAD decisions.
+///
+/// Pure Phase-3 frame-processing state machine (mirrors the
+/// [`segment_utterances_by_vad`] testability pattern): all accumulation state
+/// is threaded through explicitly and the VAD decision per hop is injected,
+/// so tests can drive the segmentation deterministically instead of relying
+/// on the stateful earshot neural detector on synthetic audio.
+///
+/// # 1:1 counting guarantee (mahbot-1782 regression)
+///
+/// Frames are processed starting at the `processed` watermark (not at the
+/// buffer head), so each hop reaches the VAD — and the speech counter —
+/// exactly once across mic chunks.  The old code restarted at the buffer head
+/// every call and only drained when a chunk boundary fired, so during
+/// continuous speech every new chunk re-counted all previously buffered
+/// frames (quadratic counter → Phase 3 completed after ~2–4 real seconds).
+///
+/// The counter must stay a monotone 1:1 record of real audio: after the
+/// drain/watermark adjustment it neither re-counts (the original bug) nor
+/// under-counts (which would silently degrade to the 120 s timeout path).
+///
+/// # Segment preservation
+///
+/// The drain is gated on the segment being closed: while no chunk boundary
+/// has fired (`segment_start == 0`, an unfinalized segment open at the buffer
+/// head), no drain runs, so the segment — and the unprocessed VAD-window
+/// overlap — survives across mic chunks intact.  When a boundary fires, the
+/// closed segment is pushed as a chunk and the drain removes everything up to
+/// the boundary, so the next segment starts at the drained buffer head.  The
+/// silence-run accumulator is reset at each chunk boundary so subsequent
+/// chunk pushes stay aligned.
+///
+/// `buf` is the full accumulated audio buffer (the caller extends it with new
+/// mic chunks before each call).  Returns the updated state; `buf` is drained
+/// in place.
+fn process_phase3_frames(
+    buf: &mut Vec<f32>,
+    processed: usize,
+    silence_samples: usize,
+    negatives_speech_samples: usize,
+    mut vad: impl FnMut(&[f32]) -> bool,
+) -> Phase3Progress {
+    let len = buf.len();
+    // Resume at the watermark: everything before it was fed to the VAD in a
+    // previous call and must not be re-counted.
+    let mut consumed = processed;
+    // Segment start is always 0 on entry: a call that closed a segment (a
+    // boundary fired) drained everything up to the boundary, so the next
+    // segment always starts at the drained buffer head.
+    let mut segment_start = 0;
+    let mut silence_samples = silence_samples;
+    let mut negatives_speech_samples = negatives_speech_samples;
+    let mut completed_chunks: Vec<Vec<f32>> = Vec::new();
+
+    while consumed + FRAME_LENGTH <= len {
+        let is_speech = vad(&buf[consumed..consumed + HOP_LENGTH]);
+
+        if is_speech {
+            // 1:1 real-audio accounting: this hop contributes exactly
+            // HOP_LENGTH samples of VAD-positive speech, exactly once.
+            negatives_speech_samples += HOP_LENGTH;
+            // Reset silence counter on any VAD-positive frame.
+            silence_samples = 0;
+        } else {
+            silence_samples += HOP_LENGTH;
+            // Check for chunk boundary: when silence exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES
+            // (aligned to streaming's ~304ms) after sustained speech,
+            // finalize the current segment as a chunk.
+            if silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
+                let chunk_end = consumed.saturating_sub(silence_samples);
+                if chunk_end > segment_start {
+                    completed_chunks.push(buf[segment_start..chunk_end].to_vec());
+                }
+                // Advance segment_start past the silence boundary so the next
+                // segment starts after this silence region.
+                segment_start = consumed;
+                // Reset the silence run at each boundary so subsequent chunk
+                // pushes stay aligned — without the reset the run keeps
+                // growing, `chunk_end` drifts below `segment_start`, and the
+                // next push is delayed/misaligned.
+                silence_samples = 0;
+            }
+        }
+
+        consumed += HOP_LENGTH;
+    }
+
+    // Drain fully processed frames (everything before segment_start) from the
+    // audio buffer, preserving the unfinalized speech segment (and the
+    // unprocessed VAD-window overlap).  Everything drained is either already
+    // pushed as a completed chunk or pure lead-in.  This also closes the
+    // drain window: the next call enters with segment_start = 0 and a new
+    // segment open at the drained buffer head.
+    if segment_start > 0 {
+        buf.drain(..segment_start);
+        consumed -= segment_start;
+    }
+
+    Phase3Progress {
+        processed: consumed,
+        silence_samples,
+        negatives_speech_samples,
+        completed_chunks,
+    }
+}
+
 /// Process incoming audio for Phase 3 owner-negative collection.
 ///
-/// Duplicates the VAD frame iteration pattern from [`handle_enrollment_audio`]
-/// (~12 lines, tagged with `SHARED-VAD-LOOP-BEGIN`/`SHARED-VAD-LOOP-END`).
-/// A closure-based helper is not used because the borrow-checker overhead
-/// outweighs deduplication benefit for two consumers. If a third consumer
-/// emerges, extract into a shared helper.
+/// Extends [`PipelineCtx::phase3_audio_buf`] with the new mic chunk and runs
+/// the pure [`process_phase3_frames`] state machine, feeding each hop to the
+/// Phase-3 VAD (the stateful earshot detector when available, else the global
+/// fallback) exactly once.
 ///
 /// Uses independent buffers (`phase3_audio_buf`, `phase3_silence_samples`)
 /// that are NOT shared with `negative_audio_buf` or `utterance_silence_samples`.
@@ -4736,54 +4886,28 @@ fn push_owner_negative_chunk(chunk: Vec<f32>, label: &str) {
 /// via [`push_owner_negative_chunk`] which enforces the memory cap.
 ///
 /// Updates `negatives_speech_samples` counter with the VAD-positive frames
-/// detected this call.
+/// detected this call (1:1 real-audio accounting — see
+/// [`process_phase3_frames`]).
 fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
-    // ── SHARED-VAD-LOOP-BEGIN: VAD frame iteration (duplicated from handle_enrollment_audio) ──
     ctx.phase3_audio_buf.extend_from_slice(samples);
-    let len = ctx.phase3_audio_buf.len();
-    let mut consumed = 0;
-    // Track the start of the current speech segment within phase3_audio_buf.
-    // When silence is detected, we finalize the speech portion as a chunk.
-    let mut segment_start: usize = 0;
-    while consumed + FRAME_LENGTH <= len {
-        let frame = &ctx.phase3_audio_buf[consumed..consumed + FRAME_LENGTH];
-        let is_speech = if let Some(ref mut det) = ctx.enrollment_vad {
-            is_speech_with_detector(&frame[..HOP_LENGTH], det, ctx.vad_threshold)
-        } else {
-            is_speech_with_threshold(&frame[..HOP_LENGTH], ctx.vad_threshold)
-        };
-        // ── SHARED-VAD-LOOP-END ──
-
-        if is_speech {
-            // Accumulate VAD-positive speech samples for the target counter.
-            ctx.negatives_speech_samples += HOP_LENGTH;
-            // Reset silence counter on any VAD-positive frame.
-            ctx.phase3_silence_samples = 0;
-        } else {
-            ctx.phase3_silence_samples += HOP_LENGTH;
-            // Check for chunk boundary: when silence exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES
-            // (aligned to streaming's ~304ms) after sustained speech,
-            // finalize the current segment as a chunk.
-            if ctx.phase3_silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
-                let chunk_end = consumed.saturating_sub(ctx.phase3_silence_samples);
-                if chunk_end > segment_start {
-                    push_owner_negative_chunk(
-                        ctx.phase3_audio_buf[segment_start..chunk_end].to_vec(),
-                        "speech",
-                    );
-                }
-                // Advance segment_start past the silence boundary so the next
-                // segment starts after this silence region.
-                segment_start = consumed;
+    let progress = process_phase3_frames(
+        &mut ctx.phase3_audio_buf,
+        ctx.phase3_processed,
+        ctx.phase3_silence_samples,
+        ctx.negatives_speech_samples,
+        |hop| {
+            if let Some(ref mut det) = ctx.enrollment_vad {
+                is_speech_with_detector(hop, det, ctx.vad_threshold)
+            } else {
+                is_speech_with_threshold(hop, ctx.vad_threshold)
             }
-        }
-
-        consumed += HOP_LENGTH;
-    }
-    // Drain fully processed frames (everything before segment_start) from the
-    // audio buffer, preserving any partial trailing speech segment or silence.
-    if segment_start > 0 {
-        ctx.phase3_audio_buf.drain(..segment_start);
+        },
+    );
+    ctx.phase3_processed = progress.processed;
+    ctx.phase3_silence_samples = progress.silence_samples;
+    ctx.negatives_speech_samples = progress.negatives_speech_samples;
+    for chunk in progress.completed_chunks {
+        push_owner_negative_chunk(chunk, "speech");
     }
 }
 
@@ -6003,6 +6127,7 @@ mod tests {
         ctx.phase3_audio_buf = vec![0.5; 100];
         ctx.phase3_silence_samples = 500;
         ctx.negatives_speech_samples = 1000;
+        ctx.phase3_processed = 1234;
         ctx.phase3_start_time = Some(Instant::now() - Duration::from_secs(10));
         ctx.vad_threshold = 0.75;
         ctx.last_wake_word_detection = Some(Instant::now() - Duration::from_secs(5));
@@ -6057,6 +6182,10 @@ mod tests {
         assert_eq!(
             ctx.negatives_speech_samples, 0,
             "negatives_speech_samples must be cleared by all reset levels"
+        );
+        assert_eq!(
+            ctx.phase3_processed, 0,
+            "phase3_processed must be cleared by all reset levels"
         );
         assert!(
             ctx.phase3_start_time.is_none(),
@@ -6208,6 +6337,197 @@ mod tests {
                 "last_voice_notice_time lost at {level:?}"
             );
         }
+    }
+
+    // ── Phase 3 owner-negative state machine tests ───────────────────────
+    // Regression tests for mahbot-1782: the Phase-3 speech counter grew
+    // quadratically (un-drained buffers re-counted every prior frame on each
+    // mic chunk), tripping the (then-60 s, now 15 s) target after ~2–4 real
+    // seconds.  The counting path is driven through the pure
+    // [`process_phase3_frames`] with injected VAD decisions — the stateful
+    // earshot neural detector is not deterministic on synthetic audio, so
+    // decisions are supplied directly.
+
+    /// Build an initial `Phase3Progress` for the state-machine tests.
+    fn empty_phase3_progress() -> Phase3Progress {
+        Phase3Progress {
+            processed: 0,
+            silence_samples: 0,
+            negatives_speech_samples: 0,
+            completed_chunks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn phase3_speech_counter_is_1_to_1_and_chunking_invariant() {
+        // 60 mic chunks of 0.5 s of continuous speech (injected all-speech
+        // decisions).  Each hop must be counted exactly once: the counter
+        // equals the real audio duration (minus the trailing partial window,
+        // which is never fed to the VAD), regardless of chunking.
+        const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 2; // 0.5 s
+        const CHUNKS: usize = 60;
+        let total_samples = CHUNK_SAMPLES * CHUNKS; // 480,000
+
+        let mut buf: Vec<f32> = Vec::new();
+        let mut prog = empty_phase3_progress();
+        let mut seen = 0usize;
+        for _ in 0..CHUNKS {
+            buf.extend(std::iter::repeat_n(0.1f32, CHUNK_SAMPLES));
+            prog = process_phase3_frames(
+                &mut buf,
+                prog.processed,
+                prog.silence_samples,
+                prog.negatives_speech_samples,
+                |_| true, // every hop VAD-positive
+            );
+            seen += CHUNK_SAMPLES;
+            // Invariant: the counter never exceeds the real audio duration.
+            assert!(
+                prog.negatives_speech_samples <= seen,
+                "counter {} exceeded real audio {seen}",
+                prog.negatives_speech_samples,
+            );
+            // 1:1 per-call monotone check: in all-speech mode every processed
+            // hop is counted, so the counter must equal the watermark exactly.
+            // The quadratic bug made the counter grow by the WHOLE buffer on
+            // each chunk (counter ≫ processed); an under-count would leave it
+            // behind (counter < processed).
+            assert_eq!(
+                prog.negatives_speech_samples, prog.processed,
+                "counter must track processed hops 1:1 across calls \
+                 (no re-count, no under-count)",
+            );
+        }
+
+        // Each processed hop counted exactly once.
+        let expected =
+            (total_samples.saturating_sub(FRAME_LENGTH)) / HOP_LENGTH * HOP_LENGTH + HOP_LENGTH;
+        assert_eq!(prog.negatives_speech_samples, expected);
+        assert!(prog.negatives_speech_samples <= total_samples);
+
+        // Chunking invariance: the same audio fed in ONE call must yield the
+        // same counter.  The quadratic bug's signature was chunk-count-
+        // dependent growth (each new chunk re-counted all prior frames).
+        let mut one_shot = vec![0.1f32; total_samples];
+        let one_shot_prog = process_phase3_frames(&mut one_shot, 0, 0, 0, |_| true);
+        assert_eq!(
+            one_shot_prog.negatives_speech_samples, prog.negatives_speech_samples,
+            "counter must not depend on mic-chunk boundaries",
+        );
+
+        // Continuous speech produces no chunk boundaries — the unfinalized
+        // segment survives intact (nothing drained, nothing pushed).
+        assert!(prog.completed_chunks.is_empty());
+        assert_eq!(buf.len(), total_samples);
+    }
+
+    #[test]
+    fn phase3_chunks_are_full_speech_segments_across_mic_chunks() {
+        // Deterministic VAD via decision-coded audio: hops of +1.0 are speech,
+        // hops of -1.0 are silence; the injected predicate decodes that.  The
+        // pattern (30 speech / 30 silence / 10 speech hops) is split across
+        // two mic chunks so the chunk boundary AND the unfinalized segment
+        // span calls.
+        let decision = |hop: &[f32]| hop[0] > 0.0;
+        let mut audio: Vec<f32> = Vec::new();
+        for _ in 0..30 {
+            audio.extend(std::iter::repeat_n(1.0f32, HOP_LENGTH));
+        }
+        for _ in 0..30 {
+            audio.extend(std::iter::repeat_n(-1.0f32, HOP_LENGTH));
+        }
+        for _ in 0..10 {
+            audio.extend(std::iter::repeat_n(1.0f32, HOP_LENGTH));
+        }
+
+        // Call 1: speech + the first 10 silence hops (39 full frames — the
+        // silence run is below the boundary threshold, nothing finalized).
+        let split = 40 * HOP_LENGTH;
+        let mut buf = audio[..split].to_vec();
+        let mut prog = process_phase3_frames(&mut buf, 0, 0, 0, decision);
+        assert!(prog.completed_chunks.is_empty());
+        assert_eq!(prog.negatives_speech_samples, 30 * HOP_LENGTH);
+        assert_eq!(prog.silence_samples, 9 * HOP_LENGTH);
+
+        // Call 2: the silence run crosses the threshold mid-call → exactly ONE
+        // completed chunk holding the full first speech segment (29 of the 30
+        // speech hops — the pre-existing boundary formula ends a chunk one hop
+        // before the silence run starts).  A full-length segment, never a hop
+        // sliver truncated by a drain.
+        buf.extend_from_slice(&audio[split..]);
+        prog = process_phase3_frames(
+            &mut buf,
+            prog.processed,
+            prog.silence_samples,
+            prog.negatives_speech_samples,
+            decision,
+        );
+        assert_eq!(prog.completed_chunks.len(), 1);
+        assert_eq!(prog.completed_chunks[0].len(), 29 * HOP_LENGTH);
+
+        // Counter 1:1: hops 0..29 (30) + hops 60..68 (9) = 39 hops, once each.
+        assert_eq!(prog.negatives_speech_samples, 39 * HOP_LENGTH);
+
+        // The unfinalized second segment (speech hops 60..69) survives in the
+        // buffer across the call boundary.
+        assert!(buf.len() >= 10 * HOP_LENGTH);
+
+        // Feed a few silence hops so the final speech hop is processed too —
+        // and prove the continued silence after a boundary pushes nothing
+        // (the silence-run reset fix: the boundary fires once per run, not on
+        // every silent hop).
+        for _ in 0..4 {
+            buf.extend(std::iter::repeat_n(-1.0f32, HOP_LENGTH));
+        }
+        prog = process_phase3_frames(
+            &mut buf,
+            prog.processed,
+            prog.silence_samples,
+            prog.negatives_speech_samples,
+            decision,
+        );
+        assert_eq!(prog.negatives_speech_samples, 40 * HOP_LENGTH);
+        assert!(
+            prog.completed_chunks.is_empty(),
+            "continued silence must not push spurious chunks",
+        );
+    }
+
+    #[test]
+    fn phase3_negative_collection_audio_counts_1_to_1_through_pipeline() {
+        // End-to-end regression through the production entry point.  Force
+        // the stateful earshot detector to report speech on every hop by
+        // setting the threshold below its documented [0,1] score range — the
+        // ticket-sanctioned threshold trick.  The same audio fed in 0.5 s
+        // chunks must count 1:1 (each hop fed exactly once) and must be
+        // chunking-invariant through the full ctx write-back path.
+        let mut ctx = PipelineCtx::new();
+        ctx.enrollment_vad = Some(earshot::Detector::default());
+        ctx.vad_threshold = -1.0;
+
+        const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 2; // 0.5 s
+        let chunk = vec![0.1f32; CHUNK_SAMPLES];
+        for _ in 0..10 {
+            handle_negative_collection_audio(&chunk, &mut ctx);
+        }
+        let total = 10 * CHUNK_SAMPLES;
+        let expected = (total.saturating_sub(FRAME_LENGTH)) / HOP_LENGTH * HOP_LENGTH + HOP_LENGTH;
+        assert_eq!(ctx.negatives_speech_samples, expected);
+        assert!(ctx.negatives_speech_samples <= total);
+
+        // Chunking invariance through the production path: one 5 s call must
+        // land on the same counter as ten 0.5 s calls.
+        let mut ctx2 = PipelineCtx::new();
+        ctx2.enrollment_vad = Some(earshot::Detector::default());
+        ctx2.vad_threshold = -1.0;
+        let big = vec![0.1f32; total];
+        handle_negative_collection_audio(&big, &mut ctx2);
+        assert_eq!(ctx2.negatives_speech_samples, ctx.negatives_speech_samples);
+
+        // Continuous speech never hits a chunk boundary — nothing pushed, and
+        // the unfinalized segment survives intact (no drain).
+        assert_eq!(ctx.phase3_audio_buf.len(), total);
+        assert!(ctx.phase3_audio_buf.iter().all(|&s| s == 0.1));
     }
 
     // ── handle_segment_boundary tests ───────────────────────────────────
