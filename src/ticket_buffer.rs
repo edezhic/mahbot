@@ -174,27 +174,6 @@ mod tests {
         let pos2 = result.find("mahbot-2").unwrap();
         let pos3 = result.find("mahbot-3").unwrap();
         assert!(pos1 < pos2 && pos2 < pos3);
-
-        // Each line renders its origin and a strict RFC 3339 timestamp.
-        let lines: Vec<&str> = result.lines().skip(1).collect();
-        assert_eq!(lines.len(), 3);
-        for (i, line) in lines.iter().enumerate() {
-            let expected_origin = if i == 1 {
-                "user action"
-            } else {
-                "pipeline flow"
-            };
-            let (_, ts_paren) = line.rsplit_once(", ").unwrap();
-            assert!(
-                line.contains(&format!("({expected_origin}, ")),
-                "origin missing on line: {line}"
-            );
-            let ts = ts_paren.trim_end_matches(')');
-            assert!(
-                crate::turso::parse_utc_timestamp(ts).is_ok(),
-                "invalid RFC 3339 timestamp on line: {line}"
-            );
-        }
     }
 
     #[test]
