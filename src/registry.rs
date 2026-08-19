@@ -45,12 +45,25 @@ pub enum ParentKey {
 }
 
 /// One tool currently executing inside a running agent — the live
-/// instrumentation shown on the Running Agents page. `args` is
-/// credential-scrubbed and truncated to a bounded length at registration.
+/// instrumentation shown on the Running Agents page.
+///
+/// `args` holds the tool's arguments as STRUCTURED key-value pairs with FULL,
+/// untruncated values, deliberately NOT credential-scrubbed: the Running
+/// Agents view shows exactly what the agent passed to the tool, including any
+/// secrets (the user wants complete visibility). This is a live-view-only
+/// divergence — durable logs (tool-call stats) and failure feedback remain
+/// scrubbed.
+///
+/// Pairs are derived from the JSON argument object at registration (keys in
+/// the object's iteration order): string values are taken verbatim, nested
+/// objects/arrays/scalars are compact-JSON-stringified. Non-object arguments
+/// (bare strings/arrays/null) collapse to a single `("args", …)` pair. The
+/// row view truncates values at display time; the hover tooltip shows
+/// everything untruncated.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunningTool {
     pub name: String,
-    pub args: String,
+    pub args: Vec<(String, String)>,
 }
 
 /// Public handle returned by `list()` — serializable, no cancel_token exposed.
@@ -150,6 +163,31 @@ impl RunningToolEntry {
     }
 }
 
+/// Flatten a tool's JSON arguments into structured key-value display pairs.
+///
+/// Object arguments become one pair per key (keys in the object's iteration
+/// order); anything else (bare strings, arrays, scalars, null) collapses to a
+/// single `("args", …)` pair. Values are full and unscrubbed — see
+/// [`RunningTool`].
+fn tool_arg_pairs(args: &serde_json::Value) -> Vec<(String, String)> {
+    match args {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| (k.clone(), json_value_to_display_string(v)))
+            .collect(),
+        other => vec![("args".to_string(), json_value_to_display_string(other))],
+    }
+}
+
+/// Render one JSON argument value as a display string: string values verbatim,
+/// everything else (nested objects/arrays/scalars) as compact JSON.
+fn json_value_to_display_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
 #[derive(Default)]
 pub struct AgentRegistry {
     inner: Mutex<HashMap<String, AgentEntry>>,
@@ -229,9 +267,7 @@ impl AgentRegistry {
         args: &serde_json::Value,
     ) -> RunningToolGuard {
         let tool_id = NEXT_TOOL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let args_str = serde_json::to_string(args).unwrap_or_default();
-        let args_scrubbed = crate::util::scrub_credentials(&args_str);
-        let args = crate::util::truncate_bytes(&args_scrubbed, MAX_LIVE_ARG_LENGTH).to_string();
+        let args = tool_arg_pairs(args);
         {
             let mut map = self.inner.lock().unwrap_poison();
             if let Some(entry) = map.get_mut(agent_id)
@@ -432,12 +468,6 @@ impl AgentRegistry {
     }
 }
 
-/// Maximum length of the serialized arguments stored in the live tool
-/// instrumentation (Running Agents page). Longer arguments are truncated at a
-/// UTF-8-safe boundary. Credentials are scrubbed BEFORE truncation so the
-/// visible window never leaks a secret that truncation would otherwise hide.
-const MAX_LIVE_ARG_LENGTH: usize = 200;
-
 /// RAII guard: removes its tool instance from the agent's live tools on drop.
 ///
 /// Creation is generation-gated (the entry is only mutated when the agent's
@@ -518,7 +548,12 @@ mod tests {
                 .expect("agent registered");
             assert_eq!(h.current_tools.len(), 1);
             assert_eq!(h.current_tools[0].name, "read");
-            assert!(h.current_tools[0].args.contains("file.rs"));
+            assert!(
+                h.current_tools[0]
+                    .args
+                    .iter()
+                    .any(|(k, v)| k == "path" && v == "/tmp/ws/file.rs")
+            );
             drop(guard);
         }
         let handles = AGENT_REGISTRY.list();
@@ -665,29 +700,32 @@ mod tests {
     }
 
     #[test]
-    fn tool_args_are_credential_scrubbed_and_bounded() {
-        let agent_id = format!("tool_scrub_{}", crate::generate_suffix());
+    fn tool_args_are_full_and_structured() {
+        let agent_id = format!("tool_full_{}", crate::generate_suffix());
         let generation = register_test_agent(&agent_id, "/tmp/ws");
         let secret = format!("token-{}", crate::generate_suffix());
-        let long_args = serde_json::json!({
-            "command": format!("echo {}", "a".repeat(1000)),
+        let long_command = format!("echo {}", "a".repeat(1000));
+        let args = serde_json::json!({
+            "command": long_command,
             "api_key": secret,
         });
-        let guard = AGENT_REGISTRY.tool_started(&agent_id, generation, "shell", &long_args);
+        let guard = AGENT_REGISTRY.tool_started(&agent_id, generation, "shell", &args);
         let handles = AGENT_REGISTRY.list();
         let h = handles
             .iter()
             .find(|h| h.agent_id == agent_id)
             .expect("agent registered");
         assert_eq!(h.current_tools.len(), 1);
+        let pairs = &h.current_tools[0].args;
         assert!(
-            !h.current_tools[0].args.contains(&secret),
-            "credentials must never leak into the live view"
+            pairs.iter().any(|(k, v)| k == "api_key" && v == &secret),
+            "live view shows full unscrubbed values (deliberate divergence from durable logs)"
         );
         assert!(
-            h.current_tools[0].args.len() <= MAX_LIVE_ARG_LENGTH + 16,
-            "args must be bounded: {}",
-            h.current_tools[0].args.len()
+            pairs
+                .iter()
+                .any(|(k, v)| k == "command" && v == &long_command),
+            "values are not truncated at registration"
         );
         drop(guard);
         AGENT_REGISTRY.deregister(&agent_id, generation);
@@ -751,7 +789,11 @@ mod tests {
             .as_ref()
             .expect("completed tool kept as last_tool");
         assert_eq!(last.name, "read");
-        assert!(last.args.contains("a.rs"));
+        assert!(
+            last.args
+                .iter()
+                .any(|(k, v)| k == "path" && v == "/tmp/ws/a.rs")
+        );
         // A second completion replaces the first.
         {
             let guard = AGENT_REGISTRY.tool_started(

@@ -14,13 +14,18 @@
 //! - An agent not executing a tool (in an LLM call, between rounds) shows its
 //!   last COMPLETED tool instead of nothing — a fast tool no longer flashes
 //!   and vanishes (deliberate override of the strict absence-is-honest rule
-//!   for tools; the last-tool badge is a historical marker, always labeled by
+//!   for tools; the last-tool block is a historical marker, always labeled by
 //!   its tool name, so it cannot be mistaken for live activity).
 //! - Parallel tool execution is represented honestly: every tool that
-//!   actually started executing appears as its own badge; tools that never
+//!   actually started executing appears as its own tool block; tools that never
 //!   execute (unknown tool, pre-flight cancellation) never show.
 //! - The instrumentation is purely observational — it never affects
 //!   shutdown/drain logic and gains no cancellation semantics.
+//! - The live view shows tool arguments EXACTLY as the agent passed them —
+//!   including any secrets. This is a deliberate, documented divergence from
+//!   the durable logs (tool-call stats, failure feedback), which remain
+//!   credential-scrubbed: the live view is transient and exists for full
+//!   visibility of what the agent is doing.
 //!
 //! The page is DB-free by design: everything it shows is derived from the
 //! live in-memory registries, plus the dashboard's registered-workspace map
@@ -34,7 +39,7 @@ use crate::gui::widgets;
 use crate::registry::{AgentHandle, ParentKey};
 use chrono::{DateTime, Utc};
 
-use iced::widget::{Column, Row, Space, column, container, row, scrollable, text};
+use iced::widget::{Column, Row, Space, column, container, row, scrollable, text, tooltip};
 use iced::{Alignment, Element, Length};
 
 use iced_fonts::lucide;
@@ -45,10 +50,19 @@ use super::{Message, WorkspaceInfo};
 /// label (the question/task text). Truncated at a char boundary with "…".
 const MAX_GROUP_LABEL_CHARS: usize = 80;
 
-/// Maximum display length (Unicode chars) of a tool badge (name + args).
-/// The registration-side cap ([`crate::registry::MAX_LIVE_ARG_LENGTH`]) bounds
-/// what is stored; this is the shorter display-level bound.
-const MAX_TOOL_BADGE_CHARS: usize = 72;
+/// Maximum display length (Unicode chars) of a single argument VALUE in the
+/// row's comma-separated key-value pairs line. The hover tooltip always shows
+/// the full untruncated value.
+const MAX_TOOL_VALUE_CHARS: usize = 20;
+
+/// Maximum display length (Unicode chars) of the whole key-value pairs line
+/// in the row (values already truncated per [`MAX_TOOL_VALUE_CHARS`]). Cut at
+/// a pair boundary with a trailing "…" so the line can never overflow into
+/// the right-aligned metrics (iced rows do not wrap).
+const MAX_TOOL_PAIRS_LINE_CHARS: usize = 80;
+
+/// Maximum width (px) of the hover tooltip content; long values wrap within it.
+const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
 
 /// Render the live running-agents page.
 ///
@@ -482,9 +496,33 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, Message> {
     // background, versus the old ~2:1 muted tone).
     let elapsed = format_elapsed(h.started_at);
 
-    // First row: role icon on the left; the session length (when known) and
-    // elapsed time as small secondary metrics on the right.
-    let mut first_row = row![icon, Space::new().width(Length::Fill)]
+    // Fill slot between the icon and the right-aligned metrics: running tools
+    // if any, else the live activity phase, else the LAST COMPLETED tool — a
+    // fast tool no longer flashes and vanishes. Each tool renders as its own
+    // block (bold white name + truncated key-value pairs) wrapped in a hover
+    // tooltip showing the full untruncated args; the activity label is plain
+    // accent text with no tooltip.
+    let mut fill = Column::new().spacing(4).align_x(Alignment::Start);
+    for tool in &h.current_tools {
+        fill = fill.push(render_tool_block(tool));
+    }
+    if h.current_tools.is_empty() {
+        // Activity indicator — a non-tool LLM phase (verdict/summary
+        // extraction, media transcription) running inside this agent. The
+        // agent card is the single tracker for these calls (no separate call
+        // rows are ever created), so the label is what keeps an
+        // extracting/transcribing agent from looking idle.
+        if let Some(activity) = &h.activity {
+            fill = fill.push(text(activity.clone()).size(11).color(theme::ACCENT));
+        } else if let Some(last) = &h.last_tool {
+            fill = fill.push(render_tool_block(last));
+        }
+    }
+
+    // Single row: role icon on the left; the tool/activity/last-tool display
+    // fills the middle; the session length (when known) and elapsed time sit
+    // right-aligned.
+    let mut first_row = row![icon, fill.width(Length::Fill)]
         .spacing(8)
         .align_y(Alignment::Center);
     if let Some(len) = h.session_tokens {
@@ -496,58 +534,106 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, Message> {
     }
     first_row = first_row.push(text(elapsed).size(11).color(theme::TEXT_SECONDARY));
 
-    // Badge row: running tools if any, else the live activity phase, else the
-    // LAST COMPLETED tool — a fast tool no longer flashes and vanishes. Tool
-    // badges have no pill background; the text stays readable and overly long
-    // arguments are truncated.
-    let mut badge_row: Row<'static, Message> = Row::new().spacing(6);
-    let mut has_badges = false;
-    for tool in &h.current_tools {
-        badge_row = badge_row.push(render_tool_badge(tool));
-        has_badges = true;
-    }
-    if h.current_tools.is_empty() {
-        // Activity indicator — a non-tool LLM phase (verdict/summary
-        // extraction, media transcription) running inside this agent. The
-        // agent card is the single tracker for these calls (no separate call
-        // rows are ever created), so the badge is what keeps an
-        // extracting/transcribing agent from looking idle.
-        if let Some(activity) = &h.activity {
-            let badge: Element<'static, Message> =
-                text(activity.clone()).size(11).color(theme::ACCENT).into();
-            badge_row = badge_row.push(badge);
-            has_badges = true;
-        } else if let Some(last) = &h.last_tool {
-            badge_row = badge_row.push(render_tool_badge(last));
-            has_badges = true;
-        }
-    }
-
-    let mut col = Column::new().spacing(4);
-    col = col.push(first_row);
-    if has_badges {
-        col = col.push(badge_row);
-    }
-
-    container(col)
+    container(first_row)
         .width(Length::Fill)
         .padding(8)
         .style(theme::surface_card_style)
         .into()
 }
 
-/// Render one tool badge: plain tool text (no pill background), readable
-/// accent color, arguments truncated at the display bound.
-fn render_tool_badge(tool: &crate::registry::RunningTool) -> Element<'static, Message> {
-    let label = if tool.args.is_empty() {
-        tool.name.clone()
+/// Render one tool block: bold white tool name on top, the comma-separated
+/// key-value pairs below it in regular weight. The whole block is the hover
+/// target of a tooltip showing the FULL untruncated argument values.
+fn render_tool_block(tool: &crate::registry::RunningTool) -> Element<'static, Message> {
+    let mut block = Column::new().spacing(2).align_x(Alignment::Start).push(
+        text(tool.name.clone())
+            .size(11)
+            .font(theme::FONT_BOLD)
+            .color(theme::TEXT_PRIMARY),
+    );
+    if !tool.args.is_empty() {
+        block = block.push(
+            text(render_tool_pairs_line(&tool.args))
+                .size(11)
+                .color(theme::TEXT_SECONDARY),
+        );
+    }
+    tooltip(block, render_tool_tooltip(tool), tooltip::Position::Top)
+        .gap(4)
+        .style(theme::tooltip_style)
+        .into()
+}
+
+/// Render the row's key-value pairs line: `name: value` pairs, comma-
+/// separated, each value collapsed to a single line and truncated to
+/// [`MAX_TOOL_VALUE_CHARS`] chars. The whole line is capped at
+/// [`MAX_TOOL_PAIRS_LINE_CHARS`] chars, cut at a pair boundary with "…" —
+/// it can never overflow into the right-aligned metrics.
+fn render_tool_pairs_line(pairs: &[(String, String)]) -> String {
+    let rendered: Vec<String> = pairs
+        .iter()
+        .map(|(k, v)| format!("{k}: {}", value_display(v)))
+        .collect();
+    let joined = rendered.join(", ");
+    if joined.chars().count() <= MAX_TOOL_PAIRS_LINE_CHARS {
+        return joined;
+    }
+    // Over budget: keep whole pairs while they fit (leaving room for the
+    // trailing "…"), then mark the cut.
+    let mut out = String::new();
+    for pair in &rendered {
+        let sep = if out.is_empty() { "" } else { ", " };
+        let candidate_len = out.chars().count() + sep.chars().count() + pair.chars().count();
+        if candidate_len + 1 > MAX_TOOL_PAIRS_LINE_CHARS {
+            break;
+        }
+        out.push_str(sep);
+        out.push_str(pair);
+    }
+    if out.is_empty() {
+        // Even the first pair alone does not fit — hard-truncate it.
+        crate::util::truncate(&rendered[0], MAX_TOOL_PAIRS_LINE_CHARS)
     } else {
-        crate::util::truncate(
-            &format!("{} {}", tool.name, tool.args),
-            MAX_TOOL_BADGE_CHARS,
-        )
-    };
-    text(label).size(11).color(theme::ACCENT).into()
+        format!("{out}…")
+    }
+}
+
+/// Single-line display form of a value: control characters (newlines, tabs)
+/// collapsed to spaces, then truncated to [`MAX_TOOL_VALUE_CHARS`] chars with
+/// "…" when cut.
+fn value_display(value: &str) -> String {
+    let single_line: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    crate::util::truncate(&single_line, MAX_TOOL_VALUE_CHARS)
+}
+
+/// Render the hover tooltip: the tool name header (bold white) followed by
+/// every argument pair on its own line, sorted by FULL value length ascending
+/// (stable, so equal-length pairs keep registration order) — the shortest
+/// pairs sit at the top and stay visible even when the longest values extend
+/// beyond the viewport. Values are full and untruncated, including secrets.
+fn render_tool_tooltip(tool: &crate::registry::RunningTool) -> Element<'static, Message> {
+    let mut pairs = tool.args.clone();
+    pairs.sort_by_key(|(_, v)| v.chars().count());
+
+    let mut content = Column::new().spacing(2).push(
+        text(tool.name.clone())
+            .size(11)
+            .font(theme::FONT_BOLD)
+            .color(theme::TEXT_PRIMARY),
+    );
+    for (k, v) in &pairs {
+        content = content.push(
+            text(format!("{k}: {v}"))
+                .size(11)
+                .font(super::JETBRAINS_MONO)
+                .color(theme::TEXT_SECONDARY)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        );
+    }
+    container(content).max_width(MAX_TOOL_TOOLTIP_WIDTH).into()
 }
 
 /// Render a compact non-agent LLM call row: zap marker + purpose + elapsed.
