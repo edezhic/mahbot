@@ -1,4 +1,4 @@
-Transition an existing ticket to a new phase. Requires the ticket `ticket_id`, which you can obtain from the output of create_ticket or list_tickets. The `ticket_id` may be a bare number (e.g. `123`) or the fully prefixed form (e.g. `mahbot-123`); only tickets from the current workspace can be updated. The valid phases for manual transitions are:
+Transition an existing ticket to a new phase. Requires the ticket `ticket_id`, which you can obtain from the output of create_ticket or list_tickets. The `ticket_id` may be a bare number (e.g. `123`) or the fully prefixed form (e.g. `workspace-123`). The valid phases for manual transitions are:
 
 - **backlog** — return the ticket to the start (analysts will re-evaluate it)
 - **planning** — paused state awaiting further decision whether to proceed with the ticket or cancel it

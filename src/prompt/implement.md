@@ -1,1 +1,1 @@
-Implement the ticket described in the system prompt. You don't need to discuss or plan it any further, but you should consider analysts' comments and reviewers/QAs feedback comments if any.
+The ticket in your system prompt has been confirmed and approved, you should now proceed figuring out the optimal design for the solution and it's implementation.
