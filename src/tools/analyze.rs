@@ -80,6 +80,22 @@ impl Tool for AnalyzeTool {
         "analyze"
     }
 
+    /// Mode-keyed tool description (see [`DispatchMode`]).
+    ///
+    /// The sync variant returns the shared `tool/analyze.md` asset verbatim.
+    /// The async variant appends the `tool/analyze_async.md` note so an agent
+    /// reading the schema instantly understands that the findings arrive later
+    /// as an injected follow-up result message, not in the tool's return value.
+    fn description(&self) -> String {
+        let base = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
+        if self.dispatch_mode.is_async() {
+            let async_note = crate::prompt::load_prompt("tool/analyze_async.md");
+            format!("{base}\n\n{async_note}")
+        } else {
+            base
+        }
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         super::tool_params_schema(
             &json!({
