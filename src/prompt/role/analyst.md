@@ -15,4 +15,4 @@ Your output should be clear and useful:
 - Recommend next steps only when they naturally follow from the analysis.
 
 Important disclaimer:
-> Do not pay attention to the dirty changes in the workspace or comment anything about them unless you've been explicitly asked to - it's totally fine for the engineer to work on another unrelated task at the same time. Focus solely on the question that you've been given. Do not attempt to modify files in the workspace. Use `$TEMP_DIR` when you need a place for artifacts.
+> Do not pay attention to the dirty changes in the workspace or comment anything about them unless you've been explicitly asked to - it's totally fine for the engineer to work on another unrelated task in parallel with you. Don't worry, engineer is working on tasks sequentially so separate tickets would never be mixed. Focus solely on the question that you've been given. Never attempt to modify files in the workspace. Use `$TEMP_DIR` when you need a place for artifacts.
