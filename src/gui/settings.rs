@@ -264,7 +264,7 @@ pub enum SettingsMessage {
     /// A config field value has settled and should be persisted now.
     ///
     /// `field` is the canonical field id (`config:<key>`,
-    /// `role_model:<role>`, `role_reasoning:<role>`,
+    /// `role_model:<role>`,
     /// `routing_order:<model>`, `routing_allow:<model>`). `generation` is the
     /// generation counter captured when the value was staged; a settle whose
     /// generation no longer matches the current counter is stale and dropped,
@@ -293,10 +293,6 @@ pub enum SettingsMessage {
     RoleModel {
         role: String,
         model: String,
-    },
-    RoleReasoning {
-        role: String,
-        effort: String,
     },
     /// Per-model provider routing edits
     ModelRoutingOrder {
@@ -383,8 +379,6 @@ pub enum SettingsMessage {
 }
 
 // ── State ────────────────────────────────────────────────────────
-
-const REASONING_EFFORT_OPTIONS: &[&str] = &["xhigh", "high", "medium", "low", "minimal"];
 
 /// Debounce delay for text inputs: a change is persisted only when the value
 /// has settled (typing paused this long), or immediately on Enter.
@@ -646,8 +640,8 @@ impl SettingsState {
     ///
     /// Only text-style fields reach this path: `ConfigFieldSettleNow` is
     /// dispatched by the Enter/submit and slider-release handlers, and
-    /// discrete controls (`role_reasoning:`, `routing_allow:`) settle with
-    /// their value passed directly to [`Self::settle_now`] instead.
+    /// discrete controls (`routing_allow:`) settle with their value passed
+    /// directly to [`Self::settle_now`] instead.
     fn staged_value(&self, field: &str) -> Option<String> {
         if let Some(key) = field.strip_prefix("config:") {
             return self
@@ -715,7 +709,7 @@ impl SettingsState {
     ///
     /// Only the column whose persist just completed (or failed) is written —
     /// a sibling column may hold a staged-but-unsettled edit (e.g. a model
-    /// typed while a reasoning click's persist is in flight) and must not be
+    /// typed while a routing toggle's persist is in flight) and must not be
     /// clobbered by a whole-row mirror. `value` is the canonical persisted
     /// value for the field's own column; when `None` (a failed persist
     /// rolling back a discrete control) the column is read back from CONFIG,
@@ -732,18 +726,6 @@ impl SettingsState {
             });
             RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
                 c.model = model;
-            });
-            self.drop_role_row_if_cleared(role);
-            return;
-        }
-        if let Some(role) = field.strip_prefix("role_reasoning:") {
-            let effort = value.and_then(crate::config::trimmed_or_none).or_else(|| {
-                crate::config::CONFIG
-                    .role_config_by_key(role)
-                    .and_then(|rc| rc.reasoning_effort)
-            });
-            RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
-                c.reasoning_effort = effort;
             });
             self.drop_role_row_if_cleared(role);
             return;
@@ -827,12 +809,11 @@ impl SettingsState {
 
     /// Whether a failed persist should roll the control back to the last
     /// persisted value. Discrete-state controls (toggles, pick lists, the
-    /// slider, per-role effort buttons, routing fallback toggles, and the
-    /// model pickers' optimistic active/list markers) revert; free-text
-    /// inputs keep the typed value so the user can correct it.
+    /// slider, routing fallback toggles, and the model pickers' optimistic
+    /// active/list markers) revert; free-text inputs keep the typed value so
+    /// the user can correct it.
     fn field_reverts_on_error(field: &str) -> bool {
-        field.starts_with("role_reasoning:")
-            || field.starts_with("routing_allow:")
+        field.starts_with("routing_allow:")
             || matches!(
                 field,
                 "config:audio_transcription_use_local"
@@ -1013,15 +994,6 @@ impl SettingsState {
                         generation: g,
                     },
                 )
-            }
-            SettingsMessage::RoleReasoning { role, effort } => {
-                let field = format!("role_reasoning:{role}");
-                self.field_errors.remove(&field);
-                let effort_opt = Some(effort.clone()).filter(|s| !s.is_empty());
-                RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
-                    c.reasoning_effort = effort_opt;
-                });
-                self.settle_now(&field, effort)
             }
             SettingsMessage::ModelRoutingOrder { model, order } => {
                 let field = format!("routing_order:{model}");
@@ -1397,8 +1369,6 @@ impl SettingsState {
             self.provider_section(),
             Space::new().height(16),
             self.models_section(),
-            Space::new().height(16),
-            self.reasoning_section(),
             Space::new().height(16),
             self.routing_section(),
             Space::new().height(16),
@@ -2518,46 +2488,6 @@ impl SettingsState {
         section("Models (per-role)", Column::from_iter(rows))
     }
 
-    fn reasoning_section(&self) -> Element<'_, SettingsMessage> {
-        let rows = Role::iter().map(|role| {
-            let key: &str = role.into();
-            let info = crate::role::role_info(&role);
-            let label = info.display_label;
-            let default = info.default_reasoning_effort;
-            let current = self
-                .role_config_for(key)
-                .and_then(|rc| rc.reasoning_effort.clone())
-                .unwrap_or_else(|| default.to_string());
-            let effort_buttons = Row::from_iter(REASONING_EFFORT_OPTIONS.iter().map(move |&opt| {
-                let is_active = current == opt;
-                let mut btn = button(text(opt).size(11)).padding(2);
-                if is_active {
-                    btn = btn.style(theme::button_primary);
-                } else {
-                    btn = btn.style(theme::button_secondary);
-                }
-                btn = btn.on_press(SettingsMessage::RoleReasoning {
-                    role: key.to_string(),
-                    effort: opt.to_string(),
-                });
-                row![
-                    {
-                        let btn_elem: Element<_> = btn.into();
-                        btn_elem
-                    },
-                    Space::new().width(4),
-                ]
-                .into()
-            }));
-            let error = self
-                .field_errors
-                .get(&format!("role_reasoning:{key}"))
-                .map(String::as_str);
-            field_row_with_error(label, effort_buttons.into(), None, error)
-        });
-        section("Reasoning Effort (per-role)", Column::from_iter(rows))
-    }
-
     fn transcription_section(&self) -> Element<'_, SettingsMessage> {
         let local_enabled = self.config.audio_transcription_use_local.as_deref() != Some("false");
 
@@ -3453,7 +3383,7 @@ fn delete_confirm_button<'a>(
 ///
 /// Field ids (see [`SettingsMessage::ConfigFieldSettled`]):
 /// - `config:<key>` — string config fields
-/// - `role_model:<role>` / `role_reasoning:<role>` — per-role rows
+/// - `role_model:<role>` — per-role rows
 /// - `routing_order:<model>` / `routing_allow:<model>` — per-model rows
 ///
 /// Returns the canonical persisted value.
@@ -3463,9 +3393,6 @@ async fn persist_settled_field(field: &str, value: &str) -> anyhow::Result<Strin
     }
     if let Some(role) = field.strip_prefix("role_model:") {
         return crate::config::persist_settled_role_model(role, value).await;
-    }
-    if let Some(role) = field.strip_prefix("role_reasoning:") {
-        return crate::config::persist_settled_role_reasoning(role, value).await;
     }
     if let Some(model) = field.strip_prefix("routing_order:") {
         return crate::config::persist_settled_routing_order(model, value).await;
@@ -4280,19 +4207,8 @@ mod tests {
     }
 
     #[test]
-    fn per_role_reasoning_click_arms_immediate_settle_and_role_model_debounces() {
+    fn role_model_keystroke_arms_debounced_settle() {
         let mut state = SettingsState::new();
-
-        // Role reasoning is a discrete button → immediate settle.
-        let _task = state.update(SettingsMessage::RoleReasoning {
-            role: "engineer".to_string(),
-            effort: "high".to_string(),
-        });
-        assert_eq!(
-            state.field_gen.get("role_reasoning:engineer").copied(),
-            Some(1),
-            "reasoning click arms a zero-delay settle"
-        );
 
         // Role model is a text input → debounced settle (700 ms).
         let _task = state.update(SettingsMessage::RoleModel {

@@ -74,7 +74,11 @@ pub struct RoleInfo {
     pub badge_fg: (f32, f32, f32),
     /// Default model ID for this role, used when no per-role override is configured.
     pub default_model: &'static str,
-    /// Default reasoning effort for this role, used when no per-role override is configured.
+    /// Default reasoning effort for this role.
+    ///
+    /// Authoritative since mahbot-1819: reasoning effort is no longer
+    /// user-tunable and stored `config_role.reasoning_effort` values are never
+    /// consulted, so this baked default is what request time always uses.
     pub default_reasoning_effort: &'static str,
     /// Human-readable display label (e.g. `"QA"` for [`Role::Qa`]).
     pub display_label: &'static str,
@@ -91,7 +95,7 @@ const BASE_ROLE_INFO: RoleInfo = RoleInfo {
     requires_multimodal: false,
     badge_fg: (0.0, 0.0, 0.0),
     default_model: "deepseek/deepseek-v4-flash-0731",
-    default_reasoning_effort: "xhigh",
+    default_reasoning_effort: "high",
     display_label: "",
 };
 
@@ -106,6 +110,7 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         Role::Manager => &RoleInfo {
             badge_fg: (0.816, 0.635, 0.082),
             default_model: "deepseek/deepseek-v4-pro",
+            default_reasoning_effort: "xhigh",
             display_label: "Manager",
             ..BASE_ROLE_INFO
         },
@@ -136,6 +141,7 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         },
         Role::Discovery => &RoleInfo {
             has_discovery: false,
+            default_reasoning_effort: "xhigh",
             badge_fg: (0.227, 0.663, 0.624),
             display_label: "Discovery",
             ..BASE_ROLE_INFO
@@ -145,11 +151,12 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             requires_multimodal: true,
             badge_fg: (0.808, 0.365, 0.592),
             default_model: "qwen/qwen3.6-plus",
-            default_reasoning_effort: "medium",
+            default_reasoning_effort: "high",
             display_label: "Artist",
         },
         Role::Maintainer => &RoleInfo {
             badge_fg: (0.753, 0.376, 0.502),
+            default_reasoning_effort: "xhigh",
             display_label: "Maintainer",
             ..BASE_ROLE_INFO
         },
@@ -161,7 +168,7 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         Role::Assistant => &RoleInfo {
             has_discovery: false,
             badge_fg: (0.153, 0.820, 0.757),
-            default_reasoning_effort: "medium",
+            default_reasoning_effort: "xhigh",
             display_label: "Assistant",
             ..BASE_ROLE_INFO
         },

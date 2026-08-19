@@ -3,7 +3,10 @@
 //!
 //! Three tables:
 //! - `config_kv` — generic key-value string pairs for runtime configuration.
-//! - `config_role` — per-role model and reasoning_effort overrides.
+//! - `config_role` — per-role model overrides. The `model` column is the
+//!   override consulted at request time; the `reasoning_effort` column is
+//!   retained as orphaned data since mahbot-1819 (loaded and preserved, never
+//!   consulted).
 //! - `config_model_routing` — per-model provider order and fallback settings.
 
 use crate::config::{ModelRouting, RoleConfig};
@@ -629,13 +632,6 @@ mod tests {
             vec![role_config("engineer", None, Some("high"))],
             "cleared model keeps the reasoning_effort row"
         );
-
-        // Clearing the reasoning too deletes the empty row.
-        crate::config::persist_settled_role_reasoning("engineer", "")
-            .await
-            .unwrap();
-        let rows = store.get_all_role_configs().await.unwrap();
-        assert!(rows.is_empty(), "all-None row removed");
 
         crate::config::CONFIG.swap(original);
     }

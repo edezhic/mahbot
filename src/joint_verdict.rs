@@ -126,7 +126,11 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
         model,
         allow_image_parts: false,
         max_tokens: Some(PIPELINE_GROUPING_MAX_TOKENS),
-        reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(role)),
+        reasoning_effort: Some(
+            crate::role::role_info(&role)
+                .default_reasoning_effort
+                .to_string(),
+        ),
         provider_order: routing.provider_order,
         provider_allow_fallbacks: routing.allow_fallbacks,
         meta: Some(ChatRequestMeta {

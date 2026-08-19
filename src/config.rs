@@ -41,19 +41,23 @@
 //! Fields **not** in this chain (e.g. `per_role_configs`, `model_routings`) have
 //! their own dedicated tables and reload paths.
 //!
-//! ## Chain 2: Per-role model and reasoning effort
+//! ## Chain 2: Per-role model override
 //!
-//! `config_role` table → [`crate::role::RoleInfo::default_model`] / [`crate::role::RoleInfo::default_reasoning_effort`]
+//! `config_role` table → [`crate::role::RoleInfo::default_model`]
 //!
 //! Stored in [`ConfigData::per_role_configs`] as a [`Vec<RoleConfig>`][RoleConfig],
 //! loaded at reload time from the `config_role` table. Checked at request time by
-//! [`ConfigReload::role_model`] and [`ConfigReload::role_reasoning_effort`] with
-//! the priority:
+//! [`ConfigReload::role_model`] with the priority:
 //!
-//! > Per-role override → [`role_info`]`(role).default_*`
+//! > Per-role override → [`role_info`]`(role).default_model`
 //!
 //! When no matching [`RoleConfig`] entry exists, the role's built-in default from
 //! [`role_info`] (defined in [`crate::role`]) is returned.
+//!
+//! Reasoning effort is **not** part of this chain since mahbot-1819: it is baked
+//! into [`crate::role::RoleInfo::default_reasoning_effort`] and no longer
+//! user-tunable. Stored `config_role.reasoning_effort` values are retained as
+//! harmless orphans (never consulted, never deleted) per the orphaned-key policy.
 //!
 //! ## Chain 3: Per-model provider routing
 //!
@@ -115,7 +119,12 @@ const DEFAULT_ADAPTIVE_K: &str = "2.5";
 
 // ── Named config structs ───────────────────────────────────────────
 
-/// A per-role model & reasoning-effort override.
+/// A per-role model override.
+///
+/// The `reasoning_effort` field is retained orphaned data since mahbot-1819:
+/// it is loaded and preserved through the persist path but never consulted at
+/// request time (the baked [`crate::role::RoleInfo::default_reasoning_effort`]
+/// is authoritative).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoleConfig {
     pub role: String,
@@ -861,21 +870,6 @@ impl ConfigReload {
         }
         role_info(&role).default_model.to_string()
     }
-
-    /// Resolve the configured reasoning effort for a role.
-    ///
-    /// Priority: per-role override → role info default.
-    /// Always returns a value — every role has a non-empty default defined
-    /// in [`role_info`].
-    #[must_use]
-    pub fn role_reasoning_effort(&self, role: Role) -> String {
-        if let Some(rc) = self.find_role_config(role)
-            && let Some(ref r) = rc.reasoning_effort
-        {
-            return r.clone();
-        }
-        role_info(&role).default_reasoning_effort.to_string()
-    }
 }
 
 // ── Startup / reload / save ──────────────────────────────────────
@@ -1108,8 +1102,9 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
 /// Persist a settled per-role model override (`""` clears it).
 ///
 /// Preserves the role row's current `reasoning_effort` from the live config,
-/// so a reasoning-effort edit and a model edit on the same role never clobber
-/// each other regardless of arrival order. Returns the canonical model value.
+/// so a model edit never alters or deletes stored rows: the orphaned
+/// `reasoning_effort` column is kept intact (mahbot-1819 no-writes/no-deletes
+/// guarantee). Returns the canonical model value.
 pub async fn persist_settled_role_model(role: &str, model: &str) -> Result<String> {
     let _guard = persist_lock().lock().await;
     let model = trimmed_or_none(model);
@@ -1117,19 +1112,6 @@ pub async fn persist_settled_role_model(role: &str, model: &str) -> Result<Strin
         .role_config_by_key(role)
         .and_then(|rc| rc.reasoning_effort);
     save_role_row(role, model, reasoning).await
-}
-
-/// Persist a settled per-role reasoning-effort override.
-///
-/// Preserves the role row's current `model` from the live config. Returns the
-/// canonical effort value (the settled effort trimmed, `None` collapsed to
-/// `""` — NOT the row's preserved model).
-pub async fn persist_settled_role_reasoning(role: &str, effort: &str) -> Result<String> {
-    let _guard = persist_lock().lock().await;
-    let effort = trimmed_or_none(effort);
-    let model = CONFIG.role_config_by_key(role).and_then(|rc| rc.model);
-    save_role_row(role, model, effort.clone()).await?;
-    Ok(effort.unwrap_or_default())
 }
 
 /// Persist a settled per-model routing `provider_order` (`""` clears it).

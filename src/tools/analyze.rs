@@ -1141,7 +1141,11 @@ async fn consolidate_findings(
         &system,
         &user,
         model,
-        Some(CONFIG.role_reasoning_effort(Role::Analyst)),
+        Some(
+            crate::role::role_info(&Role::Analyst)
+                .default_reasoning_effort
+                .to_string(),
+        ),
         routing.provider_order,
         routing.allow_fallbacks,
         Some(DEFAULT_MAX_TOKENS),

@@ -187,7 +187,11 @@ pub(crate) fn chat_request(
         model,
         allow_image_parts,
         max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
-        reasoning_effort: Some(crate::config::CONFIG.role_reasoning_effort(role)),
+        reasoning_effort: Some(
+            crate::role::role_info(&role)
+                .default_reasoning_effort
+                .to_string(),
+        ),
         provider_order: routing.provider_order,
         provider_allow_fallbacks: routing.allow_fallbacks,
         meta: None,
@@ -1284,7 +1288,9 @@ impl Agent {
     /// provider-routing settings.
     ///
     /// All parameter sources are lazily resolved each call so that runtime
-    /// hot-reload (model, routing, reasoning-effort) is reflected immediately.
+    /// hot-reload (model, routing) is reflected immediately. Reasoning effort
+    /// is baked into the role metadata since mahbot-1819 — it is not
+    /// hot-reloadable.
     ///
     /// # KV-cache preservation
     ///
