@@ -28,8 +28,8 @@ use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, Workspace};
 
 // ── Hardcoded review-count calibration defaults (no config surface) ──────
 
-pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: u64 = 300;
-pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: u64 = 1000;
+pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: u64 = 500;
+pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: u64 = 2000;
 
 /// Maximum tolerated bounces before the ticket fails (the 11th bounce fails).
 pub(crate) const MAX_BOUNCES: usize = 10;
@@ -326,12 +326,12 @@ fn member_text(
 
 /// Compute the reviewer-count base from total working-tree churn (added +
 /// deleted lines, including lines of new files): 2 for churn ≤ low, 4 for
-/// churn ≥ high, 3 otherwise. Never 1.
+/// churn > high (strict — exactly `high` stays 3), 3 otherwise. Never 1.
 #[must_use]
 pub(crate) fn review_base_from_signals(total_churn: i64, low_churn: i64, high_churn: i64) -> usize {
     if total_churn <= low_churn {
         2
-    } else if total_churn >= high_churn {
+    } else if total_churn > high_churn {
         4
     } else {
         3

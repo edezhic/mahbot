@@ -788,23 +788,32 @@ async fn repair_rejects_empty_member_group() {
 
 #[test]
 fn review_base_from_signals_thresholds() {
-    // Low churn (≤ 300) → 2.
-    assert_eq!(review_base_from_signals(10, 300, 1000), 2);
+    // Arguments reference the calibration constants so threshold changes
+    // cannot silently drift the test away from the shipped ladder.
+    let low = DEFAULT_REVIEW_COUNT_LOW_CHURN as i64;
+    let high = DEFAULT_REVIEW_COUNT_HIGH_CHURN as i64;
+    // Low churn (≤ low) → 2.
+    assert_eq!(review_base_from_signals(10, low, high), 2);
     assert_eq!(
-        review_base_from_signals(300, 300, 1000),
+        review_base_from_signals(low, low, high),
         2,
-        "boundary 300 is inclusive → 2"
+        "boundary {low} is inclusive → 2"
     );
-    // High churn (≥ 1000) → 4.
+    // High churn (> high) → 4.
     assert_eq!(
-        review_base_from_signals(1000, 300, 1000),
+        review_base_from_signals(high + 1, low, high),
         4,
-        "boundary 1000 is inclusive → 4"
+        "boundary {high} is exclusive → 4 requires > {high}"
     );
-    assert_eq!(review_base_from_signals(1500, 300, 1000), 4);
-    // Middle → 3.
-    assert_eq!(review_base_from_signals(301, 300, 1000), 3);
-    assert_eq!(review_base_from_signals(999, 300, 1000), 3);
+    assert_eq!(review_base_from_signals(high * 2, low, high), 4);
+    // Middle → 3, including exactly `high`.
+    assert_eq!(review_base_from_signals(low + 1, low, high), 3);
+    assert_eq!(review_base_from_signals(high - 1, low, high), 3);
+    assert_eq!(
+        review_base_from_signals(high, low, high),
+        3,
+        "exactly {high} stays 3 (strict > boundary)"
+    );
 }
 
 #[test]
