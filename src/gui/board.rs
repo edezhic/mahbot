@@ -1416,9 +1416,9 @@ impl BoardState {
                      but no further work happens;\n\
                      • leave uncommitted changes in the working tree — not \
                      committed, not reverted;\n\
-                     • pause the workspace pipeline — new development is \
-                     blocked until you manually resume it (analysis, review, \
-                     and QA of other tickets continue).",
+                     • pause the workspace pipeline — new analysis and \
+                     development claims are blocked until you manually \
+                     resume it (review and QA of other tickets continue).",
                 )
                 .size(13)
                 .color(theme::TEXT_SECONDARY),

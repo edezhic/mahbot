@@ -1522,6 +1522,131 @@ async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
     assert!(last.contains("agent produced no response"), "{last}");
 }
 
+// ── Pause gate: automatic claims blocked while paused (mahbot-1766) ──
+
+/// The pause gate must block exactly the automatic pickup of *new* work:
+/// BacklogAnalysis (backlog → analysis) and EngineerDevelopment
+/// (ready_for_development → in_development). Later-phase claims (review,
+/// QA) proceed while paused, and nothing is blocked when the workspace is
+/// unpaused.
+///
+/// Asserted against [`CLAIM_PHASES`] — the only phases the gate predicate is
+/// ever consulted for in production — so the test cannot drift from the
+/// claim pipeline's real surface (SanitationCheck/DiagnosticsCheck never
+/// flow through the claim loop and are deliberately absent).
+#[test]
+fn paused_blocks_claim_gate_matrix() {
+    for &(source, phase) in CLAIM_PHASES {
+        let new_work = matches!(
+            phase,
+            PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
+        );
+        assert_eq!(
+            paused_blocks_claim(true, phase),
+            new_work,
+            "pause gate mismatch for {} ({} → {})",
+            phase.info().log_label,
+            source.as_ref(),
+            phase.info().expected_phase.as_ref(),
+        );
+        assert!(
+            !paused_blocks_claim(false, phase),
+            "{} must run when unpaused",
+            phase.info().log_label,
+        );
+    }
+}
+
+/// Regression test for the pause gate: a paused workspace must keep its
+/// Backlog and ReadyForDevelopment tickets unclaimed, and unpausing resumes
+/// the automatic claims on the next pipeline run.
+///
+/// Later-phase claims (review/QA) are not part of the gate — covered by
+/// [`paused_blocks_claim_gate_matrix`]; this test exercises the real
+/// [`run_claim_pipeline`] path for the two gated phases.
+///
+/// Serialized with the reset_inflight tests: `run_claim_pipeline` claims
+/// through the shared global board. The unpaused run spawns real dispatch
+/// tasks (they abort when this test's runtime drops); the claim transitions
+/// are synchronous, so the phase assertions are deterministic.
+///
+/// Two deliberate couplings, both serialized by the group + lock:
+/// - The spawned dispatch tasks read the process-global provider, so the
+///   test holds `retry_tests_lock()` per the suite's provider-seam
+///   convention.
+/// - The spawned dispatches may persist `ticket_stage_jobs`/`agents` rows
+///   for this test's ticket IDs into the shared test jobs DB before the
+///   runtime drops them; later `recover_from_restart` tests in this serial
+///   group tolerate extra rows (they assert on their own fixture IDs).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global provider seams
+async fn paused_workspace_holds_backlog_and_rfd_until_unpause() {
+    let _lock = crate::util::test::retry_tests_lock();
+    let ws = setup_db_workspace("pause_gate").await;
+    let ws_name = ws.name.clone();
+    crate::workspace::store()
+        .set_paused(&ws_name, true)
+        .await
+        .expect("pause workspace");
+
+    // Backlog claims carry a 5s fresh-ticket grace (BACKLOG_CLAIM_GRACE) —
+    // backdate so the claim is eligible once unpaused.
+    let backlog_id = make_ticket(board(), &ws, "Paused Backlog", TicketPhase::Backlog).await;
+    let rfd_id = make_ticket(board(), &ws, "Paused RFD", TicketPhase::ReadyForDevelopment).await;
+    let old = (chrono::Utc::now() - ChronoDuration::minutes(10)).to_rfc3339();
+    for id in [&backlog_id, &rfd_id] {
+        board()
+            .conn
+            .execute(
+                "UPDATE tickets SET created_at = ?1 WHERE id = ?2",
+                crate::turso::params![old.clone(), id.clone()],
+            )
+            .await
+            .expect("backdate ticket created_at");
+    }
+
+    // Paused: neither automatic claim fires.
+    let paused_ws = crate::workspace::store()
+        .get_by_name(&ws_name)
+        .await
+        .expect("get workspace")
+        .expect("workspace exists");
+    run_claim_pipeline(&paused_ws).await;
+    assert_eq!(
+        expect_ticket_phase(board(), &backlog_id).await,
+        TicketPhase::Backlog,
+        "paused workspace must not claim backlog into analysis",
+    );
+    assert_eq!(
+        expect_ticket_phase(board(), &rfd_id).await,
+        TicketPhase::ReadyForDevelopment,
+        "paused workspace must not claim RFD into development",
+    );
+
+    // Unpaused: the next pipeline run claims both automatically.
+    crate::workspace::store()
+        .set_paused(&ws_name, false)
+        .await
+        .expect("unpause workspace");
+    let resumed_ws = crate::workspace::store()
+        .get_by_name(&ws_name)
+        .await
+        .expect("get workspace")
+        .expect("workspace exists");
+    run_claim_pipeline(&resumed_ws).await;
+    assert_eq!(
+        expect_ticket_phase(board(), &backlog_id).await,
+        TicketPhase::Analysis,
+        "unpaused workspace must claim backlog into analysis",
+    );
+    assert_eq!(
+        expect_ticket_phase(board(), &rfd_id).await,
+        TicketPhase::InDevelopment,
+        "unpaused workspace must claim RFD into development",
+    );
+}
+
 // ── process_analyst_verdicts — analyst scoring and transitions ─────────
 
 /// Verify process_analyst_verdicts across all outcomes (fail-open):

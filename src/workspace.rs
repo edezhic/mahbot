@@ -328,7 +328,12 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
 /// - If `all_ok`: sets status to `ready` and unpauses the workspace. The
 ///   discovery flow itself set the analysis pause (`add`/`rediscover` write
 ///   `paused = 1` alongside `status = Analyzing`), and rediscovery is the
-///   documented unpause path — so a successful discovery clears it.
+///   documented unpause path — so a successful discovery clears it. While
+///   that pause is set, the claim pipeline's pause gate also holds automatic
+///   Backlog→Analysis and ReadyForDevelopment→InDevelopment claims (see
+///   `run_claim_pipeline` in the management module), so queued backlog/RFD
+///   tickets wait out the discovery and are picked up on the next poll cycle
+///   after this unpause.
 /// - If **not** `all_ok`: sets status to `failed` and leaves `paused` untouched.
 /// - Before any write, checks the generation guard: if a newer [`WorkspaceStore::rediscover`]
 ///   bumped the generation while discovery was in flight, the writes are skipped.
@@ -1853,10 +1858,8 @@ mod tests {
         let dir = TempDir::new().expect("temp dir for workspace path");
 
         // add() requires: search engine globals initialized + CONFIG storage
-        // root set.  Initialize the minimum globals.
-        if !crate::search_engine::registry_initialized() {
-            crate::search_engine::init_global();
-        }
+        // root set. Initialize the minimum globals (init_global is idempotent).
+        crate::search_engine::init_global();
         // Point the storage root at the shared test root. A per-test TempDir
         // would leave the global storage root pointing at a deleted directory
         // once the TempDir drops — the shared root lives for the whole

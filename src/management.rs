@@ -486,12 +486,12 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
 }
 
 /// Wording shared by the failure-comment pause note and the Manager
-/// notification: the pause gate blocks ReadyForDevelopment→InDevelopment
-/// claims only (see [`run_claim_pipeline`]), so the consequence must be scoped
-/// to development — earlier-phase queues (Backlog→Analysis) still run.
+/// notification: the pause gate blocks automatic Backlog→Analysis and
+/// ReadyForDevelopment→InDevelopment claims (see [`run_claim_pipeline`]),
+/// while later-phase work (review, QA, in-flight runs) continues.
 /// Single-sourced so the two sites cannot drift.
 fn paused_workspace_sentence() -> &'static str {
-    "new development claims are blocked until the workspace is resumed"
+    "new analysis and development claims are blocked until the workspace is resumed"
 }
 
 /// Pause the workspace after a technical/agent failure so queued development
@@ -525,9 +525,11 @@ fn paused_workspace_sentence() -> &'static str {
 /// ReadyForDevelopment without pausing. Analyze-tool sub-agent failures (parallel
 /// analysts under [`AnalyzeTool`](crate::tools::AnalyzeTool)) likewise never
 /// reach this helper — they are tool calls inside a caller's run, not
-/// ticket-level failures. The pause gate itself only blocks
-/// ReadyForDevelopment→InDevelopment claims, so a dispatch panic in an earlier
-/// phase still cascades through queued tickets until one reaches the Engineer.
+/// ticket-level failures. The pause gate blocks automatic Backlog→Analysis
+/// and ReadyForDevelopment→InDevelopment claims, so a pause stops further
+/// pickup of queued Backlog/RFD tickets on the poll cycles that follow (a
+/// claim already in flight within the current cycle may still land);
+/// tickets already past analysis continue through their later phases.
 pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) -> String {
     if crate::shutdown::aborting() {
         // Shutdown AND the graceful drain are excluded: a drain-cut round is
@@ -1347,13 +1349,30 @@ async fn process_single_workspace(ws: Workspace) {
     .await;
 }
 
+/// Whether the pause gate blocks the automatic claim for `phase`.
+///
+/// Paused workspaces stop only the automatic pickup of *new* work:
+/// BacklogAnalysis (backlog → analysis) and EngineerDevelopment
+/// (ready_for_development → in_development). Later-phase claims
+/// (DiagnosticsDone→Review, Reviewed→QA) proceed so tickets already past
+/// analysis finish without getting stuck — pausing gates new analysis and
+/// development, not in-progress work.
+fn paused_blocks_claim(paused: bool, phase: PollPhase) -> bool {
+    paused
+        && matches!(
+            phase,
+            PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
+        )
+}
+
 /// Claim for each pipeline phase in a workspace.
 ///
-/// When the workspace is paused, only block EngineerDevelopment
-/// (ready_for_development → in_development). All other phases
-/// (analysis, review, QA, …) proceed normally so that tickets
-/// already in review or QA finish without getting stuck — pausing
-/// gates *new* development, not in-progress work.
+/// When the workspace is paused, [`paused_blocks_claim`] skips the automatic
+/// pickup of new work (backlog → analysis and ready_for_development →
+/// in_development). Later-phase claims (DiagnosticsDone→Review, Reviewed→QA)
+/// proceed normally so that tickets already past analysis finish without
+/// getting stuck — pausing gates new analysis/development, not in-progress
+/// work.
 ///
 /// On claim error we `break` out of the phase loop — this skips all
 /// remaining CLAIM_PHASES for this workspace and falls through to
@@ -1363,7 +1382,7 @@ async fn process_single_workspace(ws: Workspace) {
 async fn run_claim_pipeline(ws: &Workspace) {
     let board = board();
     for &(source, phase) in CLAIM_PHASES {
-        if ws.paused && matches!(phase, PollPhase::EngineerDevelopment) {
+        if paused_blocks_claim(ws.paused, phase) {
             continue;
         }
         let info = phase.info();

@@ -204,17 +204,19 @@ pub struct Workspace {
     /// `true`  — the maintainer loop processes this workspace on each cycle.
     /// `false` — the maintainer skips this workspace entirely (default).
     ///
-    /// Unlike [`Self::paused`] (which blocks development dispatch but allows all other
-    /// pipeline phases to run normally), `maintenance_enabled` specifically controls only
-    /// the maintainer loop. A paused workspace can still be maintained if
+    /// Unlike [`Self::paused`] (which blocks automatic analysis and development
+    /// claims but allows all other pipeline phases to run normally),
+    /// `maintenance_enabled` specifically controls only the maintainer loop.
+    /// A paused workspace can still be maintained if
     /// `maintenance_enabled` is `true`, and vice versa.
     ///
     /// Persisted in the `workspaces` table with a `DEFAULT 0` schema default.
     /// Toggled via the settings panel in the GUI.
     pub maintenance_enabled: bool,
-    /// Whether development dispatch is paused for this workspace (blocks
-    /// ready_for_development → in_development). All other pipeline phases
-    /// (analysis, review, QA, diagnostics, sanitation, maintainer) run normally.
+    /// Whether automatic claim dispatch is paused for this workspace (blocks
+    /// backlog → analysis and ready_for_development → in_development). Later
+    /// pipeline phases (review, QA, diagnostics, sanitation, maintainer) run
+    /// normally, and tickets already past analysis keep progressing.
     ///
     /// Automatically set to `true` on technical/agent failures (dispatch panic,
     /// agent run failure, all verifiers failing, user cancelling an in-flight

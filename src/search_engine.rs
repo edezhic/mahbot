@@ -50,10 +50,12 @@ static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<SearchEngineEntry>>>> = Onc
 
 /// Initialize the global registry. Must be called during bootstrap, after
 /// [`crate::workspace::init_global`] and before any background task that may search.
+///
+/// Idempotent: a second call (e.g. a test init path racing another test's
+/// bootstrap) is a no-op that preserves the existing registry — the map is
+/// never cleared, so there is nothing to re-create.
 pub fn init_global() {
-    REGISTRY
-        .set(RwLock::new(HashMap::new()))
-        .expect("search engine registry already initialized");
+    let _ = REGISTRY.set(RwLock::new(HashMap::new()));
 }
 
 fn registry() -> &'static RwLock<HashMap<String, Arc<SearchEngineEntry>>> {
