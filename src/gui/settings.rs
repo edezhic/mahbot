@@ -18,8 +18,8 @@ use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Checkbox, Column, Row, Space, button, column, container, mouse_area, pick_list, row,
-    scrollable, slider, stack, text, text_editor, text_input, toggler, tooltip,
+    Checkbox, Column, Row, Space, button, column, container, pick_list, row, scrollable, slider,
+    stack, text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -28,6 +28,7 @@ use iced_fonts::lucide;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
+use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
 use super::users;
 use super::widget_helpers;
@@ -1469,20 +1470,9 @@ impl SettingsState {
                     .color(theme::TEXT_MUTED),
             );
         } else {
-            for (row_index, ws_item) in ws.workspaces.iter().enumerate() {
+            for ws_item in &ws.workspaces {
                 let (status_color, status_bg) = theme::workspace_status_color(ws_item.status);
                 let maintainer_on = ws_item.maintenance_enabled;
-
-                let delete_btn = delete_confirm_button(
-                    Some(&ws_item.name) == ws.delete_target.as_ref(),
-                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::ConfirmDelete(
-                        ws_item.name.clone(),
-                    )),
-                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::CancelDelete),
-                    SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::DeleteWorkspace(
-                        ws_item.name.clone(),
-                    )),
-                );
 
                 let ws_row = container(
                     column![
@@ -1507,8 +1497,10 @@ impl SettingsState {
                                 .width(Length::FillPortion(35))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center),
-                            // Agent icons column (FillPortion: 25)
+                            // Left cluster column (FillPortion: 28) — per-role
+                            // context icons, general context, Diag, Notes.
                             {
+                                let mut left = Row::new().spacing(4).align_y(Alignment::Center);
                                 let mut role_btns = Row::new().spacing(2);
                                 for role in
                                     Role::iter().filter(|r| crate::role::role_info(r).has_discovery)
@@ -1526,52 +1518,32 @@ impl SettingsState {
                                             )),
                                     );
                                 }
-                                container(role_btns)
-                                    .width(Length::FillPortion(25))
-                                    .align_x(Alignment::Start)
-                                    .align_y(Alignment::Center)
-                            },
-                            // Actions column (FillPortion: 15)
-                            container(
-                                row![
-                                    // Maintainer toggle
-                                    tooltip(
-                                        button(widgets::maint_badge(maintainer_on))
-                                            .style(theme::button_text)
-                                            .on_press(SettingsMessage::WorkspaceMsg(
-                                                workspaces::WorkspacesMessage::ToggleMaintainer(
-                                                    ws_item.name.clone(),
-                                                    !maintainer_on,
-                                                ),
-                                            ),),
-                                        text(if maintainer_on {
-                                            "stop maintenance"
-                                        } else {
-                                            "start maintenance"
-                                        })
-                                        .size(11),
-                                        tooltip::Position::Top,
+                                left = left.push(role_btns);
+                                left = left.push(
+                                    button(
+                                        theme::general_context_icon().size(11).color(theme::ACCENT),
                                     )
-                                    .style(theme::tooltip_style),
-                                    Space::new().width(4),
-                                    button(row![
-                                        lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                                            .size(11)
-                                            .color(theme::TEXT_MUTED),
-                                        Space::new().width(4),
-                                        text("Re-analyze").size(11),
-                                    ])
                                     .style(theme::button_text)
                                     .on_press(
                                         SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::Reanalyze(
-                                                ws_item.name.clone()
+                                            workspaces::WorkspacesMessage::ViewGeneralContext(
+                                                ws_item.name.clone(),
                                             ),
-                                        )
+                                        ),
                                     ),
-                                    Space::new().width(4),
-                                    {
-                                        let is_open = ws.notes_open.contains(&ws_item.name);
+                                );
+                                left = left.push(
+                                    button(text("Diag").size(11).color(theme::TEXT_MUTED))
+                                        .style(theme::button_text)
+                                        .on_press(SettingsMessage::WorkspaceMsg(
+                                            workspaces::WorkspacesMessage::ShowDiagnostics(
+                                                ws_item.name.clone(),
+                                            ),
+                                        )),
+                                );
+                                {
+                                    let is_open = ws.notes_open.contains(&ws_item.name);
+                                    left = left.push(
                                         button(
                                             text(if is_open { "Notes ✓" } else { "Notes" })
                                                 .size(11)
@@ -1584,22 +1556,36 @@ impl SettingsState {
                                                     ws_item.name.clone(),
                                                 ),
                                             ),
-                                        )
-                                    },
-                                    Space::new().width(4),
-                                    button(text("Diag").size(11).color(theme::TEXT_MUTED),)
+                                        ),
+                                    );
+                                }
+                                container(left)
+                                    .width(Length::FillPortion(28))
+                                    .align_x(Alignment::Start)
+                                    .align_y(Alignment::Center)
+                            },
+                            // Right column (FillPortion: 12) — Maintainer toggle only.
+                            container(
+                                tooltip(
+                                    button(widgets::maint_badge(maintainer_on))
                                         .style(theme::button_text)
                                         .on_press(SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::ShowDiagnostics(
+                                            workspaces::WorkspacesMessage::ToggleMaintainer(
                                                 ws_item.name.clone(),
+                                                !maintainer_on,
                                             ),
-                                        )),
-                                    Space::new().width(4),
-                                    delete_btn,
-                                ]
-                                .align_y(Alignment::Center)
+                                        ),),
+                                    text(if maintainer_on {
+                                        "stop maintenance"
+                                    } else {
+                                        "start maintenance"
+                                    })
+                                    .size(11),
+                                    tooltip::Position::Top,
+                                )
+                                .style(theme::tooltip_style),
                             )
-                            .width(Length::FillPortion(15))
+                            .width(Length::FillPortion(12))
                             .align_x(Alignment::End)
                             .align_y(Alignment::Center),
                         ]
@@ -1619,51 +1605,52 @@ impl SettingsState {
                 .padding(8)
                 .style(theme::surface_card_style);
 
-                // Wrap with mouse_area for right-click context menu
-                let row_with_ctx =
-                    mouse_area(ws_row).on_right_press(SettingsMessage::WorkspaceMsg(
-                        workspaces::WorkspacesMessage::ContextMenu(row_index),
-                    ));
-
-                rows = rows.push(row_with_ctx);
-
-                // Render context menu action buttons below the row
-                if ws.context_row == Some(row_index) {
-                    let ctx_actions = container(
-                        row![
-                            button(text("Re-analyze").size(11))
-                                .style(theme::button_text)
-                                .on_press(SettingsMessage::WorkspaceMsg(
-                                    workspaces::WorkspacesMessage::Reanalyze(ws_item.name.clone(),),
-                                )),
-                            Space::new().width(4),
-                            button(text("Diag").size(11))
-                                .style(theme::button_text)
-                                .on_press(SettingsMessage::WorkspaceMsg(
-                                    workspaces::WorkspacesMessage::ShowDiagnostics(
-                                        ws_item.name.clone(),
-                                    ),
-                                )),
-                            Space::new().width(4),
-                            button(
-                                lucide::x::<iced::Theme, iced::Renderer>()
-                                    .size(18)
-                                    .color(theme::STATUS_ERROR),
-                            )
-                            .style(theme::button_text)
-                            .on_press(SettingsMessage::WorkspaceMsg(
+                // Right-click context menu (Re-analyze / Delete). The card's
+                // own buttons still work: ContextMenu forwards all events to
+                // the underlay first; only right-clicks open the menu.
+                let ws_row: Element<'_, SettingsMessage> = ContextMenu::new(
+                    ws_row,
+                    vec![
+                        MenuItem::with_icon(
+                            iced_fonts::lucide::advanced_text::refresh_cw,
+                            "Re-analyze".into(),
+                            SettingsMessage::WorkspaceMsg(
+                                workspaces::WorkspacesMessage::Reanalyze(ws_item.name.clone()),
+                            ),
+                        ),
+                        MenuItem::with_icon(
+                            iced_fonts::lucide::advanced_text::trash,
+                            "Delete".into(),
+                            SettingsMessage::WorkspaceMsg(
                                 workspaces::WorkspacesMessage::DeleteWorkspace(
                                     ws_item.name.clone(),
                                 ),
-                            )),
-                        ]
-                        .spacing(4)
-                        .padding([2, 8]),
-                    )
-                    .style(|_| {
-                        theme::container_style(theme::BG_ELEVATED, 4.0, 1.0, theme::BORDER_STRONG)
-                    });
-                    rows = rows.push(ctx_actions);
+                            ),
+                        ),
+                    ],
+                )
+                .into();
+                rows = rows.push(ws_row);
+
+                // Inline two-step delete confirmation — armed by the context menu's
+                // "Delete" item (the menu closes after firing); lives below the card,
+                // reusing the delete_confirm_button machinery.
+                if ws.delete_target.as_ref() == Some(&ws_item.name) {
+                    let confirm = delete_confirm_button(
+                        true,
+                        SettingsMessage::WorkspaceMsg(
+                            workspaces::WorkspacesMessage::ConfirmDelete(ws_item.name.clone()),
+                        ),
+                        SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::CancelDelete),
+                        SettingsMessage::WorkspaceMsg(
+                            workspaces::WorkspacesMessage::DeleteWorkspace(ws_item.name.clone()),
+                        ),
+                    );
+                    rows = rows.push(
+                        container(confirm)
+                            .padding([4, 8])
+                            .style(theme::pill_style(theme::BG_ELEVATED)),
+                    );
                 }
 
                 // ── Inline notes editor ──────────────────────────────────
@@ -1756,10 +1743,13 @@ impl SettingsState {
         let mut section_content = column![rows];
 
         // Context view overlay — read-only markdown (inline in section)
-        if let Some((ref _ws_name, ref role, ref md_items_opt)) = ws.context_view {
+        if let Some((ref _ws_name, ref kind, ref md_items_opt)) = ws.context_view {
             section_content = section_content.push(Space::new().height(16));
 
-            let title = format!("Context for {role}");
+            let title = match kind {
+                workspaces::ContextKind::Role(role) => format!("Context for {role}"),
+                workspaces::ContextKind::General => "General context".to_string(),
+            };
 
             let body: Element<'_, SettingsMessage> = match md_items_opt {
                 None => container(widgets::loading_text())

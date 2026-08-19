@@ -184,6 +184,14 @@ pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme,
     }
 }
 
+/// Returns the Lucide icon widget for the workspace GENERAL context
+/// (the discovery-produced summary for non-role LLM calls, shown in the
+/// Settings → Workspaces row).
+#[must_use]
+pub fn general_context_icon() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
+    lucide::book_open_text()
+}
+
 /// Bold weight variant of JetBrains Mono (the dashboard default font).
 pub const FONT_BOLD: iced::Font = iced::Font {
     family: iced::font::Family::Name("JetBrains Mono"),

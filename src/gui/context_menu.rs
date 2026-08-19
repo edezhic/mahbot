@@ -48,6 +48,8 @@ pub struct MenuItem<Message> {
     pub label: String,
     /// Action to fire when clicked. `None` for disabled items (rendered in muted style).
     pub action: Option<Message>,
+    /// Lucide glyph codepoint rendered left of the label. `None` = label-only.
+    pub icon: Option<char>,
 }
 
 impl<Message> MenuItem<Message> {
@@ -57,6 +59,31 @@ impl<Message> MenuItem<Message> {
         Self {
             label,
             action: Some(action),
+            icon: None,
+        }
+    }
+
+    /// Create a menu item with a lucide icon glyph rendered left of the label.
+    ///
+    /// `icon` is an `iced_fonts::lucide::advanced_text::*` function; the single
+    /// codepoint it yields is extracted here. The overlay renders glyphs
+    /// manually with [`iced_fonts::LUCIDE_FONT`], mirroring the role-menu
+    /// overlay-glyph pattern in [`super::role_menu`].
+    #[must_use]
+    pub fn with_icon(
+        icon: fn() -> (String, iced::Font, text::Shaping),
+        label: String,
+        action: Message,
+    ) -> Self {
+        let glyph = icon()
+            .0
+            .chars()
+            .next()
+            .expect("lucide glyph strings are single characters");
+        Self {
+            label,
+            action: Some(action),
+            icon: Some(glyph),
         }
     }
 
@@ -66,6 +93,7 @@ impl<Message> MenuItem<Message> {
         Self {
             label,
             action: None,
+            icon: None,
         }
     }
 }
@@ -130,7 +158,7 @@ impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for ContextMenu<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
-    Renderer: iced::advanced::Renderer + text::Renderer,
+    Renderer: iced::advanced::Renderer + text::Renderer<Font = iced::Font>,
 {
     fn size(&self) -> Size<Length> {
         self.underlay.as_widget().size()
@@ -322,7 +350,7 @@ impl<'a, Message, Theme, Renderer> From<ContextMenu<'a, Message, Theme, Renderer
 where
     Message: Clone + 'a,
     Theme: 'a,
-    Renderer: iced::advanced::Renderer + text::Renderer + 'a,
+    Renderer: iced::advanced::Renderer + text::Renderer<Font = iced::Font> + 'a,
 {
     fn from(context_menu: ContextMenu<'a, Message, Theme, Renderer>) -> Self {
         Self::new(context_menu)
@@ -348,6 +376,10 @@ const MENU_PADDING: f32 = 8.0;
 const MENU_MIN_WIDTH: f32 = 140.0;
 const MENU_FONT_SIZE: f32 = 14.0;
 
+/// Icon glyph size and gap between the icon and the label.
+const MENU_ICON_SIZE: f32 = 14.0;
+const MENU_ICON_GAP: f32 = 8.0;
+
 /// Convert a y-offset (relative to menu origin, minus padding) into a
 /// menu item index.
 /// Returns None if the offset is negative or beyond the last item.
@@ -364,7 +396,7 @@ impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
     for ContextMenuOverlay<'_, '_, Message>
 where
     Message: Clone,
-    Renderer: text::Renderer,
+    Renderer: text::Renderer<Font = iced::Font>,
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         let item_count = self.menu_items.len();
@@ -391,7 +423,13 @@ where
                 paragraph.min_bounds().width
             })
             .fold(0.0_f32, f32::max);
-        let menu_width = (max_label_width + MENU_PADDING * 2.0).max(MENU_MIN_WIDTH);
+        let has_icon = self.menu_items.iter().any(|item| item.icon.is_some());
+        let icon_slot = if has_icon {
+            MENU_ICON_SIZE + MENU_ICON_GAP
+        } else {
+            0.0
+        };
+        let menu_width = (max_label_width + icon_slot + MENU_PADDING * 2.0).max(MENU_MIN_WIDTH);
 
         // Edge clipping: flip left/up if the menu would overflow bounds.
         let mut x = self.position.x;
@@ -472,9 +510,37 @@ where
                 theme::TEXT_SECONDARY
             };
 
+            let icon_slot = if item.icon.is_some() {
+                MENU_ICON_SIZE + MENU_ICON_GAP
+            } else {
+                0.0
+            };
+
+            if let Some(glyph) = item.icon {
+                renderer.fill_text(
+                    text::Text {
+                        content: glyph.to_string(),
+                        bounds: Size::new(MENU_ICON_SIZE, MENU_ITEM_HEIGHT),
+                        size: Pixels(MENU_ICON_SIZE),
+                        line_height: text::LineHeight::Relative(1.3),
+                        font: iced_fonts::LUCIDE_FONT,
+                        align_x: text::Alignment::Left,
+                        align_y: alignment::Vertical::Center,
+                        shaping: text::Shaping::Basic,
+                        wrapping: text::Wrapping::default(),
+                    },
+                    Point::new(item_bounds.x + MENU_PADDING, item_bounds.center_y()),
+                    text_color,
+                    item_bounds,
+                );
+            }
+
             let text = text::Text {
                 content: item.label.clone(),
-                bounds: Size::new(bounds.width - MENU_PADDING * 2.0, MENU_ITEM_HEIGHT),
+                bounds: Size::new(
+                    bounds.width - MENU_PADDING * 2.0 - icon_slot,
+                    MENU_ITEM_HEIGHT,
+                ),
                 size: text_size,
                 line_height: text::LineHeight::Relative(1.3),
                 font,
@@ -486,7 +552,10 @@ where
 
             renderer.fill_text(
                 text,
-                Point::new(item_bounds.x + MENU_PADDING, item_bounds.center_y()),
+                Point::new(
+                    item_bounds.x + MENU_PADDING + icon_slot,
+                    item_bounds.center_y(),
+                ),
                 text_color,
                 item_bounds,
             );

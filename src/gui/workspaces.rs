@@ -48,6 +48,7 @@ pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(private_interfaces)] // ContextKind is deliberately pub(crate) (see gui/mod.rs Message)
 pub enum WorkspacesMessage {
     Refreshed(Vec<Workspace>),
     RefreshError(String),
@@ -63,14 +64,15 @@ pub enum WorkspacesMessage {
     /// User clicked a role icon to view per-agent context (read-only markdown).
     ViewContext(String, String), // workspace_name, role
 
+    /// User clicked the general-context icon to view the workspace's
+    /// non-role context (read-only markdown).
+    ViewGeneralContext(String), // workspace_name
+
     /// Async fetch of workspace context completed.
-    ContextViewed(String, String, Result<Option<String>, String>), // ws_name, role, result
+    ContextViewed(String, ContextKind, Result<Option<String>, String>), // ws_name, kind, result
 
     /// Markdown link clicked in the context view.
     LinkClicked(String),
-
-    /// Right-click context menu on a row.
-    ContextMenu(usize),
 
     /// Show diagnostics modal for a workspace.
     ShowDiagnostics(String),
@@ -106,19 +108,26 @@ pub enum WorkspacesMessage {
     NotesCancel(String),
 }
 
+/// Which context entry the read-only context panel is showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContextKind {
+    /// Per-role discovery context (`workspace_contexts.role = <role>`).
+    Role(String),
+    /// General workspace context (the `role IS NULL` row).
+    General,
+}
+
 pub struct WorkspacesState {
     pub(crate) workspaces: Vec<Workspace>,
     pub(crate) load_state: super::common::AsyncLoadState,
     pub(crate) delete_target: Option<String>,
     pub(crate) deleting: bool,
 
-    /// Read-only context view modal: (workspace_name, role, parsed_markdown_items).
+    /// Read-only context view modal: (workspace_name, context kind, parsed_markdown_items).
     /// `None` while the modal is not open, `Some` with `None` items while loading.
-    pub(crate) context_view: Option<(String, String, Option<Vec<markdown::Item>>)>,
+    pub(crate) context_view: Option<(String, ContextKind, Option<Vec<markdown::Item>>)>,
     pub(crate) context_view_error: Option<String>,
 
-    /// Right-click context menu target row index.
-    pub(crate) context_row: Option<usize>,
     /// Diagnostics modal: workspace name being viewed/edited.
     pub(crate) diagnostics_modal: Option<String>,
     /// Edit buffers for the 7 diagnostics command fields (when modal is open).
@@ -148,7 +157,6 @@ impl WorkspacesState {
             deleting: false,
             context_view: None,
             context_view_error: None,
-            context_row: None,
             diagnostics_modal: None,
             diagnostics_edit_buffers: HashMap::new(),
             diagnostics_busy: false,
@@ -191,7 +199,6 @@ impl WorkspacesState {
                 Task::none()
             }
             WorkspacesMessage::DeleteWorkspace(name) => {
-                self.context_row = None;
                 self.delete_target = Some(name);
                 Task::none()
             }
@@ -222,18 +229,15 @@ impl WorkspacesState {
                 self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
-            WorkspacesMessage::Reanalyze(name) => {
-                self.context_row = None;
-                Task::perform(
-                    async move {
-                        crate::workspace::store()
-                            .rediscover(&name)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    WorkspacesMessage::ReanalyzeResult,
-                )
-            }
+            WorkspacesMessage::Reanalyze(name) => Task::perform(
+                async move {
+                    crate::workspace::store()
+                        .rediscover(&name)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                WorkspacesMessage::ReanalyzeResult,
+            ),
             WorkspacesMessage::ReanalyzeResult(Ok(())) => self.refresh(),
             WorkspacesMessage::ReanalyzeResult(Err(e)) => {
                 self.load_state.fail(e.clone());
@@ -254,7 +258,7 @@ impl WorkspacesState {
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
             WorkspacesMessage::ViewContext(ws_name, role) => {
-                self.context_view = Some((ws_name.clone(), role.clone(), None));
+                self.context_view = Some((ws_name.clone(), ContextKind::Role(role.clone()), None));
                 self.context_view_error = None;
                 let ws_name2 = ws_name.clone();
                 let role2 = role.clone();
@@ -267,27 +271,57 @@ impl WorkspacesState {
                         Ok::<_, String>((ws_name, role, content))
                     },
                     move |res| match res {
-                        Ok((name, role, content)) => {
-                            WorkspacesMessage::ContextViewed(name, role, Ok(content))
-                        }
-                        Err(e) => WorkspacesMessage::ContextViewed(ws_name2, role2, Err(e)),
+                        Ok((name, role, content)) => WorkspacesMessage::ContextViewed(
+                            name,
+                            ContextKind::Role(role),
+                            Ok(content),
+                        ),
+                        Err(e) => WorkspacesMessage::ContextViewed(
+                            ws_name2,
+                            ContextKind::Role(role2),
+                            Err(e),
+                        ),
                     },
                 )
             }
-            WorkspacesMessage::ContextViewed(ws_name, role, Ok(Some(content))) => {
+            WorkspacesMessage::ViewGeneralContext(ws_name) => {
+                self.context_view = Some((ws_name.clone(), ContextKind::General, None));
+                self.context_view_error = None;
+                let ws_name2 = ws_name.clone();
+                Task::perform(
+                    async move {
+                        let content = crate::workspace::store()
+                            .get_general_context(&ws_name)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((ws_name, content))
+                    },
+                    move |res| match res {
+                        Ok((name, content)) => WorkspacesMessage::ContextViewed(
+                            name,
+                            ContextKind::General,
+                            Ok(content),
+                        ),
+                        Err(e) => {
+                            WorkspacesMessage::ContextViewed(ws_name2, ContextKind::General, Err(e))
+                        }
+                    },
+                )
+            }
+            WorkspacesMessage::ContextViewed(ws_name, kind, Ok(Some(content))) => {
                 let md_items: Vec<markdown::Item> = markdown::parse(&content).collect();
-                self.context_view = Some((ws_name, role, Some(md_items)));
+                self.context_view = Some((ws_name, kind, Some(md_items)));
                 self.context_view_error = None;
                 Task::none()
             }
-            WorkspacesMessage::ContextViewed(ws_name, role, Ok(None)) => {
+            WorkspacesMessage::ContextViewed(ws_name, kind, Ok(None)) => {
                 // No context set yet — show empty state with empty items
-                self.context_view = Some((ws_name, role, Some(Vec::new())));
+                self.context_view = Some((ws_name, kind, Some(Vec::new())));
                 self.context_view_error = None;
                 Task::none()
             }
-            WorkspacesMessage::ContextViewed(ws_name, role, Err(e)) => {
-                self.context_view = Some((ws_name, role, Some(Vec::new())));
+            WorkspacesMessage::ContextViewed(ws_name, kind, Err(e)) => {
+                self.context_view = Some((ws_name, kind, Some(Vec::new())));
                 self.context_view_error = Some(e);
                 Task::none()
             }
@@ -296,12 +330,7 @@ impl WorkspacesState {
                 // variant to call open_url() before forwarding to update().
                 Task::none()
             }
-            WorkspacesMessage::ContextMenu(idx) => {
-                self.context_row = Some(idx);
-                Task::none()
-            }
             WorkspacesMessage::ShowDiagnostics(name) => {
-                self.context_row = None;
                 self.diagnostics_modal = Some(name.clone());
                 self.diagnostics_busy = false;
                 self.diagnostics_error = None;
@@ -373,7 +402,6 @@ impl WorkspacesState {
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
             WorkspacesMessage::RediscoverDiagnostics(name) => {
-                self.context_row = None;
                 self.diagnostics_busy = true;
                 self.diagnostics_error = None;
                 let name_for_task = name.clone();
@@ -401,7 +429,6 @@ impl WorkspacesState {
 
             // ── User notes editor ────────────────────────────────
             WorkspacesMessage::ToggleNotes(name) => {
-                self.context_row = None;
                 if self.notes_open.contains(&name) {
                     // Close: discard editor state
                     self.notes_open.remove(&name);
@@ -477,7 +504,6 @@ impl WorkspacesState {
                 self.delete_target = None;
                 self.context_view = None;
                 self.context_view_error = None;
-                self.context_row = None;
                 self.diagnostics_modal = None;
                 self.diagnostics_edit_buffers.clear();
                 self.diagnostics_busy = false;
