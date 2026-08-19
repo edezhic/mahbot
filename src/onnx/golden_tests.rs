@@ -6,7 +6,7 @@
 //! `candle-onnx-mahbot` fork (mahbot-1776).  The fork was the only oracle for
 //! TTS audio; these fixtures preserve that oracle in the repo.
 //!
-//! Feature-gated behind `voice-tests` (like the voice-pipeline e2e bench)
+//! Feature-gated behind `voice-tests` (like the wake_word bench)
 //! because they require the ~383 MB model files on disk under
 //! `~/.mahbot/models/supertonic3/onnx`.  When the models are absent the tests
 //! skip with a notice instead of failing.

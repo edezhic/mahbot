@@ -1064,10 +1064,10 @@ fn consume_warmup(ctx: &mut super::PipelineCtx) {
 
     // ── Reset instrumentation ─────────────────────────────
     // Warm-up audio passes through the full scoring pipeline and records into
-    // ctx.instrumentation: per_frame_scores, peak_score, VAD counts, and the
-    // adaptive threshold trajectory.  Without a reset, warm-up-only scores
-    // contaminate the test utterance's per-variant metrics (silence/noise
-    // negatives would report "detection triggers" from warm-up speech).
+    // ctx.instrumentation: peak_score and the VAD-active frame count.  Without
+    // a reset, warm-up-only scores contaminate the test utterance's
+    // per-variant metrics (silence/noise negatives would report "detection
+    // triggers" from warm-up speech).
     ctx.instrumentation = super::DetectionInstrumentation::new();
 }
 
@@ -1843,27 +1843,18 @@ fn faph_merge_events(events: &[f64], cooldown_secs: f64) -> usize {
     merged
 }
 
-/// Clear the session-lifetime per-frame instrumentation vectors between
-/// corpus files in the continuous-listening real-audio feed.
+/// Clear the session-lifetime instrumentation between corpus files in the
+/// continuous-listening real-audio feed.
 ///
-/// The real-audio phase only counts detection events — the per-frame
-/// instrumentation (scores / trajectory, one entry per voiced frame) is never
-/// read here, and leaving it would grow unboundedly across the corpus.
-/// Only the diagnostic vectors are cleared; the acoustic state the continuous
+/// The real-audio phase only counts detection events and the VAD-active
+/// frames — [`DetectionInstrumentation`] holds just `vad_speech_frames` and
+/// `peak_score` (the per-variant diagnostic fields were pruned with the old
+/// e2e bench), and the VAD counter must reset per file+gap window so the
+/// FA/h denominator is window-scoped.  The acoustic state the continuous
 /// feed depends on (audio ring, adaptive threshold, VAD detector) is
 /// preserved.
-///
-/// # Future-field hazard
-/// A per-frame field added to `DetectionInstrumentation` without a matching
-/// clear here would silently accumulate unbounded memory across the corpus —
-/// keep this clear list exhaustive when the instrumentation struct grows.
 fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
-    ctx.instrumentation.per_frame_scores.clear();
-    ctx.instrumentation.adaptive_threshold_trajectory.clear();
-    ctx.instrumentation.per_hop_vad.clear();
-    ctx.instrumentation.n_frames_below_reset = 0;
     ctx.instrumentation.vad_speech_frames = 0;
-    ctx.instrumentation.ceiling_limited_frames = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

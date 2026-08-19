@@ -1007,7 +1007,7 @@ fn is_mic_permission_error(err: &anyhow::Error) -> bool {
 // ── Voice PCM disk cache helpers ─────────────────────────────
 //
 // These helpers are consumed by the unit tests below and by the voice-tests
-// e2e benchmark (`synthesize_with_pcm_cache`); nothing in the production
+// wake_word bench (`synthesize_with_pcm_cache`); nothing in the production
 // detection path synthesises TTS PCM anymore, so the whole section is
 // dead-code-allowed in default builds.
 
@@ -2058,49 +2058,26 @@ impl AdaptiveThresholdState {
 
 /// Per-variant instrumentation collected by the wake word detection benchmark.
 /// Feature-gated behind `voice-tests` — zero production overhead.
+///
+/// Only what the surviving `wake_word` bench reads is kept: the peak rolling
+/// score (recognition logging) and the VAD-active frame count (the FA/h
+/// denominator for the real-audio phase).  The per-variant diagnostic fields
+/// (per-frame score triples, adaptive threshold trajectory, trigger index,
+/// per-hop VAD) were pruned with the old e2e bench — nothing reads them.
 #[cfg(feature = "voice-tests")]
 pub(crate) struct DetectionInstrumentation {
-    /// All per-frame `[total_score, rolling_sum, threshold]` triples
-    /// encountered during detection of a single variant.  The third element
-    /// is the effective threshold used for the rolling window comparison
-    /// (adaptive threshold post-bootstrap, or static match_threshold()
-    /// during bootstrap / when no adaptive state is configured).
-    pub per_frame_scores: Vec<[f32; 3]>,
-    /// Count of frames where `total_score < NO_MATCH_RESET_THRESHOLD` (0.35).
-    pub n_frames_below_reset: usize,
     /// Count of VAD-positive 512-sample frames during streaming detection.
     pub vad_speech_frames: usize,
     /// Peak rolling-sum score across all segments in this detection session.
     pub peak_score: f32,
-    /// Per-frame adaptive threshold trajectory.
-    /// Records the effective threshold value (`per_frame_scores[i][2]`) at each
-    /// embedding frame so the ADAPTIVE_CEILING calibration can be data-driven.
-    pub adaptive_threshold_trajectory: Vec<f32>,
-    /// Count of frames where the effective threshold hit ADAPTIVE_CEILING.
-    pub ceiling_limited_frames: usize,
-    /// Index into [`per_frame_scores`](Self::per_frame_scores) of the first
-    /// frame where the rolling sum reached the effective threshold
-    /// (detection trigger).  `None` if detection never triggered on
-    /// test-utterance frames.
-    pub first_trigger_frame_idx: Option<usize>,
-    /// Per-hop VAD decisions during streaming detection, in order — one entry
-    /// per VAD decision (each 512-sample frame processed, feeding its new
-    /// 256-sample half to the VAD).
-    pub per_hop_vad: Vec<bool>,
 }
 
 #[cfg(feature = "voice-tests")]
 impl DetectionInstrumentation {
     pub fn new() -> Self {
         Self {
-            per_frame_scores: Vec::new(),
-            n_frames_below_reset: 0,
             vad_speech_frames: 0,
             peak_score: 0.0,
-            adaptive_threshold_trajectory: Vec::new(),
-            ceiling_limited_frames: 0,
-            first_trigger_frame_idx: None,
-            per_hop_vad: Vec::new(),
         }
     }
 }
@@ -4006,9 +3983,6 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // accumulated count from previous calls so the counter is continuous.
     let mut hop_count = ctx.segment_silence_hops;
 
-    #[cfg(feature = "voice-tests")]
-    let mut per_hop_vad: Vec<bool> = Vec::new();
-
     while ctx.vad_cursor + FRAME_LENGTH <= ctx.audio_buffer.len() {
         let frame = &ctx.audio_buffer[ctx.vad_cursor..ctx.vad_cursor + FRAME_LENGTH];
         // ── VAD check ──
@@ -4047,8 +4021,6 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
         } else {
             hop_count += 1;
         }
-        #[cfg(feature = "voice-tests")]
-        per_hop_vad.push(is_speech);
         ctx.vad_cursor += HOP_LENGTH;
         ctx.last_score_sample_count += HOP_LENGTH;
     }
@@ -4109,32 +4081,14 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
 
                 // The underscore-prefixed bindings are intentionally unused in
                 // the default build (the instrumentation block below is
-                // voice-tests-only), so the usage sites carry an expect for
+                // voice-tests-only), so the usage site carries an expect for
                 // clippy::used_underscore_binding instead of renaming them
                 // (which would warn about unused variables without voice-tests).
                 #[cfg(feature = "voice-tests")]
                 #[expect(clippy::used_underscore_binding)]
                 {
-                    ctx.instrumentation.per_frame_scores.push([
-                        _total_score,
-                        _rolling_sum,
-                        _effective_threshold,
-                    ]);
-                    if _total_score < NO_MATCH_RESET_THRESHOLD {
-                        ctx.instrumentation.n_frames_below_reset += 1;
-                    }
-                    ctx.instrumentation
-                        .adaptive_threshold_trajectory
-                        .push(_effective_threshold);
-                    if _effective_threshold >= ADAPTIVE_CEILING {
-                        ctx.instrumentation.ceiling_limited_frames += 1;
-                    }
                     if _rolling_sum > ctx.instrumentation.peak_score {
                         ctx.instrumentation.peak_score = _rolling_sum;
-                    }
-                    if detected {
-                        ctx.instrumentation.first_trigger_frame_idx =
-                            Some(ctx.instrumentation.per_frame_scores.len() - 1);
                     }
                 }
 
@@ -4151,9 +4105,6 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             }
         }
     }
-
-    #[cfg(feature = "voice-tests")]
-    ctx.instrumentation.per_hop_vad.extend(per_hop_vad);
 
     // ── Detection→recording handoff ──
     // When detection fires, the raw ring is moved into command_buffer so
