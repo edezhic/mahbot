@@ -209,7 +209,9 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     // Nightly workspace re-analysis: checks for new git commits and
     // triggers rediscover during the 2-3 AM local time window, gated to
-    // at most one pass per 7 days (rolling, recorded at pass start).
+    // at most one pass per 7 days (rolling, recorded at pass start); each
+    // allowed pass also dispatches the fire-and-forget temp-dir cleaner
+    // (Sanitation).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

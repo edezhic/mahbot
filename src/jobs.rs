@@ -225,6 +225,11 @@ pub(crate) enum SpawnChild {
     /// name) so the row holds the run folder until the cleanup completes —
     /// the folder is released by the cleanup tail (folder first, row last).
     ResearchCleanup,
+    /// A periodic OS temp-dir cleaner Sanitation agent (fire-and-forget, see
+    /// `crate::temp_cleanup`). No child row: the jobs row's `task` holds the
+    /// cleanup prompt. Leftover rows are terminalized at boot (never
+    /// resumed) — the cleaner's ephemeral workspace is never registered.
+    TempCleanup,
     /// ticket_stage_jobs (id, ticket_id, stage, phase, round).
     TicketStage {
         ticket_id: String,
@@ -244,6 +249,7 @@ impl SpawnChild {
             Self::Analyze => "analyze",
             Self::Research => "research",
             Self::ResearchCleanup => "research_cleanup",
+            Self::TempCleanup => "temp_cleanup",
             Self::TicketStage { .. } => "ticket_stage",
         }
     }
@@ -294,9 +300,9 @@ pub(crate) async fn spawn_job(
         .with_context(|| format!("failed to insert agent roster for job {id}"))?;
     }
     match child {
-        // Analyze / ResearchCleanup are pure kind markers — the job row alone
-        // drives resume (the cleanup prompt lives in jobs.task).
-        SpawnChild::Analyze | SpawnChild::ResearchCleanup => {}
+        // Analyze / ResearchCleanup / TempCleanup are pure kind markers — the
+        // job row alone drives resume (the cleanup prompt lives in jobs.task).
+        SpawnChild::Analyze | SpawnChild::ResearchCleanup | SpawnChild::TempCleanup => {}
         SpawnChild::Research => {
             tx.execute(
                 "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
@@ -1314,6 +1320,21 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                 // already happened there. Silently accept the canonical kind
                 // here so it never trips the catch-all below (the first loop
                 // resumes exactly the same job rows this loop iterates).
+            }
+            "temp_cleanup" => {
+                // A periodic OS temp-dir cleaner interrupted by a crash.
+                // Fire-and-forget: the cleanup is best-effort and the next
+                // scheduled pass re-runs it, so a leftover row is
+                // terminalized (never resumed). The cleaner's workspace is a
+                // synthetic ephemeral name that is never registered in
+                // workspaces.db — resuming would hit run_management's
+                // unresolvable-workspace path; terminalizing here keeps that
+                // explicit and skips the catch-all warning.
+                info!(
+                    job = %job.id,
+                    "Temp-dir cleanup row left over from a previous lifetime — terminalizing (fire-and-forget, no resume)",
+                );
+                let _ = terminalize_job(conn, &job.id).await;
             }
             _ => {
                 warn!(job = %job.id, kind = %job.kind, "Unknown job kind — skipping");
@@ -2407,6 +2428,48 @@ mod tests {
         assert_eq!(
             updated, now,
             "capped cleanup must not be checkpointed — updated_at unchanged so the 8h purge can reclaim the row"
+        );
+    }
+
+    /// A `temp_cleanup` row left over from a previous lifetime (crash
+    /// mid-cleaner) must be TERMINALIZED at boot, never resumed: the cleaner
+    /// is fire-and-forget, its workspace is a synthetic ephemeral name that
+    /// is never registered in workspaces.db, and the next scheduled pass
+    /// re-runs the cleanup cleanly.
+    #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // recover_from_restart resets the shared global board
+    async fn recover_from_restart_terminalizes_temp_cleanup_rows() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let now = crate::turso::now();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
+             created_at, updated_at) \
+             VALUES ('jtmpclean', 'temp_cleanup', 'launched', '', 'tmp', 'sanitation', 0, ?1, ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        let resumable = recover_from_restart().await.unwrap();
+        // Terminalized: the row is GONE and no resumable stage references it.
+        let remaining = conn
+            .query(
+                "SELECT COUNT(*) FROM jobs WHERE id = 'jtmpclean' AND kind = 'temp_cleanup'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining[0].get::<i64>(0).unwrap(),
+            0,
+            "temp_cleanup row must be terminalized at boot (fire-and-forget, no resume)"
+        );
+        assert!(
+            !resumable.iter().any(|r| matches!(
+                r,
+                ResumableStage::ResearchCleanup { job_id, .. } if job_id.as_str() == "jtmpclean"
+            )),
+            "no resumable entry may refer to the temp_cleanup row"
         );
     }
 

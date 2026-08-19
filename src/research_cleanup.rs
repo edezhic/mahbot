@@ -15,7 +15,10 @@
 //! tail ([`run_cleanup_agent_and_finish`]) releases the search-engine state,
 //! deletes the whole folder, then terminalizes the cleanup row. Folders of
 //! crashed runs are left for the OS — the daemon builds no mechanisms for
-//! crash leftovers, so there are no boot or periodic run-folder sweeps.
+//! crash leftovers, so there are no boot or periodic run-folder sweeps. The
+//! only periodic temp sweep (the temp-dir cleaner, see `crate::temp_cleanup`)
+//! protects research run folders by prompt instruction — the daemon builds
+//! no programmatic run-folder sweeps.
 //!
 //! ## Command dump + Sanitation cleanup
 //!
@@ -389,6 +392,9 @@ pub(crate) async fn dispatch_cleanup_for_pending_envelope(
 /// The cleanup Sanitation agent id for a run. Single builder — the
 /// transient-prefix invariant test in session/mod.rs asserts against it, so a
 /// format change is caught by tests instead of silently leaking sessions.
+/// Shared by ALL transient `cleanup_` Sanitation agents: the research-run
+/// cleanup AND the periodic temp-dir cleaner (`crate::temp_cleanup`), so the
+/// transient-prefix invariant test covers both.
 #[must_use]
 pub(crate) fn cleanup_agent_id(job_id: &str) -> String {
     format!("cleanup_{job_id}")
@@ -468,8 +474,8 @@ pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Resu
 /// header during the cleanup window (all other run members have deregistered
 /// by then). Purely presentational — never affects cleanup behavior.
 ///
-/// Delete capability: Role::Sanitation's standard toolset (Read / Search /
-/// Shell ReadOnly) already permits rm/mv/cp under the allowed temp roots —
+/// Delete capability: Role::Sanitation's standard toolset (Read / Shell
+/// ReadOnly) already permits rm/mv/cp under the allowed temp roots —
 /// the readonly guard's TEMP_MUTATORS gate on the path, not the role. The
 /// cleanup agent therefore needs NO custom toolset.
 pub(crate) async fn dispatch_research_cleanup(

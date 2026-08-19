@@ -1693,6 +1693,10 @@ fn has_new_commits(last_analyzed_commit: Option<&str>, current_hash: &str) -> bo
 ///   a pass — the timestamp is written before any workspace is inspected, so
 ///   an unpause right after an empty pass waits for the next eligible night
 ///   (manual Reanalyze stays available and ungated).
+/// * **Temp-dir cleaner**: each allowed pass also dispatches the periodic
+///   temp-dir cleaner (`crate::temp_cleanup`) fire-and-forget from inside
+///   the gated block, so it inherits the at-most-once-per-7-days cadence
+///   and is fully isolated from workspace processing.
 /// * **Pass-start timestamp write failure**: fail-closed — the pass is
 ///   skipped so the at-most-once-per-7-days invariant holds; the next
 ///   eligible night retries.
@@ -1728,6 +1732,17 @@ pub async fn run_nightly_check_loop() {
         // [`nightly_gate_should_run`].
         if !nightly_gate_should_run(crate::config_db::CONFIG_STORE.get()).await {
             continue;
+        }
+
+        // Periodic temp-dir cleaner (fire-and-forget, Sanitation role):
+        // dispatched INSIDE the gated block so it inherits the pass cadence
+        // (at most one cleaner per 7 days — the gate's pass-start timestamp
+        // also dedups the two 30-min wakes in this window). Fully isolated
+        // from the discovery pass: a dispatch failure only logs and the pass
+        // proceeds (and vice versa — a pass failure never blocks the next
+        // week's cleaner).
+        if let Err(e) = crate::temp_cleanup::dispatch_temp_cleanup().await {
+            tracing::warn!(error = %e, "Nightly check: temp-dir cleaner dispatch failed — discovery pass continues");
         }
 
         let store = if let Some(s) = WORKSPACES.get() {

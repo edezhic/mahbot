@@ -258,7 +258,7 @@ use crate::tools::{
 
 impl Role {
     /// Core read/search/read-only-shell tools for inspector-style roles
-    /// (Analyst, QA, Reviewer, Discovery, Sanitation, Maintainer).
+    /// (Analyst, QA, Reviewer, Discovery, Maintainer).
     fn readonly_core_tools() -> Vec<Box<dyn Tool>> {
         vec![
             Box::new(ReadTool),
@@ -313,8 +313,19 @@ impl Role {
                 t
             }
             Role::Coder => Self::full_core_tools(),
-            Role::Qa | Role::Reviewer | Role::Discovery | Role::Sanitation => {
-                Self::readonly_core_tools()
+            Role::Qa | Role::Reviewer | Role::Discovery => Self::readonly_core_tools(),
+            Role::Sanitation => {
+                // Sanitation deliberately has NO search tools (local `search`
+                // or `web_search`): the role inspects and cleans specific
+                // filesystem artifacts and never needs to index the temp tree
+                // or hit the web — for the periodic temp-dir cleaner a
+                // `search` over the whole temp folder would index junk and
+                // start filesystem watchers. Read + read-only shell cover
+                // inspection and temp-root mutation (mahbot-1779).
+                vec![
+                    Box::new(ReadTool),
+                    Box::new(ShellTool::new(ShellMode::ReadOnly)),
+                ]
             }
             Role::Artist => {
                 vec![
@@ -341,7 +352,7 @@ impl Role {
             }
         };
 
-        if !matches!(self, Role::Manager) {
+        if !matches!(self, Role::Manager | Role::Sanitation) {
             Self::add_web_search_tool(&mut tools);
         }
 
@@ -354,7 +365,9 @@ impl Role {
     /// is configured but its API key is missing, no tool is added.
     /// Auto-selection: Firecrawl wins ties (both keys set, no preference).
     /// The caller is responsible for skipping this for Manager (who is
-    /// expected to delegate web searches to analysts via [`AnalyzeTool`]).
+    /// expected to delegate web searches to analysts via [`AnalyzeTool`])
+    /// and Sanitation (whose toolset is deliberately search-free — see
+    /// [`Role::tools`]).
     fn add_web_search_tool(tools: &mut Vec<Box<dyn Tool>>) {
         let provider = CONFIG.web_search_provider();
         let firecrawl_key = CONFIG.firecrawl_key();
@@ -485,6 +498,29 @@ mod tests {
                 role.as_str()
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+    fn sanitation_toolset_is_read_and_shell_only() {
+        // Acceptance pin (mahbot-1779): the Sanitation role advertises NO
+        // search tools — even with web search configured — exactly read +
+        // read-only shell.
+        let snapshot = crate::config::CONFIG.snapshot();
+        crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
+        let _ = crate::config::CONFIG.set_string_field("web_search_provider", "exa");
+        let _ = crate::config::CONFIG.set_string_field("exa_key", "test-key");
+        let names: Vec<&str> = crate::Role::Sanitation
+            .tools(&crate::workspace::test_ws("test"))
+            .iter()
+            .map(|t| t.name())
+            .collect();
+        crate::config::CONFIG.swap(snapshot);
+        assert_eq!(
+            names,
+            ["read", "shell"],
+            "Sanitation toolset must be exactly read + read-only shell, got: {names:?}"
+        );
     }
 
     #[test]
