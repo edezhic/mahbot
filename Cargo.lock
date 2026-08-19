@@ -3891,6 +3891,7 @@ dependencies = [
  "ogg",
  "opus-decoder",
  "paste",
+ "pulldown-cmark",
  "qwen-asr",
  "rand 0.10.2",
  "regex",

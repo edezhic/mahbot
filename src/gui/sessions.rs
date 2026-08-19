@@ -1052,9 +1052,12 @@ impl SessionsState {
 /// (`AutoRefreshResult`) to keep the decoding logic in a single place.
 ///
 /// The display text is the decoded assistant/tool-result content (falling
-/// back to the raw stored content) — the exact text the markdown body and
-/// the collapse measurement both see, so the measured line count matches the
-/// rendered body.
+/// back to the raw stored content) — the exact text the collapse measurement
+/// sees, so the measured line count matches the rendered body. The markdown
+/// body additionally runs [`escape_html_blocks`] first: angle-bracket tag
+/// blocks are otherwise classified as HTML and dropped wholesale at parse
+/// time (the collapsed preview is plain text, which is why the content is
+/// visible collapsed but vanished when expanded via 'Show more').
 fn parse_messages_to_md_items(messages: &[ChatMessage]) -> Vec<Vec<markdown::Item>> {
     messages
         .iter()
@@ -1066,9 +1069,88 @@ fn parse_messages_to_md_items(messages: &[ChatMessage]) -> Vec<Vec<markdown::Ite
                 })
                 .unwrap_or_else(|| m.content.clone());
             let processed = super::media_markers::preprocess(&display);
-            markdown::parse(&processed).collect()
+            let escaped = escape_html_blocks(&processed);
+            markdown::parse(&escaped).collect()
         })
         .collect()
+}
+
+/// Markdown options iced's `markdown::parse` runs with (iced_widget
+/// `src/markdown.rs`, `parse_with`). [`escape_html_blocks`] pre-scans with the
+/// exact same option set so it classifies HTML regions identically to the real
+/// parse; keep in sync if iced's defaults change.
+fn iced_markdown_options() -> pulldown_cmark::Options {
+    pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | pulldown_cmark::Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
+        | pulldown_cmark::Options::ENABLE_TABLES
+        | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
+        | pulldown_cmark::Options::ENABLE_TASKLISTS
+}
+
+/// Escape `<` → `&lt;` only inside the regions the markdown parser classifies
+/// as HTML (block-level `Event::Html` plus inline `Event::InlineHtml`), so
+/// angle-bracket tag blocks (`<system-notification>`, `<analyze-tool-result>`,
+/// `<timestamp>` …) render as visible literal text on the Sessions transcript
+/// instead of being dropped wholesale.
+///
+/// This is deliberately a Sessions-only, `<`-only escape: the shared
+/// `media_markers::preprocess` / `selectable_markdown_view` / `theme` helpers
+/// used by Home/board/workspaces are untouched, and `util::escape_html` is
+/// not reused (it also escapes `>` — breaking blockquotes — and `&`, which
+/// would double-encode existing entities).
+///
+/// Pre-scanning with the same pulldown-cmark parser iced uses confines the
+/// change to exactly the bytes that would be dropped: autolinks
+/// (`<https://…>`), code spans and fenced code blocks are not HTML events and
+/// pass through byte-identical, avoiding both trade-offs of a whole-string
+/// escape (dead autolinks, `&lt;` entities inside code). Re-parsing the
+/// escaped text also re-interprets the block's inner content as markdown, so
+/// bold/lists/code/links keep working.
+///
+/// Returns a borrowed `Cow` when the text has no `<` at all (the per-second
+/// auto-refresh reparse fast path for the common tag-free message) or the
+/// scan finds no HTML regions.
+fn escape_html_blocks(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('<') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(text, iced_markdown_options()).into_offset_iter()
+    {
+        match event {
+            pulldown_cmark::Event::Html(_) | pulldown_cmark::Event::InlineHtml(_) => {
+                ranges.push(range);
+            }
+            _ => {}
+        }
+    }
+    if ranges.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    // Events arrive in document order with disjoint ranges; merge overlapping
+    // or adjacent ones so multi-line HTML blocks collapse into single
+    // replacement regions.
+    ranges.sort_by_key(|r| (r.start, r.end));
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    let mut out = String::with_capacity(text.len() + merged.len() * 4);
+    let mut pos = 0;
+    for range in &merged {
+        out.push_str(&text[pos..range.start]);
+        out.push_str(&text[range.clone()].replace('<', "&lt;"));
+        pos = range.end;
+    }
+    out.push_str(&text[pos..]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Resolve the collapse measurement for message `i` at the current
