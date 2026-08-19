@@ -11,10 +11,13 @@ use crate::config_db::ConfigStore;
 use crate::role::DIAGNOSTICS_ROLE;
 use crate::session::discovery_agent_id;
 use crate::turso::{self, Value};
+use crate::util::UnwrapPoison;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike, Utc};
 use futures_util::future::join_all;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use strum::IntoEnumIterator;
 use tracing::warn;
 
@@ -162,12 +165,12 @@ async fn check_generation(
 /// if it no longer matches, a newer [`WorkspaceStore::rediscover`] call has been made and this
 /// task's result is stale — the write is skipped silently.
 ///
-/// Returns `Ok(())` on success, or an error describing what went wrong.
+/// Returns `Ok(())` on success, or a classified [`DiscoveryRunError`].
 async fn run_workspace_discovery(
     ws: &Workspace,
     role: Role,
     discovery_generation: i64,
-) -> Result<()> {
+) -> Result<(), DiscoveryRunError> {
     run_discovery_task(
         ws,
         role.discovery_prompt(),
@@ -179,7 +182,10 @@ async fn run_workspace_discovery(
 
 /// Run general (non-role) workspace discovery — a project overview used by
 /// non-agent LLM calls. Stored as the NULL-role context row.
-async fn run_general_discovery(ws: &Workspace, discovery_generation: i64) -> Result<()> {
+async fn run_general_discovery(
+    ws: &Workspace,
+    discovery_generation: i64,
+) -> Result<(), DiscoveryRunError> {
     run_discovery_task(
         ws,
         crate::prompt::load_prompt("discovery/general.md"),
@@ -198,7 +204,7 @@ async fn run_discovery_task(
     prompt: String,
     discovery_generation: i64,
     role: Option<&str>,
-) -> Result<()> {
+) -> Result<(), DiscoveryRunError> {
     let label = role.unwrap_or("general");
     let storage = WORKSPACES
         .get()
@@ -209,14 +215,17 @@ async fn run_discovery_task(
 
     // Create a Discovery agent pointed at the workspace
     let agent_id = discovery_agent_id(&ws.name, label);
-    let (_agent, response) =
+    let (agent, response) =
         run_default_agent(&agent_id, Role::Discovery, ws, &prompt, None, None, None).await;
-    let response =
-        response.context("Discovery agent returned no response (cancelled or failed)")?;
+    let Some(response) = response else {
+        return Err(discovery_no_response_error(&agent, "Discovery"));
+    };
 
     let content = response.trim().to_string();
     if content.is_empty() {
-        anyhow::bail!("Empty response for '{label}'");
+        return Err(DiscoveryRunError::fatal(anyhow::anyhow!(
+            "Empty response for '{label}'"
+        )));
     }
 
     // Guard against stale writes: if another rediscover has been triggered
@@ -239,7 +248,7 @@ async fn run_discovery_task(
     };
     if let Err(e) = result {
         tracing::error!(workspace_name = ws.name, role = %label, error = %e, "Failed to store context");
-        return Err(e);
+        return Err(DiscoveryRunError::fatal(e));
     }
 
     tracing::info!(workspace_name = ws.name, role = %label, "Workspace discovery for {label} completed");
@@ -258,7 +267,10 @@ async fn run_discovery_task(
 /// was triggered while diagnostics were being computed, the write is skipped.
 ///
 /// On failure, existing diagnostics data is left untouched.
-async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) -> Result<()> {
+async fn run_workspace_diagnostics(
+    ws: &Workspace,
+    diagnostics_generation: i64,
+) -> Result<(), DiscoveryRunError> {
     let storage = WORKSPACES
         .get()
         .context("WORKSPACES not initialized")?
@@ -273,7 +285,9 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
 
     let (agent, response) =
         run_default_agent(&agent_id, Role::Discovery, ws, &prompt, None, None, None).await;
-    response.context("Diagnostics discovery agent returned no response (cancelled or failed)")?;
+    let Some(_response) = response else {
+        return Err(discovery_no_response_error(&agent, "Diagnostics discovery"));
+    };
 
     // Keep the Agent alive after run_default_agent() for extract_verdict —
     // it needs agent.session.history() and agent.tool_specs.
@@ -287,7 +301,7 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
     let cmds: crate::DiagnosticsCommands = agent
         .extract_verdict(&extraction_prompt, None, None)
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(|e| DiscoveryRunError::classified(&agent, anyhow::Error::from(e)))?;
 
     // Guard against stale writes.
     if !check_generation(
@@ -325,16 +339,25 @@ async fn run_workspace_diagnostics(ws: &Workspace, diagnostics_generation: i64) 
 ///
 /// ## Invariants
 ///
-/// - If `all_ok`: sets status to `ready` and unpauses the workspace. The
-///   discovery flow itself set the analysis pause (`add`/`rediscover` write
-///   `paused = 1` alongside `status = Analyzing`), and rediscovery is the
-///   documented unpause path — so a successful discovery clears it. While
-///   that pause is set, the claim pipeline's pause gate also holds automatic
-///   Backlog→Analysis and ReadyForDevelopment→InDevelopment claims (see
-///   `run_claim_pipeline` in the management module), so queued backlog/RFD
-///   tickets wait out the discovery and are picked up on the next poll cycle
-///   after this unpause.
-/// - If **not** `all_ok`: sets status to `failed` and leaves `paused` untouched.
+/// - [`DiscoveryOutcome::AllOk`]: sets status to `ready` and unpauses the
+///   workspace. The discovery flow itself set the analysis pause
+///   (`add`/`rediscover`/pickup write `paused = 1` alongside
+///   `status = Analyzing`), and rediscovery is the documented unpause path —
+///   so a successful discovery clears it. While that pause is set, the claim
+///   pipeline's gate also holds automatic Backlog→Analysis and
+///   ReadyForDevelopment→InDevelopment claims (see `run_claim_pipeline` in
+///   the management module), so queued backlog/RFD tickets wait out the
+///   discovery and are picked up on the next poll cycle after this unpause.
+/// - [`DiscoveryOutcome::Fatal`] (at least one non-provider failure — runtime
+///   errors, parse failures): sets status to `failed` (terminal, manual
+///   Re-analyze as before) and leaves `paused` untouched. Panics never reach
+///   this branch — they abort the spawned task and are recovered by boot
+///   reclassification to `pending` (see [`spawn_panic_guarded`]).
+/// - [`DiscoveryOutcome::Transient`] (every failure is provider-class —
+///   auth/quota/transport/5xx/shutdown): sets status to `pending` and arms
+///   the in-memory pickup cooldown, so the management poll's pickup step
+///   retries the workspace once the provider is available again (no retry
+///   storm). `paused` stays 1 (the analysis pause).
 /// - Before any write, checks the generation guard: if a newer [`WorkspaceStore::rediscover`]
 ///   bumped the generation while discovery was in flight, the writes are skipped.
 ///
@@ -350,7 +373,7 @@ async fn finalize_discovery(
     ws_name: &str,
     ws_path: &str,
     discovery_generation: i64,
-    all_ok: bool,
+    outcome: DiscoveryOutcome,
     errors: &[String],
 ) {
     // Final guard: if a newer rediscover was triggered while this task ran,
@@ -368,42 +391,371 @@ async fn finalize_discovery(
         return;
     }
 
-    if all_ok {
-        // Capture the current git HEAD commit hash for nightly re-analysis detection.
-        // If the git command fails (not a git repo, no commits, or other error),
-        // store NULL — this is not an error for the discovery itself.
-        let commit_hash = crate::git_commands::run_git_head(std::path::Path::new(ws_path))
-            .await
-            .ok();
+    match outcome {
+        DiscoveryOutcome::AllOk => {
+            // Success — any prior provider-failure cooldown is obsolete.
+            clear_pending_pickup_cooldown(ws_name);
 
-        if let Err(e) = storage
-            .exec_update_with_updated_at(
-                "status = ?, paused = 0, last_analyzed_commit = ?",
-                vec![
-                    Value::from(WorkspaceStatus::Ready.to_string()),
-                    Value::from(commit_hash.as_deref()),
-                ],
-                ws_name,
-            )
-            .await
-        {
-            tracing::warn!(
-                workspace = ws_name,
-                error = %e,
-                "Failed to update workspace status after discovery",
+            // Capture the current git HEAD commit hash for nightly re-analysis detection.
+            // If the git command fails (not a git repo, no commits, or other error),
+            // store NULL — this is not an error for the discovery itself.
+            let commit_hash = crate::git_commands::run_git_head(std::path::Path::new(ws_path))
+                .await
+                .ok();
+
+            if let Err(e) = storage
+                .exec_update_with_updated_at(
+                    "status = ?, paused = 0, last_analyzed_commit = ?",
+                    vec![
+                        Value::from(WorkspaceStatus::Ready.to_string()),
+                        Value::from(commit_hash.as_deref()),
+                    ],
+                    ws_name,
+                )
+                .await
+            {
+                tracing::warn!(
+                    workspace = ws_name,
+                    error = %e,
+                    "Failed to update workspace status after discovery",
+                );
+            }
+
+            tracing::info!(workspace = ws_name, "Workspace pipeline resumed");
+            tracing::info!(
+                workspace_name = ws_name,
+                "Workspace analysis complete — all roles ready"
             );
         }
-
-        tracing::info!(workspace = ws_name, "Workspace pipeline resumed");
-        tracing::info!(
-            workspace_name = ws_name,
-            "Workspace analysis complete — all roles ready"
-        );
-    } else {
-        let msg = errors.join("; ");
-        let _ = storage.set_status(ws_name, &WorkspaceStatus::Failed).await;
-        tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
+        DiscoveryOutcome::Fatal => {
+            let msg = errors.join("; ");
+            // Terminal — the workspace leaves the pending-pickup cycle; drop any
+            // cooldown armed by an earlier provider-class failure.
+            clear_pending_pickup_cooldown(ws_name);
+            if let Err(e) = storage.set_status(ws_name, &WorkspaceStatus::Failed).await {
+                // A failed write strands the workspace in `analyzing` until boot
+                // recovery — log so it is not silent.
+                tracing::warn!(
+                    workspace = ws_name,
+                    error = %e,
+                    "Failed to mark workspace Failed after fatal discovery failure"
+                );
+            }
+            tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
+        }
+        DiscoveryOutcome::Transient => {
+            // Every failure was provider-class: return to pending. The pickup step
+            // retries after the in-memory cooldown — the workspace waits for the
+            // provider (or a key fix) without burning retry budgets repeatedly.
+            //
+            // Arm the cooldown BEFORE the status write: while the row is still
+            // `analyzing` the pickup step cannot claim it, so there is no window
+            // where a poll round sees `pending` with no cooldown armed and spawns
+            // a duplicate discovery run (arming after the await would leave a
+            // TOCTOU gap that defeats the cooldown for this cycle).
+            record_pending_pickup_cooldown(ws_name);
+            if let Err(e) = storage.set_status(ws_name, &WorkspaceStatus::Pending).await {
+                // A failed write strands the workspace in `analyzing` with the
+                // cooldown armed until boot recovery — log so it is not silent.
+                tracing::warn!(
+                    workspace = ws_name,
+                    error = %e,
+                    "Failed to return workspace to Pending after provider-class failure"
+                );
+            }
+            tracing::warn!(
+                workspace_name = ws_name,
+                error = %errors.join("; "),
+                "Workspace analysis stalled on provider failure — pending pickup retry after cooldown"
+            );
+        }
     }
+}
+
+// ── Discovery failure classification ──────────────────────────────
+
+/// Two-bucket classification of a discovery failure.
+///
+/// * [`DiscoveryFailureKind::Transient`] — provider-class (auth 401/403,
+///   quota/insufficient balance, transport/unreachable/5xx, shutdown/cancel):
+///   the workspace returns to Pending and the pickup step retries it after an
+///   in-memory cooldown.
+/// * [`DiscoveryFailureKind::Fatal`] — genuine failure (internal runtime
+///   errors, parse failures): the workspace goes Failed, terminal (manual
+///   Re-analyze as before). Panics never reach this classifier — they abort
+///   the spawned discovery task and strand the workspace in `analyzing` until
+///   the boot reclassification reclasses it to `pending` (a retryable
+///   treatment, not terminal Failed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DiscoveryFailureKind {
+    Transient,
+    Fatal,
+}
+
+/// A discovery failure carrying its two-bucket classification.
+///
+/// The classification rides the error so the parallel discovery tasks in
+/// [`spawn_workspace_discovery`] can aggregate mixed outcomes with a
+/// "any fatal → Failed" precedence without string matching.
+#[derive(Debug)]
+struct DiscoveryRunError {
+    kind: DiscoveryFailureKind,
+    error: anyhow::Error,
+}
+
+impl DiscoveryRunError {
+    fn transient(error: anyhow::Error) -> Self {
+        Self {
+            kind: DiscoveryFailureKind::Transient,
+            error,
+        }
+    }
+
+    fn fatal(error: anyhow::Error) -> Self {
+        Self {
+            kind: DiscoveryFailureKind::Fatal,
+            error,
+        }
+    }
+
+    /// Wrap an error with the two-bucket classification for a failed
+    /// discovery agent run (the shared wrap used by every agent-failure
+    /// site in the discovery path).
+    fn classified(agent: &crate::Agent, error: anyhow::Error) -> Self {
+        match classify_discovery_failure(agent, Some(&error)) {
+            DiscoveryFailureKind::Transient => Self::transient(error),
+            DiscoveryFailureKind::Fatal => Self::fatal(error),
+        }
+    }
+}
+
+impl std::fmt::Display for DiscoveryRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+/// Default conversion for `?` propagation: an unclassified plain error (DB
+/// failure, missing global, ...) is a genuine runtime failure — fatal.
+/// Agent-run failures must NOT use this conversion: they go through
+/// [`DiscoveryRunError::classified`], which buckets the typed
+/// [`crate::retry::FailureClass`] — that is the only path that yields
+/// [`DiscoveryRunError::transient`].
+impl From<anyhow::Error> for DiscoveryRunError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::fatal(error)
+    }
+}
+
+/// Classify a failed discovery agent run into the two-bucket scheme.
+///
+/// Mirrors [`crate::agent::failure_classification`] ordering: drain/shutdown/
+/// user-cancel are treated as transient (the run was cut short, not a genuine
+/// failure — the workspace retries after restart/cooldown; a user-cancelled
+/// discovery deliberately returns to Pending instead of the historical
+/// terminal Failed, since cancellation is not a workspace defect). A typed
+/// [`crate::retry::RetryExhausted`] class decides provider-vs-genuine for
+/// retry-loop terminations; everything else (untyped runtime errors) is
+/// fatal. Panics never reach the classifier — they abort the spawned task
+/// and strand the workspace in `analyzing` until boot reclassifies it to
+/// `pending` (see [`spawn_panic_guarded`]).
+///
+/// ## Deliberate bucket decisions
+///
+/// * **`NonRetryable` → Transient** — the class covers auth 401/403 (the
+///   ticket's primary "bad or missing key" case) as well as invalid-model and
+///   tool-schema 400s. All of these are *config*-fixable — the workspace must
+///   wait in Pending for the user to correct the settings rather than go
+///   terminal Failed. The escalating cooldown bounds the retry rate, so a
+///   permanently-wrong config cannot burn unbounded tokens.
+/// * **`WallClockExceeded` → Transient** — the 12-minute retry budget being
+///   exhausted is almost always the symptom of sustained provider
+///   unavailability, which the cooldown is designed to ride out.
+/// * **`Parse`/validation classes → Fatal** — the provider answered, so the
+///   failure is a genuine pipeline/format defect; retrying later would not
+///   help.
+///
+/// `error` is the raw error when one is available at the call site (e.g. a
+/// failed `extract_verdict`); the typed class captured by `run_agent` on the
+/// agent takes precedence (it is the original error of the agent loop).
+fn classify_discovery_failure(
+    agent: &crate::Agent,
+    error: Option<&anyhow::Error>,
+) -> DiscoveryFailureKind {
+    if crate::shutdown::is_draining()
+        || crate::shutdown::shutdown_token().is_cancelled()
+        || agent.is_cancelled()
+    {
+        return DiscoveryFailureKind::Transient;
+    }
+    let class = agent
+        .failure_class
+        .or_else(|| error.and_then(crate::agent::failure_class_from_error));
+    let Some(class) = class else {
+        return DiscoveryFailureKind::Fatal;
+    };
+    match class {
+        crate::retry::FailureClass::Transport
+        | crate::retry::FailureClass::TruncatedEnvelope
+        | crate::retry::FailureClass::NoResponse
+        | crate::retry::FailureClass::TruncatedOutput
+        | crate::retry::FailureClass::NonRetryable
+        | crate::retry::FailureClass::WallClockExceeded
+        | crate::retry::FailureClass::Shutdown => DiscoveryFailureKind::Transient,
+        crate::retry::FailureClass::Parse
+        | crate::retry::FailureClass::OutOfRangeScore
+        | crate::retry::FailureClass::Membership
+        | crate::retry::FailureClass::Completeness
+        | crate::retry::FailureClass::ContradictionAgents
+        | crate::retry::FailureClass::ValidationOther => DiscoveryFailureKind::Fatal,
+    }
+}
+
+/// Aggregate outcome of a discovery run — encodes the success/fatal/transient
+/// trichotomy structurally (a success implies no fatal failure), replacing a
+/// pair of bools that could express invalid combinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryOutcome {
+    /// Every sub-run succeeded.
+    AllOk,
+    /// At least one fatal (non-provider) failure — terminal `Failed`.
+    Fatal,
+    /// Only provider-class (transient) failures — return to `Pending`.
+    Transient,
+}
+
+/// Fold one discovery sub-run result into the aggregate outcome shared by the
+/// role/general/diagnostics sites in [`spawn_workspace_discovery`]: degrades
+/// [`DiscoveryOutcome::AllOk`] on any error, forces
+/// [`DiscoveryOutcome::Fatal`] on fatal errors ("any fatal → Failed"
+/// precedence), and records the error string (with `prefix`) for the finalize
+/// message. Error strings are scrubbed here so agent failure chains (which
+/// may embed provider error bodies) never reach the finalize logs
+/// unscrubbed.
+fn fold_discovery_result(
+    outcome: &mut DiscoveryOutcome,
+    errors: &mut Vec<String>,
+    result: Result<(), DiscoveryRunError>,
+    prefix: &str,
+) {
+    if let Err(e) = result {
+        errors.push(crate::util::scrub_credentials(&format!("{prefix}{e}")));
+        if e.kind == DiscoveryFailureKind::Fatal {
+            *outcome = DiscoveryOutcome::Fatal;
+        } else if *outcome == DiscoveryOutcome::AllOk {
+            *outcome = DiscoveryOutcome::Transient;
+        }
+    }
+}
+
+/// Build the classified error for an agent run that produced no response.
+/// Shared by [`run_discovery_task`] and [`run_workspace_diagnostics`] — the
+/// only difference between the two sites is the task label in the message.
+fn discovery_no_response_error(agent: &crate::Agent, task_label: &str) -> DiscoveryRunError {
+    DiscoveryRunError::classified(
+        agent,
+        anyhow::anyhow!(
+            "{task_label} agent returned no response: {}",
+            agent.failure_reason("unknown error")
+        ),
+    )
+}
+
+// ── Pending-pickup cooldown (in-memory) ───────────────────────────
+
+/// Base cooldown for the first provider-class discovery failure (15 min).
+const PENDING_PICKUP_COOLDOWN_BASE_MINS: u64 = 15;
+/// Ceiling for the escalating pickup cooldown (4 h).
+const PENDING_PICKUP_COOLDOWN_MAX_MINS: u64 = 240;
+
+/// Escalating cooldown for the `attempts`-th consecutive provider-class
+/// discovery failure: 15 min, 30 min, 1 h, 2 h, then 4 h forever.
+///
+/// Memory-only by design: no DB writes, no new columns; after a
+/// restart a pending workspace may be retried once immediately (acceptable).
+/// Escalation bounds the long-run retry duty cycle of a persistently-down
+/// provider — the full 12-minute retry budget no longer burns every 15
+/// minutes forever, which would violate the ticket's "no repeated 12-minute
+/// LLM-burn loops" criterion.
+fn pending_pickup_cooldown_duration(attempts: u32) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(4);
+    let minutes = (PENDING_PICKUP_COOLDOWN_BASE_MINS * 2u64.pow(exponent))
+        .min(PENDING_PICKUP_COOLDOWN_MAX_MINS);
+    Duration::from_mins(minutes)
+}
+
+/// Per-workspace cooldown state.
+#[derive(Debug, Clone, Copy)]
+struct PickupCooldown {
+    /// Instant before which the pickup step must not claim the workspace.
+    deadline: Instant,
+    /// Consecutive provider-class discovery failures since the last success
+    /// or manual reset — drives the escalating cooldown duration.
+    attempts: u32,
+}
+
+/// In-memory cooldown map: workspace name → cooldown state. Written by
+/// [`finalize_discovery`] on provider-class failure; cleared on successful
+/// discovery, manual rediscover, workspace delete, and re-add.
+static PENDING_PICKUP_COOLDOWNS: OnceLock<std::sync::Mutex<HashMap<String, PickupCooldown>>> =
+    OnceLock::new();
+
+fn pending_pickup_cooldowns() -> &'static std::sync::Mutex<HashMap<String, PickupCooldown>> {
+    PENDING_PICKUP_COOLDOWNS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Arm the (escalating) cooldown for a provider-class discovery failure: the
+/// pending pickup for `ws_name` waits before claiming it again. Each
+/// consecutive failure lengthens the wait (see
+/// [`pending_pickup_cooldown_duration`]); success, manual rediscover, delete,
+/// and re-add reset it via [`clear_pending_pickup_cooldown`].
+///
+/// In the rare race where a transient finalize lands after a concurrent
+/// delete's clear, the re-armed entry is stale — harmless (the map is bounded
+/// by workspace count) and cleared again on re-add.
+pub(crate) fn record_pending_pickup_cooldown(ws_name: &str) {
+    let mut map = pending_pickup_cooldowns().lock().unwrap_poison();
+    let attempts = map.get(ws_name).map_or(0, |c| c.attempts) + 1;
+    let deadline = Instant::now() + pending_pickup_cooldown_duration(attempts);
+    map.insert(ws_name.to_string(), PickupCooldown { deadline, attempts });
+}
+
+/// Arm the cooldown with an explicit deadline (test hook; production callers
+/// use [`record_pending_pickup_cooldown`]).
+#[cfg(test)]
+pub(crate) fn record_pending_pickup_cooldown_until(ws_name: &str, deadline: Instant) {
+    let mut map = pending_pickup_cooldowns().lock().unwrap_poison();
+    map.insert(
+        ws_name.to_string(),
+        PickupCooldown {
+            deadline,
+            attempts: 1,
+        },
+    );
+}
+
+/// Clear the cooldown for a workspace (successful discovery, manual
+/// rediscover, delete, re-add) — also resets the escalation counter.
+pub(crate) fn clear_pending_pickup_cooldown(ws_name: &str) {
+    pending_pickup_cooldowns()
+        .lock()
+        .unwrap_poison()
+        .remove(ws_name);
+}
+
+/// Whether the pickup step must wait out a cooldown for `ws_name` before
+/// claiming its pending workspace.
+///
+/// Expired entries are deliberately retained (the map is bounded by workspace
+/// count): the `attempts` escalation counter must survive expiry so the next
+/// provider-class failure arms a *longer* cooldown rather than restarting at
+/// the 15-minute base — pruning here would reset the escalation on every
+/// pickup cycle. Entries are removed by [`clear_pending_pickup_cooldown`] on
+/// success, manual rediscover, delete, and re-add.
+pub(crate) fn pending_pickup_cooldown_active(ws_name: &str) -> bool {
+    let map = pending_pickup_cooldowns().lock().unwrap_poison();
+    map.get(ws_name)
+        .is_some_and(|c| Instant::now() < c.deadline)
 }
 
 /// Spawn `future` in a panic-guarded sub-task and await it, logging a
@@ -411,8 +763,9 @@ async fn finalize_discovery(
 ///
 /// NOTE: Unlike the ticket-dispatch panic recovery (which transitions the
 /// ticket to Failed), this guard only logs and does NOT transition the
-/// workspace to "failed". Non-prompt panics will leave the workspace in
-/// "analyzing" — visible in logs but not recovered.
+/// workspace to "failed". A non-prompt panic leaves the workspace in
+/// "analyzing" — visible in logs; the boot reclassification
+/// (`reclassify_analyzing_to_pending`) recovers it at the next startup.
 async fn spawn_panic_guarded(
     ws_name: &str,
     task: &str,
@@ -440,8 +793,9 @@ async fn spawn_panic_guarded(
 /// The discovery functions use it to guard against stale writes.
 ///
 /// When `discover_diagnostics` is `false` (e.g. during a re-analysis via
-/// [`WorkspaceStore::rediscover`]), diagnostics discovery is skipped so that
-/// user-managed diagnostics survive re-analysis.
+/// [`WorkspaceStore::rediscover`], or a pickup that found existing
+/// diagnostics), diagnostics discovery is skipped so that user-managed
+/// diagnostics survive re-analysis.
 pub fn spawn_workspace_discovery(
     ws: &Workspace,
     discovery_generation: i64,
@@ -492,30 +846,24 @@ pub fn spawn_workspace_discovery(
                 (roles, general, Ok(()))
             };
 
-            let mut all_ok = true;
+            let mut outcome = DiscoveryOutcome::AllOk;
             let mut errors: Vec<String> = Vec::new();
 
             for result in role_results {
-                match result {
-                    Ok(()) => {}
-                    Err(e) => {
-                        all_ok = false;
-                        errors.push(e.to_string());
-                    }
-                }
+                fold_discovery_result(&mut outcome, &mut errors, result, "");
             }
 
-            // General context failure is fatal.
-            if let Err(e) = general_result {
-                all_ok = false;
-                errors.push(e.to_string());
-            }
-
-            // Diagnostics failure is fatal.
-            if let Err(e) = diagnostics_result {
-                all_ok = false;
-                errors.push(format!("Diagnostics discovery failed: {e}"));
-            }
+            // General/diagnostics failures fail the run; the failure kind
+            // decides whether the workspace returns to Pending (provider-class)
+            // or goes Failed (genuine). Transient diagnostics failures are
+            // retried via the pickup step, not terminal.
+            fold_discovery_result(&mut outcome, &mut errors, general_result, "");
+            fold_discovery_result(
+                &mut outcome,
+                &mut errors,
+                diagnostics_result,
+                "Diagnostics discovery failed: ",
+            );
 
             let Some(storage) = WORKSPACES.get() else {
                 tracing::error!("WORKSPACES not initialized during final status update");
@@ -527,7 +875,7 @@ pub fn spawn_workspace_discovery(
                 &ws_name_for_finalize,
                 &ws_path_for_finalize,
                 discovery_generation,
-                all_ok,
+                outcome,
                 &errors,
             )
             .await;
@@ -687,7 +1035,14 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Insert a new workspace and kick off analysis.
+    /// Insert a new workspace and register it for analysis.
+    ///
+    /// The workspace is written with status `pending` (paused=1) and the
+    /// discovery spawn is deferred to the management poll's pickup step:
+    /// discovery starts automatically once the LLM provider is configured, so
+    /// a first-run "workspace added before the key" no longer flips to Failed
+    /// seconds later. Manual Re-analyze and the nightly rediscovery path are
+    /// unaffected.
     pub async fn add(&self, name: &str, path: &str) -> Result<Workspace> {
         // Validate the workspace name.
         validate_name(name)?;
@@ -696,7 +1051,7 @@ impl WorkspaceStore {
         let canonical = canonicalize_workspace_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
         let path = ensure_trailing_slash(&canonical);
         let now = turso::now();
-        let analyzing = WorkspaceStatus::Analyzing.to_string();
+        let pending = WorkspaceStatus::Pending.to_string();
         let ws = self
             .conn
             .query_row(
@@ -704,15 +1059,15 @@ impl WorkspaceStore {
                     "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING {WORKSPACE_COLUMNS}"
                 ),
-                turso::params![name, path, analyzing, now.clone(), now.clone(), 1],
+                turso::params![name, path, pending, now.clone(), now.clone(), 1],
                 workspace_from_row,
             )
             .await?;
-        // New workspace: discovery_generation defaults to 0 in the schema.
-        // Generation 0 means "the first discovery" — if rediscover() bumps
-        // the generation before this task finishes, the task's context/
-        // diagnostics/status writes will be skipped by the generation guard.
-        spawn_workspace_discovery(&ws, 0, true);
+        // No discovery spawn here: the pickup step claims the pending
+        // workspace once the provider is configured. discovery_generation
+        // defaults to 0 in the schema — the pickup reads the live value.
+        // Clear any stale cooldown from a previously-deleted same-name row.
+        clear_pending_pickup_cooldown(name);
         // Eagerly initialize the shared search engine for this workspace.
         if let Err(e) =
             crate::search_engine::get_or_init_engine(name, std::path::Path::new(&ws.path), false)
@@ -769,6 +1124,7 @@ impl WorkspaceStore {
             )
             .await?;
         crate::search_engine::remove_engine(name);
+        clear_pending_pickup_cooldown(name);
         Ok(())
     }
 
@@ -776,6 +1132,57 @@ impl WorkspaceStore {
     pub async fn set_status(&self, name: &str, status: &WorkspaceStatus) -> Result<()> {
         self.exec_update_with_updated_at("status = ?", vec![Value::from(status.to_string())], name)
             .await
+    }
+
+    /// Atomically claim a pending workspace for its first discovery:
+    /// transitions status `pending` → `analyzing` (with the analysis pause)
+    /// and returns the row's live `discovery_generation`, captured in the same
+    /// statement so a concurrent `rediscover` generation bump cannot race the
+    /// read.
+    ///
+    /// Returns `Ok(None)` when the row was no longer pending — a concurrent
+    /// pickup, GUI Re-analyze, or delete won the race; the caller must not
+    /// spawn.
+    pub(crate) async fn claim_pending_for_discovery(&self, name: &str) -> Result<Option<i64>> {
+        self.conn
+            .query_optional(
+                "UPDATE workspaces SET status = ?, paused = 1, updated_at = ? \
+                 WHERE name = ? AND status = ? RETURNING discovery_generation",
+                turso::params![
+                    WorkspaceStatus::Analyzing.to_string(),
+                    turso::now(),
+                    name,
+                    WorkspaceStatus::Pending.to_string()
+                ],
+                |row| row.get(0),
+            )
+            .await
+    }
+
+    /// Boot recovery: discovery leaves no job rows, so a workspace still in
+    /// `analyzing` at startup means a crashed/panicked mid-discovery run.
+    /// Reclassify it to `pending` so the management poll's pickup step retries
+    /// it (or waits for the provider). Returns the number of reclassified
+    /// workspaces.
+    pub async fn reclassify_analyzing_to_pending(&self) -> Result<u64> {
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE workspaces SET status = ?, updated_at = ? WHERE status = ?",
+                turso::params![
+                    WorkspaceStatus::Pending.to_string(),
+                    turso::now(),
+                    WorkspaceStatus::Analyzing.to_string()
+                ],
+            )
+            .await?;
+        if affected > 0 {
+            tracing::info!(
+                count = affected,
+                "Boot recovery: reclassified stranded analyzing workspaces to pending"
+            );
+        }
+        Ok(affected)
     }
 
     /// Set or clear the maintenance toggle for a workspace.
@@ -924,8 +1331,16 @@ impl WorkspaceStore {
     /// Resets status to "analyzing", clears stale per-role contexts, and
     /// spawns analysis with a fresh generation counter.
     ///
-    /// Unlike [`Self::rediscover_diagnostics`], this does **not** clear or
-    /// re-discover diagnostics — user-managed diagnostics survive re-analysis.
+    /// Unlike [`Self::rediscover_diagnostics`], this does **not** clear
+    /// diagnostics — user-managed diagnostics survive re-analysis. Diagnostics
+    /// discovery runs only when none exist yet (a never-analyzed `Pending`
+    /// workspace re-analyzed manually would otherwise reach Ready with no
+    /// diagnostics ever discovered, since `add()` no longer spawns discovery);
+    /// when diagnostics are present they are preserved untouched.
+    ///
+    /// Manual Re-analyze bypasses the pending-pickup cooldown by design: it
+    /// spawns discovery immediately, so any in-memory cooldown is cleared
+    /// here (a later provider-class failure re-arms it).
     pub async fn rediscover(&self, name: &str) -> Result<()> {
         let ws = self
             .get_by_name(name)
@@ -944,6 +1359,8 @@ impl WorkspaceStore {
         )
         .await?;
 
+        clear_pending_pickup_cooldown(name);
+
         // Clear stale per-role context entries so that old discovery tasks
         // that beat the generation check cannot leave partial data behind.
         self.clear_contexts(name).await?;
@@ -951,8 +1368,11 @@ impl WorkspaceStore {
         let generation = self
             .get_generation(name, GenerationColumn::DISCOVERY)
             .await?;
-        // Skip diagnostics discovery so user-managed diagnostics survive re-analysis.
-        spawn_workspace_discovery(&ws, generation, false);
+        // Skip diagnostics discovery when diagnostics already exist so
+        // user-managed diagnostics survive re-analysis; discover them on a
+        // never-analyzed workspace (the same rule the pending pickup uses).
+        let discover_diagnostics = ws.diagnostics.is_none();
+        spawn_workspace_discovery(&ws, generation, discover_diagnostics);
 
         Ok(())
     }
@@ -1722,7 +2142,7 @@ mod tests {
                 suffix,
                 &format!("/tmp/{suffix}"),
                 generation,
-                true,
+                DiscoveryOutcome::AllOk,
                 &[],
             )
             .await;
@@ -1749,9 +2169,18 @@ mod tests {
         let (store, _tmp) = test_store().await;
         insert_direct(&store, "fail_gen0", "/tmp/fail_gen0", true, false, 0, 0).await;
 
-        // Act: discovery failed (all_ok = false).
-        let errors = vec!["Diagnostics discovery failed: timeout".to_string()];
-        finalize_discovery(&store, "fail_gen0", "/tmp/fail_gen0", 0, false, &errors).await;
+        // Act: discovery failed with a genuine (non-provider) failure
+        // (outcome = Fatal) — must be terminal Failed as before.
+        let errors = vec!["Empty response for 'general'".to_string()];
+        finalize_discovery(
+            &store,
+            "fail_gen0",
+            "/tmp/fail_gen0",
+            0,
+            DiscoveryOutcome::Fatal,
+            &errors,
+        )
+        .await;
 
         let ws = store
             .get_by_name("fail_gen0")
@@ -1763,6 +2192,58 @@ mod tests {
             ws.status,
             WorkspaceStatus::Failed,
             "Status should be 'failed'"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_discovery_provider_failure_returns_to_pending() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "prov_gen0", "/tmp/prov_gen0", true, false, 0, 0).await;
+
+        // Act: discovery failed with provider-class failures only
+        // (outcome = Transient) — must return to Pending and arm the cooldown.
+        let errors = vec![
+            "Diagnostics discovery failed: exhausted retry budget (last: transport): connection reset"
+                .to_string(),
+        ];
+        finalize_discovery(
+            &store,
+            "prov_gen0",
+            "/tmp/prov_gen0",
+            0,
+            DiscoveryOutcome::Transient,
+            &errors,
+        )
+        .await;
+
+        let ws = store
+            .get_by_name("prov_gen0")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert!(ws.paused, "Should remain paused (analysis pause)");
+        assert_eq!(
+            ws.status,
+            WorkspaceStatus::Pending,
+            "Provider-class discovery failure should return the workspace to pending"
+        );
+        assert!(
+            pending_pickup_cooldown_active("prov_gen0"),
+            "Provider-class failure must arm the in-memory pickup cooldown"
+        );
+        // A successful finalize clears the cooldown.
+        finalize_discovery(
+            &store,
+            "prov_gen0",
+            "/tmp/prov_gen0",
+            0,
+            DiscoveryOutcome::AllOk,
+            &[],
+        )
+        .await;
+        assert!(
+            !pending_pickup_cooldown_active("prov_gen0"),
+            "Successful discovery must clear the pickup cooldown"
         );
     }
 
@@ -1780,7 +2261,15 @@ mod tests {
             .expect("bump generation");
 
         // Act: try to finalize with the stale generation 0.
-        finalize_discovery(&store, "stale", "/tmp/stale", 0, true, &[]).await;
+        finalize_discovery(
+            &store,
+            "stale",
+            "/tmp/stale",
+            0,
+            DiscoveryOutcome::AllOk,
+            &[],
+        )
+        .await;
 
         let ws = store
             .get_by_name("stale")
@@ -1853,6 +2342,7 @@ mod tests {
     // ── Integration: add() returns paused: true ──────────────────
 
     #[tokio::test]
+    #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
     async fn add_returns_paused_true() {
         let (store, _tmp) = test_store().await;
         let dir = TempDir::new().expect("temp dir for workspace path");
@@ -1876,6 +2366,12 @@ mod tests {
             ws.paused,
             "add() must return a Workspace with paused = true"
         );
+        assert_eq!(
+            ws.status,
+            WorkspaceStatus::Pending,
+            "add() must return a Workspace with status = pending — \
+             discovery is deferred to the pickup step until the provider is configured"
+        );
         // Pins schema defaults (add() reads them back via RETURNING).
         assert!(
             !ws.maintenance_enabled,
@@ -1895,6 +2391,237 @@ mod tests {
         assert!(
             fetched.paused,
             "Persisted workspace must have paused = true"
+        );
+        assert_eq!(
+            fetched.status,
+            WorkspaceStatus::Pending,
+            "Persisted workspace must have status = pending"
+        );
+    }
+
+    // ── Pending-pickup: atomic claim + boot reclassification ──────
+
+    #[tokio::test]
+    async fn claim_pending_for_discovery_is_atomic_and_returns_live_generation() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "pickup", "/tmp/pickup", true, false, 3, 0).await;
+
+        // Claim succeeds and returns the live generation counter.
+        let generation = store
+            .claim_pending_for_discovery("pickup")
+            .await
+            .expect("claim")
+            .expect("pending row should be claimable");
+        assert_eq!(generation, 3, "must return the live discovery_generation");
+
+        let ws = store
+            .get_by_name("pickup")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert_eq!(
+            ws.status,
+            WorkspaceStatus::Analyzing,
+            "claim must transition pending → analyzing"
+        );
+        assert!(ws.paused, "claim must set the analysis pause");
+
+        // A second claim on the same row is a no-op (atomicity guard).
+        let second = store
+            .claim_pending_for_discovery("pickup")
+            .await
+            .expect("claim");
+        assert!(
+            second.is_none(),
+            "a non-pending row must not be claimable twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclassify_analyzing_to_pending_recovers_stranded_workspaces() {
+        let (store, _tmp) = test_store().await;
+        insert_direct(&store, "stranded1", "/tmp/stranded1", true, false, 0, 0).await;
+        insert_direct(&store, "stranded2", "/tmp/stranded2", true, false, 0, 0).await;
+        insert_direct(&store, "fine", "/tmp/fine", false, false, 0, 0).await;
+        store
+            .set_status("stranded1", &WorkspaceStatus::Analyzing)
+            .await
+            .unwrap();
+        store
+            .set_status("stranded2", &WorkspaceStatus::Analyzing)
+            .await
+            .unwrap();
+        store
+            .set_status("fine", &WorkspaceStatus::Ready)
+            .await
+            .unwrap();
+
+        let affected = store
+            .reclassify_analyzing_to_pending()
+            .await
+            .expect("reclassify");
+        assert_eq!(affected, 2, "only analyzing workspaces are reclassified");
+
+        for name in ["stranded1", "stranded2"] {
+            let ws = store
+                .get_by_name(name)
+                .await
+                .expect("fetch")
+                .expect("exists");
+            assert_eq!(
+                ws.status,
+                WorkspaceStatus::Pending,
+                "stranded analyzing workspace must become pending at boot"
+            );
+        }
+        let fine = store
+            .get_by_name("fine")
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert_eq!(
+            fine.status,
+            WorkspaceStatus::Ready,
+            "non-analyzing workspaces are untouched"
+        );
+    }
+
+    // ── Discovery failure classification taxonomy ─────────────────
+
+    /// Build an agent with a preset typed failure class (simulating a failed
+    /// run_agent) and classify it.
+    fn classify_with(class: Option<crate::retry::FailureClass>) -> DiscoveryFailureKind {
+        let ws = test_ws("/tmp/classify_ws");
+        let mut agent = crate::Agent::new(
+            "classify-test".into(),
+            crate::Role::Discovery,
+            &ws,
+            None,
+            String::new(),
+            String::new(),
+            None,
+            None,
+        );
+        agent.failure_class = class;
+        classify_discovery_failure(&agent, None)
+    }
+
+    #[test]
+    fn discovery_failure_taxonomy_maps_provider_and_genuine_classes() {
+        // Provider-class → Transient (workspace returns to Pending).
+        for class in [
+            crate::retry::FailureClass::Transport,
+            crate::retry::FailureClass::TruncatedEnvelope,
+            crate::retry::FailureClass::NoResponse,
+            crate::retry::FailureClass::TruncatedOutput,
+            crate::retry::FailureClass::NonRetryable, // auth / quota / invalid model
+            crate::retry::FailureClass::WallClockExceeded,
+            crate::retry::FailureClass::Shutdown,
+        ] {
+            assert_eq!(
+                classify_with(Some(class)),
+                DiscoveryFailureKind::Transient,
+                "{class:?} must be provider-class (Transient)"
+            );
+        }
+
+        // Genuine failures → Fatal (workspace goes Failed).
+        for class in [
+            crate::retry::FailureClass::Parse,
+            crate::retry::FailureClass::OutOfRangeScore,
+            crate::retry::FailureClass::Membership,
+            crate::retry::FailureClass::Completeness,
+            crate::retry::FailureClass::ContradictionAgents,
+            crate::retry::FailureClass::ValidationOther,
+        ] {
+            assert_eq!(
+                classify_with(Some(class)),
+                DiscoveryFailureKind::Fatal,
+                "{class:?} must be a genuine failure (Fatal)"
+            );
+        }
+
+        // No typed class (runtime errors, panics) → Fatal.
+        assert_eq!(
+            classify_with(None),
+            DiscoveryFailureKind::Fatal,
+            "unclassified runtime failures must be Fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_pickup_cooldown_arms_clears_and_expires() {
+        clear_pending_pickup_cooldown("cooldown_ws");
+        assert!(
+            !pending_pickup_cooldown_active("cooldown_ws"),
+            "no cooldown by default"
+        );
+
+        record_pending_pickup_cooldown_until(
+            "cooldown_ws",
+            Instant::now() + Duration::from_mins(1),
+        );
+        assert!(
+            pending_pickup_cooldown_active("cooldown_ws"),
+            "armed cooldown must gate the pickup"
+        );
+
+        clear_pending_pickup_cooldown("cooldown_ws");
+        assert!(
+            !pending_pickup_cooldown_active("cooldown_ws"),
+            "clear must disarm the cooldown"
+        );
+
+        // Expiry: a past deadline no longer gates the pickup.
+        let past = Instant::now()
+            .checked_sub(Duration::from_mins(1))
+            .expect("instant subtraction cannot underflow in a test");
+        record_pending_pickup_cooldown_until("cooldown_ws", past);
+        assert!(
+            !pending_pickup_cooldown_active("cooldown_ws"),
+            "an expired cooldown must not gate the pickup"
+        );
+        clear_pending_pickup_cooldown("cooldown_ws");
+    }
+
+    #[test]
+    fn pending_pickup_cooldown_escalates_and_resets() {
+        // The cooldown duration doubles per consecutive failure, capped at 4h.
+        assert_eq!(pending_pickup_cooldown_duration(1), Duration::from_mins(15));
+        assert_eq!(pending_pickup_cooldown_duration(2), Duration::from_mins(30));
+        assert_eq!(pending_pickup_cooldown_duration(3), Duration::from_hours(1));
+        assert_eq!(pending_pickup_cooldown_duration(4), Duration::from_hours(2));
+        assert_eq!(
+            pending_pickup_cooldown_duration(5),
+            Duration::from_hours(4),
+            "escalation caps at 4 h"
+        );
+        assert_eq!(
+            pending_pickup_cooldown_duration(99),
+            Duration::from_hours(4),
+            "escalation never exceeds the 4 h cap"
+        );
+
+        // Consecutive production records increment the stored attempt count
+        // (the escalation driver); clear resets it.
+        clear_pending_pickup_cooldown("escalate_ws");
+        record_pending_pickup_cooldown("escalate_ws");
+        record_pending_pickup_cooldown("escalate_ws");
+        let map = pending_pickup_cooldowns().lock().unwrap_poison();
+        let entry = map
+            .get("escalate_ws")
+            .expect("cooldown entry after two failures");
+        assert_eq!(entry.attempts, 2, "two failures → attempt count 2");
+        let remaining = entry.deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining >= Duration::from_mins(25),
+            "second failure must arm a ~30 min cooldown (got {remaining:?})"
+        );
+        drop(map);
+        clear_pending_pickup_cooldown("escalate_ws");
+        assert!(
+            !pending_pickup_cooldown_active("escalate_ws"),
+            "clear must reset the cooldown"
         );
     }
 

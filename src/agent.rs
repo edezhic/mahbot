@@ -276,6 +276,7 @@ impl Agent {
             round_ts: None,
             first_call_notify: None,
             failure: None,
+            failure_class: None,
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
@@ -1716,6 +1717,7 @@ pub(crate) async fn run_agent(
                 // Capture the real cause (full chain) so ticket dispatchers can
                 // persist it in failure comments instead of a generic placeholder.
                 agent.failure = Some(format!("{e:#}"));
+                agent.failure_class = failure_class_from_error(&e);
                 let classification = failure_classification(&agent, Some(&e));
                 let error_chain = crate::util::truncate_sandwich(
                     &crate::util::scrub_credentials(&format!("{e:#}")),
@@ -1793,6 +1795,21 @@ pub(crate) async fn run_default_agent(
     .await
 }
 
+/// Extract the typed provider failure class from an error chain, when the
+/// chain carries a [`RetryExhausted`] (the terminal retry-loop error that
+/// preserves the granular [`crate::retry::FailureClass`]).
+///
+/// `None` means the error is not provider-classified (runtime errors, panics,
+/// plain I/O failures) — callers treat that as a genuine non-provider failure.
+pub(crate) fn failure_class_from_error(
+    error: &anyhow::Error,
+) -> Option<crate::retry::FailureClass> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
+        .map(|exhausted| exhausted.final_class)
+}
+
 /// Stable failure classification for the agent-failure log.
 ///
 /// Order matters: the global shutdown token fires on SIGTERM/SIGINT and
@@ -1816,11 +1833,8 @@ fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'sta
         "shutdown"
     } else if agent.is_cancelled() {
         "cancelled"
-    } else if let Some(exhausted) = error.and_then(|e| {
-        e.chain()
-            .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
-    }) {
-        exhausted.final_class.label()
+    } else if let Some(class) = error.and_then(failure_class_from_error) {
+        class.label()
     } else {
         "runtime"
     }
@@ -1897,6 +1911,7 @@ mod tests {
             round_ts: None,
             first_call_notify: None,
             failure: None,
+            failure_class: None,
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),

@@ -762,6 +762,13 @@ pub struct Agent {
     /// on error, left `None` on success or cancellation (callers classify
     /// cancellation via the cancel tokens).
     pub(crate) failure: Option<String>,
+    /// Typed provider failure classification from the last run — set by
+    /// [`crate::agent::run_agent`] alongside [`Self::failure`] when the error
+    /// chain carries a [`crate::retry::RetryExhausted`]; `None` for runtime
+    /// errors, cancellations, and successes. Consumed by workspace discovery
+    /// to distinguish provider-class failures (workspace returns to Pending)
+    /// from genuine failures (workspace goes Failed).
+    pub(crate) failure_class: Option<crate::retry::FailureClass>,
     /// Agent-scoped registry of background shell sessions (Full shell roles
     /// only). Live sessions are force-killed on agent teardown ([`Drop`]) —
     /// see [`crate::tools::shell::BackgroundSessions`]. Reachable from the

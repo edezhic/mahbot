@@ -45,8 +45,9 @@ use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
 use crate::turso::TxGuard;
 use crate::util::panic_message;
+use crate::workspace::spawn_workspace_discovery;
 
-use crate::{Agent, DiagnosticsCommands, Role, Workspace};
+use crate::{Agent, DiagnosticsCommands, Role, Workspace, WorkspaceStatus};
 
 /// Default number of parallel analyst agents per round. Reviewers use a
 /// calibrated dynamic count (see [`crate::joint_verdict::review_agent_count`]);
@@ -723,6 +724,18 @@ pub async fn run_management() {
         }
     };
 
+    // Boot recovery for workspaces: discovery leaves no job rows, so a
+    // workspace still in 'analyzing' at startup means a crashed/panicked
+    // mid-discovery run. Reclassify to 'pending' so the pickup step retries
+    // it (or waits for the provider) — fixes the historical "stranded in
+    // analyzing forever" behavior. Must precede the first poll cycle.
+    if let Err(e) = crate::workspace::store()
+        .reclassify_analyzing_to_pending()
+        .await
+    {
+        warn!(error = %e, "Boot recovery: failed to reclassify stranded analyzing workspaces");
+    }
+
     // Resume the selected rounds (silent background resume — no Manager
     // notifications; results deliver via normal paths).
     for stage in resumable {
@@ -1216,12 +1229,15 @@ where
 /// Run one poll round: claim actionable tickets and dispatch agents.
 ///
 /// Workspaces are processed concurrently via [`tokio::spawn`] so that a
-/// slow or panicking workspace does not delay others. The five per-workspace
+/// slow or panicking workspace does not delay others. The per-workspace
 /// steps are issued in order; safety comes from atomic claim transitions
 /// (per-ticket work runs in detached tasks, not serially).
 ///
-/// The five per-workspace steps (see [`process_single_workspace`]) are:
+/// The per-workspace steps (see [`process_single_workspace`]) are:
 ///
+/// 0. **Pending pickup** — claim `Pending` workspaces into their first
+///    discovery once the LLM provider is configured
+///    ([`pickup_pending_workspace`]).
 /// 1. **Pipeline claims** — atomic source→target phase transitions
 ///    (`run_claim_pipeline`).
 /// 2. **DiagnosticsCheck** — dispatch unassigned `InDiagnostics` tickets
@@ -1280,12 +1296,25 @@ async fn poll_round() {
     );
 }
 
-/// Process all five pipeline steps for a single workspace.
+/// Process the poll steps for a single workspace.
 ///
 /// Steps are issued in order because claims must be ordered and the git tree
 /// is shared; per-ticket work runs concurrently in detached tasks. Across
 /// workspaces this function is called concurrently by [`poll_round`].
 async fn process_single_workspace(ws: Workspace) {
+    // 0. Pending-workspace pickup — a pending workspace (added without a
+    // provider key, or returned to pending after provider-class discovery
+    // failures) is claimed into its first discovery when the provider is
+    // configured. Runs before the claim pipeline: a freshly-claimed workspace
+    // re-arms the analysis pause, so no Backlog/RFD claims race the
+    // discovery. A successful claim returns the fresh post-claim copy; the
+    // pipeline below then runs against the claimed analyzing+paused state
+    // instead of the pre-claim poll-round copy.
+    let ws = match pickup_pending_workspace(&ws).await {
+        Some(claimed) => claimed,
+        None => ws,
+    };
+
     // 1. Pipeline claims — atomic source→target transitions
     run_claim_pipeline(&ws).await;
 
@@ -1349,30 +1378,159 @@ async fn process_single_workspace(ws: Workspace) {
     .await;
 }
 
-/// Whether the pause gate blocks the automatic claim for `phase`.
+/// Whether the LLM provider is configured for discovery: a non-empty provider
+/// key, or a custom provider endpoint (keyless local/self-hosted
+/// OpenAI-compatible servers). In-memory check only — no network or LLM call.
+fn provider_configured() -> bool {
+    crate::config::CONFIG.provider_key().is_some()
+        || crate::config::CONFIG.provider_endpoint() != crate::config::DEFAULT_PROVIDER_ENDPOINT
+}
+
+/// Pickup step: claim a `Pending` workspace into its first discovery when the
+/// LLM provider is configured and no provider-failure cooldown is armed.
 ///
-/// Paused workspaces stop only the automatic pickup of *new* work:
-/// BacklogAnalysis (backlog → analysis) and EngineerDevelopment
-/// (ready_for_development → in_development). Later-phase claims
-/// (DiagnosticsDone→Review, Reviewed→QA) proceed so tickets already past
-/// analysis finish without getting stuck — pausing gates new analysis and
-/// development, not in-progress work.
-fn paused_blocks_claim(paused: bool, phase: PollPhase) -> bool {
-    paused
-        && matches!(
-            phase,
-            PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
-        )
+/// The claim is an atomic conditional UPDATE (`status = 'pending'` →
+/// `'analyzing'`, `paused = 1`) so concurrent pickups, GUI Re-analyze, or
+/// delete cannot double-dispatch — the live `discovery_generation` is read in
+/// the same statement (never hardcoded), so the spawned discovery's finalize
+/// passes the generation guard. Diagnostics discovery is skipped when
+/// diagnostics already exist: a crashed mid-rediscover workspace re-picked-up
+/// at boot must not overwrite user-managed diagnostics.
+///
+/// Returns the fresh post-claim [`Workspace`] (status `analyzing`, paused) so
+/// the caller can run the remaining poll steps against the claimed state
+/// rather than the pre-claim poll-round copy; `None` when the workspace stays
+/// pending.
+async fn pickup_pending_workspace(ws: &Workspace) -> Option<Workspace> {
+    // `?` propagates the claim's None residual (the payload type differs from
+    // this function's return type, which is fine for Option).
+    let (generation, discover_diagnostics) = pickup_claim(ws).await?;
+
+    info!(
+        workspace = %ws.name,
+        generation,
+        discover_diagnostics,
+        "Pickup: pending workspace claimed into discovery"
+    );
+    spawn_workspace_discovery(ws, generation, discover_diagnostics);
+
+    // Re-read so the poll steps that follow see the claimed state
+    // (analyzing + paused), not the stale pre-claim copy. On a read failure
+    // the caller falls back to the poll-round copy — the pipeline's status
+    // gate ([`blocks_claim`]) still blocks new-work claims on it.
+    crate::workspace::store()
+        .get_by_name(&ws.name)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Decide + claim half of [`pickup_pending_workspace`], split out so tests can
+/// exercise the gating and the atomic claim without spawning real discovery
+/// agents. Returns `Some((discovery_generation, discover_diagnostics))` when
+/// the workspace was atomically claimed, `None` when it must stay pending
+/// (not pending / provider unconfigured / cooldown armed / claim lost to a
+/// concurrent claimer or delete).
+///
+/// # Pause-flag overloading
+///
+/// The claim deliberately does **not** gate on `ws.paused`. A `Pending`
+/// workspace always carries `paused = 1` — the analysis pause written by
+/// `add()` and the discovery finalizer — so gating on the paused column
+/// would block every pending pickup and break the analysis-pause flow. The
+/// user pause toggle therefore cannot stop a pending workspace's retry
+/// cycle: it only gates the ticket pipeline (see [`blocks_claim`]).
+/// A successful pickup discovery also unpauses via the finalizer (the
+/// documented analysis-pause lifecycle), so a manual pause on a `Pending`
+/// workspace is not preserved across a pickup — the escalating cooldown,
+/// not the pause flag, bounds the retry rate. Do not "fix" this by adding a
+/// `paused` gate here.
+///
+/// The reverse direction is covered by the pipeline instead: a manual GUI
+/// unpause on a `Pending`/`Analyzing`/`Failed` workspace does **not**
+/// re-enable new-work claims — [`blocks_claim`] requires `Ready` for
+/// Backlog/RFD claims regardless of the pause flag, so a non-Ready workspace
+/// cannot take development work even when unpaused.
+async fn pickup_claim(ws: &Workspace) -> Option<(i64, bool)> {
+    if ws.status != WorkspaceStatus::Pending {
+        return None;
+    }
+    if !provider_configured() {
+        return None;
+    }
+    if crate::workspace::pending_pickup_cooldown_active(&ws.name) {
+        return None;
+    }
+
+    let storage = crate::workspace::store();
+    let generation = match storage.claim_pending_for_discovery(&ws.name).await {
+        Ok(Some(generation)) => generation,
+        // Concurrent claimer (GUI Re-analyze / another pickup) won the race —
+        // the row is no longer pending; nothing to do.
+        Ok(None) => return None,
+        Err(e) => {
+            // Persistent DB faults must not strand the workspace silently:
+            // log and let the next poll cycle re-evaluate.
+            warn!(
+                workspace = %ws.name,
+                error = %e,
+                "Pickup: failed to claim pending workspace — retrying next poll cycle"
+            );
+            return None;
+        }
+    };
+
+    // Fresh read for the diagnostics-preservation decision: the poll-round
+    // copy may predate a concurrent set_diagnostics. On a read failure the
+    // poll-round copy decides instead of defaulting to discovery — the
+    // non-destructive direction for the crash-mid-rediscover case this flag
+    // exists to protect. The diagnostics generation guard only covers a save
+    // landing *while the discovery runs*; this fresh read additionally
+    // preserves a save made between the poll-round list and the claim (a save
+    // after this read is a narrow accepted residual race).
+    let discover_diagnostics = match storage.get_by_name(&ws.name).await {
+        Ok(Some(fresh)) => fresh.diagnostics.is_none(),
+        Ok(None) | Err(_) => ws.diagnostics.is_none(),
+    };
+
+    Some((generation, discover_diagnostics))
+}
+
+/// Whether the automatic claim for `phase` is blocked for `ws`.
+///
+/// Two gates apply to *new-work* claims — BacklogAnalysis (backlog →
+/// analysis) and EngineerDevelopment (ready_for_development →
+/// in_development):
+///
+/// * **Pause gate** — a paused workspace stops the automatic pickup of new
+///   work, so queued tickets don't cascade into a workspace that failed or
+///   was manually paused.
+/// * **Status gate** — the workspace must have completed discovery
+///   (`Ready`). Pending/Analyzing/Failed workspaces have missing or stale
+///   contexts; a manual unpause on them (or the same-round stale copy after
+///   a pending-pickup claim) must not re-enable new-work claims.
+///
+/// Later-phase claims (DiagnosticsDone→Review, Reviewed→QA) proceed so
+/// tickets already past analysis finish without getting stuck — pausing and
+/// incomplete discovery gate new analysis/development, not in-progress work.
+fn blocks_claim(ws: &Workspace, phase: PollPhase) -> bool {
+    if !matches!(
+        phase,
+        PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
+    ) {
+        return false;
+    }
+    ws.paused || ws.status != WorkspaceStatus::Ready
 }
 
 /// Claim for each pipeline phase in a workspace.
 ///
-/// When the workspace is paused, [`paused_blocks_claim`] skips the automatic
-/// pickup of new work (backlog → analysis and ready_for_development →
-/// in_development). Later-phase claims (DiagnosticsDone→Review, Reviewed→QA)
-/// proceed normally so that tickets already past analysis finish without
-/// getting stuck — pausing gates new analysis/development, not in-progress
-/// work.
+/// [`blocks_claim`] skips the automatic pickup of new work (backlog →
+/// analysis and ready_for_development → in_development) when the workspace is
+/// paused **or** has not completed discovery (`Ready`). Later-phase claims
+/// (DiagnosticsDone→Review, Reviewed→QA) proceed normally so that tickets
+/// already past analysis finish without getting stuck — pausing gates new
+/// analysis/development, not in-progress work.
 ///
 /// On claim error we `break` out of the phase loop — this skips all
 /// remaining CLAIM_PHASES for this workspace and falls through to
@@ -1382,7 +1540,7 @@ fn paused_blocks_claim(paused: bool, phase: PollPhase) -> bool {
 async fn run_claim_pipeline(ws: &Workspace) {
     let board = board();
     for &(source, phase) in CLAIM_PHASES {
-        if paused_blocks_claim(ws.paused, phase) {
+        if blocks_claim(ws, phase) {
             continue;
         }
         let info = phase.info();

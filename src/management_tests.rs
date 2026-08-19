@@ -1522,38 +1522,74 @@ async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
     assert!(last.contains("agent produced no response"), "{last}");
 }
 
-// ── Pause gate: automatic claims blocked while paused (mahbot-1766) ──
+// ── Claim gate: automatic claims blocked while paused or not Ready ──
 
-/// The pause gate must block exactly the automatic pickup of *new* work:
-/// BacklogAnalysis (backlog → analysis) and EngineerDevelopment
-/// (ready_for_development → in_development). Later-phase claims (review,
-/// QA) proceed while paused, and nothing is blocked when the workspace is
-/// unpaused.
+/// The claim gate ([`blocks_claim`]) must block exactly the automatic pickup
+/// of *new* work: BacklogAnalysis (backlog → analysis) and
+/// EngineerDevelopment (ready_for_development → in_development). Two gates:
+///
+/// * **Pause gate** — later-phase claims (review, QA) proceed while paused,
+///   and nothing is blocked when a Ready workspace is unpaused.
+/// * **Status gate** — a non-Ready workspace (Pending/Analyzing/Failed)
+///   blocks new-work claims even when unpaused: its contexts are missing or
+///   stale, so a manual unpause must not re-enable development work.
 ///
 /// Asserted against [`CLAIM_PHASES`] — the only phases the gate predicate is
 /// ever consulted for in production — so the test cannot drift from the
 /// claim pipeline's real surface (SanitationCheck/DiagnosticsCheck never
 /// flow through the claim loop and are deliberately absent).
 #[test]
-fn paused_blocks_claim_gate_matrix() {
+fn blocks_claim_gate_matrix() {
     for &(source, phase) in CLAIM_PHASES {
         let new_work = matches!(
             phase,
             PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
         );
+        // Pause gate: a paused Ready workspace blocks new work only.
+        let paused = Workspace {
+            status: WorkspaceStatus::Ready,
+            paused: true,
+            ..Default::default()
+        };
         assert_eq!(
-            paused_blocks_claim(true, phase),
+            blocks_claim(&paused, phase),
             new_work,
             "pause gate mismatch for {} ({} → {})",
             phase.info().log_label,
             source.as_ref(),
             phase.info().expected_phase.as_ref(),
         );
+        // Baseline: a Ready + unpaused workspace runs everything.
+        let ready = Workspace {
+            status: WorkspaceStatus::Ready,
+            paused: false,
+            ..Default::default()
+        };
         assert!(
-            !paused_blocks_claim(false, phase),
-            "{} must run when unpaused",
+            !blocks_claim(&ready, phase),
+            "{} must run when Ready and unpaused",
             phase.info().log_label,
         );
+        // Status gate: non-Ready + unpaused still blocks new work (missing or
+        // stale contexts) but lets later phases through.
+        for status in [
+            WorkspaceStatus::Pending,
+            WorkspaceStatus::Analyzing,
+            WorkspaceStatus::Failed,
+        ] {
+            let not_ready = Workspace {
+                status,
+                paused: false,
+                ..Default::default()
+            };
+            assert_eq!(
+                blocks_claim(&not_ready, phase),
+                new_work,
+                "status gate mismatch for {} ({})",
+                phase.info().log_label,
+                status,
+            );
+        }
     }
 }
 
@@ -1562,7 +1598,7 @@ fn paused_blocks_claim_gate_matrix() {
 /// the automatic claims on the next pipeline run.
 ///
 /// Later-phase claims (review/QA) are not part of the gate — covered by
-/// [`paused_blocks_claim_gate_matrix`]; this test exercises the real
+/// [`blocks_claim_gate_matrix`]; this test exercises the real
 /// [`run_claim_pipeline`] path for the two gated phases.
 ///
 /// Serialized with the reset_inflight tests: `run_claim_pipeline` claims
@@ -1585,6 +1621,13 @@ async fn paused_workspace_holds_backlog_and_rfd_until_unpause() {
     let _lock = crate::util::test::retry_tests_lock();
     let ws = setup_db_workspace("pause_gate").await;
     let ws_name = ws.name.clone();
+    // A workspace with tickets has completed discovery — the claim gate's
+    // status check requires Ready (Pending/Analyzing/Failed workspaces never
+    // take new-work claims, even unpaused).
+    crate::workspace::store()
+        .set_status(&ws_name, &WorkspaceStatus::Ready)
+        .await
+        .expect("set workspace ready");
     crate::workspace::store()
         .set_paused(&ws_name, true)
         .await
@@ -2804,5 +2847,206 @@ fn ticket_stage_slot_task_angle_branches() {
         ticket_stage_slot_task(prompt, &angles3, 5, 4),
         format!("{prompt}\n\nb"),
         "escalation global idx 4 → angles[4 % 3]"
+    );
+}
+
+// ── Pending-workspace pickup ─────────────────────────────────────
+
+/// Snapshot the process-global CONFIG and replace it with a controlled state
+/// for the duration of the test (pickup gating reads CONFIG).
+///
+/// Serialized in the `config_persist` group: these tests swap the shared
+/// global CONFIG, and an unserialized swap could clobber a concurrent test's
+/// CONFIG writes (or be clobbered by them) and fail its asserts
+/// nondeterministically.
+struct ConfigGuard(crate::config::ConfigData);
+
+impl ConfigGuard {
+    fn new(provider_key: Option<&str>, custom_endpoint: Option<&str>) -> Self {
+        let snapshot = crate::config::CONFIG.snapshot();
+        crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
+        if let Some(key) = provider_key {
+            let _ = crate::config::CONFIG.set_string_field("provider_key", key);
+        }
+        if let Some(endpoint) = custom_endpoint {
+            let _ = crate::config::CONFIG.set_string_field("provider_endpoint", endpoint);
+        }
+        Self(snapshot)
+    }
+}
+
+impl Drop for ConfigGuard {
+    fn drop(&mut self) {
+        crate::config::CONFIG.swap(self.0.clone());
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+async fn pickup_pending_workspace_waits_for_provider() {
+    init_management_test_stores().await;
+    // No provider key, default endpoint — the pickup must hold the workspace
+    // in pending (no claim, no discovery spawn, no LLM calls).
+    let _cfg = ConfigGuard::new(None, None);
+    let ws = create_test_workspace("/tmp/test_pickup_wait", "ws_pickup_wait").await;
+    assert_eq!(ws.status, WorkspaceStatus::Pending, "precondition: pending");
+
+    pickup_pending_workspace(&ws).await;
+
+    let stored = crate::workspace::store()
+        .get_by_name("ws_pickup_wait")
+        .await
+        .expect("fetch")
+        .expect("exists");
+    assert_eq!(
+        stored.status,
+        WorkspaceStatus::Pending,
+        "no provider configured → workspace stays pending"
+    );
+    assert!(
+        !stored.paused,
+        "no provider → not claimed, the pause toggle is untouched"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+async fn pickup_claim_claims_when_provider_configured() {
+    init_management_test_stores().await;
+    let _cfg = ConfigGuard::new(Some("sk-test"), None);
+    let ws = create_test_workspace("/tmp/test_pickup_claim", "ws_pickup_claim").await;
+
+    // pickup_claim (the decision + atomic claim half of the pickup) must
+    // claim without spawning any discovery task — deterministic, no agents.
+    let claimed = pickup_claim(&ws).await;
+    let (generation, discover_diagnostics) = claimed.expect("claim should succeed");
+    assert_eq!(generation, 0, "fresh workspace has discovery_generation 0");
+    assert!(
+        discover_diagnostics,
+        "no diagnostics exist yet → first discovery must run diagnostics"
+    );
+
+    let stored = crate::workspace::store()
+        .get_by_name("ws_pickup_claim")
+        .await
+        .expect("fetch")
+        .expect("exists");
+    assert_eq!(
+        stored.status,
+        WorkspaceStatus::Analyzing,
+        "provider key configured → pending workspace claimed into discovery"
+    );
+    assert!(
+        stored.paused,
+        "the claim must set the analysis pause (blocks pipeline claims while discovery runs)"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+async fn pickup_claim_gates_on_custom_endpoint_without_key() {
+    init_management_test_stores().await;
+    // Keyless local OpenAI-compatible endpoint: 'provider configured' must
+    // mean key OR custom endpoint, otherwise these setups strand in pending.
+    let _cfg = ConfigGuard::new(None, Some("http://localhost:8080/v1"));
+    let ws = create_test_workspace("/tmp/test_pickup_endpoint", "ws_pickup_endpoint").await;
+
+    let claimed = pickup_claim(&ws).await;
+    assert!(
+        claimed.is_some(),
+        "a custom provider endpoint without a key must count as provider configured"
+    );
+
+    let stored = crate::workspace::store()
+        .get_by_name("ws_pickup_endpoint")
+        .await
+        .expect("fetch")
+        .expect("exists");
+    assert_eq!(
+        stored.status,
+        WorkspaceStatus::Analyzing,
+        "custom endpoint → pending workspace claimed into discovery"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+async fn pickup_pending_workspace_respects_cooldown() {
+    init_management_test_stores().await;
+    let _cfg = ConfigGuard::new(Some("sk-test"), None);
+    let ws = create_test_workspace("/tmp/test_pickup_cooldown", "ws_pickup_cooldown").await;
+    crate::workspace::record_pending_pickup_cooldown("ws_pickup_cooldown");
+
+    pickup_pending_workspace(&ws).await;
+
+    let stored = crate::workspace::store()
+        .get_by_name("ws_pickup_cooldown")
+        .await
+        .expect("fetch")
+        .expect("exists");
+    assert_eq!(
+        stored.status,
+        WorkspaceStatus::Pending,
+        "armed cooldown → pickup must hold the workspace in pending"
+    );
+    crate::workspace::clear_pending_pickup_cooldown("ws_pickup_cooldown");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+async fn pickup_skips_non_pending_workspaces() {
+    init_management_test_stores().await;
+    let _cfg = ConfigGuard::new(Some("sk-test"), None);
+    let ws = create_test_workspace("/tmp/test_pickup_skip", "ws_pickup_skip").await;
+    crate::workspace::store()
+        .set_status("ws_pickup_skip", &WorkspaceStatus::Analyzing)
+        .await
+        .expect("set status");
+
+    pickup_pending_workspace(&ws).await;
+
+    let stored = crate::workspace::store()
+        .get_by_name("ws_pickup_skip")
+        .await
+        .expect("fetch")
+        .expect("exists");
+    assert_eq!(
+        stored.status,
+        WorkspaceStatus::Analyzing,
+        "pickup only touches pending workspaces"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+async fn pickup_claim_is_atomic_against_db_state() {
+    init_management_test_stores().await;
+    let _cfg = ConfigGuard::new(Some("sk-test"), None);
+    let ws = create_test_workspace("/tmp/test_pickup_race", "ws_pickup_race").await;
+
+    // Simulate a concurrent claimer that already transitioned the row: the
+    // pickup's in-memory copy still says pending, but the DB says analyzing —
+    // the conditional UPDATE must win and no second discovery is spawned.
+    crate::workspace::store()
+        .claim_pending_for_discovery("ws_pickup_race")
+        .await
+        .expect("first claim")
+        .expect("should claim");
+
+    let claimed = pickup_claim(&ws).await;
+    assert!(
+        claimed.is_none(),
+        "an already-claimed row must not be claimed twice"
+    );
+
+    let stored = crate::workspace::store()
+        .get_by_name("ws_pickup_race")
+        .await
+        .expect("fetch")
+        .expect("exists");
+    assert_eq!(
+        stored.status,
+        WorkspaceStatus::Analyzing,
+        "already-claimed row stays analyzing (single claim)"
     );
 }
