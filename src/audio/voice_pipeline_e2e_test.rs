@@ -161,8 +161,8 @@ const OWNER_NEGATIVE_PHRASES: &[&str] = &[
 /// - enrolled: index 0 (F1) — the ONLY voice in the enrollment clips and
 ///   owner negatives.
 /// - negative pool: indices 0..6 (F1..M1) — the confusable/unrelated prewarm
-///   styles.  Production rotates ALL voices; the canary+reserved voices are
-///   dropped so they never train in.
+///   styles.  Production rotates ALL voices; the bench pins F1 for the
+///   enrollment so the negative pool never trains in.
 struct VoiceAllocation {
     enrolled: String,
     negative_pool: Vec<String>,
@@ -637,7 +637,6 @@ fn generate_phrase_variants_cached(
     variants
 }
 
-/// Generate all seed variants for a phrase list in a single batch.
 /// Generate white uniform noise in [-1.0, 1.0].
 fn generate_white_uniform_noise() -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -984,8 +983,8 @@ fn process_frame(samples: &[f32], ctx: &mut super::PipelineCtx) {
 /// in [`FRAME_LENGTH`](super::FRAME_LENGTH) chunks, then send silence frames to flush any
 /// remaining detection state — matching the processing pattern in [`run_streaming_detection`].
 ///
-/// This is used to pre-warm the pipeline before the actual test utterance,
-/// without contaminating latency measurements.
+/// This is used to pre-warm the pipeline before the actual test utterance so
+/// the ring and adaptive state are warm when the utterance starts.
 fn feed_audio(samples: &[f32], ctx: &mut super::PipelineCtx) {
     for chunk in samples.chunks(super::FRAME_LENGTH) {
         process_frame(chunk, ctx);
@@ -1584,8 +1583,8 @@ fn test_detection_samples(
         if !cold_start && let Some(ref mut state) = adaptive_state {
             ctx.adaptive_threshold = state.clone();
         }
-        // Warm pass: feed warm-up audio so the latency timer measures only the
-        // wake word and the ring is primed.  The cold pass skips
+        // Warm pass: feed warm-up audio so the ring is primed and the
+        // adaptive path is warm before the utterance.  The cold pass skips
         // consume_warmup — production has no warm-up after a silence boundary.
         if !cold_start {
             consume_warmup(&mut ctx);
@@ -1631,14 +1630,13 @@ fn test_detection_samples(
     }
 }
 
-/// The full negative detection corpus, in the exact order the detection
-/// phases consume it (confusable band 800, confusable band 810, unrelated
-/// band 900, unrelated band 910, silence, noise profiles).  Built ONCE by
-/// [`build_negative_corpus`] and consumed by the false-reaction metric.
+/// The full negative detection corpus, built ONCE by [`build_negative_corpus`]
+/// and consumed by the false-reaction metric (confusable bands 800/810,
+/// unrelated bands 900/910, silence, noise profiles).
 struct NegativeCorpus {
-    /// Confusable band 800 + confusable2 band 810 (merged, phase order).
+    /// Confusable band 800 + confusable2 band 810 (merged).
     confusable: Vec<(Vec<f32>, String)>,
-    /// Unrelated band 900 + unrelated2 band 910 (merged, phase order).
+    /// Unrelated band 900 + unrelated2 band 910 (merged).
     unrelated: Vec<(Vec<f32>, String)>,
     /// Silence profiles ([`SILENCE_DURATIONS`]).
     silence: Vec<(Vec<f32>, String)>,
@@ -1869,7 +1867,7 @@ fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Simple benchmark baseline: three plain metrics
+// Wake-word benchmark baseline: three plain metrics
 // ═══════════════════════════════════════════════════════════════════════
 //
 // The whole report is exactly three metrics:
@@ -1882,7 +1880,7 @@ fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
 // plus the worker count and the FA/h basis note.  No per-frame arrays, no
 // analysis sections, no old-run comparisons.
 
-/// Pinned real-audio subset for the simple benchmark's FA-per-hour metric.
+/// Pinned real-audio subset for the wake-word bench's FA-per-hour metric.
 ///
 /// Selection heuristic: the longest librivox
 /// speech files up to a target + ALL us-gov speech files + a fixed noise
@@ -1902,7 +1900,7 @@ fn faph_clear_instrumentation(ctx: &mut super::PipelineCtx) {
 /// workers measured ≈ 1.5× serial throughput on the M3 Pro validation
 /// machine), so the first pinned list (~2.63 h) exceeded the cap and was
 /// shrunk to this list; the report discloses the final coverage.
-const SIMPLE_BENCH_REAL_AUDIO_SUBSET: &[&str] = &[
+const BENCH_REAL_AUDIO_SUBSET: &[&str] = &[
     // 6 longest librivox speech files (≈31.2 min)
     "speech/librivox/speech-librivox-0027.wav",
     "speech/librivox/speech-librivox-0051.wav",
@@ -1942,28 +1940,28 @@ const SIMPLE_BENCH_REAL_AUDIO_SUBSET: &[&str] = &[
     "noise/sound-bible/noise-sound-bible-0032.wav",
 ];
 
-/// Worker count for the simple benchmark's parallel real-audio feed — a
+/// Worker count for the wake-word bench's parallel real-audio feed — a
 /// pinned bench constant (NOT an env knob).
-const SIMPLE_BENCH_WORKERS: usize = 8;
+const BENCH_WORKERS: usize = 8;
 
 /// File→worker assignment shape for the parallel real-audio feed: round-robin
-/// over [`SIMPLE_BENCH_REAL_AUDIO_SUBSET`] in pinned order (worker `i` feeds
-/// files `i`, `i + SIMPLE_BENCH_WORKERS`, `i + 2·SIMPLE_BENCH_WORKERS`, …).
+/// over [`BENCH_REAL_AUDIO_SUBSET`] in pinned order (worker `i` feeds
+/// files `i`, `i + BENCH_WORKERS`, `i + 2·BENCH_WORKERS`, …).
 /// Pinned as a bench constant — deterministic per run.
-const SIMPLE_BENCH_ASSIGNMENT: &str = "round_robin";
+const BENCH_ASSIGNMENT: &str = "round_robin";
 
 /// Inter-file silence gap for each worker's continuous-listening stream
 /// (2 s at 16 kHz, so the natural segment-boundary reset fires between
 /// files).
-const SIMPLE_BENCH_FILE_GAP_SAMPLES: usize = 32_000;
+const BENCH_FILE_GAP_SAMPLES: usize = 32_000;
 
-/// Per-worker real-audio feed totals for the simple benchmark.
+/// Per-worker real-audio feed totals for the wake-word bench.
 ///
 /// Cooldown merge applies PER WORKER: events on different workers are
 /// independent continuous-listening streams and are never merged across
 /// workers.  Totals are summed across workers afterwards.
 #[derive(Default)]
-struct SimpleWorkerTotals {
+struct WorkerTotals {
     files_fed: u64,
     audio_secs: f64,
     speech_audio_secs: f64,
@@ -1973,8 +1971,8 @@ struct SimpleWorkerTotals {
     merged_events: usize,
 }
 
-impl SimpleWorkerTotals {
-    fn merge(&mut self, other: SimpleWorkerTotals) {
+impl WorkerTotals {
+    fn merge(&mut self, other: WorkerTotals) {
         self.files_fed += other.files_fed;
         self.audio_secs += other.audio_secs;
         self.speech_audio_secs += other.speech_audio_secs;
@@ -1992,11 +1990,8 @@ impl SimpleWorkerTotals {
 /// global [`VAD_DETECTOR`](super::VAD_DETECTOR) singleton is never touched by
 /// parallel workers, so the streams stay independent.  Detection LOGIC is
 /// unchanged — only the detector instance differs.
-fn simple_worker_feed(
-    files: &[(String, String, u64)],
-    cache_root: &std::path::Path,
-) -> SimpleWorkerTotals {
-    const GAP_SAMPLES: usize = SIMPLE_BENCH_FILE_GAP_SAMPLES;
+fn worker_feed(files: &[(String, String, u64)], cache_root: &std::path::Path) -> WorkerTotals {
+    const GAP_SAMPLES: usize = BENCH_FILE_GAP_SAMPLES;
     let gap: Vec<f32> = vec![0.0; GAP_SAMPLES];
     let mut ctx = super::PipelineCtx::new();
     // Per-worker detector instance (the voice-tests seam).  Preserved across
@@ -2004,13 +1999,13 @@ fn simple_worker_feed(
     // doc comment in voice.rs).
     ctx.injected_vad = Some(earshot::Detector::default());
     let mut audio_pos = 0.0f64;
-    let mut totals = SimpleWorkerTotals::default();
+    let mut totals = WorkerTotals::default();
     for (path, _sha256, _size) in files {
         let p = cache_root.join(path);
         let samples = match crate::audio::local_transcriber::decode_audio_to_mono_f32(&p) {
             Ok(s) => s,
             Err(e) => {
-                warn!("simple bench: decode failed for {path}: {e}");
+                warn!("wake-word bench: decode failed for {path}: {e}");
                 continue;
             }
         };
@@ -2048,12 +2043,12 @@ fn simple_worker_feed(
     totals
 }
 
-/// Build a documented-skip report for the simple bench's real-audio phase
+/// Build a documented-skip report for the wake-word bench's real-audio phase
 /// (degraded-skip contract — a loud 'not measured' marker, never a silent
 /// drop).
-fn simple_skip_json(reason_key: &str, detail: &str) -> serde_json::Value {
-    warn!("Simple bench real-audio phase skipped: {reason_key} — {detail}");
-    eprintln!("         Simple bench real-audio phase skipped: {reason_key} — {detail}");
+fn skip_json(reason_key: &str, detail: &str) -> serde_json::Value {
+    warn!("Wake-word bench real-audio phase skipped: {reason_key} — {detail}");
+    eprintln!("         Wake-word bench real-audio phase skipped: {reason_key} — {detail}");
     serde_json::json!({
         "status": "skipped",
         "metric": "FA rate per hour on real audio — NOT MEASURED (degraded skip)",
@@ -2063,7 +2058,7 @@ fn simple_skip_json(reason_key: &str, detail: &str) -> serde_json::Value {
 }
 
 /// Run the wake-word bench's real-audio phase: feed the pinned subset in
-/// parallel ([`SIMPLE_BENCH_WORKERS`] workers, round-robin file assignment),
+/// parallel ([`BENCH_WORKERS`] workers, round-robin file assignment),
 /// each worker through its own [`PipelineCtx`] + injected detector, using the
 /// SAME production detection path.
 ///
@@ -2071,7 +2066,7 @@ fn simple_skip_json(reason_key: &str, detail: &str) -> serde_json::Value {
 /// when the phase cannot run: corpus files are missing/unverifiable —
 /// download-on-demand is attempted first, then a loud skip.
 #[expect(clippy::too_many_lines)]
-fn run_simple_real_audio_phase() -> serde_json::Value {
+fn run_real_audio_phase() -> serde_json::Value {
     let phase_start = Instant::now();
 
     // ── Corpus manifest (pinned, embedded at compile time; the subset is the
@@ -2080,7 +2075,7 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
         match serde_json::from_str(include_str!("faph_corpus_manifest.json")) {
             Ok(m) => m,
             Err(e) => {
-                return simple_skip_json(
+                return skip_json(
                     "manifest_parse_failed",
                     &format!("embedded manifest failed to parse: {e}"),
                 );
@@ -2102,18 +2097,17 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
     let repo = manifest["repo"].as_str().unwrap_or("alexwengg/musan_mini");
     let revision = manifest["revision"].as_str().unwrap_or("");
     if manifest_files.is_empty() {
-        return simple_skip_json("manifest_empty", "manifest file list is empty");
+        return skip_json("manifest_empty", "manifest file list is empty");
     }
 
     // ── Resolve the pinned subset against the manifest, preserving the
     // pinned order (run-to-run reproducible file order). ──
-    let mut subset: Vec<(String, String, u64)> =
-        Vec::with_capacity(SIMPLE_BENCH_REAL_AUDIO_SUBSET.len());
-    for &path in SIMPLE_BENCH_REAL_AUDIO_SUBSET {
+    let mut subset: Vec<(String, String, u64)> = Vec::with_capacity(BENCH_REAL_AUDIO_SUBSET.len());
+    for &path in BENCH_REAL_AUDIO_SUBSET {
         match manifest_files.iter().find(|(p, _, _)| p == path) {
             Some((p, sha, size)) => subset.push((p.clone(), sha.clone(), *size)),
             None => {
-                return simple_skip_json(
+                return skip_json(
                     "subset_path_not_in_manifest",
                     &format!("pinned subset path missing from manifest: {path}"),
                 );
@@ -2125,7 +2119,7 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
     let cache_root = match crate::config::default_config_dir() {
         Ok(d) => d.join("faph_corpus"),
         Err(e) => {
-            return simple_skip_json(
+            return skip_json(
                 "cache_root_unavailable",
                 &format!("cannot resolve ~/.mahbot for corpus cache: {e}"),
             );
@@ -2152,7 +2146,7 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
         let url = format!("https://huggingface.co/datasets/{repo}/resolve/{revision}/{path}");
         match faph_download_file(&url, &dest, sha256) {
             Ok(()) => {
-                info!("simple bench corpus: downloaded {path} ({size} bytes)");
+                info!("wake-word bench corpus: downloaded {path} ({size} bytes)");
             }
             Err(e) => {
                 download_errors.push(format!("{path}: {e}"));
@@ -2165,26 +2159,26 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
             download_errors.len(),
             download_errors[0],
         );
-        return simple_skip_json("corpus_download_failed", &reason);
+        return skip_json("corpus_download_failed", &reason);
     }
 
     // ── Parallel feed: round-robin assignment over the pinned order ──
-    let worker_files: Vec<Vec<(String, String, u64)>> = (0..SIMPLE_BENCH_WORKERS)
+    let worker_files: Vec<Vec<(String, String, u64)>> = (0..BENCH_WORKERS)
         .map(|w| {
             subset
                 .iter()
                 .skip(w)
-                .step_by(SIMPLE_BENCH_WORKERS)
+                .step_by(BENCH_WORKERS)
                 .cloned()
                 .collect()
         })
         .collect();
-    let mut handles = Vec::with_capacity(SIMPLE_BENCH_WORKERS);
+    let mut handles = Vec::with_capacity(BENCH_WORKERS);
     for wf in worker_files {
         let cr = cache_root.clone();
-        handles.push(std::thread::spawn(move || simple_worker_feed(&wf, &cr)));
+        handles.push(std::thread::spawn(move || worker_feed(&wf, &cr)));
     }
-    let mut totals = SimpleWorkerTotals::default();
+    let mut totals = WorkerTotals::default();
     let mut worker_panic: Option<String> = None;
     for handle in handles {
         match handle.join() {
@@ -2199,7 +2193,7 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
     // Join ALL workers even after a panic so no worker thread is left
     // detached while the skip report proceeds; then report the panic.
     if let Some(reason) = worker_panic {
-        return simple_skip_json("worker_panicked", &reason);
+        return skip_json("worker_panicked", &reason);
     }
 
     let wall_secs = phase_start.elapsed().as_secs_f64();
@@ -2219,20 +2213,20 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
     };
 
     info!(
-        "Simple bench real audio: {files_fed} files fed, {audio_hours:.2} h audio \
+        "Wake-word bench real audio: {files_fed} files fed, {audio_hours:.2} h audio \
          ({vad_active_hours:.2} h VAD-active), {merged_events} cooldown-merged FA events \
          (raw {raw_events}), {fa_per_hour_vad:.4} FA/h VAD-active, {wall_secs:.1}s wall \
-         ({workers} parallel workers, {SIMPLE_BENCH_ASSIGNMENT})",
+         ({workers} parallel workers, {BENCH_ASSIGNMENT})",
         files_fed = totals.files_fed,
-        workers = SIMPLE_BENCH_WORKERS,
+        workers = BENCH_WORKERS,
     );
     eprintln!(
-        "         Simple bench real audio: {files_fed} files fed, {audio_hours:.2} h audio \
+        "         Wake-word bench real audio: {files_fed} files fed, {audio_hours:.2} h audio \
          ({vad_active_hours:.2} h VAD-active), {merged_events} cooldown-merged FA events \
          (raw {raw_events}), {fa_per_hour_vad:.4} FA/h VAD-active, {wall_secs:.1}s wall \
-         ({workers} parallel workers, {SIMPLE_BENCH_ASSIGNMENT})",
+         ({workers} parallel workers, {BENCH_ASSIGNMENT})",
         files_fed = totals.files_fed,
-        workers = SIMPLE_BENCH_WORKERS,
+        workers = BENCH_WORKERS,
     );
 
     serde_json::json!({
@@ -2241,12 +2235,12 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
                    contains ~zero wake-word utterances, so every detection is a \
                    spontaneous false accept",
         "subset": {
-            "files_total": SIMPLE_BENCH_REAL_AUDIO_SUBSET.len(),
-            "speech_files": SIMPLE_BENCH_REAL_AUDIO_SUBSET
+            "files_total": BENCH_REAL_AUDIO_SUBSET.len(),
+            "speech_files": BENCH_REAL_AUDIO_SUBSET
                 .iter()
                 .filter(|p| p.starts_with("speech/"))
                 .count(),
-            "noise_files": SIMPLE_BENCH_REAL_AUDIO_SUBSET
+            "noise_files": BENCH_REAL_AUDIO_SUBSET
                 .iter()
                 .filter(|p| p.starts_with("noise/"))
                 .count(),
@@ -2256,8 +2250,8 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
                                     constant",
         },
         "feed": {
-            "workers": SIMPLE_BENCH_WORKERS,
-            "assignment": SIMPLE_BENCH_ASSIGNMENT,
+            "workers": BENCH_WORKERS,
+            "assignment": BENCH_ASSIGNMENT,
             "files_fed": totals.files_fed,
             "audio_hours_fed": audio_hours,
             "speech_hours_fed": totals.speech_audio_secs / 3600.0,
@@ -2283,10 +2277,10 @@ fn run_simple_real_audio_phase() -> serde_json::Value {
 
 /// Run the wake-word benchmark (three plain metrics).
 ///
-/// Called from `voice::run_simple_voice_pipeline_benchmark()` which is the
-/// entry point for `benches/wake_word.rs`.
+/// Entry point invoked by `voice::run_wake_word_benchmark()` from
+/// `benches/wake_word.rs`.
 #[expect(clippy::cast_precision_loss, clippy::too_many_lines)]
-pub(crate) fn run_simple_benchmark() {
+pub(crate) fn run_wake_word_benchmark() {
     // ── Heartbeat drop guard ──────────────────────────────
     // A pulse every 60 s so the operator can confirm progress (the whole
     // warm run is capped at ~10 min).
@@ -2431,7 +2425,7 @@ pub(crate) fn run_simple_benchmark() {
     negative_embeddings.extend(unrelated_neg_embeddings);
     assert!(
         !negative_embeddings.is_empty(),
-        "Simple bench negative pool must be non-empty — an all-skip run would \
+        "Wake-word bench negative pool must be non-empty — an all-skip run would \
          silently calibrate a weaker enrollment"
     );
 
@@ -2459,7 +2453,7 @@ pub(crate) fn run_simple_benchmark() {
         };
     let Some(enrollment) = enrollment else {
         eprintln!(
-            "FATAL: no enrollment (consistency gate failed) — cannot run the simple benchmark"
+            "FATAL: no enrollment (consistency gate failed) — cannot run the wake-word bench"
         );
         return;
     };
@@ -2515,7 +2509,7 @@ pub(crate) fn run_simple_benchmark() {
         + negative_corpus.noise.len();
     if non_phrase_total != 113 {
         warn!(
-            "Simple bench non-phrase set size is {non_phrase_total}, not the pinned 113 \
+            "Wake-word bench non-phrase set size is {non_phrase_total}, not the pinned 113 \
              (likely TTS synthesis misses on a cold cache) — reporting the actual count",
         );
     }
@@ -2562,7 +2556,7 @@ pub(crate) fn run_simple_benchmark() {
     eprintln!("  False reactions: {false_reactions}/{non_phrase_total} on the non-phrase set");
 
     // ── Metric 2b: Real-audio FA/h (parallel, pinned subset) ──
-    let real_audio = run_simple_real_audio_phase();
+    let real_audio = run_real_audio_phase();
     // Coverage numbers are read from the real-audio section BEFORE the json!
     // macro moves `real_audio` into the report.
     let real_audio_audio_hours = real_audio["feed"]["audio_hours_fed"].as_f64();
@@ -2598,7 +2592,7 @@ pub(crate) fn run_simple_benchmark() {
             "real_audio_speech_hours": real_audio_speech_hours,
             "real_audio_noise_hours": real_audio_noise_hours,
         },
-        "workers": SIMPLE_BENCH_WORKERS,
+        "workers": BENCH_WORKERS,
         "wall_clock_secs": wall_clock_secs,
         "fa_per_hour_basis_note": "FA-per-hour denominators are reported as BOTH raw \
                                     audio hours and VAD-active hours (per-worker sums); \
@@ -2652,8 +2646,8 @@ pub(crate) fn run_simple_benchmark() {
          \x20               TTS-synthesized speech, not real human speech (real audio\n\
          \x20               feeds the false-reaction rate only)",
         wake = BENCH_WAKE_PHRASE,
-        workers = SIMPLE_BENCH_WORKERS,
-        assignment = SIMPLE_BENCH_ASSIGNMENT,
+        workers = BENCH_WORKERS,
+        assignment = BENCH_ASSIGNMENT,
         audio_hours = real_audio_audio_hours.unwrap_or(f64::NAN),
         wall = wall_clock_secs,
         wall_min = wall_clock_secs / 60.0,
@@ -2739,7 +2733,6 @@ mod tests {
             "morning clip (0.92x slower resample) must be longer than normal"
         );
     }
-
 
     /// Voice allocation: standard 10-style set → enrolled=F1, negative pool
     /// F1..M1 (styles outside the pool never train in).

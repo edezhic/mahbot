@@ -151,6 +151,6 @@ fn main() {
     run_with_timeout(
         "wake_word.lock",
         15,
-        mahbot::audio::voice::run_simple_voice_pipeline_benchmark,
+        mahbot::audio::voice::run_wake_word_benchmark,
     );
 }

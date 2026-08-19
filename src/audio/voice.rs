@@ -82,8 +82,8 @@ pub(crate) mod voice_pipeline_e2e_test;
 /// Called by `benches/wake_word.rs`.  Only compiled when the `voice-tests`
 /// feature is enabled.
 #[cfg(feature = "voice-tests")]
-pub fn run_simple_voice_pipeline_benchmark() {
-    voice_pipeline_e2e_test::run_simple_benchmark();
+pub fn run_wake_word_benchmark() {
+    voice_pipeline_e2e_test::run_wake_word_benchmark();
 }
 
 // Constants
