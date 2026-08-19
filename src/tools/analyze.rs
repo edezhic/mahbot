@@ -1147,7 +1147,6 @@ async fn consolidate_findings(
                 .to_string(),
         ),
         routing.provider_order,
-        routing.allow_fallbacks,
         Some(DEFAULT_MAX_TOKENS),
     );
 

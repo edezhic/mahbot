@@ -211,7 +211,6 @@ mod tests {
             max_tokens: None,
             reasoning_effort: None,
             provider_order: None,
-            provider_allow_fallbacks: None,
             meta: None,
         }
     }

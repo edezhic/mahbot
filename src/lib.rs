@@ -1300,9 +1300,6 @@ pub(crate) struct ChatRequest {
     /// When `Some` and non-empty, sent as the provider routing block.
     /// When `None`, no provider routing is sent (OpenRouter defaults apply).
     pub provider_order: Option<String>,
-    /// Provider routing: allow fallbacks when provider_order is set.
-    /// When `None` (and provider_order is set), defaults to `false`.
-    pub provider_allow_fallbacks: Option<bool>,
     /// Optional operation metadata for per-request LLM stats logging.
     pub meta: Option<ChatRequestMeta>,
 }

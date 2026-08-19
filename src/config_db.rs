@@ -1,15 +1,14 @@
-//! Config key-value, per-role model overrides, and per-model routing rules
-//! stored in `config.db`.
+//! Config key-value pairs and per-model routing rules stored in `config.db`.
 //!
-//! Three tables:
+//! Two tables:
 //! - `config_kv` — generic key-value string pairs for runtime configuration.
-//! - `config_role` — per-role model overrides. The `model` column is the
-//!   override consulted at request time; the `reasoning_effort` column is
-//!   retained as orphaned data since mahbot-1819 (loaded and preserved, never
-//!   consulted).
-//! - `config_model_routing` — per-model provider order and fallback settings.
+//! - `config_model_routing` — per-model provider order.
+//!
+//! The `config_role` table (per-role model overrides) remains in the schema
+//! but is intentionally unreferenced since mahbot-1822: its rows are inert
+//! orphans (schema unchanged, rows untouched, no read or write path).
 
-use crate::config::{ModelRouting, RoleConfig};
+use crate::config::ModelRouting;
 use crate::turso::{self};
 use anyhow::Result;
 
@@ -49,47 +48,23 @@ crate::columns! {
     }
 }
 
-// config_role table (3-column SELECT: role, model, reasoning_effort)
-crate::columns! {
-    ROLE_CONFIG_COLUMNS [RC] {
-        ROLE             => "role",
-        MODEL            => "model",
-        REASONING_EFFORT => "reasoning_effort",
-    }
-}
-
-// config_model_routing table (3-column SELECT: model, provider_order, allow_fallbacks)
+// config_model_routing table (2-column SELECT: model, provider_order)
 crate::columns! {
     MODEL_ROUTING_COLUMNS [MR] {
-        MODEL           => "model",
-        PROVIDER_ORDER  => "provider_order",
-        ALLOW_FALLBACKS => "allow_fallbacks",
+        MODEL          => "model",
+        PROVIDER_ORDER => "provider_order",
     }
 }
 
 // ── Shared row-parsing helpers ──────────────────────────────────
 
-/// Parse a `RoleConfig` from a `config_role` row.
-fn role_config_from_row(row: &turso::Row) -> Result<RoleConfig, ::turso::Error> {
-    let role = row.get::<String>(COL_RC_ROLE)?;
-    let model = row.get::<Option<String>>(COL_RC_MODEL)?;
-    let reasoning_effort = row.get::<Option<String>>(COL_RC_REASONING_EFFORT)?;
-    Ok(RoleConfig {
-        role,
-        model,
-        reasoning_effort,
-    })
-}
-
 /// Parse a `ModelRouting` from a `config_model_routing` row.
 fn model_routing_from_row(row: &turso::Row) -> Result<ModelRouting, ::turso::Error> {
     let model = row.get::<String>(COL_MR_MODEL)?;
     let provider_order = row.get::<Option<String>>(COL_MR_PROVIDER_ORDER)?;
-    let allow_fallbacks = row.get::<Option<bool>>(COL_MR_ALLOW_FALLBACKS)?;
     Ok(ModelRouting {
         model,
         provider_order,
-        allow_fallbacks,
     })
 }
 
@@ -107,18 +82,11 @@ const SET_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
 
 const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 
-// ── Per-row UPSERT / DELETE (config_role, config_model_routing) ──
+// ── Per-row UPSERT / DELETE (config_model_routing) ──
 
-const UPSERT_ROLE_CONFIG_SQL: &str = "INSERT INTO config_role (role, model, reasoning_effort) VALUES (?1, ?2, ?3) \
-     ON CONFLICT(role) DO UPDATE SET \
-         model = excluded.model, reasoning_effort = excluded.reasoning_effort";
-
-const DELETE_ROLE_CONFIG_SQL: &str = "DELETE FROM config_role WHERE role = ?1";
-
-const UPSERT_MODEL_ROUTING_SQL: &str = "INSERT INTO config_model_routing (model, provider_order, allow_fallbacks) \
-     VALUES (?1, ?2, ?3) \
-     ON CONFLICT(model) DO UPDATE SET \
-         provider_order = excluded.provider_order, allow_fallbacks = excluded.allow_fallbacks";
+const UPSERT_MODEL_ROUTING_SQL: &str = "INSERT INTO config_model_routing (model, provider_order) \
+     VALUES (?1, ?2) \
+     ON CONFLICT(model) DO UPDATE SET provider_order = excluded.provider_order";
 
 const DELETE_MODEL_ROUTING_SQL: &str = "DELETE FROM config_model_routing WHERE model = ?1";
 
@@ -158,19 +126,6 @@ impl ConfigStore {
             .await
     }
 
-    // ── config_role ──────────────────────────────────────────
-
-    /// Get all role config rows.
-    pub async fn get_all_role_configs(&self) -> Result<Vec<RoleConfig>> {
-        self.get_all_rows(
-            ROLE_CONFIG_COLUMNS,
-            "config_role",
-            "role",
-            role_config_from_row,
-        )
-        .await
-    }
-
     // ── config_model_routing ──────────────────────────────────
 
     /// Get all model routing rows.
@@ -184,58 +139,30 @@ impl ConfigStore {
         .await
     }
 
-    // ── per-row save (role configs / model routings) ─────────────
+    // ── per-row save (model routings) ────────────────────────────
     //
     // Used by the settings page's per-field autosave: each editable row is
-    // persisted individually (UPSERT, or DELETE once both override columns
-    // are `None` — an all-None row is indistinguishable from having no
-    // override, and the role's built-in defaults resolve identically either
+    // persisted individually (UPSERT, or DELETE once the order column is
+    // `None` — an all-None row is indistinguishable from having no override,
+    // and the provider layer's built-in defaults resolve identically either
     // way).
 
-    /// Save a single `config_role` row: UPSERT, or DELETE when both override
-    /// fields are `None` (an all-None row is indistinguishable from having no
-    /// override — the role's built-in defaults resolve identically either way).
-    pub async fn save_role_config(
-        &self,
-        role: &str,
-        model: Option<&str>,
-        reasoning_effort: Option<&str>,
-    ) -> Result<()> {
-        if model.is_none() && reasoning_effort.is_none() {
-            self.conn
-                .execute(DELETE_ROLE_CONFIG_SQL, turso::params![role])
-                .await?;
-        } else {
-            self.conn
-                .execute(
-                    UPSERT_ROLE_CONFIG_SQL,
-                    turso::params![role, model, reasoning_effort],
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Save a single `config_model_routing` row: UPSERT, or DELETE when both
-    /// override fields are `None`. `Some(false)` on `allow_fallbacks` is
-    /// meaningful (explicitly disables fallbacks at request time) and is
-    /// therefore preserved — only `None` + `None` deletes.
+    /// Save a single `config_model_routing` row: UPSERT, or DELETE when the
+    /// `provider_order` column is `None`.
     pub async fn save_model_routing(
         &self,
         model: &str,
         provider_order: Option<&str>,
-        allow_fallbacks: Option<bool>,
     ) -> Result<()> {
-        if provider_order.is_none() && allow_fallbacks.is_none() {
+        if provider_order.is_none() {
             self.conn
                 .execute(DELETE_MODEL_ROUTING_SQL, turso::params![model])
                 .await?;
         } else {
-            let allow_int = allow_fallbacks.map(i32::from);
             self.conn
                 .execute(
                     UPSERT_MODEL_ROUTING_SQL,
-                    turso::params![model, provider_order, allow_int],
+                    turso::params![model, provider_order],
                 )
                 .await?;
         }
@@ -273,7 +200,7 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{model_routing, role_config};
+    use crate::config::model_routing;
     use tempfile::TempDir;
 
     async fn setup() -> (ConfigStore, TempDir) {
@@ -344,108 +271,40 @@ mod tests {
 
     // ── Per-row save (settings-page autosave) ─────────────────────
 
-    /// `save_role_config` UPSERTs a row and DELETE-if-empty removes it once
-    /// both override columns are `None`; clearing a single column keeps the
-    /// row.
-    #[tokio::test]
-    async fn test_save_role_config_upsert_and_delete_if_empty() {
-        let (store, _dir) = setup().await;
-
-        // New row.
-        store
-            .save_role_config("engineer", Some("m1"), None)
-            .await
-            .unwrap();
-        let all = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            all,
-            vec![role_config("engineer", Some("m1"), None)],
-            "new row persisted"
-        );
-
-        // UPSERT over the same role replaces both columns.
-        store
-            .save_role_config("engineer", Some("m2"), Some("high"))
-            .await
-            .unwrap();
-        let all = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            all,
-            vec![role_config("engineer", Some("m2"), Some("high"))],
-            "upsert replaces both columns"
-        );
-
-        // Clearing only the model keeps the row (reasoning still set).
-        store
-            .save_role_config("engineer", None, Some("medium"))
-            .await
-            .unwrap();
-        let all = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            all,
-            vec![role_config("engineer", None, Some("medium"))],
-            "single-column clear keeps the row"
-        );
-
-        // Both None → row deleted (all-None row == no override).
-        store
-            .save_role_config("engineer", None, None)
-            .await
-            .unwrap();
-        let all = store.get_all_role_configs().await.unwrap();
-        assert!(all.is_empty(), "all-None row deleted");
-    }
-
-    /// `save_model_routing` UPSERTs a row and DELETE-if-empty removes it only
-    /// when BOTH columns are `None` — `Some(false)` on `allow_fallbacks` is
-    /// meaningful (explicitly disables fallbacks) and must survive.
+    /// `save_model_routing` UPSERTs a row with a provider order and DELETEs it
+    /// once the order is cleared (`None` order == no override).
     #[tokio::test]
     async fn test_save_model_routing_upsert_and_delete_if_empty() {
         let (store, _dir) = setup().await;
 
-        // `Some(false)` is meaningful: row persists with order None.
+        // New row.
         store
-            .save_model_routing("test-model", None, Some(false))
+            .save_model_routing("test-model", Some("OpenAI"))
             .await
             .unwrap();
         let all = store.get_all_model_routings().await.unwrap();
         assert_eq!(
             all,
-            vec![model_routing("test-model", None, Some(false))],
-            "Some(false) allow_fallbacks persists with None order"
+            vec![model_routing("test-model", Some("OpenAI"))],
+            "new row persisted"
         );
 
-        // UPSERT replaces both columns.
+        // UPSERT replaces the order column.
         store
-            .save_model_routing("test-model", Some("OpenAI"), Some(true))
+            .save_model_routing("test-model", Some("Anthropic"))
             .await
             .unwrap();
         let all = store.get_all_model_routings().await.unwrap();
         assert_eq!(
             all,
-            vec![model_routing("test-model", Some("OpenAI"), Some(true))],
-            "upsert replaces both columns"
+            vec![model_routing("test-model", Some("Anthropic"))],
+            "upsert replaces the order column"
         );
 
-        // Clearing only the order keeps the row (allow_fallbacks still set).
-        store
-            .save_model_routing("test-model", None, Some(true))
-            .await
-            .unwrap();
+        // Order cleared → row deleted.
+        store.save_model_routing("test-model", None).await.unwrap();
         let all = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            all,
-            vec![model_routing("test-model", None, Some(true))],
-            "single-column clear keeps the row"
-        );
-
-        // Both None → row deleted.
-        store
-            .save_model_routing("test-model", None, None)
-            .await
-            .unwrap();
-        let all = store.get_all_model_routings().await.unwrap();
-        assert!(all.is_empty(), "all-None row deleted");
+        assert!(all.is_empty(), "cleared order deletes the row");
     }
 
     /// The per-field persist path must never overwrite or delete the
@@ -587,117 +446,6 @@ mod tests {
             store.get_kv("exa_key").await.unwrap().is_none(),
             "cleared value deletes the row"
         );
-        crate::config::CONFIG.swap(original);
-    }
-
-    /// A per-role model settle preserves the row's reasoning effort from the
-    /// live config (the two columns are edited independently), and clearing
-    /// the model keeps the row when reasoning is still set.
-    #[tokio::test]
-    #[serial_test::serial(config_persist)]
-    async fn test_persist_settled_role_model_preserves_reasoning_effort() {
-        crate::util::test::init_test_stores().await;
-        let store = crate::config_db::store();
-        let original = crate::config::CONFIG.snapshot();
-
-        // Seed the live row (as a prior reasoning-effort settle would).
-        crate::config::CONFIG.set_role_config_row(
-            "engineer",
-            Some("old-model".into()),
-            Some("high".into()),
-        );
-        store
-            .save_role_config("engineer", Some("old-model"), Some("high"))
-            .await
-            .unwrap();
-
-        let persisted = crate::config::persist_settled_role_model("engineer", "new-model")
-            .await
-            .unwrap();
-        assert_eq!(persisted, "new-model");
-        let rows = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            rows,
-            vec![role_config("engineer", Some("new-model"), Some("high"))],
-            "model updated, reasoning_effort preserved"
-        );
-
-        // Clearing the model keeps the row (reasoning still set).
-        crate::config::persist_settled_role_model("engineer", "")
-            .await
-            .unwrap();
-        let rows = store.get_all_role_configs().await.unwrap();
-        assert_eq!(
-            rows,
-            vec![role_config("engineer", None, Some("high"))],
-            "cleared model keeps the reasoning_effort row"
-        );
-
-        crate::config::CONFIG.swap(original);
-    }
-
-    /// A routing allow-fallbacks settle preserves the row's provider order,
-    /// and `Some(false)` survives (explicitly disabling fallbacks is
-    /// meaningful at request time).
-    #[tokio::test]
-    #[serial_test::serial(config_persist)]
-    async fn test_persist_settled_routing_allow_preserves_order() {
-        crate::util::test::init_test_stores().await;
-        let store = crate::config_db::store();
-        let original = crate::config::CONFIG.snapshot();
-
-        crate::config::CONFIG.set_model_routing_row(
-            "test-model",
-            Some("OpenAI".into()),
-            Some(false),
-        );
-        store
-            .save_model_routing("test-model", Some("OpenAI"), Some(false))
-            .await
-            .unwrap();
-
-        let persisted = crate::config::persist_settled_routing_allow("test-model", true)
-            .await
-            .unwrap();
-        assert_eq!(persisted, "true", "canonical allow value returned");
-        let rows = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            rows,
-            vec![model_routing("test-model", Some("OpenAI"), Some(true))],
-            "allow_fallbacks updated, provider_order preserved"
-        );
-
-        crate::config::persist_settled_routing_order("test-model", "")
-            .await
-            .unwrap();
-        let rows = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            rows,
-            vec![model_routing("test-model", None, Some(true))],
-            "cleared order keeps the allow_fallbacks row"
-        );
-
-        crate::config::persist_settled_routing_allow("test-model", false)
-            .await
-            .unwrap();
-        let rows = store.get_all_model_routings().await.unwrap();
-        assert_eq!(
-            rows,
-            vec![model_routing("test-model", None, Some(false))],
-            "Some(false) is meaningful and preserved"
-        );
-
-        crate::config::persist_settled_routing_allow("test-model", false)
-            .await
-            .unwrap();
-        crate::config::CONFIG.set_model_routing_row("test-model", None, None);
-        store
-            .save_model_routing("test-model", None, None)
-            .await
-            .unwrap();
-        let rows = store.get_all_model_routings().await.unwrap();
-        assert!(rows.is_empty(), "all-None routing row removed");
-
         crate::config::CONFIG.swap(original);
     }
 }

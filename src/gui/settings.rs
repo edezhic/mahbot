@@ -9,11 +9,9 @@
 //! Also manages workspaces and users (formerly separate pages), with
 //! modal dialogs for add operations.
 
-#![expect(clippy::from_iter_instead_of_collect)]
-
 use crate::Role;
 use crate::Workspace;
-use crate::config::{CONFIG, ConfigData, ModelRouting, RoleConfig};
+use crate::config::{CONFIG, ConfigData, ModelRouting};
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
@@ -263,8 +261,7 @@ pub enum SettingsMessage {
     /// A config field value has settled and should be persisted now.
     ///
     /// `field` is the canonical field id (`config:<key>`,
-    /// `role_model:<role>`,
-    /// `routing_order:<model>`, `routing_allow:<model>`). `generation` is the
+    /// `routing_order:<model>`). `generation` is the
     /// generation counter captured when the value was staged; a settle whose
     /// generation no longer matches the current counter is stale and dropped,
     /// so per-keystroke and out-of-order writes are impossible.
@@ -288,19 +285,10 @@ pub enum SettingsMessage {
         generation: u64,
         result: Result<String, String>,
     },
-    /// Per-role model edits
-    RoleModel {
-        role: String,
-        model: String,
-    },
     /// Per-model provider routing edits
     ModelRoutingOrder {
         model: String,
         order: String,
-    },
-    ModelRoutingAllowFallbacks {
-        model: String,
-        allow: bool,
     },
     /// Toggle password visibility for a specific field.
     TogglePasswordVisibility(PasswordTarget),
@@ -395,8 +383,9 @@ const TEXT_INPUT_KEYS: &[&str] = &[
     "firecrawl_key",
     "exa_key",
     "telegram_bot_token",
-    "media_transcription_model",
-    "media_transcription_provider",
+    "manager_model",
+    "worker_model",
+    "multimodal_model",
 ];
 
 /// Config keys rendered as discrete controls (toggles / pick lists) that
@@ -550,14 +539,6 @@ impl SettingsState {
         self.add_user_adding = false;
     }
 
-    /// Look up the role config for a given role key.
-    fn role_config_for(&self, key: &str) -> Option<&RoleConfig> {
-        self.config
-            .per_role_configs
-            .iter()
-            .find(|rc| rc.role == key)
-    }
-
     /// Mirror a toggle in both config snapshots: `"true"`/`""` (the empty
     /// string keeps the [non_empty] accessor collapsing to None = disabled),
     /// plus the global CONFIG so refresh() can't revert the change.
@@ -639,8 +620,8 @@ impl SettingsState {
     ///
     /// Only text-style fields reach this path: `ConfigFieldSettleNow` is
     /// dispatched by the Enter/submit and slider-release handlers, and
-    /// discrete controls (`routing_allow:`) settle with their value passed
-    /// directly to [`Self::settle_now`] instead.
+    /// discrete controls settle with their value passed directly to
+    /// [`Self::settle_now`] instead.
     fn staged_value(&self, field: &str) -> Option<String> {
         if let Some(key) = field.strip_prefix("config:") {
             return self
@@ -649,9 +630,6 @@ impl SettingsState {
                 .into_iter()
                 .find(|(k, _)| *k == key)
                 .and_then(|(_, v)| v.map(String::from));
-        }
-        if let Some(role) = field.strip_prefix("role_model:") {
-            return self.role_config_for(role).and_then(|rc| rc.model.clone());
         }
         if let Some(model) = field.strip_prefix("routing_order:") {
             return self
@@ -703,32 +681,14 @@ impl SettingsState {
         )
     }
 
-    /// Re-sync a single persisted column of a role/routing row into the
-    /// editable snapshot.
+    /// Re-sync a single persisted column of a routing row into the editable
+    /// snapshot.
     ///
-    /// Only the column whose persist just completed (or failed) is written —
-    /// a sibling column may hold a staged-but-unsettled edit (e.g. a model
-    /// typed while a routing toggle's persist is in flight) and must not be
-    /// clobbered by a whole-row mirror. `value` is the canonical persisted
-    /// value for the field's own column; when `None` (a failed persist
-    /// rolling back a discrete control) the column is read back from CONFIG,
-    /// the source of truth. When the persist deleted the row, the row is
-    /// dropped from the snapshot only if it holds no staged sibling content
-    /// — a staged sibling edit keeps it alive and re-creates the row when it
-    /// persists.
+    /// `value` is the canonical persisted value for the field's own column;
+    /// when `None` (a failed persist rolling back a discrete control) the
+    /// column is read back from CONFIG, the source of truth. When the persist
+    /// deleted the row, the row is dropped from the snapshot.
     fn sync_field(&mut self, field: &str, value: Option<&str>) {
-        if let Some(role) = field.strip_prefix("role_model:") {
-            let model = value.and_then(crate::config::trimmed_or_none).or_else(|| {
-                crate::config::CONFIG
-                    .role_config_by_key(role)
-                    .and_then(|rc| rc.model)
-            });
-            RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
-                c.model = model;
-            });
-            self.drop_role_row_if_cleared(role);
-            return;
-        }
         if let Some(model) = field.strip_prefix("routing_order:") {
             let order = value.and_then(crate::config::trimmed_or_none).or_else(|| {
                 crate::config::CONFIG
@@ -737,19 +697,6 @@ impl SettingsState {
             });
             ModelRouting::upsert(&mut self.config.model_routings, model, |row| {
                 row.provider_order = order;
-            });
-            self.drop_routing_row_if_cleared(model);
-            return;
-        }
-        if let Some(model) = field.strip_prefix("routing_allow:") {
-            let allow = match value {
-                Some(v) => Some(v == "true"),
-                None => crate::config::CONFIG
-                    .model_routing_by_key(model)
-                    .and_then(|mr| mr.allow_fallbacks),
-            };
-            ModelRouting::upsert(&mut self.config.model_routings, model, |row| {
-                row.allow_fallbacks = allow;
             });
             self.drop_routing_row_if_cleared(model);
             return;
@@ -769,25 +716,13 @@ impl SettingsState {
         }
     }
 
-    /// Drop a role row from the editable snapshot when the persist deleted it
-    /// from the DB/CONFIG — unless a staged sibling edit keeps it alive (the
-    /// row is re-created when that edit persists).
-    fn drop_role_row_if_cleared(&mut self, role: &str) {
-        if crate::config::CONFIG.role_config_by_key(role).is_none() {
-            self.config.per_role_configs.retain(|rc| {
-                rc.role != role || rc.model.is_some() || rc.reasoning_effort.is_some()
-            });
-        }
-    }
-
     /// Drop a routing row from the editable snapshot when the persist deleted
-    /// it from the DB/CONFIG — unless a staged sibling edit keeps it alive
-    /// (the row is re-created when that edit persists).
+    /// it from the DB/CONFIG.
     fn drop_routing_row_if_cleared(&mut self, model: &str) {
         if crate::config::CONFIG.model_routing_by_key(model).is_none() {
-            self.config.model_routings.retain(|mr| {
-                mr.model != model || mr.provider_order.is_some() || mr.allow_fallbacks.is_some()
-            });
+            self.config
+                .model_routings
+                .retain(|mr| mr.model != model || mr.provider_order.is_some());
         }
     }
 
@@ -808,21 +743,19 @@ impl SettingsState {
 
     /// Whether a failed persist should roll the control back to the last
     /// persisted value. Discrete-state controls (toggles, pick lists, the
-    /// slider, routing fallback toggles, and the model pickers' optimistic
-    /// active/list markers) revert; free-text inputs keep the typed value so
-    /// the user can correct it.
+    /// slider, and the model pickers' optimistic active/list markers) revert;
+    /// free-text inputs keep the typed value so the user can correct it.
     fn field_reverts_on_error(field: &str) -> bool {
-        field.starts_with("routing_allow:")
-            || matches!(
-                field,
-                "config:audio_transcription_use_local"
-                    | "config:web_search_provider"
-                    | "config:adaptive_k"
-                    | "config:image_gen_model"
-                    | "config:image_gen_models"
-                    | "config:video_model"
-                    | "config:video_models"
-            )
+        matches!(
+            field,
+            "config:audio_transcription_use_local"
+                | "config:web_search_provider"
+                | "config:adaptive_k"
+                | "config:image_gen_model"
+                | "config:image_gen_models"
+                | "config:video_model"
+                | "config:video_models"
+        )
     }
 
     /// Persist a model-picker's list field immediately (discrete action —
@@ -976,24 +909,6 @@ impl SettingsState {
                     }
                 }
             }
-            SettingsMessage::RoleModel { role, model } => {
-                let field = format!("role_model:{role}");
-                self.field_errors.remove(&field);
-                let model_opt = Some(model.clone()).filter(|s| !s.is_empty());
-                RoleConfig::upsert(&mut self.config.per_role_configs, role, |c| {
-                    c.model = model_opt;
-                });
-                let generation = self.bump_gen(&field);
-                let f = field.clone();
-                Task::perform(
-                    super::widgets::debounce_sleep(SETTLE_MS, generation),
-                    move |g| SettingsMessage::ConfigFieldSettled {
-                        field: f,
-                        value: model,
-                        generation: g,
-                    },
-                )
-            }
             SettingsMessage::ModelRoutingOrder { model, order } => {
                 let field = format!("routing_order:{model}");
                 self.field_errors.remove(&field);
@@ -1011,14 +926,6 @@ impl SettingsState {
                         generation: g,
                     },
                 )
-            }
-            SettingsMessage::ModelRoutingAllowFallbacks { model, allow } => {
-                let field = format!("routing_allow:{model}");
-                self.field_errors.remove(&field);
-                ModelRouting::upsert(&mut self.config.model_routings, model, |mr| {
-                    mr.allow_fallbacks = Some(allow);
-                });
-                self.settle_now(&field, allow.to_string())
             }
             SettingsMessage::TogglePasswordVisibility(target) => {
                 if self.password_visible.contains(&target) {
@@ -2478,36 +2385,73 @@ impl SettingsState {
     }
 
     fn models_section(&self) -> Element<'_, SettingsMessage> {
-        let rows = Role::iter().map(|role| {
-            let key: &str = role.into();
-            let info = crate::role::role_info(&role);
-            let label = info.display_label;
-            let default = info.default_model;
-            let current = self
-                .role_config_for(key)
-                .and_then(|rc| rc.model.clone())
-                .unwrap_or_default();
-            let field = format!("role_model:{key}");
-            let submit = SettingsMessage::ConfigFieldSettleNow {
-                field: field.clone(),
-            };
-            let error = self.field_errors.get(&field).map(String::as_str);
-            field_row_with_error(
-                label,
-                text_input(default, &current)
-                    .on_input(move |v| SettingsMessage::RoleModel {
-                        role: key.to_string(),
-                        model: v,
-                    })
-                    .on_submit(submit)
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(375.0))
-                    .into(),
-                Some(default),
-                error,
+        let manager_row = field_row_with_error(
+            "Manager",
+            text_input(
+                crate::config::DEFAULT_MANAGER_MODEL,
+                self.config.manager_model.as_deref().unwrap_or_default(),
             )
-        });
-        section("Models (per-role)", Column::from_iter(rows))
+            .on_input(|v| SettingsMessage::ConfigField {
+                key: "manager_model",
+                value: v,
+            })
+            .on_submit(SettingsMessage::ConfigFieldSettleNow {
+                field: "config:manager_model".into(),
+            })
+            .style(super::widgets::text_input_style)
+            .width(Length::Fixed(375.0))
+            .into(),
+            Some("Manager"),
+            self.field_errors
+                .get("config:manager_model")
+                .map(String::as_str),
+        );
+        let worker_row = field_row_with_error(
+            "Worker",
+            text_input(
+                crate::config::DEFAULT_WORKER_MODEL,
+                self.config.worker_model.as_deref().unwrap_or_default(),
+            )
+            .on_input(|v| SettingsMessage::ConfigField {
+                key: "worker_model",
+                value: v,
+            })
+            .on_submit(SettingsMessage::ConfigFieldSettleNow {
+                field: "config:worker_model".into(),
+            })
+            .style(super::widgets::text_input_style)
+            .width(Length::Fixed(375.0))
+            .into(),
+            Some("Engineer, Analyst, Coder, QA, Reviewer, Discovery, Maintainer, Sanitation"),
+            self.field_errors
+                .get("config:worker_model")
+                .map(String::as_str),
+        );
+        let multimodal_row = field_row_with_error(
+            "Multimodal",
+            text_input(
+                crate::config::DEFAULT_MULTIMODAL_MODEL,
+                self.config.multimodal_model.as_deref().unwrap_or_default(),
+            )
+            .on_input(|v| SettingsMessage::ConfigField {
+                key: "multimodal_model",
+                value: v,
+            })
+            .on_submit(SettingsMessage::ConfigFieldSettleNow {
+                field: "config:multimodal_model".into(),
+            })
+            .style(super::widgets::text_input_style)
+            .width(Length::Fixed(375.0))
+            .into(),
+            Some("Artist, Assistant, and image/video transcription"),
+            self.field_errors
+                .get("config:multimodal_model")
+                .map(String::as_str),
+        );
+        section(
+            "Models",
+            column![manager_row, worker_row, multimodal_row].spacing(4),
+        )
     }
 
     fn transcription_section(&self) -> Element<'_, SettingsMessage> {
@@ -2534,30 +2478,9 @@ impl SettingsState {
                         .map(String::as_str),
                 ),
                 Space::new().height(8),
-                config_text_input(
-                    "Media Model",
-                    "qwen/qwen3.6-plus",
-                    self.config
-                        .media_transcription_model
-                        .as_deref()
-                        .unwrap_or_default(),
-                    "media_transcription_model",
-                    self.field_errors
-                        .get("config:media_transcription_model")
-                        .map(String::as_str),
-                ),
-                config_text_input(
-                    "Media Provider",
-                    "",
-                    self.config
-                        .media_transcription_provider
-                        .as_deref()
-                        .unwrap_or_default(),
-                    "media_transcription_provider",
-                    self.field_errors
-                        .get("config:media_transcription_provider")
-                        .map(String::as_str),
-                ),
+                text("Image/video transcription uses the Multimodal model.")
+                    .size(10)
+                    .color(theme::TEXT_SECONDARY),
             ],
         )
     }
@@ -3093,21 +3016,21 @@ impl SettingsState {
     }
 
     fn routing_section(&self) -> Element<'_, SettingsMessage> {
-        // Collect all unique models that should appear in the routing section:
-        // 1. Every role's effective model (override from per_role_configs → hardcoded default)
-        // 2. Every model with a saved routing entry (preserves orphaned entries)
+        // The three effective model slots — saved routing rows for models
+        // outside these slots are not rendered (they are inert orphans).
         let mut model_names: BTreeSet<String> = BTreeSet::new();
-        for role in Role::iter() {
-            let role_key: &str = role.into();
-            let model = self
-                .role_config_for(role_key)
-                .and_then(|rc| rc.model.clone().filter(|m| !m.is_empty()))
-                .unwrap_or_else(|| crate::role::role_info(&role).default_model.to_string());
-            model_names.insert(model);
-        }
-        for mr in &self.config.model_routings {
-            model_names.insert(mr.model.clone());
-        }
+        model_names.insert(crate::config::resolve_or(
+            self.config.manager_model.clone(),
+            crate::config::DEFAULT_MANAGER_MODEL,
+        ));
+        model_names.insert(crate::config::resolve_or(
+            self.config.worker_model.clone(),
+            crate::config::DEFAULT_WORKER_MODEL,
+        ));
+        model_names.insert(crate::config::resolve_or(
+            self.config.multimodal_model.clone(),
+            crate::config::DEFAULT_MULTIMODAL_MODEL,
+        ));
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
         for model_name in &model_names {
@@ -3121,69 +3044,48 @@ impl SettingsState {
                     ModelRouting {
                         model: model_name.clone(),
                         provider_order: None,
-                        allow_fallbacks: None,
                     },
                     Clone::clone,
                 );
             let current_order = current.provider_order;
-            let current_allow = current.allow_fallbacks;
 
             let display_name = model_name.clone();
             let order_model = model_name.clone();
-            let allow_model = model_name.clone();
             let order_field = format!("routing_order:{model_name}");
             let order_submit = SettingsMessage::ConfigFieldSettleNow {
                 field: order_field.clone(),
             };
             let order_error = self.field_errors.get(&order_field).map(String::as_str);
-            let order_input = text_input("DeepSeek", &current_order.unwrap_or_default())
-                .on_input(move |v| SettingsMessage::ModelRoutingOrder {
-                    model: order_model.clone(),
-                    order: v,
-                })
-                .on_submit(order_submit)
-                .style(super::widgets::text_input_style)
-                .width(Length::Fixed(375.0));
+            let order_input: Element<'_, SettingsMessage> =
+                text_input("DeepSeek", &current_order.unwrap_or_default())
+                    .on_input(move |v| SettingsMessage::ModelRoutingOrder {
+                        model: order_model.clone(),
+                        order: v,
+                    })
+                    .on_submit(order_submit)
+                    .style(super::widgets::text_input_style)
+                    .width(Length::Fixed(375.0))
+                    .into();
 
-            let allow_field = format!("routing_allow:{model_name}");
-            let allow_error = self.field_errors.get(&allow_field).map(String::as_str);
-            let allow_toggle = toggler(current_allow.unwrap_or(false)).on_toggle(move |b| {
-                SettingsMessage::ModelRoutingAllowFallbacks {
-                    model: allow_model.clone(),
-                    allow: b,
-                }
+            let row = column![
+                // Model name label (read-only)
+                text(display_name)
+                    .font(iced::Font::MONOSPACE)
+                    .size(13)
+                    .color(theme::TEXT_SECONDARY),
+                Space::new().height(4),
+                order_input,
+            ]
+            .spacing(2);
+
+            rows.push(if let Some(err) = order_error {
+                column![row, inline_error(err, 0.0)].spacing(2).into()
+            } else {
+                row.into()
             });
-
-            rows.push(
-                column![
-                    // Model name label (read-only)
-                    text(display_name)
-                        .font(iced::Font::MONOSPACE)
-                        .size(13)
-                        .color(theme::TEXT_SECONDARY),
-                    Space::new().height(4),
-                    field_row_with_error(
-                        "Provider Order",
-                        order_input.into(),
-                        Some("Comma-separated provider slugs"),
-                        order_error,
-                    ),
-                    field_row_with_error(
-                        "Allow Fallbacks",
-                        allow_toggle.into(),
-                        None,
-                        allow_error,
-                    ),
-                ]
-                .spacing(2)
-                .into(),
-            );
         }
 
-        // No empty-state needed — defaults from Role::iter() always
-        // populate the list.
-
-        section("Provider Routing (per-model)", Column::from_iter(rows))
+        section("Provider Routing", Column::from_iter(rows))
     }
 }
 
@@ -3374,51 +3276,17 @@ fn delete_confirm_button<'a>(
 ///
 /// Field ids (see [`SettingsMessage::ConfigFieldSettled`]):
 /// - `config:<key>` — string config fields
-/// - `role_model:<role>` — per-role rows
-/// - `routing_order:<model>` / `routing_allow:<model>` — per-model rows
+/// - `routing_order:<model>` — per-model rows
 ///
 /// Returns the canonical persisted value.
 async fn persist_settled_field(field: &str, value: &str) -> anyhow::Result<String> {
     if let Some(key) = field.strip_prefix("config:") {
         return crate::config::persist_settled_string_field(key, value).await;
     }
-    if let Some(role) = field.strip_prefix("role_model:") {
-        return crate::config::persist_settled_role_model(role, value).await;
-    }
     if let Some(model) = field.strip_prefix("routing_order:") {
         return crate::config::persist_settled_routing_order(model, value).await;
     }
-    if let Some(model) = field.strip_prefix("routing_allow:") {
-        return crate::config::persist_settled_routing_allow(model, value == "true").await;
-    }
     anyhow::bail!("unknown settings field: {field}");
-}
-
-/// Config text input — label on left, styled text input on right, optional
-/// inline error below. Settles on Enter in addition to the debounce timer.
-fn config_text_input<'a>(
-    label: &'static str,
-    placeholder: &str,
-    value: &str,
-    config_key: &'static str,
-    error: Option<&'a str>,
-) -> Element<'a, SettingsMessage> {
-    let field = format!("config:{config_key}");
-    let submit = SettingsMessage::ConfigFieldSettleNow { field };
-    field_row_with_error(
-        label,
-        text_input(placeholder, value)
-            .on_input(move |v| SettingsMessage::ConfigField {
-                key: config_key,
-                value: v,
-            })
-            .on_submit(submit)
-            .style(super::widgets::text_input_style)
-            .width(Length::Fixed(375.0))
-            .into(),
-        None,
-        error,
-    )
 }
 
 /// Configuration for a single text field in [`modal_dialog`].
@@ -3963,22 +3831,22 @@ mod tests {
     fn stale_result_does_not_apply_stale_value() {
         let mut state = SettingsState::new();
         let _ = state.update(SettingsMessage::ConfigField {
-            key: "media_transcription_model",
+            key: "manager_model",
             value: "model-a".into(),
         });
         let _ = state.update(SettingsMessage::ConfigField {
-            key: "media_transcription_model",
+            key: "manager_model",
             value: "model-b".into(),
         });
 
         // A stale SUCCESS result (gen 1) must not overwrite the staged value.
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:media_transcription_model".into(),
+            field: "config:manager_model".into(),
             generation: 1,
             result: Ok("model-a".into()),
         });
         assert_eq!(
-            state.config.media_transcription_model.as_deref(),
+            state.config.manager_model.as_deref(),
             Some("model-b"),
             "stale success must not overwrite the newer staged value"
         );
@@ -4164,17 +4032,14 @@ mod tests {
 
         // Enter on a text field settles the staged value immediately too.
         let _task = state.update(SettingsMessage::ConfigField {
-            key: "media_transcription_model",
+            key: "manager_model",
             value: "model-c".into(),
         });
         let _task = state.update(SettingsMessage::ConfigFieldSettleNow {
-            field: "config:media_transcription_model".into(),
+            field: "config:manager_model".into(),
         });
         assert_eq!(
-            state
-                .field_gen
-                .get("config:media_transcription_model")
-                .copied(),
+            state.field_gen.get("config:manager_model").copied(),
             Some(2),
             "Enter settles the staged value with a fresh generation"
         );
@@ -4198,23 +4063,23 @@ mod tests {
     }
 
     #[test]
-    fn role_model_keystroke_arms_debounced_settle() {
+    fn model_slot_keystroke_arms_debounced_settle() {
         let mut state = SettingsState::new();
 
-        // Role model is a text input → debounced settle (700 ms).
-        let _task = state.update(SettingsMessage::RoleModel {
-            role: "engineer".to_string(),
-            model: "test-model".to_string(),
+        // Model slots are text inputs → debounced settle (700 ms).
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "manager_model",
+            value: "test-model".to_string(),
         });
         assert_eq!(
-            state.field_gen.get("role_model:engineer").copied(),
+            state.field_gen.get("config:manager_model").copied(),
             Some(1),
-            "role model keystroke arms a debounced settle"
+            "model slot keystroke arms a debounced settle"
         );
         assert_eq!(
-            state.config.per_role_configs[0].model.as_deref(),
+            state.config.manager_model.as_deref(),
             Some("test-model"),
-            "role model staged in the editable snapshot"
+            "model slot staged in the editable snapshot"
         );
     }
 }

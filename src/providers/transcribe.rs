@@ -108,7 +108,7 @@ impl MediaTranscriber {
         });
 
         if let Some(route) = &self.provider_route
-            && let Some(routing) = crate::providers::provider_routing_json(route, false)
+            && let Some(routing) = crate::providers::provider_routing_json(route)
         {
             body["provider"] = routing;
         }

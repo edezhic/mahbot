@@ -12,7 +12,7 @@ pub(crate) mod transcribe;
 
 pub(crate) use reasoning::plaintext_for_display;
 
-use crate::config::{CONFIG, non_empty, resolve_or, trimmed_or_none};
+use crate::config::{CONFIG, resolve_or, trimmed_or_none};
 use crate::util::UnwrapPoison;
 pub(crate) use crate::{ChatRequest, ChatResponse, Provider};
 
@@ -37,7 +37,6 @@ pub(crate) fn test_request(
         max_tokens: None,
         reasoning_effort: None,
         provider_order: None,
-        provider_allow_fallbacks: None,
         meta: None,
     }
 }
@@ -137,22 +136,22 @@ pub(crate) fn ensure_base_url(endpoint: &str) -> String {
 /// single-provider strings (transcription) — a single slug survives the
 /// split/trim/filter cycle unchanged.
 ///
+/// Fallbacks are explicitly pinned to `false` in the emitted JSON (mahbot-1822:
+/// the Allow Fallbacks option was removed from the settings and the runtime).
+///
 /// # Example
 ///
 /// ```ignore
-/// let routing = provider_routing_json("openai,   anthropic  ", true);
+/// let routing = provider_routing_json("openai,   anthropic  ");
 /// assert_eq!(
 ///     routing,
 ///     Some(serde_json::json!({
 ///         "order": ["openai", "anthropic"],
-///         "allow_fallbacks": true,
+///         "allow_fallbacks": false,
 ///     })),
 /// );
 /// ```
-pub(crate) fn provider_routing_json(
-    order: &str,
-    allow_fallbacks: bool,
-) -> Option<serde_json::Value> {
+pub(crate) fn provider_routing_json(order: &str) -> Option<serde_json::Value> {
     let providers: Vec<&str> = order
         .split(',')
         .map(str::trim)
@@ -163,7 +162,7 @@ pub(crate) fn provider_routing_json(
     }
     Some(serde_json::json!({
         "order": providers,
-        "allow_fallbacks": allow_fallbacks,
+        "allow_fallbacks": false,
     }))
 }
 
@@ -298,11 +297,11 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::
 
 /// Rebuild only the media transcriber singleton from the current `CONFIG`.
 ///
-/// Used by the settings page's per-field autosave when a transcription
-/// setting (`media_transcription_model` / `media_transcription_provider`)
-/// settles — the media transcriber captures its model/provider at build time,
-/// so a change must rebuild it, but no provider warmup (network call) is
-/// needed: the provider itself is unaffected by transcription settings.
+/// Used by the settings page's per-field autosave when the Multimodal model
+/// slot or its provider routing settles — the media transcriber captures its
+/// model/provider route at build time, so a change must rebuild it, but no
+/// provider warmup (network call) is needed: the provider itself is
+/// unaffected by these settings.
 pub(crate) fn recreate_media_transcriber() {
     let config = CONFIG.snapshot();
     let transcriber = build_media_transcriber(&config);
@@ -414,17 +413,22 @@ fn create_transcriber(
 fn build_media_transcriber(config: &crate::config::ConfigData) -> Option<MediaTranscriber> {
     // The runtime endpoint is hardcoded (mahbot-1813) — only the default
     // endpoint is supported right now.
+    let model = resolve_or(
+        config.multimodal_model.clone(),
+        crate::config::DEFAULT_MULTIMODAL_MODEL,
+    );
+    // The transcriber captures its provider route at build time; the route
+    // comes from the routing row for the resolved Multimodal model.
+    let route = config
+        .model_routings
+        .iter()
+        .find(|mr| mr.model == model)
+        .and_then(|mr| mr.provider_order.clone());
     create_transcriber(
         Some(crate::config::DEFAULT_PROVIDER_ENDPOINT),
         config.provider_key.as_deref(),
-        Some(
-            resolve_or(
-                config.media_transcription_model.clone(),
-                crate::config::DEFAULT_MEDIA_TRANSCRIPTION_MODEL,
-            )
-            .as_str(),
-        ),
-        non_empty(config.media_transcription_provider.clone()).as_deref(),
+        Some(model.as_str()),
+        route.as_deref(),
     )
 }
 
@@ -545,7 +549,6 @@ mod tests {
         struct Case {
             name: &'static str,
             order: &'static str,
-            allow_fallbacks: bool,
             expected: Option<serde_json::Value>,
         }
 
@@ -553,7 +556,6 @@ mod tests {
             Case {
                 name: "single_provider",
                 order: "openai",
-                allow_fallbacks: false,
                 expected: Some(serde_json::json!({
                     "order": ["openai"],
                     "allow_fallbacks": false,
@@ -562,28 +564,24 @@ mod tests {
             Case {
                 name: "multiple_providers",
                 order: "openai, anthropic, google",
-                allow_fallbacks: true,
                 expected: Some(serde_json::json!({
                     "order": ["openai", "anthropic", "google"],
-                    "allow_fallbacks": true,
+                    "allow_fallbacks": false,
                 })),
             },
             Case {
                 name: "whitespace_only_yields_none",
                 order: "  , ,  ",
-                allow_fallbacks: false,
                 expected: None,
             },
             Case {
                 name: "empty_string_yields_none",
                 order: "",
-                allow_fallbacks: true,
                 expected: None,
             },
             Case {
                 name: "leading_trailing_whitespace",
                 order: "  openai  ",
-                allow_fallbacks: false,
                 expected: Some(serde_json::json!({
                     "order": ["openai"],
                     "allow_fallbacks": false,
@@ -594,7 +592,6 @@ mod tests {
             Case {
                 name: "single_slug_survives_split",
                 order: "google-gemini",
-                allow_fallbacks: false,
                 expected: Some(serde_json::json!({
                     "order": ["google-gemini"],
                     "allow_fallbacks": false,
@@ -604,12 +601,11 @@ mod tests {
 
         for c in &cases {
             assert_eq!(
-                provider_routing_json(c.order, c.allow_fallbacks),
+                provider_routing_json(c.order),
                 c.expected,
-                "case '{}': provider_routing_json({:?}, {})",
+                "case '{}': provider_routing_json({:?})",
                 c.name,
                 c.order,
-                c.allow_fallbacks,
             );
         }
     }

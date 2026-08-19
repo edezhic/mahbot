@@ -132,7 +132,6 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
                 .to_string(),
         ),
         provider_order: routing.provider_order,
-        provider_allow_fallbacks: routing.allow_fallbacks,
         meta: Some(ChatRequestMeta {
             purpose: "synthesis",
             agent_id: format!("joint_verdict_{}", crate::generate_suffix()),

@@ -193,7 +193,6 @@ pub(crate) fn chat_request(
                 .to_string(),
         ),
         provider_order: routing.provider_order,
-        provider_allow_fallbacks: routing.allow_fallbacks,
         meta: None,
     }
 }

@@ -951,7 +951,6 @@ pub(crate) fn grouping_request(
     model: String,
     reasoning_effort: Option<String>,
     provider_order: Option<String>,
-    provider_allow_fallbacks: Option<bool>,
     max_tokens: Option<u32>,
 ) -> ChatRequest {
     ChatRequest {
@@ -965,7 +964,6 @@ pub(crate) fn grouping_request(
         max_tokens,
         reasoning_effort,
         provider_order,
-        provider_allow_fallbacks,
         meta: Some(ChatRequestMeta {
             purpose,
             agent_id: format!("grouping_{}_{}", ws.name, crate::generate_suffix()),

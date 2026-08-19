@@ -753,8 +753,7 @@ impl OpenAiCompatibleProvider {
         // Provider routing — per-request values only; no global fallback.
         // If provider_order is present and non-empty, build the routing block.
         if let Some(order) = &request.provider_order
-            && let Some(routing) =
-                provider_routing_json(order, request.provider_allow_fallbacks.unwrap_or(false))
+            && let Some(routing) = provider_routing_json(order)
         {
             extra.insert("provider".to_string(), routing);
         }

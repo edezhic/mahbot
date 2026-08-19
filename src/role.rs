@@ -47,7 +47,7 @@ pub(crate) const SANITATION_ROLE: &str = "sanitation_admin";
 ///
 /// * `badge_fg` black sentinel (struct update syntax)
 /// * `display_label` empty string sentinel (struct update syntax)
-/// * `default_model` and `default_reasoning_effort` non-empty (struct update)
+/// * `default_reasoning_effort` non-empty (struct update)
 /// * [`Role::tools()`] non-empty for every variant
 /// * `role_description()` contains real content (no placeholder)
 /// * `summary_prompt()` contains real content (no placeholder)
@@ -72,8 +72,6 @@ pub struct RoleInfo {
     /// Converted to an [`iced::Color`] badge in `gui/theme.rs`. The badge
     /// background is always this color at 0.1 alpha.
     pub badge_fg: (f32, f32, f32),
-    /// Default model ID for this role, used when no per-role override is configured.
-    pub default_model: &'static str,
     /// Default reasoning effort for this role.
     ///
     /// Authoritative since mahbot-1819: reasoning effort is no longer
@@ -94,7 +92,6 @@ const BASE_ROLE_INFO: RoleInfo = RoleInfo {
     has_discovery: true,
     requires_multimodal: false,
     badge_fg: (0.0, 0.0, 0.0),
-    default_model: "deepseek/deepseek-v4-flash-0731",
     default_reasoning_effort: "high",
     display_label: "",
 };
@@ -109,7 +106,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
     match role {
         Role::Manager => &RoleInfo {
             badge_fg: (0.816, 0.635, 0.082),
-            default_model: "deepseek/deepseek-v4-pro",
             default_reasoning_effort: "xhigh",
             display_label: "Manager",
             ..BASE_ROLE_INFO
@@ -150,7 +146,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             has_discovery: false,
             requires_multimodal: true,
             badge_fg: (0.808, 0.365, 0.592),
-            default_model: "qwen/qwen3.6-plus",
             default_reasoning_effort: "high",
             display_label: "Artist",
         },
@@ -460,16 +455,11 @@ mod tests {
 
     #[test]
     fn defaults_set() {
-        // Guards against empty default_model or default_reasoning_effort — a new
-        // role added with struct update syntax must set them if they differ from
-        // the BASE_ROLE_INFO defaults, and even the base must be non-empty.
+        // Guards against an empty default_reasoning_effort — a new role added
+        // with struct update syntax must set it if it differs from the
+        // BASE_ROLE_INFO default, and even the base must be non-empty.
         for role in Role::iter() {
             let info = super::role_info(&role);
-            assert!(
-                !info.default_model.is_empty(),
-                "{}: default_model must not be empty",
-                role.as_str()
-            );
             assert!(
                 !info.default_reasoning_effort.is_empty(),
                 "{}: default_reasoning_effort must not be empty",

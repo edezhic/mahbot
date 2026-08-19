@@ -14,8 +14,8 @@
 //! # Resolution chains
 //!
 //! The configuration system has three independent resolution chains. They are
-//! **independent** — a KV entry in Chain 1 cannot override a per-role model in
-//! Chain 2, and a per-role entry in Chain 2 cannot override a per-model routing
+//! **independent** — a KV entry in Chain 1 cannot override a model slot in
+//! Chain 2, and a slot entry in Chain 2 cannot override a per-model routing
 //! in Chain 3. Each chain applies to different fields.
 //!
 //! ## Chain 1: KV-overridable string fields
@@ -38,26 +38,23 @@
 //! through [`ConfigData::set_string_field`]. Any key absent from the table
 //! remains `None`, and the accessor resolves the hardcoded fallback.
 //!
-//! Fields **not** in this chain (e.g. `per_role_configs`, `model_routings`) have
-//! their own dedicated tables and reload paths.
+//! Fields **not** in this chain (e.g. `model_routings`) have their own
+//! dedicated table and reload path.
 //!
-//! ## Chain 2: Per-role model override
+//! ## Chain 2: Three model slots
 //!
-//! `config_role` table → [`crate::role::RoleInfo::default_model`]
+//! `config_kv` table → hardcoded slot default (`const` in this module)
 //!
-//! Stored in [`ConfigData::per_role_configs`] as a [`Vec<RoleConfig>`][RoleConfig],
-//! loaded at reload time from the `config_role` table. Checked at request time by
-//! [`ConfigReload::role_model`] with the priority:
+//! The three model slots — `manager_model`, `worker_model`, `multimodal_model`
+//! — are ordinary Chain 1 fields. [`ConfigReload::role_model`] maps every role
+//! onto exactly one slot:
 //!
-//! > Per-role override → [`role_info`]`(role).default_model`
+//! > `Role::Manager` → manager slot; `Role::Artist` | `Role::Assistant` →
+//! > multimodal slot; every other role → worker slot
 //!
-//! When no matching [`RoleConfig`] entry exists, the role's built-in default from
-//! [`role_info`] (defined in [`crate::role`]) is returned.
-//!
-//! Reasoning effort is **not** part of this chain since mahbot-1819: it is baked
-//! into [`crate::role::RoleInfo::default_reasoning_effort`] and no longer
-//! user-tunable. Stored `config_role.reasoning_effort` values are retained as
-//! harmless orphans (never consulted, never deleted) per the orphaned-key policy.
+//! Unset slots fall back to their `DEFAULT_*_MODEL` constant. The legacy
+//! `config_role` table (per-role overrides) is no longer read or written —
+//! its rows are inert orphans per the orphaned-key policy.
 //!
 //! ## Chain 3: Per-model provider routing
 //!
@@ -65,20 +62,22 @@
 //!
 //! Stored in [`ConfigData::model_routings`] as a [`Vec<ModelRouting>`][ModelRouting],
 //! loaded at reload time from the `config_model_routing` table. Checked via
-//! [`ConfigReload::model_routing`]. When no entry exists, all fields on the
-//! returned [`ModelRouting`] — `provider_order` and `allow_fallbacks` — are `None`.
-//! The provider layer (in [`crate::providers`]) resolves these `None` values at
-//! request time when building the OpenAI-compatible chat request.
+//! [`ConfigReload::model_routing`]. When no entry exists, the returned
+//! [`ModelRouting`] has `provider_order` `None`. The provider layer (in
+//! [`crate::providers`]) resolves this `None` value at request time when
+//! building the OpenAI-compatible chat request.
 //!
 //! # Persistence layer
 //!
-//! The three tables live in `config.db` and are managed by [`crate::config_db`]:
+//! The tables live in `config.db` and are managed by [`crate::config_db`]:
 //!
 //! | Table | Read | Write |
 //! |---|---|---|
 //! | `config_kv` | [`crate::config_db::ConfigStore::get_all_kv`] | [`crate::config_db::ConfigStore::set_kv`] |
-//! | `config_role` | [`crate::config_db::ConfigStore::get_all_role_configs`] | [`crate::config_db::ConfigStore::save_role_config`] |
 //! | `config_model_routing` | [`crate::config_db::ConfigStore::get_all_model_routings`] | [`crate::config_db::ConfigStore::save_model_routing`] |
+//!
+//! The `config_role` table remains in the schema but is intentionally
+//! unreferenced (see the orphaned-key policy below).
 //!
 //! # Orphaned database keys
 //!
@@ -89,6 +88,11 @@
 //! must not be deleted. Orphaned rows are harmless and are naturally
 //! overwritten if a future config key reuses the name.
 //!
+//! The `config_role` table (per-role overrides) and the legacy
+//! `media_transcription_model` / `media_transcription_provider` config_kv keys
+//! are inert orphans since mahbot-1822: their schema and rows are left
+//! untouched, but no code reads or writes them.
+//!
 //! # See also
 //!
 //! * [`crate::config_db`] — database persistence for all three chains.
@@ -97,7 +101,6 @@
 //!   at the provider layer.
 
 use crate::Role;
-use crate::role::role_info;
 use crate::util::{UnwrapPoison, is_http_url};
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -109,9 +112,12 @@ use tokio::fs;
 
 pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 
+pub(crate) const DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-pro-0813";
+pub(crate) const DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
+pub(crate) const DEFAULT_MULTIMODAL_MODEL: &str = "qwen/qwen3.7-flash";
+
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
 const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
-pub(crate) const DEFAULT_MEDIA_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.6-plus";
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
 /// Default adaptive k multiplier for wake word detection.
@@ -119,56 +125,11 @@ const DEFAULT_ADAPTIVE_K: &str = "2.5";
 
 // ── Named config structs ───────────────────────────────────────────
 
-/// A per-role model override.
-///
-/// The `reasoning_effort` field is retained orphaned data since mahbot-1819:
-/// it is loaded and preserved through the persist path but never consulted at
-/// request time (the baked [`crate::role::RoleInfo::default_reasoning_effort`]
-/// is authoritative).
-#[derive(Debug, Clone, PartialEq)]
-pub struct RoleConfig {
-    pub role: String,
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-}
-
-// NOTE: RoleConfig::upsert and ModelRouting::upsert are structurally identical
-// by design. The ~13 lines of shared find-or-push logic are below the abstraction
-// threshold — a trait, macro, or generic function would add more conceptual surface
-// area than the duplication it eliminates. Keep both methods direct and concrete.
-
-impl RoleConfig {
-    /// Find-or-push: update a subset of fields on an existing entry matching
-    /// `role`, or push a new entry (all fields defaulted to `None`).
-    ///
-    /// Only the field(s) mutated inside `set_field` are touched — if the
-    /// entry already exists its other fields are preserved unchanged.
-    pub(crate) fn upsert(
-        configs: &mut Vec<RoleConfig>,
-        role: impl Into<String>,
-        set_field: impl FnOnce(&mut RoleConfig),
-    ) {
-        let role = role.into();
-        if let Some(existing) = configs.iter_mut().find(|rc| rc.role == role) {
-            set_field(existing);
-        } else {
-            let mut new = RoleConfig {
-                role,
-                model: None,
-                reasoning_effort: None,
-            };
-            set_field(&mut new);
-            configs.push(new);
-        }
-    }
-}
-
 /// A per-model provider routing rule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRouting {
     pub model: String,
     pub provider_order: Option<String>,
-    pub allow_fallbacks: Option<bool>,
 }
 
 impl ModelRouting {
@@ -189,7 +150,6 @@ impl ModelRouting {
             let mut new = ModelRouting {
                 model,
                 provider_order: None,
-                allow_fallbacks: None,
             };
             set_field(&mut new);
             routings.push(new);
@@ -247,10 +207,14 @@ pub struct ConfigData {
     pub provider_key: Option<String>,
     /// Base URL for the OpenAI-compatible LLM provider.
     pub provider_endpoint: Option<String>,
-    /// Media transcription model (images and videos).
-    pub media_transcription_model: Option<String>,
-    /// Media transcription provider routing.
-    pub media_transcription_provider: Option<String>,
+    /// Model slot for the Manager role.
+    pub manager_model: Option<String>,
+    /// Model slot for all worker roles (Engineer, Analyst, Coder, QA,
+    /// Reviewer, Discovery, Maintainer, Sanitation).
+    pub worker_model: Option<String>,
+    /// Model slot for multimodal roles (Artist, Assistant) and image/video
+    /// transcription.
+    pub multimodal_model: Option<String>,
     /// Image generation model.
     pub image_gen_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
@@ -302,10 +266,7 @@ pub struct ConfigData {
     /// The adaptive threshold is computed as `mean + k × std` over a running
     /// window of recent per-frame classifier scores.  Range: [1.0, 4.0].
     pub adaptive_k: Option<String>,
-    /// Per-role model overrides.
-    pub per_role_configs: Vec<RoleConfig>,
     /// Per-model provider routing.
-    /// `allow_fallbacks` is `None` when unset (defaults to `false` at request time).
     pub model_routings: Vec<ModelRouting>,
 }
 
@@ -394,15 +355,13 @@ macro_rules! string_config_fields {
             /// ever runs.
             pub(crate) const STRUCT_FIELDS_DEFAULT: Self = Self {
                 $($field: None,)*
-                per_role_configs: Vec::new(),
                 model_routings: Vec::new(),
             };
 
             /// Return all string-valued config fields as (db_key, current_value) pairs.
             ///
-            /// `per_role_configs` and `model_routings` are **not** included here:
-            /// the former lives in a separate database table (`config_role`),
-            /// the latter in `config_model_routing`.
+            /// `model_routings` is **not** included here — it lives in a
+            /// separate database table (`config_model_routing`).
             #[must_use]
             pub fn string_fields(&self) -> Vec<(&'static str, Option<&str>)> {
                 vec![$((stringify!($field), self.$field.as_deref())),*]
@@ -414,8 +373,8 @@ macro_rules! string_config_fields {
             /// The value is stored as-is without normalization — call [`Self::normalize`]
             /// before using the config to collapse empty/whitespace-only values to `None`.
             ///
-            /// `per_role_configs` and `model_routings` are **not** handled here —
-            /// they live in separate database tables (`config_role` and `config_model_routing`).
+            /// `model_routings` is **not** handled here — it lives in a separate
+            /// database table (`config_model_routing`).
             #[must_use]
             pub fn set_string_field(&mut self, key: &str, value: &str) -> bool {
                 match key {
@@ -522,8 +481,9 @@ macro_rules! string_config_fields {
 string_config_fields! {
     provider_key [non_empty],
     provider_endpoint [fixed(DEFAULT_PROVIDER_ENDPOINT)],
-    media_transcription_model [or(DEFAULT_MEDIA_TRANSCRIPTION_MODEL)],
-    media_transcription_provider [non_empty],
+    manager_model [or(DEFAULT_MANAGER_MODEL)],
+    worker_model [or(DEFAULT_WORKER_MODEL)],
+    multimodal_model [or(DEFAULT_MULTIMODAL_MODEL)],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
     video_model [or(DEFAULT_VIDEO_MODEL)],
@@ -546,12 +506,8 @@ impl ConfigData {
     ///
     /// This is the Vec-entry counterpart of [`normalize_string_fields()`] —
     /// the macro-generated method only touches top-level `Option<String>` fields,
-    /// not the inner fields of [`RoleConfig`] and [`ModelRouting`] entries.
+    /// not the inner fields of [`ModelRouting`] entries.
     fn normalize_entries(&mut self) {
-        for rc in &mut self.per_role_configs {
-            rc.model = non_empty(rc.model.take());
-            rc.reasoning_effort = non_empty(rc.reasoning_effort.take());
-        }
         for mr in &mut self.model_routings {
             mr.provider_order = non_empty(mr.provider_order.take());
         }
@@ -562,10 +518,9 @@ impl ConfigData {
     ///
     /// The sequence is:
     /// 1. Trim top-level `Option<String>` fields and collapse empty → `None`.
-    /// 2. Trim inner fields on `Vec` entries (`[RoleConfig]`, `[ModelRouting]`)
+    /// 2. Trim inner fields on `Vec` entries (`[ModelRouting]`)
     ///    and collapse empty → `None`.
-    /// 3. Sort `per_role_configs` by role name.
-    /// 4. Sort `model_routings` by model name.
+    /// 3. Sort `model_routings` by model name.
     ///
     /// Every caller that produces a newly-built [`ConfigData`] must call
     /// this before swapping into the global [`CONFIG`] so that the in-memory
@@ -573,7 +528,6 @@ impl ConfigData {
     pub(crate) fn normalize(&mut self) {
         self.normalize_string_fields();
         self.normalize_entries();
-        self.per_role_configs.sort_by(|a, b| a.role.cmp(&b.role));
         self.model_routings.sort_by(|a, b| a.model.cmp(&b.model));
     }
 }
@@ -647,7 +601,7 @@ pub static CONFIG: ConfigReload = ConfigReload::const_new();
 /// Serializes all per-field config persistence (settings-page autosave).
 ///
 /// Every settled-field persist runs inside this lock so that:
-/// - read-modify-write sequences (per-role rows, endpoint/key probes built
+/// - read-modify-write sequences (routing rows, endpoint/key probes built
 ///   from the live config) never interleave with each other;
 /// - side-effect settles (provider warmup + recreate, Telegram listener
 ///   restart) cannot race, which would let two full config rewrites with
@@ -748,61 +702,17 @@ impl ConfigReload {
         guard.set_string_field(key, value)
     }
 
-    /// Find the per-role override row by role key (string form), if one exists.
-    ///
-    /// Unlike [`Self::find_role_config`] (which takes the [`Role`] enum),
-    /// this accepts the raw role key as stored in `config_role.role`, so the
-    /// settings page and persistence layer can look rows up without
-    /// re-parsing the key.
-    pub(crate) fn role_config_by_key(&self, role: &str) -> Option<RoleConfig> {
-        let guard = self.read();
-        guard
-            .per_role_configs
-            .iter()
-            .find(|rc| rc.role == role)
-            .cloned()
-    }
-
-    /// Apply a single role-config row to the in-memory config (find-or-push).
-    ///
-    /// When both override fields are `None` the row is removed — an all-None
-    /// row is indistinguishable from having no override, and the removal keeps
-    /// the in-memory representation identical to what [`reload_from_db`]
-    /// would load from the DB after the matching row deletion.
-    pub(crate) fn set_role_config_row(
-        &self,
-        role: &str,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-    ) {
-        let mut guard = self.inner.write().unwrap_poison();
-        if model.is_none() && reasoning_effort.is_none() {
-            guard.per_role_configs.retain(|rc| rc.role != role);
-        } else {
-            RoleConfig::upsert(&mut guard.per_role_configs, role, |rc| {
-                rc.model = model;
-                rc.reasoning_effort = reasoning_effort;
-            });
-        }
-    }
-
     /// Apply a single model-routing row to the in-memory config (find-or-push).
     ///
-    /// `Some(false)` on `allow_fallbacks` is meaningful and preserved; only
-    /// `None` + `None` removes the row (mirroring [`ConfigReload::set_role_config_row`]).
-    pub(crate) fn set_model_routing_row(
-        &self,
-        model: &str,
-        provider_order: Option<String>,
-        allow_fallbacks: Option<bool>,
-    ) {
+    /// `None` on `provider_order` removes the row (mirroring the
+    /// DELETE-if-empty persistence path).
+    pub(crate) fn set_model_routing_row(&self, model: &str, provider_order: Option<String>) {
         let mut guard = self.inner.write().unwrap_poison();
-        if provider_order.is_none() && allow_fallbacks.is_none() {
+        if provider_order.is_none() {
             guard.model_routings.retain(|mr| mr.model != model);
         } else {
             ModelRouting::upsert(&mut guard.model_routings, model, |mr| {
                 mr.provider_order = provider_order;
-                mr.allow_fallbacks = allow_fallbacks;
             });
         }
     }
@@ -837,38 +747,24 @@ impl ConfigReload {
             ModelRouting {
                 model: model.to_string(),
                 provider_order: None,
-                allow_fallbacks: None,
             }
         }
     }
 
-    // ── Per-role model resolution ───────────────────────────────
+    // ── Role model resolution (three slots) ─────────────────────
 
-    /// Find the per-role override config for a given role, if one exists.
+    /// Resolve the configured model for a role from the three model slots.
     ///
-    /// Returns `None` when no matching override is configured in
-    /// `per_role_configs`.
-    fn find_role_config(&self, role: Role) -> Option<RoleConfig> {
-        let role_key: &str = role.into();
-        let guard = self.read();
-        guard
-            .per_role_configs
-            .iter()
-            .find(|rc| rc.role == role_key)
-            .cloned()
-    }
-
-    /// Resolve the configured model for a role.
-    ///
-    /// Priority: per-role override → role info default.
+    /// Manager uses the manager slot; Artist and Assistant use the multimodal
+    /// slot (they need vision); every other role uses the worker slot. Unset
+    /// slots fall back to their code default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
-        if let Some(rc) = self.find_role_config(role)
-            && let Some(ref m) = rc.model
-        {
-            return m.clone();
+        match role {
+            Role::Manager => self.manager_model(),
+            Role::Artist | Role::Assistant => self.multimodal_model(),
+            _ => self.worker_model(),
         }
-        role_info(&role).default_model.to_string()
     }
 }
 
@@ -949,21 +845,6 @@ pub async fn reload_from_db() -> Result<()> {
             first_legacy_value(&kvs, &["video_edit_model", "video_gen_model"]).map(String::from);
     }
 
-    // Migrate the legacy image_transcription_* keys into media_transcription_*
-    // (the transcriber now handles images and videos). The legacy keys remain
-    // as orphaned config_kv rows (harmless; a downgrade would resurrect them).
-    if config.media_transcription_model.is_none() {
-        config.media_transcription_model =
-            first_legacy_value(&kvs, &["image_transcription_model"]).map(String::from);
-    }
-    if config.media_transcription_provider.is_none() {
-        config.media_transcription_provider =
-            first_legacy_value(&kvs, &["image_transcription_provider"]).map(String::from);
-    }
-
-    let roles = store.get_all_role_configs().await?;
-    config.per_role_configs = roles;
-
     let routings = store.get_all_model_routings().await?;
     config.model_routings = routings;
 
@@ -979,7 +860,7 @@ pub async fn reload_from_db() -> Result<()> {
 // ── Per-field persistence (settings-page autosave) ─────────────────
 //
 // Each settled config field is persisted individually — a single KV row or a
-// single role/routing row — instead of a whole-config rewrite. Every function
+// single routing row — instead of a whole-config rewrite. Every function
 // in this section:
 //
 // 1. Runs under [`persist_lock`] so read-modify-write sequences and
@@ -991,9 +872,9 @@ pub async fn reload_from_db() -> Result<()> {
 //    (provider/transcriber re-init, Telegram listener reload) — never per
 //    keystroke, only when a value settles.
 // 4. Returns the canonical persisted value (trimmed, `None` collapsed to
-//    `""`; `"true"`/`"false"` for the routing-allow toggle) so the caller
-//    can re-sync its display snapshot — the settings page writes exactly
-//    this value back into the editable snapshot for every field type.
+//    `""`) so the caller can re-sync its display snapshot — the settings
+//    page writes exactly this value back into the editable snapshot for
+//    every field type.
 //
 // `wake_word_templates` is excluded from every path: it is owned exclusively
 // by the voice pipeline (`persist_enrollment` in `voice.rs`), which writes
@@ -1077,10 +958,10 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
             }
             write_kv_and_update_config("image_gen_model", &trimmed).await?;
         }
-        // Transcription settings rebuild the media transcriber (no provider
-        // warmup — the provider is unaffected by these) and kick the local
-        // transcriber load when it becomes enabled.
-        "media_transcription_model" | "media_transcription_provider" => {
+        // Multimodal model changes rebuild the media transcriber (no provider
+        // warmup — the provider is unaffected by this) — the transcriber
+        // captures the model at build time.
+        "multimodal_model" => {
             write_kv_and_update_config(key, &trimmed).await?;
             crate::providers::recreate_media_transcriber();
         }
@@ -1099,71 +980,27 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
     Ok(trimmed_or_none(&trimmed).unwrap_or_default())
 }
 
-/// Persist a settled per-role model override (`""` clears it).
-///
-/// Preserves the role row's current `reasoning_effort` from the live config,
-/// so a model edit never alters or deletes stored rows: the orphaned
-/// `reasoning_effort` column is kept intact (mahbot-1819 no-writes/no-deletes
-/// guarantee). Returns the canonical model value.
-pub async fn persist_settled_role_model(role: &str, model: &str) -> Result<String> {
-    let _guard = persist_lock().lock().await;
-    let model = trimmed_or_none(model);
-    let reasoning = CONFIG
-        .role_config_by_key(role)
-        .and_then(|rc| rc.reasoning_effort);
-    save_role_row(role, model, reasoning).await
-}
-
 /// Persist a settled per-model routing `provider_order` (`""` clears it).
 ///
-/// Preserves the row's current `allow_fallbacks` from the live config.
-/// Returns the canonical order value.
+/// Returns the canonical order value. When the routed model is the effective
+/// Multimodal model, the media transcriber is rebuilt — it captures its
+/// provider route at build time.
 pub async fn persist_settled_routing_order(model: &str, order: &str) -> Result<String> {
     let _guard = persist_lock().lock().await;
     let order = trimmed_or_none(order);
-    let allow = CONFIG.model_routing(model).allow_fallbacks;
-    save_routing_row(model, order, allow).await
-}
-
-/// Persist a settled per-model routing `allow_fallbacks` toggle.
-///
-/// Preserves the row's current `provider_order` from the live config.
-/// Returns the canonical allow value (`"true"`/`"false"`) so the caller can
-/// re-sync its display snapshot — the row's order is unchanged by this call.
-pub async fn persist_settled_routing_allow(model: &str, allow: bool) -> Result<String> {
-    let _guard = persist_lock().lock().await;
-    let order = CONFIG.model_routing(model).provider_order;
-    save_routing_row(model, order, Some(allow)).await?;
-    Ok(allow.to_string())
-}
-
-/// Write a single role row (UPSERT or DELETE-if-empty) and mirror it into the
-/// in-memory CONFIG. Caller holds [`persist_lock`].
-async fn save_role_row(
-    role: &str,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-) -> Result<String> {
-    let store = crate::config_db::store();
-    store
-        .save_role_config(role, model.as_deref(), reasoning_effort.as_deref())
-        .await?;
-    CONFIG.set_role_config_row(role, model.clone(), reasoning_effort);
-    Ok(model.unwrap_or_default())
+    let persisted = save_routing_row(model, order).await?;
+    if CONFIG.multimodal_model() == model {
+        crate::providers::recreate_media_transcriber();
+    }
+    Ok(persisted)
 }
 
 /// Write a single routing row (UPSERT or DELETE-if-empty) and mirror it into
 /// the in-memory CONFIG. Caller holds [`persist_lock`].
-async fn save_routing_row(
-    model: &str,
-    order: Option<String>,
-    allow: Option<bool>,
-) -> Result<String> {
+async fn save_routing_row(model: &str, order: Option<String>) -> Result<String> {
     let store = crate::config_db::store();
-    store
-        .save_model_routing(model, order.as_deref(), allow)
-        .await?;
-    CONFIG.set_model_routing_row(model, order.clone(), allow);
+    store.save_model_routing(model, order.as_deref()).await?;
+    CONFIG.set_model_routing_row(model, order.clone());
     Ok(order.unwrap_or_default())
 }
 
@@ -1220,31 +1057,12 @@ fn validate_config(config: &ConfigData) -> Result<()> {
 
 // ── Test helpers ──────────────────────────────────────────────
 
-/// Construct a [`RoleConfig`] for tests.
-#[cfg(test)]
-pub(crate) fn role_config(
-    role: &str,
-    model: Option<&str>,
-    reasoning_effort: Option<&str>,
-) -> RoleConfig {
-    RoleConfig {
-        role: role.into(),
-        model: model.map(String::from),
-        reasoning_effort: reasoning_effort.map(String::from),
-    }
-}
-
 /// Construct a [`ModelRouting`] for tests.
 #[cfg(test)]
-pub(crate) fn model_routing(
-    model: &str,
-    provider_order: Option<&str>,
-    allow_fallbacks: Option<bool>,
-) -> ModelRouting {
+pub(crate) fn model_routing(model: &str, provider_order: Option<&str>) -> ModelRouting {
     ModelRouting {
         model: model.into(),
         provider_order: provider_order.map(String::from),
-        allow_fallbacks,
     }
 }
 
@@ -1351,9 +1169,19 @@ mod tests {
         // ── or: falls back to default when unset ──
         reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
         assert_eq!(
-            reload.media_transcription_model(),
-            DEFAULT_MEDIA_TRANSCRIPTION_MODEL,
-            "unset media_transcription_model falls back to default"
+            reload.manager_model(),
+            DEFAULT_MANAGER_MODEL,
+            "unset manager_model falls back to default"
+        );
+        assert_eq!(
+            reload.worker_model(),
+            DEFAULT_WORKER_MODEL,
+            "unset worker_model falls back to default"
+        );
+        assert_eq!(
+            reload.multimodal_model(),
+            DEFAULT_MULTIMODAL_MODEL,
+            "unset multimodal_model falls back to default"
         );
 
         // ── fixed: always returns the constant, ignoring persisted values ──
@@ -1403,172 +1231,60 @@ mod tests {
         assert_eq!(trimmed_or_none(""), None);
     }
 
-    // NOTE: Per-struct normalize tests (`role_config_normalize`,
-    // `model_routing_normalize`) have been intentionally removed as
-    // redundant.  Both `normalize()` methods are one-line delegations to
-    // `non_empty()` with no conditional logic.  The `non_empty` / `trimmed_or_none`
-    // primitive is covered exhaustively by `trimmed_or_none_trims_whitespace`
-    // above, and the end-to-end integration through `normalize_entries()` is
-    // covered by `normalize_entries_works` below.  If a new normalization
-    // scenario is added, it should be added to the primitive test AND
-    // exercised through the integration test — there is no need for
-    // per-struct test duplication.
+    // NOTE: Per-struct normalize tests (`model_routing_normalize`) have been
+    // intentionally removed as redundant.  The `normalize()` method is a
+    // one-line delegation to `non_empty()` with no conditional logic.  The
+    // `non_empty` / `trimmed_or_none` primitive is covered exhaustively by
+    // `trimmed_or_none_trims_whitespace` above, and the end-to-end integration
+    // through `normalize_entries()` is covered by `normalize_entries_works`
+    // below.  If a new normalization scenario is added, it should be added to
+    // the primitive test AND exercised through the integration test — there is
+    // no need for per-struct test duplication.
 
     /// Verify that [`ConfigData::normalize_entries`] normalises every entry in
-    /// `per_role_configs` and `model_routings`.
+    /// `model_routings`.
     #[test]
     fn normalize_entries_works() {
         let mut config = ConfigData {
-            per_role_configs: vec![
-                RoleConfig {
-                    role: "engineer".into(),
-                    model: Some(String::new()),
-                    reasoning_effort: Some("  high  ".into()),
+            model_routings: vec![
+                ModelRouting {
+                    model: "test-model".into(),
+                    provider_order: Some("   ".into()),
                 },
-                RoleConfig {
-                    role: "manager".into(),
-                    model: Some("  test-model  ".into()),
-                    reasoning_effort: None,
+                ModelRouting {
+                    model: "test-model-2".into(),
+                    provider_order: Some("  OpenAi,  Anthropic  ".into()),
                 },
             ],
-            model_routings: vec![ModelRouting {
-                model: "test-model".into(),
-                provider_order: Some("   ".into()),
-                allow_fallbacks: None,
-            }],
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
 
         config.normalize_entries();
 
-        // First role: empty model → None, whitespace reasoning_effort → trimmed
-        assert_eq!(config.per_role_configs[0].model, None);
-        assert_eq!(
-            config.per_role_configs[0].reasoning_effort,
-            Some("high".into())
-        );
-
-        // Second role: trimmed model preserved, None stays None
-        assert_eq!(config.per_role_configs[1].model, Some("test-model".into()));
-        assert_eq!(config.per_role_configs[1].reasoning_effort, None);
-
         // Routing: whitespace-only provider_order → None
         assert_eq!(config.model_routings[0].provider_order, None);
+
+        // Routing: trimmed provider_order preserved
+        assert_eq!(
+            config.model_routings[1].provider_order,
+            Some("OpenAi,  Anthropic".into())
+        );
     }
 
     // ── Upsert three-scenario tests ─────────────────────────
     //
-    // Each upsert method (RoleConfig::upsert, ModelRouting::upsert)
-    // is tested across three scenarios:
-    //   1. updates_existing — existing entry, upsert sets one field,
-    //      the other field is preserved unchanged
+    // `ModelRouting::upsert` is tested across three scenarios:
+    //   1. updates_existing — existing entry, upsert sets the target field
     //   2. pushes_new_entry — empty vec, new entry is pushed with the
-    //      target field set and the other field None
-    //   3. can_set_none — existing entry has both fields set to non-None;
-    //      clearing one field via None leaves the other field unchanged
-
-    #[test]
-    fn upsert_role_config_fields() {
-        // 1a. updates_existing — set model preserves reasoning_effort
-        {
-            let mut items = vec![role_config("engineer", Some("old"), Some("high"))];
-            RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.model = Some("new".into());
-            });
-            assert_eq!(items.len(), 1);
-            assert_eq!(
-                items[0].model,
-                Some("new".into()),
-                "[model] target field updated"
-            );
-            assert_eq!(
-                items[0].reasoning_effort,
-                Some("high".into()),
-                "[model] other field preserved"
-            );
-        }
-        // 1b. updates_existing — set reasoning_effort preserves model
-        {
-            let mut items = vec![role_config("engineer", Some("test-model"), Some("low"))];
-            RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.reasoning_effort = Some("high".into());
-            });
-            assert_eq!(items.len(), 1);
-            assert_eq!(
-                items[0].reasoning_effort,
-                Some("high".into()),
-                "[reasoning_effort] target field updated"
-            );
-            assert_eq!(
-                items[0].model,
-                Some("test-model".into()),
-                "[reasoning_effort] other field preserved"
-            );
-        }
-
-        // 2a. pushes_new_entry — model set, reasoning_effort is None
-        {
-            let mut items = vec![];
-            RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.model = Some("test-model".into());
-            });
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].role, "engineer");
-            assert_eq!(
-                items[0].model,
-                Some("test-model".into()),
-                "[model] set on new entry"
-            );
-            assert_eq!(items[0].reasoning_effort, None);
-        }
-        // 2b. pushes_new_entry — reasoning_effort set, model is None
-        {
-            let mut items = vec![];
-            RoleConfig::upsert(&mut items, "engineer", |item| {
-                item.reasoning_effort = Some("high".into());
-            });
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].role, "engineer");
-            assert_eq!(
-                items[0].reasoning_effort,
-                Some("high".into()),
-                "[reasoning_effort] set on new entry"
-            );
-            assert_eq!(items[0].model, None);
-        }
-
-        // 3a. can_set_none — clear model, reasoning_effort preserved
-        {
-            let mut items = vec![role_config("engineer", Some("test-model"), Some("high"))];
-            RoleConfig::upsert(&mut items, "engineer", |item| item.model = None);
-            assert_eq!(items[0].model, None, "[model] cleared to None");
-            assert_eq!(
-                items[0].reasoning_effort,
-                Some("high".into()),
-                "[model] other field preserved when clearing"
-            );
-        }
-        // 3b. can_set_none — clear reasoning_effort, model preserved
-        {
-            let mut items = vec![role_config("engineer", Some("test-model"), Some("high"))];
-            RoleConfig::upsert(&mut items, "engineer", |item| item.reasoning_effort = None);
-            assert_eq!(
-                items[0].reasoning_effort, None,
-                "[reasoning_effort] cleared to None"
-            );
-            assert_eq!(
-                items[0].model,
-                Some("test-model".into()),
-                "[reasoning_effort] other field preserved when clearing"
-            );
-        }
-    }
+    //      target field set
+    //   3. can_set_none — existing entry has the field set to non-None;
+    //      clearing it via None removes the value
 
     #[test]
     fn upsert_model_routing_fields() {
-        // 1a. updates_existing — set provider_order preserves allow_fallbacks
+        // 1. updates_existing — set provider_order
         {
-            let mut items = vec![model_routing("test-model", Some("OpenAi"), Some(true))];
+            let mut items = vec![model_routing("test-model", Some("OpenAi"))];
             ModelRouting::upsert(&mut items, "test-model", |item| {
                 item.provider_order = Some("Anthropic".into());
             });
@@ -1578,32 +1294,9 @@ mod tests {
                 Some("Anthropic".into()),
                 "[provider_order] target field updated"
             );
-            assert_eq!(
-                items[0].allow_fallbacks,
-                Some(true),
-                "[provider_order] other field preserved"
-            );
-        }
-        // 1b. updates_existing — set allow_fallbacks preserves provider_order
-        {
-            let mut items = vec![model_routing("test-model", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut items, "test-model", |item| {
-                item.allow_fallbacks = Some(false);
-            });
-            assert_eq!(items.len(), 1);
-            assert_eq!(
-                items[0].allow_fallbacks,
-                Some(false),
-                "[allow_fallbacks] target field updated"
-            );
-            assert_eq!(
-                items[0].provider_order,
-                Some("OpenAi".into()),
-                "[allow_fallbacks] other field preserved"
-            );
         }
 
-        // 2a. pushes_new_entry — provider_order set, allow_fallbacks is None
+        // 2. pushes_new_entry
         {
             let mut items = vec![];
             ModelRouting::upsert(&mut items, "test-model", |item| {
@@ -1616,78 +1309,27 @@ mod tests {
                 Some("OpenAi".into()),
                 "[provider_order] set on new entry"
             );
-            assert_eq!(items[0].allow_fallbacks, None);
-        }
-        // 2b. pushes_new_entry — allow_fallbacks set, provider_order is None
-        {
-            let mut items = vec![];
-            ModelRouting::upsert(&mut items, "test-model", |item| {
-                item.allow_fallbacks = Some(false);
-            });
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].model, "test-model");
-            assert_eq!(
-                items[0].allow_fallbacks,
-                Some(false),
-                "[allow_fallbacks] set on new entry"
-            );
-            assert_eq!(items[0].provider_order, None);
         }
 
-        // 3a. can_set_none — clear provider_order, allow_fallbacks preserved
+        // 3. can_set_none — clear provider_order
         {
-            let mut items = vec![model_routing("test-model", Some("OpenAi"), Some(true))];
+            let mut items = vec![model_routing("test-model", Some("OpenAi"))];
             ModelRouting::upsert(&mut items, "test-model", |item| item.provider_order = None);
             assert_eq!(
                 items[0].provider_order, None,
                 "[provider_order] cleared to None"
-            );
-            assert_eq!(
-                items[0].allow_fallbacks,
-                Some(true),
-                "[provider_order] other field preserved when clearing"
-            );
-        }
-        // 3b. can_set_none — clear allow_fallbacks, provider_order preserved
-        {
-            let mut items = vec![model_routing("test-model", Some("OpenAi"), Some(true))];
-            ModelRouting::upsert(&mut items, "test-model", |item| item.allow_fallbacks = None);
-            assert_eq!(
-                items[0].allow_fallbacks, None,
-                "[allow_fallbacks] cleared to None"
-            );
-            assert_eq!(
-                items[0].provider_order,
-                Some("OpenAi".into()),
-                "[allow_fallbacks] other field preserved when clearing"
             );
         }
     }
 
     #[test]
     fn upsert_multiple_entries_independent_keys() {
-        let mut configs = vec![
-            role_config("engineer", Some("model-a"), None),
-            role_config("manager", Some("model-b"), Some("high")),
-        ];
         let mut routings = vec![
-            model_routing("test-router-a", Some("OpenAi"), None),
-            model_routing("test-router-b", Some("Anthropic"), Some(true)),
+            model_routing("test-router-a", Some("OpenAi")),
+            model_routing("test-router-b", Some("Anthropic")),
         ];
 
         // Each upsert targets exactly one entry by key.
-        RoleConfig::upsert(&mut configs, "engineer", |c| {
-            c.model = Some("model-c".into());
-        });
-        assert_eq!(configs[0].model, Some("model-c".into()));
-        assert_eq!(configs[1].model, Some("model-b".into()));
-
-        RoleConfig::upsert(&mut configs, "manager", |c| {
-            c.reasoning_effort = Some("low".into());
-        });
-        assert_eq!(configs[1].reasoning_effort, Some("low".into()));
-        assert_eq!(configs[0].reasoning_effort, None);
-
         ModelRouting::upsert(&mut routings, "test-router-a", |mr| {
             mr.provider_order = Some("Google".into());
         });
@@ -1695,13 +1337,12 @@ mod tests {
         assert_eq!(routings[1].provider_order, Some("Anthropic".into()));
 
         ModelRouting::upsert(&mut routings, "test-router-b", |mr| {
-            mr.allow_fallbacks = Some(false);
+            mr.provider_order = Some("OpenAi".into());
         });
-        assert_eq!(routings[0].allow_fallbacks, None);
-        assert_eq!(routings[1].allow_fallbacks, Some(false));
+        assert_eq!(routings[0].provider_order, Some("Google".into()));
+        assert_eq!(routings[1].provider_order, Some("OpenAi".into()));
 
         // Total entries unchanged — no spurious pushes.
-        assert_eq!(configs.len(), 2);
         assert_eq!(routings.len(), 2);
     }
 
