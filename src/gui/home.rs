@@ -158,7 +158,7 @@ pub enum HomeMessage {
     /// workspace change so the Personal-picker merge partner never goes
     /// stale). Carries `(user, project_workspace)`.
     ProjectWorkspaceRefreshed(String, Option<String>),
-    /// Clear chat button pressed — reset session and display.
+    /// Reset session button pressed — reset session and display.
     ClearChat,
     /// Copy a chat message's raw markdown content to the clipboard.
     /// Carries the exact stored/transmitted text (original media markers
@@ -479,7 +479,7 @@ impl HomeState {
         self.pagination_gen = self.pagination_gen.wrapping_add(1);
     }
 
-    /// Clear chat display state: messages, dedup set, history flag, pagination.
+    /// Reset session display state: messages, dedup set, history flag, pagination.
     fn reset_chat_state(&mut self) {
         self.messages.clear();
         self.seen_ids.clear();
@@ -741,7 +741,7 @@ impl HomeState {
                     // with original media markers). Wrapping only the bubble —
                     // not the align_bubble row — keeps the spacer beside it a
                     // fall-through: spacer/empty-space right-clicks reach the
-                    // outer "Clear chat" menu in gui/mod.rs instead.
+                    // outer "Reset session" menu in gui/mod.rs instead.
                     let bubble: Element<'_, HomeMessage> = ContextMenu::new(
                         bubble,
                         vec![MenuItem::new(

@@ -1659,13 +1659,13 @@ impl Dashboard {
                     .map(Message::Home);
                 let sidebar = ticket_sidebar(&self.board_state);
                 // Wrap chat area in a right-click context menu with
-                // "Clear chat". Per-bubble ContextMenus (Copy message,
+                // "Reset session". Per-bubble ContextMenus (Copy message,
                 // see home.rs) capture bubble right-clicks; this outer
                 // menu is the fallback for empty-space right-clicks.
                 let home_view: Element<'_, Message> = ContextMenu::new(
                     home_view,
                     vec![context_menu::MenuItem::new(
-                        "Clear chat".into(),
+                        "Reset session".into(),
                         Message::Home(home::HomeMessage::ClearChat),
                     )],
                 )

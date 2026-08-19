@@ -587,7 +587,7 @@ where
                 shell.capture_event();
             }
             // Right-click anywhere or Escape dismisses too — the right-click
-            // capture also prevents the chat "Clear chat" context menu from
+            // capture also prevents the chat "Reset session" context menu from
             // stacking on top of the open list.
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
             | Event::Keyboard(iced::keyboard::Event::KeyPressed {
