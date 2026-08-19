@@ -26,7 +26,6 @@ use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::Duration;
 
 use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
@@ -1607,14 +1606,10 @@ impl SettingsState {
                 // reusing the delete_confirm_button machinery.
                 if ws.delete_target.as_ref() == Some(&ws_item.name) {
                     let confirm = delete_confirm_button(
-                        true,
                         SettingsMessage::WorkspaceMsg(
                             workspaces::WorkspacesMessage::ConfirmDelete(ws_item.name.clone()),
                         ),
                         SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::CancelDelete),
-                        SettingsMessage::WorkspaceMsg(
-                            workspaces::WorkspacesMessage::DeleteWorkspace(ws_item.name.clone()),
-                        ),
                     );
                     rows = rows.push(
                         container(confirm)
@@ -1822,32 +1817,25 @@ impl SettingsState {
                     .into()
                 } else {
                     container(
-                        button(
-                            lucide::log_in::<iced::Theme, iced::Renderer>()
-                                .size(18)
-                                .color(theme::TEXT_MUTED),
+                        tooltip(
+                            button(
+                                lucide::log_in::<iced::Theme, iced::Renderer>()
+                                    .size(18)
+                                    .color(theme::TEXT_MUTED),
+                            )
+                            .style(theme::button_text)
+                            .padding(0)
+                            .on_press(SettingsMessage::UserMsg(users::UsersMessage::SwitchUser(
+                                user.name.clone(),
+                            ))),
+                            text("Switch active user").size(11),
+                            tooltip::Position::Top,
                         )
-                        .style(theme::button_text)
-                        .padding(0)
-                        .on_press(SettingsMessage::UserMsg(
-                            users::UsersMessage::SwitchUser(user.name.clone()),
-                        )),
+                        .style(theme::tooltip_style),
                     )
                     .width(Length::Fixed(28.0))
                     .align_x(iced::alignment::Horizontal::Center)
                     .into()
-                };
-
-                let delete_btn: Element<'_, SettingsMessage> = if is_admin {
-                    row![].into()
-                } else {
-                    // Users confirm deletion via the modal in
-                    // `render_modal_overlay` (the inline "Delete? Yes / No"
-                    // prompt is only used for workspaces), so the trash
-                    // button is rendered directly.
-                    delete_trash_button(SettingsMessage::UserMsg(users::UsersMessage::DeleteUser(
-                        user.name.clone(),
-                    )))
                 };
 
                 let user_row = container(
@@ -1882,21 +1870,26 @@ impl SettingsState {
                                     .find(|o| o.value == ws_value)
                                     .cloned();
                                 container(
-                                    pick_list(
-                                        us.workspace_options.as_slice(),
-                                        ws_selected,
-                                        |opt| {
-                                            SettingsMessage::UserMsg(
-                                                users::UsersMessage::UpdateWorkspace(
-                                                    user.name.clone(),
-                                                    opt.value,
-                                                ),
-                                            )
-                                        },
+                                    tooltip(
+                                        pick_list(
+                                            us.workspace_options.as_slice(),
+                                            ws_selected,
+                                            |opt| {
+                                                SettingsMessage::UserMsg(
+                                                    users::UsersMessage::UpdateWorkspace(
+                                                        user.name.clone(),
+                                                        opt.value,
+                                                    ),
+                                                )
+                                            },
+                                        )
+                                        .style(widgets::pick_list_style)
+                                        .padding([4, 8])
+                                        .width(Length::Fixed(200.0)),
+                                        text("Active workspace").size(11),
+                                        tooltip::Position::Top,
                                     )
-                                    .style(widgets::pick_list_style)
-                                    .padding([4, 8])
-                                    .width(Length::Fixed(200.0)),
+                                    .style(theme::tooltip_style),
                                 )
                                 .width(Length::FillPortion(20))
                                 .align_x(Alignment::Start)
@@ -1905,27 +1898,30 @@ impl SettingsState {
                             // Role column (FillPortion: 15) — active role
                             // picker (pool-restricted) + pool editor button
                             {
-                                let role_picker: Element<'_, SettingsMessage> =
-                                    match us.active_role_options.get(&user.name) {
-                                        Some(options) if !options.is_empty() => {
-                                            let role_selected = user
-                                                .selected_role
-                                                .as_ref()
-                                                .and_then(|name| {
-                                                    options.iter().find(|o| o.value == *name)
-                                                })
-                                                .cloned()
-                                                .or_else(|| {
-                                                    // No (or stale) stored selection —
-                                                    // mirror resolve_active_role's default:
-                                                    // Analyst when in the pool, else the
-                                                    // first pool role.
-                                                    options
-                                                        .iter()
-                                                        .find(|o| o.value == "analyst")
-                                                        .or_else(|| options.first())
-                                                        .cloned()
-                                                });
+                                let role_picker: Element<'_, SettingsMessage> = match us
+                                    .active_role_options
+                                    .get(&user.name)
+                                {
+                                    Some(options) if !options.is_empty() => {
+                                        let role_selected = user
+                                            .selected_role
+                                            .as_ref()
+                                            .and_then(|name| {
+                                                options.iter().find(|o| o.value == *name)
+                                            })
+                                            .cloned()
+                                            .or_else(|| {
+                                                // No (or stale) stored selection —
+                                                // mirror resolve_active_role's default:
+                                                // Analyst when in the pool, else the
+                                                // first pool role.
+                                                options
+                                                    .iter()
+                                                    .find(|o| o.value == "analyst")
+                                                    .or_else(|| options.first())
+                                                    .cloned()
+                                            });
+                                        tooltip(
                                             pick_list(options.as_slice(), role_selected, |opt| {
                                                 SettingsMessage::UserMsg(
                                                     users::UsersMessage::UpdateRole(
@@ -1936,29 +1932,39 @@ impl SettingsState {
                                             })
                                             .style(widgets::pick_list_style)
                                             .padding([4, 8])
-                                            .width(Length::Fixed(150.0))
-                                            .into()
-                                        }
-                                        _ => text("none").size(12).color(theme::TEXT_MUTED).into(),
-                                    };
+                                            .width(Length::Fixed(150.0)),
+                                            text("Active role").size(11),
+                                            tooltip::Position::Top,
+                                        )
+                                        .style(theme::tooltip_style)
+                                        .into()
+                                    }
+                                    _ => text("none").size(12).color(theme::TEXT_MUTED).into(),
+                                };
                                 container(
                                     row![
                                         role_picker,
                                         Space::new().width(4),
-                                        button(
-                                            lucide::pencil_line::<iced::Theme, iced::Renderer>()
+                                        tooltip(
+                                            button(
+                                                lucide::pencil_line::<iced::Theme, iced::Renderer>(
+                                                )
                                                 .size(15)
                                                 .color(theme::TEXT_MUTED),
-                                        )
-                                        .style(theme::button_text)
-                                        .padding(2)
-                                        .on_press(
-                                            SettingsMessage::UserMsg(
-                                                users::UsersMessage::OpenPoolEdit(
-                                                    user.name.clone()
-                                                ),
                                             )
-                                        ),
+                                            .style(theme::button_text)
+                                            .padding(2)
+                                            .on_press(
+                                                SettingsMessage::UserMsg(
+                                                    users::UsersMessage::OpenPoolEdit(
+                                                        user.name.clone()
+                                                    ),
+                                                )
+                                            ),
+                                            text("Edit role pool").size(11),
+                                            tooltip::Position::Top,
+                                        )
+                                        .style(theme::tooltip_style),
                                     ]
                                     .align_y(Alignment::Center),
                                 )
@@ -1966,17 +1972,13 @@ impl SettingsState {
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center)
                             },
-                            // Actions column (FillPortion: 50) — switch icon + delete
+                            // Actions column (FillPortion: 12) — switch icon
                             container({
                                 let mut actions = Row::new().align_y(Alignment::Center);
                                 actions = actions.push(switch_icon);
-                                if !is_admin {
-                                    actions = actions.push(Space::new().width(8));
-                                    actions = actions.push(delete_btn);
-                                }
                                 actions
                             })
-                            .width(Length::FillPortion(50))
+                            .width(Length::FillPortion(12))
                             .align_x(Alignment::End)
                             .align_y(Alignment::Center),
                         ]
@@ -2108,6 +2110,26 @@ impl SettingsState {
                 .padding(8)
                 .style(theme::surface_card_style);
 
+                // Right-click context menu (Delete). The card's own controls
+                // still work: ContextMenu forwards all events to the underlay
+                // first; only right-clicks open the menu. Admins are exempt —
+                // no context menu at all (an empty menu would render a hollow
+                // box).
+                let user_row: Element<'_, SettingsMessage> = if is_admin {
+                    user_row.into()
+                } else {
+                    ContextMenu::new(
+                        user_row,
+                        vec![MenuItem::with_icon(
+                            iced_fonts::lucide::advanced_text::trash,
+                            "Delete".into(),
+                            SettingsMessage::UserMsg(users::UsersMessage::DeleteUser(
+                                user.name.clone(),
+                            )),
+                        )],
+                    )
+                    .into()
+                };
                 rows = rows.push(user_row);
             }
         }
@@ -3328,55 +3350,24 @@ fn password_input<'a>(
     }
 }
 
-/// Trash-icon delete button (with tooltip). Starts the item's deletion
-/// flow — for users this is the confirmation modal in
-/// `render_modal_overlay`; for workspaces it is the inline "Delete? Yes /
-/// No" prompt rendered by [`delete_confirm_button`] when the row is the
-/// delete target.
-fn delete_trash_button<'a>(on_delete: SettingsMessage) -> Element<'a, SettingsMessage> {
-    row![
-        tooltip(
-            button(
-                lucide::x::<iced::Theme, iced::Renderer>()
-                    .size(18)
-                    .color(theme::STATUS_ERROR),
-            )
-            .style(theme::button_text)
-            .on_press(on_delete),
-            "Delete",
-            tooltip::Position::Top,
-        )
-        .style(theme::tooltip_style)
-        .delay(Duration::from_millis(400)),
-    ]
-    .into()
-}
-
-/// Delete button — shows a "Delete? Yes / No" confirmation prompt when the
-/// item is the delete target, or a trash icon (with tooltip) that starts
-/// the item's deletion flow otherwise.
+/// Delete confirmation prompt — the inline "Delete? Yes / No" row shown
+/// below a workspace card when the row is the delete target.
 fn delete_confirm_button<'a>(
-    is_delete_target: bool,
     on_confirm: SettingsMessage,
     on_cancel: SettingsMessage,
-    on_delete: SettingsMessage,
 ) -> Element<'a, SettingsMessage> {
-    if is_delete_target {
-        row![
-            text("Delete?").size(12).color(theme::STATUS_ERROR),
-            Space::new().width(4),
-            button(text("Yes").size(11).color(theme::STATUS_ERROR))
-                .style(theme::button_danger)
-                .on_press(on_confirm),
-            Space::new().width(4),
-            button(text("No").size(11))
-                .style(theme::button_secondary)
-                .on_press(on_cancel),
-        ]
-        .into()
-    } else {
-        delete_trash_button(on_delete)
-    }
+    row![
+        text("Delete?").size(12).color(theme::STATUS_ERROR),
+        Space::new().width(4),
+        button(text("Yes").size(11).color(theme::STATUS_ERROR))
+            .style(theme::button_danger)
+            .on_press(on_confirm),
+        Space::new().width(4),
+        button(text("No").size(11))
+            .style(theme::button_secondary)
+            .on_press(on_cancel),
+    ]
+    .into()
 }
 
 /// Dispatch a settled field value to its per-field persistence function.
