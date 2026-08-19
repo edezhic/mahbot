@@ -77,20 +77,10 @@ use tracing::{debug, error, info, warn};
 #[path = "voice_pipeline_e2e_test.rs"]
 pub(crate) mod voice_pipeline_e2e_test;
 
-/// Public entry point for the voice pipeline benchmark.
+/// Public entry point for the wake-word benchmark (three plain metrics).
 ///
-/// Called by `benches/voice_pipeline_e2e.rs`.  Only compiled when the
-/// `voice-tests` feature is enabled.
-#[cfg(feature = "voice-tests")]
-pub fn run_voice_pipeline_benchmark() {
-    voice_pipeline_e2e_test::run_internal();
-}
-
-/// Public entry point for the simple voice pipeline benchmark (three plain
-/// metrics).
-///
-/// Called by `benches/voice_pipeline_simple.rs`.  Only compiled when the
-/// `voice-tests` feature is enabled.
+/// Called by `benches/wake_word.rs`.  Only compiled when the `voice-tests`
+/// feature is enabled.
 #[cfg(feature = "voice-tests")]
 pub fn run_simple_voice_pipeline_benchmark() {
     voice_pipeline_e2e_test::run_simple_benchmark();

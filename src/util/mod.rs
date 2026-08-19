@@ -1676,7 +1676,6 @@ pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
 #[cfg(feature = "voice-tests")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NoiseColor {
-    White,
     Pink,
     Brown,
 }
@@ -1693,9 +1692,6 @@ pub(crate) fn add_noise_color(pcm: &[f32], snr_db: f32, color: NoiseColor, seed:
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let signal_rms = compute_rms(pcm).max(1e-10);
     let noise: Vec<f32> = match color {
-        NoiseColor::White => (0..pcm.len())
-            .map(|_| rng.random::<f32>() * 2.0 - 1.0)
-            .collect(),
         NoiseColor::Pink => generate_pink_noise(pcm.len(), &mut rng),
         NoiseColor::Brown => {
             let mut acc = 0.0f32;
@@ -1754,89 +1750,6 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
     let u1: f32 = rng.random::<f32>().max(f32::EPSILON);
     let u2: f32 = rng.random::<f32>().max(f32::EPSILON);
     gaussian_pair_from_uniforms(u1, u2)
-}
-
-/// Mix white noise into audio at a given SNR (dB).
-///
-/// When `rng_seed` is `Some(seed)`, uses a deterministic seeded RNG for
-/// reproducible output. When `None`, uses an entropy-seeded RNG (current
-/// non-deterministic behavior). The deterministic path is used by the
-/// benchmark to ensure stable training data across re-runs.
-///
-/// # Arguments
-///
-/// * `samples` — Clean audio PCM f32 in [-1.0, 1.0].
-/// * `snr_db` — Desired signal-to-noise ratio in dB (typical: 10-25).
-///   Lower values = more noise. Must be finite.
-/// * `rng_seed` — Optional seed for deterministic RNG. `Some(seed)` produces
-///   reproducible noise; `None` uses entropy-based seeding.
-///
-/// # Returns
-///
-/// Noisy audio PCM f32 in [-1.0, 1.0] (clamped).
-///
-/// # Note — do NOT merge with the [`NoiseColor::White`] arm of [`add_noise_color`]
-///
-/// This is the former `tts_data_gen::add_noise` (4-arg) relocated unchanged.
-/// Despite the identical per-sample draw sequence (`rng.random::<f32>() * 2.0 - 1.0`
-/// here and in [`add_noise_color`]'s White arm — the old "different RNG
-/// consumption" justification only holds against the 3-arg pink alias), the two
-/// white paths deliberately stay separate:
-///
-/// (a) seed type: `Option<u64>` with an entropy fallback (`rand::random()`)
-///     here vs a plain `u64` in [`add_noise_color`];
-/// (b) degenerate-input handling: early passthrough on near-zero RMS
-///     (`<= 1e-10` returns `samples.to_vec()`) vs `.max(1e-10)` floors that
-///     still scale the mix;
-/// (c) scale arithmetic order — `(signal_rms / noise_rms) * 10^(-snr/20)` here
-///     vs `signal_rms * 10^(-snr/20) / noise_rms` in [`add_noise_color`], a
-///     possible 1-ulp difference;
-/// (d) this path guards `!snr_db.is_finite()` (early passthrough);
-///     [`add_noise_color`] does not.
-///
-/// The golden hashes pin [`add_noise_color`]'s White cells (NOT this
-/// report-only probe-matrix path), so changing [`add_noise_color`]'s
-/// arithmetic would break byte-exact goldens, while merging the two paths
-/// would only shift report-only probe-matrix diagnostics. Keep them separate.
-#[must_use]
-#[cfg(feature = "voice-tests")]
-pub(crate) fn add_white_noise(samples: &[f32], snr_db: f32, rng_seed: Option<u64>) -> Vec<f32> {
-    if samples.is_empty() || !snr_db.is_finite() {
-        return samples.to_vec();
-    }
-
-    // Create a seeded or entropy-based RNG.
-    // When None, we seed from rand::random() rather than using the
-    // thread-local generator directly, isolating RNG state.
-    let mut rng: rand::rngs::StdRng = match rng_seed {
-        Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
-        None => rand::rngs::StdRng::seed_from_u64(rand::random()),
-    };
-
-    // Generate noise using the single RNG.
-    // Uniform white noise in [-1.0, 1.0]
-    let noise: Vec<f32> = (0..samples.len())
-        .map(|_| rng.random::<f32>() * 2.0 - 1.0)
-        .collect();
-
-    // Compute RMS of signal and noise
-    let signal_rms = compute_rms(samples);
-    let noise_rms = compute_rms(&noise);
-
-    if signal_rms <= 1e-10 || noise_rms <= 1e-10 {
-        return samples.to_vec(); // Degenerate case — no scaling
-    }
-
-    // SNR = 20 * log10(signal_rms / noise_rms * scale)
-    // scale = signal_rms / noise_rms * 10^(-SNR/20)
-    let scale = (signal_rms / noise_rms) * 10.0_f32.powf(-snr_db / 20.0);
-
-    // Mix
-    let mut result = Vec::with_capacity(samples.len());
-    for (&s, &n) in samples.iter().zip(noise.iter()) {
-        result.push((s + n * scale).clamp(-1.0, 1.0));
-    }
-    result
 }
 
 /// Apply speed perturbation by resampling.

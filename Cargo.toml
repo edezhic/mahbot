@@ -217,12 +217,7 @@ http = "1.5"
 serial_test = "3"
 
 [[bench]]
-name = "voice_pipeline_e2e"
-harness = false
-required-features = ["voice-tests"]
-
-[[bench]]
-name = "voice_pipeline_simple"
+name = "wake_word"
 harness = false
 required-features = ["voice-tests"]
 
