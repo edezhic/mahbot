@@ -12,6 +12,7 @@
 
 pub(crate) mod agent;
 pub mod audio;
+pub mod bench_openrouter;
 pub mod board;
 pub(crate) mod boot;
 pub(crate) mod call_registry;

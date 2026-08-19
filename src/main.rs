@@ -509,11 +509,22 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
 
+    // bench-openrouter subcommand: standalone OpenRouter provider benchmark.
+    // Dispatched before lock acquisition — must run while the daemon holds the
+    // flock. Never touches live stores (config.db reads are read-only).
+    if std::env::args().nth(1).as_deref() == Some("bench-openrouter") {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let code = rt.block_on(mahbot::bench_openrouter::run_cli());
+        std::process::exit(code);
+    }
+
     // Consolidate ALL daemon temp files under one private root
     // (`/tmp/mahbot`, mode 0700) and pin TMPDIR to it — BEFORE any
-    // temp use (config, logs, stores, shell children). The debug and
-    // __grep-engine subcommands above must NOT create the root (they exit
-    // before this point).
+    // temp use (config, logs, stores, shell children). The debug,
+    // __grep-engine and bench-openrouter subcommands above must NOT create
+    // the root (they exit before this point).
     mahbot::temp_root::init_temp_root()?;
 
     // Detect self-update availability mode before any async work.

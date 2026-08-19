@@ -1325,6 +1325,10 @@ fn is_engine_panic_error(err: &anyhow::Error) -> bool {
 
 /// Open a store file read-only with the given engine opts.
 ///
+/// Also used by the `bench-openrouter` subcommand for read-only `config.db`
+/// lookups (worker model / provider key fallbacks) — same guarantees, same
+/// no-write path as the debug CLI.
+///
 /// Uses the low-level `turso::core` API because the SDK `Builder` cannot open
 /// read-only: `OpenFlags::ReadOnly | OpenFlags::NoLock` guarantees the open
 /// cannot create or mutate files. The core IO is synchronous (`FsIO`), so
@@ -1334,7 +1338,7 @@ fn is_engine_panic_error(err: &anyhow::Error) -> bool {
 /// `open_path` is the file actually opened; `display_path` is the identity
 /// named in errors (e.g. a forensic family opened through its temp copy
 /// reports the family, not the OS temp dir).
-fn open_readonly(
+pub(crate) fn open_readonly(
     open_path: &Path,
     display_path: &Path,
     opts: turso::core::DatabaseOpts,
@@ -1365,6 +1369,9 @@ fn open_readonly(
 
 /// Connect to an opened store, applying the in-memory temp-store setting.
 ///
+/// Also used by the `bench-openrouter` subcommand for read-only `config.db`
+/// lookups — see [`open_readonly`].
+///
 /// Every turso connection the application opens — the service connection
 /// factory AND this debug CLI path (they do not share an opening path) —
 /// runs with in-memory temp storage, so no statement or transaction can
@@ -1377,7 +1384,7 @@ fn open_readonly(
 /// per-connection `set_temp_store` (turso_core translate/pragma.rs); if a
 /// future engine rejects it, the CLI fails loudly here instead of silently
 /// regressing to disk-backed temp storage.
-fn connect_readonly(
+pub(crate) fn connect_readonly(
     db: &std::sync::Arc<turso::core::Database>,
     db_path: &Path,
 ) -> Result<std::sync::Arc<turso::core::Connection>> {
