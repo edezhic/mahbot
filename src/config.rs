@@ -90,8 +90,11 @@
 //!
 //! The `config_role` table (per-role overrides) and the legacy
 //! `media_transcription_model` / `media_transcription_provider` config_kv keys
-//! are inert orphans since mahbot-1822: their schema and rows are left
-//! untouched, but no code reads or writes them.
+//! and the `adaptive_k` key are inert orphans: their schema and rows are left
+//! untouched, and no code path reads or writes them. (`adaptive_k`'s accessor
+//! is `fixed` since mahbot-1825 — the persisted row is never read — and the
+//! settings UI no longer renders a control for it, so nothing writes the row
+//! either.)
 //!
 //! # See also
 //!
@@ -105,6 +108,7 @@ use crate::util::{UnwrapPoison, is_http_url};
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 use tokio::fs;
 
@@ -121,6 +125,10 @@ const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
 /// Default adaptive k multiplier for wake word detection.
+///
+/// Fixed runtime value since mahbot-1825: the `adaptive_k` config key is no
+/// longer read (the accessor is `fixed`, so a persisted row is an inert
+/// orphan), and this constant always applies.
 const DEFAULT_ADAPTIVE_K: &str = "2.5";
 
 // ── Named config structs ───────────────────────────────────────────
@@ -497,7 +505,7 @@ string_config_fields! {
     tts_enabled [non_empty],
     tts_language [or(DEFAULT_TTS_LANGUAGE)],
     wake_word_templates [non_empty],
-    adaptive_k [or(DEFAULT_ADAPTIVE_K)],
+    adaptive_k [fixed(DEFAULT_ADAPTIVE_K)],
 }
 
 impl ConfigData {
@@ -615,6 +623,13 @@ static CONFIG_PERSIST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 fn persist_lock() -> &'static tokio::sync::Mutex<()> {
     CONFIG_PERSIST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
+
+/// Fresh-install discriminator (mahbot-1825): set during [`load_or_init`] to
+/// whether `config.db` did not exist on disk before the config store was
+/// opened this boot. [`reload_from_db`] seeds the fresh-install audio defaults
+/// into brand-new config databases only — existing databases receive zero
+/// writes (hard constraint).
+static CONFIG_DB_FRESH_AT_BOOT: AtomicBool = AtomicBool::new(false);
 
 /// Reloadable configuration with atomic swap capability.
 ///
@@ -802,6 +817,15 @@ pub async fn load_or_init() -> Result<()> {
 
     CONFIG.set_storage_root(mahbot_dir.clone());
 
+    // Fresh-install discriminator: capture whether the config store file exists
+    // BEFORE any store open creates it, so reload_from_db() can seed
+    // fresh-install defaults into brand-new databases only (mahbot-1825). The
+    // probe must check the exact path the store open uses (`<root>/db/config.db`
+    // — see [`crate::turso::store_db_path`]); probing any other location would
+    // classify every existing install as fresh and re-seed it on each boot,
+    // violating the zero-write hard constraint.
+    CONFIG_DB_FRESH_AT_BOOT.store(config_db_is_fresh(&mahbot_dir), Ordering::Release);
+
     // Start with hardcoded defaults — reload_from_db() will overlay
     // any persisted values from config.db (called later in bootstrap).
     CONFIG.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
@@ -822,12 +846,70 @@ fn first_legacy_value<'a>(kvs: &'a [(String, String)], legacy: &[&str]) -> Optio
     })
 }
 
+/// Fresh-install discriminator (mahbot-1825): `true` when the config store
+/// file does not yet exist at its real location (`<root>/db/config.db` — see
+/// [`crate::turso::store_db_path`]).
+///
+/// Must be probed BEFORE any store open creates the file, and must check the
+/// exact path the open uses (`init_all_stores` → `open_store` →
+/// `store_db_path`). A probe of any other location would classify existing
+/// installs as fresh and re-seed them on every boot, violating the zero-write
+/// hard constraint.
+fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
+    !crate::turso::store_db_path(mahbot_dir, "config").exists()
+}
+
+/// Seed the fresh-install audio defaults into a brand-new config database
+/// (mahbot-1825).
+///
+/// A fresh install must not load or download any audio model until the user
+/// enables a feature, so `audio_transcription_use_local` is seeded to
+/// `"false"` (the existing reading semantics are unchanged: absence of the
+/// row = enabled, `"false"` = disabled). `fresh` is the pre-open
+/// file-existence discriminator captured in [`load_or_init`] — existing
+/// databases receive zero writes.
+async fn seed_fresh_install_defaults(
+    fresh: bool,
+    store: &crate::config_db::ConfigStore,
+) -> Result<()> {
+    if !fresh {
+        return Ok(());
+    }
+    store
+        .set_kv("audio_transcription_use_local", "false")
+        .await?;
+    tracing::info!(
+        "Fresh config database: seeded audio_transcription_use_local=false (no audio models at boot)"
+    );
+    Ok(())
+}
+
+/// Consume the boot fresh-install discriminator and seed the fresh-install
+/// audio defaults when it fired.
+///
+/// Mirrors the `load_or_init` → `reload_from_db` handoff exactly: the flag is
+/// set from [`config_db_is_fresh`] during boot and consumed (reset) here, so
+/// the seed lands once per fresh boot only. Kept as a separate function so the
+/// flag-consumption path is testable without the global store.
+async fn seed_fresh_install_defaults_from_flag(
+    store: &crate::config_db::ConfigStore,
+) -> Result<()> {
+    let fresh = CONFIG_DB_FRESH_AT_BOOT.swap(false, Ordering::AcqRel);
+    seed_fresh_install_defaults(fresh, store).await
+}
+
 /// Reload config from the `config.db` database, atomically swapping the
 /// runtime config. Called at startup (after config_db init) to overlay
 /// persisted settings on top of hardcoded defaults.
 pub async fn reload_from_db() -> Result<()> {
     let store = crate::config_db::store();
     let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
+
+    // Fresh-install seed (mahbot-1825): a brand-new config database gets the
+    // transcription-off default so no audio model is downloaded or loaded at
+    // boot. Existing installs are never written (the flag is only set when
+    // config.db did not exist before the store open).
+    seed_fresh_install_defaults_from_flag(store).await?;
 
     let kvs = store.get_all_kv().await?;
     for (key, value) in &kvs {
@@ -964,12 +1046,6 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
         "multimodal_model" => {
             write_kv_and_update_config(key, &trimmed).await?;
             crate::providers::recreate_media_transcriber();
-        }
-        "audio_transcription_use_local" => {
-            write_kv_and_update_config(key, &trimmed).await?;
-            if trimmed != "false" && !crate::audio::local_transcriber::is_loaded() {
-                crate::audio::local_transcriber::try_init_from_cache().await;
-            }
         }
         // Everything else is read dynamically at use time — persist only.
         _ => {
@@ -1441,5 +1517,77 @@ mod tests {
         );
 
         CONFIG.swap(original);
+    }
+
+    /// Fresh-install seed (mahbot-1825): the transcription-off default lands in
+    /// brand-new config databases only — existing databases receive zero
+    /// writes.
+    ///
+    /// This test drives the real boot chain end-to-end instead of hand-picking
+    /// `fresh` values: the discriminator probe (`config_db_is_fresh` — the
+    /// exact function `load_or_init` uses), the boot flag it feeds, the store
+    /// open that creates `db/config.db`, and the flag-consumption + seed
+    /// (`seed_fresh_install_defaults_from_flag`, the `reload_from_db` path).
+    ///
+    /// Regression guard for the wrong-path probe: opening the config store
+    /// must flip the discriminator to "not fresh" — a probe of any other
+    /// location (e.g. a top-level `<root>/config.db`) would still report
+    /// "fresh" here and re-seed every existing install on every boot.
+    #[tokio::test]
+    async fn fresh_config_db_seeds_transcription_off_only_when_new() {
+        // ── Fresh install: the store file does not exist yet ──
+        let fresh_root = tempfile::TempDir::new().unwrap();
+        let fresh = config_db_is_fresh(fresh_root.path());
+        assert!(
+            fresh,
+            "a storage root with no config store file must be classified fresh"
+        );
+        CONFIG_DB_FRESH_AT_BOOT.store(fresh, Ordering::Release);
+
+        // Opening the config store creates <root>/db/config.db — the exact
+        // file the probe must check. This is the regression pin for the
+        // original bug: probing <root>/config.db would still report "fresh"
+        // here and re-seed existing installs on every boot.
+        let fresh_store = crate::config_db::ConfigStore::open(fresh_root.path())
+            .await
+            .unwrap();
+        assert!(
+            !config_db_is_fresh(fresh_root.path()),
+            "an existing config store file must not be classified fresh"
+        );
+
+        // reload_from_db's path: consume the boot flag and seed.
+        seed_fresh_install_defaults_from_flag(&fresh_store)
+            .await
+            .unwrap();
+        assert!(
+            !CONFIG_DB_FRESH_AT_BOOT.load(Ordering::Acquire),
+            "the boot discriminator must be consumed by the seed"
+        );
+        assert_eq!(
+            fresh_store.get_all_kv().await.unwrap(),
+            vec![(
+                "audio_transcription_use_local".to_string(),
+                "false".to_string()
+            )],
+            "a fresh config database must be seeded with transcription off"
+        );
+
+        // ── Existing install: the store file already exists ──
+        let (existing_store, existing_dir) =
+            crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        let fresh_existing = config_db_is_fresh(existing_dir.path());
+        assert!(
+            !fresh_existing,
+            "an existing install must not be classified fresh"
+        );
+        CONFIG_DB_FRESH_AT_BOOT.store(fresh_existing, Ordering::Release);
+        seed_fresh_install_defaults_from_flag(&existing_store)
+            .await
+            .unwrap();
+        assert!(
+            existing_store.get_all_kv().await.unwrap().is_empty(),
+            "an existing config database must receive zero writes"
+        );
     }
 }

@@ -109,6 +109,41 @@ impl ConfigStore {
         Ok(())
     }
 
+    /// Persist the transcription toggle and its wake-word cascade atomically
+    /// (mahbot-1825).
+    ///
+    /// Row semantics are unchanged: enabling deletes the `audio_transcription_use_local`
+    /// row (absence = enabled), disabling writes `"false"`. When turning
+    /// transcription OFF while wake word was on, `voice_enabled` is deleted in the
+    /// same transaction — a failure then rolls back both keys, so the settings UI
+    /// can never diverge from the DB.
+    pub async fn set_transcription_toggle(
+        &self,
+        transcription_enabled: bool,
+        cascade_voice_off: bool,
+    ) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        if transcription_enabled {
+            tx.execute(
+                DELETE_KV_SQL,
+                turso::params!["audio_transcription_use_local"],
+            )
+            .await?;
+        } else {
+            tx.execute(
+                SET_KV_SQL,
+                turso::params!["audio_transcription_use_local", "false"],
+            )
+            .await?;
+        }
+        if cascade_voice_off {
+            tx.execute(DELETE_KV_SQL, turso::params!["voice_enabled"])
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Get a single value by key; returns `None` when the key is absent.
     pub async fn get_kv(&self, key: &str) -> Result<Option<String>> {
         self.conn

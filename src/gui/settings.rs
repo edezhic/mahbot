@@ -3,7 +3,7 @@
 //! Reads the current config snapshot from [`crate::config::CONFIG`],
 //! presents editable fields organised in sections, and persists every change
 //! immediately when the value settles (debounced text inputs, immediate
-//! toggles/pickers, release-settled slider) via the per-field persistence
+//! toggles/pickers) via the per-field persistence
 //! functions in [`crate::config`].
 //!
 //! Also manages workspaces and users (formerly separate pages), with
@@ -16,8 +16,8 @@ use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Checkbox, Column, Row, Space, button, column, container, pick_list, row, scrollable, slider,
-    stack, text, text_editor, text_input, toggler, tooltip,
+    Checkbox, Column, Row, Space, button, column, container, pick_list, row, scrollable, stack,
+    text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -252,8 +252,8 @@ pub enum SettingsMessage {
     /// (matches the keys in [`crate::config::ConfigData::set_string_field`]).
     /// Stages the value in the editable snapshot; text inputs also arm a
     /// debounced settle, immediate controls (toggles / pick lists) persist
-    /// right away, and the `adaptive_k` slider waits for
-    /// [`ConfigFieldSettleNow`](Self::ConfigFieldSettleNow) (release).
+    /// right away, and the value is settled via
+    /// [`ConfigFieldSettleNow`](Self::ConfigFieldSettleNow).
     ConfigField {
         key: &'static str,
         value: String,
@@ -270,8 +270,8 @@ pub enum SettingsMessage {
         value: String,
         generation: u64,
     },
-    /// Settle the staged value of a field immediately (Enter on a text
-    /// input, slider release) instead of waiting for the debounce timer.
+    /// Settle the staged value of a field immediately (Enter on a text input)
+    /// instead of waiting for the debounce timer.
     ConfigFieldSettleNow {
         field: String,
     },
@@ -334,6 +334,24 @@ pub enum SettingsMessage {
         ok: Result<(), String>,
     },
     // ── Voice assistant messages ──────────────────────────
+    // ── Transcription messages ────────────────────────────
+    /// Toggle local transcription on/off. Turning it OFF also turns Wake Word
+    /// Detection off (they share the loaded ASR model — the cascade persists
+    /// `voice_enabled` away and stops the pipeline). Toggling ON kicks the
+    /// model load/download in the background (auto-activates when ready).
+    TranscriptionToggle(bool),
+    /// Result of the async transcription-toggle persistence. `voice_was_enabled`
+    /// carries the pre-toggle wake-word state so a failed persist can roll both
+    /// keys (and the pipeline) back. `generation` guards against stale results
+    /// from rapid toggling (mirrors [`Self::VoiceToggleResult`]).
+    TranscriptionToggleResult {
+        generation: u64,
+        voice_was_enabled: bool,
+        result: Result<(), String>,
+    },
+    /// Retry the local ASR model load/download after a terminal failure
+    /// (re-toggling alone cannot recover — a dedicated action is required).
+    RetryTranscription,
     /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
     VoiceToggle(bool),
     /// Result of async DB persistence after a voice toggle.
@@ -389,9 +407,11 @@ const TEXT_INPUT_KEYS: &[&str] = &[
 ];
 
 /// Config keys rendered as discrete controls (toggles / pick lists) that
-/// persist immediately on change. The `adaptive_k` slider is intentionally
-/// absent — it persists on release only (see [`SettingsMessage::ConfigFieldSettleNow`]).
-const IMMEDIATE_KEYS: &[&str] = &["audio_transcription_use_local", "web_search_provider"];
+/// persist immediately on change. `audio_transcription_use_local` is not a
+/// generic ConfigField key since mahbot-1825 — it is a dedicated
+/// [`SettingsMessage::TranscriptionToggle`] toggle with its own transactional
+/// persist path.
+const IMMEDIATE_KEYS: &[&str] = &["web_search_provider"];
 
 pub struct SettingsState {
     /// Current editable snapshot, loaded from CONFIG each refresh.
@@ -459,6 +479,11 @@ pub struct SettingsState {
     /// passed through to `VoiceToggleResult` so stale results from
     /// earlier toggles are detected and ignored.
     voice_toggle_gen: u64,
+    /// Generation counter for transcription toggle operations.
+    /// Incremented before each `TranscriptionToggle`; the expected value is
+    /// passed through to `TranscriptionToggleResult` so stale results from
+    /// earlier toggles are detected and ignored.
+    transcription_toggle_gen: u64,
     /// Transient text input for the wake word phrase.
     /// Not persisted — passed to [`VoiceCommand::StartEnrollment`] on click.
     wake_word_phrase_input: String,
@@ -506,6 +531,7 @@ impl SettingsState {
             add_user_adding: false,
             model_picker_inputs: [const { String::new() }; ModelPickerTarget::COUNT],
             voice_toggle_gen: 0,
+            transcription_toggle_gen: 0,
             wake_word_phrase_input: String::new(),
             tts_toggle_gen: 0,
         }
@@ -616,12 +642,11 @@ impl SettingsState {
     }
 
     /// Read the currently staged value of a canonical field id from the
-    /// editable snapshot (used by Enter/submit and slider-release settles).
+    /// editable snapshot (used by Enter/submit settles).
     ///
     /// Only text-style fields reach this path: `ConfigFieldSettleNow` is
-    /// dispatched by the Enter/submit and slider-release handlers, and
-    /// discrete controls settle with their value passed directly to
-    /// [`Self::settle_now`] instead.
+    /// dispatched by the Enter/submit handlers, and discrete controls settle
+    /// with their value passed directly to [`Self::settle_now`] instead.
     fn staged_value(&self, field: &str) -> Option<String> {
         if let Some(key) = field.strip_prefix("config:") {
             return self
@@ -742,15 +767,13 @@ impl SettingsState {
     }
 
     /// Whether a failed persist should roll the control back to the last
-    /// persisted value. Discrete-state controls (toggles, pick lists, the
-    /// slider, and the model pickers' optimistic active/list markers) revert;
-    /// free-text inputs keep the typed value so the user can correct it.
+    /// persisted value. Discrete-state controls (toggles, pick lists, and the
+    /// model pickers' optimistic active/list markers) revert; free-text inputs
+    /// keep the typed value so the user can correct it.
     fn field_reverts_on_error(field: &str) -> bool {
         matches!(
             field,
-            "config:audio_transcription_use_local"
-                | "config:web_search_provider"
-                | "config:adaptive_k"
+            "config:web_search_provider"
                 | "config:image_gen_model"
                 | "config:image_gen_models"
                 | "config:video_model"
@@ -816,21 +839,11 @@ impl SettingsState {
                 } else if IMMEDIATE_KEYS.contains(&key) {
                     // Toggles / pick lists are discrete: persist right away.
                     self.settle_now(&field, value)
-                } else if key == "adaptive_k" {
-                    // Release-settled slider: the value is staged in the
-                    // snapshot; the slider's on_release sends
-                    // ConfigFieldSettleNow to persist it. Bump the generation
-                    // like every other staging path so an in-flight persist
-                    // result from an earlier release can't pass the stale
-                    // check and clobber the newly staged drag value.
-                    let _ = self.bump_gen(&field);
-                    Task::none()
                 } else {
                     // No settle path for this key: the value would stage
                     // forever and never persist — exactly the silent-edit-loss
                     // this design removes. Every rendered config field must be
-                    // classified in TEXT_INPUT_KEYS, IMMEDIATE_KEYS, or the
-                    // release-settled arm above.
+                    // classified in TEXT_INPUT_KEYS or IMMEDIATE_KEYS.
                     tracing::warn!(
                         key,
                         "settings: unclassified config field staged but not persisted"
@@ -900,8 +913,8 @@ impl SettingsState {
                     Err(e) => {
                         self.field_errors.insert(field.clone(), e);
                         if Self::field_reverts_on_error(&field) {
-                            // Discrete-state controls (toggles/pickers/sliders)
-                            // roll back to the last persisted value; free text
+                            // Discrete-state controls (toggles/pickers) roll
+                            // back to the last persisted value; free text
                             // keeps the typed value for correction.
                             self.revert_field(&field);
                         }
@@ -933,6 +946,91 @@ impl SettingsState {
                 } else {
                     self.password_visible.insert(target);
                 }
+                Task::none()
+            }
+
+            // ── Transcription ───────────────────────────────────
+            SettingsMessage::TranscriptionToggle(enabled) => {
+                self.transcription_toggle_gen += 1;
+                let generation = self.transcription_toggle_gen;
+                let voice_was_enabled = self.config.voice_enabled.as_deref() == Some("true");
+                // Mirror into both snapshots (enabled → "" = absent row;
+                // disabled → "false"), matching the persisted row semantics.
+                let transcription_value = if enabled { "" } else { "false" };
+                let _ = self
+                    .config
+                    .set_string_field("audio_transcription_use_local", transcription_value);
+                let _ = crate::config::CONFIG
+                    .set_string_field("audio_transcription_use_local", transcription_value);
+                // Turning transcription OFF also turns Wake Word Detection OFF
+                // (shared ASR model): stop the pipeline now.
+                if !enabled && voice_was_enabled {
+                    let _ = self.config.set_string_field("voice_enabled", "");
+                    let _ = crate::config::CONFIG.set_string_field("voice_enabled", "");
+                    sync_voice_state(false);
+                }
+                // Toggle ON: kick the model load/download in the background —
+                // load from cache first, otherwise download with retries. A
+                // terminal failure is recovered via retry_init (same path as
+                // the inline Retry button); any other state falls through to
+                // spawn_background_init, which claims Uninit→Loading with the
+                // same panic→Failed guard the boot path uses (a raw spawn
+                // here could strand the transcriber in Loading on a panic).
+                if enabled && !crate::audio::local_transcriber::is_loaded() {
+                    if !crate::audio::local_transcriber::retry_init() {
+                        crate::audio::local_transcriber::spawn_background_init();
+                    }
+                }
+                Task::perform(
+                    async move {
+                        let store = crate::config_db::store();
+                        store
+                            .set_transcription_toggle(enabled, !enabled && voice_was_enabled)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    move |result| SettingsMessage::TranscriptionToggleResult {
+                        generation,
+                        voice_was_enabled,
+                        result,
+                    },
+                )
+            }
+            SettingsMessage::TranscriptionToggleResult {
+                generation,
+                voice_was_enabled,
+                result,
+            } => {
+                // Ignore results from a superseded toggle (rapid re-toggle).
+                if generation != self.transcription_toggle_gen {
+                    return Task::none();
+                }
+                match result {
+                    Ok(()) => Task::none(),
+                    Err(e) => {
+                        self.error = Some(e);
+                        // Revert the transcription snapshot to the opposite
+                        // staged state (binary toggle).
+                        let currently_off =
+                            self.config.audio_transcription_use_local.as_deref() == Some("false");
+                        let restore = if currently_off { "" } else { "false" };
+                        let _ = self
+                            .config
+                            .set_string_field("audio_transcription_use_local", restore);
+                        let _ = crate::config::CONFIG
+                            .set_string_field("audio_transcription_use_local", restore);
+                        // Restore the wake-word state the cascade disabled.
+                        if voice_was_enabled {
+                            let _ = self.config.set_string_field("voice_enabled", "true");
+                            let _ = crate::config::CONFIG.set_string_field("voice_enabled", "true");
+                            sync_voice_state(true);
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            SettingsMessage::RetryTranscription => {
+                let _ = crate::audio::local_transcriber::retry_init();
                 Task::none()
             }
 
@@ -1278,11 +1376,7 @@ impl SettingsState {
             Space::new().height(16),
             self.routing_section(),
             Space::new().height(16),
-            self.transcription_section(),
-            Space::new().height(16),
-            self.voice_section(),
-            Space::new().height(16),
-            self.tts_section(),
+            self.audio_section(),
             Space::new().height(16),
             self.generation_section(),
             Space::new().height(16),
@@ -2454,35 +2548,416 @@ impl SettingsState {
         )
     }
 
-    fn transcription_section(&self) -> Element<'_, SettingsMessage> {
-        let local_enabled = self.config.audio_transcription_use_local.as_deref() != Some("false");
+    // ── Audio section (mahbot-1825) ──────────────────────────
+    //
+    // One 'Audio' section with exactly three rows — Transcription, Wake Word
+    // Detection, Text to Speech — each with the toggle and an inline status in
+    // the same row. The wake-word enrollment UI (phrase input, Enroll button,
+    // enrolled-phrase display, multi-line progress/Cancel) sits below the
+    // three rows, unchanged.
 
-        section(
+    #[allow(clippy::too_many_lines)]
+    fn audio_section(&self) -> Element<'_, SettingsMessage> {
+        use iced::widget::Text;
+
+        let transcription_enabled =
+            self.config.audio_transcription_use_local.as_deref() != Some("false");
+        let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
+        let status = crate::audio::voice::get_status();
+        let has_enrollment = crate::audio::voice::get_enrollment().is_some();
+        let is_enrolling = matches!(
+            status,
+            crate::audio::voice::VoiceStatus::Enrolling { .. }
+                | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
+                | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+                | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. }
+        );
+
+        // ── Row 1: Transcription (toggle + inline status + Retry) ──
+        let transcription_status: Element<'_, SettingsMessage> = if !transcription_enabled {
+            Text::new("Disabled")
+                .size(13)
+                .color(theme::TEXT_SECONDARY)
+                .into()
+        } else if crate::audio::local_transcriber::is_loaded() {
+            Text::new("Ready").size(13).into()
+        } else if crate::audio::local_transcriber::is_failed() {
+            let retry_btn = button(Text::new("   Retry   ").size(13))
+                .on_press(SettingsMessage::RetryTranscription)
+                .style(theme::button_danger)
+                .padding(4);
+            row![
+                Text::new("Download failed").size(14),
+                Space::new().width(8),
+                retry_btn,
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            Text::new("Downloading…").size(13).into()
+        };
+        let transcription_row = field_row(
             "Transcription",
-            column![
-                field_row_with_error(
-                    "Local Transcription",
-                    toggler(local_enabled)
-                        .on_toggle(move |b| SettingsMessage::ConfigField {
-                            key: "audio_transcription_use_local",
-                            value: if b {
-                                String::new()
-                            } else {
-                                "false".to_string()
-                            },
-                        })
+            row![
+                toggler(transcription_enabled).on_toggle(SettingsMessage::TranscriptionToggle),
+                Space::new().width(12),
+                transcription_status,
+            ]
+            .align_y(Alignment::Center)
+            .into(),
+            Some("Local Qwen3-ASR (offline) — audio never leaves the machine"),
+        );
+
+        // ── Row 2: Wake Word Detection (toggle gated on Transcription + live status) ──
+        // Live status: re-rendered every second by the dashboard tick, so the
+        // pipeline state (listening / enrolling / model error …) is current.
+        let wake_status: Element<'_, SettingsMessage> = match status.clone() {
+            crate::audio::voice::VoiceStatus::Disabled => Text::new("Disabled")
+                .size(13)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+            crate::audio::voice::VoiceStatus::LoadingModels => {
+                Text::new("Loading models…").size(13).into()
+            }
+            crate::audio::voice::VoiceStatus::ModelError => {
+                let retry_btn = button(Text::new("   Retry   ").size(13))
+                    .on_press(SettingsMessage::RetryVoiceModels)
+                    .style(theme::button_danger)
+                    .padding(4);
+                row![
+                    Text::new("Model error").size(14),
+                    Space::new().width(8),
+                    retry_btn,
+                ]
+                .align_y(Alignment::Center)
+                .into()
+            }
+            crate::audio::voice::VoiceStatus::Listening => {
+                Text::new("Listening for wake word").size(13).into()
+            }
+            crate::audio::voice::VoiceStatus::Recording => {
+                Text::new("Recording command").size(13).into()
+            }
+            crate::audio::voice::VoiceStatus::RecordingManual => {
+                Text::new("Recording voice message").size(13).into()
+            }
+            crate::audio::voice::VoiceStatus::Transcribing => {
+                Text::new("Transcribing…").size(13).into()
+            }
+            crate::audio::voice::VoiceStatus::MicPermissionDenied => {
+                Text::new("Microphone permission denied").size(13).into()
+            }
+            crate::audio::voice::VoiceStatus::MicDisconnected => {
+                Text::new("Microphone disconnected").size(13).into()
+            }
+            crate::audio::voice::VoiceStatus::Enrolling { .. }
+            | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
+            | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+            | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. } => {
+                Text::new("Enrolling…").size(13).into()
+            }
+            crate::audio::voice::VoiceStatus::Enrolled => Text::new("Enrolled").size(13).into(),
+            crate::audio::voice::VoiceStatus::Error(msg) => Text::new(msg).size(13).into(),
+        };
+        // Gated: wake word can only be enabled while Transcription is ON (they
+        // share the loaded ASR model). Turning Transcription OFF cascades it off.
+        let wake_row = field_row(
+            "Wake Word Detection",
+            row![
+                toggler(voice_enabled).on_toggle_maybe(if transcription_enabled {
+                    Some(SettingsMessage::VoiceToggle)
+                } else {
+                    None
+                }),
+                Space::new().width(12),
+                wake_status,
+            ]
+            .align_y(Alignment::Center)
+            .into(),
+            Some(if transcription_enabled {
+                "Hands-free voice commands with wake word detection"
+            } else {
+                "Requires Transcription to be enabled"
+            }),
+        );
+
+        // ── Row 3: Text to Speech (toggle + inline status + Test in one row) ──
+        let tts_enabled = self.config.tts_enabled.as_deref() == Some("true");
+        let tts_ready = crate::audio::tts::models_ready();
+        let tts_failed = crate::audio::tts::download_failed();
+        let audio_ok = crate::audio::tts::audio_output_ready();
+        let tts_status: Element<'_, SettingsMessage> = if !tts_enabled {
+            Text::new("Disabled")
+                .size(13)
+                .color(theme::TEXT_SECONDARY)
+                .into()
+        } else if tts_ready {
+            if audio_ok {
+                Text::new("Ready").size(13).into()
+            } else {
+                Text::new("No audio output device")
+                    .size(13)
+                    .color(theme::STATUS_ERROR)
+                    .into()
+            }
+        } else if tts_failed {
+            let retry_btn = button(Text::new("   Retry   ").size(13))
+                .on_press(SettingsMessage::TtsRetryModels)
+                .style(theme::button_danger)
+                .padding(4);
+            row![
+                Text::new("Model download failed").size(14),
+                Space::new().width(8),
+                retry_btn,
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            Text::new("Downloading models…").size(13).into()
+        };
+        let test_btn = button(Text::new("   Test TTS   ").size(13))
+            .style(theme::button_primary)
+            .padding(4)
+            .on_press_maybe(if tts_enabled && tts_ready {
+                Some(SettingsMessage::TtsTest)
+            } else {
+                None
+            });
+        let tts_row = field_row(
+            "Text to Speech",
+            row![
+                toggler(tts_enabled).on_toggle(SettingsMessage::TtsToggle),
+                Space::new().width(12),
+                tts_status,
+                Space::new().width(12),
+                test_btn,
+            ]
+            .align_y(Alignment::Center)
+            .into(),
+            Some("Text-to-speech for agent responses"),
+        );
+
+        // ── Wake-word enrollment UI (below the three rows, unchanged) ──
+        // Enrolled-phrase display / phrase input / Enroll button (when voice
+        // is on and transcription allows it — the push site below applies the
+        // same guard, so the row collapses to nothing when either is off).
+        let wake_word_row = if let Some(phrase) = crate::audio::voice::get_enrolled_phrase() {
+            field_row("Wake Word", Text::new(phrase).size(13).into(), None)
+        } else if has_enrollment {
+            // V2 enrollment present but phrase unavailable (shouldn't
+            // happen) — surface it so the user can re-enroll.
+            field_row(
+                "Wake Word",
+                Text::new("Enrollment found — re-enroll to replace it")
+                    .size(13)
+                    .into(),
+                None,
+            )
+        } else {
+            field_row(
+                "Wake Word",
+                Text::new("Enroll a wake word to get started")
+                    .size(13)
+                    .into(),
+                None,
+            )
+        };
+
+        // Text input for the wake word phrase (before enrollment).
+        let phrase_input = if voice_enabled && transcription_enabled && !is_enrolling {
+            let input = text_input("mahbot", &self.wake_word_phrase_input)
+                .on_input(SettingsMessage::WakeWordPhraseInput)
+                .style(super::widgets::text_input_style)
+                .width(Length::Fixed(250.0));
+            field_row("Wake Word Phrase", input.into(), None)
+        } else {
+            Space::new().height(0).into()
+        };
+
+        let enroll_btn: Element<'_, SettingsMessage> = if voice_enabled && transcription_enabled {
+            container(
+                button(Text::new("Enroll Wake Word").size(13))
+                    .on_press(SettingsMessage::StartVoiceEnrollment)
+                    .style(theme::button_primary)
+                    .padding(6),
+            )
+            .into()
+        } else {
+            container(Text::new("")).into()
+        };
+
+        // Multi-line enrollment progress + Cancel (shown during active
+        // enrollment; mirrors the previous status-row rendering).
+        let enrollment_ui: Option<Element<'_, SettingsMessage>> = match status {
+            crate::audio::voice::VoiceStatus::Enrolling {
+                sample,
+                total,
+                duration_ms,
+                quality,
+            } => {
+                let remaining = total.saturating_sub(sample);
+                let mut lines: Vec<String> = Vec::new();
+
+                let duration_hint = if duration_ms > 0 {
+                    if duration_ms >= crate::audio::voice::ENROLLMENT_QUALITY_DURATION_MAX_MS {
+                        format!(
+                            " — captured {}.{}s ✅",
+                            duration_ms / 1000,
+                            (duration_ms % 1000) / 100
+                        )
+                    } else if duration_ms >= crate::audio::voice::ENROLLMENT_QUALITY_DURATION_MIN_MS
+                    {
+                        format!(
+                            " — captured {}.{}s 📝",
+                            duration_ms / 1000,
+                            (duration_ms % 1000) / 100
+                        )
+                    } else {
+                        format!(
+                            " — captured {}.{}s ⚠ too short",
+                            duration_ms / 1000,
+                            (duration_ms % 1000) / 100
+                        )
+                    }
+                } else {
+                    String::new()
+                };
+
+                if remaining > 0 {
+                    if remaining == 1 {
+                        lines.push(format!(
+                            "Sample {sample}/{total}{duration_hint} — 1 more time."
+                        ));
+                    } else {
+                        lines.push(format!(
+                            "Sample {sample}/{total}{duration_hint} — {remaining} more times."
+                        ));
+                    }
+
+                    if sample < total {
+                        let prompt = crate::audio::voice::enrollment_prompt_for_sample(sample);
+                        lines.push(format!("📢 {prompt}"));
+                    }
+
+                    if let Some(ref q) = quality {
+                        let quality_line = format!("{} (score: {:.2})", q.level.label(), q.score);
+                        lines.push(quality_line);
+
+                        if q.clipping_detected {
+                            lines.push(
+                                "⚠️ Clipping detected — your microphone gain may be too high"
+                                    .to_string(),
+                            );
+                        }
+                        if q.snr_db.is_finite() && q.snr_db < 10.0 {
+                            lines.push(
+                                "⚠️ Low signal-to-noise ratio — try speaking closer to the mic"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                } else {
+                    lines.push("Processing…".to_string());
+                }
+
+                let cancel_btn: Element<'_, SettingsMessage> = container(
+                    button(Text::new("Cancel").size(13))
+                        .on_press(SettingsMessage::CancelVoiceEnrollment)
+                        .style(theme::button_danger)
+                        .padding(6),
+                )
+                .into();
+                Some(
+                    Column::new()
+                        .push(Space::new().height(8))
+                        .push(Text::new(lines.join("\n")).size(13))
+                        .push(Space::new().height(8))
+                        .push(cancel_btn)
                         .into(),
-                    Some("Use local Qwen3-ASR (offline) — audio never leaves the machine"),
-                    self.field_errors
-                        .get("config:audio_transcription_use_local")
-                        .map(String::as_str),
-                ),
-                Space::new().height(8),
-                text("Image/video transcription uses the Multimodal model.")
-                    .size(10)
-                    .color(theme::TEXT_SECONDARY),
-            ],
-        )
+                )
+            }
+            crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
+                let cancel_btn: Element<'_, SettingsMessage> = container(
+                    button(Text::new("Cancel").size(13))
+                        .on_press(SettingsMessage::CancelVoiceEnrollment)
+                        .style(theme::button_danger)
+                        .padding(6),
+                )
+                .into();
+                Some(
+                    Column::new()
+                        .push(Space::new().height(8))
+                        .push(Text::new("Listening…").size(13))
+                        .push(Space::new().height(8))
+                        .push(cancel_btn)
+                        .into(),
+                )
+            }
+            crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
+                let cancel_btn: Element<'_, SettingsMessage> = container(
+                    button(Text::new("Cancel").size(13))
+                        .on_press(SettingsMessage::CancelVoiceEnrollment)
+                        .style(theme::button_danger)
+                        .padding(6),
+                )
+                .into();
+                Some(
+                    Column::new()
+                        .push(Space::new().height(8))
+                        .push(Text::new("Keep silent to confirm…").size(13))
+                        .push(Space::new().height(8))
+                        .push(cancel_btn)
+                        .into(),
+                )
+            }
+            crate::audio::voice::VoiceStatus::EnrollingNegatives {
+                accumulated_secs,
+                target_secs,
+                wall_clock_elapsed,
+            } => {
+                let pct = (accumulated_secs * 100)
+                    .checked_div(target_secs)
+                    .unwrap_or(0);
+                let cancel_btn: Element<'_, SettingsMessage> = container(
+                    button(Text::new("Cancel").size(13))
+                        .on_press(SettingsMessage::CancelVoiceEnrollment)
+                        .style(theme::button_danger)
+                        .padding(6),
+                )
+                .into();
+                Some(
+                    Column::new()
+                        .push(Space::new().height(8))
+                        .push(
+                            Text::new(format!(
+                                "Collecting negative samples… {accumulated_secs}s/{target_secs}s \
+                                 ({pct}%) elapsed {wall_clock_elapsed}s"
+                            ))
+                            .size(13),
+                        )
+                        .push(Space::new().height(8))
+                        .push(cancel_btn)
+                        .into(),
+                )
+            }
+            _ => None,
+        };
+
+        let mut column = Column::new()
+            .push(transcription_row)
+            .push(wake_row)
+            .push(tts_row);
+        if voice_enabled && transcription_enabled {
+            column = column.push(Space::new().height(8));
+            column = column.push(wake_word_row);
+            column = column.push(phrase_input);
+            column = column.push(enroll_btn);
+        }
+        if let Some(ui) = enrollment_ui {
+            column = column.push(ui);
+        }
+
+        section("Audio", column)
     }
 
     // ── Model picker view helper ───────────────────────────────
@@ -2668,351 +3143,6 @@ impl SettingsState {
                 row![text(mode_note).size(11).color(theme::TEXT_FAINT),],
             ],
         )
-    }
-
-    /// Voice Assistant section — enable/disable, enrollment, status.
-    #[allow(clippy::too_many_lines)]
-    fn voice_section(&self) -> Element<'_, SettingsMessage> {
-        use iced::widget::Text;
-
-        let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
-        let status = crate::audio::voice::get_status();
-        let has_enrollment = crate::audio::voice::get_enrollment().is_some();
-
-        let status_text: Element<'_, SettingsMessage> = match status.clone() {
-            crate::audio::voice::VoiceStatus::Disabled => Text::new("Disabled").into(),
-            crate::audio::voice::VoiceStatus::LoadingModels => Text::new("Loading models…").into(),
-            crate::audio::voice::VoiceStatus::ModelError => {
-                // Show retry button inline so the user can trigger recovery
-                // without toggling voice off/on.
-                let retry_btn = iced::widget::button(Text::new("   Retry   ").size(13))
-                    .on_press(SettingsMessage::RetryVoiceModels)
-                    .style(theme::button_danger)
-                    .padding(4);
-                iced::widget::row![
-                    Text::new("Model error").size(14),
-                    iced::widget::Space::new().width(8),
-                    retry_btn,
-                ]
-                .align_y(iced::Alignment::Center)
-                .into()
-            }
-            crate::audio::voice::VoiceStatus::Listening => {
-                Text::new("Listening for wake word").into()
-            }
-            crate::audio::voice::VoiceStatus::Recording => Text::new("Recording command").into(),
-            crate::audio::voice::VoiceStatus::RecordingManual => {
-                Text::new("Recording voice message").into()
-            }
-            crate::audio::voice::VoiceStatus::Transcribing => Text::new("Transcribing…").into(),
-            crate::audio::voice::VoiceStatus::MicPermissionDenied => {
-                Text::new("Microphone permission denied").into()
-            }
-            crate::audio::voice::VoiceStatus::MicDisconnected => {
-                Text::new("Microphone disconnected").into()
-            }
-            crate::audio::voice::VoiceStatus::Enrolling {
-                sample,
-                total,
-                duration_ms,
-                quality,
-            } => {
-                let remaining = total.saturating_sub(sample);
-                let mut lines: Vec<String> = Vec::new();
-
-                // Main status line with sample count and duration hint
-                let duration_hint = if duration_ms > 0 {
-                    if duration_ms >= crate::audio::voice::ENROLLMENT_QUALITY_DURATION_MAX_MS {
-                        format!(
-                            " — captured {}.{}s ✅",
-                            duration_ms / 1000,
-                            (duration_ms % 1000) / 100
-                        )
-                    } else if duration_ms >= crate::audio::voice::ENROLLMENT_QUALITY_DURATION_MIN_MS
-                    {
-                        format!(
-                            " — captured {}.{}s 📝",
-                            duration_ms / 1000,
-                            (duration_ms % 1000) / 100
-                        )
-                    } else {
-                        format!(
-                            " — captured {}.{}s ⚠ too short",
-                            duration_ms / 1000,
-                            (duration_ms % 1000) / 100
-                        )
-                    }
-                } else {
-                    String::new()
-                };
-
-                if remaining > 0 {
-                    if remaining == 1 {
-                        lines.push(format!(
-                            "Sample {sample}/{total}{duration_hint} — 1 more time."
-                        ));
-                    } else {
-                        lines.push(format!(
-                            "Sample {sample}/{total}{duration_hint} — {remaining} more times."
-                        ));
-                    }
-
-                    // Enrollment prompt for multi-position guidance.
-                    // Show a prompt as long as there's at least one more
-                    // utterance to record (including before the first one).
-                    if sample < total {
-                        // `sample` is the count of completed samples; the prompt for
-                        // the NEXT utterance is at index `sample` (0-based).
-                        let prompt = crate::audio::voice::enrollment_prompt_for_sample(sample);
-                        lines.push(format!("📢 {prompt}"));
-                    }
-
-                    // Quality feedback for the most recent sample
-                    if let Some(ref q) = quality {
-                        let quality_line = format!("{} (score: {:.2})", q.level.label(), q.score);
-                        lines.push(quality_line);
-
-                        if q.clipping_detected {
-                            lines.push(
-                                "⚠️ Clipping detected — your microphone gain may be too high"
-                                    .to_string(),
-                            );
-                        }
-                        if q.snr_db.is_finite() && q.snr_db < 10.0 {
-                            lines.push(
-                                "⚠️ Low signal-to-noise ratio — try speaking closer to the mic"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                } else {
-                    lines.push("Processing…".to_string());
-                }
-
-                let text = lines.join("\n");
-                Text::new(text).into()
-            }
-            crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
-                Text::new("Listening…").into()
-            }
-            crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
-                Text::new("Keep silent to confirm…").into()
-            }
-            crate::audio::voice::VoiceStatus::EnrollingNegatives {
-                accumulated_secs,
-                target_secs,
-                wall_clock_elapsed,
-            } => {
-                let pct = (accumulated_secs * 100)
-                    .checked_div(target_secs)
-                    .unwrap_or(0);
-                Text::new(format!(
-                    "Collecting negative samples… {accumulated_secs}s/{target_secs}s \
-                     ({pct}%) elapsed {wall_clock_elapsed}s"
-                ))
-                .into()
-            }
-            crate::audio::voice::VoiceStatus::Enrolled => Text::new("Enrolled").into(),
-            crate::audio::voice::VoiceStatus::Error(msg) => Text::new(msg).into(),
-        };
-
-        // Enrollment progress UI (shown during active enrollment)
-        let enrollment_ui: Option<Element<'_, SettingsMessage>> = match status {
-            crate::audio::voice::VoiceStatus::Enrolling { .. }
-            | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
-            | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
-            | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. } => {
-                let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(13))
-                        .on_press(SettingsMessage::CancelVoiceEnrollment)
-                        .style(theme::button_danger)
-                        .padding(6),
-                )
-                .into();
-                Some(
-                    Column::new()
-                        .push(iced::widget::Space::new().height(8))
-                        .push(cancel_btn)
-                        .into(),
-                )
-            }
-            _ => None,
-        };
-
-        let enroll_btn: Element<'_, SettingsMessage> = if voice_enabled {
-            container(
-                iced::widget::button(Text::new("Enroll Wake Word").size(13))
-                    .on_press(SettingsMessage::StartVoiceEnrollment)
-                    .style(theme::button_primary)
-                    .padding(6),
-            )
-            .into()
-        } else {
-            container(Text::new("")).into()
-        };
-
-        let wake_word_row = if voice_enabled {
-            if let Some(phrase) = crate::audio::voice::get_enrolled_phrase() {
-                field_row("Wake Word", Text::new(phrase).size(13).into(), None)
-            } else if has_enrollment {
-                // V2 enrollment present but phrase unavailable (shouldn't
-                // happen — phrase is always persisted) — defensive branch.
-                field_row(
-                    "Wake Word",
-                    Text::new("Enrolled").size(13).into(),
-                    Some("Re-enroll to set a custom wake word phrase"),
-                )
-            } else {
-                field_row(
-                    "Wake Word",
-                    Text::new("Enroll a wake word to get started")
-                        .size(13)
-                        .into(),
-                    None,
-                )
-            }
-        } else {
-            iced::widget::Space::new().height(0).into()
-        };
-
-        // Text input for the wake word phrase (before enrollment).
-        let is_enrolling = matches!(
-            status,
-            crate::audio::voice::VoiceStatus::Enrolling { .. }
-                | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
-                | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
-                | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. }
-        );
-        let phrase_input = if voice_enabled && !is_enrolling {
-            let input = text_input("mahbot", &self.wake_word_phrase_input)
-                .on_input(SettingsMessage::WakeWordPhraseInput)
-                .style(super::widgets::text_input_style)
-                .width(Length::Fixed(250.0));
-            field_row("Wake Word Phrase", input.into(), None)
-        } else {
-            iced::widget::Space::new().height(0).into()
-        };
-
-        let mut column = Column::new()
-            .push(field_row(
-                "Enable Voice",
-                iced::widget::toggler(voice_enabled)
-                    .on_toggle(SettingsMessage::VoiceToggle)
-                    .into(),
-                Some("Hands-free voice commands with wake word detection"),
-            ))
-            .push(iced::widget::Space::new().height(8))
-            .push(field_row("Status", status_text, None))
-            .push(wake_word_row)
-            .push(phrase_input)
-            .push(enroll_btn);
-
-        // Adaptive threshold k slider — persists on release (never on drag).
-        let current_k: f32 = self
-            .config
-            .adaptive_k
-            .as_deref()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(2.5);
-        let k_slider = slider(1.0_f32..=4.0_f32, current_k, move |v| {
-            SettingsMessage::ConfigField {
-                key: "adaptive_k",
-                value: format!("{v:.1}"),
-            }
-        })
-        .step(0.1_f32)
-        .on_release(SettingsMessage::ConfigFieldSettleNow {
-            field: "config:adaptive_k".to_string(),
-        })
-        .width(Length::Fixed(200.0));
-        column = column.push(iced::widget::Space::new().height(8));
-        column = column.push(field_row_with_error(
-            "Adaptive K",
-            iced::widget::row![
-                k_slider,
-                iced::widget::Space::new().width(8),
-                text(format!("{current_k:.1}")).size(13),
-            ]
-            .align_y(iced::Alignment::Center)
-            .into(),
-            Some("Detection sensitivity (1.0–4.0, default 2.5)"),
-            self.field_errors
-                .get("config:adaptive_k")
-                .map(String::as_str),
-        ));
-
-        if let Some(ui) = enrollment_ui {
-            column = column.push(ui);
-        }
-
-        section("Voice Assistant", column)
-    }
-
-    // ── TTS section ──────────────────────────────────────────
-
-    fn tts_section(&self) -> Element<'_, SettingsMessage> {
-        use iced::widget::Text;
-
-        let tts_enabled = self.config.tts_enabled.as_deref() == Some("true");
-        let ready = crate::audio::tts::models_ready();
-        let failed = crate::audio::tts::download_failed();
-        let audio_ok = crate::audio::tts::audio_output_ready();
-
-        let status_text: Element<'_, SettingsMessage> = if !tts_enabled {
-            Text::new("Disabled").into()
-        } else if ready {
-            if audio_ok {
-                Text::new("Ready").into()
-            } else {
-                Text::new("No audio output device")
-                    .color(theme::STATUS_ERROR)
-                    .into()
-            }
-        } else if failed {
-            // Show retry button inline so the user can trigger recovery
-            // without toggling TTS off/on.
-            let retry_btn = iced::widget::button(Text::new("   Retry   ").size(13))
-                .on_press(SettingsMessage::TtsRetryModels)
-                .style(theme::button_danger)
-                .padding(4);
-            iced::widget::row![
-                Text::new("Model download failed").size(14),
-                iced::widget::Space::new().width(8),
-                retry_btn,
-            ]
-            .align_y(iced::Alignment::Center)
-            .into()
-        } else {
-            Text::new("Downloading models…").into()
-        };
-
-        // Test button: enabled only when TTS is enabled and models loaded.
-        // On click, audio output readiness is checked separately and shown
-        // as a toast if unavailable — the button itself stays clickable so
-        // the user gets immediate feedback about the problem.
-        let test_btn = iced::widget::button(Text::new("   Test TTS   ").size(13))
-            .style(theme::button_primary)
-            .padding(4)
-            .on_press_maybe(if tts_enabled && ready {
-                Some(SettingsMessage::TtsTest)
-            } else {
-                None
-            });
-
-        let column = Column::new()
-            .push(field_row(
-                "Enable TTS",
-                iced::widget::toggler(tts_enabled)
-                    .on_toggle(SettingsMessage::TtsToggle)
-                    .into(),
-                Some("Text-to-speech for agent responses"),
-            ))
-            .push(iced::widget::Space::new().height(8))
-            .push(field_row("Status", status_text, None))
-            .push(iced::widget::Space::new().height(8))
-            .push(field_row("", test_btn.into(), None));
-
-        section("TTS", column)
     }
 
     fn routing_section(&self) -> Element<'_, SettingsMessage> {
@@ -3858,18 +3988,18 @@ mod tests {
 
         // First settle spawns a persist (field marked in flight).
         let _task = state.update(SettingsMessage::ConfigField {
-            key: "audio_transcription_use_local",
-            value: "true".into(),
+            key: "web_search_provider",
+            value: "exa".into(),
         });
         let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:audio_transcription_use_local".into(),
-            value: "true".into(),
+            field: "config:web_search_provider".into(),
+            value: "exa".into(),
             generation: 1,
         });
         assert!(
             state
                 .in_flight_persists
-                .contains("config:audio_transcription_use_local"),
+                .contains("config:web_search_provider"),
             "fresh settle marks the field in flight"
         );
 
@@ -3877,18 +4007,16 @@ mod tests {
         // second persist — it queues the newest value instead, so the last
         // settle always lands last in the DB.
         let _task = state.update(SettingsMessage::ConfigField {
-            key: "audio_transcription_use_local",
-            value: String::new(), // toggled back off
+            key: "web_search_provider",
+            value: String::new(), // toggled back to Auto
         });
         let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:audio_transcription_use_local".into(),
+            field: "config:web_search_provider".into(),
             value: String::new(),
             generation: 2,
         });
         assert_eq!(
-            state
-                .pending_persists
-                .get("config:audio_transcription_use_local"),
+            state.pending_persists.get("config:web_search_provider"),
             Some(&(String::new(), 2)),
             "newer settle queued with the generation it was queued at"
         );
@@ -3896,20 +4024,20 @@ mod tests {
         // The in-flight persist's (stale) result frees the field and flushes
         // the pending value into a fresh persist — the latest edit wins.
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:audio_transcription_use_local".into(),
+            field: "config:web_search_provider".into(),
             generation: 1,
-            result: Ok("true".into()),
+            result: Ok("exa".into()),
         });
         assert!(
             !state
                 .pending_persists
-                .contains_key("config:audio_transcription_use_local"),
+                .contains_key("config:web_search_provider"),
             "pending value flushed"
         );
         assert!(
             state
                 .in_flight_persists
-                .contains("config:audio_transcription_use_local"),
+                .contains("config:web_search_provider"),
             "flushed persist re-marks the field in flight"
         );
     }
@@ -3920,29 +4048,27 @@ mod tests {
 
         // Settle #1 spawns a persist (field in flight, gen 1).
         let _task = state.update(SettingsMessage::ConfigField {
-            key: "audio_transcription_use_local",
-            value: "true".into(),
+            key: "web_search_provider",
+            value: "exa".into(),
         });
         let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:audio_transcription_use_local".into(),
-            value: "true".into(),
+            field: "config:web_search_provider".into(),
+            value: "exa".into(),
             generation: 1,
         });
 
         // Settle #2 while the first persist runs queues a pending value.
         let _task = state.update(SettingsMessage::ConfigField {
-            key: "audio_transcription_use_local",
-            value: String::new(), // toggled back off
+            key: "web_search_provider",
+            value: String::new(), // toggled back to Auto
         });
         let _task = state.update(SettingsMessage::ConfigFieldSettled {
-            field: "config:audio_transcription_use_local".into(),
+            field: "config:web_search_provider".into(),
             value: String::new(),
             generation: 2,
         });
         assert_eq!(
-            state
-                .pending_persists
-                .get("config:audio_transcription_use_local"),
+            state.pending_persists.get("config:web_search_provider"),
             Some(&(String::new(), 2)),
             "pending value queued with its own generation"
         );
@@ -3950,14 +4076,11 @@ mod tests {
         // The user stages a THIRD edit (gen 3) before the first persist
         // completes — its debounce is armed and the snapshot holds it.
         let _task = state.update(SettingsMessage::ConfigField {
-            key: "audio_transcription_use_local",
-            value: "true".into(),
+            key: "web_search_provider",
+            value: "exa".into(),
         });
         assert_eq!(
-            state
-                .field_gen
-                .get("config:audio_transcription_use_local")
-                .copied(),
+            state.field_gen.get("config:web_search_provider").copied(),
             Some(3),
             "third edit bumped the generation"
         );
@@ -3965,72 +4088,48 @@ mod tests {
         // The first persist's result frees the field and flushes the pending
         // value with ITS OWN generation (2) — never the current one (3).
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:audio_transcription_use_local".into(),
+            field: "config:web_search_provider".into(),
             generation: 1,
-            result: Ok("true".into()),
+            result: Ok("exa".into()),
         });
         assert!(
             !state
                 .pending_persists
-                .contains_key("config:audio_transcription_use_local"),
+                .contains_key("config:web_search_provider"),
             "pending value flushed"
         );
         assert!(
             state
                 .in_flight_persists
-                .contains("config:audio_transcription_use_local"),
+                .contains("config:web_search_provider"),
             "flush re-marks the field in flight"
         );
 
         // The flushed persist's result carries gen 2 — stale against the
         // newer staged edit (gen 3) — so it must NOT overwrite the snapshot.
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:audio_transcription_use_local".into(),
+            field: "config:web_search_provider".into(),
             generation: 2,
             result: Ok(String::new()), // the flushed (older) value's canonical
         });
         assert_eq!(
-            state.config.audio_transcription_use_local.as_deref(),
-            Some("true"),
+            state.config.web_search_provider.as_deref(),
+            Some("exa"),
             "stale flushed result must not clobber the newer staged value"
         );
         assert!(
             !state
                 .field_errors
-                .contains_key("config:audio_transcription_use_local"),
+                .contains_key("config:web_search_provider"),
             "stale result must not surface anything either"
         );
     }
 
     #[test]
-    fn settle_now_uses_the_staged_value_for_release_and_enter() {
+    fn settle_now_uses_the_staged_value_on_enter() {
         let mut state = SettingsState::new();
 
-        // Slider drag stages the value (release-settled → no settle armed).
-        // The generation still bumps, like every other staging path, so an
-        // in-flight persist result from an earlier release is stale and can
-        // never clobber the newly staged drag value.
-        let _task = state.update(SettingsMessage::ConfigField {
-            key: "adaptive_k",
-            value: "3.2".into(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:adaptive_k").copied(),
-            Some(1),
-            "drag bumps the generation but arms no settle"
-        );
-
-        // Release settles it immediately.
-        let _task = state.update(SettingsMessage::ConfigFieldSettleNow {
-            field: "config:adaptive_k".into(),
-        });
-        assert_eq!(
-            state.field_gen.get("config:adaptive_k").copied(),
-            Some(2),
-            "release arms a zero-delay settle"
-        );
-
-        // Enter on a text field settles the staged value immediately too.
+        // Enter on a text field settles the staged value immediately.
         let _task = state.update(SettingsMessage::ConfigField {
             key: "manager_model",
             value: "model-c".into(),
@@ -4043,20 +4142,32 @@ mod tests {
             Some(2),
             "Enter settles the staged value with a fresh generation"
         );
+
+        // Same for a second text field: the staged value is read from the
+        // editable snapshot at settle time.
+        let _task = state.update(SettingsMessage::ConfigField {
+            key: "worker_model",
+            value: "worker-d".into(),
+        });
+        let _task = state.update(SettingsMessage::ConfigFieldSettleNow {
+            field: "config:worker_model".into(),
+        });
+        assert_eq!(
+            state.field_gen.get("config:worker_model").copied(),
+            Some(2),
+            "Enter settles the second text field's staged value too"
+        );
     }
 
     #[test]
     fn immediate_toggle_arms_a_zero_delay_settle() {
         let mut state = SettingsState::new();
         let _task = state.update(SettingsMessage::ConfigField {
-            key: "audio_transcription_use_local",
-            value: String::new(), // enabled → "" (None collapsed)
+            key: "web_search_provider",
+            value: "firecrawl".into(),
         });
         assert_eq!(
-            state
-                .field_gen
-                .get("config:audio_transcription_use_local")
-                .copied(),
+            state.field_gen.get("config:web_search_provider").copied(),
             Some(1),
             "immediate toggle arms a zero-delay settle"
         );

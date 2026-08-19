@@ -311,12 +311,6 @@ const ADAPTIVE_WINDOW_N: usize = 15;
 /// Default k multiplier for the adaptive threshold (mean + k × std).
 const ADAPTIVE_K_DEFAULT: f32 = 2.5;
 
-/// Minimum allowed adaptive k value (user-configurable range).
-const ADAPTIVE_K_MIN: f32 = 1.0;
-
-/// Maximum allowed adaptive k value (user-configurable range).
-const ADAPTIVE_K_MAX: f32 = 4.0;
-
 /// Absolute ceiling — the adaptive threshold must never exceed this value.
 /// Re-calibrated for the cosine soft-score space with the p99 floor (0.75):
 /// the max rolling sum is 3.0 (3 × 1.0), and the ceiling must sit above the
@@ -2250,7 +2244,8 @@ pub(crate) struct PipelineCtx {
     segment_silence_hops: usize,
     /// Adaptive threshold tracker for the rolling score window.
     adaptive_threshold: AdaptiveThresholdState,
-    /// Adaptive threshold k multiplier (from config, clamped).
+    /// Adaptive threshold k multiplier (fixed default — the adaptive_k config
+    /// key is no longer read, mahbot-1825).
     adaptive_k: f32,
     /// Accumulated non-VAD audio during enrollment (pre-speech ambient noise
     /// and inter-utterance silence), saved as negative examples at speech
@@ -2325,13 +2320,9 @@ impl PipelineCtx {
             last_voice_notice_time: None,
             auto_model_retries_left: MAX_AUTO_MODEL_RETRY_CYCLES,
             adaptive_threshold: AdaptiveThresholdState::new(),
-            adaptive_k: {
-                let k_str = crate::config::CONFIG.adaptive_k();
-                k_str
-                    .parse::<f32>()
-                    .unwrap_or(ADAPTIVE_K_DEFAULT)
-                    .clamp(ADAPTIVE_K_MIN, ADAPTIVE_K_MAX)
-            },
+            // Fixed code default (mahbot-1825): the stored adaptive_k config
+            // key is no longer read — it is an inert orphan.
+            adaptive_k: ADAPTIVE_K_DEFAULT,
             segment_silence_hops: 0,
             #[cfg(feature = "voice-tests")]
             instrumentation: DetectionInstrumentation::new(),
@@ -5633,52 +5624,6 @@ mod tests {
 
         // get_enrolled_phrase() must still return the cached phrase
         assert_eq!(get_enrolled_phrase(), Some("hey computer".to_string()),);
-    }
-
-    // ── PipelineCtx adaptive_k clamping ───────────────────────────────────
-    // PipelineCtx::new() reads adaptive_k from CONFIG and clamps it to
-    // [ADAPTIVE_K_MIN, ADAPTIVE_K_MAX].  Verify this works for out-of-range
-    // config values.
-
-    #[test]
-    #[serial_test::serial(config)]
-    fn adaptive_k_clamped_below_min() {
-        let _ = crate::config::CONFIG.set_string_field("adaptive_k", "0.1");
-        let ctx = PipelineCtx::new();
-        assert!(
-            (ctx.adaptive_k - ADAPTIVE_K_MIN).abs() < 0.01,
-            "adaptive_k {} should be clamped to min {}",
-            ctx.adaptive_k,
-            ADAPTIVE_K_MIN,
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(config)]
-    fn adaptive_k_clamped_above_max() {
-        let _ = crate::config::CONFIG.set_string_field("adaptive_k", "9.9");
-        let ctx = PipelineCtx::new();
-        assert!(
-            (ctx.adaptive_k - ADAPTIVE_K_MAX).abs() < 0.01,
-            "adaptive_k {} should be clamped to max {}",
-            ctx.adaptive_k,
-            ADAPTIVE_K_MAX,
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(config)]
-    fn adaptive_k_uses_default_when_config_empty() {
-        // Setting to empty string should cause parse failure, falling back
-        // to ADAPTIVE_K_DEFAULT.
-        let _ = crate::config::CONFIG.set_string_field("adaptive_k", "");
-        let ctx = PipelineCtx::new();
-        assert!(
-            (ctx.adaptive_k - ADAPTIVE_K_DEFAULT).abs() < 0.01,
-            "adaptive_k {} should be default {} when config is empty",
-            ctx.adaptive_k,
-            ADAPTIVE_K_DEFAULT,
-        );
     }
 
     // ── reset_pipeline_state level tests ──────────────────────────────────
