@@ -3435,6 +3435,14 @@ mod tests {
     /// the fresh store's quick_check masks the known FTS count-mismatch false
     /// positive. The FTS index lives on a separate short-value table (real
     /// titles), not the overflow-aliased long-value column.
+    ///
+    /// This test is `#[ignore]` by default because it performs real overflow-aliasing page surgery on a multi-MB database fixture (~4 s). Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test overflow_aliasing_rebuild_preserves_fts_store -- --ignored --nocapture
+    /// ```
+    #[ignore = "performs real overflow-page DB surgery on a multi-MB fixture (~4 s); runs only when explicitly invoked"]
     #[tokio::test]
     async fn overflow_aliasing_rebuild_preserves_fts_store() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3527,6 +3535,14 @@ mod tests {
     /// finding, not corruption: the rebuild aborts report-only (no silent
     /// recreate, no quarantine) and the original store — with its readable
     /// data — is preserved for operator review.
+    ///
+    /// This test is `#[ignore]` by default because it performs real overflow-aliasing page surgery on a multi-MB database fixture (~4 s). Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test overflow_aliasing_rebuild_constraint_finding_aborts -- --ignored --nocapture
+    /// ```
+    #[ignore = "performs real overflow-page DB surgery on a multi-MB fixture (~4 s); runs only when explicitly invoked"]
     #[tokio::test]
     async fn overflow_aliasing_rebuild_constraint_finding_aborts() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3570,6 +3586,14 @@ mod tests {
     /// watermark (5000) exceeds the surviving max id (4000) — the only shape
     /// where the carry-over matters: without it, the next auto-id would
     /// re-issue 4001.
+    ///
+    /// This test is `#[ignore]` by default because it performs real overflow-aliasing page surgery on a multi-MB database fixture (~4 s). Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test overflow_aliasing_rebuild_preserves_autoincrement_store -- --ignored --nocapture
+    /// ```
+    #[ignore = "performs real overflow-page DB surgery on a multi-MB fixture (~4 s); runs only when explicitly invoked"]
     #[tokio::test]
     async fn overflow_aliasing_rebuild_preserves_autoincrement_store() {
         let tmp = tempfile::TempDir::new().unwrap();

@@ -1163,6 +1163,17 @@ mod tests {
         );
     }
 
+    /// Embeddings from the real cached jina-embeddings-v5 GGUF model are
+    /// 768-dimensional L2-normalized unit vectors — for single and batch
+    /// document inputs and for query inputs.
+    ///
+    /// This test is `#[ignore]` by default because it loads the real cached
+    /// 157 MB GGUF model (~3-4 s). Run it explicitly with:
+    ///
+    /// ```sh
+    /// cargo test test_embedding_produces_unit_vectors -- --ignored --nocapture
+    /// ```
+    #[ignore = "loads the real cached 157 MB GGUF model (~3-4 s); runs only when explicitly invoked"]
     #[test]
     fn test_embedding_produces_unit_vectors() {
         let Some(emb) = test_embedder_opt() else {
@@ -1206,6 +1217,17 @@ mod tests {
         );
     }
 
+    /// Cosine similarity ranks same-topic embeddings above cross-topic ones:
+    /// two rust documents must be more similar than a rust and a python
+    /// document.
+    ///
+    /// This test is `#[ignore]` by default because it loads the real cached
+    /// 157 MB GGUF model (~3-4 s). Run it explicitly with:
+    ///
+    /// ```sh
+    /// cargo test test_similar_embeddings_are_similar -- --ignored --nocapture
+    /// ```
+    #[ignore = "loads the real cached 157 MB GGUF model (~3-4 s); runs only when explicitly invoked"]
     #[test]
     fn test_similar_embeddings_are_similar() {
         let Some(emb) = test_embedder_opt() else {
@@ -1227,6 +1249,16 @@ mod tests {
         );
     }
 
+    /// Embedding an empty document list must produce an error, not a panic or
+    /// an empty result.
+    ///
+    /// This test is `#[ignore]` by default because it loads the real cached
+    /// 157 MB GGUF model (~3-4 s). Run it explicitly with:
+    ///
+    /// ```sh
+    /// cargo test test_empty_input_fails -- --ignored --nocapture
+    /// ```
+    #[ignore = "loads the real cached 157 MB GGUF model (~3-4 s); runs only when explicitly invoked"]
     #[test]
     fn test_empty_input_fails() {
         let Some(emb) = test_embedder_opt() else {

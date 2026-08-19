@@ -3404,6 +3404,18 @@ mod tests {
         );
     }
 
+    /// A command that outlives its timeout must be killed: the run returns
+    /// `ShellRunResult::TimedOut` with an elapsed time close to the limit
+    /// (not the full `sleep` duration).
+    ///
+    /// This test is `#[ignore]` by default because it waits out a real 1 s
+    /// command timeout against a live `sleep 10` child. Run it explicitly
+    /// with:
+    ///
+    /// ```sh
+    /// cargo test run_command_with_timeout_kills_long_sleep -- --ignored --nocapture
+    /// ```
+    #[ignore = "waits out real command timeouts against live processes (hardcoded waits); runs only when explicitly invoked"]
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_with_timeout_kills_long_sleep() {
@@ -3423,6 +3435,17 @@ mod tests {
         }
     }
 
+    /// When a command times out, stdout written before the kill must be
+    /// preserved in `ShellRunResult::TimedOut`.
+    ///
+    /// This test is `#[ignore]` by default because it waits out a real 2 s
+    /// command timeout against a live `sleep 60` child. Run it explicitly
+    /// with:
+    ///
+    /// ```sh
+    /// cargo test run_command_with_timeout_captures_partial_stdout -- --ignored --nocapture
+    /// ```
+    #[ignore = "waits out real command timeouts against live processes (hardcoded waits); runs only when explicitly invoked"]
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_with_timeout_captures_partial_stdout() {
@@ -3447,6 +3470,14 @@ mod tests {
     /// tails) and ANSI stripping works.
     ///
     /// The `sleep 30` grandchild is now terminated by the PGID kill, not orphaned.
+    ///
+    /// This test is `#[ignore]` by default because it waits out a real 1 s command timeout against a live `sleep 30` child. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test shell_timeout_error_includes_diagnostics -- --ignored --nocapture
+    /// ```
+    #[ignore = "waits out real command timeouts against live processes (hardcoded waits); runs only when explicitly invoked"]
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_timeout_error_includes_diagnostics() {
@@ -3509,6 +3540,14 @@ mod tests {
     /// [`run_command_with_timeout`] sends SIGKILL to the entire process group
     /// via `libc::kill(-pgid, SIGKILL)`, which terminates grandchildren
     /// (e.g. the `sleep` in this test) in addition to the direct `sh` child.
+    ///
+    /// This test is `#[ignore]` by default because it waits out a real 2 s command timeout plus a 500 ms kill-delivery grace against live processes. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test process_group_kills_grandchildren_on_timeout -- --ignored --nocapture
+    /// ```
+    #[ignore = "waits out real command timeouts against live processes (hardcoded waits); runs only when explicitly invoked"]
     #[cfg(unix)]
     #[tokio::test]
     async fn process_group_kills_grandchildren_on_timeout() {

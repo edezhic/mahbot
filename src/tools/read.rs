@@ -1732,6 +1732,14 @@ impl Baz {}
 
     /// A writer that wrote data then holds the pipe open idle past the bound:
     /// the already-received bytes are delivered (fail-open), never discarded.
+    ///
+    /// This test is `#[ignore]` by default because the writer holds the pipe open with a hardcoded 2 s sleep. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test fifo_writer_idle_after_data_delivers_buffered_bytes -- --ignored --nocapture
+    /// ```
+    #[ignore = "hardcoded 2 s writer sleep to verify fail-open buffered delivery; runs only when explicitly invoked"]
     #[cfg(unix)]
     #[tokio::test]
     async fn fifo_writer_idle_after_data_delivers_buffered_bytes() {

@@ -1954,6 +1954,14 @@ mod tests {
     /// End-to-end: a crafted artifact state (tshm advertises live frames while
     /// the on-disk WAL is empty) must produce the explicit artifact error, not
     /// a raw torn-frame read.
+    ///
+    /// This test is `#[ignore]` by default because the artifact open burns the full 15 s torn-frame retry backoff before reporting. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test run_debug_reports_artifact_instead_of_torn_frame -- --ignored --nocapture
+    /// ```
+    #[ignore = "burns the full 15 s torn-frame retry backoff on a crafted artifact state; runs only when explicitly invoked"]
     #[tokio::test]
     #[serial_test::serial(family)]
     async fn run_debug_reports_artifact_instead_of_torn_frame() {
@@ -2028,6 +2036,14 @@ mod tests {
     /// End-to-end: `--db all` must exit non-zero (return an error) when any
     /// store fails — scripted diagnostics rely on the exit code, so per-store
     /// failures cannot be silently swallowed.
+    ///
+    /// This test is `#[ignore]` by default because the artifact open burns the full 15 s torn-frame retry backoff before reporting. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test run_debug_all_reports_failure_summary -- --ignored --nocapture
+    /// ```
+    #[ignore = "burns the full 15 s torn-frame retry backoff on a crafted artifact state; runs only when explicitly invoked"]
     #[tokio::test]
     #[serial_test::serial(family)]
     async fn run_debug_all_reports_failure_summary() {
@@ -2714,6 +2730,14 @@ mod tests {
     /// started) — the snapshot-query and bare-store workflows stay unblocked.
     /// Serialized: the gate tests manipulate process-wide flock/fcntl state
     /// and spawn perl lock-holder children, so they must not run concurrently.
+    ///
+    /// This test is `#[ignore]` by default because it exercises real cross-process fcntl locks (spawned perl lock-holder children) with multi-second waits. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test flock_gate_passes_without_lock_file -- --ignored --nocapture
+    /// ```
+    #[ignore = "exercises real cross-process fcntl locks with multi-second waits; runs only when explicitly invoked"]
     #[tokio::test]
     #[serial_test::serial(flock_gate)]
     async fn flock_gate_passes_without_lock_file() {
@@ -2731,6 +2755,14 @@ mod tests {
     /// must come from a real child process: on macOS `F_GETLK` deliberately
     /// ignores locks held by the calling process itself, so an in-process
     /// lock would read as "free" and the gate would (correctly) wait.
+    ///
+    /// This test is `#[ignore]` by default because it exercises real cross-process fcntl locks (spawned perl lock-holder children) with multi-second waits. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test flock_gate_proceeds_when_daemon_alive -- --ignored --nocapture
+    /// ```
+    #[ignore = "exercises real cross-process fcntl locks with multi-second waits; runs only when explicitly invoked"]
     #[tokio::test]
     #[cfg(unix)]
     #[serial_test::serial(flock_gate)]
@@ -2761,6 +2793,14 @@ mod tests {
     /// observed held, then released), two consecutive free observations make
     /// the gate TAKE the flock and return the guard, which actually holds it
     /// (a second probe sees it busy).
+    ///
+    /// This test is `#[ignore]` by default because it exercises real cross-process fcntl locks (spawned perl lock-holder children) with multi-second waits. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test flock_gate_takes_flock_in_crash_recovery -- --ignored --nocapture
+    /// ```
+    #[ignore = "exercises real cross-process fcntl locks with multi-second waits; runs only when explicitly invoked"]
     #[tokio::test]
     #[serial_test::serial(flock_gate)]
     async fn flock_gate_takes_flock_in_crash_recovery() {
@@ -2805,6 +2845,14 @@ mod tests {
     /// Self-update handoff: flock free + byte-0 held (old process finishing).
     /// The gate must wait (time out into a refusal) and must never take the
     /// flock — a transient acquire would kill a fail-fast incoming daemon.
+    ///
+    /// This test is `#[ignore]` by default because it exercises real cross-process fcntl locks (spawned perl lock-holder children) with multi-second waits. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test flock_gate_never_takes_flock_during_handoff -- --ignored --nocapture
+    /// ```
+    #[ignore = "exercises real cross-process fcntl locks with multi-second waits; runs only when explicitly invoked"]
     #[tokio::test]
     #[cfg(unix)]
     #[serial_test::serial(flock_gate)]
@@ -2846,6 +2894,14 @@ mod tests {
     /// old child locks a different file), so the new pid lands with wide
     /// margin before the gate's second observation (~1s) and the PID change
     /// fires.
+    ///
+    /// This test is `#[ignore]` by default because it exercises real cross-process fcntl locks (spawned perl lock-holder children) with multi-second waits. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test flock_gate_proceeds_after_handoff_pid_change -- --ignored --nocapture
+    /// ```
+    #[ignore = "exercises real cross-process fcntl locks with multi-second waits; runs only when explicitly invoked"]
     #[tokio::test]
     #[cfg(unix)]
     #[serial_test::serial(flock_gate)]
@@ -2907,6 +2963,14 @@ mod tests {
     /// The macOS lock-drop state (flock held by a live daemon whose fcntl
     /// byte-0 lock is gone) must NOT proceed — opening would classify
     /// Exclusive and trigger repair. Times out into a [`GateRefusal`].
+    ///
+    /// This test is `#[ignore]` by default because it exercises real cross-process fcntl locks (spawned perl lock-holder children) with multi-second waits. Run it
+    /// explicitly with:
+    ///
+    /// ```sh
+    /// cargo test flock_gate_refuses_in_lock_drop_state -- --ignored --nocapture
+    /// ```
+    #[ignore = "exercises real cross-process fcntl locks with multi-second waits; runs only when explicitly invoked"]
     #[tokio::test]
     #[serial_test::serial(flock_gate)]
     async fn flock_gate_refuses_in_lock_drop_state() {
