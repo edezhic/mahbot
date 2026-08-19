@@ -393,6 +393,10 @@ const SETTLE_MS: u64 = 700;
 /// settles (debounce / Enter), never per keystroke.
 const TEXT_INPUT_KEYS: &[&str] = &[
     "provider_key",
+    // Retained even though the Endpoint UI control is hidden (mahbot-1813):
+    // the config key stays in the schema and the settle plumbing stays wired
+    // for when configurable endpoints are re-enabled. The runtime never
+    // honors a persisted value today.
     "provider_endpoint",
     "firecrawl_key",
     "exa_key",
@@ -1263,20 +1267,16 @@ impl SettingsState {
                         // Image-gen additions are validated against the catalog
                         // (fail-open when it is unavailable) before the list is
                         // mutated; the input buffer is kept on rejection so the
-                        // user can correct it. Validation uses the endpoint being
-                        // drafted — the committed global may differ when the user
-                        // changed the endpoint in this session.
+                        // user can correct it. The runtime endpoint is hardcoded
+                        // (mahbot-1813), so validation always runs against the
+                        // default endpoint — a persisted custom value is not
+                        // honored and must not gate model additions.
                         ModelPickerTarget::ImageGen => {
                             let model = self.model_picker_inputs[t.idx()].trim().to_string();
                             if model.is_empty() {
                                 return Task::none();
                             }
-                            let endpoint = self
-                                .config
-                                .provider_endpoint
-                                .as_deref()
-                                .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT)
-                                .to_string();
+                            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
                             Task::perform(
                                 async move {
                                     let ok = crate::tools::image_catalog::
@@ -2460,39 +2460,38 @@ impl SettingsState {
     // ── Section helpers ──────────────────────────────────────────
 
     fn provider_section(&self) -> Element<'_, SettingsMessage> {
+        // The API key field is highlighted until a valid (trimmed non-empty)
+        // key is present. Computed per-render from the editable snapshot, so
+        // the highlight clears on the first typed character and re-arms when
+        // the field is cleared to empty/whitespace.
+        let api_key_unset = self
+            .config
+            .provider_key
+            .as_deref()
+            .is_none_or(|key| key.trim().is_empty());
         section(
             "Provider",
-            column![
-                field_row(
-                    "API Key",
-                    password_input(
-                        "sk-or-v1-...",
-                        self.config.provider_key.as_deref().unwrap_or_default(),
-                        self.password_visible.contains(&PasswordTarget::ProviderKey),
-                        |v| SettingsMessage::ConfigField {
-                            key: "provider_key",
-                            value: v
-                        },
-                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::ProviderKey),
-                        SettingsMessage::ConfigFieldSettleNow {
-                            field: "config:provider_key".to_string()
-                        },
-                        self.field_errors
-                            .get("config:provider_key")
-                            .map(String::as_str),
-                    ),
-                    None,
-                ),
-                config_text_input(
-                    "Endpoint",
-                    "https://openrouter.ai/api/v1",
-                    self.config.provider_endpoint.as_deref().unwrap_or_default(),
-                    "provider_endpoint",
+            column![field_row(
+                "API Key",
+                password_input(
+                    "sk-or-v1-...",
+                    self.config.provider_key.as_deref().unwrap_or_default(),
+                    self.password_visible.contains(&PasswordTarget::ProviderKey),
+                    |v| SettingsMessage::ConfigField {
+                        key: "provider_key",
+                        value: v
+                    },
+                    SettingsMessage::TogglePasswordVisibility(PasswordTarget::ProviderKey),
+                    SettingsMessage::ConfigFieldSettleNow {
+                        field: "config:provider_key".to_string()
+                    },
                     self.field_errors
-                        .get("config:provider_endpoint")
+                        .get("config:provider_key")
                         .map(String::as_str),
+                    api_key_unset,
                 ),
-            ],
+                None,
+            )],
         )
     }
 
@@ -2719,6 +2718,7 @@ impl SettingsState {
                         self.field_errors
                             .get("config:firecrawl_key")
                             .map(String::as_str),
+                        false,
                     ),
                     None,
                 ),
@@ -2737,6 +2737,7 @@ impl SettingsState {
                             field: "config:exa_key".to_string()
                         },
                         self.field_errors.get("config:exa_key").map(String::as_str),
+                        false,
                     ),
                     None,
                 ),
@@ -2761,6 +2762,7 @@ impl SettingsState {
                         self.field_errors
                             .get("config:telegram_bot_token")
                             .map(String::as_str),
+                        false,
                     ),
                     Some("Applied automatically"),
                 ),
@@ -3354,6 +3356,9 @@ fn role_checkbox_row<'a>(
 
 /// Password input — masked by default, eye button toggles visibility.
 /// Settles on Enter in addition to the debounce timer. Optional inline error.
+/// `highlight` switches to the accent attention style (used for the provider
+/// API key while unset).
+#[allow(clippy::too_many_arguments)]
 fn password_input<'a>(
     placeholder: &str,
     value: &str,
@@ -3362,12 +3367,18 @@ fn password_input<'a>(
     on_toggle: SettingsMessage,
     on_submit: SettingsMessage,
     error: Option<&'a str>,
+    highlight: bool,
 ) -> Element<'a, SettingsMessage> {
+    let style = if highlight {
+        super::widgets::text_input_highlight_style
+    } else {
+        super::widgets::text_input_style
+    };
     let input: Element<_> = text_input(placeholder, value)
         .secure(!show)
         .on_input(on_input)
         .on_submit(on_submit)
-        .style(super::widgets::text_input_style)
+        .style(style)
         .width(Length::Fixed(375.0))
         .into();
 
@@ -4044,23 +4055,23 @@ mod tests {
     fn stale_result_does_not_apply_stale_value() {
         let mut state = SettingsState::new();
         let _ = state.update(SettingsMessage::ConfigField {
-            key: "provider_endpoint",
-            value: "https://a.example".into(),
+            key: "media_transcription_model",
+            value: "model-a".into(),
         });
         let _ = state.update(SettingsMessage::ConfigField {
-            key: "provider_endpoint",
-            value: "https://b.example".into(),
+            key: "media_transcription_model",
+            value: "model-b".into(),
         });
 
         // A stale SUCCESS result (gen 1) must not overwrite the staged value.
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:provider_endpoint".into(),
+            field: "config:media_transcription_model".into(),
             generation: 1,
-            result: Ok("https://a.example".into()),
+            result: Ok("model-a".into()),
         });
         assert_eq!(
-            state.config.provider_endpoint.as_deref(),
-            Some("https://b.example"),
+            state.config.media_transcription_model.as_deref(),
+            Some("model-b"),
             "stale success must not overwrite the newer staged value"
         );
     }
@@ -4245,14 +4256,17 @@ mod tests {
 
         // Enter on a text field settles the staged value immediately too.
         let _task = state.update(SettingsMessage::ConfigField {
-            key: "provider_endpoint",
-            value: "https://c.example".into(),
+            key: "media_transcription_model",
+            value: "model-c".into(),
         });
         let _task = state.update(SettingsMessage::ConfigFieldSettleNow {
-            field: "config:provider_endpoint".into(),
+            field: "config:media_transcription_model".into(),
         });
         assert_eq!(
-            state.field_gen.get("config:provider_endpoint").copied(),
+            state
+                .field_gen
+                .get("config:media_transcription_model")
+                .copied(),
             Some(2),
             "Enter settles the staged value with a fresh generation"
         );

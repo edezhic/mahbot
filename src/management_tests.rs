@@ -2944,17 +2944,18 @@ async fn pickup_claim_claims_when_provider_configured() {
 
 #[tokio::test]
 #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
-async fn pickup_claim_gates_on_custom_endpoint_without_key() {
+async fn pickup_claim_does_not_claim_without_key_even_with_custom_endpoint_persisted() {
     init_management_test_stores().await;
-    // Keyless local OpenAI-compatible endpoint: 'provider configured' must
-    // mean key OR custom endpoint, otherwise these setups strand in pending.
+    // The runtime endpoint is hardcoded (mahbot-1813) — a persisted custom
+    // endpoint is no longer honored, so without a provider key the pickup
+    // must hold the workspace in pending (no claim, no discovery spawn).
     let _cfg = ConfigGuard::new(None, Some("http://localhost:8080/v1"));
     let ws = create_test_workspace("/tmp/test_pickup_endpoint", "ws_pickup_endpoint").await;
 
     let claimed = pickup_claim(&ws).await;
     assert!(
-        claimed.is_some(),
-        "a custom provider endpoint without a key must count as provider configured"
+        claimed.is_none(),
+        "a persisted custom endpoint without a key must NOT count as provider configured"
     );
 
     let stored = crate::workspace::store()
@@ -2964,8 +2965,8 @@ async fn pickup_claim_gates_on_custom_endpoint_without_key() {
         .expect("exists");
     assert_eq!(
         stored.status,
-        WorkspaceStatus::Analyzing,
-        "custom endpoint → pending workspace claimed into discovery"
+        WorkspaceStatus::Pending,
+        "no provider key → workspace stays pending despite the persisted endpoint"
     );
 }
 

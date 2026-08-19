@@ -77,6 +77,28 @@ pub fn text_input_style(_theme: &iced::Theme, _status: text_input::Status) -> te
     }
 }
 
+/// Highlighted [`fn@text_input`] style for fields that need attention (e.g.
+/// the provider API key while unset): an accent border plus a subtle accent
+/// background tint. Identical to [`text_input_style`] otherwise.
+#[must_use]
+pub fn text_input_highlight_style(
+    _theme: &iced::Theme,
+    _status: text_input::Status,
+) -> text_input::Style {
+    text_input::Style {
+        background: iced::Background::Color(theme::ACCENT.scale_alpha(0.07)),
+        border: iced::Border {
+            radius: 4.0.into(),
+            width: 1.5,
+            color: theme::ACCENT,
+        },
+        icon: theme::TEXT_MUTED,
+        placeholder: theme::TEXT_MUTED,
+        value: theme::TEXT_PRIMARY,
+        selection: theme::ACCENT,
+    }
+}
+
 /// Render a styled error banner for dashboard panels.
 #[must_use]
 pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {

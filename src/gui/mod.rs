@@ -635,10 +635,23 @@ impl Dashboard {
                     load_workspace_options(prev.selected_workspace),
                     std::convert::identity,
                 );
+
+                // Start on Settings while no API key is configured. The
+                // decision must be made here, after the config is fully
+                // loaded (bootstrap_mahbot finished), not in the initial
+                // loading state where CONFIG still holds defaults. A trimmed
+                // non-empty key counts as set — `provider_key()` collapses
+                // empty/whitespace to None, so those re-arm this startup.
+                let settings_start = if crate::config::CONFIG.provider_key().is_none() {
+                    self.navigate_to(Page::Settings)
+                } else {
+                    Task::none()
+                };
                 Task::batch([
                     refresh_logs.map(Message::Logs),
                     refresh_board.map(Message::Board),
                     boot_workspaces,
+                    settings_start,
                 ])
             }
             Err(e) => {

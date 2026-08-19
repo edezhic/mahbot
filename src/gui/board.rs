@@ -2,9 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::str::FromStr;
 
-use crate::Role;
 use crate::board::{Ticket, TicketPhase};
 use crate::git_commands::{parse_numstat_lines, run_git_output};
 
@@ -1271,7 +1269,7 @@ impl BoardState {
                 button(
                     column![
                         text(&ticket.title).size(13).color(theme::TEXT_PRIMARY),
-                        text(&ticket.id).size(10).color(theme::TEXT_MUTED),
+                        text(&ticket.id).size(10).color(theme::TEXT_SECONDARY),
                     ]
                     .spacing(2),
                 )
@@ -1508,42 +1506,22 @@ impl BoardState {
         let actions = Self::available_actions(ticket.phase);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
-        let reporter_display = if ticket.reporter.is_empty() {
-            "Legacy".to_string()
-        } else {
-            Role::from_str(&ticket.reporter).map_or_else(
-                |_| {
-                    let mut chars = ticket.reporter.chars();
-                    let first = chars.next().expect("non-empty checked above");
-                    first.to_uppercase().to_string() + chars.as_str()
-                },
-                |role| crate::role::role_info(&role).display_label.to_string(),
-            )
-        };
         let created = theme::format_timestamp(&ticket.created_at);
         let updated = theme::format_timestamp(&ticket.updated_at);
 
         let meta_els: Vec<Element<'_, BoardMessage>> = vec![
             text(format!("Created: {created}"))
                 .size(12)
-                .color(theme::TEXT_MUTED)
+                .color(theme::TEXT_SECONDARY)
                 .into(),
-            text(" · ").size(12).color(theme::TEXT_MUTED).into(),
+            text(" · ").size(12).color(theme::TEXT_SECONDARY).into(),
             text(format!("Updated: {updated}"))
                 .size(12)
-                .color(theme::TEXT_MUTED)
-                .into(),
-            text(" · ").size(12).color(theme::TEXT_MUTED).into(),
-            text(format!("Reporter: {reporter_display}"))
-                .size(12)
-                .color(theme::TEXT_MUTED)
+                .color(theme::TEXT_SECONDARY)
                 .into(),
         ];
 
         let mut secondary: Vec<String> = Vec::new();
-        if let Some(ref assignee) = ticket.assigned_to {
-            secondary.push(format!("Assigned: {assignee}"));
-        }
         if !ticket.prerequisites.is_empty() {
             secondary.push(format!(
                 "Prerequisites: {}",
@@ -1565,7 +1543,7 @@ impl BoardState {
         } else {
             let second_row: Element<'_, BoardMessage> = text(secondary.join(" · "))
                 .size(12)
-                .color(theme::TEXT_MUTED)
+                .color(theme::TEXT_SECONDARY)
                 .into();
             column![first_row, second_row].spacing(2).into()
         };
@@ -1581,7 +1559,7 @@ impl BoardState {
                     button(
                         lucide::x::<iced::Theme, iced::Renderer>()
                             .size(16)
-                            .color(theme::TEXT_MUTED),
+                            .color(theme::TEXT_SECONDARY),
                     )
                     .style(theme::button_text)
                     .on_press(BoardMessage::CloseModal),
@@ -1591,7 +1569,7 @@ impl BoardState {
                 .style(theme::tooltip_style),
             ]
             .align_y(Alignment::Center),
-            text(&ticket.id).size(12).color(theme::TEXT_MUTED),
+            text(&ticket.id).size(12).color(theme::TEXT_SECONDARY),
             Space::new().height(6),
             row![
                 Self::priority_badge(ticket.priority, 12, [2, 8]),
@@ -1822,7 +1800,7 @@ impl BoardState {
                     Space::new().width(8),
                     text(theme::format_timestamp(&comment.created_at))
                         .size(10)
-                        .color(theme::TEXT_MUTED),
+                        .color(theme::TEXT_SECONDARY),
                 ]
                 .align_y(Alignment::Center),
             );

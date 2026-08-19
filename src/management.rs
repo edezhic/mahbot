@@ -1378,12 +1378,12 @@ async fn process_single_workspace(ws: Workspace) {
     .await;
 }
 
-/// Whether the LLM provider is configured for discovery: a non-empty provider
-/// key, or a custom provider endpoint (keyless local/self-hosted
-/// OpenAI-compatible servers). In-memory check only — no network or LLM call.
+/// Whether the LLM provider is configured: a non-empty provider key.
+/// In-memory check only — no network or LLM call. The runtime endpoint is
+/// hardcoded (mahbot-1813), so a keyless custom endpoint no longer counts
+/// as provider configured.
 fn provider_configured() -> bool {
     crate::config::CONFIG.provider_key().is_some()
-        || crate::config::CONFIG.provider_endpoint() != crate::config::DEFAULT_PROVIDER_ENDPOINT
 }
 
 /// Pickup step: claim a `Pending` workspace into its first discovery when the

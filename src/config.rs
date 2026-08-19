@@ -329,10 +329,13 @@ pub struct ConfigData {
 //
 // ══ Per-field accessor patterns ═════════════════════════════════════
 //
-// Each field is annotated with one of three patterns:
+// Each field is annotated with one of four patterns:
 //
 // * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
 // * `or(DEFAULT)` — returns `String`, falls back to the given default constant.
+// * `fixed(DEFAULT)` — returns `String`, ALWAYS the given constant (the
+//   persisted field value is not honored; used when a field stays in the
+//   schema for future use but only one value is currently supported).
 // * `list_or(fallback = <field>, default = <const>)` — returns `Vec<String>`,
 //   parses a newline-separated list, falls back to the named field then
 //   the default constant.
@@ -344,7 +347,7 @@ pub struct ConfigData {
 /// — all from a single annotated list of `Option<String>` field names.
 ///
 /// Each field is declared as `$field [$annotation]` where `$annotation` is one of
-/// `non_empty`, `or($default)`, or `list_or(fallback = $fallback, default = $default)`.
+/// `non_empty`, `or($default)`, `fixed($default)`, or `list_or(fallback = $fallback, default = $default)`.
 ///
 /// All generated items are guaranteed to stay synchronised because they expand
 /// from the same source.
@@ -465,6 +468,24 @@ macro_rules! string_config_fields {
         }
     };
 
+    // ── Accessor pattern: fixed(DEFAULT) ────────────────────────
+    //
+    // Returns String, ALWAYS the given constant — the persisted field
+    // value is not honored at runtime. Used when a config field stays in
+    // the schema (future use) but only one value is currently supported.
+    (@accessor $field:ident fixed($default:expr)) => {
+        #[doc = concat!(
+            "Returns the hardcoded `", stringify!($field),
+            "` value `", stringify!($default),
+            "` — any persisted value is not honored while only this ",
+            "value is supported."
+        )]
+        #[must_use]
+        pub fn $field(&self) -> String {
+            $default.to_string()
+        }
+    };
+
     // ── Accessor pattern: list_or(fallback = <field>, default = <const>) ──
     //
     // Returns Vec<String>. Tries parsing `$field` as a newline-separated list.
@@ -491,7 +512,7 @@ macro_rules! string_config_fields {
 
 string_config_fields! {
     provider_key [non_empty],
-    provider_endpoint [or(DEFAULT_PROVIDER_ENDPOINT)],
+    provider_endpoint [fixed(DEFAULT_PROVIDER_ENDPOINT)],
     media_transcription_model [or(DEFAULT_MEDIA_TRANSCRIPTION_MODEL)],
     media_transcription_provider [non_empty],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
@@ -1329,7 +1350,8 @@ mod tests {
     }
 
     /// Smoke test: macro-generated accessors roundtrip correctly for one
-    /// representative field of each pattern (`non_empty`, `or`, `list_or`).
+    /// representative field of each pattern (`non_empty`, `or`, `fixed`,
+    /// `list_or`).
     ///
     /// Structural sync (every field has a correctly-typed accessor) is guaranteed
     /// at compile time by the macro — this test only verifies runtime semantics.
@@ -1347,9 +1369,19 @@ mod tests {
         // ── or: falls back to default when unset ──
         reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
         assert_eq!(
+            reload.media_transcription_model(),
+            DEFAULT_MEDIA_TRANSCRIPTION_MODEL,
+            "unset media_transcription_model falls back to default"
+        );
+
+        // ── fixed: always returns the constant, ignoring persisted values ──
+        let mut fixed_cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(fixed_cfg.set_string_field("provider_endpoint", "https://custom.example/v1"));
+        reload.swap(fixed_cfg);
+        assert_eq!(
             reload.provider_endpoint(),
             DEFAULT_PROVIDER_ENDPOINT,
-            "unset provider_endpoint falls back to default"
+            "fixed field ignores a persisted custom value"
         );
 
         // ── non_empty: empty/whitespace → None ──

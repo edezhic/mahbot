@@ -184,12 +184,13 @@ static MEDIA_TRANSCRIBER: RwLock<Option<MediaTranscriber>> = RwLock::new(None);
 fn build_provider_and_transcriber(
     config: &crate::config::ConfigData,
 ) -> anyhow::Result<(Arc<dyn Provider>, Option<MediaTranscriber>)> {
-    let endpoint_str = resolve_or(
-        config.provider_endpoint.clone(),
-        crate::config::DEFAULT_PROVIDER_ENDPOINT,
-    );
-    let provider: Arc<dyn Provider> =
-        create_provider(config.provider_key.as_deref(), Some(endpoint_str.as_str()))?.into();
+    // Runtime endpoint is hardcoded: only the default endpoint is supported
+    // right now (any persisted custom value is not honored — mahbot-1813).
+    let provider: Arc<dyn Provider> = create_provider(
+        config.provider_key.as_deref(),
+        Some(crate::config::DEFAULT_PROVIDER_ENDPOINT),
+    )?
+    .into();
 
     // Construct the transcriber eagerly — purely synchronous CPU work with no
     // I/O, so there's no reason to wait until after the warmup HTTP call.
@@ -222,10 +223,9 @@ pub fn init_global() -> anyhow::Result<()> {
 
     // Background warmup (non-fatal). The provider is Arc-cloned so the task
     // outlives init_global; the endpoint string is captured for the log.
-    let endpoint_str = resolve_or(
-        config.provider_endpoint.clone(),
-        crate::config::DEFAULT_PROVIDER_ENDPOINT,
-    );
+    // The runtime endpoint is hardcoded (mahbot-1813) — only the default
+    // endpoint is supported right now.
+    let endpoint_str = crate::config::DEFAULT_PROVIDER_ENDPOINT;
     tokio::spawn(async move {
         if let Err(e) = provider.warmup().await {
             tracing::warn!(endpoint = %endpoint_str, "Provider warmup failed (non-fatal): {e}");
@@ -246,11 +246,12 @@ pub fn init_global() -> anyhow::Result<()> {
 pub(crate) async fn warmup_provider_from_config(
     config: &crate::config::ConfigData,
 ) -> anyhow::Result<()> {
-    let endpoint = config
-        .provider_endpoint
-        .as_deref()
-        .and_then(trimmed_or_none);
-    let provider = create_provider(config.provider_key.as_deref(), endpoint.as_deref())?;
+    // The runtime endpoint is hardcoded (mahbot-1813) — warm up against it,
+    // never against a persisted (no longer honored) custom value.
+    let provider = create_provider(
+        config.provider_key.as_deref(),
+        Some(crate::config::DEFAULT_PROVIDER_ENDPOINT),
+    )?;
     provider.warmup().await?;
     Ok(())
 }
@@ -411,12 +412,10 @@ fn create_transcriber(
 /// autosave ([`recreate_media_transcriber`]).
 #[must_use]
 fn build_media_transcriber(config: &crate::config::ConfigData) -> Option<MediaTranscriber> {
-    let endpoint_str = resolve_or(
-        config.provider_endpoint.clone(),
-        crate::config::DEFAULT_PROVIDER_ENDPOINT,
-    );
+    // The runtime endpoint is hardcoded (mahbot-1813) — only the default
+    // endpoint is supported right now.
     create_transcriber(
-        Some(&endpoint_str),
+        Some(crate::config::DEFAULT_PROVIDER_ENDPOINT),
         config.provider_key.as_deref(),
         Some(
             resolve_or(
