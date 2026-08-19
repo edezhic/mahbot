@@ -9,6 +9,11 @@
 //! Every entry carries its transition timestamp and origin (pipeline flow
 //! vs user action). On drain the Manager receives the full chronological
 //! sequence accumulated since the last drain — every hop, never coalesced.
+//! Consecutive transitions of the same ticket with the same origin are
+//! grouped into a single labeled block so a ticket bouncing through many
+//! phases reads as one block instead of repeated identical bullets; a new
+//! block starts whenever the (ticket, origin) pair changes (run-based in
+//! buffer order), so no hop, timestamp, or origin is lost or reordered.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
@@ -97,11 +102,17 @@ pub(crate) fn push(
 ///
 /// Panics if the buffer has not been initialized via [`init_global`].
 ///
-/// Format:
+/// Format: consecutive transitions of the same ticket with the same origin
+/// are grouped into one labeled block (a new block starts on any
+/// (ticket, origin) change); each hop keeps its full RFC 3339 UTC timestamp.
 /// ```text
-/// Ticket updates:
-/// • mahbot-1: in_development → in_diagnostics (pipeline flow, 2026-08-07T11:00:00+00:00)
-/// • mahbot-2: in_diagnostics → diagnostics_done (user action, 2026-08-07T11:05:00+00:00)
+/// <ticket-updates>
+/// • mahbot-1 (pipeline flow):
+///     in_development → in_diagnostics (2026-08-07T11:00:00+00:00)
+///     in_diagnostics → diagnostics_done (2026-08-07T11:05:00+00:00)
+/// • mahbot-2 (user action):
+///     analysis → planning (2026-08-07T11:10:00+00:00)
+/// </ticket-updates>
 /// ```
 #[must_use]
 pub(crate) fn drain(workspace_name: &str) -> String {
@@ -109,12 +120,18 @@ pub(crate) fn drain(workspace_name: &str) -> String {
     let Some(entries) = map.remove(workspace_name) else {
         return String::new();
     };
-    let mut out = String::from("<ticket-updates>");
-    for entry in entries {
+    let mut out = String::from("<ticket-updates>\n");
+    let mut current_block: Option<(&str, TransitionOrigin)> = None;
+    for entry in &entries {
+        let block_key = (entry.id.as_str(), entry.origin);
+        if current_block != Some(block_key) {
+            let _ = writeln!(out, "• {} ({}):", entry.id, entry.origin);
+            current_block = Some(block_key);
+        }
         let _ = writeln!(
             out,
-            "• {}: {} → {} ({}, {})",
-            entry.id, entry.source, entry.target, entry.origin, entry.at
+            "    {} → {} ({})",
+            entry.source, entry.target, entry.at
         );
     }
     let _ = writeln!(out, "</ticket-updates>");
@@ -143,6 +160,30 @@ mod tests {
         push(ws, id, source, target, TransitionOrigin::Pipeline);
     }
 
+    /// Push an entry with a deterministic timestamp (tests pin the exact
+    /// rendered format; [`push`] timestamps via [`crate::turso::now`]).
+    fn push_raw(
+        ws: &str,
+        id: &str,
+        source: TicketPhase,
+        target: TicketPhase,
+        origin: TransitionOrigin,
+        at: &str,
+    ) {
+        buffer()
+            .lock()
+            .unwrap_poison()
+            .entry(ws.to_string())
+            .or_default()
+            .push_back(Entry {
+                id: id.to_string(),
+                source,
+                target,
+                at: at.to_string(),
+                origin,
+            });
+    }
+
     #[test]
     fn push_and_drain_ordered() {
         let _guard = TEST_LOCK.lock().unwrap();
@@ -167,13 +208,167 @@ mod tests {
             TicketPhase::InDiagnostics,
         );
         let result = drain("ws-a");
-        assert!(result.contains("mahbot-1: backlog → analysis"));
-        assert!(result.contains("mahbot-2: analysis → planning"));
-        assert!(result.contains("mahbot-3: in_development → in_diagnostics"));
-        let pos1 = result.find("mahbot-1").unwrap();
-        let pos2 = result.find("mahbot-2").unwrap();
-        let pos3 = result.find("mahbot-3").unwrap();
+        // Envelope markup preserved.
+        assert!(result.starts_with("<ticket-updates>\n"));
+        assert!(result.ends_with("</ticket-updates>\n"));
+        // Each (id, origin) run gets a labeled header; hop lines keep the
+        // source → target arrow plus the full RFC 3339 timestamp.
+        assert!(result.contains("• mahbot-1 (pipeline flow):"));
+        assert!(result.contains("• mahbot-2 (user action):"));
+        assert!(result.contains("• mahbot-3 (pipeline flow):"));
+        assert!(result.contains("    backlog → analysis ("));
+        assert!(result.contains("    analysis → planning ("));
+        assert!(result.contains("    in_development → in_diagnostics ("));
+        let pos1 = result.find("• mahbot-1").unwrap();
+        let pos2 = result.find("• mahbot-2").unwrap();
+        let pos3 = result.find("• mahbot-3").unwrap();
         assert!(pos1 < pos2 && pos2 < pos3);
+    }
+
+    #[test]
+    fn single_origin_ticket_groups_all_hops_into_one_block() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        push_raw(
+            "ws-a",
+            "mahbot-1736",
+            TicketPhase::InDevelopment,
+            TicketPhase::InDiagnostics,
+            TransitionOrigin::Pipeline,
+            "2026-08-17T08:11:34.225709+00:00",
+        );
+        push_raw(
+            "ws-a",
+            "mahbot-1736",
+            TicketPhase::InDiagnostics,
+            TicketPhase::DiagnosticsDone,
+            TransitionOrigin::Pipeline,
+            "2026-08-17T08:21:19.225709+00:00",
+        );
+        push_raw(
+            "ws-a",
+            "mahbot-1736",
+            TicketPhase::DiagnosticsDone,
+            TicketPhase::InSanitation,
+            TransitionOrigin::Pipeline,
+            "2026-08-17T08:32:01.225709+00:00",
+        );
+        let result = drain("ws-a");
+        // One labeled header — the repeated-id noise is gone.
+        assert_eq!(result.matches("• mahbot-1736").count(), 1);
+        assert!(result.contains("• mahbot-1736 (pipeline flow):"));
+        // Every hop keeps its full RFC 3339 timestamp, in push order.
+        assert!(
+            result
+                .contains("    in_development → in_diagnostics (2026-08-17T08:11:34.225709+00:00)")
+        );
+        assert!(
+            result.contains(
+                "    in_diagnostics → diagnostics_done (2026-08-17T08:21:19.225709+00:00)"
+            )
+        );
+        assert!(
+            result.contains(
+                "    diagnostics_done → in_sanitation (2026-08-17T08:32:01.225709+00:00)"
+            )
+        );
+        let hop1 = result.find("    in_development").unwrap();
+        let hop2 = result
+            .find("    in_diagnostics → diagnostics_done")
+            .unwrap();
+        let hop3 = result.find("    diagnostics_done → in_sanitation").unwrap();
+        assert!(hop1 < hop2 && hop2 < hop3);
+    }
+
+    #[test]
+    fn origin_change_mid_run_starts_new_labeled_block() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        push_raw(
+            "ws-a",
+            "mahbot-1736",
+            TicketPhase::InDevelopment,
+            TicketPhase::InDiagnostics,
+            TransitionOrigin::Pipeline,
+            "2026-08-17T08:11:34.225709+00:00",
+        );
+        push_raw(
+            "ws-a",
+            "mahbot-1736",
+            TicketPhase::InDiagnostics,
+            TicketPhase::DiagnosticsDone,
+            TransitionOrigin::Pipeline,
+            "2026-08-17T08:21:19.225709+00:00",
+        );
+        push_raw(
+            "ws-a",
+            "mahbot-1736",
+            TicketPhase::InReview,
+            TicketPhase::ReadyForDevelopment,
+            TransitionOrigin::User,
+            "2026-08-17T09:02:11.225709+00:00",
+        );
+        let result = drain("ws-a");
+        // Two runs → two labeled headers for the same ticket.
+        assert_eq!(result.matches("• mahbot-1736").count(), 2);
+        assert!(result.contains("• mahbot-1736 (pipeline flow):"));
+        assert!(result.contains("• mahbot-1736 (user action):"));
+        // Pipeline hops sit under the pipeline header, the user hop under
+        // the user header; nothing is lost or reordered.
+        let pipeline_header = result.find("• mahbot-1736 (pipeline flow)").unwrap();
+        let user_header = result.find("• mahbot-1736 (user action)").unwrap();
+        let pipeline_hop = result.find("    in_development → in_diagnostics").unwrap();
+        let user_hop = result
+            .find("    in_review → ready_for_development")
+            .unwrap();
+        assert!(pipeline_header < pipeline_hop);
+        assert!(pipeline_hop < user_header);
+        assert!(user_header < user_hop);
+        // Full timestamps preserved for every hop.
+        assert!(result.contains("(2026-08-17T08:11:34.225709+00:00)"));
+        assert!(result.contains("(2026-08-17T08:21:19.225709+00:00)"));
+        assert!(result.contains("(2026-08-17T09:02:11.225709+00:00)"));
+    }
+
+    #[test]
+    fn interleaved_tickets_are_run_grouped_not_merged() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset();
+        // A-p, B-p, A-p: run-based grouping must produce three blocks, with
+        // A's second run under its own header — merging non-consecutive
+        // hops would reorder them across tickets.
+        push_raw(
+            "ws-a",
+            "mahbot-A",
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+            TransitionOrigin::Pipeline,
+            "2026-08-17T08:00:00+00:00",
+        );
+        push_raw(
+            "ws-a",
+            "mahbot-B",
+            TicketPhase::Analysis,
+            TicketPhase::Planning,
+            TransitionOrigin::Pipeline,
+            "2026-08-17T08:01:00+00:00",
+        );
+        push_raw(
+            "ws-a",
+            "mahbot-A",
+            TicketPhase::Planning,
+            TicketPhase::ReadyForDevelopment,
+            TransitionOrigin::Pipeline,
+            "2026-08-17T08:02:00+00:00",
+        );
+        let result = drain("ws-a");
+        assert_eq!(result.matches("• mahbot-A").count(), 2);
+        assert_eq!(result.matches("• mahbot-B").count(), 1);
+        // Chronological hop order preserved across tickets.
+        let hop_a1 = result.find("    backlog → analysis").unwrap();
+        let hop_b = result.find("    analysis → planning").unwrap();
+        let hop_a2 = result.find("    planning → ready_for_development").unwrap();
+        assert!(hop_a1 < hop_b && hop_b < hop_a2);
     }
 
     #[test]
