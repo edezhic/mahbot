@@ -2276,12 +2276,13 @@ impl BoardStore {
         ticket.done_at.as_deref().unwrap_or(&ticket.created_at)
     }
 
-    // ── Archived ticket search methods ────────────────────────────────────
+    // ── Ticket FTS/embedding search methods ───────────────────────────────
     //
-    // These BoardStore methods contain the FTS and embedding SQL used by
-    // [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets).
-    // The board owns the schema (`ngram` tokenizer, FTS index name, blob format)
-    // and the tool layer owns the hybrid RRF merge logic.
+    // The archived-search methods contain the FTS and embedding SQL used by
+    // [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets);
+    // [`search_by_fts`] backs the GUI sidebar search. The board owns the
+    // schema (`ngram` tokenizer, FTS index name, blob format) and the tool
+    // layer owns the hybrid RRF merge logic.
 
     /// Search archived tickets by FTS keyword match, scoped to a workspace.
     ///
@@ -2303,7 +2304,7 @@ impl BoardStore {
             return Ok(Vec::new());
         }
 
-        // Param order mirrors search_active_by_fts: ?1 = workspace, ?2 = query.
+        // Param order mirrors search_by_fts: ?1 = workspace, ?2 = query.
         let sql = format!(
             "SELECT t.id, fts_score(t.title, ?2) AS score \
              FROM tickets t \
@@ -2339,8 +2340,8 @@ impl BoardStore {
         }
     }
 
-    /// Search active (non-archived) tickets by FTS keyword match, scoped to an
-    /// optional workspace.
+    /// Search tickets (both active and archived) by FTS keyword match, scoped
+    /// to an optional workspace.
     ///
     /// Sanitizes the input query (strips non-alphanumeric characters) before
     /// matching against the `ngram`-tokenized FTS index on `title`.
@@ -2348,7 +2349,7 @@ impl BoardStore {
     /// Returns full [`Ticket`] objects (without comments) ordered by FTS
     /// relevance (`fts_score DESC`), up to `limit` results.
     /// On SQL error, logs a warning and returns an empty vec.
-    pub async fn search_active_by_fts(
+    pub async fn search_by_fts(
         &self,
         query: &str,
         limit: usize,
@@ -2365,8 +2366,7 @@ impl BoardStore {
         let sql = format!(
             "SELECT {TICKET_COLUMNS} \
              FROM tickets t \
-             WHERE t.is_archived = 0 \
-               AND (?1 IS NULL OR t.workspace_name = ?1) \
+             WHERE (?1 IS NULL OR t.workspace_name = ?1) \
                AND t.title MATCH ?2 \
              ORDER BY fts_score(t.title, ?2) DESC \
              LIMIT {limit}"
@@ -2395,7 +2395,7 @@ impl BoardStore {
                 tracing::warn!(
                     query = %sanitized,
                     error = %e,
-                    "FTS search for active tickets failed"
+                    "FTS search failed"
                 );
                 Ok(Vec::new())
             }

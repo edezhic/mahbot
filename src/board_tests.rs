@@ -2442,30 +2442,36 @@ async fn test_search_by_fts_finds_matching_title() {
     );
 
     let active_results = store
-        .search_active_by_fts("network timeout", 10, Some("ws_active"))
+        .search_by_fts("network timeout", 10, Some("ws_active"))
         .await
-        .expect("active FTS search");
+        .expect("FTS search");
     assert!(
         active_results.iter().any(|t| t.id == active),
-        "active search should find the active ticket"
+        "search should find the active ticket"
     );
 }
 
 #[tokio::test]
-async fn test_search_by_fts_excludes_opposite_archive_state() {
+async fn test_search_by_fts_includes_both_archive_states() {
     let (store, _tmp) = open_test_store().await;
-    create_archived_ticket(&store, "Still searching", "ws2").await;
+    let archived = create_archived_ticket(&store, "still searching", "ws2").await;
+    let active = create_active_ticket(&store, "still active", "ws2").await;
 
-    let active_results = store
-        .search_active_by_fts("searching", 10, Some("ws2"))
+    // General search must find tickets in either archive state.
+    let results = store
+        .search_by_fts("still", 10, Some("ws2"))
         .await
-        .expect("active FTS search");
+        .expect("general FTS search");
     assert!(
-        active_results.is_empty(),
-        "archived ticket must not appear in active search"
+        results.iter().any(|t| t.id == archived),
+        "archived ticket must appear in general search results"
+    );
+    assert!(
+        results.iter().any(|t| t.id == active),
+        "active ticket must appear in general search results"
     );
 
-    create_active_ticket(&store, "Still active", "ws2").await;
+    // Archived-only search keeps its is_archived = 1 filter.
     let archived_results = store
         .search_archived_by_fts("active", 10, "ws2")
         .await
@@ -2488,25 +2494,25 @@ async fn test_search_by_fts_sanitize_short_circuit() {
             archived.is_empty(),
             "query {query:?} yields no archived results"
         );
-        let active = store
-            .search_active_by_fts(query, 10, Some("ws"))
+        let results = store
+            .search_by_fts(query, 10, Some("ws"))
             .await
-            .expect("active FTS search");
+            .expect("FTS search");
         assert!(
-            active.is_empty(),
-            "query {query:?} yields no active results"
+            results.is_empty(),
+            "query {query:?} yields no search results"
         );
     }
 }
 
 #[tokio::test]
-async fn test_search_active_by_fts_scoped_to_workspace() {
+async fn test_search_by_fts_scoped_to_workspace() {
     let (store, _tmp) = open_test_store().await;
     create_active_ticket(&store, "Fix network timeout bug", "ws_scope_a").await;
     create_active_ticket(&store, "Database connection pool error", "ws_scope_b").await;
 
     let results = store
-        .search_active_by_fts("network timeout", 10, Some("ws_scope_a"))
+        .search_by_fts("network timeout", 10, Some("ws_scope_a"))
         .await
         .expect("FTS search scoped to ws_scope_a");
     assert_eq!(results.len(), 1, "should find only ws_scope_a ticket");

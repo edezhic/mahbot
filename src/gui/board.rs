@@ -1078,7 +1078,7 @@ impl BoardState {
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         let board = crate::board::store();
                         board
-                            .search_active_by_fts(&query, 20, ws.as_deref())
+                            .search_by_fts(&query, 20, ws.as_deref())
                             .await
                             .map_err(|e| e.to_string())
                     },
