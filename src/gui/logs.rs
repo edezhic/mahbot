@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use iced_fonts::lucide;
 
+use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets;
 
@@ -85,6 +86,11 @@ pub enum LogMessage {
 
     /// Cmd+F keyboard shortcut — highlight the search input.
     FocusSearch,
+
+    /// Copy a log entry's full formatted content to the clipboard (right-click
+    /// context-menu action). Carries the entry so the formatting happens in
+    /// `update()`, not in the per-frame `view()`.
+    CopyEntry(LogEntry),
 
     /// Bridged Tool Failures sub-messages.
     ToolFailures(super::tool_failures::ToolFailuresMessage),
@@ -422,6 +428,11 @@ impl LogsState {
                 self.focus_search = true;
                 Task::none()
             }
+            LogMessage::CopyEntry(entry) => {
+                // Silent copy — no toast, matching the app's clipboard
+                // convention for context-menu actions (Home bubbles, editor).
+                iced::clipboard::write(format_log_entry(&entry))
+            }
             LogMessage::TabSelected(tab) => {
                 self.active_tab = tab;
                 self.refresh_active_tab(log_store)
@@ -694,12 +705,29 @@ impl LogsState {
                             .iter()
                             .map(|entry| {
                                 let is_newest = newest_ts.as_deref() == Some(&entry.timestamp);
-                                if is_newest && fade_progress < 1.0 {
+                                let rendered = if is_newest && fade_progress < 1.0 {
                                     // Fade-in: render with animated background opacity
                                     LogsState::render_log_entry(entry, fade_progress)
                                 } else {
                                     LogsState::render_log_entry(entry, 1.0)
-                                }
+                                };
+                                // Per-row context menu: right-click copies the
+                                // full entry in formatted form. Wrapping only
+                                // the row — not the column — keeps the
+                                // inter-row spacing a fall-through (same
+                                // convention as the per-bubble menus on the
+                                // Home page). Left-click drag selection on the
+                                // row is unaffected: ContextMenu forwards all
+                                // non-right-click events to the underlay.
+                                let row: Element<'_, LogMessage> = ContextMenu::new(
+                                    rendered,
+                                    vec![MenuItem::new(
+                                        "Copy".into(),
+                                        LogMessage::CopyEntry(entry.clone()),
+                                    )],
+                                )
+                                .into();
+                                row
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -787,14 +815,11 @@ impl LogsState {
                 if key == "message" {
                     continue;
                 }
-                let val_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
                 // Cap the tag text so long fields (e.g. error_chain) render
                 // as readable tags instead of overflowing the row; the full
-                // value stays queryable in the log store.
-                let val_str = crate::util::truncate(&val_str, 200);
+                // value stays queryable in the log store and is copied in
+                // full via the row's "Copy" context menu.
+                let val_str = crate::util::truncate(&field_value_str(value), 200);
                 spans.push(Span::new("\n").size(10));
                 spans.push(
                     Span::new(format!("{key}: {val_str}"))
@@ -842,5 +867,156 @@ impl LogsState {
                 .style(theme::surface_card_style)
                 .into()
         }
+    }
+}
+
+/// Render a stored log-field value as text: strings verbatim, everything else
+/// via serde_json's Display (numbers/bools as literals, nested JSON compact).
+/// Shared by the row renderer (which then truncates) and the clipboard format
+/// (which must stay untruncated).
+#[must_use]
+fn field_value_str(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Format a [`LogEntry`] for clipboard copy ("Copy" context-menu action): the
+/// full raw RFC 3339 timestamp and level on the first line, a header line with
+/// the available role/agent/target/workspace parts, then the complete
+/// untruncated message, then each remaining field as a `key: value` line.
+///
+/// Concrete layout (only the parts present in the entry are emitted; the
+/// header line is omitted entirely when no role/agent/target/workspace part
+/// exists):
+///
+/// ```text
+/// 2026-08-17T20:15:44.581360Z  ERROR
+/// role: engineer  agent: ticket_42_engineer  target: run_agent  workspace: mahbot
+///
+/// The full untruncated message, possibly spanning multiple lines.
+/// error_chain: crate::foo at src/foo.rs:42
+/// attempt: 3
+/// ```
+///
+/// Field lines iterate the stored fields JSON in **sorted key order** (the
+/// format function sorts explicitly, so the output is deterministic regardless
+/// of serde_json's `preserve_order` feature state) and skip only the `message`
+/// key, mirroring the row renderer. Keys that duplicate header parts (e.g.
+/// `agent_id`/`role` inside fields) are kept: the fields section is a faithful
+/// dump of the stored JSON, exactly as the row displays them. Non-string
+/// values render via [`field_value_str`] — numbers/bools as literals, nested
+/// JSON compact.
+#[must_use]
+fn format_log_entry(entry: &LogEntry) -> String {
+    let mut out = String::new();
+    out.push_str(&entry.timestamp);
+    out.push_str("  ");
+    out.push_str(&entry.level);
+
+    // Header: only the parts that are present, fixed order, two-space gaps.
+    let mut header: Vec<String> = Vec::new();
+    if !entry.agent_role.is_empty() {
+        header.push(format!("role: {}", entry.agent_role));
+    }
+    if !entry.agent_id.is_empty() {
+        header.push(format!("agent: {}", entry.agent_id));
+    }
+    if !entry.target.is_empty() {
+        header.push(format!("target: {}", entry.target));
+    }
+    if !entry.workspace.is_empty() {
+        header.push(format!("workspace: {}", entry.workspace));
+    }
+    if !header.is_empty() {
+        out.push('\n');
+        out.push_str(&header.join("  "));
+    }
+
+    out.push_str("\n\n");
+    out.push_str(&entry.message);
+
+    if let Some(obj) = entry.fields.as_object() {
+        // Sort explicitly: serde_json's Map is a BTreeMap in this build
+        // (sorted), but `preserve_order` could be enabled by feature
+        // unification elsewhere in the graph — the sort keeps the copy format
+        // deterministic either way.
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        for key in keys {
+            if key == "message" {
+                continue;
+            }
+            out.push('\n');
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&field_value_str(&obj[key]));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn entry() -> LogEntry {
+        LogEntry {
+            timestamp: "2026-08-17T20:15:44.581360Z".to_string(),
+            level: "ERROR".to_string(),
+            target: "run_agent".to_string(),
+            message: "Agent failed".to_string(),
+            // Written out of order on purpose: fields are emitted in sorted
+            // key order, so the fixture order must not leak into the output.
+            fields: json!({
+                "error_chain": "crate::foo at src/foo.rs:42",
+                "message": "not copied",
+                "attempt": 3,
+                "agent_id": "ticket_42_engineer",
+                "role": "engineer",
+            }),
+            agent_id: "ticket_42_engineer".to_string(),
+            agent_role: "engineer".to_string(),
+            workspace: "mahbot".to_string(),
+        }
+    }
+
+    #[test]
+    fn format_log_entry_full_layout() {
+        let out = format_log_entry(&entry());
+        assert_eq!(
+            out,
+            "2026-08-17T20:15:44.581360Z  ERROR\n\
+             role: engineer  agent: ticket_42_engineer  target: run_agent  workspace: mahbot\n\
+             \n\
+             Agent failed\n\
+             agent_id: ticket_42_engineer\n\
+             attempt: 3\n\
+             error_chain: crate::foo at src/foo.rs:42\n\
+             role: engineer"
+        );
+    }
+
+    #[test]
+    fn format_log_entry_minimal_omits_header_and_empty_fields() {
+        let entry = LogEntry {
+            timestamp: "2026-08-17T20:15:44.581360Z".to_string(),
+            level: "INFO".to_string(),
+            target: String::new(),
+            message: "plain message".to_string(),
+            fields: serde_json::Value::Null,
+            agent_id: String::new(),
+            agent_role: String::new(),
+            workspace: String::new(),
+        };
+        let out = format_log_entry(&entry);
+        assert_eq!(
+            out,
+            "2026-08-17T20:15:44.581360Z  INFO\n\
+             \n\
+             plain message"
+        );
     }
 }
