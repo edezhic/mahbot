@@ -35,6 +35,7 @@ use serde_json::json;
 
 mod classify;
 mod discovery;
+pub(crate) mod run;
 mod select;
 
 use crate::bench_openrouter::discovery::{
@@ -556,10 +557,11 @@ pub(crate) struct PlanData<'a> {
 }
 
 /// Rounds per provider: 2 warmup rounds (no gap) + one ladder round per
-/// ladder entry.
+/// ladder entry plus one — the ladder is a list of inactivity GAPS between
+/// ladder rounds, so a 7-entry ladder yields 2 + 8 = 10 requests per provider.
 #[must_use]
 pub(crate) fn rounds_per_provider(ladder_secs: &[u64]) -> usize {
-    WARMUP_ROUNDS + ladder_secs.len()
+    WARMUP_ROUNDS + ladder_secs.len() + 1
 }
 
 /// Total tokens per provider for the cost estimate: the prefix-size estimate
@@ -771,8 +773,9 @@ mod tests {
             model: "acme/model-1".to_string(),
             api_key: Some("sk-or-secret-key".to_string()),
             cap_usd: 2.0,
-            // 8 ladder entries → rounds = 2 + 8 = 10 (the spec's nominal shape).
-            ladder_secs: vec![0, 5, 30, 120, 300, 600, 1800, 3600],
+            // Default 7-entry ladder (7 gaps between 8 ladder rounds) →
+            // rounds = 2 warmup + 8 = 10 requests per provider.
+            ladder_secs: vec![0, 5, 30, 120, 300, 600, 1800],
             providers: None,
             prefix_chars: 64_000,
             output_dir: PathBuf::from("/tmp/benchmarks"),
@@ -863,7 +866,8 @@ mod tests {
             assert!(object.contains_key(k), "missing top-level key {k}");
         }
 
-        // request_count == selected × rounds (2 warmup + 8 ladder = 10 here).
+        // request_count == selected × rounds (2 warmup + 8 ladder rounds for
+        // the default 7-gap ladder = 10 requests per provider here).
         let selected_count = decisions.iter().filter(|d| d.selected).count();
         assert_eq!(plan["request_count"], (selected_count * rounds) as u64);
         assert_eq!(plan["request_count"], (selected_count * 10) as u64);
@@ -905,10 +909,12 @@ mod tests {
 
     #[test]
     fn ladder_rounds_derivation() {
-        assert_eq!(rounds_per_provider(&[0, 5, 30, 120, 300, 600, 1800]), 9);
+        // 7 gaps between 8 ladder rounds → 2 warmup + 8 = 10.
+        assert_eq!(rounds_per_provider(&[0, 5, 30, 120, 300, 600, 1800]), 10);
+        // 8 gaps → 2 warmup + 9 = 11.
         assert_eq!(
             rounds_per_provider(&[0, 5, 30, 120, 300, 600, 1800, 3600]),
-            10
+            11
         );
     }
 
