@@ -42,11 +42,9 @@
 //!   exercising the model — such a round is re-sent once after a short delay
 //!   and marked Invalid (`"response_cache"`) if it persists.
 //!
-//! Phase 2a ships the executor ahead of the Phase 3 orchestration wiring;
-//! `#![allow(dead_code)]` covers the gap until `run_provider` is driven by
-//! the full-run scheduler and the report writers consume [`ProviderRun`].
-
-#![allow(dead_code)]
+//! Phase 2a shipped the executor ahead of the Phase 2b orchestration wiring;
+//! `run_provider` is driven by the full-run scheduler in [`crate::bench_openrouter`]
+//! and the report writers consume [`ProviderRun`] / [`RoundRecord`].
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -106,6 +104,7 @@ const FILLER_WORDS: &[&str] = &[
 /// The base prompt for one provider run: the harness system prompt plus the
 /// user message. Byte-identical across all of the run's rounds so the prompt
 /// prefix is cacheable.
+#[derive(Clone)]
 pub(crate) struct BasePrompt {
     pub system: String,
     pub user: String,
@@ -301,8 +300,6 @@ pub(crate) struct RawUsage {
     pub prompt_cache_miss_tokens: Option<u64>,
     #[serde(default)]
     pub cost: Option<f64>,
-    #[serde(default)]
-    pub cost_details: Option<serde_json::Value>,
 }
 
 /// Raw chat-completions response envelope. Every field is optional / defaulted
@@ -312,21 +309,7 @@ pub(crate) struct RawEnvelope {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
-    pub created: Option<i64>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
     pub provider: Option<String>,
-    #[serde(default)]
-    pub system_fingerprint: Option<String>,
-    #[serde(default)]
-    pub service_tier: Option<String>,
-    #[serde(default)]
-    pub is_byok: Option<bool>,
-    #[serde(default)]
-    pub cache_discount: Option<f64>,
-    #[serde(default)]
-    pub openrouter_metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub usage: Option<RawUsage>,
     #[serde(default)]
@@ -345,8 +328,6 @@ pub(crate) struct RawChoice {
 /// The assistant message of a choice.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RawMessage {
-    #[serde(default)]
-    pub content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<RawToolCall>>,
     #[serde(default)]
@@ -375,10 +356,9 @@ pub(crate) struct RawToolCallFunction {
     pub arguments: Option<String>,
 }
 
-/// Response headers captured for cache-status + metadata inspection.
+/// Response headers captured for cache-status inspection.
 pub(crate) struct RawHeaders {
     pub cache_status: Option<String>,
-    pub openrouter_metadata: Option<String>,
 }
 
 /// Result of one HTTP round (one [`send_round`] call, including its internal
@@ -494,7 +474,6 @@ pub(crate) async fn send_round(
             };
             let raw_headers = RawHeaders {
                 cache_status: read_header("x-openrouter-cache-status"),
-                openrouter_metadata: read_header("x-openrouter-metadata"),
             };
             cache_status_header = raw_headers.cache_status.clone();
             response_cache_hit = raw_headers
@@ -893,7 +872,7 @@ pub(crate) async fn run_provider(
     let t_send = now_ms();
     let outcome_w1 = dispatch_round(client, key, &w_body).await;
     let t_headers = outcome_w1.t_headers.clone();
-    let t_body = now_ms();
+    let t_body = outcome_w1.t_body.clone().unwrap_or_else(now_ms);
 
     if let Some(class) = outcome_w1.error_class.as_deref()
         && (class == "auth" || class == "quota")
@@ -957,7 +936,7 @@ pub(crate) async fn run_provider(
     let t_send = now_ms();
     let outcome_w2 = dispatch_round(client, key, &w_body).await;
     let t_headers = outcome_w2.t_headers.clone();
-    let t_body = now_ms();
+    let t_body = outcome_w2.t_body.clone().unwrap_or_else(now_ms);
     let w2_cached = cached_tokens_of(outcome_w2.envelope.as_ref());
     let cache_supported = w2_cached > 0;
     let base_cached = w2_cached;
@@ -1039,7 +1018,7 @@ pub(crate) async fn run_provider(
 
         let mut outcome = dispatch_round(client, key, &body).await;
         let mut t_headers = outcome.t_headers.clone();
-        let mut t_body = now_ms();
+        let mut t_body = outcome.t_body.clone().unwrap_or_else(now_ms);
         let mut extra_retries = 0u32;
         let mut pin_verified = false;
         let mut invalid_reason: Option<String> = None;
@@ -1061,7 +1040,7 @@ pub(crate) async fn run_provider(
             outcome = dispatch_round(client, key, &body).await;
             extra_retries += 1;
             t_headers = outcome.t_headers.clone();
-            t_body = now_ms();
+            t_body = outcome.t_body.clone().unwrap_or_else(now_ms);
             if outcome.response_cache_hit {
                 invalid_reason = Some("response_cache".to_string());
             } else if outcome.envelope.is_none() {
@@ -1086,7 +1065,7 @@ pub(crate) async fn run_provider(
                 outcome = dispatch_round(client, key, &body).await;
                 extra_retries += 1;
                 t_headers = outcome.t_headers.clone();
-                t_body = now_ms();
+                t_body = outcome.t_body.clone().unwrap_or_else(now_ms);
                 if outcome.envelope.is_none() {
                     invalid_reason = Some(
                         outcome
@@ -1134,7 +1113,7 @@ pub(crate) async fn run_provider(
                         outcome = dispatch_round(client, key, &retry_body).await;
                         extra_retries += 1;
                         t_headers = outcome.t_headers.clone();
-                        t_body = now_ms();
+                        t_body = outcome.t_body.clone().unwrap_or_else(now_ms);
                         if outcome.envelope.is_none() {
                             invalid_reason = Some(
                                 outcome

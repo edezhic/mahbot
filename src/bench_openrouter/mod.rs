@@ -6,19 +6,24 @@
 //! touch is a read-only (ReadOnly|NoLock) `config.db` lookup for the worker
 //! model / provider key fallback, identical in spirit to `mahbot debug`.
 //!
-//! # Phase 1 (this module)
+//! # Modes
 //!
-//! Discovery → selection → dry-run plan. `--dry-run` performs the full
-//! discovery (models catalog, requested-model endpoints, key envelope) and
-//! cost-based provider selection, then emits the canonical plan JSON to
-//! stdout with ZERO chat-completions calls. The full-run executor and report
-//! writers are Phase 2 — the data model (snapshot, selection, plan) is shaped
-//! so they slot in without restructuring.
+//! `--dry-run` performs the full discovery (models catalog, requested-model
+//! endpoints, key envelope) and cost-based provider selection, then emits the
+//! canonical plan JSON to stdout with ZERO chat-completions calls.
+//!
+//! The default (full-run) mode adds the TTL-ladder executor: one tokio task
+//! per selected provider runs the warmup + ladder rounds against the pinned
+//! endpoint, and the run writes report.json / summary.md / providers.json /
+//! manifest.json under `<output-dir>/bench-openrouter/<run-ts>/` plus a
+//! `latest/` mirror ([`crate::bench_openrouter::report`]).
 //!
 //! # Exit codes
 //!
-//! `0` dry-run success; `1` hard error (bad key, unaffordable estimate,
-//! discovery failure); `2` usage error (unknown flag / bad value).
+//! `0` dry-run success, or a full run whose artifacts were written; `1` hard
+//! error (bad key, unaffordable estimate, discovery failure, lock held, write
+//! failure) — a full-run hard abort still writes the partial report first;
+//! `2` usage error (unknown flag / bad value).
 //!
 //! # Prompt
 //!
@@ -33,8 +38,11 @@ use std::path::{Path, PathBuf};
 use anyhow::bail;
 use serde_json::json;
 
+use crate::util::UnwrapPoison;
+
 mod classify;
 mod discovery;
+pub(crate) mod report;
 pub(crate) mod run;
 mod select;
 
@@ -390,39 +398,162 @@ pub async fn run_cli() -> i32 {
     if opts.dry_run {
         dry_run(&opts).await
     } else {
-        run_full(&opts)
+        full_run(&opts).await
     }
-}
-
-/// The full-run executor — Phase 2. For now it reports "not yet implemented".
-fn run_full(_opts: &BenchOptions) -> i32 {
-    eprintln!("Error: bench-openrouter full run is not yet implemented (Phase 2)");
-    1
 }
 
 /// Usage text shared by `--help` (stdout) and usage errors (stderr).
 fn usage() -> &'static str {
     "\
-mahbot bench-openrouter — OpenRouter provider benchmark (Phase 1: dry-run)
+mahbot bench-openrouter — OpenRouter provider benchmark
 
 Usage:
   mahbot bench-openrouter [flags]
+
+Two modes:
+  --dry-run   Discovery + selection + plan JSON to stdout. ZERO chat calls.
+  (default)   Full run: TTL ladder over the selected providers, then writes
+              report.json / summary.md / providers.json / manifest.json to
+              <output-dir>/bench-openrouter/<run-ts>/ with a latest/ mirror.
 
 Flags:
   --model <slug>         Model id to benchmark. Resolution: --model, env
                          MAHBOT_BENCH_MODEL, config.db worker_model, default.
   --api-key <key>        OpenRouter API key. Resolution: --api-key, env
                          MAHBOT_BENCH_API_KEY, env OPENROUTER_API_KEY,
-                         config.db provider_key.
-  --cap-usd <f64>        Total cost cap in USD (default: 2.00).
+                         config.db provider_key. Never printed; the manifest
+                         stores only '***' for its value.
+  --cap-usd <f64>        Total cost cap in USD (default: 2.00). Also sets the
+                         per-provider guard (cap x2 / selected count).
   --ladder <csv>         Inactivity-gap ladder in seconds (default:
                          0,5,30,120,300,600,1800).
   --providers <csv>      Provider tag allowlist (e.g. streamlake/fp8,deepseek/auto).
   --prefix-chars <usize> Estimated prompt prefix size in characters (default: 64000).
   --output-dir <dir>     Report output directory (default: ~/.mahbot/benchmarks).
-  --dry-run              Discovery + selection + plan only; ZERO chat calls.
   -h, --help             Print this help and exit.
+
+Exit codes:
+  0  Success. In a full run, partial per-round failures are documented in the
+     report (rounds_failed / error classes); the artifacts are complete.
+  1  Hard failure (bad key, unaffordable estimate, discovery failure, lock
+     held, artifact write failure). A full-run abort (spend cap / deadline /
+     auth / quota) still writes the partial report before exiting 1.
+  2  Usage error (unknown flag / bad value).
+
+Redaction: the API key is never printed. --api-key / env values are recorded
+as '***' in manifest.json; providers.json marks the key payload redacted.
+
+Not implemented (design-only): --from-plan, --max-gap-min, --all-endpoints,
+the streaming probe, and the /generation audit.
 "
+}
+
+// ── Shared helpers (dry-run + full-run) ────────────────────────────
+
+/// Model-level capabilities resolved from the discovery catalog: the reasoning
+/// effort the run will request and which request parameters the model
+/// advertises support for.
+pub(crate) struct ModelConfig {
+    reasoning_effort_used: Option<String>,
+    supports_tools: bool,
+    supports_tool_choice: bool,
+    supports_reasoning_effort: bool,
+}
+
+/// Resolve the reasoning config + supported parameters from the catalog entry
+/// for `model`. The reasoning effort picks the LAST (lowest) supported effort;
+/// a model that advertises reasoning without a supported-efforts list falls
+/// back to `"low"`.
+fn resolve_model_config(snapshot: &DiscoverySnapshot, model: &str) -> ModelConfig {
+    let catalog_entry = snapshot.catalog.iter().find(|e| e.id == model);
+    let reasoning_effort_used = catalog_entry
+        .as_ref()
+        .and_then(|e| e.reasoning.as_ref())
+        .map(|r| {
+            r.supported_efforts
+                .as_ref()
+                .and_then(|efforts| efforts.last().cloned())
+                .unwrap_or_else(|| "low".to_string())
+        });
+    let supported_parameters = catalog_entry
+        .as_ref()
+        .and_then(|e| e.supported_parameters.as_ref())
+        .map_or::<&[String], _>(&[], Vec::as_slice);
+    ModelConfig {
+        reasoning_effort_used,
+        supports_tools: supported_parameters.iter().any(|p| p == "tools"),
+        supports_tool_choice: supported_parameters.iter().any(|p| p == "tool_choice"),
+        supports_reasoning_effort: supported_parameters.iter().any(|p| p == "reasoning_effort"),
+    }
+}
+
+/// Selection pipeline outputs for one snapshot: per-endpoint cost estimate +
+/// health classification, the estimate flags, the selection decisions, and the
+/// plan cost (total estimate + per-provider spend guard).
+pub(crate) struct SelectionBundle {
+    inputs: Vec<SelectionInput>,
+    flags: Vec<Vec<String>>,
+    decisions: Vec<SelectionDecision>,
+    total_est: f64,
+    per_provider_guard: f64,
+}
+
+/// Build the selection bundle: per-endpoint cost estimate + health
+/// classification → selection decisions → plan cost.
+fn build_selection(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> SelectionBundle {
+    let rounds = rounds_per_provider(&opts.ladder_secs);
+    let total_tokens = total_tokens_estimate(opts.prefix_chars, rounds);
+    let mut inputs = Vec::with_capacity(snapshot.endpoints.data.endpoints.len());
+    let mut flags = Vec::with_capacity(snapshot.endpoints.data.endpoints.len());
+    let default_price = Pricing::default();
+    for ep in &snapshot.endpoints.data.endpoints {
+        let mut f = Vec::new();
+        let price = if let Some(p) = &ep.pricing {
+            p
+        } else {
+            f.push("no pricing advertised; estimate assumes zero cost".to_string());
+            &default_price
+        };
+        let est_cost = estimate_cost(price, total_tokens, rounds, &mut f);
+        let (healthy, reason) = classify_endpoint(ep, MIN_CONTEXT, opts.providers.as_deref());
+        inputs.push(SelectionInput {
+            endpoint: ep.clone(),
+            est_cost,
+            healthy,
+            excluded_reason: reason.map(|r| r.to_string()),
+        });
+        flags.push(f);
+    }
+    let decisions = select_providers(&inputs, MIN_CONTEXT, opts.providers.as_deref());
+    let (total_est, per_provider_guard) = plan_cost(&decisions, &inputs, opts.cap_usd);
+    SelectionBundle {
+        inputs,
+        flags,
+        decisions,
+        total_est,
+        per_provider_guard,
+    }
+}
+
+/// The affordability preflight shared by both modes: hard-fail when the
+/// estimate exceeds the remaining key limit, warn above 25% of it. Returns
+/// `true` when the run must stop (fatal).
+fn affordability_preflight(snapshot: &DiscoverySnapshot, total_est: f64) -> bool {
+    let Some(remaining) = snapshot.key.limit_remaining else {
+        return false;
+    };
+    if total_est > remaining {
+        eprintln!(
+            "Error: estimated cost ${total_est:.4} exceeds the remaining key limit ${remaining:.4}"
+        );
+        return true;
+    }
+    if total_est > 0.25 * remaining {
+        eprintln!(
+            "Warning: estimated cost ${total_est:.4} is more than 25% of the remaining key limit ${remaining:.4}"
+        );
+    }
+    false
 }
 
 // ── Dry-run orchestration ──────────────────────────────────────────
@@ -453,88 +584,354 @@ async fn dry_run(opts: &BenchOptions) -> i32 {
         }
     };
 
-    // 3. Resolve the reasoning config + supported parameters from the catalog.
-    let catalog_entry = snapshot.catalog.iter().find(|e| e.id == opts.model);
-    let reasoning_effort_used = catalog_entry
-        .as_ref()
-        .and_then(|e| e.reasoning.as_ref())
-        .map(|r| {
-            // Pick the LAST (lowest) supported effort; if the model advertises
-            // reasoning without a supported-efforts list, fall back to "low".
-            r.supported_efforts
-                .as_ref()
-                .and_then(|efforts| efforts.last().cloned())
-                .unwrap_or_else(|| "low".to_string())
-        });
-    let supported_parameters = catalog_entry
-        .as_ref()
-        .and_then(|e| e.supported_parameters.as_ref())
-        .map_or::<&[String], _>(&[], Vec::as_slice);
-    let supports_tools = supported_parameters.iter().any(|p| p == "tools");
-    let supports_tool_choice = supported_parameters.iter().any(|p| p == "tool_choice");
-    let supports_reasoning_effort = supported_parameters.iter().any(|p| p == "reasoning_effort");
+    // 3. Model config + selection (shared with the full run).
+    let model_config = resolve_model_config(&snapshot, &opts.model);
+    let bundle = build_selection(opts, &snapshot);
 
-    // 4. Selection: per-endpoint cost estimate + health classification.
-    let rounds = rounds_per_provider(&opts.ladder_secs);
-    let total_tokens = total_tokens_estimate(opts.prefix_chars, rounds);
-    let mut inputs = Vec::with_capacity(snapshot.endpoints.data.endpoints.len());
-    let mut flags = Vec::with_capacity(snapshot.endpoints.data.endpoints.len());
-    let default_price = Pricing::default();
-    for ep in &snapshot.endpoints.data.endpoints {
-        let mut f = Vec::new();
-        let price = if let Some(p) = &ep.pricing {
-            p
-        } else {
-            f.push("no pricing advertised; estimate assumes zero cost".to_string());
-            &default_price
-        };
-        let est_cost = estimate_cost(price, total_tokens, rounds, &mut f);
-        let (healthy, reason) = classify_endpoint(ep, MIN_CONTEXT, opts.providers.as_deref());
-        inputs.push(SelectionInput {
-            endpoint: ep.clone(),
-            est_cost,
-            healthy,
-            excluded_reason: reason.map(|r| r.to_string()),
-        });
-        flags.push(f);
-    }
-    let decisions = select_providers(&inputs, MIN_CONTEXT, opts.providers.as_deref());
-    let (total_est, per_provider_guard) = plan_cost(&decisions, &inputs, opts.cap_usd);
-
-    // 5. Affordability preflight against the key envelope.
-    if let Some(remaining) = snapshot.key.limit_remaining {
-        if total_est > remaining {
-            eprintln!(
-                "Error: estimated cost ${total_est:.4} exceeds the remaining key limit ${remaining:.4}"
-            );
-            return 1;
-        }
-        if total_est > 0.25 * remaining {
-            eprintln!(
-                "Warning: estimated cost ${total_est:.4} is more than 25% of the remaining key limit ${remaining:.4}"
-            );
-        }
+    // 4. Affordability preflight against the key envelope.
+    if affordability_preflight(&snapshot, bundle.total_est) {
+        return 1;
     }
 
-    // 6. Plan JSON → stdout (EPIPE-tolerant).
+    // 5. Plan JSON → stdout (EPIPE-tolerant).
     let plan = build_plan(&PlanData {
         opts,
         snapshot: &snapshot,
         key_source,
-        reasoning_effort_used,
-        supports_tools,
-        supports_tool_choice,
-        supports_reasoning_effort,
-        inputs: &inputs,
-        flags: &flags,
-        decisions: &decisions,
-        total_est,
-        per_provider_guard,
+        reasoning_effort_used: model_config.reasoning_effort_used,
+        supports_tools: model_config.supports_tools,
+        supports_tool_choice: model_config.supports_tool_choice,
+        supports_reasoning_effort: model_config.supports_reasoning_effort,
+        inputs: &bundle.inputs,
+        flags: &bundle.flags,
+        decisions: &bundle.decisions,
+        total_est: bundle.total_est,
+        per_provider_guard: bundle.per_provider_guard,
     });
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let _ = writeln!(out, "{plan}");
     0
+}
+
+// ── Full-run orchestration ─────────────────────────────────────────
+
+/// The selection JSON recorded in the report: the aggregate counts plus one
+/// entry per endpoint with its selection decision and a human reason (the same
+/// rendering the dry-run plan uses).
+fn build_selection_json(opts: &BenchOptions, bundle: &SelectionBundle) -> serde_json::Value {
+    let healthy_count = bundle.inputs.iter().filter(|i| i.healthy).count();
+    let selected_count = bundle.decisions.iter().filter(|d| d.selected).count();
+    let padding_count = bundle
+        .decisions
+        .iter()
+        .filter(|d| matches!(d.reason, Some(ExclusionReason::Padding)))
+        .count();
+    let allowlist_matches = opts.providers.as_ref().map(|wl| {
+        wl.iter()
+            .filter(|t| bundle.inputs.iter().any(|i| i.endpoint.tag == **t))
+            .count()
+    });
+    let target_count = match (healthy_count, allowlist_matches) {
+        (0, _) => 0,
+        (_, Some(m)) if m > 0 && m <= 2 => m,
+        _ => selection_target(healthy_count),
+    };
+    let providers: Vec<serde_json::Value> = bundle
+        .inputs
+        .iter()
+        .zip(&bundle.decisions)
+        .map(|(input, d)| {
+            let reason = match (&d.reason, d.selected) {
+                (Some(r), _) => r.to_string(),
+                (None, true) => "selected".to_string(),
+                (None, false) => "not selected".to_string(),
+            };
+            json!({"tag": input.endpoint.tag, "selected": d.selected, "reason": reason})
+        })
+        .collect();
+    json!({
+        "healthy_count": healthy_count,
+        "selected_count": selected_count,
+        "padding_count": padding_count,
+        "target_count": target_count,
+        "min_context": MIN_CONTEXT,
+        "allowlist": opts.providers.clone().unwrap_or_default(),
+        "providers": providers,
+    })
+}
+
+/// The full-run executor: discovery + selection → one task per selected
+/// provider (staggered) → TTL-ladder rounds → report artifacts.
+///
+/// Exit codes: `0` when the artifacts were written and the run was not aborted
+/// at run level; `1` on a hard failure (bad key, unaffordable estimate,
+/// discovery failure, lock held, write failure) or a run-level abort (spend
+/// cap / outer deadline / auth / quota) — the partial report is still written
+/// before returning 1; `2` is not used here (parse errors exit before this
+/// point).
+// One long sequential orchestration (the ticket's steps 1-15); splitting it
+// would obscure the step ordering.
+#[allow(clippy::too_many_lines)]
+async fn full_run(opts: &BenchOptions) -> i32 {
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    // 1. Resolve the API key.
+    let (key, key_source) = match resolve_key(opts) {
+        Ok(k) => k,
+        Err(CliError::Hard(msg)) => {
+            eprintln!("Error: {msg}");
+            return 1;
+        }
+        Err(CliError::Usage(msg)) => {
+            eprintln!("Error: {msg}");
+            return 2;
+        }
+    };
+
+    // 2. Discovery (models catalog, endpoints, key envelope).
+    let discovery_client = DiscoveryClient::new(key.clone());
+    let snapshot = match discover(&discovery_client, &opts.model).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            return 1;
+        }
+    };
+
+    // 3. Model config + selection.
+    let model_config = resolve_model_config(&snapshot, &opts.model);
+    let bundle = build_selection(opts, &snapshot);
+
+    // 4. Affordability preflight (same as dry-run).
+    if affordability_preflight(&snapshot, bundle.total_est) {
+        return 1;
+    }
+
+    // 5. The bench's own run lock (never the daemon's mahbot.lock).
+    let _run_lock = match report::acquire_run_lock(&opts.output_dir) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            return 1;
+        }
+    };
+
+    // 6. Run start + base prompt (per-run nonce, deterministic filler).
+    let run_started = std::time::Instant::now();
+    let run_ts = chrono::Utc::now();
+    let started_at = run_ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let nonce = format!("{:016x}", rand::random::<u64>());
+    let filler = run::generate_filler(opts.prefix_chars);
+    let base = run::build_base_prompt(&bench_system_prompt(), &nonce, &filler);
+
+    // 7. Bench reqwest client (run.rs's send_round applies the 120s request
+    //    timeout itself).
+    crate::util::http::install_ring_provider();
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to build the benchmark HTTP client: {e}");
+            return 1;
+        }
+    };
+
+    // 8. Run context: budget + abort token + abort reason + deadline. Shared
+    //    with the spawned tasks via Arc (JoinSet tasks are 'static).
+    let ctx = std::sync::Arc::new(run::RunContext {
+        budget: run::RunBudget::new(opts.cap_usd, bundle.per_provider_guard),
+        abort: CancellationToken::new(),
+        abort_reason: Mutex::new(None),
+        deadline: run_started + Duration::from_secs(run::RUN_DEADLINE_MINS * 60),
+    });
+
+    // 9. One task per SELECTED provider (index = position among selected),
+    //    staggered deterministically. The tasks share ctx immutably — the
+    //    abort token and budget are internally synchronized.
+    let selected: Vec<usize> = bundle
+        .decisions
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.selected)
+        .map(|(i, _)| i)
+        .collect();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (idx, &endpoint_idx) in selected.iter().enumerate() {
+        let endpoint = snapshot.endpoints.data.endpoints[endpoint_idx].clone();
+        let client = client.clone();
+        let key = key.clone();
+        let model = opts.model.clone();
+        let base = base.clone();
+        let reasoning_effort = model_config.reasoning_effort_used.clone();
+        let ladder = opts.ladder_secs.clone();
+        let ctx = std::sync::Arc::clone(&ctx);
+        tasks.spawn(async move {
+            let stagger =
+                Duration::from_millis(u64::try_from(200 * idx).unwrap_or(u64::MAX).min(1000));
+            tokio::time::sleep(stagger).await;
+            run::run_provider(
+                &client,
+                &key,
+                &endpoint,
+                &model,
+                &base,
+                reasoning_effort.as_deref(),
+                &ladder,
+                &ctx,
+                run_started,
+            )
+            .await
+        });
+    }
+
+    // 10. Join with an outer 60-minute guard (the per-provider deadline inside
+    //     run_provider is 55 min; the outer guard catches anything stuck).
+    let mut provider_runs: Vec<run::ProviderRun> = Vec::new();
+    let join = tokio::time::timeout(Duration::from_hours(1), async {
+        while let Some(res) = tasks.join_next().await {
+            match res {
+                Ok(run) => provider_runs.push(run),
+                Err(e) => {
+                    // A panicked task is exceptional: log and continue — the
+                    // report covers the providers that finished.
+                    eprintln!("Warning: a provider task panicked: {e}");
+                }
+            }
+        }
+    })
+    .await;
+    if join.is_err() {
+        ctx.abort.cancel();
+        *ctx.abort_reason.lock().unwrap_poison() = Some("outer 60-minute deadline".to_string());
+        while let Some(res) = tasks.join_next().await {
+            match res {
+                Ok(run) => provider_runs.push(run),
+                Err(e) => eprintln!("Warning: a provider task panicked: {e}"),
+            }
+        }
+    }
+
+    // 11. Run-level abort state + total billed. Per-provider estimated costs
+    //     and selection reasons come from the selection bundle (find by tag);
+    //     `ProviderRun.selection_reason` is populated here and read back for
+    //     the report's parallel reasons array.
+    let abort_reason = ctx.abort_reason.lock().unwrap_poison().clone();
+    let aborted = abort_reason.is_some();
+    let total_billed: f64 = provider_runs.iter().map(|r| r.billed_usd).sum();
+    let mut selection_reasons: Vec<(bool, Option<String>)> =
+        Vec::with_capacity(provider_runs.len());
+    for run in &mut provider_runs {
+        let decision = bundle
+            .decisions
+            .iter()
+            .zip(&bundle.inputs)
+            .find(|(_, input)| input.endpoint.tag == run.tag);
+        if let Some((_, input)) = decision {
+            run.estimated_usd = input.est_cost;
+        }
+        let (selected, reason) = decision.map_or((false, "not selected".to_string()), |(d, _)| {
+            let reason = match (&d.reason, d.selected) {
+                (Some(r), _) => r.to_string(),
+                (None, true) => "selected".to_string(),
+                (None, false) => "not selected".to_string(),
+            };
+            (d.selected, reason)
+        });
+        run.selection_reason = Some(reason.clone());
+        selection_reasons.push((selected, Some(reason)));
+    }
+
+    // 12. Selection JSON for the report (mirrors the dry-run plan rendering).
+    let selection_json = build_selection_json(opts, &bundle);
+
+    // 13. Artifacts: meta → report/summary/providers/manifest → write.
+    let finished_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let duration_secs = run_started.elapsed().as_secs_f64();
+    let exit_code = i32::from(aborted);
+    let run_dir = opts
+        .output_dir
+        .join("bench-openrouter")
+        .join(report::run_dir_name(&run_ts));
+
+    let meta = report::RunMeta {
+        started_at,
+        finished_at,
+        duration_secs,
+        model: opts.model.clone(),
+        key_source: key_source.to_string(),
+        cap_usd: opts.cap_usd,
+        ladder_secs: opts.ladder_secs.clone(),
+        prefix_chars: opts.prefix_chars,
+        aborted,
+        abort_reason,
+        exit_code,
+        output_dir: opts.output_dir.clone(),
+    };
+    let report_json = report::build_report(
+        &meta,
+        &selection_json,
+        &provider_runs,
+        &selection_reasons,
+        &run_dir,
+    );
+    let summary_md = report::build_summary_md(&meta, &report_json, &provider_runs);
+    let providers_json = report::providers_snapshot_json(&snapshot);
+    let manifest = report::build_manifest(
+        &std::env::args().collect::<Vec<_>>(),
+        opts,
+        &meta.key_source,
+        &meta.started_at,
+        &meta.finished_at,
+        meta.duration_secs,
+        meta.exit_code,
+        meta.aborted,
+        meta.abort_reason.as_deref(),
+    );
+    let paths = report::ArtifactPaths {
+        run_dir: run_dir.clone(),
+        report: run_dir.join("report.json"),
+        summary: run_dir.join("summary.md"),
+        providers: run_dir.join("providers.json"),
+        manifest: run_dir.join("manifest.json"),
+        latest_dir: opts.output_dir.join("bench-openrouter").join("latest"),
+    };
+    if let Err(e) = report::write_artifacts(
+        &paths,
+        &report_json,
+        &summary_md,
+        &providers_json,
+        &manifest,
+    ) {
+        eprintln!("Error: failed to write benchmark artifacts: {e:#}");
+        return 1;
+    }
+
+    // 14. Stdout (EPIPE-tolerant).
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let _ = writeln!(
+        out,
+        "bench-openrouter: report written to {}",
+        run_dir.display()
+    );
+
+    // 15. 0 when the artifacts were written; 1 when the run aborted at run
+    //     level (the partial report above is already written).
+    if meta.aborted {
+        eprintln!(
+            "Error: benchmark run aborted: {}",
+            meta.abort_reason.as_deref().unwrap_or("unknown reason")
+        );
+    }
+    if total_billed > 0.0 {
+        eprintln!("bench-openrouter: total billed ${total_billed:.4}");
+    }
+    exit_code
 }
 
 // ── Plan building ──────────────────────────────────────────────────
@@ -719,8 +1116,7 @@ fn provider_entries(
 
 /// The benchmark harness system prompt (loaded from the embedded asset so the
 /// "all LLM-sent prompts live under src/prompt/" rule holds by construction).
-/// Phase 2's executor sends it; unused until then.
-#[allow(dead_code)]
+/// Sent by the full-run executor; the dry run never sends it.
 #[must_use]
 pub(crate) fn bench_system_prompt() -> String {
     crate::prompt::load_prompt("bench_openrouter.md")
@@ -784,7 +1180,8 @@ mod tests {
     }
 
     /// Build the selection pipeline outputs (owned) from a snapshot, so the
-    /// test can hold references for the [`PlanData`] lifetime.
+    /// test can hold references for the [`PlanData`] lifetime. Uses the real
+    /// shared [`build_selection`] so the test exercises the production path.
     fn selection_outputs(
         opts: &BenchOptions,
         snapshot: &DiscoverySnapshot,
@@ -795,27 +1192,14 @@ mod tests {
         f64,
         f64,
     ) {
-        let rounds = rounds_per_provider(&opts.ladder_secs);
-        let total_tokens = total_tokens_estimate(opts.prefix_chars, rounds);
-        let mut inputs = Vec::new();
-        let mut flags = Vec::new();
-        let default_price = Pricing::default();
-        for ep in &snapshot.endpoints.data.endpoints {
-            let mut f = Vec::new();
-            let price = ep.pricing.as_ref().unwrap_or(&default_price);
-            let est_cost = estimate_cost(price, total_tokens, rounds, &mut f);
-            let (healthy, reason) = classify_endpoint(ep, MIN_CONTEXT, None);
-            inputs.push(SelectionInput {
-                endpoint: ep.clone(),
-                est_cost,
-                healthy,
-                excluded_reason: reason.map(|r| r.to_string()),
-            });
-            flags.push(f);
-        }
-        let decisions = select_providers(&inputs, MIN_CONTEXT, None);
-        let (total_est, per_provider_guard) = plan_cost(&decisions, &inputs, opts.cap_usd);
-        (inputs, flags, decisions, total_est, per_provider_guard)
+        let bundle = build_selection(opts, snapshot);
+        (
+            bundle.inputs,
+            bundle.flags,
+            bundle.decisions,
+            bundle.total_est,
+            bundle.per_provider_guard,
+        )
     }
 
     #[test]

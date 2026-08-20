@@ -9,12 +9,6 @@
 //! Pure math — no I/O. Unit tests cover the threshold boundaries, bucket
 //! derivation (including warmup handling), formatting, saturation, and the
 //! tag→name pin verification.
-//!
-//! Phase 1 ships the full classifier (tested) ahead of the ladder executor;
-//! `#![allow(dead_code)]` covers the gap until Phase 2 runs rounds and the
-//! report consumes the buckets.
-
-#![allow(dead_code)]
 
 use super::discovery::EndpointInfo;
 
