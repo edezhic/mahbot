@@ -122,6 +122,18 @@ pub(crate) const DEFAULT_MULTIMODAL_MODEL: &str = "qwen/qwen3.7-flash";
 
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
 const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
+
+/// Fresh-install seeded image-generation model list (newline-separated, in
+/// picker order; the first entry is the active model). Mirrors the curated
+/// set the live install ships (mahbot-1834).
+const FRESH_INSTALL_IMAGE_GEN_MODELS: &str =
+    "google/gemini-3.1-flash-image\nmicrosoft/mai-image-2.5\nqwen/qwen-image-3-pro";
+
+/// Fresh-install seeded video-generation model list (newline-separated, in
+/// picker order; the second entry is the active model). Mirrors the curated
+/// set the live install ships (mahbot-1834).
+const FRESH_INSTALL_VIDEO_MODELS: &str = "bytedance/seedance-2.0-mini\nminimax/hailuo-3";
+
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
 /// Default adaptive k multiplier for wake word detection.
@@ -626,7 +638,7 @@ fn persist_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// Fresh-install discriminator (mahbot-1825): set during [`load_or_init`] to
 /// whether `config.db` did not exist on disk before the config store was
-/// opened this boot. [`reload_from_db`] seeds the fresh-install audio defaults
+/// opened this boot. [`reload_from_db`] seeds the fresh-install defaults
 /// into brand-new config databases only — existing databases receive zero
 /// writes (hard constraint).
 static CONFIG_DB_FRESH_AT_BOOT: AtomicBool = AtomicBool::new(false);
@@ -859,13 +871,18 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
     !crate::turso::store_db_path(mahbot_dir, "config").exists()
 }
 
-/// Seed the fresh-install audio defaults into a brand-new config database
-/// (mahbot-1825).
+/// Seed the fresh-install defaults into a brand-new config database
+/// (mahbot-1825, mahbot-1834).
 ///
 /// A fresh install must not load or download any audio model until the user
 /// enables a feature, so `audio_transcription_use_local` is seeded to
 /// `"false"` (the existing reading semantics are unchanged: absence of the
-/// row = enabled, `"false"` = disabled). `fresh` is the pre-open
+/// row = enabled, `"false"` = disabled). It must also show populated model
+/// pickers: the Settings GUI reads the raw snapshot fields
+/// (`config.image_gen_models` / `config.image_gen_model`,
+/// `config.video_models` / `config.video_model`), not the default-resolving
+/// `list_or`/`or` accessors, so the image/video generation model lists and
+/// their active selections are seeded too. `fresh` is the pre-open
 /// file-existence discriminator captured in [`load_or_init`] — existing
 /// databases receive zero writes.
 async fn seed_fresh_install_defaults(
@@ -878,14 +895,24 @@ async fn seed_fresh_install_defaults(
     store
         .set_kv("audio_transcription_use_local", "false")
         .await?;
+    store
+        .set_kv("image_gen_model", DEFAULT_IMAGE_GEN_MODEL)
+        .await?;
+    store
+        .set_kv("image_gen_models", FRESH_INSTALL_IMAGE_GEN_MODELS)
+        .await?;
+    store.set_kv("video_model", DEFAULT_VIDEO_MODEL).await?;
+    store
+        .set_kv("video_models", FRESH_INSTALL_VIDEO_MODELS)
+        .await?;
     tracing::info!(
-        "Fresh config database: seeded audio_transcription_use_local=false (no audio models at boot)"
+        "Fresh config database: seeded fresh-install defaults (audio transcription off; image/video generation model sets)"
     );
     Ok(())
 }
 
 /// Consume the boot fresh-install discriminator and seed the fresh-install
-/// audio defaults when it fired.
+/// defaults when it fired.
 ///
 /// Mirrors the `load_or_init` → `reload_from_db` handoff exactly: the flag is
 /// set from [`config_db_is_fresh`] during boot and consumed (reset) here, so
@@ -905,10 +932,12 @@ pub async fn reload_from_db() -> Result<()> {
     let store = crate::config_db::store();
     let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
 
-    // Fresh-install seed (mahbot-1825): a brand-new config database gets the
-    // transcription-off default so no audio model is downloaded or loaded at
-    // boot. Existing installs are never written (the flag is only set when
-    // config.db did not exist before the store open).
+    // Fresh-install seed (mahbot-1825, mahbot-1834): a brand-new config
+    // database gets the transcription-off default (so no audio model is
+    // downloaded or loaded at boot) plus the image/video generation model
+    // lists and active selections (so the Settings GUI pickers are populated).
+    // Existing installs are never written (the flag is only set when config.db
+    // did not exist before the store open).
     seed_fresh_install_defaults_from_flag(store).await?;
 
     let kvs = store.get_all_kv().await?;
@@ -1519,9 +1548,14 @@ mod tests {
         CONFIG.swap(original);
     }
 
-    /// Fresh-install seed (mahbot-1825): the transcription-off default lands in
-    /// brand-new config databases only — existing databases receive zero
-    /// writes.
+    /// Fresh-install seed (mahbot-1825, mahbot-1834): the fresh-install
+    /// defaults land in brand-new config databases only — existing databases
+    /// receive zero writes.
+    ///
+    /// The seeded set is the transcription-off default (so no audio model is
+    /// downloaded or loaded at boot) plus the image/video generation model
+    /// lists and active selections (so the Settings GUI model pickers, which
+    /// read the raw snapshot fields, are populated on fresh installs).
     ///
     /// This test drives the real boot chain end-to-end instead of hand-picking
     /// `fresh` values: the discriminator probe (`config_db_is_fresh` — the
@@ -1534,7 +1568,7 @@ mod tests {
     /// location (e.g. a top-level `<root>/config.db`) would still report
     /// "fresh" here and re-seed every existing install on every boot.
     #[tokio::test]
-    async fn fresh_config_db_seeds_transcription_off_only_when_new() {
+    async fn fresh_config_db_seeds_defaults_only_when_new() {
         // ── Fresh install: the store file does not exist yet ──
         let fresh_root = tempfile::TempDir::new().unwrap();
         let fresh = config_db_is_fresh(fresh_root.path());
@@ -1566,11 +1600,27 @@ mod tests {
         );
         assert_eq!(
             fresh_store.get_all_kv().await.unwrap(),
-            vec![(
-                "audio_transcription_use_local".to_string(),
-                "false".to_string()
-            )],
-            "a fresh config database must be seeded with transcription off"
+            vec![
+                (
+                    "audio_transcription_use_local".to_string(),
+                    "false".to_string()
+                ),
+                (
+                    "image_gen_model".to_string(),
+                    "google/gemini-3.1-flash-image".to_string()
+                ),
+                (
+                    "image_gen_models".to_string(),
+                    "google/gemini-3.1-flash-image\nmicrosoft/mai-image-2.5\nqwen/qwen-image-3-pro"
+                        .to_string()
+                ),
+                ("video_model".to_string(), "minimax/hailuo-3".to_string()),
+                (
+                    "video_models".to_string(),
+                    "bytedance/seedance-2.0-mini\nminimax/hailuo-3".to_string()
+                ),
+            ],
+            "a fresh config database must be seeded with the fresh-install defaults"
         );
 
         // ── Existing install: the store file already exists ──
