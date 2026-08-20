@@ -1522,13 +1522,11 @@ mod tests {
 
         // A roster row (non-NULL job_id) for the SAME agent_id must coexist
         // under the composite PK (job row first — FK constraint).
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-             VALUES ('j1', 'ticket_stage', 'launched', '', 'ws', 'engineer', ?1, ?1)",
-            params![turso::now()],
-        )
-        .await
-        .expect("insert job for roster row");
+        crate::util::test::JobRowBuilder::new(conn, "j1", "ticket_stage", "engineer", "ws")
+            .timestamps(turso::now())
+            .insert()
+            .await
+            .expect("insert job for roster row");
         conn.execute(
             "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
              VALUES ('j1', ?1, 'engineer', NULL, 'launched', 'roster-task')",
@@ -1929,13 +1927,11 @@ mod tests {
             .unwrap();
         // Job-tracked: an agents row references the session.
         let conn = &store.conn;
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-             VALUES ('jttl', 'ticket_stage', 'launched', '', 'ws', 'engineer', ?1, ?1)",
-            params![stale.clone()],
-        )
-        .await
-        .unwrap();
+        crate::util::test::JobRowBuilder::new(conn, "jttl", "ticket_stage", "engineer", "ws")
+            .timestamps(stale.clone())
+            .insert()
+            .await
+            .unwrap();
         conn.execute(
             "INSERT INTO agents (job_id, agent_id, kind, status, task) \
              VALUES ('jttl', 'ticket_t1_0_suf_engineer', 'engineer', 'launched', '')",
@@ -1995,11 +1991,15 @@ mod tests {
         .await;
         // Stale job (updated_at long ago) with a stale session.
         let stale = (chrono::Utc::now() - chrono::Duration::hours(20)).to_rfc3339();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-             VALUES ('jstale', 'ticket_stage', 'launched', '', 'purge_ws', 'engineer', ?1, ?1)",
-            params![stale.clone()],
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            "jstale",
+            "ticket_stage",
+            "engineer",
+            "purge_ws",
         )
+        .timestamps(stale.clone())
+        .insert()
         .await
         .unwrap();
         conn.execute(
@@ -2094,11 +2094,15 @@ mod tests {
             } else {
                 turso::now()
             };
-            conn.execute(
-                "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-                 VALUES (?1, 'ticket_stage', 'launched', '', 'purge_ws2', 'reviewer', ?2, ?2)",
-                params![id, ts.clone()],
+            crate::util::test::JobRowBuilder::new(
+                conn,
+                id,
+                "ticket_stage",
+                "reviewer",
+                "purge_ws2",
             )
+            .timestamps(ts.clone())
+            .insert()
             .await
             .unwrap();
             conn.execute(
@@ -2154,13 +2158,11 @@ mod tests {
             ("jsa2", "analysis", "analysis", "analyst", 2i64),
             ("jsr1", "review", "in_review", "reviewer", 1i64),
         ] {
-            conn.execute(
-                "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-                 VALUES (?1, 'ticket_stage', 'launched', '', 'purge_ws4', ?2, ?3, ?3)",
-                params![id, role, stale.clone()],
-            )
-            .await
-            .unwrap();
+            crate::util::test::JobRowBuilder::new(conn, id, "ticket_stage", role, "purge_ws4")
+                .timestamps(stale.clone())
+                .insert()
+                .await
+                .unwrap();
             conn.execute(
                 "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -2207,11 +2209,15 @@ mod tests {
         let conn = &crate::session::store().conn;
         let stale = (chrono::Utc::now() - chrono::Duration::hours(20)).to_rfc3339();
         // Stale ticket_stage job (must be retained) + stale analyze job (purged).
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-             VALUES ('jfail_ts', 'ticket_stage', 'launched', '', 'purge_ws3', 'engineer', ?1, ?1)",
-            params![stale.clone()],
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            "jfail_ts",
+            "ticket_stage",
+            "engineer",
+            "purge_ws3",
         )
+        .timestamps(stale.clone())
+        .insert()
         .await
         .unwrap();
         conn.execute(
@@ -2221,11 +2227,15 @@ mod tests {
         )
         .await
         .unwrap();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, created_at, updated_at) \
-             VALUES ('jfail_analyze', 'analyze', 'launched', '', 'purge_ws3', 'assistant', ?1, ?1)",
-            params![stale.clone()],
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            "jfail_analyze",
+            "analyze",
+            "assistant",
+            "purge_ws3",
         )
+        .timestamps(stale.clone())
+        .insert()
         .await
         .unwrap();
         // Raw BEGIN on the board connection (bypasses the wrapper's tx
@@ -2333,14 +2343,11 @@ mod tests {
         )
         .await;
         let now = crate::turso::now();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-             created_at, updated_at) \
-             VALUES ('jscan', 'ticket_stage', 'launched', '', 'ws_scan', 'engineer', 0, ?1, ?1)",
-            params![now.clone()],
-        )
-        .await
-        .unwrap();
+        crate::util::test::JobRowBuilder::new(conn, "jscan", "ticket_stage", "engineer", "ws_scan")
+            .timestamps(now.clone())
+            .insert()
+            .await
+            .unwrap();
         conn.execute(
             "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
              VALUES ('jscan', ?1, 'engineer', 'in_development', 1)",
@@ -2408,12 +2415,16 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-             created_at, updated_at) \
-             VALUES ('jclean', 'research_cleanup', 'launched', '', 'ws_scan', 'sanitation', ?1, ?2, ?2)",
-            params![MAX_BOOT_REDISPATCH, now.clone()],
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            "jclean",
+            "research_cleanup",
+            "sanitation",
+            "ws_scan",
         )
+        .retry_count(MAX_BOOT_REDISPATCH)
+        .timestamps(now.clone())
+        .insert()
         .await
         .unwrap();
         // Run-folder fixture: what a crash-left cleanup run leaves behind.
@@ -2454,12 +2465,15 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-             created_at, updated_at) \
-             VALUES ('jtmpclean', 'temp_cleanup', 'launched', '', 'tmp', 'sanitation', 0, ?1, ?1)",
-            params![now.clone()],
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            "jtmpclean",
+            "temp_cleanup",
+            "sanitation",
+            "tmp",
         )
+        .timestamps(now.clone())
+        .insert()
         .await
         .unwrap();
         let resumable = recover_from_restart().await.unwrap();
@@ -2498,12 +2512,15 @@ mod tests {
         let conn = &crate::session::store().conn;
         crate::util::test::create_test_workspace("/tmp/test_ws_replay_cleanup", "ws_replay").await;
         let now = crate::turso::now();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-             created_at, updated_at) \
-             VALUES ('rcln', 'research_cleanup', 'launched', '', 'ws_replay', 'sanitation', 0, ?1, ?1)",
-            params![now.clone()],
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            "rcln",
+            "research_cleanup",
+            "sanitation",
+            "ws_replay",
         )
+        .timestamps(now.clone())
+        .insert()
         .await
         .unwrap();
         conn.execute(
@@ -2744,14 +2761,11 @@ mod tests {
         )
         .await;
         for (id, round) in [("jdup1", 1i64), ("jdup2", 2i64)] {
-            conn.execute(
-                "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-                 created_at, updated_at) \
-                 VALUES (?1, 'ticket_stage', 'launched', '', 'ws_cls', 'engineer', 0, ?2, ?2)",
-                params![id, now.clone()],
-            )
-            .await
-            .unwrap();
+            crate::util::test::JobRowBuilder::new(conn, id, "ticket_stage", "engineer", "ws_cls")
+                .timestamps(now.clone())
+                .insert()
+                .await
+                .unwrap();
             conn.execute(
                 "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
                  VALUES (?1, ?2, 'engineer', 'in_development', ?3)",
@@ -2770,14 +2784,11 @@ mod tests {
             crate::board::TicketPhase::InQa,
         )
         .await;
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-             created_at, updated_at) \
-             VALUES ('jcls2', 'ticket_stage', 'launched', '', 'ws_cls', 'reviewer', 0, ?1, ?1)",
-            params![now.clone()],
-        )
-        .await
-        .unwrap();
+        crate::util::test::JobRowBuilder::new(conn, "jcls2", "ticket_stage", "reviewer", "ws_cls")
+            .timestamps(now.clone())
+            .insert()
+            .await
+            .unwrap();
         conn.execute(
             "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
              VALUES ('jcls2', ?1, 'review', 'in_review', 1)",
@@ -2794,14 +2805,12 @@ mod tests {
             crate::board::TicketPhase::InDevelopment,
         )
         .await;
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-             created_at, updated_at) \
-             VALUES ('jcls3', 'ticket_stage', 'done', '', 'ws_cls', 'engineer', 0, ?1, ?1)",
-            params![now.clone()],
-        )
-        .await
-        .unwrap();
+        crate::util::test::JobRowBuilder::new(conn, "jcls3", "ticket_stage", "engineer", "ws_cls")
+            .status("done")
+            .timestamps(now.clone())
+            .insert()
+            .await
+            .unwrap();
         conn.execute(
             "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
              VALUES ('jcls3', ?1, 'engineer', 'in_development', 1)",

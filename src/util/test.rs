@@ -15,6 +15,10 @@
 //! historically defined in the `board` module and imported from there by sibling
 //! modules. Moved here so all test infrastructure lives in one place.
 //!
+//! Also provides [`JobRowBuilder`], a builder for inserting test `jobs` rows
+//! (the sessions.db durability/resume substrate) that mirrors the production
+//! INSERT in [`crate::jobs::spawn_job`].
+//!
 //! Also provides [`create_test_workspace`] (inserting a workspace into the test DB)
 //! and [`init_management_test_stores`] (initializing all stores plus the manager
 //! queue), relocated from `management.rs` tests so they are discoverable alongside
@@ -774,6 +778,153 @@ impl<'a> TicketBuilder<'a> {
                 priority: self.priority,
             },
         )
+    }
+}
+
+/// Builder for inserting a test `jobs` row (sessions.db durability substrate).
+///
+/// Mirrors the production INSERT in [`crate::jobs::spawn_job`] — when the
+/// `jobs` schema changes, update both this builder and the production insert.
+///
+/// Required schema columns live in the constructor (`id`, `kind`, `role`,
+/// `workspace_name`); the columns the historical fixtures varied between
+/// (user identity, channel, retry count) are opt-in setters, and `status` /
+/// `task` default to the schema defaults (`'launched'` / `''`). Timestamps
+/// are required via [`Self::timestamps`] and transcribed verbatim — the
+/// helper never generates timestamps internally (tests assert exact
+/// equality on them).
+///
+/// # Panics
+///
+/// [`Self::insert`] panics if [`Self::timestamps`] was not called.
+pub(crate) struct JobRowBuilder<'a> {
+    conn: &'a crate::turso::Connection,
+    id: String,
+    kind: String,
+    role: String,
+    workspace_name: String,
+    status: String,
+    task: String,
+    user_name: Option<String>,
+    channel: Option<String>,
+    retry_count: Option<i64>,
+    timestamps: Option<String>,
+}
+
+impl<'a> JobRowBuilder<'a> {
+    /// Start a builder for a `jobs` row with the schema-required columns.
+    pub(crate) fn new(
+        conn: &'a crate::turso::Connection,
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        role: impl Into<String>,
+        workspace_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            conn,
+            id: id.into(),
+            kind: kind.into(),
+            role: role.into(),
+            workspace_name: workspace_name.into(),
+            status: "launched".into(),
+            task: String::new(),
+            user_name: None,
+            channel: None,
+            retry_count: None,
+            timestamps: None,
+        }
+    }
+
+    /// Set `status` (default: `'launched'`).
+    pub(crate) fn status(mut self, status: impl Into<String>) -> Self {
+        self.status = status.into();
+        self
+    }
+
+    /// Set `task` (default: `''`).
+    pub(crate) fn task(mut self, task: impl Into<String>) -> Self {
+        self.task = task.into();
+        self
+    }
+
+    /// Set `user_name` explicitly (default: column omitted → schema default
+    /// `''`). Pass an empty string to force the explicit `''` value.
+    pub(crate) fn user_name(mut self, user_name: impl Into<String>) -> Self {
+        self.user_name = Some(user_name.into());
+        self
+    }
+
+    /// Set `channel` explicitly (default: column omitted → schema default
+    /// `''`). Pass an empty string to force the explicit `''` value.
+    pub(crate) fn channel(mut self, channel: impl Into<String>) -> Self {
+        self.channel = Some(channel.into());
+        self
+    }
+
+    /// Set `retry_count` (default: column omitted → schema default `0`).
+    pub(crate) fn retry_count(mut self, retry_count: i64) -> Self {
+        self.retry_count = Some(retry_count);
+        self
+    }
+
+    /// Set `created_at` AND `updated_at` (both required, transcribed
+    /// verbatim — the helper never generates timestamps internally).
+    pub(crate) fn timestamps(mut self, timestamps: impl Into<String>) -> Self {
+        self.timestamps = Some(timestamps.into());
+        self
+    }
+
+    /// Insert the row.
+    pub(crate) async fn insert(self) -> anyhow::Result<()> {
+        let Self {
+            conn,
+            id,
+            kind,
+            role,
+            workspace_name,
+            status,
+            task,
+            user_name,
+            channel,
+            retry_count,
+            timestamps,
+        } = self;
+        let mut columns = vec!["id", "kind", "status", "task", "workspace_name", "role"];
+        let mut values: Vec<crate::turso::Value> = vec![
+            crate::turso::Value::Text(id),
+            crate::turso::Value::Text(kind),
+            crate::turso::Value::Text(status),
+            crate::turso::Value::Text(task),
+            crate::turso::Value::Text(workspace_name),
+            crate::turso::Value::Text(role),
+        ];
+        if let Some(user_name) = user_name {
+            columns.push("user_name");
+            values.push(crate::turso::Value::Text(user_name));
+        }
+        if let Some(channel) = channel {
+            columns.push("channel");
+            values.push(crate::turso::Value::Text(channel));
+        }
+        if let Some(retry_count) = retry_count {
+            columns.push("retry_count");
+            values.push(crate::turso::Value::Integer(retry_count));
+        }
+        let timestamps = timestamps.expect(
+            "JobRowBuilder::insert: `.timestamps()` is required — the helper never generates timestamps internally",
+        );
+        columns.push("created_at");
+        columns.push("updated_at");
+        values.push(crate::turso::Value::Text(timestamps.clone()));
+        values.push(crate::turso::Value::Text(timestamps));
+        let placeholders = vec!["?"; values.len()].join(", ");
+        let table = "jobs";
+        let sql = format!(
+            "INSERT INTO {table} ({}) VALUES ({placeholders})",
+            columns.join(", ")
+        );
+        conn.execute(&sql, values).await?;
+        Ok(())
     }
 }
 

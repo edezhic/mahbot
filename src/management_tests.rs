@@ -2,8 +2,8 @@ use super::*;
 use crate::prompt::{load_prompt, substitute};
 use crate::util::test::make_ticket;
 use crate::util::test::{
-    create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
-    init_test_stores,
+    JobRowBuilder, create_test_workspace, expect_ticket, expect_ticket_phase,
+    init_management_test_stores, init_test_stores,
 };
 use crate::workspace::test_ws_named;
 
@@ -858,14 +858,11 @@ async fn resume_verifier_round_replays_stored_outcomes() {
 
     // Job row + ticket_stage_jobs row exactly as a crashed dispatch leaves
     // them (stage=review, phase=in_review, round=1).
-    conn.execute(
-        "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-         created_at, updated_at) \
-         VALUES (?1, 'ticket_stage', 'launched', '', ?2, 'reviewer', 0, ?3, ?3)",
-        crate::turso::params![job_id, ws.name.clone(), now.clone()],
-    )
-    .await
-    .unwrap();
+    JobRowBuilder::new(conn, job_id, "ticket_stage", "reviewer", &ws.name)
+        .timestamps(now.clone())
+        .insert()
+        .await
+        .unwrap();
     conn.execute(
         "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
          VALUES (?1, ?2, 'review', 'in_review', 1)",
@@ -1031,14 +1028,12 @@ async fn resume_engineer_round_continues_anchor_session() {
 
     // Job + ticket_stage_jobs rows exactly as a crashed round-2 dispatch
     // leaves them (stage=engineer, phase=in_development, round=2).
-    conn.execute(
-        "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-         created_at, updated_at) \
-         VALUES (?1, 'ticket_stage', 'launched', ?2, ?3, 'engineer', 0, ?4, ?4)",
-        crate::turso::params![job_id, task, ws.name.clone(), now.clone()],
-    )
-    .await
-    .unwrap();
+    JobRowBuilder::new(conn, job_id, "ticket_stage", "engineer", &ws.name)
+        .task(task)
+        .timestamps(now.clone())
+        .insert()
+        .await
+        .unwrap();
     conn.execute(
         "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
          VALUES (?1, ?2, 'engineer', 'in_development', 2)",
@@ -1173,14 +1168,12 @@ async fn resume_sanitation_round_continues_session_and_passes() {
 
     // Job + ticket_stage_jobs rows exactly as a crashed dispatch leaves them
     // (stage=sanitation, phase=in_sanitation, round=1).
-    conn.execute(
-        "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-         created_at, updated_at) \
-         VALUES (?1, 'ticket_stage', 'launched', ?2, ?3, 'sanitation', 0, ?4, ?4)",
-        crate::turso::params![job_id, task, ws.name.clone(), now.clone()],
-    )
-    .await
-    .unwrap();
+    JobRowBuilder::new(conn, job_id, "ticket_stage", "sanitation", &ws.name)
+        .task(task)
+        .timestamps(now.clone())
+        .insert()
+        .await
+        .unwrap();
     conn.execute(
         "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
          VALUES (?1, ?2, 'sanitation', 'in_sanitation', 1)",
@@ -2994,16 +2987,17 @@ async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
     let ticket_id = make_ticket(board(), &ws, "Eng Drain", TicketPhase::InDevelopment).await;
     let job_id = "job_eng_drain";
     let now = crate::turso::now();
-    crate::session::store()
-        .conn
-        .execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-             created_at, updated_at) \
-             VALUES (?1, 'ticket_stage', 'launched', '', ?2, 'engineer', 0, ?3, ?3)",
-            crate::turso::params![job_id, ws.name.clone(), now],
-        )
-        .await
-        .expect("insert launched job row");
+    JobRowBuilder::new(
+        &crate::session::store().conn,
+        job_id,
+        "ticket_stage",
+        "engineer",
+        &ws.name,
+    )
+    .timestamps(now)
+    .insert()
+    .await
+    .expect("insert launched job row");
     let ticket = expect_ticket(board(), &ticket_id).await;
     let mut agent = engineer_finalize_test_agent(&ws, &ticket, "drain");
     agent.failure = Some("drained boom".to_string());
@@ -3082,16 +3076,17 @@ async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
     .await;
     let job_id = "job_eng_midtail";
     let now = crate::turso::now();
-    crate::session::store()
-        .conn
-        .execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
-             created_at, updated_at) \
-             VALUES (?1, 'ticket_stage', 'launched', '', ?2, 'engineer', 0, ?3, ?3)",
-            crate::turso::params![job_id, ws.name.clone(), now],
-        )
-        .await
-        .expect("insert launched job row");
+    JobRowBuilder::new(
+        &crate::session::store().conn,
+        job_id,
+        "ticket_stage",
+        "engineer",
+        &ws.name,
+    )
+    .timestamps(now)
+    .insert()
+    .await
+    .expect("insert launched job row");
 
     let ticket = expect_ticket(board(), &ticket_id).await;
     let mut agent = engineer_finalize_test_agent(&ws, &ticket, "midtail");

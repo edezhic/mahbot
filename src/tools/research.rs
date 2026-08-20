@@ -3617,15 +3617,15 @@ mod tests {
         let job_id = "research_job_capped_1";
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-             retry_count, created_at, updated_at) \
-             VALUES (?1, 'research', 'launched', ?2, ?3, 'caller-user', 'telegram', 'assistant', \
-             3, ?4, ?4)",
-            crate::turso::params![job_id, "question?", ws.name.clone(), now.clone()],
-        )
-        .await
-        .unwrap();
+        crate::util::test::JobRowBuilder::new(conn, job_id, "research", "assistant", &ws.name)
+            .task("question?")
+            .user_name("caller-user")
+            .channel("telegram")
+            .retry_count(crate::jobs::MAX_BOOT_REDISPATCH)
+            .timestamps(now.clone())
+            .insert()
+            .await
+            .unwrap();
         conn.execute(
             "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
             crate::turso::params![job_id],
@@ -3713,15 +3713,14 @@ mod tests {
         let job_id = "research_job_resume_1";
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-             retry_count, created_at, updated_at) \
-             VALUES (?1, 'research', 'launched', ?2, ?3, 'caller-user', 'telegram', 'assistant', \
-             0, ?4, ?4)",
-            crate::turso::params![job_id, "question?", ws.name.clone(), now.clone()],
-        )
-        .await
-        .unwrap();
+        crate::util::test::JobRowBuilder::new(conn, job_id, "research", "assistant", &ws.name)
+            .task("question?")
+            .user_name("caller-user")
+            .channel("telegram")
+            .timestamps(now.clone())
+            .insert()
+            .await
+            .unwrap();
 
         // Checkpointed state: stage=Synthesis (post-fix crash state — the
         // verification pass completed and its results were persisted), one
@@ -4563,15 +4562,14 @@ mod tests {
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
         // The durable research job row (research_jobs.id FKs jobs.id).
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-             retry_count, created_at, updated_at) \
-             VALUES (?1, 'research', 'launched', ?2, 'ws', 'caller-user', 'telegram', 'assistant', \
-             0, ?3, ?3)",
-            crate::turso::params![job_id, "question?", now.clone()],
-        )
-        .await
-        .unwrap();
+        crate::util::test::JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
+            .task("question?")
+            .user_name("caller-user")
+            .channel("telegram")
+            .timestamps(now.clone())
+            .insert()
+            .await
+            .unwrap();
         // A valid checkpointed state blob (no command history in it).
         let json = serde_json::to_string(&ResearchState::default()).unwrap();
         conn.execute(

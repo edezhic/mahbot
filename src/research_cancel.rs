@@ -192,7 +192,7 @@ async fn delete_results_archive(job_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::test::retry_tests_lock;
+    use crate::util::test::{JobRowBuilder, retry_tests_lock};
 
     #[tokio::test]
     async fn cancel_fires_signal_and_guard_removes_entry_on_drop() {
@@ -223,14 +223,14 @@ mod tests {
         let job_id = "research_cancel_midrun_1";
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-             retry_count, created_at, updated_at) \
-             VALUES (?1, 'research', 'launched', 'q', 'ws', 'u', 'telegram', 'assistant', 0, ?2, ?2)",
-            crate::turso::params![job_id, now.clone()],
-        )
-        .await
-        .unwrap();
+        JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
+            .task("q")
+            .user_name("u")
+            .channel("telegram")
+            .timestamps(now.clone())
+            .insert()
+            .await
+            .unwrap();
         conn.execute(
             "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
             crate::turso::params![job_id],
@@ -298,15 +298,14 @@ mod tests {
         let job_id = "research_cancel_terminal_1";
         let conn = &crate::session::store().conn;
         let now = crate::turso::now();
-        conn.execute(
-            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-             retry_count, created_at, updated_at) \
-             VALUES (?1, 'research_cleanup', 'launched', 'cleanup prompt', 'ws', '', '', \
-             'sanitation', 0, ?2, ?2)",
-            crate::turso::params![job_id, now.clone()],
-        )
-        .await
-        .unwrap();
+        JobRowBuilder::new(conn, job_id, "research_cleanup", "sanitation", "ws")
+            .task("cleanup prompt")
+            .user_name("")
+            .channel("")
+            .timestamps(now.clone())
+            .insert()
+            .await
+            .unwrap();
         conn.execute(
             "INSERT INTO pending_jobs (id, envelope, target_agent_id, created_at) \
              VALUES (?1, ?2, 'manager_ws', ?3)",
