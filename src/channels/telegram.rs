@@ -85,7 +85,10 @@ enum IncomingAttachmentKind {
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
 /// The effective per-chunk limit is reduced to leave room for continuation markers.
-/// When the input contains HTML tags, avoids splitting mid-tag.
+/// When the input contains HTML tags, avoids splitting mid-tag unless the tag
+/// would push the chunk past the limit, in which case the split stays at the
+/// 4066-char boundary (the plain-text fallback in `send_text_chunks` tolerates
+/// the resulting malformed HTML).
 fn split_message_for_telegram(message: &str) -> Vec<String> {
     if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
         return vec![message.to_string()];
@@ -110,8 +113,16 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
         };
 
         // If we split inside an HTML tag, extend past the '>'.
+        // Clamp the extension to `hard_split` — the byte offset of the
+        // 4066-char boundary, always a char boundary. Letting the tag push
+        // the chunk past the sendable limit gets the message rejected by
+        // the API (the HTML send and the plain-text retry both fail), while
+        // a mid-tag split only degrades formatting — the existing HTML→plain
+        // fallback in `send_text_chunks` already tolerates it. Clamping to a
+        // char count instead would be unit-mismatched (byte offset vs chars)
+        // and panic on multibyte text.
         if let Some(adjusted) = extend_past_open_tag(remaining, chunk_end) {
-            chunk_end = adjusted;
+            chunk_end = adjusted.min(hard_split);
         }
 
         chunks.push(remaining[..chunk_end].to_string());

@@ -647,6 +647,67 @@ fn wrapped_chunks_respect_telegram_limit() {
     assert_eq!(chunks.len(), 1, "4096-char message should not split");
 }
 
+#[test]
+fn tag_extension_clamped_to_telegram_limit() {
+    // Regression (mahbot-1845): extend_past_open_tag could push a chunk
+    // past the sendable limit when the split point landed inside a long
+    // HTML tag whose '>' fell beyond the 4066-char window. The raw chunk
+    // then exceeded 4096 chars and Telegram rejected the send (HTML and
+    // the plain-text retry both fail), dropping the message.
+    //
+    // Well-formed variant of the ticket repro — what
+    // markdown_to_telegram_html actually emits: a link whose href opens
+    // within the last ~100 chars of the window and whose '>' lands past
+    // it. Under the old code the first chunk was 4151 chars (wrapped 4166).
+    let tag = format!(
+        "<a href=\"https://example.com/{}\">link</a>",
+        "y".repeat(120)
+    );
+
+    // ASCII body — the original overflow reproducer.
+    let ascii_msg = format!("{}{}", "x".repeat(4000), tag);
+    // Multibyte bodies: the clamp must target the byte offset of the
+    // 4066-char boundary (hard_split), never a raw byte count — clamping
+    // to byte 4066 panics on 3-byte CJK and under-fills 2-byte Cyrillic.
+    let cjk_msg = format!("{}{}", "界".repeat(4000), tag);
+    let cyrillic_msg = format!("{}{}", "ы".repeat(4000), tag);
+
+    for (name, msg) in [
+        ("ascii", ascii_msg),
+        ("cjk", cjk_msg),
+        ("cyrillic", cyrillic_msg),
+    ] {
+        let chunks = split_message_for_telegram(&msg);
+        // Reconstruction must be lossless.
+        assert_eq!(chunks.join(""), msg, "{name}: reconstruction");
+        assert!(chunks.len() >= 2, "{name}: expected a split");
+        for (i, chunk) in chunks.iter().enumerate() {
+            // Raw chunks never exceed the 4066-char budget...
+            assert!(
+                chunk.chars().count()
+                    <= TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD,
+                "{name}: chunk {i} raw {} chars exceeds the 4066 budget",
+                chunk.chars().count(),
+            );
+            // ...and the wrapped form (as sent by send_text_chunks) never
+            // exceeds Telegram's hard 4096-char limit.
+            let wrapped = wrap_chunk(chunk, i, chunks.len());
+            assert!(
+                wrapped.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "{name}: chunk {i} wrapped {} chars exceeds 4096",
+                wrapped.chars().count(),
+            );
+        }
+        // The budget is used effectively: the first chunk sits near the
+        // 4066-char ceiling instead of being truncated by a byte clamp.
+        assert!(
+            chunks[0].chars().count() >= 4000,
+            "{name}: first chunk only {} chars — budget underused",
+            chunks[0].chars().count(),
+        );
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // extract_sender_user_name tests
 // ─────────────────────────────────────────────────────────────────────
