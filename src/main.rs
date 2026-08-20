@@ -260,9 +260,11 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     let rx = init_message_pipeline(&mut tasks, &shutdown_token);
 
-    // `run_message_dispatch_loop` runs unconditionally. When no channels are registered,
-    // tx is never cloned into a listener, rx is dropped, and the handler exits
-    // gracefully (rx.recv() returns `None` immediately).
+    // `run_message_dispatch_loop` runs unconditionally and exits only via the
+    // shutdown token: `MESSAGE_TX` (a process-lifetime `OnceLock` global set in
+    // `init_message_pipeline`) and the always-registered GUI listener hold
+    // sender clones, so `rx.recv()` never returns `None` (the `None => break`
+    // arm is unreachable in practice).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

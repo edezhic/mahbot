@@ -1274,9 +1274,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
                     warn!(job = %job.id, kind = %kind, "{msg}");
                 }
                 // Capped resumes keep retry_count (the cap already fired);
-                // normal resumes bump it. The variant mirrors the DB kind
-                // (capped = old "{kind}_capped" suffix) — the match arm above
-                // already discriminated research vs analyze.
+                // normal resumes bump it.
                 let _ = checkpoint_job(
                     conn,
                     &job.id,
@@ -2652,8 +2650,9 @@ mod tests {
     /// cleanup ran to completion in a previous lifetime — the tail released
     /// the folder and terminalized the row) must NOT re-dispatch — folder
     /// absence is the completed marker on the replay path, and re-dispatching
-    /// would cost one LLM round per boot until the 7-day pending cap. The
-    /// envelope itself still replays.
+    /// would cost one LLM round per boot until the boot re-dispatch cap
+    /// ([`MAX_BOOT_REDISPATCH`]) fires and the row ages into the 8h purge
+    /// ([`PURGE_CUTOFF_HOURS`]). The envelope itself still replays.
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // shared process-lifetime store rows
     async fn replay_skips_cleanup_dispatch_when_run_folder_gone() {

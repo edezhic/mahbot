@@ -98,8 +98,10 @@ pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
 /// its outside-folder scratch leaks to the OS temp sweep — the safe direction.
 /// The alternative (fail-open on error) would re-dispatch a cleanup LLM round
 /// for a run that ALREADY completed, per boot, until the envelope is delivered
-/// or the pending cap fires — a bounded but avoidable cost for a transient
-/// read error that is far more likely than a genuine crash-window hit.
+/// or the boot re-dispatch cap (`crate::jobs::MAX_BOOT_REDISPATCH`) fires and
+/// the row ages into the 8h purge (`crate::jobs::PURGE_CUTOFF_HOURS`) — a
+/// bounded but avoidable cost for a transient read error that is far more
+/// likely than a genuine crash-window hit.
 async fn run_folder_exists(job_id: &str) -> bool {
     tokio::fs::try_exists(run_root_path(job_id))
         .await
