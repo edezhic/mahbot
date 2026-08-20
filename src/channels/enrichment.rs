@@ -11,6 +11,12 @@
 //! - **File operations** → downloading/saving images to workspace, cleaning
 //!   up temporary files
 //!
+//! **Containment invariant**: all local file reads, copies, and deletes are
+//! scoped to the daemon's Telegram temp dir. Marker paths outside it
+//! (user-typed `[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]` annotations) degrade
+//! to plain-text annotations and are never read, transcribed, copied into
+//! workspace uploads, or deleted.
+//!
 //! The public entry points are [`enrich_message`] and [`enrich_links`],
 //! re-exported from [`crate::channels`]. The two [`EnrichmentStrategy`]
 //! variants control how image media markers are handled: `Multimodal`
@@ -30,6 +36,11 @@ use std::sync::LazyLock;
 /// brackets, or double-quotes.
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).expect("URL regex must compile"));
+
+/// The audio-transcription icon combo (sound written into text). Used both as
+/// the transcription-failure fallback and as the annotation for out-of-scope
+/// `[AUDIO:...]` markers that must never be read or deleted.
+const AUDIO_ICON: &str = "🔊✍️";
 
 /// Transcribe an audio file referenced by a `[AUDIO:...]` marker and return
 /// the content to embed in the message: the audio-transcription icon combo
@@ -63,9 +74,9 @@ async fn transcribe_audio_marker(path: &str) -> String {
                 tracing::debug!("Local audio transcription succeeded");
                 let text = text.trim();
                 return if text.is_empty() {
-                    "🔊✍️".to_string()
+                    AUDIO_ICON.to_string()
                 } else {
-                    format!("🔊✍️ {text}")
+                    format!("{AUDIO_ICON} {text}")
                 };
             }
             Err(e) => {
@@ -76,7 +87,7 @@ async fn transcribe_audio_marker(path: &str) -> String {
 
     // ── Step 2: Icon-only fallback (no text, no filename) ────────────
     tracing::warn!("Audio transcription unavailable");
-    "🔊✍️".to_string()
+    AUDIO_ICON.to_string()
 }
 
 /// A media file copied into the workspace `uploads/` directory: the
@@ -114,6 +125,10 @@ async fn save_media_to_workspace(
 
 /// Strategy for message enrichment, determining how each media marker kind
 /// (IMAGE, AUDIO, VIDEO) is handled.
+///
+/// Local media reads, copies, transcriptions, and deletes are scoped to the
+/// daemon's Telegram temp dir (see module docs); out-of-scope marker paths
+/// degrade to plain-text annotations.
 #[derive(Debug, Clone)]
 pub enum EnrichmentStrategy {
     /// Multimodal mode:
@@ -125,12 +140,16 @@ pub enum EnrichmentStrategy {
     ///   clip and feed it into the video-edit flow
     ///
     /// When `workspace_path` is provided, copies of media files are saved to
-    /// `uploads/` for agent tool references.
+    /// `uploads/` for agent tool references. Reads, copies, and cleanup are
+    /// scoped to the daemon's Telegram temp dir.
     Multimodal {
         workspace_path: Option<std::path::PathBuf>,
     },
     /// Non-multimodal mode: all media markers are transcribed/extracted to
     /// text annotations and the raw markers are stripped from the content.
+    /// Transcription (a read) and cleanup only happen for files in the
+    /// daemon's Telegram temp dir; out-of-scope markers become plain
+    /// attachment annotations.
     NonMultimodal,
 }
 
@@ -139,16 +158,21 @@ enum MultimodalImageAction {
     /// Keep the marker unchanged (e.g. HTTP/HTTPS URL).
     Keep,
     /// Replace the marker with the given text, optionally including an
-    /// upload-path annotation for agent tool references.
+    /// upload-path annotation for agent tool references. `delete_temp` is set
+    /// only when the source file was consumed from the daemon's Telegram temp
+    /// dir (copied/read) — out-of-scope and missing files are never deleted.
     Replace {
         replacement: String,
         upload_annotation: Option<String>,
+        delete_temp: bool,
     },
 }
 
-/// Handle an IMAGE marker in multimodal mode — convert to data URI or invalid
-/// reference. Saves a workspace copy if `uploads_dir` is available.
-/// The caller is responsible for cleaning up the source temp file.
+/// Handle an IMAGE marker in multimodal mode — convert to data URI, invalid
+/// reference, or (for out-of-scope paths) a plain-text annotation. Saves a
+/// workspace copy if `uploads_dir` is available. The returned action's
+/// `delete_temp` tells the caller whether the source temp file was consumed
+/// from the Telegram temp dir and may be cleaned up.
 async fn handle_multimodal_image(
     path: &str,
     path_obj: &std::path::Path,
@@ -165,6 +189,17 @@ async fn handle_multimodal_image(
         return MultimodalImageAction::Replace {
             replacement: invalid_ref,
             upload_annotation: None,
+            delete_temp: false,
+        };
+    }
+
+    // Containment: only Telegram-temp-dir files may be read, copied, or deleted.
+    if !is_under_telegram_files(path_obj).await {
+        tracing::warn!(%path, "Image path outside telegram temp dir — annotating without copy");
+        return MultimodalImageAction::Replace {
+            replacement: format!("[Image: {} attached]", file_name_or_path(path)),
+            upload_annotation: None,
+            delete_temp: false,
         };
     }
 
@@ -185,6 +220,7 @@ async fn handle_multimodal_image(
     MultimodalImageAction::Replace {
         replacement,
         upload_annotation: saved,
+        delete_temp: true,
     }
 }
 
@@ -311,9 +347,9 @@ async fn handle_non_multimodal_image(
 /// | VIDEO | workspace copy + `[Saved video: path]` + transcription | text annotation |
 ///
 /// After processing, markers that were handled are stripped from the content
-/// and annotations are prepended. Temp files are cleaned up after processing —
-/// audio unconditionally (temp-dir scoped), video once copied to the workspace
-/// — only the transcription (or icon) survives.
+/// and annotations are prepended. Temp files are cleaned up after processing,
+/// scoped to the daemon's Telegram temp dir — out-of-scope marker paths are
+/// never read, copied, or deleted and degrade to plain-text annotations.
 // Marker dispatch hub (3 kinds × 2 strategies); per-kind handling is extracted
 // into the handler functions above, keeping this loop flat on purpose.
 #[allow(clippy::too_many_lines)]
@@ -324,9 +360,9 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     // Only ever populated in Multimodal/IMAGE branch — always empty otherwise.
     let mut upload_annotations: Vec<String> = Vec::new();
 
-    // Tracks temp files to remove after the loop; each kind decides its own
-    // cleanup. Audio is unconditional (temp-dir scoped) — the file is a pure
-    // intermediate artifact, only the transcription (or icon) survives.
+    // Temp files to remove after the loop — only ever queued for files under
+    // the daemon's Telegram temp dir, so user-typed markers can never delete
+    // arbitrary local files.
     let mut files_to_delete: Vec<std::path::PathBuf> = Vec::new();
 
     let uploads_dir = match strategy {
@@ -351,33 +387,45 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                         MultimodalImageAction::Replace {
                             replacement,
                             upload_annotation,
+                            delete_temp,
                         } => {
                             result = result.replacen(whole.as_str(), &replacement, 1);
                             if let Some(ann) = upload_annotation {
                                 upload_annotations.push(ann);
                             }
-                            // Local IMAGE temp files are always cleaned up
-                            // (legacy behaviour; image retries tracked in a follow-up).
-                            files_to_delete.push(path_obj.to_path_buf());
+                            // Local IMAGE temp files are cleaned up only when
+                            // consumed from the daemon's Telegram temp dir (delete_temp).
+                            if delete_temp {
+                                files_to_delete.push(path_obj.to_path_buf());
+                            }
                         }
                     }
                 }
                 EnrichmentStrategy::NonMultimodal => {
                     let file_name = file_name_or_path(path);
-                    annotations.push(
-                        handle_non_multimodal_image(path_obj, file_name, &msg.workspace).await,
-                    );
-                    // IMAGE temp files cleaned up regardless of outcome.
-                    files_to_delete.push(path_obj.to_path_buf());
+                    // Containment: only Telegram-temp-dir files are transcribed or deleted.
+                    let in_scope = is_under_telegram_files(path_obj).await;
+                    let annotation = if in_scope {
+                        handle_non_multimodal_image(path_obj, file_name, &msg.workspace).await
+                    } else {
+                        tracing::warn!(%path, "Image path outside telegram temp dir — annotating without transcription");
+                        format!("[Image: {file_name} attached]")
+                    };
+                    annotations.push(annotation);
+                    if in_scope {
+                        files_to_delete.push(path_obj.to_path_buf());
+                    }
                 }
             },
             "AUDIO" => {
-                annotations.push(transcribe_audio_marker(path).await);
-                // Audio temp files are always cleaned up, scoped to the daemon's
-                // Telegram temp dir so user-typed [AUDIO:...] markers can never
-                // delete arbitrary local files.
+                // Containment: only Telegram-temp-dir files are transcribed or
+                // deleted; out-of-scope markers degrade to the icon only.
                 if is_under_telegram_files(path_obj).await {
+                    annotations.push(transcribe_audio_marker(path).await);
                     files_to_delete.push(path_obj.to_path_buf());
+                } else {
+                    tracing::warn!(%path, "Audio path outside telegram temp dir — annotating without transcription");
+                    annotations.push(AUDIO_ICON.to_string());
                 }
             }
             "VIDEO" => match strategy {
@@ -403,8 +451,10 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                 }
                 EnrichmentStrategy::NonMultimodal => {
                     annotations.push(format!("[Video: {} attached]", file_name_or_path(path)));
-                    // VIDEO temp files are always cleaned up.
-                    files_to_delete.push(path_obj.to_path_buf());
+                    // Containment: only Telegram-temp-dir files are deleted.
+                    if is_under_telegram_files(path_obj).await {
+                        files_to_delete.push(path_obj.to_path_buf());
+                    }
                 }
             },
             // NOTE: If a new marker kind is added to MEDIA_MARKER_RE in
@@ -422,8 +472,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     }
 
     // ── File cleanup ────────────────────────────────────────────────
-    // Temp files queued above are deleted here — per kind: audio
-    // unconditionally, video only after a successful workspace copy.
+    // Delete queued temp files (only Telegram-temp-dir paths are ever queued).
     // Deletion errors are logged (not silently discarded).
     for file_path in &files_to_delete {
         if let Err(e) = tokio::fs::remove_file(file_path).await {
@@ -671,6 +720,32 @@ mod tests {
         }
     }
 
+    /// Create the daemon's Telegram temp dir. The containment root must exist
+    /// before path canonicalization — a missing root makes every path look
+    /// out of scope.
+    async fn ensure_telegram_files_dir() {
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+    }
+
+    /// Set up an out-of-scope fixture: a unique scratch dir under the system
+    /// temp dir (outside the Telegram temp dir) containing a fake workspace
+    /// (`ws_path`) and a single arbitrary media file. Returns
+    /// `(tmp_root, ws_path, arbitrary_file)`.
+    async fn out_of_scope_fixture(
+        prefix: &str,
+        file_name: &str,
+        contents: &[u8],
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        ensure_telegram_files_dir().await;
+        let tmp_root = std::env::temp_dir().join(format!("{prefix}_{}", std::process::id()));
+        let ws_path = tmp_root.join("myworkspace");
+        tokio::fs::create_dir_all(&ws_path).await.unwrap();
+        let arbitrary = tmp_root.join(file_name);
+        tokio::fs::write(&arbitrary, contents).await.unwrap();
+        (tmp_root, ws_path, arbitrary)
+    }
+
     #[tokio::test]
     async fn enrich_multimodal_image_http_url_passthrough() {
         let mut msg = test_msg("Check this [IMAGE:https://example.com/img.png] out");
@@ -728,7 +803,11 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_multimodal_image_valid_file_converts_to_data_uri_and_deletes_temp() {
-        let tmp = std::env::temp_dir().join(format!("test_enrich_img_{}.png", std::process::id()));
+        // The fixture must live under the daemon's Telegram temp dir to be in
+        // scope for reading (data URI) and cleanup.
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp = tg_dir.join(format!("test_enrich_img_{}.png", std::process::id()));
         let png_header: &[u8] = &[
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
             0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
@@ -768,8 +847,11 @@ mod tests {
         let ws_path = tmp_root.join("myworkspace");
         tokio::fs::create_dir_all(&ws_path).await.unwrap();
 
-        let tmp_img =
-            std::env::temp_dir().join(format!("test_enrich_ws_img_{}.png", std::process::id()));
+        // The fixture must live under the daemon's Telegram temp dir to be in
+        // scope for reading (data URI) and cleanup.
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp_img = tg_dir.join(format!("test_enrich_ws_img_{}.png", std::process::id()));
         let png_header: &[u8] = &[
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
             0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
@@ -806,7 +888,9 @@ mod tests {
     async fn enrich_non_multimodal_image_annotation() {
         let mut msg = test_msg("Here is [IMAGE:/tmp/photo_xyz.jpg] from the camera");
         enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
-        // IMAGE marker stripped, annotation prepended (fallback since no transcriber)
+        // IMAGE marker stripped, annotation prepended — the path is outside
+        // the daemon's Telegram temp dir, so it gets the plain attachment
+        // annotation without a transcription attempt.
         assert!(
             msg.content.contains("[Image:"),
             "Image annotation must be present, got: {}",
@@ -903,15 +987,10 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_multimodal_video_outside_telegram_files_annotates_without_copy() {
-        let tmp_root =
-            std::env::temp_dir().join(format!("test_enrich_video_outside_{}", std::process::id()));
-        let ws_path = tmp_root.join("myworkspace");
-        tokio::fs::create_dir_all(&ws_path).await.unwrap();
-
         // An injected marker pointing at an arbitrary readable file must not
         // be copied into uploads (exfiltration vector) or deleted.
-        let arbitrary = tmp_root.join("secret.txt");
-        tokio::fs::write(&arbitrary, b"top secret").await.unwrap();
+        let (tmp_root, ws_path, arbitrary) =
+            out_of_scope_fixture("test_enrich_video_outside", "secret.txt", b"top secret").await;
         let marker = format!("Edit [VIDEO:{}]", arbitrary.display());
 
         let mut msg = test_msg(&marker);
@@ -940,6 +1019,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enrich_multimodal_image_outside_telegram_files_annotates_without_read_or_copy() {
+        // An injected marker pointing at an arbitrary readable file must not
+        // be read into model context (data URI), copied into uploads, or
+        // deleted.
+        let (tmp_root, ws_path, arbitrary) = out_of_scope_fixture(
+            "test_enrich_img_outside",
+            "secret.png",
+            b"top secret image bytes",
+        )
+        .await;
+        let marker = format!("Look at [IMAGE:{}]", arbitrary.display());
+
+        let mut msg = test_msg(&marker);
+        let strategy = EnrichmentStrategy::Multimodal {
+            workspace_path: Some(ws_path.clone()),
+        };
+        enrich_message(&mut msg, &strategy).await;
+
+        assert!(
+            msg.content.contains("[Image: secret.png attached]"),
+            "Out-of-scope path must degrade to a plain-text annotation, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("data:image"),
+            "No data URI may be produced for out-of-scope paths (would read the file)"
+        );
+        assert!(!msg.content.contains("[Saved image:"));
+        assert!(!msg.content.contains("[IMAGE:"));
+        assert!(
+            arbitrary.exists(),
+            "Source file outside the telegram temp dir must not be deleted"
+        );
+        assert_eq!(
+            tokio::fs::read(&arbitrary).await.unwrap(),
+            b"top secret image bytes",
+            "Source file contents must be unchanged"
+        );
+        assert!(
+            !ws_path.join("uploads").exists(),
+            "No uploads copy may be created for out-of-scope paths"
+        );
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    #[tokio::test]
+    async fn enrich_non_multimodal_image_outside_telegram_files_annotates_without_read_or_delete() {
+        // An injected marker pointing at an arbitrary readable file must not
+        // be transcribed (read) or deleted — the key regression: the old code
+        // deleted it.
+        let (tmp_root, _ws_path, arbitrary) = out_of_scope_fixture(
+            "test_enrich_img_nonmm",
+            "secret.png",
+            b"top secret image bytes",
+        )
+        .await;
+        let marker = format!("Look at [IMAGE:{}]", arbitrary.display());
+
+        let mut msg = test_msg(&marker);
+        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
+
+        assert!(
+            msg.content.contains("[Image: secret.png attached]"),
+            "Out-of-scope path must degrade to a plain-text annotation, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("data:image"),
+            "No data URI may be produced for out-of-scope paths (would read the file)"
+        );
+        assert!(!msg.content.contains("[IMAGE:"));
+        assert!(
+            arbitrary.exists(),
+            "Source file outside the telegram temp dir must not be deleted"
+        );
+        assert_eq!(
+            tokio::fs::read(&arbitrary).await.unwrap(),
+            b"top secret image bytes",
+            "Source file contents must be unchanged"
+        );
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    #[tokio::test]
+    async fn enrich_non_multimodal_video_outside_telegram_files_annotates_without_delete() {
+        // An injected marker pointing at an arbitrary readable file must not
+        // be deleted by the non-multimodal cleanup pass.
+        let (tmp_root, _ws_path, arbitrary) = out_of_scope_fixture(
+            "test_enrich_video_nonmm",
+            "secret.mp4",
+            b"top secret video bytes",
+        )
+        .await;
+        let marker = format!("Watch [VIDEO:{}]", arbitrary.display());
+
+        let mut msg = test_msg(&marker);
+        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
+
+        assert!(
+            msg.content.contains("[Video: secret.mp4 attached]"),
+            "Out-of-scope path must degrade to a plain-text annotation, got: {}",
+            msg.content
+        );
+        assert!(!msg.content.contains("[VIDEO:"));
+        assert!(
+            arbitrary.exists(),
+            "Source file outside the telegram temp dir must not be deleted"
+        );
+        assert_eq!(
+            tokio::fs::read(&arbitrary).await.unwrap(),
+            b"top secret video bytes",
+            "Source file contents must be unchanged"
+        );
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    #[tokio::test]
     async fn enrich_multimodal_video_http_url_kept_as_plain_text() {
         let mut msg = test_msg("Edit [VIDEO:https://example.com/clip.mp4] this");
         let strategy = EnrichmentStrategy::Multimodal {
@@ -958,9 +1157,9 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_non_multimodal_all_markers_stripped_and_annotated() {
-        // _xyz-suffixed paths: nonexistent by convention, so the AUDIO branch
-        // deterministically falls back to the annotation (never a loaded-model
-        // transcription) and the IMAGE/VIDEO cleanup passes are no-ops.
+        // The `_xyz`-suffixed paths are outside the daemon's Telegram temp dir,
+        // so IMAGE/AUDIO never attempt transcription (a read) and no cleanup is
+        // queued — all three degrade to their plain-text annotations.
         let mut msg = test_msg(
             "Check [IMAGE:/tmp/img_xyz.png] and listen [AUDIO:/tmp/audio_xyz.mp3] and watch [VIDEO:/tmp/vid_xyz.mp4]",
         );
