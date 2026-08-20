@@ -577,14 +577,10 @@ async fn execute_local_update() -> Result<()> {
     .await;
 
     // 4. Compute paths early (needed by copy, spawn, and cleanup below).
-    let binary_path = manifest_dir.join("target").join("release").join({
-        let exe_suffix = std::env::consts::EXE_SUFFIX;
-        if exe_suffix.is_empty() {
-            "mahbot".to_string()
-        } else {
-            format!("mahbot{exe_suffix}")
-        }
-    });
+    let binary_path = manifest_dir
+        .join("target")
+        .join("release")
+        .join(format!("mahbot{}", std::env::consts::EXE_SUFFIX));
 
     // Resolve the cargo install bin path. Checks `$CARGO_HOME` first, then
     // falls back to `~/.cargo/bin` via `directories::UserDirs`. Unlike the
@@ -899,9 +895,9 @@ async fn run_cargo_with_timeout(
 /// would require replicating cargo's full config resolution, so this narrow
 /// case is accepted and documented rather than guessed.
 ///
-/// The chosen spawn target is validated with [`is_executable`] before being
-/// returned (mirroring [`resolve_spawn_path`]); if it is not executable, falls
-/// back to `current_exe()`.
+/// The chosen spawn target is validated with [`is_executable`] via the shared
+/// [`executable_or_current_exe`] helper (mirroring [`resolve_spawn_path`]);
+/// if it is not executable, falls back to `current_exe()`.
 async fn resolve_registry_spawn_path(admin_target: Option<&str>) -> Result<PathBuf> {
     let current_exe = std::env::current_exe()
         .context("Failed to resolve current_exe() for registry update restart")?;
@@ -944,20 +940,11 @@ async fn resolve_registry_spawn_path(admin_target: Option<&str>) -> Result<PathB
         }
     }
 
-    // Validate the chosen spawn target exists and is executable.
+    // Validate the spawn target; on fallback the helper returns `current_exe`
+    // (or bails) — return it before the `fresh_elsewhere` admin notification,
+    // which must not fire when restarting from `current_exe` instead.
     if !is_executable(&spawn) {
-        warn!(
-            path = %spawn.display(),
-            "Registry spawn target not executable — falling back to current_exe()"
-        );
-        if !is_executable(&current_exe) {
-            anyhow::bail!(
-                "Neither cargo bin path `{}` nor current_exe `{}` is executable",
-                spawn.display(),
-                current_exe.display(),
-            );
-        }
-        return Ok(current_exe);
+        return executable_or_current_exe(&spawn, &current_exe, "Registry");
     }
 
     if fresh_elsewhere {
@@ -1177,8 +1164,9 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 ///   already updated it in-place).
 /// - The copy to the cargo bin path fails.
 ///
-/// Validates that the chosen spawn target exists and is executable. If
-/// validation fails, falls back to `current_exe()`.
+/// Validates that the chosen spawn target exists and is executable (via the
+/// shared [`executable_or_current_exe`] helper). If validation fails, falls
+/// back to `current_exe()`.
 async fn resolve_spawn_path(
     built_binary: &Path,
     cargo_bin: Option<&Path>,
@@ -1207,23 +1195,37 @@ async fn resolve_spawn_path(
         current_exe.clone()
     };
 
-    // Validate the chosen spawn target exists and is executable.
-    if !is_executable(&candidate) {
+    // Validate the chosen spawn target; falls back to current_exe() (or bails).
+    executable_or_current_exe(&candidate, &current_exe, "Primary")
+}
+
+/// Validate that the chosen spawn target exists and is executable, falling
+/// back to `current_exe()` (or bailing when that is not executable either).
+///
+/// `warn_label` distinguishes the two resolvers ("Registry" / "Primary").
+/// On fallback the returned path is always `current_exe` — a caller with a
+/// side effect after validation (see [`resolve_registry_spawn_path`]) must
+/// early-return rather than fall through.
+fn executable_or_current_exe(
+    candidate: &Path,
+    current_exe: &Path,
+    warn_label: &str,
+) -> Result<PathBuf> {
+    if !is_executable(candidate) {
         warn!(
             path = %candidate.display(),
-            "Primary spawn target not executable — falling back to current_exe()"
+            "{warn_label} spawn target not executable — falling back to current_exe()"
         );
-        if !is_executable(&current_exe) {
+        if !is_executable(current_exe) {
             anyhow::bail!(
                 "Neither cargo bin path `{}` nor current_exe `{}` is executable",
                 candidate.display(),
                 current_exe.display(),
             );
         }
-        return Ok(current_exe);
+        return Ok(current_exe.to_path_buf());
     }
-
-    Ok(candidate)
+    Ok(candidate.to_path_buf())
 }
 
 /// Spawn the new mahbot instance as a detached child process from the given path.
