@@ -39,11 +39,14 @@ use crate::gui::widgets;
 use crate::registry::{AgentHandle, ParentKey};
 use chrono::{DateTime, Utc};
 
-use iced::widget::{Column, Row, Space, column, container, row, scrollable, text, tooltip};
+use iced::widget::{
+    Column, Row, Space, button, column, container, row, scrollable, stack, text, tooltip,
+};
 use iced::{Alignment, Element, Length};
 
 use iced_fonts::lucide;
 
+use super::widget_helpers;
 use super::{Message, WorkspaceInfo};
 
 /// Maximum display length (Unicode chars) of an analyze/research group header
@@ -64,16 +67,39 @@ const MAX_TOOL_PAIRS_LINE_CHARS: usize = 80;
 /// Maximum width (px) of the hover tooltip content; long values wrap within it.
 const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
 
+/// Messages emitted by the Running Agents page.
+///
+/// The page itself stays stateless — the pending research-cancel
+/// confirmation lives on the [`Dashboard`](super::Dashboard) so the dialog
+/// requires no per-run page state beyond the pending confirmation itself.
+#[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)] // the Cancel* names are deliberate — one cancel flow, four stages
+pub(crate) enum RunningMessage {
+    /// Cancel button pressed on a research-run group header. Carries the
+    /// run's durable job id — NEVER rendered as text; the button action
+    /// alone carries it.
+    CancelRequest(String),
+    /// The confirmation dialog's danger button — start the async cancel.
+    CancelConfirmed,
+    /// Keep/Dismiss (or Escape/backdrop) — close the dialog with no effect.
+    CancelDismissed,
+    /// The async cancel finished: `Ok(())` = run stopped and removed
+    /// permanently; `Err` = the durable sweep failed (surfaced as a toast).
+    CancelFinished(Result<(), String>),
+}
+
 /// Render the live running-agents page.
 ///
-/// The page is purely observational: it emits no messages of its own, so it
-/// renders directly into the dashboard's [`Message`] type instead of carrying
-/// a page-local message enum. `workspaces` is the dashboard's
+/// The page is observational — it reads the live in-memory registries and
+/// renders directly into the dashboard's [`Message`] type; its only
+/// self-emitted messages are the research-run manual-cancel flow
+/// ([`RunningMessage`]). `workspaces` is the dashboard's
 /// registered-workspace map (name → info) — used only to mark
 /// unregistered/ephemeral workspace sections with the "(external)" suffix.
 /// Everything else comes from the live in-memory registries.
 pub(crate) fn view(
     workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
+    pending_cancel: Option<&str>,
 ) -> Element<'static, Message> {
     let agents = crate::registry::AGENT_REGISTRY.list();
     let calls = crate::call_registry::NON_AGENT_CALLS.list();
@@ -83,7 +109,7 @@ pub(crate) fn view(
     // singletons → unattributed), sections alphabetically by name.
     let sections = build_sections(build_groups(&agents, &calls), workspaces);
 
-    let body: Element<'_, Message> = if sections.is_empty() {
+    let body: Element<'_, RunningMessage> = if sections.is_empty() {
         // Shared empty-state pattern: large radar glyph (the page's nav
         // icon) + label, centered.
         widgets::empty_state_placeholder(
@@ -104,12 +130,22 @@ pub(crate) fn view(
 
     // Uniform page chrome with the rest of the dashboard: base Flexoki
     // fill + 24px padding, matching the other pages.
-    container(body)
+    let page: Element<'_, RunningMessage> = container(body)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(24)
         .style(theme::base_container_style)
-        .into()
+        .into();
+    // Confirm-dialog overlay: the page content is stack child 0, the dialog
+    // (or a type-stable placeholder) child 1 — the widget shapes never
+    // change, so no page state is lost when the dialog opens/closes.
+    let confirm_layer: Element<'_, RunningMessage> = if let Some(run_key) = pending_cancel {
+        cancel_confirm_dialog(run_key)
+    } else {
+        stack([widget_helpers::empty_stack_placeholder()]).into()
+    };
+    let stacked: Element<'_, RunningMessage> = stack([page, confirm_layer]).into();
+    stacked.map(Message::RunningAgents)
 }
 
 // ── Display model ─────────────────────────────────────────────────────────
@@ -361,7 +397,7 @@ fn build_sections(
 ///
 /// The returned element owns all rendered content (text widgets take owned
 /// Strings), so its lifetime is independent of the `section` borrow.
-fn render_section(section: &WorkspaceSection) -> Element<'static, Message> {
+fn render_section(section: &WorkspaceSection) -> Element<'static, RunningMessage> {
     let mut groups = Column::new().spacing(10);
     for group in &section.groups {
         groups = groups.push(render_group(group));
@@ -415,15 +451,26 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
 /// Render one group: header (title + secondary + run-lifetime marker) then
 /// the group panel holding its cards/rows. Cards are visually separated from
 /// the panel via the established card style.
-fn render_group(group: &DisplayGroup) -> Element<'static, Message> {
+fn render_group(group: &DisplayGroup) -> Element<'static, RunningMessage> {
     let (title, secondary) = group_title(group);
-    let mut header_parts: Vec<Element<'_, Message>> =
+    let mut header_parts: Vec<Element<'_, RunningMessage>> =
         vec![text(title).size(15).color(theme::ACCENT).into()];
     if let Some(secondary) = secondary {
         header_parts.push(text(secondary).size(11).color(theme::TEXT_MUTED).into());
     }
     if group.run_lifetime {
         header_parts.push(text("run active").size(11).color(theme::ACCENT).into());
+    }
+    // Manual cancel: danger-styled button on RESEARCH-run group headers only.
+    // The run key is carried by the message, never rendered as text.
+    if group.kind == GroupKind::Research {
+        header_parts.push(Space::new().width(Length::Fill).into());
+        header_parts.push(
+            button(text("Cancel run").size(11))
+                .style(theme::button_danger)
+                .on_press(RunningMessage::CancelRequest(group.key.clone()))
+                .into(),
+        );
     }
 
     let mut items = Column::new().spacing(6);
@@ -449,6 +496,58 @@ fn render_group(group: &DisplayGroup) -> Element<'static, Message> {
     ]
     .spacing(6)
     .into()
+}
+
+/// Build the research-run manual-cancel confirmation dialog, mirroring the
+/// board's ticket-cancel pattern: consequences listed, danger confirm
+/// button, Keep/Dismiss (and Escape/backdrop) to close with no effect.
+/// `run_key` is the run's durable job id — never displayed as text.
+fn cancel_confirm_dialog(run_key: &str) -> Element<'static, RunningMessage> {
+    // Deliberately unused: the run key must never appear in the dialog's
+    // rendered text — the button action alone carries it (see the enum docs).
+    let _ = run_key;
+    let dialog = container(
+        column![
+            text("Cancel this research run?")
+                .size(16)
+                .color(theme::TEXT_PRIMARY)
+                .font(theme::FONT_BOLD),
+            Space::new().height(12),
+            text("Confirming will:")
+                .size(13)
+                .color(theme::TEXT_SECONDARY),
+            Space::new().height(8),
+            text(
+                "• stop all agents of this run — an in-flight tool or LLM call \
+                 may finish, but no further work happens;\n\
+                 • stop the orchestrator — no more rounds, no report, no \
+                 cleanup agent;\n\
+                 • delete the run's temporary folder and archived result;\n\
+                 • remove the run permanently — nothing is delivered to the \
+                 Manager, and it can never resume.",
+            )
+            .size(13)
+            .color(theme::TEXT_SECONDARY),
+            Space::new().height(16),
+            row![
+                Space::new().width(Length::Fill),
+                button(text("Keep run").size(13))
+                    .style(theme::button_secondary)
+                    .on_press(RunningMessage::CancelDismissed),
+                Space::new().width(8),
+                button(text("Cancel run").size(13))
+                    .style(theme::button_danger)
+                    .on_press(RunningMessage::CancelConfirmed),
+            ]
+            .align_y(Alignment::Center),
+        ]
+        .width(Length::Fill),
+    )
+    .width(Length::Fixed(480.0))
+    .padding(24)
+    .style(theme::dialog_container_style);
+
+    widget_helpers::modal_backdrop(dialog, RunningMessage::CancelDismissed, 0.5)
 }
 
 /// Fallback label for workspaces outside the dashboard's registered set
@@ -483,7 +582,7 @@ fn workspace_label_for(
 /// carries the role and the workspace section header carries the workspace.
 /// Cards use the established surface-card style so they read as distinct from
 /// the group panel.
-fn render_agent_card(card: &AgentCard) -> Element<'static, Message> {
+fn render_agent_card(card: &AgentCard) -> Element<'static, RunningMessage> {
     let h = &card.handle;
     // Color resolution via the canonical string helper (handles derivative
     // names and falls back to muted grey for unknown roles); the icon still
@@ -544,7 +643,7 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, Message> {
 /// Render one tool block: bold white tool name on top, the comma-separated
 /// key-value pairs below it in regular weight. The whole block is the hover
 /// target of a tooltip showing the FULL untruncated argument values.
-fn render_tool_block(tool: &crate::registry::RunningTool) -> Element<'static, Message> {
+fn render_tool_block(tool: &crate::registry::RunningTool) -> Element<'static, RunningMessage> {
     let mut block = Column::new().spacing(2).align_x(Alignment::Start).push(
         text(tool.name.clone())
             .size(11)
@@ -614,7 +713,7 @@ fn value_display(value: &str) -> String {
 /// (stable, so equal-length pairs keep registration order) — the shortest
 /// pairs sit at the top and stay visible even when the longest values extend
 /// beyond the viewport. Values are full and untruncated, including secrets.
-fn render_tool_tooltip(tool: &crate::registry::RunningTool) -> Element<'static, Message> {
+fn render_tool_tooltip(tool: &crate::registry::RunningTool) -> Element<'static, RunningMessage> {
     let mut pairs = tool.args.clone();
     pairs.sort_by_key(|(_, v)| v.chars().count());
 
@@ -640,7 +739,7 @@ fn render_tool_tooltip(tool: &crate::registry::RunningTool) -> Element<'static, 
 /// No workspace name (the section header carries it); the elapsed time uses
 /// the same brighter tone as agent cards. The purpose is the static
 /// human-readable label — raw kind names never leak.
-fn render_call_row(call: &CallRow) -> Element<'static, Message> {
+fn render_call_row(call: &CallRow) -> Element<'static, RunningMessage> {
     let h = &call.handle;
     let elapsed = format_elapsed(h.started_at);
     let purpose = crate::call_registry::call_kind_label(h.kind);

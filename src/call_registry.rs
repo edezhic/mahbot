@@ -100,6 +100,20 @@ impl NonAgentCallRegistry {
             .cloned()
             .collect()
     }
+
+    /// Remove every in-flight call belonging to a direct parent invocation
+    /// (ticket / analyze round / research run). Purely observational — the
+    /// RAII guards' drops become no-ops. Used by the research manual-cancel
+    /// path so the run's group disappears from Running Agents immediately
+    /// instead of lingering until the orchestrator task returns (which can be
+    /// minutes mid-LLM-call).
+    pub fn remove_by_parent_key(&self, parent: &ParentKey) {
+        let parent = parent.clone();
+        self.inner
+            .lock()
+            .unwrap_poison()
+            .retain(|_, h| h.parent_key.as_ref() != Some(&parent));
+    }
 }
 
 /// RAII guard: removes its registry entry on drop.
@@ -235,5 +249,53 @@ mod tests {
             "Other LLM work",
             "unknown kinds fall back to a generic label"
         );
+    }
+
+    #[test]
+    fn remove_by_parent_key_removes_matching_calls_only() {
+        // Two calls of runA + one call of runB — removing runA must drop its
+        // calls from the live list and leave runB's call visible.
+        let run_a1 = NON_AGENT_CALLS.register(
+            "consolidate",
+            "ws1",
+            Some(ParentKey::Research("runA".to_string())),
+            false,
+            None,
+        );
+        let run_a2 = NON_AGENT_CALLS.register(
+            "synthesis",
+            "ws1",
+            Some(ParentKey::Research("runA".to_string())),
+            false,
+            None,
+        );
+        let run_b1 = NON_AGENT_CALLS.register(
+            "synthesize",
+            "ws1",
+            Some(ParentKey::Research("runB".to_string())),
+            false,
+            None,
+        );
+
+        NON_AGENT_CALLS.remove_by_parent_key(&ParentKey::Research("runA".to_string()));
+
+        let handles = NON_AGENT_CALLS.list();
+        assert!(
+            !handles
+                .iter()
+                .any(|h| h.parent_key == Some(ParentKey::Research("runA".to_string()))),
+            "runA calls removed from the live list"
+        );
+        assert!(
+            handles
+                .iter()
+                .any(|h| h.parent_key == Some(ParentKey::Research("runB".to_string()))),
+            "runB call still visible"
+        );
+        // The guards' drops are now no-ops (their entries are already gone) —
+        // dropping them must not panic and must not disturb anything else.
+        drop(run_a1);
+        drop(run_a2);
+        drop(run_b1);
     }
 }

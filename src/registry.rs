@@ -415,6 +415,19 @@ impl AgentRegistry {
         });
     }
 
+    /// Cancel every agent belonging to a direct parent invocation (ticket /
+    /// analyze round / research run) as a group. Used by the research
+    /// manual-cancel path to stop the whole run (analysts, verifier, coder,
+    /// and the cleanup agent — they share the run's [`ParentKey::Research`]).
+    ///
+    /// Follows the lock-ordering invariant documented on
+    /// [`cancel_matching`](AgentRegistry::cancel_matching): the predicate runs
+    /// under the lock, cancellation outside it.
+    pub fn cancel_by_parent_key(&self, parent: &ParentKey) {
+        let parent = parent.clone();
+        self.cancel_matching(move |entry| entry.handle.parent_key.as_ref() == Some(&parent));
+    }
+
     /// Snapshot of all currently running agents (serializable).
     #[must_use]
     pub fn list(&self) -> Vec<AgentHandle> {
@@ -815,5 +828,59 @@ mod tests {
             "newer completed tool replaces the old one"
         );
         AGENT_REGISTRY.deregister(&agent_id, generation);
+    }
+
+    #[test]
+    fn cancel_by_parent_key_cancels_matching_agents_only() {
+        // Two agents of runA + one agent of runB — a group cancel of runA must
+        // fire exactly the runA tokens and leave runB untouched.
+        let a1 = format!("cancel_parent_a1_{}", crate::generate_suffix());
+        let a2 = format!("cancel_parent_a2_{}", crate::generate_suffix());
+        let b1 = format!("cancel_parent_b1_{}", crate::generate_suffix());
+        let ws = crate::Workspace {
+            name: "ws_cancel_parent".to_string(),
+            path: "/tmp/ws_cancel_parent".to_string(),
+            ..Default::default()
+        };
+        let register_with_parent = |agent_id: &str, parent: ParentKey| {
+            AGENT_REGISTRY.register(
+                agent_id.to_string(),
+                "analyst".to_string(),
+                None,
+                &ws,
+                "test".to_string(),
+                CancellationToken::new(),
+                Some(parent),
+                None,
+            )
+        };
+        let gen_a1 = register_with_parent(&a1, ParentKey::Research("runA".to_string()));
+        let gen_a2 = register_with_parent(&a2, ParentKey::Research("runA".to_string()));
+        let gen_b1 = register_with_parent(&b1, ParentKey::Research("runB".to_string()));
+
+        AGENT_REGISTRY.cancel_by_parent_key(&ParentKey::Research("runA".to_string()));
+
+        // runA agents are gone from the registry (cancel removes the entry);
+        // runB survives.
+        assert!(
+            !AGENT_REGISTRY.contains(&a1) && !AGENT_REGISTRY.contains(&a2),
+            "runA agents cancelled (entry removed)"
+        );
+        assert!(
+            AGENT_REGISTRY.contains(&b1),
+            "runB agent untouched by the runA group cancel"
+        );
+        let b = AGENT_REGISTRY
+            .list()
+            .into_iter()
+            .find(|h| h.agent_id == b1)
+            .expect("runB agent still registered");
+        assert_eq!(
+            b.parent_key,
+            Some(ParentKey::Research("runB".to_string())),
+            "runB agent keeps its parent key"
+        );
+        AGENT_REGISTRY.deregister(&b1, gen_b1);
+        let _ = (gen_a1, gen_a2);
     }
 }

@@ -407,6 +407,14 @@ pub(crate) fn cleanup_agent_id(job_id: &str) -> String {
 /// `Ok(None)` when the row already exists (deduped — the boot-scan arm resumes
 /// the surviving row). Idempotent.
 pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<String>> {
+    // Manual-cancel gate: a cancelled run must never get a cleanup agent —
+    // the cancel sweep owns the folder deletion. The research job row is
+    // already gone at this point (cancelled runs are swept), so this is a
+    // defensive guard for a racing terminalize.
+    if crate::research_cancel::is_cancelled(job_id) {
+        tracing::info!(job = %job_id, "Research cleanup suppressed by manual cancel");
+        return Ok(None);
+    }
     let conn = &crate::session::store().conn;
     // The row itself is the dedup marker: a surviving row means the cleanup is
     // already in flight (crash between dispatch and completion) — no second
@@ -541,16 +549,22 @@ async fn run_cleanup_agent_and_finish(
     .await;
     // The cleaner's final response is logged for observability (no archive
     // append, no cleanup_report.md, no report consumer); on failure it is a
-    // visible failure signal in the log.
-    let report = response.unwrap_or_else(|| {
-        format!(
-            "Research cleanup FAILED (job {job_id}): {}",
-            agent
-                .failure
-                .clone()
-                .unwrap_or_else(|| "no failure detail".to_string())
-        )
-    });
+    // visible failure signal in the log. A manual-cancel kill of the run is
+    // not a failure — the tail still releases the folder (double-release
+    // safe) and terminalizes the (already deleted) row (no-op).
+    let report = if agent.is_cancelled() {
+        "cancelled (manual research-run cancel)".to_string()
+    } else {
+        response.unwrap_or_else(|| {
+            format!(
+                "Research cleanup FAILED (job {job_id}): {}",
+                agent
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| "no failure detail".to_string())
+            )
+        })
+    };
     tracing::info!(
         job = %job_id,
         agent = %agent_id,

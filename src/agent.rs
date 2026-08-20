@@ -249,6 +249,17 @@ impl Agent {
             Some(crate::registry::ParentKey::Ticket(_)) => ticket.as_ref().map(|t| t.title.clone()),
             _ => None,
         });
+        // Registration-time manual-cancel check: a sub-agent of a research
+        // run whose cancel signal already fired (the user cancelled the run
+        // from the Running Agents page) must never run a round — even when it
+        // registers AFTER the registry's cancel sweep (the late-register
+        // race). The token is pre-cancelled, so the agent's llm_loop bails at
+        // its first iteration-top check and the round yields no response.
+        if let Some(crate::registry::ParentKey::Research(run_id)) = &parent_key
+            && crate::research_cancel::is_cancelled(run_id)
+        {
+            cancel_token.cancel();
+        }
         let generation = crate::registry::AGENT_REGISTRY.register(
             agent_id.clone(),
             role.to_string(),

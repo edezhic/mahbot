@@ -289,6 +289,8 @@ pub enum Message {
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
     Sessions(sessions::SessionsMessage),
+    /// Running Agents page messages (manual research-run cancel).
+    RunningAgents(running::RunningMessage),
     /// Diff modal overlay (not a page) — wraps [`diff::DiffMessage`].
     /// Named `DiffModal` rather than `Diff` to avoid ambiguity with the
     /// removed `Page::Diff` variant and the existing page-message convention.
@@ -549,6 +551,11 @@ pub struct Dashboard {
     /// [`Message::UpdateBot`]; the build/install itself only starts on
     /// [`Message::ConfirmUpdate`], so dismissing leaves the system untouched.
     show_update_confirm: bool,
+    /// Research run awaiting manual-cancel confirmation — the run's durable
+    /// job id. `Some` while the confirm dialog is shown on the Running Agents
+    /// page; the cancel runs only on [`running::RunningMessage::CancelConfirmed`].
+    /// The id is never displayed as text — the button message carries it.
+    pending_research_cancel: Option<String>,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
@@ -602,6 +609,7 @@ impl Dashboard {
             exit_requested_during_update: false,
             draining: false,
             show_update_confirm: false,
+            pending_research_cancel: None,
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
@@ -948,7 +956,13 @@ impl Dashboard {
                     .update(board::BoardMessage::Escape)
                     .map(Message::Board),
                 // Shell and Running Agents have no escape handling.
-                Page::Shell | Page::RunningAgents => Task::none(),
+                // Running Agents: Escape dismisses the pending research-cancel
+                // confirmation (Keep) — never confirms it.
+                Page::RunningAgents => {
+                    self.pending_research_cancel = None;
+                    Task::none()
+                }
+                Page::Shell => Task::none(),
                 Page::Logs => self
                     .logs_state
                     .update(
@@ -1059,6 +1073,49 @@ impl Dashboard {
         ];
 
         Task::batch(tasks.into_iter().flatten())
+    }
+
+    /// Process a Running Agents page message — the manual research-run
+    /// cancel flow: button → pending-confirmation → async cancel → toast.
+    fn process_running_message(&mut self, msg: running::RunningMessage) -> Task<Message> {
+        match msg {
+            running::RunningMessage::CancelRequest(run_key) => {
+                // Pending-confirmation only: the dialog renders over the
+                // Running Agents page; the run key is never displayed.
+                self.pending_research_cancel = Some(run_key);
+                Task::none()
+            }
+            running::RunningMessage::CancelConfirmed => {
+                let Some(run_key) = self.pending_research_cancel.take() else {
+                    return Task::none();
+                };
+                // The cancel is async: fire the run's signal, stop the run's
+                // agents, remove the durable rows, release the folder and
+                // archive. Silent to the Manager/caller — only the GUI gets a
+                // toast.
+                Task::perform(
+                    async move { crate::research_cancel::cancel_research_run(&run_key).await },
+                    |result| {
+                        Message::RunningAgents(running::RunningMessage::CancelFinished(result))
+                    },
+                )
+            }
+            running::RunningMessage::CancelDismissed => {
+                self.pending_research_cancel = None;
+                Task::none()
+            }
+            running::RunningMessage::CancelFinished(result) => {
+                let toast = match result {
+                    Ok(()) => ToastMessage::SuccessMsg(
+                        "Research run cancelled — agents stopped, run removed permanently."
+                            .to_string(),
+                    ),
+                    Err(e) => ToastMessage::Error(format!("research cancel failed: {e}")),
+                };
+                self.toasts.push(Toast::from_toast_msg(&toast));
+                Task::none()
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1244,6 +1301,7 @@ impl Dashboard {
                 self.board_state.update(msg).map(Message::Board)
             }
             Message::Sessions(msg) => self.sessions_state.update(msg).map(Message::Sessions),
+            Message::RunningAgents(msg) => self.process_running_message(msg),
             // Intercept CloseModal from successful manual commit — auto-close
             // the diff modal while keeping the diff state in working-tree view.
             // ClearCommitState is intentionally not emitted; the commit handler
@@ -1694,7 +1752,9 @@ impl Dashboard {
                 .settings_state
                 .view(self.selected_user_name.as_deref())
                 .map(Message::Settings),
-            Page::RunningAgents => running::view(&self.workspaces),
+            Page::RunningAgents => {
+                running::view(&self.workspaces, self.pending_research_cancel.as_deref())
+            }
         };
 
         let body = column![

@@ -400,6 +400,20 @@ pub(crate) async fn complete_job_with_envelope(
     .await
     .with_context(|| format!("failed to persist envelope for job {job_id}"))?;
     delete_job_tx(&tx, job_id).await?;
+    // Manual-cancel gate INSIDE the tx (after the INSERT, before the
+    // commit): the tx holds the single-writer lock, so a cancel that
+    // fired after the caller's pre-completion gate check is still
+    // observed here and rolls the tx back (the default DropBehavior) —
+    // the pending row is never committed and the job row survives for
+    // the cancel sweep. The sweep's own DELETE then serializes behind
+    // this tx (single-writer), so no cancelled run can leave a
+    // deliverable pending row. Only research runs ever register a cancel
+    // signal (analyze job ids are never registered) — no behavior change
+    // for other job kinds.
+    if crate::research_cancel::is_cancelled(job_id) {
+        tracing::info!(job = %job_id, "Job completion rolled back — run manually cancelled");
+        return Ok(());
+    }
     tx.commit().await?;
     Ok(())
 }

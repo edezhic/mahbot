@@ -41,6 +41,7 @@ pub(crate) mod onnx;
 pub(crate) mod prompt;
 pub mod providers;
 pub mod registry;
+pub(crate) mod research_cancel;
 pub mod research_cleanup;
 pub(crate) mod retry;
 pub(crate) mod role;
