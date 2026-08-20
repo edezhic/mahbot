@@ -1077,11 +1077,13 @@ async fn rollback_stranded_tickets(rollbacks: &[(String, String, bool)]) -> bool
         }
         // Phase CAS: the ticket's current phase must equal the dispatched-for
         // phase — a moved ticket is not rolled back.
+        let sql = format!(
+            "UPDATE tickets SET {} WHERE id = ?3 AND phase = ?5",
+            crate::board::BoardStore::RESET_TICKET_SET_CLAUSE
+        );
         let updated = tx
             .execute(
-                "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
-                 pipeline_reservation = ?4 \
-                 WHERE id = ?3 AND phase = ?5",
+                &sql,
                 crate::turso::params![
                     to,
                     now.clone(),

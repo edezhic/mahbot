@@ -1652,6 +1652,19 @@ impl BoardStore {
             .find(|t| t.from == from)
             .map(|t| (t.to, t.pipeline_reservation))
     }
+    /// SET clause shared by the boot reset ([`Self::reset_inflight_tickets`])
+    /// and the stale-purge rollback in jobs.rs: phase + assignee clear +
+    /// updated_at + pipeline reservation.
+    ///
+    /// Parameter slots: `?1` = target phase, `?2` = now, `?4` =
+    /// pipeline_reservation (`?3`/`?5` are WHERE-bound at the call sites —
+    /// board.rs binds `?3` = source phase; jobs.rs binds `?3` = ticket id and
+    /// `?5` = source phase).
+    ///
+    /// Interpolated via `format!` at both call sites — must never contain a
+    /// literal `{` or `}`.
+    pub(crate) const RESET_TICKET_SET_CLAUSE: &str =
+        "phase = ?1, assigned_to = NULL, updated_at = ?2, pipeline_reservation = ?4";
     /// Reset all in-flight tickets to their ready state (for crash/restart recovery).
     ///
     /// Resets:
@@ -1699,8 +1712,8 @@ impl BoardStore {
                 )
             };
             let sql = format!(
-                "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
-                 pipeline_reservation = ?4 WHERE phase = ?3{clause}"
+                "UPDATE tickets SET {} WHERE phase = ?3{clause}",
+                Self::RESET_TICKET_SET_CLAUSE
             );
             tx.execute(&sql, values).await?;
         }
