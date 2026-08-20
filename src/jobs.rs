@@ -13,7 +13,6 @@ use crate::Role;
 use crate::message_router::{AgentJob, JobKind};
 use crate::turso::{self, Connection, Row, TxGuard, Value, params};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -60,8 +59,7 @@ impl std::str::FromStr for RowStatus {
 }
 
 /// Values of `agents.kind` — dispatch-slot kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Analyst,
     Verifier,
@@ -83,7 +81,9 @@ impl AgentKind {
 
 /// Boot re-dispatch cap for a single job (retry_count increments per
 /// boot-resume attempt; exceeding the cap → partial report from checkpoint
-/// (research) or failed (other kinds)). In-job retries are not counted.
+/// (research), failure envelope (analyze), marked done (ticket_stage), or
+/// left for the periodic purge (research_cleanup)). In-job retries are not
+/// counted.
 pub const MAX_BOOT_REDISPATCH: i64 = 3;
 
 /// Graceful-shutdown drain cap: in-flight work completes within this window,
@@ -486,8 +486,8 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
     Ok(())
 }
 
-/// Delete the jobs row (CASCADE destroys ticket_stage/analyze/research child
-/// rows) inside an existing transaction.
+/// Delete the jobs row (CASCADE destroys ticket_stage/research child rows)
+/// inside an existing transaction.
 async fn delete_job_tx(tx: &TxGuard<'_>, job_id: &str) -> Result<()> {
     tx.execute("DELETE FROM jobs WHERE id = ?1", params![job_id])
         .await
@@ -1120,7 +1120,9 @@ async fn rollback_stranded_tickets(rollbacks: &[(String, String, bool)]) -> bool
 /// Boot recovery scan: first statement of run_management, before
 /// reset_inflight_tickets. Order: (0) replay pending_jobs; (1) ticket_stage
 /// scan → resumed-ticket exclusion set; (2) reworked reset_inflight_tickets
-/// with NOT IN exclusion; (3) research; (4) analyze.
+/// with NOT IN exclusion; (3) one combined loop over the remaining kinds
+/// (research/analyze resumed or capped, research_cleanup resumed or
+/// folder-released in-process, temp_cleanup terminalized).
 ///
 /// Every resumed job gets updated_at = now (the boot bump — the ONLY
 /// protection for the pre-first-commit window; Session::init with an empty
@@ -1359,7 +1361,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
     let elapsed = start.elapsed();
     info!(
         duration_ms = elapsed.as_millis() as u64,
-        resumed_tickets = resumable.len(),
+        resumed_tickets = resumable.len() - resumed_other,
         resumed_other,
         replayed_pending = replayed,
         "Boot recovery scan complete",
