@@ -882,29 +882,12 @@ impl Agent {
             .await
             .with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
-        // Reasoning-only stop (empty content, no parsed tool calls): classified
-        // HERE, before any promotion/persistence/display. The provider-layer
-        // reasoning→text promotion is gone, so the response is the model's
-        // honest output. Recover via bounded continuation; on exhaustion the
-        // turn fails safely — nothing persisted, nothing displayed, the
-        // existing failure indicators (direct chat emoji / pipeline comment)
-        // fire. The continuation is appended-only and never touches the
-        // session transcript, so the thinking can never leak to the user.
-        let response = if is_reasoning_only_stop(&response) {
-            match self
-                .recover_reasoning_only_stop(messages, response, "agent-continuation")
-                .await
-            {
-                Ok(cont) => cont,
-                Err(exhausted) => {
-                    return Err(anyhow::Error::new(exhausted).context(
-                        "model returned only reasoning without an answer after continuation attempts",
-                    ));
-                }
-            }
-        } else {
-            response
-        };
+        // Reasoning-only stop: recovered here — before any promotion,
+        // persistence or display — via the bounded continuation (leak-safety
+        // invariants are documented on `recover_if_reasoning_only_stop`).
+        let response = self
+            .recover_if_reasoning_only_stop(messages, response, Self::AGENT_REASONING_RECOVERY)
+            .await?;
 
         // A SUCCESSFUL agent-purpose call updates the session length; failures
         // never reach here (the error above propagates), and a reasoning-only
@@ -1148,6 +1131,53 @@ impl Agent {
             }
             None => Err(exhausted),
         }
+    }
+
+    /// Recovery policy for the agent loop ([`Self::llm_call`]): continuation
+    /// exhaustion fails the turn.
+    const AGENT_REASONING_RECOVERY: ReasoningOnlyStopRecovery = ReasoningOnlyStopRecovery {
+        purpose: "agent-continuation",
+        exhausted_ctx: "model returned only reasoning without an answer after continuation attempts",
+    };
+
+    /// Recovery policy for summarization ([`Self::summarize`]): continuation
+    /// exhaustion fails open with the full history.
+    const SUMMARIZE_REASONING_RECOVERY: ReasoningOnlyStopRecovery = ReasoningOnlyStopRecovery {
+        purpose: "summarize-continuation",
+        exhausted_ctx: "summarization continuation exhausted — failing open with full history",
+    };
+
+    /// Recover a reasoning-only stop via the bounded continuation, or pass
+    /// the response through unchanged.
+    ///
+    /// This is the single classification point for the reasoning-only stop
+    /// (empty content, no parsed tool calls), reached by both LLM paths before
+    /// any promotion, persistence or display. The provider-layer reasoning→text
+    /// promotion is gone, so the response is the model's honest output.
+    ///
+    /// On continuation exhaustion the returned error carries
+    /// `recovery.exhausted_ctx` — the caller's failure semantics: the agent
+    /// loop fails the turn safely (nothing persisted, nothing displayed; the
+    /// existing failure indicators — direct chat emoji / pipeline comment —
+    /// fire), while the summarize path fails open, warning and continuing with
+    /// the full history.
+    ///
+    /// Leak-safety invariants (shared by both paths): the continuation is
+    /// appended-only and never touches the session transcript, so the thinking
+    /// can never leak to the user — and the exhaustion error never embeds the
+    /// thinking text either (see [`Self::recover_reasoning_only_stop`]).
+    async fn recover_if_reasoning_only_stop(
+        &self,
+        messages: Vec<ChatMessage>,
+        response: ChatResponse,
+        recovery: ReasoningOnlyStopRecovery,
+    ) -> anyhow::Result<ChatResponse> {
+        if !is_reasoning_only_stop(&response) {
+            return Ok(response);
+        }
+        self.recover_reasoning_only_stop(messages, response, recovery.purpose)
+            .await
+            .map_err(|e| anyhow::Error::new(e).context(recovery.exhausted_ctx))
     }
 
     /// Record the real provider-reported session length after a SUCCESSFUL
@@ -1410,24 +1440,12 @@ impl Agent {
         .with_context(|| format!("summarization LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
         // Reasoning-only stop: the same bounded continuation as the agent loop
-        // (the provider promotion is gone, so a reasoning-only summary has
-        // empty text). On exhaustion, fail open below — the empty-response
-        // error path warns and continues with the full history.
-        let chat_resp = if is_reasoning_only_stop(&chat_resp) {
-            match self
-                .recover_reasoning_only_stop(history, chat_resp, "summarize-continuation")
-                .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    return Err(anyhow::Error::new(e).context(
-                        "summarization continuation exhausted — failing open with full history",
-                    ));
-                }
-            }
-        } else {
-            chat_resp
-        };
+        // (leak-safety invariants on `recover_if_reasoning_only_stop`). On
+        // exhaustion, fail open below — the empty-response error path warns
+        // and continues with the full history.
+        let chat_resp = self
+            .recover_if_reasoning_only_stop(history, chat_resp, Self::SUMMARIZE_REASONING_RECOVERY)
+            .await?;
 
         if let Some(ref u) = chat_resp.usage {
             tracing::debug!(
@@ -1500,6 +1518,20 @@ impl Agent {
             }
         }
     }
+}
+
+/// Parameters for a reasoning-only-stop recovery: the telemetry purpose tag
+/// forwarded to [`Agent::recover_reasoning_only_stop`] and the context
+/// attached to the exhaustion error. The two strings travel as a single
+/// named-field struct (rather than two adjacent `&'static str` arguments) so
+/// they cannot be silently swapped at a call site — see the per-path
+/// constants on [`Agent`].
+struct ReasoningOnlyStopRecovery {
+    /// Purpose tag for the continuation LLM request (telemetry).
+    purpose: &'static str,
+    /// Context attached to the `anyhow` error when continuation attempts are
+    /// exhausted.
+    exhausted_ctx: &'static str,
 }
 
 /// Result of preparing an assistant turn from the LLM response.
