@@ -794,10 +794,11 @@ pub(crate) struct Verdict {
 }
 
 /// Deserialize a verdict score, self-healing common model emissions:
-/// - [0,10] integers pass through; fractional values floor (8.5 → 8).
+/// - [0,10] values pass through; fractional values floor (8.5 → 8).
 /// - [11,100] divides by 10 then floors (85 → 8, 11 → 1, 100 → 10).
 /// - Integers 101–255 pass through so downstream validation keeps
-///   classifying them as out-of-range (failure-class stability).
+///   classifying them as out-of-range (failure-class stability); the
+///   float spellings of that band (101.0, 255.0) fail closed.
 /// - Everything else (non-numeric, negative, the (10,11) gap, fractions
 ///   outside the bands) fails closed — range checks precede any cast.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -810,19 +811,6 @@ where
     let Some(n) = value.as_number() else {
         return Err(D::Error::custom("verdict score must be a number"));
     };
-    if let Some(i) = n.as_i64() {
-        return if (0..=10).contains(&i) {
-            Ok(i as u8)
-        } else if (11..=100).contains(&i) {
-            Ok((i / 10) as u8)
-        } else if (101..=255).contains(&i) {
-            // Out-of-range integers pass through so downstream validation
-            // keeps their out-of-range classification (failure-class stability).
-            Ok(i as u8)
-        } else {
-            Err(D::Error::custom("verdict score out of accepted ranges"))
-        };
-    }
     let f = n
         .as_f64()
         .ok_or_else(|| D::Error::custom("verdict score out of accepted ranges"))?;
@@ -830,6 +818,11 @@ where
         Ok(f.floor() as u8)
     } else if (11.0..=100.0).contains(&f) {
         Ok((f / 10.0).floor() as u8)
+    } else if (101.0..=255.0).contains(&f) && n.is_i64() {
+        // Out-of-range integers pass through so downstream validation
+        // keeps their out-of-range classification (failure-class stability).
+        // Floats in this band (e.g. 255.0) fail closed.
+        Ok(f as u8)
     } else {
         Err(D::Error::custom("verdict score out of accepted ranges"))
     }
@@ -889,6 +882,16 @@ mod verdict_score_tests {
             Case {
                 json: r#"{"score": 255, "issues": []}"#,
                 expected: Some(255),
+            },
+            // ...but the float spellings of that band fail closed, pinning
+            // the lexical-form distinction (255 accepted vs 255.0 rejected).
+            Case {
+                json: r#"{"score": 101.0, "issues": []}"#,
+                expected: None,
+            },
+            Case {
+                json: r#"{"score": 255.0, "issues": []}"#,
+                expected: None,
             },
             // (10,11) gap and everything outside the bands fail closed.
             Case {
