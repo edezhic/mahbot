@@ -41,7 +41,7 @@ impl DiscoveryClient {
     /// constructed (reqwest 0.13 rustls-no-provider path); every client
     /// construction in the process installs it idempotently.
     #[must_use]
-    // Spec-pinned 60s request timeout (from_secs reads closer to the ticket).
+    // Spec-pinned 60s request timeout (from_secs states the 60s intent directly).
     #[allow(clippy::duration_suboptimal_units)]
     pub(crate) fn new(key: String) -> Self {
         install_ring_provider();

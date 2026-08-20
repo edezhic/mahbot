@@ -1,5 +1,5 @@
 //! Provider selection for the OpenRouter benchmark: cost estimation + the
-//! ticket's selection rules (health gate, outlier filter, top-n, padding).
+//! selection rules (health gate, outlier filter, top-n, padding).
 //!
 //! Pure math — no I/O. All functions here are unit-tested against synthetic
 //! inputs; the caller (dry-run orchestration) feeds live discovery data in.
@@ -220,7 +220,7 @@ pub(crate) fn classify_endpoint(
 
 // ── Selection ──────────────────────────────────────────────────────
 
-/// Select benchmark providers per the ticket rules (see module docs).
+/// Select benchmark providers per the selection rules (see module docs).
 ///
 /// Returns one [`SelectionDecision`] per input (parallel). The plan builder
 /// orders the selected providers by est cost ascending for display.

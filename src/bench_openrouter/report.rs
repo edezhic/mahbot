@@ -3,12 +3,12 @@
 //! The full-run executor writes four artifacts under
 //! `<output-dir>/bench-openrouter/<run-ts>/`:
 //!
-//! - `report.json` — the complete structured run report: run meta, the
-//!   selection JSON, one [`provider_run_json`] entry per provider (flat, nulls
-//!   for absent values), a summary block, and the artifact paths.
-//! - `summary.md` — the human-readable markdown summary (comparison table,
-//!   cache-hold curves, reliability taxonomy, cost analysis, quantization,
-//!   methodology footnote).
+//! - `report.json` — the complete structured run report: run meta, one
+//!   three-column entry per provider (`tag` / `static_price_usd_per_m` /
+//!   `cache_hold`), and the artifact paths.
+//! - `summary.md` — the human-readable markdown summary (meta table, the
+//!   per-provider price + cache-hold table, a short methodology, and an abort
+//!   note when applicable).
 //! - `providers.json` — the verbatim discovery snapshot (raw models /
 //!   endpoints / key payloads with the key redacted).
 //! - `manifest.json` — the run manifest: scrubbed argv + env entries +
@@ -22,12 +22,13 @@
 //! synthetic inputs; [`write_artifacts`] and [`acquire_run_lock`] are the only
 //! I/O boundaries.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::bench_openrouter::discovery::DiscoverySnapshot;
-use crate::bench_openrouter::run::{ProviderRun, RoundRecord};
+use crate::bench_openrouter::discovery::{DiscoverySnapshot, EndpointInfo, Pricing};
+use crate::bench_openrouter::run::ProviderRun;
 use crate::bench_openrouter::{BenchOptions, discovery::parse_price};
 
 // ── Paths ──────────────────────────────────────────────────────────
@@ -236,37 +237,33 @@ pub(crate) struct RunMeta {
 
 /// Build the complete structured report (pure — no I/O).
 ///
-/// `selection_reasons` is parallel to `providers`: `(selected, selection_reason)`
-/// per provider, in the same order as the providers slice.
+/// Every discovered endpoint gets a providers-array entry; the cache-hold is
+/// the run's `cache_hold_bucket` when a run exists for that tag, else
+/// `"not measured"`.
 #[must_use]
 pub(crate) fn build_report(
     meta: &RunMeta,
-    selection: &serde_json::Value,
+    endpoints: &[EndpointInfo],
     providers: &[ProviderRun],
-    selection_reasons: &[(bool, Option<String>)],
     output_dir: &Path,
 ) -> serde_json::Value {
-    let provider_json: Vec<serde_json::Value> = providers
+    let by_tag: HashMap<&str, &ProviderRun> = providers
         .iter()
-        .zip(selection_reasons)
-        .map(|(run, (selected, reason))| provider_run_json(run, *selected, reason.as_deref()))
+        .map(|run| (run.tag.as_str(), run))
         .collect();
 
-    let completed_count = providers
+    let provider_json: Vec<serde_json::Value> = endpoints
         .iter()
-        .filter(|p| !p.incomplete && !p.aborted)
-        .count();
-    let total_billed_usd: f64 = providers.iter().map(|p| p.billed_usd).sum();
-    let total_estimated_usd: f64 = providers.iter().map(|p| p.estimated_usd).sum();
-    let cache_supported_count = providers.iter().filter(|p| p.cache_supported).count();
-
-    let mut hold_dist: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for p in providers {
-        *hold_dist.entry(p.cache_hold_bucket.as_str()).or_insert(0) += 1;
-    }
-    let hold_distribution: serde_json::Map<String, serde_json::Value> = hold_dist
-        .into_iter()
-        .map(|(bucket, count)| (bucket.to_string(), json!(count)))
+        .map(|ep| {
+            let cache_hold = by_tag
+                .get(ep.tag.as_str())
+                .map_or("not measured", |run| run.cache_hold_bucket.as_str());
+            json!({
+                "tag": ep.tag,
+                "static_price_usd_per_m": static_price_usd_per_m(ep.pricing.as_ref()),
+                "cache_hold": cache_hold,
+            })
+        })
         .collect();
 
     json!({
@@ -283,16 +280,7 @@ pub(crate) fn build_report(
             "abort_reason": meta.abort_reason,
             "exit_code": meta.exit_code,
         },
-        "selection": selection.clone(),
         "providers": provider_json,
-        "summary": {
-            "selected_count": providers.len(),
-            "completed_count": completed_count,
-            "total_billed_usd": total_billed_usd,
-            "total_estimated_usd": total_estimated_usd,
-            "cache_supported_count": cache_supported_count,
-            "hold_distribution": hold_distribution,
-        },
         "artifacts": {
             "run_dir": output_dir.display().to_string(),
             "report": "report.json",
@@ -303,181 +291,24 @@ pub(crate) fn build_report(
     })
 }
 
-/// One provider's flat report object (nulls for absent values).
-#[must_use]
-// u64→f64 is exact for token counts far below 2^53; blended cost math needs floats.
-#[allow(clippy::cast_precision_loss)]
-fn provider_run_json(
-    run: &ProviderRun,
-    selected: bool,
-    selection_reason: Option<&str>,
-) -> serde_json::Value {
-    let ep = &run.endpoint;
-
-    let total = run.total_tokens_reported;
-    let blended = if total > 0 {
-        Some(run.billed_usd / total as f64 * 1e6)
-    } else {
-        None
-    };
-    let per_m_at_validated_mix = price_triple(run).map(|(cache_read, prompt, completion)| {
-        session_cost(1e6, cache_read, prompt, completion, 0.977, 0.014, 0.009)
-    });
-    let per_m_all_miss = price_triple(run).map(|(_, prompt, completion)| {
-        session_cost(1e6, prompt, prompt, completion, 1.0, 0.0, 0.0)
-    });
-
-    let warmup: Vec<serde_json::Value> = run.warmup.iter().map(round_json).collect();
-    let ladder: Vec<serde_json::Value> = run.ladder.iter().map(round_json).collect();
-
-    json!({
-        "tag": run.tag,
-        "name": ep.name,
-        "provider_name": ep.provider_name,
-        "quantization": ep.quantization,
-        "status": ep.status,
-        "supports_implicit_caching": ep.supports_implicit_caching,
-        "context_length": ep.context_length,
-        "selected": selected,
-        "selection_reason": selection_reason,
-        "cache_supported": run.cache_supported,
-        "contamination_warning": run.contamination_warning,
-        "warmup": warmup,
-        "ladder": ladder,
-        "cache_hold_bucket": run.cache_hold_bucket,
-        "cache_hold_curve": run.cache_hold_curve,
-        "cost": {
-            "estimated_usd": run.estimated_usd,
-            "billed_usd": run.billed_usd,
-            "delta_usd": run.billed_usd - run.estimated_usd,
-            "blended_usd_per_m": blended,
-            "per_m_at_validated_mix": per_m_at_validated_mix,
-            "per_m_all_miss": per_m_all_miss,
-        },
-        "latency": run.latency,
-        "token_usage": run.token_usage,
-        "reliability": run.reliability,
-        "incomplete": run.incomplete,
-        "incomplete_reason": run.incomplete_reason,
-        "aborted": run.aborted,
-        "abort_reason": run.abort_reason,
-    })
-}
-
-/// One round's flat JSON (Option fields render as null automatically).
-#[must_use]
-fn round_json(rec: &RoundRecord) -> serde_json::Value {
-    json!({
-        "kind": rec.kind,
-        "rung": rec.rung,
-        "nominal_gap_secs": rec.nominal_gap_secs,
-        "measured_gap_ms": rec.measured_gap_ms,
-        "t_send": rec.t_send,
-        "t_headers": rec.t_headers,
-        "t_body": rec.t_body,
-        "prompt_hash": rec.prompt_hash,
-        "http_status": rec.http_status,
-        "finish_reason": rec.finish_reason,
-        "serving_provider": rec.serving_provider,
-        "pin_verified": rec.pin_verified,
-        "generation_id": rec.generation_id,
-        "response_cache_hit": rec.response_cache_hit,
-        "usage": {
-            "prompt_tokens": rec.usage.prompt_tokens,
-            "completion_tokens": rec.usage.completion_tokens,
-            "total_tokens": rec.usage.total_tokens,
-            "cached_tokens": rec.usage.cached_tokens,
-            "cache_write_tokens": rec.usage.cache_write_tokens,
-            "miss_tokens": rec.usage.miss_tokens,
-            "reasoning_tokens": rec.usage.reasoning_tokens,
-            "cost": rec.usage.cost,
-        },
-        "cache_classification": rec.cache_classification,
-        "expected_cached_tokens": rec.expected_cached_tokens,
-        "error_class": rec.error_class,
-        "retries": rec.retries,
-        "cache_status_header": rec.cache_status_header,
-    })
-}
-
 // ── Summary markdown ───────────────────────────────────────────────
 
-/// Per-provider prices for the cost tables: cache-read (falling back to the
-/// full prompt price when the provider omits cache pricing), prompt and
-/// completion, all in USD per token. `None` when pricing is entirely absent.
+/// Ladder gap rendered for the summary: raw seconds below 30 minutes, whole
+/// minutes above (the default ladder reads `0s, 5s, 30s, 120s, 300s, 600s, 30m`).
 #[must_use]
-fn price_triple(run: &ProviderRun) -> Option<(f64, f64, f64)> {
-    let p = run.endpoint.pricing.as_ref()?;
-    let cache_read = p
-        .input_cache_read
-        .as_deref()
-        .and_then(parse_price)
-        .or_else(|| p.prompt.as_deref().and_then(parse_price))?;
-    let prompt = p.prompt.as_deref().and_then(parse_price)?;
-    let completion = p.completion.as_deref().and_then(parse_price)?;
-    Some((cache_read, prompt, completion))
-}
-
-/// Median of the round-trip (`full_ms`) latencies, or `None` when no round
-/// succeeded.
-#[must_use]
-fn latency_p50_ms(run: &ProviderRun) -> Option<u64> {
-    let mut ms: Vec<u64> = run
-        .latency
-        .get("full_ms")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| arr.iter().filter_map(serde_json::Value::as_u64).collect())
-        .unwrap_or_default();
-    if ms.is_empty() {
-        return None;
-    }
-    ms.sort_unstable();
-    let mid = ms.len() / 2;
-    Some(if ms.len().is_multiple_of(2) {
-        // Overflow-safe midpoint on the sorted slice (b >= a).
-        ms[mid - 1] + (ms[mid] - ms[mid - 1]) / 2
+fn format_ladder_gap(secs: u64) -> String {
+    if secs < 1800 {
+        format!("{secs}s")
     } else {
-        ms[mid]
-    })
-}
-
-/// Measured cache-hit ratio `cached / (cached + miss)` from the run's token
-/// usage (0 when no prompt tokens were reported).
-#[must_use]
-// u64→f64 is exact for token counts far below 2^53; ratio math needs floats.
-#[allow(clippy::cast_precision_loss)]
-fn measured_hit_ratio(run: &ProviderRun) -> f64 {
-    let cached = run
-        .token_usage
-        .get("cached")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let miss = run
-        .token_usage
-        .get("miss")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let denom = cached + miss;
-    if denom == 0 {
-        0.0
-    } else {
-        cached as f64 / denom as f64
+        format!("{}m", secs / 60)
     }
 }
 
 /// Build the human-readable markdown summary (pure — no I/O). Sections:
-/// header + meta table, provider comparison, cache-hold curves, reliability
-/// taxonomy, cost analysis (+ extrapolation), quantization, methodology
-/// footnote, and an abort note when the run was aborted.
+/// header + meta table, the per-provider price + cache-hold table, a short
+/// methodology, and an abort note when the run was aborted.
 #[must_use]
-// One fixed-format document builder; splitting it would obscure the section
-// ordering. u64→f64 is exact for token counts far below 2^53.
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-pub(crate) fn build_summary_md(
-    meta: &RunMeta,
-    report: &serde_json::Value,
-    providers: &[ProviderRun],
-) -> String {
+pub(crate) fn build_summary_md(meta: &RunMeta, report: &serde_json::Value) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
@@ -488,6 +319,13 @@ pub(crate) fn build_summary_md(
     let _ = writeln!(out, "| Duration | {:.1} s |", meta.duration_secs);
     let _ = writeln!(out, "| Key source | {} |", meta.key_source);
     let _ = writeln!(out, "| Spend cap | ${:.2} |", meta.cap_usd);
+    let ladder: Vec<String> = meta
+        .ladder_secs
+        .iter()
+        .map(|&s| format_ladder_gap(s))
+        .collect();
+    let _ = writeln!(out, "| Ladder | {} |", ladder.join(", "));
+    let _ = writeln!(out, "| Output dir | {} |", meta.output_dir.display());
     if meta.aborted {
         let _ = writeln!(
             out,
@@ -495,220 +333,52 @@ pub(crate) fn build_summary_md(
             meta.abort_reason.as_deref().unwrap_or("yes")
         );
     }
-    let _ = writeln!(out, "| Output dir | {} |", meta.output_dir.display());
     let _ = writeln!(out);
 
-    // 2. Provider comparison.
-    let _ = writeln!(out, "## Provider comparison\n");
-    let _ = writeln!(
-        out,
-        "| Provider (tag) | Quant | Status | Cache hold | Latency p50 (ms) | Est $ | Billed $ | Δ $ | Errors | Incomplete |"
-    );
-    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|");
-    for run in providers {
-        let quant = run.endpoint.quantization.as_deref().unwrap_or("");
-        let status = run.endpoint.status.as_deref().unwrap_or("");
-        let p50 = latency_p50_ms(run).map_or_else(|| "n/a".to_string(), |ms| ms.to_string());
-        let errors = run
-            .reliability
-            .get("rounds_failed")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} | {} | {} | {:.4} | {:.4} | {:.4} | {} | {} |",
-            run.tag,
-            quant,
-            status,
-            run.cache_hold_bucket,
-            p50,
-            run.estimated_usd,
-            run.billed_usd,
-            run.billed_usd - run.estimated_usd,
-            errors,
-            if run.incomplete { "yes" } else { "" },
-        );
+    // 2. Per-provider price + cache-hold table (read from the report JSON).
+    let _ = writeln!(out, "## Providers\n");
+    let _ = writeln!(out, "| Provider (tag) | Static price ($/1M) | Cache hold |");
+    let _ = writeln!(out, "|---|---|---|");
+    let providers = report["providers"].as_array().cloned().unwrap_or_default();
+    for p in providers {
+        let tag = p
+            .get("tag")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let price = p
+            .get("static_price_usd_per_m")
+            .and_then(serde_json::Value::as_f64)
+            .map_or_else(|| "n/a".to_string(), |v| format!("{v:.4}"));
+        let hold = p
+            .get("cache_hold")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not measured");
+        let _ = writeln!(out, "| {tag} | {price} | {hold} |");
     }
     let _ = writeln!(out);
 
-    // 3. Cache-hold curves.
-    let _ = writeln!(out, "## Cache-hold curves\n");
-    for run in providers {
-        let curve: Vec<String> = run
-            .cache_hold_curve
-            .iter()
-            .map(|c| {
-                let gap = c
-                    .get("gap_secs")
-                    .and_then(serde_json::Value::as_f64)
-                    .unwrap_or(0.0);
-                let cls = c
-                    .get("classification")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("invalid");
-                format!("{gap:.0}s={cls}")
-            })
-            .collect();
-        let _ = writeln!(out, "`{}`: {}", run.tag, curve.join(" "));
-    }
-    let _ = writeln!(out);
-
-    // 4. Reliability taxonomy (aggregated error classes, sorted desc).
-    let _ = writeln!(
-        out,
-        "## Reliability taxonomy\n\n| error class | count |\n|---|---|"
-    );
-    let mut counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
-    for run in providers {
-        if let Some(errors) = run
-            .reliability
-            .get("errors")
-            .and_then(serde_json::Value::as_array)
-        {
-            for e in errors {
-                if let (Some(class), Some(count)) = (
-                    e.get("class").and_then(serde_json::Value::as_str),
-                    e.get("count").and_then(serde_json::Value::as_u64),
-                ) {
-                    *counts.entry(class).or_insert(0) += count;
-                }
-            }
-        }
-    }
-    let mut sorted: Vec<(&str, u64)> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    for (class, count) in sorted {
-        let _ = writeln!(out, "| {class} | {count} |");
-    }
-    let _ = writeln!(out);
-
-    // 5. Cost analysis.
-    let _ = writeln!(out, "## Cost analysis\n");
-    let _ = writeln!(
-        out,
-        "| tag | billed $ | est $ | blended $/M (measured) | $/M @ validated mix | $/M all-miss |"
-    );
-    let _ = writeln!(out, "|---|---|---|---|---|---|");
-    for run in providers {
-        let blended = if run.total_tokens_reported > 0 {
-            format!(
-                "{:.4}",
-                run.billed_usd / run.total_tokens_reported as f64 * 1e6
-            )
-        } else {
-            "n/a".to_string()
-        };
-        let (validated, all_miss) = match price_triple(run) {
-            Some((cache_read, prompt, completion)) => (
-                format!(
-                    "{:.4}",
-                    session_cost(1e6, cache_read, prompt, completion, 0.977, 0.014, 0.009)
-                ),
-                format!(
-                    "{:.4}",
-                    session_cost(1e6, prompt, prompt, completion, 1.0, 0.0, 0.0)
-                ),
-            ),
-            None => ("n/a".to_string(), "n/a".to_string()),
-        };
-        let _ = writeln!(
-            out,
-            "| {} | {:.4} | {:.4} | {} | {} | {} |",
-            run.tag, run.billed_usd, run.estimated_usd, blended, validated, all_miss,
-        );
-    }
-    let total_billed = report["summary"]["total_billed_usd"]
-        .as_f64()
-        .unwrap_or(0.0);
-    let total_est = report["summary"]["total_estimated_usd"]
-        .as_f64()
-        .unwrap_or(0.0);
-    let _ = writeln!(
-        out,
-        "| **Total** | {total_billed:.4} | {total_est:.4} | | | |"
-    );
-    let _ = writeln!(out);
-
-    // Extrapolation: 100K / 1M / 10M tokens at the validated mix, plus a
-    // second row at the provider's measured hit ratio when caching is
-    // supported (validated mix when the measured ratio is 0).
-    let _ = writeln!(
-        out,
-        "| tag | 100K tokens | 1M tokens | 10M tokens |\n|---|---|---|---|"
-    );
-    for run in providers {
-        let Some((cache_read, prompt, completion)) = price_triple(run) else {
-            continue;
-        };
-        let validated_row =
-            |n: f64| session_cost(n, cache_read, prompt, completion, 0.977, 0.014, 0.009);
-        let _ = writeln!(
-            out,
-            "| {} (validated mix) | {:.4} | {:.4} | {:.4} |",
-            run.tag,
-            validated_row(1e5),
-            validated_row(1e6),
-            validated_row(1e7),
-        );
-        if run.cache_supported {
-            let ratio = measured_hit_ratio(run);
-            let (mix_cached, mix_input, mix_output) = if ratio == 0.0 {
-                (0.977, 0.014, 0.009)
-            } else {
-                (ratio, 1.0 - ratio, 0.0)
-            };
-            let measured_row = |n: f64| {
-                session_cost(
-                    n, cache_read, prompt, completion, mix_cached, mix_input, mix_output,
-                )
-            };
-            let _ = writeln!(
-                out,
-                "| {} (measured hit {:.3}{}) | {:.4} | {:.4} | {:.4} |",
-                run.tag,
-                ratio,
-                if ratio == 0.0 { "; validated mix" } else { "" },
-                measured_row(1e5),
-                measured_row(1e6),
-                measured_row(1e7),
-            );
-        }
-    }
-    let _ = writeln!(out);
-
-    // 6. Quantization.
-    let _ = writeln!(out, "## Quantization\n");
-    for run in providers {
-        let q = run.endpoint.quantization.as_deref().unwrap_or("n/a");
-        let _ = writeln!(out, "{}: {}", run.tag, q);
-    }
-    let _ = writeln!(out);
-
-    // 7. Methodology footnote (fixed text).
+    // 3. Methodology.
     let _ = writeln!(
         out,
         "## Methodology\n\n\
          - TTL ladder: per provider, 2 byte-identical warmup requests + one ladder round per gap \
          (a 7-gap ladder = 8 ladder rounds); the conversation grows one verified tool frame per round.\n\
-         - Classification: a round is a hit at >=90% of the W2-anchored expected-cached delta, a drop \
-         below 10%, partial in between.\n\
-         - Expected-cached delta: base cache (W2) plus prompt growth since W2, saturating.\n\
-         - Per-run nonce: a random nonce distinguishes runs in API logs while requests stay \
-         byte-identical within a run.\n\
+         - Cache-hold rule: a provider is \"does not cache\" when no warmup-2/ladder round reported \
+         cached tokens; otherwise the bucket is the TTL hold from the ladder (interval notation like \
+         `(5s, 30s]`, `≤5s`, `≥30m`, `immediate drop`).\n\
+         - Providers that did not run (failed to start, skipped the ladder, or were aborted before \
+         the ladder) are \"not measured\".\n\
+         - Static price: the blended cost per 1M tokens at the validated mix (0.977 cached / 0.014 \
+         input / 0.009 output), volume-independent, no per-request fee; `n/a` when the provider \
+         advertises no pricing.\n\
          - Provider pinning: provider.order pins the endpoint tag, allow_fallbacks=false; the serving \
          provider is verified against the endpoint names (drift retried once, then pin_drift).\n\
          - Retries: bounded (<=3 attempts), fixed sleeps (Retry-After clamped to 5-60 s, else 5 s), \
-         never jittered — jitter would corrupt the gap measurement.\n\
-         - Spend cap: total cap aborts the run; per-provider guard (cap x2 / selected count) stops \
-         that provider first.\n\
-         - Deadline: 55 minutes for the whole run; the per-provider deadline races every ladder sleep.\n\
-         - Timestamps: ms-precision RFC 3339 (t_send / t_headers / t_body) for latency and gaps.\n\
-         - Response-cache invalidation: a hit in x-openrouter-cache-status re-sends the round once \
-         and marks it invalid (response_cache) if it persists."
+         never jittered — jitter would corrupt the gap measurement."
     );
     let _ = writeln!(out);
 
-    // 8. Abort note.
+    // 4. Abort note.
     if meta.aborted {
         let _ = writeln!(
             out,
@@ -718,6 +388,24 @@ pub(crate) fn build_summary_md(
     }
 
     out
+}
+
+/// Static price per 1M tokens at the validated mix (0.977 cached / 0.014
+/// input / 0.009 output), volume-independent, no per-request fee. `None` when
+/// pricing is entirely absent.
+#[must_use]
+pub(crate) fn static_price_usd_per_m(pricing: Option<&Pricing>) -> Option<f64> {
+    let p = pricing?;
+    let cache_read = p
+        .input_cache_read
+        .as_deref()
+        .and_then(parse_price)
+        .or_else(|| p.prompt.as_deref().and_then(parse_price))?;
+    let prompt = p.prompt.as_deref().and_then(parse_price)?;
+    let completion = p.completion.as_deref().and_then(parse_price)?;
+    Some(session_cost(
+        1e6, cache_read, prompt, completion, 0.977, 0.014, 0.009,
+    ))
 }
 
 // ── Cost math ──────────────────────────────────────────────────────
@@ -758,7 +446,6 @@ pub(crate) fn providers_snapshot_json(snapshot: &DiscoverySnapshot) -> serde_jso
 mod tests {
     use super::*;
     use crate::bench_openrouter::discovery::{EndpointInfo, Pricing};
-    use crate::bench_openrouter::run::RoundUsage;
 
     fn endpoint(tag: &str, cache_read: &str, prompt: &str, completion: &str) -> EndpointInfo {
         EndpointInfo {
@@ -778,58 +465,10 @@ mod tests {
         }
     }
 
-    fn provider_run(tag: &str, billed: f64, estimated: f64, total_tokens: u64) -> ProviderRun {
+    fn provider_run(tag: &str, cache_hold_bucket: &str) -> ProviderRun {
         ProviderRun {
             tag: tag.to_string(),
-            endpoint: endpoint(tag, "0.0000001", "0.000001", "0.000003"),
-            selection_reason: None,
-            cache_supported: true,
-            contamination_warning: false,
-            warmup: vec![RoundRecord {
-                kind: "warmup",
-                rung: None,
-                nominal_gap_secs: None,
-                measured_gap_ms: None,
-                t_send: "2026-08-20T00:00:00.000Z".to_string(),
-                t_headers: Some("2026-08-20T00:00:00.100Z".to_string()),
-                t_body: "2026-08-20T00:00:00.200Z".to_string(),
-                prompt_hash: "abc".to_string(),
-                http_status: 200,
-                finish_reason: Some("tool_calls".to_string()),
-                serving_provider: Some("Name p".to_string()),
-                pin_verified: true,
-                generation_id: Some("gen-1".to_string()),
-                response_cache_hit: false,
-                usage: RoundUsage {
-                    prompt_tokens: Some(1000),
-                    completion_tokens: Some(10),
-                    total_tokens: Some(1010),
-                    cached_tokens: Some(900),
-                    cache_write_tokens: Some(100),
-                    miss_tokens: Some(100),
-                    reasoning_tokens: Some(0),
-                    cost: Some(billed / 2.0),
-                },
-                cache_classification: Some("hit".to_string()),
-                expected_cached_tokens: Some(900),
-                error_class: None,
-                retries: 0,
-                cache_status_header: Some("MISS".to_string()),
-            }],
-            ladder: vec![],
-            cache_hold_bucket: "≥30m".to_string(),
-            cache_hold_curve: vec![],
-            billed_usd: billed,
-            estimated_usd: estimated,
-            total_tokens_reported: total_tokens,
-            token_usage: json!({"cached": 0u64, "miss": 0u64, "output": 0u64,
-                                "cache_write": 0u64, "reasoning": 0u64}),
-            latency: json!({"header_ms": [100u64], "full_ms": [200u64]}),
-            reliability: json!({"errors": [], "retries": 0, "rounds_failed": 0}),
-            incomplete: false,
-            incomplete_reason: None,
-            aborted: false,
-            abort_reason: None,
+            cache_hold_bucket: cache_hold_bucket.to_string(),
         }
     }
 
@@ -860,21 +499,16 @@ mod tests {
 
     #[test]
     fn build_report_shape_and_totals() {
-        let providers = vec![
-            provider_run("acme-a/fp8", 0.5, 0.4, 100_000),
-            provider_run("acme-b/fp8", 0.3, 0.2, 50_000),
+        // Endpoint A has a run; endpoint B does not (→ "not measured").
+        let endpoints = vec![
+            endpoint("acme-a/fp8", "0.0000001", "0.000001", "0.000003"),
+            endpoint("acme-b/fp8", "0.0000002", "0.000002", "0.000004"),
         ];
-        let reasons = vec![(true, Some("selected".to_string())), (false, None)];
-        let selection = json!({"healthy_count": 2, "selected_count": 1});
-        let report = build_report(
-            &meta(),
-            &selection,
-            &providers,
-            &reasons,
-            Path::new("/tmp/bench"),
-        );
+        let providers = vec![provider_run("acme-a/fp8", "≥30m")];
+        let report = build_report(&meta(), &endpoints, &providers, Path::new("/tmp/bench"));
 
-        let expected_keys = ["run", "selection", "providers", "summary", "artifacts"];
+        // Exactly the specified top-level keys.
+        let expected_keys = ["run", "providers", "artifacts"];
         let object = report.as_object().expect("report is an object");
         assert_eq!(
             object.len(),
@@ -885,36 +519,49 @@ mod tests {
             assert!(object.contains_key(k), "missing top-level key {k}");
         }
 
+        // Every discovered endpoint has an entry; each entry has EXACTLY the
+        // three spec'd keys.
         let arr = report["providers"].as_array().expect("providers array");
         assert_eq!(arr.len(), 2);
+        for entry in arr {
+            let entry = entry.as_object().expect("provider entry");
+            assert_eq!(entry.len(), 3, "provider entries must have 3 keys");
+            for k in ["tag", "static_price_usd_per_m", "cache_hold"] {
+                assert!(entry.contains_key(k), "missing provider key {k}");
+            }
+        }
         assert_eq!(arr[0]["tag"], "acme-a/fp8");
-        assert_eq!(arr[0]["selected"], true);
-        assert_eq!(arr[0]["selection_reason"], "selected");
-        assert_eq!(arr[1]["selected"], false);
-        assert!(arr[1]["selection_reason"].is_null());
-        assert_eq!(arr[0]["cost"]["billed_usd"], 0.5);
-        assert_eq!(arr[0]["cost"]["estimated_usd"], 0.4);
-        assert!((arr[0]["cost"]["delta_usd"].as_f64().unwrap() - 0.1).abs() < 1e-9);
-        // blended = billed / total × 1e6
-        assert!((arr[0]["cost"]["blended_usd_per_m"].as_f64().unwrap() - 5.0).abs() < 1e-9);
-        // per_m_at_validated_mix with cache_read=$0.1/M, prompt=$1/M, completion=$3/M
+        assert_eq!(arr[0]["cache_hold"], "≥30m");
+        // static price: cache_read $0.1/M, prompt $1/M, completion $3/M.
+        let expected_price = 0.977 * 0.1 + 0.014 * 1.0 + 0.009 * 3.0;
+        assert!((arr[0]["static_price_usd_per_m"].as_f64().unwrap() - expected_price).abs() < 1e-9);
+        assert!((arr[0]["static_price_usd_per_m"].as_f64().unwrap() - 0.1387).abs() < 1e-9);
+        // The endpoint without a run is "not measured".
+        assert_eq!(arr[1]["tag"], "acme-b/fp8");
+        assert_eq!(arr[1]["cache_hold"], "not measured");
         assert!(
-            (arr[0]["cost"]["per_m_at_validated_mix"].as_f64().unwrap()
-                - (0.977 * 0.1 + 0.014 * 1.0 + 0.009 * 3.0))
+            (arr[1]["static_price_usd_per_m"].as_f64().unwrap()
+                - (0.977 * 0.2 + 0.014 * 2.0 + 0.009 * 4.0))
                 .abs()
                 < 1e-9
         );
-        assert!((arr[0]["cost"]["per_m_all_miss"].as_f64().unwrap() - 1.0).abs() < 1e-9);
-        // warmup round passthrough
-        assert_eq!(arr[0]["warmup"][0]["kind"], "warmup");
-        assert_eq!(arr[0]["warmup"][0]["usage"]["prompt_tokens"], 1000);
-        assert!(arr[0]["warmup"][0]["t_headers"].is_string());
-        assert_eq!(report["summary"]["total_billed_usd"], 0.8);
-        assert!((report["summary"]["total_estimated_usd"].as_f64().unwrap() - 0.6).abs() < 1e-9);
-        assert_eq!(report["summary"]["completed_count"], 2);
-        assert_eq!(report["summary"]["cache_supported_count"], 2);
-        assert_eq!(report["summary"]["hold_distribution"]["≥30m"], 2);
+
+        // Run-meta passthrough.
+        assert_eq!(report["run"]["model"], "acme/model-1");
+        assert_eq!(report["run"]["key_source"], "env");
+        assert_eq!(report["run"]["cap_usd"], 2.0);
+        assert_eq!(report["run"]["ladder_secs"], json!([0, 5, 30]));
+        assert_eq!(report["run"]["exit_code"], 0);
         assert_eq!(report["artifacts"]["run_dir"], "/tmp/bench");
+
+        // A provider with no pricing renders a null static price.
+        let mut no_pricing = endpoint("acme-c/fp8", "0", "0", "0");
+        no_pricing.pricing = None;
+        let report2 = build_report(&meta(), &[no_pricing], &[], Path::new("/tmp/bench"));
+        let arr2 = report2["providers"].as_array().expect("providers array");
+        assert_eq!(arr2.len(), 1);
+        assert!(arr2[0]["static_price_usd_per_m"].is_null());
+        assert_eq!(arr2[0]["cache_hold"], "not measured");
     }
 
     #[test]

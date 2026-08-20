@@ -16,7 +16,9 @@
 //! per selected provider runs the warmup + ladder rounds against the pinned
 //! endpoint, and the run writes report.json / summary.md / providers.json /
 //! manifest.json under `<output-dir>/bench-openrouter/<run-ts>/` plus a
-//! `latest/` mirror ([`crate::bench_openrouter::report`]).
+//! `latest/` mirror ([`crate::bench_openrouter::report`]). The report is a
+//! per-provider list of the static price and the cache-hold result ("does not
+//! cache" / TTL hold bucket / "not measured").
 //!
 //! # Exit codes
 //!
@@ -431,8 +433,10 @@ Flags:
   -h, --help             Print this help and exit.
 
 Exit codes:
-  0  Success. In a full run, partial per-round failures are documented in the
-     report (rounds_failed / error classes); the artifacts are complete.
+  0  Success. In a full run, the artifacts (report.json / summary.md /
+     providers.json / manifest.json) are complete; each provider's result is
+     its static price and cache-hold bucket ('does not cache', a TTL hold like
+     '(5s, 30s]', or 'not measured').
   1  Hard failure (bad key, unaffordable estimate, discovery failure, lock
      held, artifact write failure). A full-run abort (spend cap / deadline /
      auth / quota) still writes the partial report before exiting 1.
@@ -639,43 +643,6 @@ async fn dry_run(opts: &BenchOptions) -> i32 {
 
 // ── Full-run orchestration ─────────────────────────────────────────
 
-/// The selection JSON recorded in the report: the aggregate counts plus one
-/// entry per endpoint with its selection decision and a human reason (the same
-/// rendering the dry-run plan uses).
-fn build_selection_json(opts: &BenchOptions, bundle: &SelectionBundle) -> serde_json::Value {
-    let healthy_count = bundle.decisions.iter().filter(|d| d.is_healthy()).count();
-    let selected_count = bundle.decisions.iter().filter(|d| d.selected).count();
-    let padding_count = bundle
-        .decisions
-        .iter()
-        .filter(|d| matches!(d.reason, Some(ExclusionReason::Padding)))
-        .count();
-    let allowlist_matches = opts.providers.as_ref().map(|wl| {
-        wl.iter()
-            .filter(|t| bundle.inputs.iter().any(|i| i.endpoint.tag == **t))
-            .count()
-    });
-    let target_count = effective_target_count(healthy_count, allowlist_matches);
-    let providers: Vec<serde_json::Value> = bundle
-        .inputs
-        .iter()
-        .zip(&bundle.decisions)
-        .map(|(input, d)| {
-            let reason = d.reason_text();
-            json!({"tag": input.endpoint.tag, "selected": d.selected, "reason": reason})
-        })
-        .collect();
-    json!({
-        "healthy_count": healthy_count,
-        "selected_count": selected_count,
-        "padding_count": padding_count,
-        "target_count": target_count,
-        "min_context": MIN_CONTEXT,
-        "allowlist": opts.providers.clone().unwrap_or_default(),
-        "providers": providers,
-    })
-}
-
 /// The full-run executor: discovery + selection → one task per selected
 /// provider (staggered) → TTL-ladder rounds → report artifacts.
 ///
@@ -685,7 +652,7 @@ fn build_selection_json(opts: &BenchOptions, bundle: &SelectionBundle) -> serde_
 /// cap / outer deadline / auth / quota) — the partial report is still written
 /// before returning 1; `2` is not used here (parse errors exit before this
 /// point).
-// One long sequential orchestration (the ticket's steps 1-15); splitting it
+// One long sequential orchestration (steps 1-15); splitting it
 // would obscure the step ordering.
 #[allow(clippy::too_many_lines)]
 async fn full_run(opts: &BenchOptions) -> i32 {
@@ -820,35 +787,11 @@ async fn full_run(opts: &BenchOptions) -> i32 {
         }
     }
 
-    // 11. Run-level abort state + total billed. Per-provider estimated costs
-    //     and selection reasons come from the selection bundle (find by tag);
-    //     `ProviderRun.selection_reason` is populated here and read back for
-    //     the report's parallel reasons array.
+    // 11. Run-level abort state.
     let abort_reason = ctx.abort_reason.lock().unwrap_poison().clone();
     let aborted = abort_reason.is_some();
-    let total_billed: f64 = provider_runs.iter().map(|r| r.billed_usd).sum();
-    let mut selection_reasons: Vec<(bool, Option<String>)> =
-        Vec::with_capacity(provider_runs.len());
-    for run in &mut provider_runs {
-        let decision = bundle
-            .decisions
-            .iter()
-            .zip(&bundle.inputs)
-            .find(|(_, input)| input.endpoint.tag == run.tag);
-        if let Some((_, input)) = decision {
-            run.estimated_usd = input.est_cost;
-        }
-        let (selected, reason) = decision.map_or((false, "not selected".to_string()), |(d, _)| {
-            (d.selected, d.reason_text())
-        });
-        run.selection_reason = Some(reason.clone());
-        selection_reasons.push((selected, Some(reason)));
-    }
 
-    // 12. Selection JSON for the report (mirrors the dry-run plan rendering).
-    let selection_json = build_selection_json(opts, &bundle);
-
-    // 13. Artifacts: meta → report/summary/providers/manifest → write.
+    // 12. Artifacts: meta → report/summary/providers/manifest → write.
     let finished_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let duration_secs = run_started.elapsed().as_secs_f64();
     let exit_code = i32::from(aborted);
@@ -873,12 +816,11 @@ async fn full_run(opts: &BenchOptions) -> i32 {
     };
     let report_json = report::build_report(
         &meta,
-        &selection_json,
+        &snapshot.endpoints.data.endpoints,
         &provider_runs,
-        &selection_reasons,
         &run_dir,
     );
-    let summary_md = report::build_summary_md(&meta, &report_json, &provider_runs);
+    let summary_md = report::build_summary_md(&meta, &report_json);
     let providers_json = report::providers_snapshot_json(&snapshot);
     let manifest = report::build_manifest(
         &std::env::args().collect::<Vec<_>>(),
@@ -926,9 +868,6 @@ async fn full_run(opts: &BenchOptions) -> i32 {
             "Error: benchmark run aborted: {}",
             meta.abort_reason.as_deref().unwrap_or("unknown reason")
         );
-    }
-    if total_billed > 0.0 {
-        eprintln!("bench-openrouter: total billed ${total_billed:.4}");
     }
     exit_code
 }
@@ -1096,7 +1035,9 @@ fn provider_entries(
                 "context_length": ep.context_length,
                 "selected": decision.selected,
                 "selection_reason": selection_reason,
-                "est_cost_usd": inputs[i].est_cost,
+                "static_price_usd_per_m": crate::bench_openrouter::report::static_price_usd_per_m(
+                    ep.pricing.as_ref(),
+                ),
                 "flags": flags[i],
             })
         })
@@ -1252,15 +1193,30 @@ mod tests {
         // One endpoint is unhealthy → padded in, so all 3 are selected.
         assert_eq!(plan["selection"]["selected_count"], 3);
         assert_eq!(plan["selection"]["padding_count"], 1);
-        // Selected providers come first, sorted by est cost ascending.
-        let ests: Vec<f64> = providers
+        // Selected providers come first, sorted by static price ascending (the
+        // fixture has request=0 for all endpoints, so static-price order ==
+        // est-cost order).
+        let prices: Vec<f64> = providers
             .iter()
             .take_while(|p| p["selected"] == true)
-            .map(|p| p["est_cost_usd"].as_f64().unwrap())
+            .map(|p| {
+                p["static_price_usd_per_m"]
+                    .as_f64()
+                    .expect("selected providers carry a static price")
+            })
             .collect();
-        let mut sorted = ests.clone();
+        assert!(!prices.is_empty(), "selected providers must be priced");
+        let mut sorted = prices.clone();
         sorted.sort_by(f64::total_cmp);
-        assert_eq!(ests, sorted, "selected providers must be cost-ascending");
+        assert_eq!(
+            prices, sorted,
+            "selected providers must be static-price-ascending"
+        );
+        // The old est-cost key is gone from the plan.
+        assert!(
+            providers[0].get("est_cost_usd").is_none(),
+            "est_cost_usd must be absent from the plan"
+        );
 
         // Redaction marker present; the resolved key value never appears.
         assert_eq!(plan["key"]["redacted"], true);

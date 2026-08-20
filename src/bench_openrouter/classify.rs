@@ -4,7 +4,10 @@
 //! what a full cache hold would produce ([`expected_cached_for_round`]) and
 //! buckets the result ([`classify_round`]). The per-round classifications are
 //! then collapsed into a single cache-TTL bucket ([`ttl_bucket`] +
-//! [`format_bucket`]) for the report.
+//! [`format_bucket`]) for the report. [`cache_hold_result`] combines the
+//! raw cached-token observations with the ladder classifications into the
+//! report's three-outcome vocabulary ("does not cache" / TTL bucket /
+//! "not measured").
 //!
 //! Pure math — no I/O. Unit tests cover the threshold boundaries, bucket
 //! derivation (Invalid rounds are skipped; an all-Invalid ladder yields
@@ -81,7 +84,7 @@ pub(crate) fn classify_round(cached: u64, expected_cached: u64) -> CacheClassifi
 /// - If every round is Invalid → `"not measured"` (fail-closed — no hold was
 ///   measured).
 /// - If the non-Invalid rounds are all [`CacheClassification::NotSupported`] →
-///   `"not supported"` (the provider never produces cached tokens).
+///   `"does not cache"` (the provider never produces cached tokens).
 /// - The first [`CacheClassification::Drop`] at ladder index `k`:
 ///   - the Drop is at a round whose nominal gap is `0.0` (the gap-0 probe,
 ///     or a custom ladder's extra 0-gap rung) → `"immediate drop"`.
@@ -125,7 +128,7 @@ pub(crate) fn ttl_bucket(
         .iter()
         .all(|c| *c == CacheClassification::NotSupported)
     {
-        return "not supported".to_string();
+        return "does not cache".to_string();
     }
 
     // First Drop in the ladder (Invalid/NotSupported skipped by the search).
@@ -159,6 +162,51 @@ pub(crate) fn ttl_bucket(
     // No round ever established a hold (the guards above make this
     // unreachable, but fail closed rather than fabricate a bucket).
     "not measured".to_string()
+}
+
+/// The cache-hold result for a provider: `"not measured"` when no ladder round
+/// ran or no usable round measured anything, `"does not cache"` when no round
+/// ever reported non-zero cached tokens (warmup-1 excluded by the caller),
+/// otherwise the TTL bucket derived from the ladder classifications.
+#[must_use]
+pub(crate) fn cache_hold_result(
+    any_cached_observation: bool,
+    classifications: &[CacheClassification],
+    nominal_gaps_secs: &[f64],
+) -> String {
+    if classifications.is_empty() {
+        return "not measured".to_string();
+    }
+    // Fail closed: an all-Invalid ladder measured nothing (transport cascade,
+    // persistent response-cache hits, budget/abort before any usable round).
+    // The zero-cache gate must not label such a run "does not cache" on the
+    // strength of the single W2 sample — the same single-sample evidence the
+    // predicate exists to distrust.
+    if classifications
+        .iter()
+        .all(|c| *c == CacheClassification::Invalid)
+    {
+        return "not measured".to_string();
+    }
+    // Zero cache evidence across W2 + ladder rounds → the provider does not
+    // cache.
+    if !any_cached_observation {
+        return "does not cache".to_string();
+    }
+    // Cache evidence exists but every usable (non-Invalid) round measured no
+    // expected hold (all NotSupported) — the hold itself was never measured.
+    let usable: Vec<CacheClassification> = classifications
+        .iter()
+        .copied()
+        .filter(|c| *c != CacheClassification::Invalid)
+        .collect();
+    if usable
+        .iter()
+        .all(|c| *c == CacheClassification::NotSupported)
+    {
+        return "not measured".to_string();
+    }
+    ttl_bucket(classifications, nominal_gaps_secs)
 }
 
 /// Format a TTL bucket `(lo, hi]` with human durations:
@@ -272,15 +320,15 @@ mod tests {
         let gaps = [0.0, 5.0, 30.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "≤5s");
 
-        // 6. All non-Invalid rounds NotSupported → not supported.
+        // 6. All non-Invalid rounds NotSupported → does not cache.
         let classes = [C::NotSupported, C::NotSupported, C::NotSupported];
         let gaps = [0.0, 5.0, 30.0];
-        assert_eq!(ttl_bucket(&classes, &gaps), "not supported");
+        assert_eq!(ttl_bucket(&classes, &gaps), "does not cache");
 
         // 7. Invalid rounds are skipped for the NotSupported check too.
         let classes = [C::NotSupported, C::Invalid, C::NotSupported];
         let gaps = [0.0, 5.0, 30.0];
-        assert_eq!(ttl_bucket(&classes, &gaps), "not supported");
+        assert_eq!(ttl_bucket(&classes, &gaps), "does not cache");
 
         // 8. All-Invalid ladder fails closed → not measured.
         let classes = [C::Invalid, C::Invalid, C::Invalid];
@@ -324,6 +372,48 @@ mod tests {
         let classes = [C::Hit, C::Drop, C::Hit];
         let gaps = [0.0, 0.0, 30.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "immediate drop");
+    }
+
+    #[test]
+    fn cache_hold_result_outcomes() {
+        use CacheClassification as C;
+        // (a) No ladder round ran → not measured.
+        assert_eq!(cache_hold_result(true, &[], &[]), "not measured");
+        assert_eq!(cache_hold_result(false, &[], &[]), "not measured");
+
+        // (b) No round ever reported cached tokens → does not cache, even
+        //     though the ladder rounds were usable (the streamlake mislabel
+        //     regression: must NOT be "immediate drop" or a bucket).
+        let classes = [C::Drop, C::NotSupported, C::Drop];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(cache_hold_result(false, &classes, &gaps), "does not cache");
+
+        // (a') Fail closed: an all-Invalid ladder measured nothing, and the
+        //      zero-cache gate must not label it "does not cache" on the
+        //      strength of a W2-only zero sample (the single-sample evidence
+        //      the predicate exists to distrust).
+        let classes = [C::Invalid, C::Invalid, C::Invalid];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(cache_hold_result(false, &classes, &gaps), "not measured");
+
+        // (b') Mixed: usable Drop rounds exist, but zero cache evidence across
+        //      them → does not cache (the all-Invalid guard already fired).
+        let classes = [C::Invalid, C::Drop, C::Invalid];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(cache_hold_result(false, &classes, &gaps), "does not cache");
+
+        // (c) Cached observations exist → the TTL bucket from the ladder.
+        let classes = [C::Hit, C::Hit, C::Drop];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(cache_hold_result(true, &classes, &gaps), "(5s, 30s]");
+
+        // (d) Cache evidence exists but the ladder measured no expected hold
+        //     (every usable round NotSupported) → the hold itself was never
+        //     measured. This no longer contradicts the "any non-zero
+        //     observation means the provider caches" rule.
+        let classes = [C::NotSupported, C::NotSupported, C::NotSupported];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(cache_hold_result(true, &classes, &gaps), "not measured");
     }
 
     #[test]
