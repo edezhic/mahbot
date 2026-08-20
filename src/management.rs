@@ -511,11 +511,15 @@ fn paused_workspace_sentence() -> &'static str {
 ///
 /// # Circuit-breaker exclusion
 ///
-/// This is intentionally NOT called from [`try_trip_circuit_breaker`] — breaker
-/// trips keep their existing drain-to-Planning handling and must not pause.
-/// Callers are the four technical-failure sites: dispatch panic, engineer
-/// agent failure, all verifier agents failing, and the GUI cancel of an
-/// in-flight agent run.
+/// This is intentionally NOT called from [`try_trip_circuit_breaker`] — the
+/// comment-based breaker trips keep their existing drain-to-Planning handling
+/// and must not pause. The engineer hard-failure bounce trip is the one
+/// exception: it pauses at the engineer failure site, before
+/// the Failed transition, because the budget-exhausting failure is a
+/// technical failure like any other engineer failure. Callers are the
+/// technical-failure sites: dispatch panic, engineer agent failure (including
+/// its bounce-budget trip), all verifier agents failing, and the GUI cancel
+/// of an in-flight agent run.
 ///
 /// # Scope
 ///
@@ -570,6 +574,21 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
     }
 }
 
+/// Fetch the last ticket comment (any role) as the failure details for a
+/// Manager notification. The transition closure writes the failure comment
+/// LAST (after any circuit-breaker trip comment), so it is the last comment
+/// and carries the concrete error. Falls back to a generic message when no
+/// comment exists or the read fails.
+async fn last_comment_as_failure_details(ticket_id: &str) -> String {
+    match board().get_comments(ticket_id).await {
+        Ok(comments) => comments.last().map_or_else(
+            || "(unknown failure reason)".to_string(),
+            |c| c.content.clone(),
+        ),
+        Err(_) => "(unknown failure reason)".to_string(),
+    }
+}
+
 /// Enqueue a notification for the Manager about a ticket transition.
 ///
 /// Renders a template with the ticket ID, title, target phase, transition log,
@@ -589,13 +608,16 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
 /// site for the data-loss guard (drain happens only after workspace lookup
 /// succeeds so that buffered entries survive a temporary lookup failure).
 ///
-/// # Invariant: failure comment before Failed transition
+/// # Invariant: failure comment written before the notification
 ///
-/// When `target_phase == TicketPhase::Failed`, the failure details are read from
-/// the database (last comment, any role) instead of being passed as a parameter.
-/// The caller MUST ensure the failure comment has already been written to the DB
-/// before calling this function (the transition closure runs first in
-/// [`with_comment_and_transition`], so this invariant holds for all call paths).
+/// When `target_phase` is `Failed`, or the transition is the engineer
+/// hard-failure bounce (source `InDevelopment` → `ReadyForDevelopment` — the
+/// only Notify transition to RFD, enforced structurally at the gate below),
+/// the failure details are read from the database (last comment, any role)
+/// instead of being passed as a parameter. The caller MUST ensure the failure
+/// comment has already been written to the DB before calling this function
+/// (the transition closure runs first in [`with_comment_and_transition`], so
+/// this invariant holds for all call paths).
 /// The agent ID (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
 /// must see both notification context and user conversation history in a unified
@@ -650,17 +672,18 @@ async fn notify_ticket(
         ],
     );
 
-    if target_phase == TicketPhase::Failed {
-        // Fetch the last comment (any role) from the database — the failure
-        // comment was already written by the closure before this notification
-        // call. Falls back to a generic message if no comment exists.
-        let failure_details: String = match board().get_comments(&ticket.id).await {
-            Ok(comments) => comments.last().map_or_else(
-                || "(unknown failure reason)".to_string(),
-                |c| c.content.clone(),
-            ),
-            Err(_) => "(unknown failure reason)".to_string(),
-        };
+    // The engineer hard-failure bounce is the ONLY Notify transition
+    // InDevelopment → ReadyForDevelopment (verifier/sanitation bounces buffer,
+    // manual moves are user actions), so gating on the source phase
+    // structurally excludes any future RFD+Notify transition from silently
+    // rendering the engineer-bounce template.
+    let engineer_bounce =
+        source == TicketPhase::InDevelopment && target_phase == TicketPhase::ReadyForDevelopment;
+    if target_phase == TicketPhase::Failed || engineer_bounce {
+        // The transition closure wrote the failure comment LAST (after any
+        // circuit-breaker trip comment), so the last comment carries the
+        // concrete error.
+        let failure_details = last_comment_as_failure_details(&ticket.id).await;
 
         // The workspace_status sentence is chosen from the failure MECHANISM,
         // not from `ws.paused` alone: a circuit-breaker drain moved tickets
@@ -678,8 +701,16 @@ async fn notify_ticket(
                 .to_string()
         };
 
+        // The engineer hard-failure bounce gets a dedicated template: the
+        // ticket was NOT failed, so the generic failed-ticket triage wording
+        // (supersede/revert guidance) would misdirect the Manager.
+        let template = if engineer_bounce {
+            "pipeline/engineer_bounce_notification.md"
+        } else {
+            "pipeline/failure_notification.md"
+        };
         let warning = substitute(
-            &load_prompt("pipeline/failure_notification.md"),
+            &load_prompt(template),
             &[
                 ("{{failure_details}}", &failure_details),
                 ("{{workspace_status}}", &workspace_status),
@@ -934,9 +965,11 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // Adding a new PollPhase variant requires adding a row in
         // PollPhase::info() which now also carries the circuit_breaker_kind
         // and log_label fields (enforced by the single match in info()).
-        // The bounce breaker is not pre-flight (it is enforced mid-round in
-        // process_verifier_verdicts) — phases without a pre-flight breaker
-        // pass `None` and try_trip_circuit_breaker returns false immediately.
+        // The bounce breaker is not pre-flight (it is enforced at the bounce
+        // sites: review/QA in process_verifier_verdicts and engineer hard
+        // failures in bounce_engineer_hard_failure) — phases without a
+        // pre-flight breaker pass `None` and try_trip_circuit_breaker returns
+        // false immediately.
         //
         // The post-agent phase_changed_and_clear_assignment check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
@@ -945,8 +978,9 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         }
         if try_trip_circuit_breaker(&ticket, expected_phase, kind, log_label).await {
             // Circuit breaker tripped — unconditionally drain the development
-            // pipeline regardless of which breaker type fired (Sanitation,
-            // Diagnostics, or the mid-round bounce breaker). This is a
+            // pipeline regardless of which pre-flight breaker type fired
+            // (Sanitation or Diagnostics; the bounce breaker has no pre-flight
+            // arm and is enforced at its bounce sites instead). This is a
             // deliberate invariant:
             //
             //   Any breaker trip signals a potentially dirty workspace. If the
@@ -1091,7 +1125,9 @@ struct PollPhaseInfo {
     pipeline_check: PipelineCheck,
     /// Which circuit breaker variant to use for phase-guard checks.
     /// `None` for phases without a pre-flight breaker — the bounce breaker
-    /// has no pre-flight arm (it is enforced mid-round).
+    /// has no pre-flight arm (it is enforced at the bounce sites:
+    /// review/QA in `process_verifier_verdicts`, engineer hard failures in
+    /// `bounce_engineer_hard_failure`).
     circuit_breaker_kind: Option<CircuitBreakerKind>,
     /// Fresh-ticket grace for claims: when `Some`, tickets created within
     /// this window are not claimed (only the BacklogAnalysis phase sets it —
@@ -1739,14 +1775,17 @@ fn stage_round_drain_cut(
     drain_cut
 }
 
-/// Shared engineer post-run tail: phase/drain guards, failure comment, pause,
+/// Shared engineer post-run tail: phase/drain guards, failure handling, pause,
 /// transition, and job terminalization. Diagnostics are dispatched by the poll
 /// loop as a separate `PollPhase::DiagnosticsCheck` (see `poll_round`) — the
 /// success path only transitions to InDiagnostics. The guards live here:
 /// phase-moved → complete job and bail; drain-cut (see
 /// [`stage_round_drain_cut`]) → leave the job 'launched' for boot resume
-/// (fresh dispatches log, resumes stay silent); response-None past the guards
-/// is a real failure. `resumed` selects the observability log strings.
+/// (fresh dispatches log, resumes stay silent); response `None` past the
+/// guards is a real failure or user cancel, delegated to
+/// [`handle_engineer_failure`].
+///
+/// `resumed` selects the observability log strings.
 async fn finalize_engineer_round(
     ticket: &Ticket,
     agent: &Agent,
@@ -1761,61 +1800,200 @@ async fn finalize_engineer_round(
     if stage_round_drain_cut(&ticket.id, "Engineer", response, resumed) {
         return;
     }
-    let failure_comment = engineer_failure_comment(
-        crate::shutdown::shutdown_token().is_cancelled(),
-        agent.is_cancelled(),
-        agent.failure.as_deref(),
-    );
 
-    // Past the guards above, response None here is a real failure.
-    let (comment_text, target_phase, notify, log_message) = if let Some(text) = response {
-        (
-            engineer_comment_text(agent, text).await,
-            TicketPhase::InDiagnostics,
-            NotifyPolicy::Buffer,
+    // Success path: engineer produced output — transition to InDiagnostics
+    // (unchanged).
+    if let Some(text) = response {
+        let comment_text = engineer_comment_text(agent, text).await;
+        comment_and_transition_or_bail(
+            TransitionCtx {
+                ticket,
+                source: TicketPhase::InDevelopment,
+                target: TicketPhase::InDiagnostics,
+                notify: NotifyPolicy::Buffer,
+                log_label: "Engineer",
+                breaker_trip: false,
+            },
+            Role::Engineer.as_str(),
+            &comment_text,
             if resumed {
                 "Resumed engineer finished — transitioned ticket"
             } else {
                 "Engineer finished — transitioned ticket"
             },
         )
+        .await;
+        complete_ticket_stage_job(job_id).await;
+        return;
+    }
+
+    // Past the guards above, response None here is a real failure or a user
+    // cancel — classify, pause, and either fail or bounce. The helper returns
+    // false when a shutdown/drain landed mid-tail: the job must then stay
+    // status='launched' for boot resume (mirrors finalize_verifier_round's
+    // early return before job completion).
+    if !handle_engineer_failure(ticket, agent, resumed).await {
+        return;
+    }
+    complete_ticket_stage_job(job_id).await;
+}
+
+/// Handle the engineer failure tail (response `None` past the guards).
+///
+/// - **User cancel** → ticket Failed + workspace pause (unchanged, never
+///   auto-re-queued).
+/// - **Hard failure** ("Agent failed") → the workspace pauses and the ticket
+///   bounces back to ReadyForDevelopment for an automatic retry, consuming
+///   the same bounce budget as review/QA bounces. When the budget is
+///   exhausted the ticket moves to Failed via the circuit breaker — still
+///   with the workspace paused and WITHOUT draining ReadyForDevelopment
+///   siblings. The concrete error is recorded as a `SYSTEM_ROLE`
+///   comment so it survives into the retry's rework feedback (dispatch_engineer
+///   builds feedback from comments after the last engineer-role comment) and
+///   into the Manager notification.
+/// - **Shutdown/drain race** (token/drain landing after the first drain-cut
+///   check and before the transition commit — re-checked after the
+///   workspace-pause await) → no bounce, no Failed transition; the job stays
+///   'launched' for boot resume. A pause may already be committed if the
+///   drain flipped mid-await (recoverable via the normal unpause).
+///
+/// Returns `false` when a shutdown/drain cut the failure handling short — the
+/// caller must then leave the job status='launched' for boot resume. Returns
+/// `true` otherwise (failure handling ran to the transition attempt); the
+/// caller terminalizes the stage job.
+async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) -> bool {
+    let cancelled = agent.is_cancelled();
+
+    // No drain re-check here: the caller's stage_round_drain_cut just ran
+    // aborting() and no await separates that read from this point, so a
+    // second read would be provably identical. The first real gap is the
+    // pause await below, which is where the post-pause guard lives.
+
+    // Pause before the transition so the failure notification reflects the
+    // paused workspace. Shutdown is excluded inside the helper; a hard
+    // failure pauses on every occurrence, including the budget-exhausting
+    // bounce-trip one.
+    let pause_reason = if cancelled {
+        "user cancelled the agent run"
     } else {
-        // Pause before the Failed transition so the failure notification
-        // reflects the paused workspace. Shutdown is excluded inside the helper.
-        let pause_reason = if agent.is_cancelled() {
-            "user cancelled the agent run"
-        } else {
-            "engineer agent failure"
-        };
-        let pause_note = pause_workspace_on_failure(ticket, pause_reason).await;
-        (
-            format!("{failure_comment}{pause_note}"),
-            TicketPhase::Failed,
-            NotifyPolicy::Notify,
+        "engineer agent failure"
+    };
+    let pause_note = pause_workspace_on_failure(ticket, pause_reason).await;
+
+    // Second drain-cut: the pause await is the first real gap after the
+    // caller's stage_round_drain_cut — a drain landing there must not commit
+    // a bounce or a Failed transition (the job stays 'launched' for boot
+    // resume). The pause may already be committed if the drain flipped
+    // mid-await; recoverable via the normal unpause and strictly better than
+    // committing the transition during the drain.
+    if crate::shutdown::aborting() {
+        info!(
+            ticket = %ticket.id,
+            "Engineer failure cut short by shutdown/drain after the pause — job stays launched for boot resume",
+        );
+        return false;
+    }
+
+    // The guards above ensure the global token is not cancelled when this
+    // read normally runs, but it CAN fire in the window between the last
+    // guard and this read — passing the live value keeps such a shutdown
+    // classified as shutdown instead of being misread as a user cancel or a
+    // hard failure.
+    let failure_comment = engineer_failure_comment(
+        crate::shutdown::shutdown_token().is_cancelled(),
+        cancelled,
+        agent.failure.as_deref(),
+    );
+    let comment_text = format!("{failure_comment}{pause_note}");
+
+    if cancelled {
+        // User-initiated cancellation keeps today's semantics: ticket Failed
+        // + workspace pause, never auto-re-queued.
+        comment_and_transition_or_bail(
+            TransitionCtx {
+                ticket,
+                source: TicketPhase::InDevelopment,
+                target: TicketPhase::Failed,
+                notify: NotifyPolicy::Notify,
+                log_label: "Engineer",
+                breaker_trip: false,
+            },
+            SYSTEM_ROLE,
+            &comment_text,
             if resumed {
-                "Resumed engineer failed — transitioned ticket"
+                "Resumed engineer cancelled — transitioned ticket"
             } else {
-                "Engineer failed — transitioned ticket"
+                "Engineer cancelled — transitioned ticket"
             },
         )
+        .await;
+    } else {
+        bounce_engineer_hard_failure(ticket, &comment_text, resumed).await;
+    }
+    true
+}
+
+/// Bounce a hard-failed engineer ticket back to ReadyForDevelopment for an
+/// automatic retry, sharing the review/QA bounce budget. The counter is
+/// bumped atomically with the transition (drift-free invariant). When the
+/// budget is exhausted the ticket fails via the circuit breaker — workspace
+/// still paused, ReadyForDevelopment siblings NOT drained (unlike the
+/// verifier trip). The concrete-error comment is written LAST so the Manager
+/// notification surfaces it (`notify_ticket` renders the last comment as the
+/// failure details). `resumed` selects the observability log prefix.
+async fn bounce_engineer_hard_failure(ticket: &Ticket, comment_text: &str, resumed: bool) {
+    let bounce_trip = usize::try_from(ticket.bounce_count).unwrap_or(usize::MAX)
+        >= crate::joint_verdict::MAX_BOUNCES;
+    let trip_comment = bounce_trip.then(bounce_breaker_trip_comment);
+    let target = if bounce_trip {
+        TicketPhase::Failed
+    } else {
+        TicketPhase::ReadyForDevelopment
     };
 
-    comment_and_transition_or_bail(
+    let outcome = with_comment_and_transition(
         TransitionCtx {
             ticket,
             source: TicketPhase::InDevelopment,
-            target: target_phase,
-            notify,
+            target,
+            notify: NotifyPolicy::Notify,
             log_label: "Engineer",
+            // Not a circuit-breaker drain: siblings are NOT moved to
+            // Planning, so the Failed notification must render the
+            // paused-workspace sentence, not the drain sentence.
             breaker_trip: false,
         },
-        Role::Engineer.as_str(),
-        &comment_text,
-        log_message,
+        async |tx| {
+            // Trip comment first, failure comment last — notify_ticket
+            // renders comments.last() as the failure details, so the
+            // Manager sees the concrete error, not just the trip message.
+            if let Some(comment) = &trip_comment {
+                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment).await?;
+            }
+            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment_text).await?;
+            // The failing bounce is not counted (stays at the max).
+            if !bounce_trip {
+                BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
+            }
+            Ok(())
+        },
     )
     .await;
 
-    complete_ticket_stage_job(job_id).await;
+    if matches!(outcome, FinalizeOutcome::Applied) {
+        let resumed_prefix = if resumed { "Resumed " } else { "" };
+        if bounce_trip {
+            info!(
+                ticket = %ticket.id,
+                "{resumed_prefix}Engineer hard failure exhausted the bounce budget — ticket failed",
+            );
+        } else {
+            info!(
+                ticket = %ticket.id,
+                "{resumed_prefix}Engineer hard failure — ticket bounced to ReadyForDevelopment for retry",
+            );
+        }
+    }
 }
 
 /// Run an Engineer agent to implement the ticket.
@@ -1824,7 +2002,9 @@ async fn finalize_engineer_round(
 /// includes them in the agent prompt. After the agent finishes, performs a
 /// post-run phase check to catch race conditions, then transitions:
 /// - InDiagnostics (buffer) on successful completion
-/// - Failed (notify) if the agent failed or returned no output
+/// - ReadyForDevelopment (notify) on a hard "Agent failed" outcome — the
+///   ticket retries automatically, sharing the review/QA bounce budget
+/// - Failed (notify) on user cancel, or when the bounce budget is exhausted
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
     let agent_id = ticket_agent_id(&ticket.id, Role::Engineer.as_str());
 
@@ -3951,12 +4131,18 @@ fn format_analyst_summary(
 /// # Critical invariant: all breaker types trigger the drain
 ///
 /// This function is called unconditionally after **any** circuit breaker trip
-/// (Sanitation, Diagnostics, or the mid-round bounce breaker). This is intentional and
+/// that reaches the pre-flight breaker path (Sanitation, Diagnostics) or the
+/// review/QA bounce trip (the mid-round bounce breaker). This is intentional and
 /// conservative: any breaker trip signals that the workspace may be in a dirty
 /// or contaminated state. If the drain were narrowed to only some breaker
 /// types, an unrelated `ReadyForDevelopment` ticket could auto-start while the
 /// workspace still has unfinished changes from the failed ticket — leading to
 /// cascading failures, wasted API credits, and confused agents.
+///
+/// The engineer hard-failure bounce trip is the deliberate exception: it does
+/// NOT call this function — it pauses the workspace instead, which blocks new
+/// ReadyForDevelopment claims while the pause is active (see
+/// [`pause_workspace_on_failure`] and [`blocks_claim`]).
 ///
 /// Draining every `ReadyForDevelopment` ticket forces the Manager to, in order:
 ///
@@ -4018,9 +4204,11 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// This eliminates ~80% structural duplication while preserving exact
 /// behavioral semantics. Phases without a pre-flight breaker pass `None` and
 /// this returns `false` immediately — the bounce breaker is not pre-flight:
-/// it is enforced mid-round in [`process_verifier_verdicts`], which fails the
-/// ticket atomically with the bounce-back when the counter is at
-/// [`MAX_BOUNCES`](crate::joint_verdict::MAX_BOUNCES).
+/// it is enforced at the bounce sites, which fail the ticket atomically with
+/// the bounce-back when the counter is at
+/// [`MAX_BOUNCES`](crate::joint_verdict::MAX_BOUNCES): review/QA bounces in
+/// [`process_verifier_verdicts`] and engineer hard-failure bounces in
+/// [`bounce_engineer_hard_failure`].
 ///
 /// The Manager is notified when the ticket transitions to [`TicketPhase::Failed`].
 ///
@@ -4158,6 +4346,21 @@ fn verifier_failure_reasons(results: &[ParallelVerdict]) -> String {
     format!("\n\nPer-agent failures:\n{}", reasons.join("\n"))
 }
 
+/// The bounce circuit-breaker trip comment: the ticket was bounced (review/QA
+/// bounce or engineer hard failure) too many times. Shared by the verifier
+/// bounce trip and the engineer hard-failure trip so the wording cannot drift
+/// (engineer hard failures share the review/QA bounce budget).
+/// Must retain the "circuit breaker" substring (asserted by
+/// `eleventh_bounce_fails_ticket`).
+#[must_use]
+fn bounce_breaker_trip_comment() -> String {
+    let max = crate::joint_verdict::MAX_BOUNCES;
+    format!(
+        "Failed after {max} bounces — ticket bounced back too many times \
+         (circuit breaker, max: {max}). Ticket failed — Manager will triage."
+    )
+}
+
 /// Process parallel verifier results: add failing comments, determine pass/fail,
 /// and update ticket phase accordingly.
 ///
@@ -4291,15 +4494,7 @@ async fn process_verifier_verdicts(
         )
     };
 
-    let bounce_breaker_comment = bounce_trip.then(|| {
-        let max = crate::joint_verdict::MAX_BOUNCES;
-        // The ticket bounced `max` times and this failed round is the 11th —
-        // the message counts actual bounces, not rounds.
-        format!(
-            "Failed after {max} bounces — ticket bounced back from review/QA too many \
-             times (circuit breaker, max: {max}). Ticket failed — Manager will triage."
-        )
-    });
+    let bounce_breaker_comment = bounce_trip.then(bounce_breaker_trip_comment);
 
     if !matches!(
         with_comment_and_transition(

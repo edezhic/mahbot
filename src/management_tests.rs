@@ -2750,6 +2750,406 @@ async fn engineer_comment_text_fail_open_and_renders() {
     );
 }
 
+// ── Engineer hard-failure bounce ────────────────────────────────────────
+
+/// Build a test Engineer agent for the finalizer tests (registered with the
+/// ticket so cancellation-by-ticket works).
+fn engineer_finalize_test_agent(ws: &Workspace, ticket: &Ticket, suffix: &str) -> Agent {
+    Agent::new(
+        format!("eng_finalize_{suffix}_{}", crate::generate_suffix()),
+        Role::Engineer,
+        ws,
+        Some(ticket.clone()),
+        String::new(),
+        String::new(),
+        None,
+        None,
+    )
+}
+
+/// A genuine hard "Agent failed" outcome must NOT fail the ticket: it bounces
+/// back to ReadyForDevelopment (sharing the review/QA bounce budget, with the
+/// pipeline reservation for rework priority), pauses the workspace, and
+/// records the concrete error as a SYSTEM_ROLE comment — so the retry's
+/// feedback window (comments after the last engineer-role comment) and the
+/// Manager notification both carry it.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn engineer_hard_failure_bounces_to_ready_for_development() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+
+    let ws = create_test_workspace("/tmp/eng_bounce_ws", "ws_eng_bounce").await;
+    let ticket_id = make_ticket(board(), &ws, "Eng Hard Failure", TicketPhase::InDevelopment).await;
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let mut agent = engineer_finalize_test_agent(&ws, &ticket, "hard");
+    agent.failure = Some("OpenRouter 500: service is too busy".to_string());
+
+    finalize_engineer_round(&ticket, &agent, None, "job_eng_bounce", false).await;
+
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::ReadyForDevelopment,
+        "a hard engineer failure must bounce the ticket, not fail it"
+    );
+    assert_eq!(
+        t.bounce_count, 1,
+        "the hard-failure bounce must consume the shared review/QA bounce budget"
+    );
+    assert!(
+        t.pipeline_reservation,
+        "the bounce must set rework priority over fresh ReadyForDevelopment tickets"
+    );
+
+    let ws_after = crate::workspace::store()
+        .get_by_name("ws_eng_bounce")
+        .await
+        .expect("query workspace")
+        .expect("workspace exists");
+    assert!(
+        ws_after.paused,
+        "a hard engineer failure must pause the workspace"
+    );
+
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    let last = comments.last().expect("failure comment written");
+    assert_eq!(
+        last.role, SYSTEM_ROLE,
+        "the failure comment must use SYSTEM_ROLE so the retry feedback window \
+         (comments after the last engineer-role comment) includes it"
+    );
+    assert!(
+        last.content.contains("OpenRouter 500: service is too busy"),
+        "the concrete error must be recorded on the ticket: {}",
+        last.content
+    );
+    assert!(
+        last.content.contains("Workspace paused"),
+        "the pause notice must be attached to the failure comment: {}",
+        last.content
+    );
+}
+
+/// The engineer hard-failure bounce trip: when the shared bounce budget is
+/// exhausted, the ticket moves to Failed (not RFD) — the workspace is STILL
+/// paused, ReadyForDevelopment siblings are NOT drained to Planning (unlike
+/// the verifier trip), the counter stays at the max, and both the trip
+/// comment and the concrete-error comment are written (trip first, so
+/// notify_ticket's last-comment lookup surfaces the error).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+
+    let ws = create_test_workspace("/tmp/eng_trip_ws", "ws_eng_trip").await;
+    let ticket_id = make_ticket(board(), &ws, "Eng Trip", TicketPhase::InDevelopment).await;
+    // A sibling RFD ticket that must NOT be drained to Planning by the trip.
+    let sibling_id = make_ticket(
+        board(),
+        &ws,
+        "Eng Trip Sibling",
+        TicketPhase::ReadyForDevelopment,
+    )
+    .await;
+    board()
+        .conn
+        .execute(
+            "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
+            turso::params![crate::joint_verdict::MAX_BOUNCES as i64, ticket_id.as_str()],
+        )
+        .await
+        .expect("set bounce_count to max");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let mut agent = engineer_finalize_test_agent(&ws, &ticket, "trip");
+    agent.failure = Some("provider exploded".to_string());
+
+    finalize_engineer_round(&ticket, &agent, None, "job_eng_trip", false).await;
+
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::Failed,
+        "an engineer hard failure at the bounce budget max must fail the ticket"
+    );
+    assert_eq!(
+        t.bounce_count,
+        crate::joint_verdict::MAX_BOUNCES as i64,
+        "the failing bounce is not counted — the counter stays at the max"
+    );
+
+    let ws_after = crate::workspace::store()
+        .get_by_name("ws_eng_trip")
+        .await
+        .expect("query workspace")
+        .expect("workspace exists");
+    assert!(
+        ws_after.paused,
+        "the budget-exhausting hard failure must pause the workspace too"
+    );
+
+    let sibling = expect_ticket(board(), &sibling_id).await;
+    assert_eq!(
+        sibling.phase,
+        TicketPhase::ReadyForDevelopment,
+        "the engineer trip must NOT drain ReadyForDevelopment siblings to Planning"
+    );
+
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    let trip_idx = comments
+        .iter()
+        .position(|c| c.content.contains("circuit breaker"))
+        .expect("trip comment written");
+    let failure_idx = comments
+        .iter()
+        .rposition(|c| c.content.contains("provider exploded"))
+        .expect("failure comment written");
+    assert!(
+        trip_idx < failure_idx,
+        "the trip comment must be written BEFORE the failure comment so the \
+         notification's last-comment lookup surfaces the concrete error"
+    );
+    assert_eq!(
+        comments[failure_idx].role, SYSTEM_ROLE,
+        "the failure comment must be SYSTEM_ROLE"
+    );
+}
+
+/// A user-initiated cancellation of the engineer keeps today's semantics:
+/// ticket Failed + workspace paused, never auto-re-queued (no bounce).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn engineer_cancel_fails_ticket_without_bounce() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+
+    let ws = create_test_workspace("/tmp/eng_cancel_ws", "ws_eng_cancel").await;
+    let ticket_id = make_ticket(board(), &ws, "Eng Cancel", TicketPhase::InDevelopment).await;
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let agent = engineer_finalize_test_agent(&ws, &ticket, "cancel");
+    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
+
+    finalize_engineer_round(&ticket, &agent, None, "job_eng_cancel", false).await;
+
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::Failed,
+        "a user-cancelled engineer run must fail the ticket, not bounce it"
+    );
+    assert_eq!(
+        t.bounce_count, 0,
+        "a user cancel must not consume the bounce budget"
+    );
+
+    let ws_after = crate::workspace::store()
+        .get_by_name("ws_eng_cancel")
+        .await
+        .expect("query workspace")
+        .expect("workspace exists");
+    assert!(
+        ws_after.paused,
+        "a user cancel must pause the workspace (unchanged)"
+    );
+
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    let last = comments.last().expect("failure comment written");
+    assert!(
+        last.content.contains("cancelled by user"),
+        "the cancel cause must be recorded: {}",
+        last.content
+    );
+}
+
+/// A drain-cut engineer round (response None + graceful drain active) must
+/// leave the job 'launched' for boot resume — no bounce, no Failed
+/// transition, no failure comment, no pause (requirement 4). Uses a REAL
+/// launched job row so the caller's skip of job terminalization is observed:
+/// a bug that completed the job on the drain bail would flip it to 'done'.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
+    init_management_test_stores().await;
+    let _lock = crate::util::test::retry_tests_lock();
+
+    let ws = create_test_workspace("/tmp/eng_drain_ws", "ws_eng_drain").await;
+    let ticket_id = make_ticket(board(), &ws, "Eng Drain", TicketPhase::InDevelopment).await;
+    let job_id = "job_eng_drain";
+    let now = crate::turso::now();
+    crate::session::store()
+        .conn
+        .execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
+             created_at, updated_at) \
+             VALUES (?1, 'ticket_stage', 'launched', '', ?2, 'engineer', 0, ?3, ?3)",
+            crate::turso::params![job_id, ws.name.clone(), now],
+        )
+        .await
+        .expect("insert launched job row");
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let mut agent = engineer_finalize_test_agent(&ws, &ticket, "drain");
+    agent.failure = Some("drained boom".to_string());
+
+    crate::shutdown::drain_begin();
+    finalize_engineer_round(&ticket, &agent, None, job_id, false).await;
+    // Clear the process-global drain flag BEFORE the assertions so a failing
+    // assert cannot poison the serialized group.
+    crate::shutdown::drain_clear();
+
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::InDevelopment,
+        "a drain-cut engineer round must NOT transition the ticket — it stays queued for boot resume"
+    );
+    assert_eq!(
+        t.bounce_count, 0,
+        "a drain-cut round must not consume the bounce budget"
+    );
+    let ws_after = crate::workspace::store()
+        .get_by_name("ws_eng_drain")
+        .await
+        .expect("query workspace")
+        .expect("workspace exists");
+    assert!(
+        !ws_after.paused,
+        "a drain-cut round must not pause the workspace"
+    );
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    assert!(
+        comments.is_empty(),
+        "no failure comment during the drain (the job resumes at boot)"
+    );
+    let status: Option<String> = crate::session::store()
+        .conn
+        .query_optional(
+            "SELECT status FROM jobs WHERE id = ?1",
+            crate::turso::params![job_id],
+            |row| row.get::<String>(0),
+        )
+        .await
+        .expect("query job status");
+    assert_eq!(
+        status.as_deref(),
+        Some("launched"),
+        "the drain-cut job must stay 'launched' for boot resume — never terminalized to 'done'"
+    );
+}
+
+/// The post-pause drain guard inside [`handle_engineer_failure`] — the second
+/// aborting check, after the workspace-pause await (the first real gap after
+/// the caller's initial [`stage_round_drain_cut`]) — must bail without any
+/// side effects and return `false`, so the caller leaves the job
+/// status='launched' for boot resume: no bounce, no Failed transition, no
+/// comment, no pause. The test drives the drain pre-active so the guard's
+/// bail path is exercised directly (the pause itself is skipped — shutdown is
+/// excluded inside [`pause_workspace_on_failure`]).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
+    init_management_test_stores().await;
+    let _lock = crate::util::test::retry_tests_lock();
+
+    let ws = create_test_workspace("/tmp/eng_midtail_ws", "ws_eng_midtail").await;
+    let ticket_id = make_ticket(
+        board(),
+        &ws,
+        "Eng Midtail Drain",
+        TicketPhase::InDevelopment,
+    )
+    .await;
+    let job_id = "job_eng_midtail";
+    let now = crate::turso::now();
+    crate::session::store()
+        .conn
+        .execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, role, retry_count, \
+             created_at, updated_at) \
+             VALUES (?1, 'ticket_stage', 'launched', '', ?2, 'engineer', 0, ?3, ?3)",
+            crate::turso::params![job_id, ws.name.clone(), now],
+        )
+        .await
+        .expect("insert launched job row");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let mut agent = engineer_finalize_test_agent(&ws, &ticket, "midtail");
+    agent.failure = Some("drained boom".to_string());
+
+    crate::shutdown::drain_begin();
+    let bailed = handle_engineer_failure(&ticket, &agent, false).await;
+    // Clear the process-global drain flag BEFORE the assertions so a failing
+    // assert cannot poison the serialized group.
+    crate::shutdown::drain_clear();
+
+    assert!(
+        !bailed,
+        "the mid-tail drain must report the bail so the caller keeps the job launched"
+    );
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::InDevelopment,
+        "the mid-tail drain bail must not transition the ticket"
+    );
+    assert_eq!(
+        t.bounce_count, 0,
+        "the mid-tail drain bail must not consume the bounce budget"
+    );
+    let ws_after = crate::workspace::store()
+        .get_by_name("ws_eng_midtail")
+        .await
+        .expect("query workspace")
+        .expect("workspace exists");
+    assert!(
+        !ws_after.paused,
+        "the mid-tail drain bail must not pause the workspace"
+    );
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    assert!(
+        comments.is_empty(),
+        "no failure comment on the mid-tail drain bail"
+    );
+    let status: Option<String> = crate::session::store()
+        .conn
+        .query_optional(
+            "SELECT status FROM jobs WHERE id = ?1",
+            crate::turso::params![job_id],
+            |row| row.get::<String>(0),
+        )
+        .await
+        .expect("query job status");
+    assert_eq!(
+        status.as_deref(),
+        Some("launched"),
+        "the mid-tail drain bail must leave the job 'launched' for boot resume"
+    );
+}
+
 // ── ticket_stage roster helpers ──────────────────────────────────────────
 // These pin the agent-id / angle-cycling contract shared by
 // `spawn_ticket_stage_round` (fresh dispatch) and `append_ticket_stage_slots`

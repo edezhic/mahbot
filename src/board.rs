@@ -307,9 +307,10 @@ pub struct Ticket {
     pub reporter: String,
     /// Whether this ticket has been archived (hidden from normal listings).
     pub is_archived: bool,
-    /// Whether this ticket holds a pipeline reservation (bounced back from
-    /// review/QA/diagnostics and awaiting rework). When set, the ticket gets
-    /// priority over other ReadyForDevelopment tickets during claim.
+    /// Whether this ticket holds a pipeline reservation (bounced back for
+    /// rework — review/QA bounce-back, diagnostics/sanitation failure, or
+    /// engineer hard failure — and awaiting rework). When set, the ticket
+    /// gets priority over other ReadyForDevelopment tickets during claim.
     pub pipeline_reservation: bool,
     pub priority: i64,
     /// HEAD commit hash at the last completed reviewer round on this ticket.
@@ -324,8 +325,9 @@ pub struct Ticket {
     /// Exact completion timestamp: set on transition to Done, cleared when the
     /// ticket leaves Done. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
-    /// Number of times this ticket bounced back from review/QA into
-    /// development. Drives the bounce-based circuit breaker (max 10).
+    /// Number of times this ticket bounced back into development (review/QA
+    /// bounce-backs and engineer hard failures). Drives the bounce-based
+    /// circuit breaker (max 10).
     pub bounce_count: i64,
 }
 
@@ -1019,7 +1021,7 @@ impl BoardStore {
     /// review, and QA).
     ///
     /// The subquery orders by `pipeline_reservation DESC, priority ASC, created_at ASC` so that
-    /// tickets bounced back from review/QA/diagnostics (reservation = 1) are claimed
+    /// tickets bounced back for rework (reservation = 1) are claimed
     /// before fresh tickets at the same phase. Among tickets with equal reservation,
     /// tickets with lower priority (higher urgency) are claimed first, then the oldest ticket
     /// (earliest created_at) is claimed first.
@@ -1517,8 +1519,9 @@ impl BoardStore {
 
     /// Increment the ticket's bounce counter inside an existing transaction.
     ///
-    /// Called atomically with the review/QA bounce-back transition so the
-    /// counter can never drift from the transitions that produce it.
+    /// Called atomically with the bounce-back transition (review/QA bounce or
+    /// engineer hard failure) so the counter can never drift from the
+    /// transitions that produce it.
     pub(crate) async fn increment_bounce_count_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,

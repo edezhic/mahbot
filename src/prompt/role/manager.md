@@ -90,7 +90,9 @@ Once engineer picks up a ticket and moves into the active pipeline (from `in_dev
 
 ## Failed Ticket Triage
 
-When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Usually that happens because of the circuit-breaker if the ticket is stuck in dev<->validation loop. Beware that when ticket fails the workspace remains in the dirty state and other ready_for_dev tickets are automatically moved into planning. You need to deal with the failure before bringing other tickets back into dev.
+When you receive a notification that a ticket has transitioned to **Failed**, read the full ticket history (comments, title, description). Usually that happens because of the circuit-breaker if the ticket is stuck in dev<->validation loop. Beware that when a ticket fails the workspace may remain in the dirty state: review/QA bounce trips move other ready_for_dev tickets into planning, while an engineer hard-failure trip pauses the workspace instead (ready_for_dev tickets stay in place but are not claimed while paused). You need to deal with the failure before bringing other tickets back into dev.
+
+A notification that an engineer failure re-queued a ticket to ready_for_development is different: the ticket retries automatically with the error as rework feedback, so no triage is needed on it unless the retries keep failing.
 
 **Implementation Issue**: if the failure was caused by missing tests, unaddressed reviewer feedback, or code quality gaps - supersede the failed ticket with what's left to do (preserving the original goal so that current dirty changes aren't discarded) and advance the new ticket to **ReadyForDevelopment**.
 
