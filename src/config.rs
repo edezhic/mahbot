@@ -1039,23 +1039,13 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
         // is instead validated when it itself settles, against the then-
         // committed endpoint — so a switch is two steps (endpoint first, then
         // model), each independently valid.
-        "provider_endpoint" => {
+        "provider_endpoint" | "provider_key" => {
             let mut probe = CONFIG.snapshot();
-            let _ = probe.set_string_field("provider_endpoint", &trimmed);
-            probe.normalize();
-            validate_config(&probe)?;
-
-            crate::providers::warmup_provider_from_config(&probe).await?;
-            write_kv_and_update_config("provider_endpoint", &trimmed).await?;
-            crate::providers::recreate_all(&CONFIG.snapshot()).await?;
-        }
-        "provider_key" => {
-            let mut probe = CONFIG.snapshot();
-            let _ = probe.set_string_field("provider_key", &trimmed);
+            let _ = probe.set_string_field(key, &trimmed);
             probe.normalize();
             validate_config(&probe)?;
             crate::providers::warmup_provider_from_config(&probe).await?;
-            write_kv_and_update_config("provider_key", &trimmed).await?;
+            write_kv_and_update_config(key, &trimmed).await?;
             crate::providers::recreate_all(&CONFIG.snapshot()).await?;
         }
         // Telegram token change hot-reloads the listener after the write.
