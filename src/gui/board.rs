@@ -488,7 +488,7 @@ impl BoardState {
         } else if label.contains("Dev") {
             (lucide::play(), "ready for dev")
         } else if label.contains("Backlog") {
-            (lucide::rotate_ccw(), "back to analysis")
+            (lucide::rotate_ccw(), "back to backlog")
         } else {
             (lucide::circle_check(), "move phase")
         }
