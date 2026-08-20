@@ -972,6 +972,69 @@ pub(crate) async fn run_provider(
         pin_w2,
     ));
 
+    // Warmup spend counts against the budget: the cap covers ALL billed usage
+    // (the ticket's "billed usage.cost accumulated against the cap"), not just
+    // ladder rounds. A provider whose warmup alone exceeds its guard is
+    // pathological — record it and skip the ladder.
+    let w_cost = usage_from(outcome_w1.envelope.as_ref()).cost.unwrap_or(0.0)
+        + usage_from(outcome_w2.envelope.as_ref()).cost.unwrap_or(0.0);
+    let (over_guard, over_cap) = context.budget.record(&tag, w_cost);
+    if over_cap {
+        let total = context.budget.total();
+        let reason = format!(
+            "spend cap exceeded (${total:.4} > ${:.4})",
+            context.budget.cap_usd
+        );
+        context.abort.cancel();
+        *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
+        return ProviderRun {
+            tag,
+            endpoint: endpoint.clone(),
+            selection_reason: None,
+            cache_supported,
+            contamination_warning,
+            warmup,
+            ladder: Vec::new(),
+            cache_hold_bucket: "not run".to_string(),
+            cache_hold_curve: Vec::new(),
+            billed_usd: w_cost,
+            estimated_usd: 0.0,
+            total_tokens_reported: 0,
+            token_usage: json!({"cached": 0u64, "miss": 0u64, "output": 0u64,
+                                "cache_write": 0u64, "reasoning": 0u64}),
+            latency: json!({"header_ms": [], "full_ms": []}),
+            reliability: json!({"errors": [], "retries": 0, "rounds_failed": 0}),
+            incomplete: true,
+            incomplete_reason: Some("budget".to_string()),
+            aborted: true,
+            abort_reason: Some(reason),
+        };
+    }
+    if over_guard {
+        return ProviderRun {
+            tag,
+            endpoint: endpoint.clone(),
+            selection_reason: None,
+            cache_supported,
+            contamination_warning,
+            warmup,
+            ladder: Vec::new(),
+            cache_hold_bucket: "not run".to_string(),
+            cache_hold_curve: Vec::new(),
+            billed_usd: w_cost,
+            estimated_usd: 0.0,
+            total_tokens_reported: 0,
+            token_usage: json!({"cached": 0u64, "miss": 0u64, "output": 0u64,
+                                "cache_write": 0u64, "reasoning": 0u64}),
+            latency: json!({"header_ms": [], "full_ms": []}),
+            reliability: json!({"errors": [], "retries": 0, "rounds_failed": 0}),
+            incomplete: true,
+            incomplete_reason: Some("budget".to_string()),
+            aborted: false,
+            abort_reason: None,
+        };
+    }
+
     // ── Ladder ──
     let rounds = ladder_secs.len() + 1;
     let mut frames: Vec<ToolFrame> = Vec::new();
