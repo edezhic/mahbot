@@ -1125,7 +1125,6 @@ pub(crate) fn bench_system_prompt() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench_openrouter::select::select_providers;
 
     /// Synthetic discovery snapshot (no HTTP, no DBs).
     fn test_snapshot() -> DiscoverySnapshot {
@@ -1133,7 +1132,7 @@ mod tests {
             "id": "acme/model-1",
             "canonical_slug": "acme/model-1",
             "name": "Acme Model 1",
-            "context_length": 200000,
+            "context_length": 200_000,
             "reasoning": {"default_effort": "high", "supported_efforts": ["xhigh","high","medium","low"], "mandatory": false},
             "supported_parameters": ["tools", "tool_choice", "reasoning_effort"]
         }]});
@@ -1141,11 +1140,11 @@ mod tests {
             "id": "acme/model-1",
             "name": "Acme Model 1",
             "endpoints": [
-                {"tag":"acme-a/fp8","name":"Acme A","provider_name":"Acme","status":"0","context_length":200000,"supports_implicit_caching":true,"quantization":"fp8",
+                {"tag":"acme-a/fp8","name":"Acme A","provider_name":"Acme","status":"0","context_length":200_000,"supports_implicit_caching":true,"quantization":"fp8",
                  "pricing":{"prompt":"0.000002","completion":"0.000008","request":"0","input_cache_read":"0.0000002"}},
-                {"tag":"acme-b/fp8","name":"Acme B","provider_name":"Acme","status":"0","context_length":200000,"supports_implicit_caching":true,"quantization":"fp8",
+                {"tag":"acme-b/fp8","name":"Acme B","provider_name":"Acme","status":"0","context_length":200_000,"supports_implicit_caching":true,"quantization":"fp8",
                  "pricing":{"prompt":"0.000003","completion":"0.000009","request":"0","input_cache_read":"0.0000003"}},
-                {"tag":"acme-c/fp8","name":"Acme C","provider_name":"Acme","status":"-10","context_length":200000,"supports_implicit_caching":false,"quantization":"fp8",
+                {"tag":"acme-c/fp8","name":"Acme C","provider_name":"Acme","status":"-10","context_length":200_000,"supports_implicit_caching":false,"quantization":"fp8",
                  "pricing":{"prompt":"0.000004","completion":"0.000010","request":"0","input_cache_read":"0.0000004"}}
             ]
         }});

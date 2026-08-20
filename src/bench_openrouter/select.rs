@@ -491,7 +491,7 @@ mod tests {
         let est = estimate_cost(&price, 1000.0, 4, &mut flags);
         assert!(flags.is_empty(), "cache-read price present → no flag");
         let expected =
-            (0.977 * 0.0000002 + 0.014 * 0.000002 + 0.009 * 0.000008) * 1000.0 + 0.0005 * 4.0;
+            (0.977 * 0.000_000_2 + 0.014 * 0.000_002 + 0.009 * 0.000_008) * 1000.0 + 0.0005 * 4.0;
         assert!((est - expected).abs() < 1e-12);
     }
 
@@ -510,7 +510,7 @@ mod tests {
         assert_eq!(flags.len(), 1);
         assert!(flags[0].contains("no cache-read price advertised"));
         // All cached tokens billed at the full prompt price.
-        let expected = (0.977 + 0.014) * 0.000002 * 1000.0 + 0.009 * 0.000008 * 1000.0;
+        let expected = (0.977 + 0.014) * 0.000_002 * 1000.0 + 0.009 * 0.000_008 * 1000.0;
         assert!((est - expected).abs() < 1e-12);
     }
 
@@ -519,7 +519,7 @@ mod tests {
         // 8 healthy with varied costs; one cost is an outlier (>3×median).
         let mut inputs = Vec::new();
         for i in 0..8 {
-            let est = if i == 7 { 100.0 } else { (i + 1) as f64 };
+            let est = if i == 7 { 100.0 } else { f64::from(i + 1) };
             inputs.push(input(ep(&format!("p{i}"), 200_000, "0"), est));
         }
         let decisions = select_providers(&inputs, 128_000, None);
@@ -528,8 +528,8 @@ mod tests {
         assert_eq!(selected.len(), 7);
         assert_eq!(decisions[7].reason, Some(ExclusionReason::Outlier(100.0)));
         // The 6 non-outlier healthy endpoints are all selected.
-        for i in 0..6 {
-            assert!(decisions[i].selected);
+        for d in &decisions[..6] {
+            assert!(d.selected);
         }
     }
 
@@ -563,7 +563,7 @@ mod tests {
     fn selection_allowlist_restricts_and_short_allowlist_wins() {
         let mut inputs = Vec::new();
         for i in 0..4 {
-            inputs.push(input(ep(&format!("p{i}"), 200_000, "0"), (i + 1) as f64));
+            inputs.push(input(ep(&format!("p{i}"), 200_000, "0"), f64::from(i + 1)));
         }
         // Allowlist with 2 entries → exactly those two selected, no padding.
         let wl = vec!["p1".to_string(), "p3".to_string()];
@@ -583,13 +583,14 @@ mod tests {
     fn selection_min_context_excludes_small_contexts() {
         // 4 healthy (context ok) + small-context + unknown-context: the two
         // context-excluded endpoints stay out (H >= 3 → no padding).
-        let mut inputs = Vec::new();
-        inputs.push(input(ep("small", 32_000, "0"), 5.0));
-        inputs.push(input(ep_ctx("none", None, "0"), 5.0));
-        inputs.push(input(ep("ok1", 200_000, "0"), 1.0));
-        inputs.push(input(ep("ok2", 200_000, "0"), 2.0));
-        inputs.push(input(ep("ok3", 200_000, "0"), 3.0));
-        inputs.push(input(ep("ok4", 200_000, "0"), 4.0));
+        let inputs = vec![
+            input(ep("small", 32_000, "0"), 5.0),
+            input(ep_ctx("none", None, "0"), 5.0),
+            input(ep("ok1", 200_000, "0"), 1.0),
+            input(ep("ok2", 200_000, "0"), 2.0),
+            input(ep("ok3", 200_000, "0"), 3.0),
+            input(ep("ok4", 200_000, "0"), 4.0),
+        ];
         let decisions = select_providers(&inputs, 128_000, None);
         assert_eq!(
             decisions[0].reason,
@@ -599,8 +600,8 @@ mod tests {
         assert!(!decisions[0].selected && !decisions[1].selected);
         // n = max(3, ceil(0.8×4)) = 4 → all 4 healthy selected.
         assert_eq!(decisions.iter().filter(|d| d.selected).count(), 4);
-        for i in 2..6 {
-            assert!(decisions[i].selected, "endpoint {i} should be selected");
+        for (i, d) in decisions.iter().enumerate().take(6).skip(2) {
+            assert!(d.selected, "endpoint {i} should be selected");
         }
     }
 

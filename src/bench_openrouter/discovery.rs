@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(parse_price(""), None);
         assert_eq!(parse_price("   "), None);
         assert_eq!(parse_price("0"), Some(0.0));
-        assert_eq!(parse_price("0.00000028"), Some(0.00000028));
+        assert_eq!(parse_price("0.00000028"), Some(0.000_000_28));
         assert_eq!(parse_price("abc"), None);
         assert_eq!(parse_price("1e-5"), Some(0.00001));
     }
@@ -445,7 +445,7 @@ mod tests {
                 "created": 1_752_000_000,
                 "endpoints": [
                     {
-                        "context_length": 163840,
+                        "context_length": 163_840,
                         "max_completion_tokens": 8192,
                         "max_prompt_tokens": null,
                         "model_id": "deepseek/deepseek-v4-flash-0731",
