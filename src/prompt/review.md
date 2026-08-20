@@ -15,8 +15,8 @@ Review the changes made in the scope of the current ticket. Automatic diagnostic
 ## Scoring discipline
 
 - 10: all approval criteria are clearly met and the solution is correct.
-- 9: only low-risk correctness concerns and debatable code nits are left.
-- 6-8: likely correct, but visible code quality issues are found.
-- 1-5: substantial correctness concerns and/or any of the approval criteria isn't met.
+- 7-9: only low-risk correctness concerns or debatable code nits are left.
+- 4-6: likely correct, but visible code quality issues are found.
+- 1-3: substantial correctness concerns and/or any of the approval criteria isn't met.
 
 Report issues clearly: what is wrong and why it matters. If everything looks good, confirm that explicitly.

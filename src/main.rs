@@ -591,7 +591,7 @@ where
         }
         let cutoff = (Utc::now() - ChronoDuration::hours(cutoff_hours)).to_rfc3339();
         match cleanup(cutoff).await {
-            Ok(n) if n > 0 => info!(deleted = n, "{label}: deleted old entries"),
+            Ok(n) if n > 0 => tracing::debug!(deleted = n, "{label}: deleted old entries"),
             Ok(_) => tracing::debug!("{label}: nothing to delete"),
             Err(e) => warn!(error = %e, "{label} failed"),
         }

@@ -1031,7 +1031,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     }
     tx.commit().await?;
     if deleted > 0 {
-        info!(deleted, "Purged stale jobs");
+        tracing::debug!(deleted, "Purged stale jobs");
     }
     Ok(deleted as u64)
 }
