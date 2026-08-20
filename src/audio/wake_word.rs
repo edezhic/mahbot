@@ -571,7 +571,7 @@ mod tests {
             "mahbot".into(),
             &five,
             cal.clone(),
-            &[confusable.clone()],
+            std::slice::from_ref(&confusable),
             String::new(),
             String::new(),
         )

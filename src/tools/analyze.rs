@@ -1678,7 +1678,7 @@ mod tests {
             &ws,
             "test question",
             runs,
-            std::time::Instant::now() + Duration::from_secs(60),
+            std::time::Instant::now() + Duration::from_mins(1),
             "test_round",
         )
         .await;
@@ -1704,7 +1704,7 @@ mod tests {
             &ws,
             "test question",
             runs,
-            std::time::Instant::now() + Duration::from_secs(60),
+            std::time::Instant::now() + Duration::from_mins(1),
             "test_round",
         )
         .await;
@@ -1736,7 +1736,7 @@ mod tests {
         let stuck = tokio::spawn(async move {
             let _detector = AbortDetector(flag);
             loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                tokio::time::sleep(Duration::from_hours(1)).await;
             }
         });
         let done = tokio::spawn(async { 42u32 });
@@ -1774,7 +1774,7 @@ mod tests {
             &ws,
             "test question",
             runs,
-            std::time::Instant::now() + Duration::from_secs(60),
+            std::time::Instant::now() + Duration::from_mins(1),
             "test_round",
         )
         .await;
@@ -1799,7 +1799,7 @@ mod tests {
             &ws,
             "test question",
             runs,
-            std::time::Instant::now() + Duration::from_secs(60),
+            std::time::Instant::now() + Duration::from_mins(1),
             "test_round",
         )
         .await;
@@ -2184,7 +2184,7 @@ mod tests {
             &ws,
             "test question",
             runs,
-            std::time::Instant::now() + Duration::from_secs(60),
+            std::time::Instant::now() + Duration::from_mins(1),
             "test_round",
         )
         .await;

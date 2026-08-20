@@ -2301,7 +2301,7 @@ mod tests {
         )
         .await;
         board
-            .reset_inflight_tickets(&[resumed.clone()])
+            .reset_inflight_tickets(std::slice::from_ref(&resumed))
             .await
             .unwrap();
         let t_resumed = board.get_ticket(&resumed).await.unwrap().unwrap();

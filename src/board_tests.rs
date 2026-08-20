@@ -1728,10 +1728,10 @@ async fn test_transactional_triple_write() {
                     None,
                 )
                 .await?;
-                if !should_succeed {
-                    Err(anyhow::anyhow!("simulated failure for rollback test"))
-                } else {
+                if should_succeed {
                     Ok(())
+                } else {
+                    Err(anyhow::anyhow!("simulated failure for rollback test"))
                 }
             })
             .await;

@@ -85,8 +85,7 @@ async fn circuit_breaker_self_counting_prevention() {
         assert!(
             !msg.contains(failed_marker.as_str()),
             "Diagnostics trip message must not contain the diagnostics_failed.md marker string \
-             ({:?}), otherwise self-counting would occur on re-evaluation. Trip message: {msg:?}",
-            failed_marker,
+             ({failed_marker:?}), otherwise self-counting would occur on re-evaluation. Trip message: {msg:?}",
         );
 
         // Full should_trip verification: a comment with SYSTEM_ROLE (the role actually
@@ -875,14 +874,14 @@ async fn resume_verifier_round_replays_stored_outcomes() {
     // reconstructs these WITHOUT calling the provider — the FakeProvider is
     // only needed for the joint-comment synthesis).
     for i in 0..3 {
-        let agent_id = format!("ticket_{}_resume_{}_reviewer", ticket_id, i);
+        let agent_id = format!("ticket_{ticket_id}_resume_{i}_reviewer");
         conn.execute(
             "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
              VALUES (?1, ?2, 'verifier', ?3, 'done', ?4, '')",
             crate::turso::params![
                 job_id,
                 agent_id,
-                i as i64,
+                i64::from(i),
                 serialize_verdict_outcome(&pass_result()),
             ],
         )
@@ -1394,7 +1393,7 @@ async fn eleventh_bounce_fails_ticket() {
     let transitioned = process_verifier_verdicts(
         &ws,
         &ticket,
-        &vec![pass_result(), fail_result(), pass_result()],
+        &[pass_result(), fail_result(), pass_result()],
         REVIEWER_VI,
     )
     .await;
@@ -1966,7 +1965,7 @@ async fn sanitation_register_persists_registered_id() {
 
     // Mirror the run_stage_agent_round scaffolding: job-derived agent ID first,
     // then register + persist the same ID in assigned_to.
-    let agent_id = format!("ticket_test-job_sanitation");
+    let agent_id = "ticket_test-job_sanitation".to_string();
     let mut rx = register_agent_and_assign(
         &ticket_id,
         &agent_id,
@@ -2227,7 +2226,7 @@ async fn process_sanitation_verdict_cases() {
                     "case {}: expected SANITATION_ROLE comment matching {:?}",
                     case.name,
                     markers,
-                )
+                );
             }
             None => assert!(
                 !comments.iter().any(|c| c.role == SANITATION_ROLE),

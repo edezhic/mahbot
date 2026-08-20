@@ -497,6 +497,6 @@ mod tests {
         // already set by earlier factories in the same test binary).
         install_ring_provider();
         let _client = build_http_client(Duration::from_secs(5));
-        let _ = build_download_client(Duration::from_secs(60)).expect("download client builds");
+        let _ = build_download_client(Duration::from_mins(1)).expect("download client builds");
     }
 }

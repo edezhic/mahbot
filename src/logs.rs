@@ -392,10 +392,8 @@ pub struct LogQuery {
     pub target: Option<String>,
     pub search: Option<String>,
     pub since: Option<String>,
-    pub until: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
-    pub agent_id: Option<String>,
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -441,16 +439,6 @@ fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
     if let Some(ref since) = filters.since {
         conditions.push("timestamp >= ?".into());
         values.push(Value::Text(since.clone()));
-    }
-
-    if let Some(ref until) = filters.until {
-        conditions.push("timestamp <= ?".into());
-        values.push(Value::Text(until.clone()));
-    }
-
-    if let Some(ref agent_id) = filters.agent_id {
-        conditions.push("agent_id LIKE ?".into());
-        values.push(Value::Text(format!("%{agent_id}%")));
     }
 
     if conditions.is_empty() {
@@ -1274,7 +1262,7 @@ mod tests {
             store.clone(),
             rx,
             broadcast_tx,
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_mins(1),
         );
 
         // One entry first — below the batch cap, so it stays buffered.

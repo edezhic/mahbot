@@ -1815,7 +1815,7 @@ mod tests {
             "sample rate mismatch"
         );
         assert_eq!(decoder.channels().get(), 1, "should be mono");
-        let decoded: Vec<f32> = decoder.map(f32::from).collect();
+        let decoded: Vec<f32> = decoder.collect();
         assert_eq!(decoded.len(), samples.len(), "sample count mismatch");
         for (got, expected) in decoded.iter().zip(&samples) {
             assert!(
@@ -2080,12 +2080,12 @@ mod tests {
         assert_eq!(ids2, vec![0; 5], "all map to UNK (default 0)");
 
         // Test with single-entry indexer (no UNK differentiation)
-        let (ids3, len3) = encode_text_with_indexer(&vec![42], "abc");
+        let (ids3, len3) = encode_text_with_indexer(&[42], "abc");
         assert_eq!(len3, 3);
         assert_eq!(ids3, vec![42; 3], "all chars map to UNK (first entry = 42)");
 
         // Test with negative UNK sentinel
-        let (ids4, len4) = encode_text_with_indexer(&vec![-1], "x");
+        let (ids4, len4) = encode_text_with_indexer(&[-1], "x");
         assert_eq!(len4, 1);
         assert_eq!(ids4, vec![-1i64], "UNK sentinel preserved");
     }
@@ -2400,8 +2400,7 @@ mod tests {
         // Reverb tail must be 200-400ms.
         assert!(
             (200..=400).contains(&PLAYBACK_REVERB_TAIL_MS),
-            "PLAYBACK_REVERB_TAIL_MS={} must be between 200 and 400",
-            PLAYBACK_REVERB_TAIL_MS,
+            "PLAYBACK_REVERB_TAIL_MS={PLAYBACK_REVERB_TAIL_MS} must be between 200 and 400",
         );
     }
 
@@ -2749,7 +2748,7 @@ mod tests {
 
         let transcription = crate::audio::local_transcriber::transcribe_file_async(
             &wav_path,
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_mins(1),
         )
         .await
         .unwrap_or_else(|e| {
@@ -2803,7 +2802,7 @@ mod tests {
 
         // At least 70 % of unique input words must appear in the
         // transcription.  Proper ceil division: (n * 70 + 99) / 100.
-        let threshold = (total_input * 70 + 99) / 100;
+        let threshold = (total_input * 70).div_ceil(100);
         assert!(
             matched >= threshold,
             "E2E TTS→ASR roundtrip: only {matched}/{total_input} unique \

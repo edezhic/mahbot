@@ -2683,7 +2683,7 @@ mod parity_tests {
         if spec.report_stream_bytes {
             match stream_bytes {
                 Some(n) if stream.len() <= BINARY_WINDOW => {
-                    assert_eq!(n, stream.len() as u64, "stream-size marker for {command}")
+                    assert_eq!(n, stream.len() as u64, "stream-size marker for {command}");
                 }
                 Some(n) => assert!(
                     n > 0 && n <= stream.len() as u64,

@@ -39,7 +39,7 @@ impl Xs {
         self.0
     }
     fn fill(&mut self, n: usize, lo: f32, hi: f32) -> Vec<f32> {
-        let span = (hi - lo) as f32;
+        let span = (hi - lo);
         (0..n)
             .map(|_| lo + (self.next_u64() as f64 / u64::MAX as f64) as f32 * span)
             .collect()
@@ -76,8 +76,7 @@ fn assert_matches_golden(label: &str, t: &Tensor, fixture: &str) {
     let got_dims: Vec<u32> = t.dims().iter().map(|&d| d as u32).collect();
     assert_eq!(
         got_dims, dims,
-        "{label}: shape mismatch {:?} vs golden {:?}",
-        got_dims, dims
+        "{label}: shape mismatch {got_dims:?} vs golden {dims:?}"
     );
     let got: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
     assert_eq!(got.len(), expected.len(), "{label}: element count mismatch");

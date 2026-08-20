@@ -3368,7 +3368,7 @@ mod tests {
         );
         let retried_user = messages[1]
             .split('\u{0}')
-            .last()
+            .next_back()
             .expect("retried request has a user segment");
         assert!(
             !retried_user.contains("[IMAGE:"),
@@ -3497,7 +3497,7 @@ mod tests {
         );
         let retried_user = messages[1]
             .split('\u{0}')
-            .last()
+            .next_back()
             .expect("retried request has a user segment");
         assert!(
             !retried_user.contains("[IMAGE:"),

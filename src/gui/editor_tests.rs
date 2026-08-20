@@ -1766,7 +1766,11 @@ fn test_rekey_keys() {
         ("exact_prefix", "dir", "newdir", &["dir"], &[("dir", "newdir")]),
     ];
     for &(name, old_prefix, new_prefix, keys, expected) in cases {
-        let mut pairs = rekey_keys(old_prefix, new_prefix, keys.iter().map(|s| s.to_string()));
+        let mut pairs = rekey_keys(
+            old_prefix,
+            new_prefix,
+            keys.iter().map(std::string::ToString::to_string),
+        );
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         let got: Vec<(&str, &str)> = pairs
             .iter()

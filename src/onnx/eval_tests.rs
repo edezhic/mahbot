@@ -15,8 +15,14 @@ fn node(op: &str, inputs: &[&str], outputs: &[&str]) -> Node {
     Node {
         op_type: op.to_string(),
         name: String::new(),
-        inputs: inputs.iter().map(|s| s.to_string()).collect(),
-        outputs: outputs.iter().map(|s| s.to_string()).collect(),
+        inputs: inputs
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+        outputs: outputs
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
         attributes: vec![],
     }
 }
@@ -25,8 +31,14 @@ fn node_attrs(op: &str, inputs: &[&str], outputs: &[&str], attributes: Vec<Attri
     Node {
         op_type: op.to_string(),
         name: String::new(),
-        inputs: inputs.iter().map(|s| s.to_string()).collect(),
-        outputs: outputs.iter().map(|s| s.to_string()).collect(),
+        inputs: inputs
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+        outputs: outputs
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
         attributes,
     }
 }

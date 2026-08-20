@@ -3422,7 +3422,7 @@ mod tests {
             drop(conn);
         }
         {
-            let conn = Connection::open(&db_path).await.unwrap();
+            let conn = Connection::open(db_path).await.unwrap();
             conn.checkpoint().await.unwrap();
             drop(conn);
         }

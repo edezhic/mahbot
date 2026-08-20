@@ -39,7 +39,6 @@ use fff_search::shared::{SharedFilePicker, SharedFrecency, SharedQueryTracker};
 use fff_search::{FilePicker, QueryTracker};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::OnceCell;
 
@@ -85,8 +84,6 @@ pub(crate) struct SearchEngineEntry {
     /// Persistent query tracker for combo-boost scoring.
     /// Falls back to in-memory if the LMDB database cannot be opened.
     pub query_tracker: SharedQueryTracker,
-    /// Set to `true` once a background scan has been initiated.
-    scan_initiated: AtomicBool,
 }
 
 // ── Initialization ────────────────────────────────────────────────────────
@@ -185,7 +182,6 @@ fn init_engine_for_workspace(
     Ok(SearchEngineEntry {
         picker,
         query_tracker,
-        scan_initiated: AtomicBool::new(true),
     })
 }
 
@@ -252,10 +248,6 @@ fn open_persistent_query_tracker(
 /// This is an async function because [`SharedFilePicker::wait_for_scan`] is a
 /// blocking call — we run it on the tokio blocking thread pool.
 pub(crate) async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), String> {
-    if !entry.scan_initiated.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
     let picker = entry.picker.clone();
 
     let scanned = tokio::task::spawn_blocking(move || {

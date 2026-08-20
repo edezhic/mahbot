@@ -1187,12 +1187,14 @@ mod tests {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         let mut cleaned_up = false;
         while tokio::time::Instant::now() < deadline {
-            let guard = ROUTER.get().unwrap().read().unwrap_poison();
-            if !guard.contains_key(id) {
+            let found = {
+                let guard = ROUTER.get().unwrap().read().unwrap_poison();
+                guard.contains_key(id)
+            };
+            if !found {
                 cleaned_up = true;
                 break;
             }
-            drop(guard);
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
 

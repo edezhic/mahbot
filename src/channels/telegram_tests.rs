@@ -179,7 +179,7 @@ fn board_listing_isolates_hostile_titles() {
     );
 
     let state = crate::board::TicketPhase::InDevelopment;
-    let lines = vec![
+    let lines = [
         format_board_line(&state, "mahbot-1", "Fix * unclosed italic"),
         format_board_line(&state, "mahbot-2", "Use `git status` and *pair* ok"),
         format_board_line(&state, "mahbot-3", "<script>alert(1)</script> & tags"),

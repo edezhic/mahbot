@@ -4602,7 +4602,7 @@ mod tests {
             "sustained speech + silence → 1 utterance"
         );
         assert!(
-            utterances[0].len() > 0,
+            !utterances[0].is_empty(),
             "utterance should contain audio samples"
         );
     }
@@ -4619,7 +4619,10 @@ mod tests {
         let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
         assert_eq!(utterances.len(), 2, "two speech segments → two utterances");
         for (i, utt) in utterances.iter().enumerate() {
-            assert!(utt.len() > 0, "utterance {i} should contain audio samples");
+            assert!(
+                !utt.is_empty(),
+                "utterance {i} should contain audio samples"
+            );
         }
     }
 
@@ -4717,7 +4720,7 @@ mod tests {
                     .expect("1s in the past should not underflow")
             } else {
                 Instant::now()
-                    .checked_add(Duration::from_secs(60))
+                    .checked_add(Duration::from_mins(1))
                     .expect("60s in the future should not overflow")
             });
 
@@ -5002,8 +5005,7 @@ mod tests {
         let threshold = result.expect("should return Some after bootstrap");
         assert!(
             (threshold - ADAPTIVE_SAFE_HARBOR).abs() < 0.01,
-            "with constant low score, threshold {threshold} should equal safe harbor {}",
-            ADAPTIVE_SAFE_HARBOR,
+            "with constant low score, threshold {threshold} should equal safe harbor {ADAPTIVE_SAFE_HARBOR}",
         );
     }
 
@@ -5027,8 +5029,7 @@ mod tests {
         let threshold = result.expect("should return Some after bootstrap");
         assert!(
             (threshold - ADAPTIVE_CEILING).abs() < 0.01,
-            "with high-variance scores, threshold {threshold} should equal ceiling {}",
-            ADAPTIVE_CEILING,
+            "with high-variance scores, threshold {threshold} should equal ceiling {ADAPTIVE_CEILING}",
         );
     }
 
@@ -5063,8 +5064,7 @@ mod tests {
             .expect("warmed() should exit bootstrap");
         assert!(
             (threshold - ADAPTIVE_SAFE_HARBOR).abs() < 0.01,
-            "warmed() threshold {threshold} should equal safe harbor {}",
-            ADAPTIVE_SAFE_HARBOR,
+            "warmed() threshold {threshold} should equal safe harbor {ADAPTIVE_SAFE_HARBOR}",
         );
         // Verify that all bootstrap frames were fed the near-silence score
         // and not 0.5 (which would produce threshold ~1.5 instead of 1.65).
@@ -5148,8 +5148,7 @@ mod tests {
             .expect("peek should return Some after bootstrap");
         assert!(
             (threshold - ADAPTIVE_SAFE_HARBOR).abs() < 0.01,
-            "peek threshold {threshold} should equal safe harbor {} with constant low input",
-            ADAPTIVE_SAFE_HARBOR,
+            "peek threshold {threshold} should equal safe harbor {ADAPTIVE_SAFE_HARBOR} with constant low input",
         );
     }
 
@@ -5173,7 +5172,7 @@ mod tests {
             let _ = state.peek(ADAPTIVE_K_DEFAULT);
         }
 
-        assert_eq!(state.scores, before_scores, "peek must not modify scores",);
+        assert_eq!(state.scores, before_scores, "peek must not modify scores");
         assert!(
             (state.sum - before_sum).abs() < f32::EPSILON,
             "peek must not modify sum",
@@ -5210,7 +5209,7 @@ mod tests {
             .peek(ADAPTIVE_K_DEFAULT)
             .expect("Some after bootstrap");
         assert!(
-            threshold >= ADAPTIVE_SAFE_HARBOR && threshold <= ADAPTIVE_CEILING,
+            (ADAPTIVE_SAFE_HARBOR..=ADAPTIVE_CEILING).contains(&threshold),
             "peek threshold {threshold} must be within [{ADAPTIVE_SAFE_HARBOR}, {ADAPTIVE_CEILING}]",
         );
     }
@@ -5655,9 +5654,10 @@ mod tests {
         ctx.phase3_silence_samples = 500;
         ctx.negatives_speech_samples = 1000;
         ctx.phase3_processed = 1234;
-        ctx.phase3_start_time = Some(Instant::now() - Duration::from_secs(10));
+        ctx.phase3_start_time = Some(Instant::now().checked_sub(Duration::from_secs(10)).unwrap());
         ctx.vad_threshold = 0.75;
-        ctx.last_wake_word_detection = Some(Instant::now() - Duration::from_secs(5));
+        ctx.last_wake_word_detection =
+            Some(Instant::now().checked_sub(Duration::from_secs(5)).unwrap());
         ctx.auto_start_pending = true;
         ctx.is_recording = true;
         ctx
@@ -6093,7 +6093,7 @@ mod tests {
         // assertion is meaningful (not trivially true from PipelineCtx::new()).
         {
             let mut at = AdaptiveThresholdState::new();
-            for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES + 1 {
+            for _ in 0..=ADAPTIVE_BOOTSTRAP_FRAMES {
                 at.feed(0.5, ADAPTIVE_K_DEFAULT);
             }
             assert!(
@@ -6192,7 +6192,7 @@ mod tests {
     fn seed_test_pcm(path: &Path) -> u64 {
         let samples: Vec<f32> = vec![0.0; 4096]; // 16 KB
         write_pcm_cache(path, &samples);
-        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(path).map_or(0, |m| m.len())
     }
 
     #[test]

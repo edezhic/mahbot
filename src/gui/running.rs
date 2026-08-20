@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn sort_key_orders_groups_by_kind() {
-        let mut groups = vec![
+        let mut groups = [
             DisplayGroup {
                 kind: GroupKind::Unattributed,
                 key: "ws".to_string(),

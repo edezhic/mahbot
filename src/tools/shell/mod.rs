@@ -3514,7 +3514,7 @@ mod tests {
         let ansi_msg = format_timeout_error(
             "test",
             elapsed,
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             Some(42),
             ansi_stdout,
             ansi_stderr,

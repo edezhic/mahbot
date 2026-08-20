@@ -1888,7 +1888,7 @@ mod tests {
         assert!(tokens.contains(&"SELECT".to_string()));
         assert!(tokens.contains(&"b".to_string()));
         assert!(tokens.contains(&"y".to_string()));
-        assert!(!tokens.contains(&"".to_string()));
+        assert!(!tokens.contains(&String::new()));
     }
 
     #[test]

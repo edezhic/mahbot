@@ -242,9 +242,7 @@ impl LogsState {
             },
             target: None,
             search: crate::util::none_if_empty(&data.search),
-            agent_id: None,
             since: None,
-            until: None,
             limit: Some(data.pagination.page_size),
             offset: Some(data.pagination.offset()),
         };

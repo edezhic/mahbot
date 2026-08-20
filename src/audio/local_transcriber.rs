@@ -1042,7 +1042,7 @@ mod tests {
         );
         // Check that samples are in valid f32 range
         for &s in &samples {
-            assert!(s >= -1.0 && s <= 1.0, "Sample {s} out of range");
+            assert!((-1.0..=1.0).contains(&s), "Sample {s} out of range");
         }
         // Verify first few samples approximate a sine wave starting near 0
         assert!(
