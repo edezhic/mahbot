@@ -2,7 +2,7 @@
 //!
 //! This is a STANDALONE bench HTTP path — it deliberately does NOT use
 //! [`crate::providers::compatible`], [`crate::retry`], or the global CONFIG
-//! provider stack. It owns its reqwest client (provided by the Phase 3
+//! provider stack. It owns its reqwest client (provided by the full-run
 //! orchestrator), its own bounded non-jittered retry loop, and its own spend
 //! accounting, so the measurement is independent of the production agent
 //! pipeline.
@@ -30,9 +30,10 @@
 //! - **Spend accounting**: per-round billed cost accumulates against a
 //!   per-provider guard and a total cap ([`RunBudget`]); the guard stops this
 //!   provider's ladder, the cap aborts the whole run.
-//! - **Deadline**: [`RUN_DEADLINE_MINS`] caps the whole run; the per-provider
-//!   deadline races every ladder sleep so a stalled provider cannot hang the
-//!   bench.
+//! - **Deadline + abort**: [`RUN_DEADLINE_MINS`] caps the whole run; the
+//!   per-provider deadline and the run-level abort token (spend cap / auth /
+//!   quota) both race every ladder sleep, so a stalled provider cannot hang
+//!   the bench and an aborted run interrupts a sleeping provider promptly.
 //! - **Pinning verification**: the serving provider from the response
 //!   metadata is checked against the endpoint's names
 //!   ([`crate::bench_openrouter::classify::verify_pinned`]); a drift is
@@ -42,7 +43,6 @@
 //!   exercising the model — such a round is re-sent once after a short delay
 //!   and marked Invalid (`"response_cache"`) if it persists.
 //!
-//! Phase 2a shipped the executor ahead of the Phase 2b orchestration wiring;
 //! `run_provider` is driven by the full-run scheduler in [`crate::bench_openrouter`]
 //! and the report writers consume [`ProviderRun`] / [`RoundRecord`].
 
@@ -50,7 +50,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -157,18 +156,12 @@ pub(crate) struct ToolFrame {
 /// assistant(tool_calls) + tool(result) pair per verified frame. When a frame
 /// carries `reasoning`, its keys are spread into the assistant message
 /// (`reasoning_content`, `reasoning`, `reasoning_details` — whatever the
-/// provider reported). `next_step` is the step the round expects the model to
-/// call; the messages themselves carry it via the last tool result
-/// ("proceed to step N+1"), so `next_step` is NOT embedded in the prompt
-/// prefix (that would change it per round and break the cache measurement) —
-/// the caller verifies the response against it.
+/// provider reported). The step the round expects the model to call lives in
+/// the last tool result ("proceed to step N+1") — it is NOT embedded in the
+/// prompt prefix (that would change it per round and break the cache
+/// measurement); the caller verifies the response against it separately.
 #[must_use]
-pub(crate) fn build_messages(
-    base: &BasePrompt,
-    frames: &[ToolFrame],
-    next_step: u64,
-) -> Vec<serde_json::Value> {
-    let _ = next_step;
+pub(crate) fn build_messages(base: &BasePrompt, frames: &[ToolFrame]) -> Vec<serde_json::Value> {
     let mut messages = vec![
         json!({"role": "system", "content": base.system}),
         json!({"role": "user", "content": base.user}),
@@ -210,20 +203,20 @@ pub(crate) fn build_messages(
 /// Build the canonical request body for one round. `provider.order` pins the
 /// endpoint's tag slug with fallbacks off; `reasoning_effort` is omitted
 /// entirely when `None` so byte-identical requests across rounds stay
-/// byte-identical.
+/// byte-identical. The expected step is not in the body either — it lives in
+/// the tool results, keeping the prompt prefix byte-identical across rounds.
 #[must_use]
 pub(crate) fn build_request_body(
     model: &str,
     base: &BasePrompt,
     frames: &[ToolFrame],
-    next_step: u64,
     tag: &str,
     reasoning_effort: Option<&str>,
     max_tokens: u32,
 ) -> serde_json::Value {
     let mut body = json!({
         "model": model,
-        "messages": build_messages(base, frames, next_step),
+        "messages": build_messages(base, frames),
         "max_tokens": max_tokens,
         "tools": [{
             "type": "function",
@@ -411,7 +404,11 @@ fn classify_http_error(status: reqwest::StatusCode) -> Option<&'static str> {
 }
 
 /// Send one round's request with bounded (never-jittered) retries and return
-/// the outcome. The API key and request body are never logged; at most a
+/// the outcome. Every failure is recorded inside the returned [`RoundOutcome`]
+/// (never an `Err`): auth/quota/other-4xx set `error_class` without retrying,
+/// retryable statuses (429/5xx) and transport/timeout errors are retried
+/// internally, and a final failure still yields an outcome with the error
+/// class set. The API key and request body are never logged; at most a
 /// `tracing::debug!` per attempt.
 ///
 /// Retry policy (3 attempts total):
@@ -424,7 +421,7 @@ pub(crate) async fn send_round(
     client: &reqwest::Client,
     key: &str,
     body: &serde_json::Value,
-) -> Result<RoundOutcome> {
+) -> RoundOutcome {
     let mut attempts = 0u32;
     let mut http_status = 0u16;
     let mut envelope: Option<RawEnvelope> = None;
@@ -510,7 +507,7 @@ pub(crate) async fn send_round(
 
     let (tool_call_step, tool_call_id, reasoning) = extract_tool_call(envelope.as_ref());
 
-    Ok(RoundOutcome {
+    RoundOutcome {
         http_status,
         envelope,
         error_class: error_class.map(str::to_string),
@@ -522,7 +519,7 @@ pub(crate) async fn send_round(
         t_headers,
         t_body,
         cache_status_header,
-    })
+    }
 }
 
 /// Pull the first `fast_tool` tool call out of the envelope: its parsed
@@ -803,6 +800,47 @@ pub(crate) struct ProviderRun {
     pub abort_reason: Option<String>,
 }
 
+impl ProviderRun {
+    /// A provider run that ended before (or at the start of) the ladder:
+    /// zeroed aggregates, `incomplete: true`, and the given warmup records +
+    /// billing. Shared by the W1-failure and W2-budget paths.
+    #[allow(clippy::too_many_arguments)] // one explicit early-termination surface
+    fn early(
+        tag: String,
+        endpoint: EndpointInfo,
+        cache_supported: bool,
+        contamination_warning: bool,
+        warmup: Vec<RoundRecord>,
+        billed_usd: f64,
+        incomplete_reason: String,
+        aborted: bool,
+        abort_reason: Option<String>,
+    ) -> Self {
+        Self {
+            tag,
+            endpoint,
+            selection_reason: None,
+            cache_supported,
+            contamination_warning,
+            warmup,
+            ladder: Vec::new(),
+            cache_hold_bucket: "not run".to_string(),
+            cache_hold_curve: Vec::new(),
+            billed_usd,
+            estimated_usd: 0.0,
+            total_tokens_reported: 0,
+            token_usage: json!({"cached": 0u64, "miss": 0u64, "output": 0u64,
+                                "cache_write": 0u64, "reasoning": 0u64}),
+            latency: json!({"header_ms": [], "full_ms": []}),
+            reliability: json!({"errors": [], "retries": 0, "rounds_failed": 0}),
+            incomplete: true,
+            incomplete_reason: Some(incomplete_reason),
+            aborted,
+            abort_reason,
+        }
+    }
+}
+
 /// RFC 3339 with milliseconds, e.g. `2026-08-20T00:00:00.000Z`.
 #[must_use]
 fn now_ms() -> String {
@@ -816,19 +854,6 @@ fn gap_ms(prev: &str, cur: &str) -> Option<u64> {
     let cur = crate::turso::parse_utc_timestamp(cur).ok()?;
     let ms = cur.signed_duration_since(prev).num_milliseconds();
     u64::try_from(ms).ok()
-}
-
-/// Send a round, unwrapping the infallible Result — every failure is recorded
-/// inside the returned [`RoundOutcome`] (the Result on [`send_round`] matches
-/// the spec'd public surface).
-async fn dispatch_round(
-    client: &reqwest::Client,
-    key: &str,
-    body: &serde_json::Value,
-) -> RoundOutcome {
-    send_round(client, key, body)
-        .await
-        .expect("send_round is infallible: failures are recorded in RoundOutcome")
 }
 
 /// Run one provider's warmup + TTL ladder. Never panics on provider behavior:
@@ -851,7 +876,6 @@ pub(crate) async fn run_provider(
     run_started: Instant,
 ) -> ProviderRun {
     let tag = endpoint.tag.clone();
-    let mut warmup: Vec<RoundRecord> = Vec::new();
     let mut ladder: Vec<RoundRecord> = Vec::new();
     let mut incomplete = false;
     let mut incomplete_reason: Option<String> = None;
@@ -859,52 +883,12 @@ pub(crate) async fn run_provider(
     let mut abort_reason: Option<String> = None;
 
     // ── W1: warmup 1 — the auth/quota gate before any spend ──
-    let w_body = build_request_body(
-        model,
-        base,
-        &[],
-        0,
-        &tag,
-        reasoning_effort,
-        ROUND_MAX_TOKENS,
-    );
-    let w_hash = prompt_hash(&build_messages(base, &[], 0));
+    let w_body = build_request_body(model, base, &[], &tag, reasoning_effort, ROUND_MAX_TOKENS);
+    let w_hash = prompt_hash(&build_messages(base, &[]));
     let t_send = now_ms();
-    let outcome_w1 = dispatch_round(client, key, &w_body).await;
+    let outcome_w1 = send_round(client, key, &w_body).await;
     let t_headers = outcome_w1.t_headers.clone();
     let t_body = outcome_w1.t_body.clone().unwrap_or_else(now_ms);
-
-    if let Some(class) = outcome_w1.error_class.as_deref()
-        && (class == "auth" || class == "quota")
-    {
-        let reason = format!("warmup failed ({class}); provider '{tag}'");
-        context.abort.cancel();
-        *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
-        tracing::debug!(tag = %tag, class, "provider aborted during warmup");
-        return ProviderRun {
-            tag,
-            endpoint: endpoint.clone(),
-            selection_reason: None,
-            cache_supported: false,
-            contamination_warning: false,
-            warmup: Vec::new(),
-            ladder: Vec::new(),
-            cache_hold_bucket: "not run".to_string(),
-            cache_hold_curve: Vec::new(),
-            billed_usd: 0.0,
-            estimated_usd: 0.0,
-            total_tokens_reported: 0,
-            token_usage: json!({"cached": 0u64, "miss": 0u64, "output": 0u64,
-                                "cache_write": 0u64, "reasoning": 0u64}),
-            latency: json!({"header_ms": [], "full_ms": []}),
-            reliability: json!({"errors": [], "retries": 0, "rounds_failed": 0}),
-            incomplete: true,
-            incomplete_reason: Some("aborted".to_string()),
-            aborted: true,
-            abort_reason: Some(reason),
-        };
-    }
-
     let contamination_warning = cached_tokens_of(outcome_w1.envelope.as_ref()) > 0;
     let pin_w1 = verify_pinned(
         outcome_w1
@@ -913,7 +897,7 @@ pub(crate) async fn run_provider(
             .and_then(|e| e.provider.as_deref()),
         endpoint,
     );
-    warmup.push(round_record(
+    let w1_record = round_record(
         RoundSpec {
             kind: "warmup",
             rung: None,
@@ -930,11 +914,48 @@ pub(crate) async fn run_provider(
         w_hash.clone(),
         &outcome_w1,
         pin_w1,
-    ));
+    );
+
+    // A failed W1 round is recorded and gates the ladder: auth/quota abort
+    // the whole run; any other error class skips this provider's ladder
+    // without touching the run token (no wasted W2 + ladder spend).
+    if let Some(class) = outcome_w1.error_class.as_deref() {
+        if class == "auth" || class == "quota" {
+            let reason = format!("warmup failed ({class}); provider '{tag}'");
+            context.abort.cancel();
+            *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
+            tracing::debug!(tag = %tag, class, "provider aborted during warmup");
+            return ProviderRun::early(
+                tag,
+                endpoint.clone(),
+                false,
+                contamination_warning,
+                vec![w1_record],
+                usage_from(outcome_w1.envelope.as_ref()).cost.unwrap_or(0.0),
+                "aborted".to_string(),
+                true,
+                Some(reason),
+            );
+        }
+        tracing::debug!(tag = %tag, class, "provider failed warmup; skipping ladder");
+        return ProviderRun::early(
+            tag,
+            endpoint.clone(),
+            false,
+            contamination_warning,
+            vec![w1_record],
+            usage_from(outcome_w1.envelope.as_ref()).cost.unwrap_or(0.0),
+            format!("warmup failed ({class})"),
+            false,
+            None,
+        );
+    }
+
+    let mut warmup = vec![w1_record];
 
     // ── W2: warmup 2 — byte-identical; the cache-support gate ──
     let t_send = now_ms();
-    let outcome_w2 = dispatch_round(client, key, &w_body).await;
+    let outcome_w2 = send_round(client, key, &w_body).await;
     let t_headers = outcome_w2.t_headers.clone();
     let t_body = outcome_w2.t_body.clone().unwrap_or_else(now_ms);
     let w2_cached = cached_tokens_of(outcome_w2.envelope.as_ref());
@@ -987,52 +1008,67 @@ pub(crate) async fn run_provider(
         );
         context.abort.cancel();
         *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
-        return ProviderRun {
+        return ProviderRun::early(
             tag,
-            endpoint: endpoint.clone(),
-            selection_reason: None,
-            cache_supported,
+            endpoint.clone(),
+            w2_cached > 0,
             contamination_warning,
             warmup,
-            ladder: Vec::new(),
-            cache_hold_bucket: "not run".to_string(),
-            cache_hold_curve: Vec::new(),
-            billed_usd: w_cost,
-            estimated_usd: 0.0,
-            total_tokens_reported: 0,
-            token_usage: json!({"cached": 0u64, "miss": 0u64, "output": 0u64,
-                                "cache_write": 0u64, "reasoning": 0u64}),
-            latency: json!({"header_ms": [], "full_ms": []}),
-            reliability: json!({"errors": [], "retries": 0, "rounds_failed": 0}),
-            incomplete: true,
-            incomplete_reason: Some("budget".to_string()),
-            aborted: true,
-            abort_reason: Some(reason),
-        };
+            w_cost,
+            "budget".to_string(),
+            true,
+            Some(reason),
+        );
     }
     if over_guard {
-        return ProviderRun {
+        return ProviderRun::early(
             tag,
-            endpoint: endpoint.clone(),
-            selection_reason: None,
-            cache_supported,
+            endpoint.clone(),
+            w2_cached > 0,
             contamination_warning,
             warmup,
-            ladder: Vec::new(),
-            cache_hold_bucket: "not run".to_string(),
-            cache_hold_curve: Vec::new(),
-            billed_usd: w_cost,
-            estimated_usd: 0.0,
-            total_tokens_reported: 0,
-            token_usage: json!({"cached": 0u64, "miss": 0u64, "output": 0u64,
-                                "cache_write": 0u64, "reasoning": 0u64}),
-            latency: json!({"header_ms": [], "full_ms": []}),
-            reliability: json!({"errors": [], "retries": 0, "rounds_failed": 0}),
-            incomplete: true,
-            incomplete_reason: Some("budget".to_string()),
-            aborted: false,
-            abort_reason: None,
-        };
+            w_cost,
+            "budget".to_string(),
+            false,
+            None,
+        );
+    }
+
+    // W2 failure gates the ladder symmetrically with W1: auth/quota abort
+    // the whole run; any other error class skips this provider's ladder
+    // (running it with cache_supported=false and base_cached=0 would
+    // mis-scale every classification as "not supported" and burn the
+    // full ladder on likely-failing rounds).
+    if let Some(class) = outcome_w2.error_class.as_deref() {
+        if class == "auth" || class == "quota" {
+            let reason = format!("warmup failed ({class}); provider '{tag}'");
+            context.abort.cancel();
+            *context.abort_reason.lock().unwrap_poison() = Some(reason.clone());
+            tracing::debug!(tag = %tag, class, "provider aborted during warmup 2");
+            return ProviderRun::early(
+                tag,
+                endpoint.clone(),
+                false,
+                contamination_warning,
+                warmup,
+                w_cost,
+                "aborted".to_string(),
+                true,
+                Some(reason),
+            );
+        }
+        tracing::debug!(tag = %tag, class, "provider failed warmup 2; skipping ladder");
+        return ProviderRun::early(
+            tag,
+            endpoint.clone(),
+            false,
+            contamination_warning,
+            warmup,
+            w_cost,
+            format!("warmup 2 failed ({class})"),
+            false,
+            None,
+        );
     }
 
     // ── Ladder ──
@@ -1062,12 +1098,11 @@ pub(crate) async fn run_provider(
             model,
             base,
             &frames,
-            next_step,
             &tag,
             reasoning_effort,
             ROUND_MAX_TOKENS,
         );
-        let hash = prompt_hash(&build_messages(base, &frames, next_step));
+        let hash = prompt_hash(&build_messages(base, &frames));
         let t_send = now_ms();
         let measured_gap_ms = prev_t_send
             .as_deref()
@@ -1079,7 +1114,8 @@ pub(crate) async fn run_provider(
             Some(ladder_secs[r - 1] as f64)
         };
 
-        let mut outcome = dispatch_round(client, key, &body).await;
+        let mut outcome = send_round(client, key, &body).await;
+        let mut round_billed = usage_from(outcome.envelope.as_ref()).cost.unwrap_or(0.0);
         let mut t_headers = outcome.t_headers.clone();
         let mut t_body = outcome.t_body.clone().unwrap_or_else(now_ms);
         let mut extra_retries = 0u32;
@@ -1100,7 +1136,8 @@ pub(crate) async fn run_provider(
         //    its response cache without exercising the model — re-send once.
         if invalid_reason.is_none() && outcome.response_cache_hit {
             tokio::time::sleep(Duration::from_secs(RESPONSE_CACHE_RETRY_DELAY_SECS)).await;
-            outcome = dispatch_round(client, key, &body).await;
+            outcome = send_round(client, key, &body).await;
+            round_billed += usage_from(outcome.envelope.as_ref()).cost.unwrap_or(0.0);
             extra_retries += 1;
             t_headers = outcome.t_headers.clone();
             t_body = outcome.t_body.clone().unwrap_or_else(now_ms);
@@ -1125,7 +1162,8 @@ pub(crate) async fn run_provider(
                 .and_then(|e| e.provider.as_deref());
             pin_verified = verify_pinned(serving, endpoint);
             if serving.is_some() && !pin_verified {
-                outcome = dispatch_round(client, key, &body).await;
+                outcome = send_round(client, key, &body).await;
+                round_billed += usage_from(outcome.envelope.as_ref()).cost.unwrap_or(0.0);
                 extra_retries += 1;
                 t_headers = outcome.t_headers.clone();
                 t_body = outcome.t_body.clone().unwrap_or_else(now_ms);
@@ -1168,12 +1206,12 @@ pub(crate) async fn run_provider(
                             model,
                             base,
                             &frames,
-                            next_step,
                             &tag,
                             reasoning_effort,
                             LENGTH_RETRY_MAX_TOKENS,
                         );
-                        outcome = dispatch_round(client, key, &retry_body).await;
+                        outcome = send_round(client, key, &retry_body).await;
+                        round_billed += usage_from(outcome.envelope.as_ref()).cost.unwrap_or(0.0);
                         extra_retries += 1;
                         t_headers = outcome.t_headers.clone();
                         t_body = outcome.t_body.clone().unwrap_or_else(now_ms);
@@ -1242,8 +1280,15 @@ pub(crate) async fn run_provider(
             pin_verified,
         ));
 
+        // The round's report cost equals its total billed spend (first
+        // response + any re-sends), keeping the provider's billed_usd
+        // aggregate consistent with the budget.
+        if round_billed > 0.0 {
+            ladder.last_mut().expect("just pushed").usage.cost = Some(round_billed);
+        }
+
         // 7. Spend accounting.
-        let (over_guard, over_cap) = context.budget.record(&tag, usage.cost.unwrap_or(0.0));
+        let (over_guard, over_cap) = context.budget.record(&tag, round_billed);
         if over_guard {
             incomplete = true;
             incomplete_reason = Some("budget".to_string());
@@ -1277,16 +1322,24 @@ pub(crate) async fn run_provider(
             "bench [{tag}] rung {r} gap={}s {} cost=${:.6}",
             nominal_gap_secs.unwrap_or(0.0),
             invalid_reason.as_deref().unwrap_or(classification_str),
-            usage.cost.unwrap_or(0.0),
+            round_billed,
         );
 
-        // Deterministic tool delay; the deadline races the sleep.
+        // Deterministic tool delay; the deadline and the run-level abort both
+        // race the sleep.
         if r < ladder_secs.len() {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(ladder_secs[r])) => {}
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(context.deadline)) => {
                     incomplete = true;
                     incomplete_reason = Some("deadline".to_string());
+                    break;
+                }
+                _ = context.abort.cancelled() => {
+                    aborted = true;
+                    abort_reason.clone_from(&context.abort_reason.lock().unwrap_poison());
+                    incomplete = true;
+                    incomplete_reason = Some("aborted".to_string());
                     break;
                 }
             }
@@ -1429,7 +1482,7 @@ mod tests {
                 })),
             },
         ];
-        let msgs = build_messages(&base(), &frames, 2);
+        let msgs = build_messages(&base(), &frames);
         // system + user + 2 × (assistant + tool)
         assert_eq!(msgs.len(), 6);
         assert_eq!(msgs[0], json!({"role": "system", "content": "sys"}));
@@ -1460,7 +1513,7 @@ mod tests {
 
     #[test]
     fn build_request_body_pins_and_omits_effort() {
-        let body = build_request_body("acme/model-1", &base(), &[], 0, "acme/fp8", None, 128);
+        let body = build_request_body("acme/model-1", &base(), &[], "acme/fp8", None, 128);
         assert_eq!(body["model"], "acme/model-1");
         assert_eq!(body["max_tokens"], 128);
         assert!(body.get("reasoning_effort").is_none());
@@ -1474,7 +1527,7 @@ mod tests {
         );
         assert_eq!(body["tools"][0]["function"]["name"], "fast_tool");
 
-        let with_effort = build_request_body("m", &base(), &[], 0, "t", Some("low"), 256);
+        let with_effort = build_request_body("m", &base(), &[], "t", Some("low"), 256);
         assert_eq!(with_effort["reasoning_effort"], "low");
     }
 
@@ -1499,7 +1552,6 @@ mod tests {
             "system_fingerprint": "fp-1",
             "service_tier": "default",
             "is_byok": false,
-            "cache_discount": 0.1,
             "openrouter_metadata": {"elapsed": 42},
             "usage": {
                 "prompt_tokens": 16000,
@@ -1595,14 +1647,14 @@ mod tests {
 
     #[test]
     fn canonical_messages_json_deterministic() {
-        let msgs = build_messages(&base(), &[], 0);
+        let msgs = build_messages(&base(), &[]);
         let a = canonical_messages_json(&msgs);
         let b = canonical_messages_json(&msgs);
         assert_eq!(a, b);
         assert!(a.contains("\"content\":\"sys\""));
         assert!(a.contains("\"role\":\"system\""));
         // Round 0's body must be byte-identical to W2's (the base prompt only).
-        let body = build_request_body("m", &base(), &[], 0, "t", None, 128);
+        let body = build_request_body("m", &base(), &[], "t", None, 128);
         assert_eq!(
             canonical_messages_json(body["messages"].as_array().expect("messages")),
             a

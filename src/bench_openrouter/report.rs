@@ -765,26 +765,16 @@ mod tests {
             tag: tag.to_string(),
             name: format!("Name {tag}"),
             provider_name: format!("Provider {tag}"),
-            model_id: None,
-            model_name: None,
             context_length: Some(200_000),
-            max_completion_tokens: None,
             quantization: Some("fp8".to_string()),
             status: Some("0".to_string()),
             supports_implicit_caching: Some(true),
-            supported_parameters: None,
             pricing: Some(Pricing {
                 prompt: Some(prompt.to_string()),
                 completion: Some(completion.to_string()),
                 request: Some("0".to_string()),
                 input_cache_read: Some(cache_read.to_string()),
-                input_cache_write: None,
-                discount: None,
             }),
-            latency_last_30m: None,
-            uptime_last_1d: None,
-            uptime_last_30m: None,
-            uptime_last_5m: None,
         }
     }
 

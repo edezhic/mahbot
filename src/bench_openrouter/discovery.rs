@@ -12,17 +12,11 @@
 //! - `GET /key` — the key's usage/limit envelope, used for the dry-run
 //!   affordability preflight.
 //!
-//! All three raw payloads are kept verbatim in [`DiscoverySnapshot`] so Phase
-//! 2 can persist them as the audit snapshot (`providers.json`). Structs are
-//! permissive (unknown fields ignored, optionals where the API omits fields
-//! for non-reasoning models / non-caching providers).
-//!
-//! Phase 1 uses `discover()` (models + endpoints + key in one pass); the
-//! standalone fetch methods and several wire fields are consumed by Phase 2
-//! (per-endpoint refresh, audit file writing), so they carry
-//! `#![allow(dead_code)]` until then.
-
-#![allow(dead_code)]
+//! All three raw payloads are kept verbatim in [`DiscoverySnapshot`] as the
+//! audit snapshot (`providers.json`), so every wire shape survives even though
+//! the typed structs below are trimmed to what the benchmark reads. Structs
+//! are permissive (unknown fields ignored, optionals where the API omits
+//! fields for non-reasoning models / non-caching providers).
 
 use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
@@ -120,27 +114,6 @@ impl DiscoveryClient {
             .await
             .with_context(|| format!("OpenRouter GET {url} returned invalid JSON"))
     }
-
-    /// Fetch the full model catalog.
-    pub(crate) async fn fetch_models(&self) -> anyhow::Result<Vec<ModelCatalogEntry>> {
-        let v = self.fetch_json("/models").await?;
-        parse_models(&v)
-    }
-
-    /// Fetch the per-provider endpoints of one model.
-    pub(crate) async fn fetch_endpoints(
-        &self,
-        model_id: &str,
-    ) -> anyhow::Result<EndpointsResponse> {
-        let v = self.fetch_json(&self.endpoints_path(model_id)?).await?;
-        parse_endpoints(&v, model_id)
-    }
-
-    /// Fetch the key's usage/limit envelope.
-    pub(crate) async fn fetch_key(&self) -> anyhow::Result<KeyInfo> {
-        let v = self.fetch_json("/key").await?;
-        parse_key(&v)
-    }
 }
 
 // ── Wire types (permissive Deserialize) ────────────────────────────
@@ -156,29 +129,16 @@ pub(crate) struct ModelCatalogEntry {
     #[serde(default)]
     pub context_length: Option<i64>,
     #[serde(default)]
-    pub links: Option<ModelLinks>,
-    #[serde(default)]
-    pub pricing: Option<Pricing>,
-    #[serde(default)]
     pub supported_parameters: Option<Vec<String>>,
     #[serde(default)]
     pub reasoning: Option<ModelReasoning>,
-    #[serde(default)]
-    pub top_provider: Option<serde_json::Value>,
-}
-
-/// `links` object of a catalog entry (the endpoints detail link).
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct ModelLinks {
-    #[serde(default)]
-    pub details: Option<String>,
 }
 
 /// Price object shared by catalog entries and endpoints.
 ///
 /// Prices arrive as strings in USD per token (e.g. `"0.00000028"`); the
-/// `input_cache_read`/`input_cache_write` fields are OPTIONAL — providers that
-/// do not advertise cache pricing omit them entirely.
+/// `input_cache_read` field is OPTIONAL — providers that do not advertise
+/// cache pricing omit it entirely.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct Pricing {
     #[serde(default)]
@@ -189,21 +149,13 @@ pub(crate) struct Pricing {
     pub request: Option<String>,
     #[serde(default)]
     pub input_cache_read: Option<String>,
-    #[serde(default)]
-    pub input_cache_write: Option<String>,
-    #[serde(default)]
-    pub discount: Option<f64>,
 }
 
 /// `reasoning` object of a catalog entry — OMITTED for non-reasoning models.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ModelReasoning {
     #[serde(default)]
-    pub default_effort: Option<String>,
-    #[serde(default)]
     pub supported_efforts: Option<Vec<String>>,
-    #[serde(default)]
-    pub mandatory: Option<bool>,
 }
 
 /// Wrapper of `GET /models/{author}/{slug}/endpoints`.
@@ -215,9 +167,6 @@ pub(crate) struct EndpointsResponse {
 /// `data` of the endpoints response.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct EndpointsData {
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
     #[serde(default)]
     pub endpoints: Vec<EndpointInfo>,
 }
@@ -230,13 +179,7 @@ pub(crate) struct EndpointInfo {
     pub name: String,
     pub provider_name: String,
     #[serde(default)]
-    pub model_id: Option<String>,
-    #[serde(default)]
-    pub model_name: Option<String>,
-    #[serde(default)]
     pub context_length: Option<i64>,
-    #[serde(default)]
-    pub max_completion_tokens: Option<i64>,
     #[serde(default)]
     pub quantization: Option<String>,
     /// STRING enum in the OpenAPI docs (`"0"`/`"-1"`/`"-2"`/`"-3"`/`"-5"`/
@@ -249,17 +192,7 @@ pub(crate) struct EndpointInfo {
     #[serde(default)]
     pub supports_implicit_caching: Option<bool>,
     #[serde(default)]
-    pub supported_parameters: Option<Vec<String>>,
-    #[serde(default)]
     pub pricing: Option<Pricing>,
-    #[serde(default)]
-    pub latency_last_30m: Option<serde_json::Value>,
-    #[serde(default)]
-    pub uptime_last_1d: Option<f64>,
-    #[serde(default)]
-    pub uptime_last_30m: Option<f64>,
-    #[serde(default)]
-    pub uptime_last_5m: Option<f64>,
 }
 
 /// Key usage/limit envelope from `GET /key`.
@@ -271,8 +204,6 @@ pub(crate) struct KeyInfo {
     pub limit_remaining: Option<f64>,
     #[serde(default)]
     pub limit_reset: Option<String>,
-    #[serde(default)]
-    pub usage: Option<f64>,
     #[serde(default)]
     pub is_free_tier: Option<bool>,
     #[serde(default)]
@@ -343,8 +274,8 @@ fn parse_key(v: &serde_json::Value) -> anyhow::Result<KeyInfo> {
 
 // ── Snapshot + orchestration ───────────────────────────────────────
 
-/// Verbatim snapshot of one discovery pass — raw payloads kept for the Phase
-/// 2 audit file (`providers.json`).
+/// Verbatim snapshot of one discovery pass — raw payloads kept for the audit
+/// snapshot (`providers.json`).
 pub(crate) struct DiscoverySnapshot {
     /// RFC 3339 with milliseconds, e.g. `2026-08-20T00:00:00.000Z`.
     pub fetched_at: String,
@@ -456,9 +387,7 @@ mod tests {
                             "prompt": "0.00000028",
                             "completion": "0.00000028",
                             "request": "0",
-                            "input_cache_read": "0.00000009",
-                            "input_cache_write": "0.00000028",
-                            "discount": 0.0
+                            "input_cache_read": "0.00000009"
                         },
                         "quantization": "fp8",
                         "status": "0",
@@ -475,24 +404,15 @@ mod tests {
             }
         });
         let parsed: EndpointsResponse = serde_json::from_value(json).expect("fixture must parse");
-        assert_eq!(parsed.data.id, "deepseek/deepseek-v4-flash-0731");
-        assert_eq!(parsed.data.name.as_deref(), Some("DeepSeek V4 Flash"));
         let ep = &parsed.data.endpoints[0];
         assert_eq!(ep.tag, "streamlake/fp8");
         assert_eq!(ep.name, "StreamLake");
         assert_eq!(ep.provider_name, "StreamLake");
         assert_eq!(ep.context_length, Some(163_840));
-        assert_eq!(ep.max_completion_tokens, Some(8192));
         assert_eq!(ep.quantization.as_deref(), Some("fp8"));
         // status is a STRING ("0"), not a number.
         assert_eq!(ep.status.as_deref(), Some("0"));
         assert_eq!(ep.supports_implicit_caching, Some(true));
-        assert_eq!(
-            ep.supported_parameters.as_deref(),
-            Some(&["tools".to_string(), "tool_choice".to_string()][..])
-        );
-        assert_eq!(ep.uptime_last_1d, Some(99.5));
-        assert_eq!(ep.uptime_last_30m, None);
         // pricing strings survive verbatim.
         let pricing = ep.pricing.as_ref().expect("pricing present");
         assert_eq!(pricing.prompt.as_deref(), Some("0.00000028"));

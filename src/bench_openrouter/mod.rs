@@ -50,8 +50,8 @@ use crate::bench_openrouter::discovery::{
     DiscoveryClient, DiscoverySnapshot, EndpointInfo, Pricing, discover,
 };
 use crate::bench_openrouter::select::{
-    ExclusionReason, SelectionDecision, SelectionInput, classify_endpoint, estimate_cost,
-    plan_cost, select_providers, selection_target,
+    ExclusionReason, SelectionDecision, SelectionInput, effective_target_count, estimate_cost,
+    plan_cost, select_providers,
 };
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -227,6 +227,12 @@ impl BenchOptions {
             root.join("benchmarks")
         };
 
+        if !cap_usd.is_finite() || cap_usd <= 0.0 {
+            return Err(CliError::Usage(
+                "--cap-usd must be a positive number".to_string(),
+            ));
+        }
+
         Ok(Self {
             model,
             api_key,
@@ -299,8 +305,8 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
 /// `.tshm` coordination). Any failure — missing file, unreadable store,
 /// missing row — degrades to `Ok(None)` with a `tracing::warn`: this is a
 /// fallback resolution path, never fatal.
-// The `Result` wrapper is spec'd for the shared data model even though the
-// body swallows all errors (Phase 2 callers may surface them).
+// The `Result` wrapper is part of the shared helper contract even though the
+// body swallows all errors (read-only fallback path).
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn read_config_kv(storage_root: &Path, key: &str) -> anyhow::Result<Option<String>> {
     let result = read_config_kv_inner(storage_root, key);
@@ -384,15 +390,7 @@ pub async fn run_cli() -> i32 {
 
     let opts = match BenchOptions::parse(&args) {
         Ok(o) => o,
-        Err(CliError::Usage(msg)) => {
-            eprintln!("Error: {msg}");
-            eprint!("{}", usage());
-            return 2;
-        }
-        Err(CliError::Hard(msg)) => {
-            eprintln!("Error: {msg}");
-            return 1;
-        }
+        Err(e) => return cli_error_exit(e),
     };
 
     if opts.dry_run {
@@ -515,12 +513,9 @@ fn build_selection(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> Selecti
             &default_price
         };
         let est_cost = estimate_cost(price, total_tokens, rounds, &mut f);
-        let (healthy, reason) = classify_endpoint(ep, MIN_CONTEXT, opts.providers.as_deref());
         inputs.push(SelectionInput {
             endpoint: ep.clone(),
             est_cost,
-            healthy,
-            excluded_reason: reason.map(|r| r.to_string()),
         });
         flags.push(f);
     }
@@ -535,25 +530,71 @@ fn build_selection(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> Selecti
     }
 }
 
-/// The affordability preflight shared by both modes: hard-fail when the
-/// estimate exceeds the remaining key limit, warn above 25% of it. Returns
-/// `true` when the run must stop (fatal).
-fn affordability_preflight(snapshot: &DiscoverySnapshot, total_est: f64) -> bool {
-    let Some(remaining) = snapshot.key.limit_remaining else {
-        return false;
-    };
+/// Everything the dry-run plan and the full-run executor need from the shared
+/// preamble: resolved key, discovery snapshot, model config, and selection.
+struct RunPreamble {
+    key: String,
+    key_source: &'static str,
+    snapshot: DiscoverySnapshot,
+    model_config: ModelConfig,
+    bundle: SelectionBundle,
+}
+
+/// Shared preamble for both modes: key resolution → discovery → model config
+/// → selection → affordability preflight. Returns a hard/usage error the
+/// callers turn into an exit code.
+async fn run_preamble(opts: &BenchOptions) -> Result<RunPreamble, CliError> {
+    let (key, key_source) = resolve_key(opts)?;
+    let client = DiscoveryClient::new(key.clone());
+    let snapshot = discover(&client, &opts.model)
+        .await
+        .map_err(|e| CliError::Hard(format!("{e:#}")))?;
+    let model_config = resolve_model_config(&snapshot, &opts.model);
+    let bundle = build_selection(opts, &snapshot);
+    if let Some(msg) = affordability_preflight(&snapshot, bundle.total_est) {
+        return Err(CliError::Hard(msg));
+    }
+    Ok(RunPreamble {
+        key,
+        key_source,
+        snapshot,
+        model_config,
+        bundle,
+    })
+}
+
+/// Print a CLI error the way run_cli does today and return its exit code.
+fn cli_error_exit(e: CliError) -> i32 {
+    match e {
+        CliError::Usage(msg) => {
+            eprintln!("Error: {msg}");
+            eprint!("{}", usage());
+            2
+        }
+        CliError::Hard(msg) => {
+            eprintln!("Error: {msg}");
+            1
+        }
+    }
+}
+
+/// The affordability preflight shared by both modes: `Some` with a hard-fail
+/// message when the estimate exceeds the remaining key limit (the caller turns
+/// it into an error/exit code), `None` otherwise. Warns on stderr (non-fatal)
+/// above 25% of the remaining limit.
+fn affordability_preflight(snapshot: &DiscoverySnapshot, total_est: f64) -> Option<String> {
+    let remaining = snapshot.key.limit_remaining?;
     if total_est > remaining {
-        eprintln!(
-            "Error: estimated cost ${total_est:.4} exceeds the remaining key limit ${remaining:.4}"
-        );
-        return true;
+        return Some(format!(
+            "estimated cost ${total_est:.4} exceeds the remaining key limit ${remaining:.4}"
+        ));
     }
     if total_est > 0.25 * remaining {
         eprintln!(
             "Warning: estimated cost ${total_est:.4} is more than 25% of the remaining key limit ${remaining:.4}"
         );
     }
-    false
+    None
 }
 
 // ── Dry-run orchestration ──────────────────────────────────────────
@@ -561,37 +602,19 @@ fn affordability_preflight(snapshot: &DiscoverySnapshot, total_est: f64) -> bool
 /// Discovery → selection → plan JSON to stdout. Never makes a chat-completions
 /// call. Prints nothing secret (the resolved API key is never echoed).
 async fn dry_run(opts: &BenchOptions) -> i32 {
-    // 1. Resolve key + model.
-    let (key, key_source) = match resolve_key(opts) {
-        Ok(k) => k,
-        Err(CliError::Hard(msg)) => {
-            eprintln!("Error: {msg}");
-            return 1;
-        }
-        Err(CliError::Usage(msg)) => {
-            eprintln!("Error: {msg}");
-            return 2;
-        }
+    // 1-4. Shared preamble: key → discovery → model config → selection →
+    //      affordability preflight.
+    let preamble = match run_preamble(opts).await {
+        Ok(p) => p,
+        Err(e) => return cli_error_exit(e),
     };
-
-    // 2. Discovery (models catalog, endpoints, key envelope).
-    let client = DiscoveryClient::new(key);
-    let snapshot = match discover(&client, &opts.model).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: {e:#}");
-            return 1;
-        }
-    };
-
-    // 3. Model config + selection (shared with the full run).
-    let model_config = resolve_model_config(&snapshot, &opts.model);
-    let bundle = build_selection(opts, &snapshot);
-
-    // 4. Affordability preflight against the key envelope.
-    if affordability_preflight(&snapshot, bundle.total_est) {
-        return 1;
-    }
+    let RunPreamble {
+        key: _,
+        key_source,
+        snapshot,
+        model_config,
+        bundle,
+    } = preamble;
 
     // 5. Plan JSON → stdout (EPIPE-tolerant).
     let plan = build_plan(&PlanData {
@@ -620,7 +643,7 @@ async fn dry_run(opts: &BenchOptions) -> i32 {
 /// entry per endpoint with its selection decision and a human reason (the same
 /// rendering the dry-run plan uses).
 fn build_selection_json(opts: &BenchOptions, bundle: &SelectionBundle) -> serde_json::Value {
-    let healthy_count = bundle.inputs.iter().filter(|i| i.healthy).count();
+    let healthy_count = bundle.decisions.iter().filter(|d| d.is_healthy()).count();
     let selected_count = bundle.decisions.iter().filter(|d| d.selected).count();
     let padding_count = bundle
         .decisions
@@ -632,21 +655,13 @@ fn build_selection_json(opts: &BenchOptions, bundle: &SelectionBundle) -> serde_
             .filter(|t| bundle.inputs.iter().any(|i| i.endpoint.tag == **t))
             .count()
     });
-    let target_count = match (healthy_count, allowlist_matches) {
-        (0, _) => 0,
-        (_, Some(m)) if m > 0 && m <= 2 => m,
-        _ => selection_target(healthy_count),
-    };
+    let target_count = effective_target_count(healthy_count, allowlist_matches);
     let providers: Vec<serde_json::Value> = bundle
         .inputs
         .iter()
         .zip(&bundle.decisions)
         .map(|(input, d)| {
-            let reason = match (&d.reason, d.selected) {
-                (Some(r), _) => r.to_string(),
-                (None, true) => "selected".to_string(),
-                (None, false) => "not selected".to_string(),
-            };
+            let reason = d.reason_text();
             json!({"tag": input.endpoint.tag, "selected": d.selected, "reason": reason})
         })
         .collect();
@@ -678,37 +693,19 @@ async fn full_run(opts: &BenchOptions) -> i32 {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    // 1. Resolve the API key.
-    let (key, key_source) = match resolve_key(opts) {
-        Ok(k) => k,
-        Err(CliError::Hard(msg)) => {
-            eprintln!("Error: {msg}");
-            return 1;
-        }
-        Err(CliError::Usage(msg)) => {
-            eprintln!("Error: {msg}");
-            return 2;
-        }
+    // 1-4. Shared preamble: key → discovery → model config → selection →
+    //      affordability preflight.
+    let preamble = match run_preamble(opts).await {
+        Ok(p) => p,
+        Err(e) => return cli_error_exit(e),
     };
-
-    // 2. Discovery (models catalog, endpoints, key envelope).
-    let discovery_client = DiscoveryClient::new(key.clone());
-    let snapshot = match discover(&discovery_client, &opts.model).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: {e:#}");
-            return 1;
-        }
-    };
-
-    // 3. Model config + selection.
-    let model_config = resolve_model_config(&snapshot, &opts.model);
-    let bundle = build_selection(opts, &snapshot);
-
-    // 4. Affordability preflight (same as dry-run).
-    if affordability_preflight(&snapshot, bundle.total_est) {
-        return 1;
-    }
+    let RunPreamble {
+        key,
+        key_source,
+        snapshot,
+        model_config,
+        bundle,
+    } = preamble;
 
     // 5. The bench's own run lock (never the daemon's mahbot.lock).
     let _run_lock = match report::acquire_run_lock(&opts.output_dir) {
@@ -760,6 +757,13 @@ async fn full_run(opts: &BenchOptions) -> i32 {
         .filter(|(_, d)| d.selected)
         .map(|(i, _)| i)
         .collect();
+    if selected.is_empty() {
+        eprintln!(
+            "Error: no providers selected for model '{}' — nothing to benchmark (the dry-run plan shows why)",
+            opts.model
+        );
+        return 1;
+    }
     let mut tasks = tokio::task::JoinSet::new();
     for (idx, &endpoint_idx) in selected.iter().enumerate() {
         let endpoint = snapshot.endpoints.data.endpoints[endpoint_idx].clone();
@@ -835,12 +839,7 @@ async fn full_run(opts: &BenchOptions) -> i32 {
             run.estimated_usd = input.est_cost;
         }
         let (selected, reason) = decision.map_or((false, "not selected".to_string()), |(d, _)| {
-            let reason = match (&d.reason, d.selected) {
-                (Some(r), _) => r.to_string(),
-                (None, true) => "selected".to_string(),
-                (None, false) => "not selected".to_string(),
-            };
-            (d.selected, reason)
+            (d.selected, d.reason_text())
         });
         run.selection_reason = Some(reason.clone());
         selection_reasons.push((selected, Some(reason)));
@@ -987,17 +986,13 @@ pub(crate) fn build_plan(data: &PlanData<'_>) -> serde_json::Value {
         .iter()
         .filter(|d| matches!(d.reason, Some(ExclusionReason::Padding)))
         .count();
-    let healthy_count = inputs.iter().filter(|i| i.healthy).count();
+    let healthy_count = decisions.iter().filter(|d| d.is_healthy()).count();
     let allowlist_matches = opts.providers.as_ref().map(|wl| {
         wl.iter()
             .filter(|t| inputs.iter().any(|i| i.endpoint.tag == **t))
             .count()
     });
-    let target_count = match (healthy_count, allowlist_matches) {
-        (0, _) => 0,
-        (_, Some(m)) if m > 0 && m <= 2 => m,
-        _ => selection_target(healthy_count),
-    };
+    let target_count = effective_target_count(healthy_count, allowlist_matches);
 
     let rounds = rounds_per_provider(&opts.ladder_secs);
     let total_delay_secs: u64 = opts.ladder_secs.iter().sum();
@@ -1089,12 +1084,8 @@ fn provider_entries(
             let decision = &decisions[i];
             // A human string from the ExclusionReason when one is recorded
             // (e.g. padded providers show "padding (expected to fail)"),
-            // otherwise "selected".
-            let selection_reason = match (&decision.reason, decision.selected) {
-                (Some(r), _) => r.to_string(),
-                (None, true) => "selected".to_string(),
-                (None, false) => "not selected".to_string(),
-            };
+            // otherwise "selected"/"not selected".
+            let selection_reason = decision.reason_text();
             json!({
                 "tag": ep.tag,
                 "name": ep.name,
@@ -1349,6 +1340,16 @@ mod tests {
             BenchOptions::parse(&["--cap-usd".to_string(), "abc".to_string()]),
             Err(CliError::Usage(_))
         ));
+        // Non-positive / non-finite caps → Usage.
+        for v in ["0", "-1", "nan", "inf"] {
+            assert!(
+                matches!(
+                    BenchOptions::parse(&["--cap-usd".to_string(), v.to_string()]),
+                    Err(CliError::Usage(_))
+                ),
+                "--cap-usd {v} must be rejected"
+            );
+        }
         assert!(matches!(
             BenchOptions::parse(&["--ladder".to_string(), "0,x".to_string()]),
             Err(CliError::Usage(_))

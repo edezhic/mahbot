@@ -4,7 +4,7 @@
 //! Pure math — no I/O. All functions here are unit-tested against synthetic
 //! inputs; the caller (dry-run orchestration) feeds live discovery data in.
 //!
-//! # Selection rules (mahbot-1789)
+//! # Selection rules
 //!
 //! 1. **Healthy** = status `"0"` AND `context_length >= min_context`
 //!    (default 128 000; `None` context → excluded as unknown) AND not a
@@ -53,9 +53,9 @@ pub(crate) const VALIDATED_MIX_OUTPUT: f64 = 0.009;
 /// provider advertises no `input_cache_read` price the estimate assumes the
 /// full prompt price and records that assumption in `flags`.
 ///
-/// Missing/unparseable price fields contribute 0. The `discount` field is not
-/// applied (it is a market-level discount already reflected in the listed
-/// prices, not a per-request modifier).
+/// Missing/unparseable price fields contribute 0. Market-level price
+/// reductions are already reflected in the listed prices and need no
+/// adjustment here.
 #[must_use]
 // usize→f64 is exact for request counts far below 2^53; cost math needs floats.
 #[allow(clippy::cast_precision_loss)]
@@ -94,17 +94,12 @@ pub(crate) fn estimate_cost(
 
 /// One candidate endpoint for selection, with its estimated run cost.
 ///
-/// `healthy`/`excluded_reason` are caller annotations (filled via
-/// [`classify_endpoint`], used by the plan builder); `select_providers`
-/// re-derives them authoritatively from `endpoint` + `min_context` +
-/// `allowlist` and never trusts the annotations. `excluded_reason` is read by
-/// the Phase 2 executor/report; `#![allow(dead_code)]` covers the gap.
-#[allow(dead_code)]
+/// The endpoint and its estimated cost are the only inputs;
+/// `select_providers` derives health authoritatively from `endpoint` +
+/// `min_context` + `allowlist`.
 pub(crate) struct SelectionInput {
     pub endpoint: EndpointInfo,
     pub est_cost: f64,
-    pub healthy: bool,
-    pub excluded_reason: Option<String>,
 }
 
 /// Why a candidate was excluded from (or padded into) the selection.
@@ -149,6 +144,31 @@ pub(crate) struct SelectionDecision {
     pub reason: Option<ExclusionReason>,
 }
 
+impl SelectionDecision {
+    /// Human-readable selection reason for the plan/report: the exclusion
+    /// reason when one is recorded, else "selected"/"not selected".
+    #[must_use]
+    pub(crate) fn reason_text(&self) -> String {
+        match (&self.reason, self.selected) {
+            (Some(r), _) => r.to_string(),
+            (None, true) => "selected".to_string(),
+            (None, false) => "not selected".to_string(),
+        }
+    }
+
+    /// True iff the endpoint passed the health gate (independent of the cost
+    /// rules): selected with no reason, or dropped by a cost rule
+    /// (`NotSelected`/`Outlier`). Padding and gate-excluded endpoints are
+    /// not healthy.
+    #[must_use]
+    pub(crate) fn is_healthy(&self) -> bool {
+        matches!(
+            self.reason,
+            None | Some(ExclusionReason::NotSelected(_) | ExclusionReason::Outlier(_))
+        )
+    }
+}
+
 // ── Health classification ──────────────────────────────────────────
 
 /// True iff the raw OpenRouter endpoint status is the healthy `"0"`.
@@ -157,8 +177,7 @@ pub(crate) struct SelectionDecision {
 /// verbatim elsewhere): `-1` unknown, `-2` verify-live, `-3` fallback-only,
 /// `-5`/`-10` exclude. None of them is healthy.
 #[must_use]
-// Signature is spec'd as `&Option<String>` (matches EndpointInfo.status);
-// Phase 2 consumers call it the same way.
+// Signature matches EndpointInfo.status (an Option<String>); callers pass it by reference.
 #[allow(clippy::ref_option)]
 pub(crate) fn is_healthy_status(s: &Option<String>) -> bool {
     s.as_deref() == Some("0")
@@ -378,6 +397,21 @@ pub(crate) fn selection_target(healthy_count: usize) -> usize {
     (3usize).max((healthy_count as f64 * 0.8).ceil() as usize)
 }
 
+/// Effective selection target: 0 when nothing is healthy; the allowlist size
+/// when a short (1-2 entry) allowlist is given (user intent wins); else the
+/// max(3, ceil(0.8 × healthy)) rule.
+#[must_use]
+pub(crate) fn effective_target_count(
+    healthy_count: usize,
+    allowlist_matches: Option<usize>,
+) -> usize {
+    match (healthy_count, allowlist_matches) {
+        (0, _) => 0,
+        (_, Some(m)) if m > 0 && m <= 2 => m,
+        _ => selection_target(healthy_count),
+    }
+}
+
 /// Median of est costs over the given input indices (average of the two
 /// middle values for an even count).
 fn median_of(indices: &[usize], input: &[SelectionInput]) -> f64 {
@@ -429,33 +463,21 @@ mod tests {
             tag: tag.to_string(),
             name: tag.to_string(),
             provider_name: tag.to_string(),
-            model_id: None,
-            model_name: None,
             context_length: context,
-            max_completion_tokens: None,
             quantization: None,
             status: Some(status.to_string()),
             supports_implicit_caching: Some(true),
-            supported_parameters: None,
             pricing: Some(Pricing {
                 prompt: Some("0.000001".to_string()),
                 completion: Some("0.000002".to_string()),
                 request: Some("0".to_string()),
                 input_cache_read: Some("0.0000001".to_string()),
-                input_cache_write: None,
-                discount: None,
             }),
-            latency_last_30m: None,
-            uptime_last_1d: None,
-            uptime_last_30m: None,
-            uptime_last_5m: None,
         }
     }
 
     fn input(ep: EndpointInfo, est: f64) -> SelectionInput {
         SelectionInput {
-            healthy: true,
-            excluded_reason: None,
             endpoint: ep,
             est_cost: est,
         }
@@ -484,8 +506,6 @@ mod tests {
             completion: Some("0.000008".to_string()),
             request: Some("0.0005".to_string()),
             input_cache_read: Some("0.0000002".to_string()),
-            input_cache_write: None,
-            discount: None,
         };
         let mut flags = Vec::new();
         let est = estimate_cost(&price, 1000.0, 4, &mut flags);
@@ -502,8 +522,6 @@ mod tests {
             completion: Some("0.000008".to_string()),
             request: Some("0".to_string()),
             input_cache_read: None, // provider does not advertise cache pricing
-            input_cache_write: None,
-            discount: None,
         };
         let mut flags = Vec::new();
         let est = estimate_cost(&price, 1000.0, 1, &mut flags);
@@ -646,5 +664,39 @@ mod tests {
             ExclusionReason::Padding.to_string(),
             "padding (expected to fail)"
         );
+    }
+
+    #[test]
+    fn selection_decision_reason_text() {
+        let d = SelectionDecision {
+            selected: false,
+            reason: Some(ExclusionReason::Padding),
+        };
+        assert_eq!(d.reason_text(), "padding (expected to fail)");
+        let selected = SelectionDecision {
+            selected: true,
+            reason: None,
+        };
+        assert_eq!(selected.reason_text(), "selected");
+        let unselected = SelectionDecision {
+            selected: false,
+            reason: None,
+        };
+        assert_eq!(unselected.reason_text(), "not selected");
+    }
+
+    #[test]
+    fn effective_target_count_rules() {
+        // Nothing healthy → 0, allowlist or not.
+        assert_eq!(effective_target_count(0, None), 0);
+        assert_eq!(effective_target_count(0, Some(2)), 0);
+        // No allowlist: max(3, ceil(0.8 × healthy)).
+        assert_eq!(effective_target_count(5, None), 4);
+        assert_eq!(effective_target_count(20, None), 16);
+        // Short allowlist (1-2 matching endpoints) wins over the count rule.
+        assert_eq!(effective_target_count(1, Some(2)), 2);
+        assert_eq!(effective_target_count(10, Some(1)), 1);
+        // A 0-match allowlist is not "short" — the count rule applies.
+        assert_eq!(effective_target_count(10, Some(0)), 8);
     }
 }

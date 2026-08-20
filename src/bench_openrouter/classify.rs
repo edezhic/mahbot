@@ -7,8 +7,9 @@
 //! [`format_bucket`]) for the report.
 //!
 //! Pure math — no I/O. Unit tests cover the threshold boundaries, bucket
-//! derivation (including warmup handling), formatting, saturation, and the
-//! tag→name pin verification.
+//! derivation (Invalid rounds are skipped; an all-Invalid ladder yields
+//! "not measured"), formatting, saturation, and the tag→name pin
+//! verification.
 
 use super::discovery::EndpointInfo;
 
@@ -69,56 +70,60 @@ pub(crate) fn classify_round(cached: u64, expected_cached: u64) -> CacheClassifi
 /// Collapse the per-round classifications into one TTL bucket string.
 ///
 /// `classifications[i]` is ladder round `i`; `nominal_gaps_secs[i]` is the
-/// nominal inactivity gap for that round. Leading rounds with gap `0` are
-/// warmup (they establish the base cache, not the TTL ladder) and are ignored.
+/// nominal inactivity gap for that round. The arrays cover ladder rounds ONLY:
+/// the first entry is the gap-0 probe (nominal gap `0.0`). Warmup rounds are
+/// never passed in.
 ///
 /// Rules:
-/// - If every non-warmup round is [`CacheClassification::NotSupported`] →
+/// - Empty input → `"not measured"`.
+/// - [`CacheClassification::Invalid`] rounds are skipped: they neither count
+///   as a Drop nor establish a hold.
+/// - If every round is Invalid → `"not measured"` (fail-closed — no hold was
+///   measured).
+/// - If the non-Invalid rounds are all [`CacheClassification::NotSupported`] →
 ///   `"not supported"` (the provider never produces cached tokens).
-/// - [`CacheClassification::Invalid`] rounds are skipped for bucketing (they
-///   neither count as a Drop nor terminate the search).
-/// - The first [`CacheClassification::Drop`] at ladder index `k` gives
-///   `(gap[k−1], gap[k]]` — the cache survived the previous gap but not `gap[k]`.
-///   `k == 0` (the very first ladder round) → `"immediate drop"`.
-/// - No Drop at all → `"≥{last gap}"` via [`format_bucket`] (e.g. `"≥30m"`
-///   for the full default ladder; a shortened ladder reports its actual last
-///   gap). Partial rounds count as held (they are not Drops).
+/// - The first [`CacheClassification::Drop`] at ladder index `k`:
+///   - the Drop is at a round whose nominal gap is `0.0` (the gap-0 probe,
+///     or a custom ladder's extra 0-gap rung) → `"immediate drop"`.
+///   - otherwise walk back from `k−1` to the nearest index `j` classified
+///     `Hit` or `Partial` (the only rounds that establish the cache held
+///     through their gap): found → `(gap[j], gap[k]]`; not found (all prior
+///     rounds Invalid/NotSupported) → `(0, gap[k]]` — no observed lower
+///     bound, rendered `≤{gap[k]}`.
+/// - No Drop → `"≥{gap[j]}"` via [`format_bucket`] where `j` is the LAST
+///   round that established a hold (`Hit`/`Partial`) — the cache held
+///   through `gap[j]`, and trailing `Invalid`/`NotSupported` rounds after it
+///   were unmeasured and must not inflate the bucket (e.g. `"≥30m"` for the
+///   full default ladder; a shortened ladder reports its actual last gap).
+///   Partial rounds count as held (they are not Drops).
 #[must_use]
 pub(crate) fn ttl_bucket(
     classifications: &[CacheClassification],
     nominal_gaps_secs: &[f64],
 ) -> String {
-    // Ladder rounds only: skip leading warmup (gap 0) rounds. Invalid rounds
-    // stay in place — they neither count as a Drop nor terminate the search,
-    // but the bucket boundaries come from the ladder's own gap values, so a
-    // Drop after an Invalid round still buckets against the preceding gap.
-    let ladder_start = nominal_gaps_secs
-        .iter()
-        .position(|&g| g > 0.0)
-        .unwrap_or(nominal_gaps_secs.len());
-
     let ladder: Vec<(CacheClassification, f64)> = classifications
         .iter()
         .zip(nominal_gaps_secs)
-        .skip(ladder_start)
         .map(|(c, g)| (*c, *g))
         .collect();
 
     if ladder.is_empty() {
-        return "not supported".to_string();
+        return "not measured".to_string();
     }
 
-    // Every usable (non-Invalid) non-warmup round NotSupported → the provider
-    // never produces cached tokens.
+    // Every usable (non-Invalid) round NotSupported → the provider never
+    // produces cached tokens; an all-Invalid ladder → nothing was measured.
     let usable: Vec<CacheClassification> = ladder
         .iter()
         .map(|(c, _)| *c)
         .filter(|c| *c != CacheClassification::Invalid)
         .collect();
-    if !usable.is_empty()
-        && usable
-            .iter()
-            .all(|c| *c == CacheClassification::NotSupported)
+    if usable.is_empty() {
+        return "not measured".to_string();
+    }
+    if usable
+        .iter()
+        .all(|c| *c == CacheClassification::NotSupported)
     {
         return "not supported".to_string();
     }
@@ -128,15 +133,32 @@ pub(crate) fn ttl_bucket(
         .iter()
         .position(|(c, _)| *c == CacheClassification::Drop)
     {
-        if k == 0 {
+        // A Drop at a 0-gap rung (the gap-0 probe at index 0, or an extra
+        // 0-gap round in a custom ladder) is an immediate drop.
+        if ladder[k].1 == 0.0 {
             return "immediate drop".to_string();
         }
-        return format_bucket(ladder[k - 1].1, ladder[k].1);
+        // Walk back from k−1 to the nearest round that established a hold.
+        for (j, (c, _)) in ladder.iter().enumerate().take(k).rev() {
+            if matches!(c, CacheClassification::Hit | CacheClassification::Partial) {
+                return format_bucket(ladder[j].1, ladder[k].1);
+            }
+        }
+        // No prior Hit/Partial — no observed lower bound.
+        return format_bucket(0.0, ladder[k].1);
     }
 
-    // No Drop: the cache held through the whole ladder.
-    let last_gap = ladder.last().map_or(0.0, |(_, g)| *g);
-    format_bucket(last_gap, f64::INFINITY)
+    // No Drop: walk back to the LAST round that established a hold — the
+    // cache held through its gap; trailing Invalid/NotSupported rounds
+    // after it were unmeasured and must not inflate the bucket.
+    for (j, (c, _)) in ladder.iter().enumerate().rev() {
+        if matches!(c, CacheClassification::Hit | CacheClassification::Partial) {
+            return format_bucket(ladder[j].1, f64::INFINITY);
+        }
+    }
+    // No round ever established a hold (the guards above make this
+    // unreachable, but fail closed rather than fabricate a bucket).
+    "not measured".to_string()
 }
 
 /// Format a TTL bucket `(lo, hi]` with human durations:
@@ -223,42 +245,85 @@ mod tests {
     #[test]
     fn ttl_bucket_derivation() {
         use CacheClassification as C;
-        // Drop at ladder index 1 (round 3 overall): gaps (5s, 30s].
-        let classes = [C::Hit, C::Hit, C::Hit, C::Drop, C::Hit];
-        let gaps = [0.0, 0.0, 5.0, 30.0, 120.0];
+        // Ladder-only arrays; the first entry is the gap-0 probe.
+        // 1. Drop at index 2; the nearest prior Hit is at gap 5 → (5s, 30s].
+        let classes = [C::Hit, C::Hit, C::Drop, C::Hit];
+        let gaps = [0.0, 5.0, 30.0, 120.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "(5s, 30s]");
 
-        // All hits → held through the full ladder → ≥30m (1800s).
+        // 2. No Drop → held through the full ladder → ≥30m (1800s).
         let classes = [C::Hit, C::Hit, C::Hit, C::Hit, C::Hit];
-        let gaps = [0.0, 0.0, 5.0, 30.0, 1800.0];
+        let gaps = [0.0, 5.0, 30.0, 120.0, 1800.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "≥30m");
 
-        // Shortened ladder (last gap 600s) → ≥10m.
+        // 3. Shortened ladder (last gap 600s) → ≥10m.
         let classes = [C::Hit, C::Hit, C::Hit];
-        let gaps = [0.0, 0.0, 600.0];
+        let gaps = [0.0, 5.0, 600.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "≥10m");
 
-        // First ladder round drops → immediate drop.
-        let classes = [C::Hit, C::Hit, C::Drop, C::Hit];
-        let gaps = [0.0, 0.0, 5.0, 30.0];
+        // 4. The gap-0 probe itself dropped → genuine immediate drop.
+        let classes = [C::Drop, C::Hit, C::Hit];
+        let gaps = [0.0, 5.0, 30.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "immediate drop");
 
-        // All non-warmup NotSupported → not supported.
+        // 5. Held through the 0s probe, dropped at the 5s rung → ≤5s, NOT an
+        //    immediate drop (replaces the old misleading warmup-skew case).
+        let classes = [C::Hit, C::Drop, C::Hit];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "≤5s");
+
+        // 6. All non-Invalid rounds NotSupported → not supported.
         let classes = [C::NotSupported, C::NotSupported, C::NotSupported];
         let gaps = [0.0, 5.0, 30.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "not supported");
 
-        // Invalid rounds are skipped, not Drops.
-        let classes = [C::Hit, C::Hit, C::Invalid, C::Drop, C::Hit];
-        let gaps = [0.0, 0.0, 5.0, 30.0, 120.0];
-        assert_eq!(ttl_bucket(&classes, &gaps), "(5s, 30s]");
+        // 7. Invalid rounds are skipped for the NotSupported check too.
+        let classes = [C::NotSupported, C::Invalid, C::NotSupported];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "not supported");
 
-        // Partial counts as held (not a Drop): the Drop at 120s buckets
-        // against the Partial round's 30s gap, not the 5s gap (a Partial
-        // treated as a Drop would give "(5s, 30s]").
-        let classes = [C::Hit, C::Hit, C::Hit, C::Partial, C::Drop];
-        let gaps = [0.0, 0.0, 5.0, 30.0, 120.0];
+        // 8. All-Invalid ladder fails closed → not measured.
+        let classes = [C::Invalid, C::Invalid, C::Invalid];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "not measured");
+
+        // 9. Empty input → not measured.
+        assert_eq!(ttl_bucket(&[], &[]), "not measured");
+
+        // 10. The index-1 round is Invalid, so the only observed hold is the
+        //     gap-0 Hit → honest lower bound 0 → ≤30s.
+        let classes = [C::Hit, C::Invalid, C::Drop, C::Hit];
+        let gaps = [0.0, 5.0, 30.0, 120.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "≤30s");
+
+        // 11. No prior Hit/Partial at all → no observed lower bound → ≤30s.
+        let classes = [C::Invalid, C::Invalid, C::Drop];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "≤30s");
+
+        // 12. Partial counts as held (not a Drop): the walk-back finds it and
+        //     buckets the Drop at 120s against the Partial's 30s gap.
+        let classes = [C::Hit, C::Hit, C::Partial, C::Drop];
+        let gaps = [0.0, 5.0, 30.0, 120.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "(30s, 2m]");
+
+        // 13. Only the 0s hold was observed; trailing Invalids are unmeasured
+        //     and must NOT inflate the bucket to ≥30m.
+        let classes = [C::Hit, C::Invalid, C::Invalid];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "≥0s");
+
+        // 14. Last observed hold at the 5s rung; trailing Invalids after it
+        //     are unmeasured → ≥5s.
+        let classes = [C::Hit, C::Hit, C::Invalid, C::Invalid];
+        let gaps = [0.0, 5.0, 30.0, 120.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "≥5s");
+
+        // 15. Custom ladder with a second 0-gap round: a Drop at that rung is
+        //     an immediate drop (was "0s" before the gap-based check).
+        let classes = [C::Hit, C::Drop, C::Hit];
+        let gaps = [0.0, 0.0, 30.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "immediate drop");
     }
 
     #[test]
@@ -286,19 +351,11 @@ mod tests {
             tag: "acme/fp8".to_string(),
             name: "Acme Cloud".to_string(),
             provider_name: "Acme".to_string(),
-            model_id: None,
-            model_name: None,
             context_length: Some(200_000),
-            max_completion_tokens: None,
             quantization: Some("fp8".to_string()),
             status: Some("0".to_string()),
             supports_implicit_caching: Some(true),
-            supported_parameters: None,
             pricing: None,
-            latency_last_30m: None,
-            uptime_last_1d: None,
-            uptime_last_30m: None,
-            uptime_last_5m: None,
         };
         assert!(verify_pinned(Some("Acme Cloud"), &endpoint)); // name
         assert!(verify_pinned(Some("Acme"), &endpoint)); // provider_name
