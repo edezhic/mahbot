@@ -82,23 +82,33 @@ impl DiscoveryClient {
 
     /// GET `path` with `Authorization: Bearer <key>`.
     ///
+    /// `path` may be a bare path (e.g. `/models`) — resolved against the API
+    /// base — or an absolute URL (e.g. `endpoints_path`'s full model-endpoints
+    /// URL). The absolute form is used as-is; prepending the base to an
+    /// absolute URL would double it (`…/api/v1https://…`) and 404.
+    ///
     /// On a non-2xx response the body is read (≤500 chars) and returned as an
     /// error carrying status + body, so callers get the API's actual message
     /// (e.g. a 401 "invalid API key" or a 404 for an unknown model slug).
     async fn fetch_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let url = if path.starts_with("http") {
+            path.to_string()
+        } else {
+            format!("{}{}", self.base, path)
+        };
         let resp = self
             .client
-            .get(format!("{}{}", self.base, path))
+            .get(&url)
             .bearer_auth(&self.key)
             .send()
             .await
-            .with_context(|| format!("OpenRouter request failed: GET {path}"))?;
+            .with_context(|| format!("OpenRouter request failed: GET {url}"))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let detail = truncate(body.trim(), 500);
             bail!(
-                "OpenRouter GET {path} failed: HTTP {status}{}",
+                "OpenRouter GET {url} failed: HTTP {status}{}",
                 if detail.is_empty() {
                     String::new()
                 } else {
@@ -108,7 +118,7 @@ impl DiscoveryClient {
         }
         resp.json::<serde_json::Value>()
             .await
-            .with_context(|| format!("OpenRouter GET {path} returned invalid JSON"))
+            .with_context(|| format!("OpenRouter GET {url} returned invalid JSON"))
     }
 
     /// Fetch the full model catalog.
@@ -229,10 +239,12 @@ pub(crate) struct EndpointInfo {
     pub max_completion_tokens: Option<i64>,
     #[serde(default)]
     pub quantization: Option<String>,
-    /// STRING enum: `"0"` healthy, `"-1"`/`"-2"`/`"-3"`/`"-5"`/`"-10"`
-    /// unhealthy (see [`crate::bench_openrouter::select::is_healthy_status`]
-    /// for the refined bands).
-    #[serde(default)]
+    /// STRING enum in the OpenAPI docs (`"0"`/`"-1"`/`"-2"`/`"-3"`/`"-5"`/
+    /// `"-10"`) but the live API sends an INTEGER (`0`, `-2`, …) — accepted
+    /// permissively as either shape and normalized to a string
+    /// ([`deserialize_status`]). See [`crate::bench_openrouter::select::is_healthy_status`]
+    /// for the refined bands.
+    #[serde(default, deserialize_with = "deserialize_status")]
     pub status: Option<String>,
     #[serde(default)]
     pub supports_implicit_caching: Option<bool>,
@@ -280,6 +292,28 @@ pub(crate) fn parse_price(s: &str) -> Option<f64> {
         return None;
     }
     t.parse::<f64>().ok()
+}
+
+/// Permissive deserializer for the endpoint `status` field: the OpenAPI docs
+/// declare a string enum (`"0"`, `"-1"`, …) but the live API sends an integer
+/// (`0`, `-2`, …). Accepts either shape and normalizes to a string; a present
+/// value of any other type yields `None` instead of failing the whole
+/// endpoints parse.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Result is the deserialize_with contract"
+)]
+fn deserialize_status<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(de)
+        .ok()
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }))
 }
 
 /// Parse the `data` array of the models response.
@@ -464,6 +498,49 @@ mod tests {
         assert_eq!(pricing.prompt.as_deref(), Some("0.00000028"));
         assert_eq!(pricing.input_cache_read.as_deref(), Some("0.00000009"));
         assert_eq!(pricing.request.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn parses_live_integer_status_shape() {
+        // The live API sends `status` as an INTEGER (0, -2) despite the
+        // OpenAPI docs declaring a string enum — both shapes must parse and
+        // normalize to the same string form (regression for the 404/parse
+        // discovery failure found in the live smoke test).
+        let json = serde_json::json!({
+            "data": {
+                "id": "deepseek/deepseek-v4-flash-0731",
+                "endpoints": [
+                    {
+                        "tag": "streamlake/fp8",
+                        "name": "StreamLake",
+                        "provider_name": "StreamLake",
+                        "status": 0,
+                        "quantization": "fp8",
+                        "context_length": 1_048_576
+                    },
+                    {
+                        "tag": "decart/fp4",
+                        "name": "Decart",
+                        "provider_name": "Decart",
+                        "status": -2,
+                        "quantization": "fp4",
+                        "context_length": 1_048_576
+                    },
+                    {
+                        "tag": "weird/type",
+                        "name": "Weird",
+                        "provider_name": "Weird",
+                        "status": {"nested": true},
+                        "context_length": 1_048_576
+                    }
+                ]
+            }
+        });
+        let parsed: EndpointsResponse = serde_json::from_value(json).expect("fixture must parse");
+        assert_eq!(parsed.data.endpoints[0].status.as_deref(), Some("0"));
+        assert_eq!(parsed.data.endpoints[1].status.as_deref(), Some("-2"));
+        // A present-but-wrong-typed status degrades to None, not a parse failure.
+        assert_eq!(parsed.data.endpoints[2].status, None);
     }
 
     #[test]
