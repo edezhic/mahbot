@@ -1372,15 +1372,15 @@ impl SettingsState {
         let config_sections = column![
             self.provider_section(),
             Space::new().height(16),
+            self.integrations_section(),
+            Space::new().height(16),
+            self.audio_section(),
+            Space::new().height(16),
             self.models_section(),
             Space::new().height(16),
             self.routing_section(),
             Space::new().height(16),
-            self.audio_section(),
-            Space::new().height(16),
             self.generation_section(),
-            Space::new().height(16),
-            self.integrations_section(),
             Space::new().height(16),
             Self::about_section(),
         ];
@@ -1480,6 +1480,10 @@ impl SettingsState {
                                     role_btns = role_btns.push(
                                         button(theme::role_icon(&role).size(11).color(color))
                                             .style(theme::button_text)
+                                            // Halve the default 10px horizontal
+                                            // padding so adjacent role icons sit
+                                            // closer; vertical stays at 5px.
+                                            .padding([5.0, 5.0])
                                             .on_press(SettingsMessage::WorkspaceMsg(
                                                 workspaces::WorkspacesMessage::ViewContext(
                                                     ws_item.name.clone(),
@@ -1511,24 +1515,15 @@ impl SettingsState {
                                             ),
                                         )),
                                 );
-                                {
-                                    let is_open = ws.notes_open.contains(&ws_item.name);
-                                    left = left.push(
-                                        button(
-                                            text(if is_open { "Notes ✓" } else { "Notes" })
-                                                .size(11)
-                                                .color(theme::TEXT_MUTED),
-                                        )
+                                left = left.push(
+                                    button(text("Notes").size(11).color(theme::TEXT_MUTED))
                                         .style(theme::button_text)
-                                        .on_press(
-                                            SettingsMessage::WorkspaceMsg(
-                                                workspaces::WorkspacesMessage::ToggleNotes(
-                                                    ws_item.name.clone(),
-                                                ),
+                                        .on_press(SettingsMessage::WorkspaceMsg(
+                                            workspaces::WorkspacesMessage::ToggleNotes(
+                                                ws_item.name.clone(),
                                             ),
-                                        ),
-                                    );
-                                }
+                                        )),
+                                );
                                 container(left)
                                     .width(Length::FillPortion(28))
                                     .align_x(Alignment::Start)
@@ -2455,7 +2450,7 @@ impl SettingsState {
         section(
             "Provider",
             column![field_row(
-                "API Key",
+                "OpenRouter key",
                 password_input(
                     "sk-or-v1-...",
                     self.config.provider_key.as_deref().unwrap_or_default(),
