@@ -2469,13 +2469,13 @@ mod tests {
     /// (sets incoming_rx to None, returns Ok without error).
     #[tokio::test]
     async fn test_drain_incoming_messages_disconnected() {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::message_router::AgentJob>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::message_router::AgentJob>();
         let mut agent = make_agent(vec![]);
         agent.incoming_rx = Some(rx);
         agent.agent_id = "_test_drain_disconnected".into();
 
         // Drop the sender so the channel is disconnected
-        drop(_tx);
+        drop(tx);
 
         // Should not panic or error
         agent

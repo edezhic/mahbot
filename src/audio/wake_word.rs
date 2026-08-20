@@ -497,6 +497,7 @@ mod tests {
 
     #[test]
     fn calibration_floor_maps_negatives_to_zero() {
+        #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
         let proto = norm(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
@@ -507,13 +508,21 @@ mod tests {
         // all below the default floor.  p99 ≈ 0.44 clamps to the default
         // floor (0.55), and every negative maps to soft score 0.
         let negatives: Vec<Vec<f32>> = (0..20)
-            .map(|i| unit_with_cosine(&proto, 0.20 + i as f32 * 0.0125, 1000 + i as u64))
+            .map(|i| {
+                #[expect(clippy::cast_precision_loss)] // i ∈ 0..20 — exact in f32
+                unit_with_cosine(
+                    &proto,
+                    0.20 + i as f32 * 0.0125,
+                    1000 + u64::try_from(i).unwrap(),
+                )
+            })
             .collect();
         // Sanity: the negatives really sit at their claimed cosines with
         // distinct directions (guards the helper against collapsing onto the
         // prototype — the vacuous-pattern regression).
         for (i, n) in negatives.iter().enumerate() {
             let c = cosine_similarity(n, &proto);
+            #[expect(clippy::cast_precision_loss)] // i ∈ 0..20 — exact in f32
             let expected = 0.20 + i as f32 * 0.0125;
             assert!(
                 (c - expected).abs() < 1e-2,
@@ -526,9 +535,15 @@ mod tests {
             "p99 below the floor must clamp to the default floor, got {}",
             cal.neg_p99,
         );
-        assert_eq!(cal.soft_floor(), DEFAULT_SOFT_FLOOR);
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(cal.soft_floor(), DEFAULT_SOFT_FLOOR);
+        }
         for n in &negatives {
-            assert_eq!(cal.soft_score(cosine_similarity(n, &proto)), 0.0);
+            #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+            {
+                assert_eq!(cal.soft_score(cosine_similarity(n, &proto)), 0.0);
+            }
         }
         // A strong match (cosine ~0.9) maps well above 0.5.
         let match_emb = unit_with_cosine(&proto, 0.9, 999);
@@ -538,7 +553,14 @@ mod tests {
         // floor must follow the data (floor > default), proving calibration
         // is not just the default clamp.
         let hot_negatives: Vec<Vec<f32>> = (0..10)
-            .map(|i| unit_with_cosine(&proto, 0.69 + i as f32 * 0.002, 2000 + i as u64))
+            .map(|i| {
+                #[expect(clippy::cast_precision_loss)] // i ∈ 0..10 — exact in f32
+                unit_with_cosine(
+                    &proto,
+                    0.69 + i as f32 * 0.002,
+                    2000 + u64::try_from(i).unwrap(),
+                )
+            })
             .collect();
         let hot = calibrate_negatives(&proto, &hot_negatives);
         assert!(
@@ -547,7 +569,10 @@ mod tests {
             hot.soft_floor(),
         );
         for n in &hot_negatives {
-            assert_eq!(hot.soft_score(cosine_similarity(n, &proto)), 0.0);
+            #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+            {
+                assert_eq!(hot.soft_score(cosine_similarity(n, &proto)), 0.0);
+            }
         }
         let strong = unit_with_cosine(&proto, 0.9, 998);
         assert!(hot.soft_score(cosine_similarity(&strong, &proto)) > 0.5);
@@ -555,6 +580,7 @@ mod tests {
 
     #[test]
     fn anti_prototype_gate_rejects_windows_closer_to_a_negative() {
+        #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
         let proto = norm(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
@@ -579,7 +605,10 @@ mod tests {
 
         // The confusable is closer to the anti-prototype (cosine 1.0) than to
         // the prototype (cosine 0.85) → hard-rejected to 0.
-        assert_eq!(enr.soft_score(&confusable), 0.0);
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(enr.soft_score(&confusable), 0.0);
+        }
         // The exact prototype embedding is closer to the prototype (1.0) than
         // to the anti-prototype (0.85) → scored normally.
         assert!(enr.soft_score(&proto) > 0.5);
@@ -599,6 +628,7 @@ mod tests {
 
     #[test]
     fn distill_negative_prototypes_spreads_selection() {
+        #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
         let proto = norm(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
@@ -607,7 +637,14 @@ mod tests {
         // 24 well-separated negative directions (mutually near-orthogonal
         // via distinct seeds; cosine vs proto 0.30..0.53).
         let negatives: Vec<Vec<f32>> = (0..24)
-            .map(|i| unit_with_cosine(&proto, 0.30 + i as f32 * 0.01, 3000 + i as u64))
+            .map(|i| {
+                #[expect(clippy::cast_precision_loss)] // i ∈ 0..24 — exact in f32
+                unit_with_cosine(
+                    &proto,
+                    0.30 + i as f32 * 0.01,
+                    3000 + u64::try_from(i).unwrap(),
+                )
+            })
             .collect();
         let distilled = distill_negative_prototypes(&negatives);
         assert!(!distilled.is_empty());
@@ -650,9 +687,18 @@ mod tests {
     #[test]
     fn calibration_default_floor() {
         let cal = Calibration::default();
-        assert_eq!(cal.soft_floor(), DEFAULT_SOFT_FLOOR);
-        assert_eq!(cal.soft_score(DEFAULT_SOFT_FLOOR), 0.0);
-        assert_eq!(cal.soft_score(1.0), 1.0);
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(cal.soft_floor(), DEFAULT_SOFT_FLOOR);
+        }
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(cal.soft_score(DEFAULT_SOFT_FLOOR), 0.0);
+        }
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(cal.soft_score(1.0), 1.0);
+        }
     }
 
     #[test]
@@ -686,6 +732,7 @@ mod tests {
 
     #[test]
     fn prototype_is_unit_norm() {
+        #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
         let emb = norm(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
@@ -708,6 +755,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_v2() {
+        #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
         let emb = norm(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)

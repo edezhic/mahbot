@@ -1642,21 +1642,21 @@ mod tests {
 
     fn assert_normalizes(
         action: serde_json::Value,
-        args: serde_json::Value,
-        expected: serde_json::Value,
+        args: &serde_json::Value,
+        expected: &serde_json::Value,
     ) {
-        let (normalized, note) = normalize_action(action, &args).unwrap_or_else(|e| {
+        let (normalized, note) = normalize_action(action, args).unwrap_or_else(|e| {
             panic!("expected normalization to succeed, got: {e}");
         });
-        assert_eq!(normalized, expected, "normalized action mismatch");
+        assert_eq!(normalized, *expected, "normalized action mismatch");
         assert!(
             note.is_some(),
             "recoverable shape should echo a normalization note"
         );
     }
 
-    fn assert_rejects(action: serde_json::Value, args: serde_json::Value) {
-        let err = normalize_action(action, &args).unwrap_err();
+    fn assert_rejects(action: serde_json::Value, args: &serde_json::Value) {
+        let err = normalize_action(action, args).unwrap_err();
         assert!(
             err.contains("Expected action to be"),
             "expected corrective shape error, got: {err}"
@@ -1668,32 +1668,32 @@ mod tests {
         // {"action":"open","url":"..."} → {"open":{"url":"..."}}
         assert_normalizes(
             json!("open"),
-            json!({"action":"open","url":"https://example.com","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"open","url":"https://example.com","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         // {"action":"open","open":{"url":"..."}} → same
         assert_normalizes(
             json!("open"),
-            json!({"action":"open","open":{"url":"https://example.com"},"tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"open","open":{"url":"https://example.com"},"tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         // {"action":"open","open":"https://..."} → {"open":{"url":"..."}}
         assert_normalizes(
             json!("open"),
-            json!({"action":"open","open":"https://example.com","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"open","open":"https://example.com","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         // snapshot with no args
         assert_normalizes(
             json!("snapshot"),
-            json!({"action":"snapshot","tab":"t"}),
-            json!({"snapshot":{}}),
+            &json!({"action":"snapshot","tab":"t"}),
+            &json!({"snapshot":{}}),
         );
         // get_text with flattened selector
         assert_normalizes(
             json!("get_text"),
-            json!({"action":"get_text","selector":"body","tab":"t"}),
-            json!({"get_text":{"selector":"body"}}),
+            &json!({"action":"get_text","selector":"body","tab":"t"}),
+            &json!({"get_text":{"selector":"body"}}),
         );
     }
 
@@ -1702,14 +1702,14 @@ mod tests {
         // {"action":"{\"open\":{\"url\":\"...\"}}"} → {"open":{"url":"..."}}
         assert_normalizes(
             json!("{\"open\": {\"url\": \"https://example.com\"}}"),
-            json!({"action":"{\"open\": {\"url\": \"https://example.com\"}}","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"{\"open\": {\"url\": \"https://example.com\"}}","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         // CDATA-wrapped JSON
         assert_normalizes(
             json!("<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>"),
-            json!({"action":"<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"<![CDATA[{\"open\": {\"url\": \"https://example.com\"}}]]>","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
     }
 
@@ -1718,14 +1718,14 @@ mod tests {
         // {"action":{"open":"https://..."}} → {"open":{"url":"..."}}
         assert_normalizes(
             json!({"open":"https://example.com"}),
-            json!({"action":{"open":"https://example.com"},"tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":{"open":"https://example.com"},"tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         // bare URL string as the whole action
         assert_normalizes(
             json!("https://example.com"),
-            json!({"action":"https://example.com","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"https://example.com","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
     }
 
@@ -1733,46 +1733,46 @@ mod tests {
     fn normalize_xml_wrapped_actions() {
         assert_normalizes(
             json!("<open><url>https://example.com</url></open>"),
-            json!({"action":"<open><url>https://example.com</url></open>","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"<open><url>https://example.com</url></open>","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         assert_normalizes(
             json!("<open>https://example.com</open>"),
-            json!({"action":"<open>https://example.com</open>","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"<open>https://example.com</open>","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         // whitespace inside tags
         assert_normalizes(
             json!("<open>\n<url>https://example.com</url>\n</open>"),
-            json!({"action":"<open>\n<url>https://example.com</url>\n</open>","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"<open>\n<url>https://example.com</url>\n</open>","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         // stray closing tag
         assert_normalizes(
             json!("<open><url>https://example.com</url></open></action>"),
-            json!({"action":"<open><url>https://example.com</url></open></action>","tab":"t"}),
-            json!({"open":{"url":"https://example.com"}}),
+            &json!({"action":"<open><url>https://example.com</url></open></action>","tab":"t"}),
+            &json!({"open":{"url":"https://example.com"}}),
         );
         // find
         assert_normalizes(
             json!("<find><by>first</by><value>a</value><action>click</action></find>"),
-            json!({"action":"<find><by>first</by><value>a</value><action>click</action></find>","tab":"t"}),
-            json!({"find":{"by":"first","value":"a","action":"click"}}),
+            &json!({"action":"<find><by>first</by><value>a</value><action>click</action></find>","tab":"t"}),
+            &json!({"find":{"by":"first","value":"a","action":"click"}}),
         );
         // find with exact/index — XML text decoded to the serde bool/u32 types
         assert_normalizes(
             json!(
                 "<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>"
             ),
-            json!({"action":"<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>","tab":"t"}),
-            json!({"find":{"by":"text","value":"submit","action":"click","exact":true}}),
+            &json!({"action":"<find><by>text</by><value>submit</value><action>click</action><exact>true</exact></find>","tab":"t"}),
+            &json!({"find":{"by":"text","value":"submit","action":"click","exact":true}}),
         );
         assert_normalizes(
             json!(
                 "<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>"
             ),
-            json!({"action":"<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>","tab":"t"}),
-            json!({"find":{"by":"nth","value":"input","action":"click","index":2}}),
+            &json!({"action":"<find><by>nth</by><value>input</value><action>click</action><index>2</index></find>","tab":"t"}),
+            &json!({"find":{"by":"nth","value":"input","action":"click","index":2}}),
         );
     }
 
@@ -1808,25 +1808,25 @@ mod tests {
     #[test]
     fn normalize_rejects_unrecoverable_shapes() {
         // Empty payload
-        assert_rejects(json!(null), json!({}));
+        assert_rejects(json!(null), &json!({}));
         // Invented action variants
         assert_rejects(
             json!({"expand":15}),
-            json!({"action":{"expand":15},"tab":"t"}),
+            &json!({"action":{"expand":15},"tab":"t"}),
         );
         assert_rejects(
             json!({"__raw":"{\"open\":{...}}"}),
-            json!({"action":{"__raw":"x"},"tab":"t"}),
+            &json!({"action":{"__raw":"x"},"tab":"t"}),
         );
         // Unknown action name
-        assert_rejects(json!("navigate"), json!({"action":"navigate","tab":"t"}));
+        assert_rejects(json!("navigate"), &json!({"action":"navigate","tab":"t"}));
         // find missing its own `action` field
         assert_rejects(
             json!({"find":{"by":"text","value":"x"}}),
-            json!({"action":{"find":{"by":"text","value":"x"}},"tab":"t"}),
+            &json!({"action":{"find":{"by":"text","value":"x"}},"tab":"t"}),
         );
         // open without url
-        assert_rejects(json!("open"), json!({"action":"open","tab":"t"}));
+        assert_rejects(json!("open"), &json!({"action":"open","tab":"t"}));
     }
 
     // -----------------------------------------------------------------------

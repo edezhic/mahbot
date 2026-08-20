@@ -1428,6 +1428,7 @@ mod tests {
     fn focused_parent_path_cases() {
         // (name, nodes, focused, expected)
         #[rustfmt::skip]
+        #[expect(clippy::type_complexity)] // focused_parent_path case table
         let cases: &[(&str, &[(&str, bool)], bool, Option<&str>)] = &[
             ("not_focused", &[("src/main.rs", false)], false, None),
             ("empty_tree", &[], true, None),

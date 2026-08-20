@@ -981,11 +981,11 @@ mod tests {
     // ── Pre-flight input-duration gate ────────────────────────────────
 
     /// Build one ISO-BMFF box: big-endian 32-bit size + 4-cc type + payload.
-    fn box_bytes(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    fn box_bytes(box_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
         let size = u32::try_from(8 + payload.len()).unwrap();
         let mut v = Vec::with_capacity(8 + payload.len());
         v.extend_from_slice(&size.to_be_bytes());
-        v.extend_from_slice(box_type);
+        v.extend_from_slice(&box_type);
         v.extend_from_slice(payload);
         v
     }
@@ -1016,9 +1016,9 @@ mod tests {
     /// appended last — the iPhone-MOV end-of-file layout the parser must walk.
     fn mp4_bytes(moov_children: &[Vec<u8>]) -> Vec<u8> {
         let moov_payload: Vec<u8> = moov_children.iter().flatten().copied().collect();
-        let mut bytes = box_bytes(b"ftyp", b"isom");
-        bytes.extend_from_slice(&box_bytes(b"mdat", &[0u8; 64]));
-        bytes.extend_from_slice(&box_bytes(b"moov", &moov_payload));
+        let mut bytes = box_bytes(*b"ftyp", b"isom");
+        bytes.extend_from_slice(&box_bytes(*b"mdat", &[0u8; 64]));
+        bytes.extend_from_slice(&box_bytes(*b"moov", &moov_payload));
         bytes
     }
 
@@ -1026,12 +1026,12 @@ mod tests {
     /// an over-long mvhd. Shared by the parser- and gate-level tests so the
     /// byte construction lives in exactly one place.
     fn fragmented_mp4_bytes() -> Vec<u8> {
-        let mut bytes = box_bytes(b"ftyp", b"isom");
-        bytes.extend_from_slice(&box_bytes(b"moof", &[]));
-        bytes.extend_from_slice(&box_bytes(b"mdat", &[0u8; 32]));
+        let mut bytes = box_bytes(*b"ftyp", b"isom");
+        bytes.extend_from_slice(&box_bytes(*b"moof", &[]));
+        bytes.extend_from_slice(&box_bytes(*b"mdat", &[0u8; 32]));
         bytes.extend_from_slice(&box_bytes(
-            b"moov",
-            &box_bytes(b"mvhd", &mvhd_payload(0, 1000, 35_000)),
+            *b"moov",
+            &box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 35_000)),
         ));
         bytes
     }
@@ -1070,18 +1070,18 @@ mod tests {
     fn mp4_duration_reads_mvhd_in_end_of_file_moov() {
         // iPhone-MOV layout: moov (with mvhd) sits at the very end of the
         // file, after mdat — the parser must seek, not read a header window.
-        let (_dir, path) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 1000, 35_167))]);
+        let (_dir, path) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 35_167))]);
         assert_eq!(mp4_duration_ms(&path), Some(35_167));
         // Non-1000 timescale: 9760 ticks @ 600/s = 16.266 s → 16266 ms.
-        let (_dir, path) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 600, 9760))]);
+        let (_dir, path) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 600, 9760))]);
         assert_eq!(mp4_duration_ms(&path), Some(16_266));
         // Version 1 (64-bit duration fields).
-        let (_dir, path) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(1, 1000, 22_000))]);
+        let (_dir, path) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(1, 1000, 22_000))]);
         assert_eq!(mp4_duration_ms(&path), Some(22_000));
         // mvhd need not be the first moov child.
         let (_dir, path) = write_mp4(&[
-            box_bytes(b"udta", &[0u8; 8]),
-            box_bytes(b"mvhd", &mvhd_payload(0, 1000, 8_000)),
+            box_bytes(*b"udta", &[0u8; 8]),
+            box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 8_000)),
         ]);
         assert_eq!(mp4_duration_ms(&path), Some(8_000));
     }
@@ -1095,20 +1095,20 @@ mod tests {
         assert_eq!(mp4_duration_ms(&path), None);
         // mvex inside moov is the fragmented-initialization marker.
         let (_dir, path) = write_mp4(&[
-            box_bytes(b"mvhd", &mvhd_payload(0, 1000, 35_000)),
-            box_bytes(b"mvex", &box_bytes(b"trex", &[0u8; 24])),
+            box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 35_000)),
+            box_bytes(*b"mvex", &box_bytes(*b"trex", &[0u8; 24])),
         ]);
         assert_eq!(mp4_duration_ms(&path), None);
         // Non-conformant fragmented layout: moov WITHOUT mvex, then a moof
         // later in the file. The deferred top-level scan still detects the
         // fragment and fails open instead of trusting the mvhd duration.
-        let mut bytes = box_bytes(b"ftyp", b"isom");
+        let mut bytes = box_bytes(*b"ftyp", b"isom");
         bytes.extend_from_slice(&box_bytes(
-            b"moov",
-            &box_bytes(b"mvhd", &mvhd_payload(0, 1000, 35_000)),
+            *b"moov",
+            &box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 35_000)),
         ));
-        bytes.extend_from_slice(&box_bytes(b"mdat", &[0u8; 32]));
-        bytes.extend_from_slice(&box_bytes(b"moof", &[]));
+        bytes.extend_from_slice(&box_bytes(*b"mdat", &[0u8; 32]));
+        bytes.extend_from_slice(&box_bytes(*b"moof", &[]));
         let path = write_raw(&dir, &bytes);
         assert_eq!(mp4_duration_ms(&path), None);
     }
@@ -1127,8 +1127,8 @@ mod tests {
         bytes[4..8].copy_from_slice(b"moov");
         assert_eq!(mp4_duration_ms(&write_raw(&dir, &bytes)), None);
         // No moov at all.
-        let mut bytes = box_bytes(b"ftyp", b"isom");
-        bytes.extend_from_slice(&box_bytes(b"mdat", &[0u8; 16]));
+        let mut bytes = box_bytes(*b"ftyp", b"isom");
+        bytes.extend_from_slice(&box_bytes(*b"mdat", &[0u8; 16]));
         assert_eq!(mp4_duration_ms(&write_raw(&dir, &bytes)), None);
         // Non-ISO-BMFF data (mkv-like bytes).
         assert_eq!(
@@ -1136,11 +1136,11 @@ mod tests {
             None
         );
         // Zero timescale is unreadable (fail-open).
-        let (_dir, path) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 0, 35_000))]);
+        let (_dir, path) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 0, 35_000))]);
         assert_eq!(mp4_duration_ms(&path), None);
         // Zero duration is indistinguishable from 'unknown' (live/streamed or
         // broken encoders) — fail open, never a hard-reject below the floor.
-        let (_dir, path) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 1000, 0))]);
+        let (_dir, path) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 0))]);
         assert_eq!(mp4_duration_ms(&path), None);
         // Missing file.
         assert_eq!(mp4_duration_ms(&dir.path().join("nope.mp4")), None);
@@ -1150,7 +1150,7 @@ mod tests {
     fn check_local_input_duration_hard_rejects_only_verified_ranges() {
         let hailuo = ("minimax/hailuo-3", VideoEditModel::Hailuo3);
         // The observed live failure: a 35.2 s clip rejected by hailuo-3.
-        let (_dir, overlong) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 1000, 35_200))]);
+        let (_dir, overlong) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 35_200))]);
         let err = check_local_input_duration(&overlong, hailuo.0, hailuo.1).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("35.2 s"), "message: {msg}");
@@ -1165,7 +1165,7 @@ mod tests {
 
         // Sub-minimum (1.5 s) is equally doomed — same verified range; the
         // error names the violated lower bound and the actionable direction.
-        let (_dir, tooshort) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 1000, 1_500))]);
+        let (_dir, tooshort) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 1_500))]);
         let err = check_local_input_duration(&tooshort, hailuo.0, hailuo.1).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("1.5 s"), "message: {msg}");
@@ -1174,9 +1174,9 @@ mod tests {
         assert!(msg.contains("longer clip"), "message: {msg}");
 
         // Boundary values pass: 2 s and 15 s exactly.
-        let (_dir, min_ok) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 1000, 2_000))]);
+        let (_dir, min_ok) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 2_000))]);
         assert!(check_local_input_duration(&min_ok, hailuo.0, hailuo.1).is_ok());
-        let (_dir, max_ok) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 1000, 15_000))]);
+        let (_dir, max_ok) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 15_000))]);
         assert!(check_local_input_duration(&max_ok, hailuo.0, hailuo.1).is_ok());
 
         // Case-insensitive extension: an over-long .MOV clip is rejected too.
@@ -1184,7 +1184,7 @@ mod tests {
         let mov_path = dir.path().join("clip.MOV");
         std::fs::write(
             &mov_path,
-            mp4_bytes(&[box_bytes(b"mvhd", &mvhd_payload(0, 1000, 35_200))]),
+            mp4_bytes(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 35_200))]),
         )
         .unwrap();
         assert!(check_local_input_duration(&mov_path, hailuo.0, hailuo.1).is_err());
@@ -1221,7 +1221,7 @@ mod tests {
         let frag = write_raw(&dir, &fragmented_mp4_bytes());
         assert!(check_local_input_duration(&frag, hailuo.0, hailuo.1).is_ok());
         // Zero-duration mvhd is 'unknown' — fails open below the floor.
-        let (_dir, zero) = write_mp4(&[box_bytes(b"mvhd", &mvhd_payload(0, 1000, 0))]);
+        let (_dir, zero) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 0))]);
         assert!(check_local_input_duration(&zero, hailuo.0, hailuo.1).is_ok());
     }
 }

@@ -2433,7 +2433,7 @@ mod tests {
         // Invalid UTF-8 without a null byte — Binary, not skipped.
         std::fs::write(repo_path.join("invalid.bin"), [0xC3, 0x28]).unwrap();
         // Oversized — gated before read, placeholder carries the real size.
-        let big_size = MAX_UNTRACKED_SIZE as usize + 1;
+        let big_size = usize::try_from(MAX_UNTRACKED_SIZE).unwrap() + 1;
         let mut big = vec![b'a'; big_size];
         big[big_size - 1] = b'\n';
         std::fs::write(repo_path.join("big.txt"), &big).unwrap();

@@ -39,7 +39,7 @@ impl Xs {
         self.0
     }
     fn fill(&mut self, n: usize, lo: f32, hi: f32) -> Vec<f32> {
-        let span = (hi - lo);
+        let span = hi - lo;
         (0..n)
             .map(|_| lo + (self.next_u64() as f64 / u64::MAX as f64) as f32 * span)
             .collect()
@@ -109,7 +109,10 @@ fn run_all_models() -> Option<()> {
     ];
     for n in names {
         if !dir.join(n).exists() {
-            eprintln!("TTS ONNX golden tests: missing {n} under {dir:?} — skipping");
+            eprintln!(
+                "TTS ONNX golden tests: missing {n} under {} — skipping",
+                dir.display()
+            );
             return None;
         }
     }

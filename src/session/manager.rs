@@ -900,12 +900,14 @@ mod tests {
         // The most recent user message lives in the UNPERSISTED tail
         // (index 1 >= persisted_len 1): a positional UPDATE would rewrite the
         // persisted row instead — conservative no-op.
-        let mut session = Session::default();
-        session.history = vec![
-            ChatMessage::user("[IMAGE:/tmp/a.png] persisted"),
-            ChatMessage::user("[IMAGE:/tmp/b.png] unpersisted"),
-        ];
-        session.persisted_len = 1;
+        let mut session = Session {
+            history: vec![
+                ChatMessage::user("[IMAGE:/tmp/a.png] persisted"),
+                ChatMessage::user("[IMAGE:/tmp/b.png] unpersisted"),
+            ],
+            persisted_len: 1,
+            ..Default::default()
+        };
 
         let outcome = session
             .rewrite_last_user_message(agent_id, "rewritten".to_string())
@@ -925,9 +927,11 @@ mod tests {
     #[tokio::test]
     async fn rewrite_last_user_message_no_user_message_errors() {
         crate::util::test::init_test_stores().await;
-        let mut session = Session::default();
-        session.history = vec![ChatMessage::system("role")];
-        session.persisted_len = 1;
+        let mut session = Session {
+            history: vec![ChatMessage::system("role")],
+            persisted_len: 1,
+            ..Default::default()
+        };
         let err = session
             .rewrite_last_user_message("test_rewrite_err", "x".to_string())
             .await
@@ -951,12 +955,14 @@ mod tests {
             .await
             .unwrap();
 
-        let mut session = Session::default();
-        session.history = vec![
-            ChatMessage::system("role"),
-            ChatMessage::user("[IMAGE:/tmp/a.png] mine"),
-        ];
-        session.persisted_len = 2; // idx 1 < persisted_len → the guard passes
+        let mut session = Session {
+            history: vec![
+                ChatMessage::system("role"),
+                ChatMessage::user("[IMAGE:/tmp/a.png] mine"),
+            ],
+            persisted_len: 2, // idx 1 < persisted_len → the guard passes
+            ..Default::default()
+        };
 
         let err = session
             .rewrite_last_user_message(agent_id, "rewritten".to_string())

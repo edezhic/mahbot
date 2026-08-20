@@ -4668,6 +4668,7 @@ mod tests {
         let _ = init_global();
 
         // (case, timer elapsed?, recording?, initial status, expected status check, timer cleared?)
+        #[expect(clippy::type_complexity)] // refractory transition table
         let cases: [(
             &str,
             bool,
@@ -5088,13 +5089,16 @@ mod tests {
         // Feed 1.0 to trigger eviction of oldest (0.5).
         // New window: (ADAPTIVE_WINDOW_N - 1) × 0.5 + 1 × 1.0
         // mean = ((ADAPTIVE_WINDOW_N - 1) * 0.5 + 1.0) / ADAPTIVE_WINDOW_N
-        let expected_mean = (ADAPTIVE_WINDOW_N as f32 - 1.0) * 0.5 / ADAPTIVE_WINDOW_N as f32
-            + 1.0 / ADAPTIVE_WINDOW_N as f32;
+        #[expect(clippy::cast_precision_loss)] // small test constants — exact in f32
+        let window_n = ADAPTIVE_WINDOW_N as f32;
+        #[expect(clippy::cast_precision_loss)] // small test constant — exact in f32
+        let rolling_n = ROLLING_WINDOW_N as f32;
+        let expected_mean = (window_n - 1.0) * 0.5 / window_n + 1.0 / window_n;
         let result = state.feed(1.0, 0.0); // k=0 so adaptive = mean × ROLLING_WINDOW_N
         let threshold = result.expect("should return Some");
         // After eviction: mean ≈ 0.533, adaptive = 0.533 * 3 = 1.6, clamped
         // to the safe harbor 1.65.
-        let expected_raw = expected_mean * ROLLING_WINDOW_N as f32;
+        let expected_raw = expected_mean * rolling_n;
         let clamped = expected_raw.clamp(ADAPTIVE_SAFE_HARBOR, ADAPTIVE_CEILING);
         assert!(
             (threshold - clamped).abs() < 0.001,
@@ -5235,7 +5239,10 @@ mod tests {
         let (detected, rolling) =
             process_wake_word_score(NO_MATCH_RESET_THRESHOLD - 0.01, &mut window, None, false);
         assert!(!detected);
-        assert_eq!(rolling, 0.0);
+        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
+        {
+            assert_eq!(rolling, 0.0);
+        }
         assert!(
             window.is_empty(),
             "below-reset score must clear the rolling window"
@@ -5325,8 +5332,14 @@ mod tests {
         let (detected, rolling, total, _) =
             score_single_embedding(&emb, None, &mut window, None, ADAPTIVE_K_DEFAULT);
         assert!(!detected);
-        assert_eq!(total, 0.0);
-        assert_eq!(rolling, 0.0);
+        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
+        {
+            assert_eq!(total, 0.0);
+        }
+        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
+        {
+            assert_eq!(rolling, 0.0);
+        }
         assert!(
             window.is_empty(),
             "zero score must reset the rolling window"
@@ -5405,7 +5418,10 @@ mod tests {
             ADAPTIVE_K_DEFAULT,
         );
         assert!(!detected);
-        assert_eq!(rolling, 0.0);
+        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
+        {
+            assert_eq!(rolling, 0.0);
+        }
         assert!(window.is_empty(), "low score must reset the rolling window");
     }
 
@@ -5738,7 +5754,10 @@ mod tests {
         assert_buffers_cleared(&ctx);
 
         // Full-specific: state flags reset.
-        assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
+        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
+        {
+            assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
+        }
         assert!(ctx.last_wake_word_detection.is_none());
         assert!(!ctx.auto_start_pending);
         assert!(!ctx.is_recording);
@@ -5814,7 +5833,10 @@ mod tests {
         assert_buffers_cleared(&ctx);
 
         // Soft preserves these.
-        assert_eq!(ctx.vad_threshold, saved_threshold);
+        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
+        {
+            assert_eq!(ctx.vad_threshold, saved_threshold);
+        }
         assert_eq!(ctx.last_wake_word_detection, saved_cooldown);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.is_recording, saved_recording);
@@ -5846,7 +5868,10 @@ mod tests {
         assert_buffers_cleared(&ctx);
 
         // Cancel clears vad_threshold and last_wake_word_detection.
-        assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
+        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
+        {
+            assert_eq!(ctx.vad_threshold, VAD_THRESHOLD);
+        }
         assert!(ctx.last_wake_word_detection.is_none());
 
         // Cancel preserves handler-managed flags (unlike Full).
@@ -6044,6 +6069,8 @@ mod tests {
 
     #[test]
     fn phase3_negative_collection_audio_counts_1_to_1_through_pipeline() {
+        const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 2; // 0.5 s
+
         // End-to-end regression through the production entry point.  Force
         // the stateful earshot detector to report speech on every hop by
         // setting the threshold below its documented [0,1] score range — the
@@ -6054,7 +6081,6 @@ mod tests {
         ctx.enrollment_vad = Some(earshot::Detector::default());
         ctx.vad_threshold = -1.0;
 
-        const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 2; // 0.5 s
         let chunk = vec![0.1f32; CHUNK_SAMPLES];
         for _ in 0..10 {
             handle_negative_collection_audio(&chunk, &mut ctx);
@@ -6076,7 +6102,10 @@ mod tests {
         // Continuous speech never hits a chunk boundary — nothing pushed, and
         // the unfinalized segment survives intact (no drain).
         assert_eq!(ctx.phase3_audio_buf.len(), total);
-        assert!(ctx.phase3_audio_buf.iter().all(|&s| s == 0.1));
+        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
+        {
+            assert!(ctx.phase3_audio_buf.iter().all(|&s| s == 0.1));
+        }
     }
 
     // ── handle_segment_boundary tests ───────────────────────────────────

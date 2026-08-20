@@ -1815,9 +1815,13 @@ mod tests {
             "sample rate mismatch"
         );
         assert_eq!(decoder.channels().get(), 1, "should be mono");
-        let decoded: Vec<f32> = decoder.collect();
-        assert_eq!(decoded.len(), samples.len(), "sample count mismatch");
-        for (got, expected) in decoded.iter().zip(&samples) {
+        let decoded_samples: Vec<f32> = decoder.collect();
+        assert_eq!(
+            decoded_samples.len(),
+            samples.len(),
+            "sample count mismatch"
+        );
+        for (got, expected) in decoded_samples.iter().zip(&samples) {
             assert!(
                 (got - expected).abs() < 1e-3,
                 "sample {got} != expected {expected}"
@@ -2061,10 +2065,7 @@ mod tests {
         //
         // We specifically set space (32) to -1 so it falls through to UNK,
         // simulating a real indexer where space is not a valid token.
-        let mut indexer = vec![-1i32; 128];
-        for i in 0..128 {
-            indexer[i] = i as i32;
-        }
+        let mut indexer: Vec<i32> = (0..128i32).collect();
         // ID 0 is the UNK token
         indexer[0] = 0;
         // Space (code 32) → UNK (not a valid token in the model)
@@ -2219,10 +2220,10 @@ mod tests {
     /// paid only once per test run. Panics with a clear message if the style
     /// file is not cached on disk.
     fn test_voice_style() -> (&'static Tensor, &'static Tensor) {
+        static TEST_VOICE_STYLE: OnceLock<Option<(Tensor, Tensor)>> = OnceLock::new();
+
         // First ensure engine is available (which implies model files exist)
         test_tts_engine();
-
-        static TEST_VOICE_STYLE: OnceLock<Option<(Tensor, Tensor)>> = OnceLock::new();
 
         let binding = TEST_VOICE_STYLE.get_or_init(|| {
             // Use the same candidates as test_tts_engine() to find the voice style.
@@ -2546,6 +2547,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(tts)]
     async fn test_tts_e2e() {
+        const ASR_SAMPLE_RATE: u32 = 16_000;
+
+        /// Strip ASCII punctuation (Unicode punctuation like em-dashes or
+        /// curly quotes is not stripped, but these rarely appear in the
+        /// simple English phrases used by this test).
+        fn normalize_word(word: &str) -> String {
+            word.trim_matches(|c: char| c.is_ascii_punctuation())
+                .to_lowercase()
+        }
+
         // ── Test-owned storage root (never the real ~/.mahbot) ────────
         //
         // Point the CONFIG storage root at the shared test root. It must
@@ -2718,8 +2729,6 @@ mod tests {
         // The Supertonic 3 model natively outputs 44100 Hz. Qwen3-ASR
         // expects 16 kHz input, so we resample here.
 
-        const ASR_SAMPLE_RATE: u32 = 16_000;
-
         let resampled = if native_rate == ASR_SAMPLE_RATE {
             samples
         } else {
@@ -2771,14 +2780,6 @@ mod tests {
         //
         // Punctuation differences are acceptable (e.g. "engine." vs
         // "engine").
-
-        fn normalize_word(word: &str) -> String {
-            // Strip ASCII punctuation (Unicode punctuation like em-dashes or
-            // curly quotes is not stripped, but these rarely appear in the
-            // simple English phrases used by this test).
-            word.trim_matches(|c: char| c.is_ascii_punctuation())
-                .to_lowercase()
-        }
 
         let input_words: std::collections::HashSet<String> = input
             .split_whitespace()

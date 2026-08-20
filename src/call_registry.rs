@@ -269,7 +269,7 @@ mod tests {
             false,
             None,
         );
-        let run_b1 = NON_AGENT_CALLS.register(
+        let run_b = NON_AGENT_CALLS.register(
             "synthesize",
             "ws1",
             Some(ParentKey::Research("runB".to_string())),
@@ -296,6 +296,6 @@ mod tests {
         // dropping them must not panic and must not disturb anything else.
         drop(run_a1);
         drop(run_a2);
-        drop(run_b1);
+        drop(run_b);
     }
 }

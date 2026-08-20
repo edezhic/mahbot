@@ -389,7 +389,7 @@ fn test_operator_softplus() -> Result<()> {
         vals[0]
     );
     assert!(
-        (vals[2] - 0.693147).abs() < 1e-5,
+        (vals[2] - std::f32::consts::LN_2).abs() < 1e-5,
         "softplus(0) should be ~0.693147, got {}",
         vals[2]
     );

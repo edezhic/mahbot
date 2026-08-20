@@ -5415,7 +5415,6 @@ mod tests {
         run_cases(&cases);
     }
     #[allow(clippy::too_many_lines)] // data-driven bypass battery
-
     /// Git exec vectors: flags/config/env channels that run programs are
     /// rejected, even on allowlisted subcommands. Includes the analyst-flagged
     /// gaps (repo redirect, --config-env/--config-file, export channel,
@@ -5625,6 +5624,7 @@ mod tests {
     // ── extract_git_subcommand unit tests ──────────────────────────
 
     #[test]
+    #[expect(clippy::too_many_lines)] // data-driven test battery
     fn test_extract_git_subcommand() {
         struct Case {
             name: &'static str,
@@ -5778,6 +5778,7 @@ mod tests {
     // ── Temp / scratch directory tests ─────────────────────────────
 
     #[test]
+    #[expect(clippy::too_many_lines)] // data-driven test battery
     fn temp_scratch_tests() {
         let cases = [
             (
@@ -6705,6 +6706,7 @@ mod tests {
     /// Non-temp and unknown bindings poison the variable (fail-closed);
     /// temp re-binds clear the poison.
     #[test]
+    #[expect(clippy::too_many_lines)] // data-driven test battery
     fn temp_var_binding_acceptance() {
         let cases = [
             // mktemp substitution binds a temp root; writes via $SNAP allowed.

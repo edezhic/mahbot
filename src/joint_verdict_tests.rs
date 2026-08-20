@@ -790,8 +790,8 @@ async fn repair_rejects_empty_member_group() {
 fn review_base_from_signals_thresholds() {
     // Arguments reference the calibration constants so threshold changes
     // cannot silently drift the test away from the shipped ladder.
-    let low = DEFAULT_REVIEW_COUNT_LOW_CHURN as i64;
-    let high = DEFAULT_REVIEW_COUNT_HIGH_CHURN as i64;
+    let low = i64::try_from(DEFAULT_REVIEW_COUNT_LOW_CHURN).unwrap();
+    let high = i64::try_from(DEFAULT_REVIEW_COUNT_HIGH_CHURN).unwrap();
     // Low churn (≤ low) → 2.
     assert_eq!(review_base_from_signals(10, low, high), 2);
     assert_eq!(

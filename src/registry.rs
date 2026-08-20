@@ -856,7 +856,7 @@ mod tests {
         };
         let gen_a1 = register_with_parent(&a1, ParentKey::Research("runA".to_string()));
         let gen_a2 = register_with_parent(&a2, ParentKey::Research("runA".to_string()));
-        let gen_b1 = register_with_parent(&b1, ParentKey::Research("runB".to_string()));
+        let gen_b = register_with_parent(&b1, ParentKey::Research("runB".to_string()));
 
         AGENT_REGISTRY.cancel_by_parent_key(&ParentKey::Research("runA".to_string()));
 
@@ -880,7 +880,7 @@ mod tests {
             Some(ParentKey::Research("runB".to_string())),
             "runB agent keeps its parent key"
         );
-        AGENT_REGISTRY.deregister(&b1, gen_b1);
+        AGENT_REGISTRY.deregister(&b1, gen_b);
         let _ = (gen_a1, gen_a2);
     }
 }

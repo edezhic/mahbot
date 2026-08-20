@@ -1012,6 +1012,7 @@ mod tests {
         let num_samples = sample_rate as usize;
         let samples: Vec<f32> = (0..num_samples)
             .map(|i| {
+                #[expect(clippy::cast_precision_loss)] // i < sample_rate (≤16 kHz) — exact in f32
                 let t = i as f32 / sample_rate as f32;
                 (t * 440.0 * 2.0 * std::f32::consts::PI).sin()
             })
@@ -1143,7 +1144,7 @@ mod tests {
             let vendor = b"test";
             let mut tags = Vec::new();
             tags.extend_from_slice(b"OpusTags");
-            tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+            tags.extend_from_slice(&u32::try_from(vendor.len()).unwrap().to_le_bytes());
             tags.extend_from_slice(vendor);
             tags.extend_from_slice(&0u32.to_le_bytes()); // user comment list length = 0
             writer

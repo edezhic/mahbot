@@ -915,7 +915,7 @@ mod tests {
         let (_dir, repo_path) = init_temp_repo();
 
         // Create an untracked file larger than MAX_UNTRACKED_SIZE (1 MiB).
-        let size = MAX_UNTRACKED_SIZE as usize + 1;
+        let size = usize::try_from(MAX_UNTRACKED_SIZE).unwrap() + 1;
         let mut content = Vec::with_capacity(size);
         content.resize(size, b'a');
         std::fs::write(repo_path.join("large.bin"), &content).expect("write large file");

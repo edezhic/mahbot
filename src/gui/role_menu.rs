@@ -796,9 +796,15 @@ mod tests {
         let pos = popup_position(anchor, menu, viewport, ANCHOR_GAP);
 
         // Right-aligned to the anchor...
-        assert_eq!(pos.x, anchor.x + anchor.width - menu.width);
+        #[expect(clippy::float_cmp)] // exact layout math on representable values
+        {
+            assert_eq!(pos.x, anchor.x + anchor.width - menu.width);
+        }
         // ...and floating above it with the anchor gap.
-        assert_eq!(pos.y, anchor.y - menu.height - ANCHOR_GAP);
+        #[expect(clippy::float_cmp)] // exact layout math on representable values
+        {
+            assert_eq!(pos.y, anchor.y - menu.height - ANCHOR_GAP);
+        }
     }
 
     #[test]
@@ -815,7 +821,10 @@ mod tests {
 
         let pos = popup_position(anchor, menu, viewport, ANCHOR_GAP);
 
-        assert_eq!(pos.y, anchor.y + anchor.height + ANCHOR_GAP);
+        #[expect(clippy::float_cmp)] // exact layout math on representable values
+        {
+            assert_eq!(pos.y, anchor.y + anchor.height + ANCHOR_GAP);
+        }
     }
 
     #[test]
@@ -832,9 +841,15 @@ mod tests {
 
         let pos = popup_position(anchor, menu, viewport, ANCHOR_GAP);
 
-        assert_eq!(pos.y, 0.0);
+        #[expect(clippy::float_cmp)] // exact layout math on representable values
+        {
+            assert_eq!(pos.y, 0.0);
+        }
         // Right-align clamps to the viewport left edge in a narrow window.
-        assert_eq!(pos.x, 0.0);
+        #[expect(clippy::float_cmp)] // exact layout math on representable values
+        {
+            assert_eq!(pos.x, 0.0);
+        }
     }
 
     #[test]
@@ -854,8 +869,14 @@ mod tests {
 
         let pos = popup_position(anchor, menu, viewport, ANCHOR_GAP);
 
-        assert_eq!(pos.x, viewport.width - menu.width);
-        assert_eq!(pos.x, 830.0);
+        #[expect(clippy::float_cmp)] // exact layout math on representable values
+        {
+            assert_eq!(pos.x, viewport.width - menu.width);
+        }
+        #[expect(clippy::float_cmp)] // exact layout math on representable values
+        {
+            assert_eq!(pos.x, 830.0);
+        }
     }
 
     #[test]

@@ -2717,6 +2717,7 @@ mod parity_tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines)] // differential parity matrix
     fn differential_parity_matrix() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
@@ -3014,7 +3015,7 @@ mod parity_tests {
         let (_, _, _, stream_bytes) = engine_run_with_stdin(&specs[0], &stream);
         let n = stream_bytes.expect("marker emitted");
         assert!(
-            n > 0 && (n as usize) < stream.len(),
+            n > 0 && n < stream.len() as u64,
             "consumed {n} of {}: expected early stop",
             stream.len()
         );

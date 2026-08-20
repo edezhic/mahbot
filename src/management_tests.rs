@@ -525,8 +525,7 @@ fn analyst_verdict(score: u8, issues: &[&str]) -> ParallelVerdict {
 /// Without a fake provider, `providers::chat_scoped` panics on the unset
 /// global — every test that drives an any-failed / partial round (which
 /// triggers synthesis) must install these.
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
-async fn install_synthesis_test_seams(
+fn install_synthesis_test_seams(
     fake: crate::util::test::FakeProvider,
 ) -> (
     std::sync::MutexGuard<'static, ()>,
@@ -574,7 +573,7 @@ async fn process_verifier_verdicts_cases() {
 
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let cases = vec![
         Case {
@@ -718,7 +717,7 @@ async fn process_verifier_verdicts_cases() {
 async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let ws = test_ws_named("/tmp/test", "vp_moved");
     let ticket_id = make_ticket(board(), &ws, "VP Moved", TicketPhase::InReview).await;
@@ -788,7 +787,7 @@ async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
 async fn circuit_breaker_on_moved_ticket_is_silent_noop() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let ws = test_ws_named("/tmp/test", "cb_moved");
     let ticket_id = make_ticket(board(), &ws, "CB Moved", TicketPhase::InSanitation).await;
@@ -847,7 +846,7 @@ async fn circuit_breaker_on_moved_ticket_is_silent_noop() {
 async fn resume_verifier_round_replays_stored_outcomes() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let ws = test_ws_named("/tmp/test", "vp_resume");
     let ticket_id = make_ticket(board(), &ws, "VP Resume", TicketPhase::InReview).await;
@@ -1015,7 +1014,7 @@ async fn resume_engineer_round_continues_anchor_session() {
     let fake = crate::util::test::FakeProvider::new()
         .ok("implemented the resume path")
         .ok(r#"{"items": ["resumed the engineer session"]}"#);
-    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake).await;
+    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake);
 
     let ws = test_ws_named("/tmp/test", "eng_resume");
     let ticket_id = make_ticket(board(), &ws, "Eng Resume", TicketPhase::InDevelopment).await;
@@ -1155,7 +1154,7 @@ async fn resume_sanitation_round_continues_session_and_passes() {
     let fake = crate::util::test::FakeProvider::new()
         .ok("inspected the workspace — no garbage files found")
         .ok(r#"{"pass": true, "garbage_files": [], "rationale": "workspace is clean"}"#);
-    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake).await;
+    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake);
 
     let ws = test_ws_named("/tmp/test", "san_resume");
     let ticket_id = make_ticket(board(), &ws, "San Resume", TicketPhase::InSanitation).await;
@@ -1376,7 +1375,7 @@ async fn dispatch_panic_during_drain_skips_failed_transition() {
 async fn eleventh_bounce_fails_ticket() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let ws = test_ws_named("/tmp/test", "eleventh_bounce");
     let ticket_id = make_ticket(board(), &ws, "Eleventh Bounce", TicketPhase::InReview).await;
@@ -1384,7 +1383,10 @@ async fn eleventh_bounce_fails_ticket() {
         .conn
         .execute(
             "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
-            turso::params![crate::joint_verdict::MAX_BOUNCES as i64, ticket_id.as_str()],
+            turso::params![
+                i64::try_from(crate::joint_verdict::MAX_BOUNCES).unwrap(),
+                ticket_id.as_str()
+            ],
         )
         .await
         .expect("set bounce_count to max");
@@ -1410,7 +1412,7 @@ async fn eleventh_bounce_fails_ticket() {
     );
     assert_eq!(
         ticket.bounce_count,
-        crate::joint_verdict::MAX_BOUNCES as i64,
+        i64::try_from(crate::joint_verdict::MAX_BOUNCES).unwrap(),
         "bounce counter stays at the max — the failing bounce is not counted"
     );
     let comments = board()
@@ -1706,7 +1708,7 @@ async fn process_analyst_verdicts_cases() {
 
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let cases = vec![
         Case {
@@ -1801,7 +1803,7 @@ async fn analyst_round_fails_open_with_fallback_comment() {
         .err(crate::retry::FailureClass::Transport, "synthesis down")
         .err(crate::retry::FailureClass::Transport, "synthesis down")
         .err(crate::retry::FailureClass::Transport, "synthesis down");
-    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake).await;
+    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake);
 
     let ws = test_ws_named("/tmp/test", "an_fail_open");
     let ticket_id = make_ticket(board(), &ws, "Fail Open", TicketPhase::Analysis).await;
@@ -2268,15 +2270,15 @@ async fn dispatch_diagnostics_cases() {
         expected_comment_contains: &'static [&'static str],
     }
 
+    const NO_DIAG_CMDS: &[&str] = &["No diagnostics commands are configured"];
+    const DB_ERR: &[&str] = &["database error"];
+
     init_management_test_stores().await;
 
     let diagnostics_failed_marker: &'static str =
         load_prompt("pipeline/diagnostics_failed.md").leak();
     let diagnostics_passed_marker: &'static str =
         load_prompt("pipeline/diagnostics_passed.md").leak();
-
-    const NO_DIAG_CMDS: &[&str] = &["No diagnostics commands are configured"];
-    const DB_ERR: &[&str] = &["database error"];
 
     let fail_comment_contains: &'static [&'static str] =
         Box::leak(vec![diagnostics_failed_marker].into_boxed_slice());
@@ -2489,6 +2491,7 @@ fn should_skip_review_decision_matrix() {
     let base = (Some("base-head"), Some("base-tree"));
     let same = base;
     let none = (None, None);
+    #[expect(clippy::type_complexity)] // skip-review decision matrix
     let cases: [(
         (Option<&str>, Option<&str>),
         (Option<&str>, Option<&str>),
@@ -2771,7 +2774,7 @@ fn engineer_finalize_test_agent(ws: &Workspace, ticket: &Ticket, suffix: &str) -
 async fn engineer_hard_failure_bounces_to_ready_for_development() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let ws = create_test_workspace("/tmp/eng_bounce_ws", "ws_eng_bounce").await;
     let ticket_id = make_ticket(board(), &ws, "Eng Hard Failure", TicketPhase::InDevelopment).await;
@@ -2840,7 +2843,7 @@ async fn engineer_hard_failure_bounces_to_ready_for_development() {
 async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let ws = create_test_workspace("/tmp/eng_trip_ws", "ws_eng_trip").await;
     let ticket_id = make_ticket(board(), &ws, "Eng Trip", TicketPhase::InDevelopment).await;
@@ -2856,7 +2859,10 @@ async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
         .conn
         .execute(
             "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
-            turso::params![crate::joint_verdict::MAX_BOUNCES as i64, ticket_id.as_str()],
+            turso::params![
+                i64::try_from(crate::joint_verdict::MAX_BOUNCES).unwrap(),
+                ticket_id.as_str()
+            ],
         )
         .await
         .expect("set bounce_count to max");
@@ -2875,7 +2881,7 @@ async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
     );
     assert_eq!(
         t.bounce_count,
-        crate::joint_verdict::MAX_BOUNCES as i64,
+        i64::try_from(crate::joint_verdict::MAX_BOUNCES).unwrap(),
         "the failing bounce is not counted — the counter stays at the max"
     );
 
@@ -2927,7 +2933,7 @@ async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
 async fn engineer_cancel_fails_ticket_without_bounce() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new()).await;
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
 
     let ws = create_test_workspace("/tmp/eng_cancel_ws", "ws_eng_cancel").await;
     let ticket_id = make_ticket(board(), &ws, "Eng Cancel", TicketPhase::InDevelopment).await;

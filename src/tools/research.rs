@@ -3821,6 +3821,7 @@ mod tests {
     /// before synthesis runs, no LLM calls, no partial report. The durable
     /// sweep (rows + folder + archive) is covered by research_cancel.rs tests.
     #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn cancelled_run_exits_cancelled_at_stage_boundary() {
         let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
@@ -4555,6 +4556,7 @@ mod tests {
     /// `capture_round` would OVERWRITE the pre-crash capture (whose early
     /// sessions are already TTL'd).
     #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn load_seeds_commands_from_dump_after_crash() {
         crate::util::test::init_management_test_stores().await;
         let _lock = crate::util::test::retry_tests_lock();

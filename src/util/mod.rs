@@ -1881,6 +1881,7 @@ mod audio_util_tests {
     #[test]
     fn test_speed_perturbation_identity() {
         // rate=1.0 should return approximately the original
+        #[expect(clippy::cast_precision_loss)] // i ∈ 0..100 — exact in f32
         let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
         let result = speed_perturbation(&pcm, 16000, 1.0);
         assert_eq!(result.len(), pcm.len(), "identity should preserve length");
@@ -1892,6 +1893,7 @@ mod audio_util_tests {
     #[test]
     fn test_speed_perturbation_rates() {
         // Slow down: rate=0.5 should produce more samples
+        #[expect(clippy::cast_precision_loss)] // i ∈ 0..100 — exact in f32
         let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
         let slowed = speed_perturbation(&pcm, 16000, 0.5);
         assert!(
@@ -1909,6 +1911,7 @@ mod audio_util_tests {
     #[test]
     fn test_speed_perturbation_determinism() {
         // Same input + same rate → same output
+        #[expect(clippy::cast_precision_loss)] // i ∈ 0..100 — exact in f32
         let pcm: Vec<f32> = (0..100).map(|i| (i as f32) / 100.0).collect();
         let a = speed_perturbation(&pcm, 16000, 0.95);
         let b = speed_perturbation(&pcm, 16000, 0.95);
@@ -1918,6 +1921,7 @@ mod audio_util_tests {
     #[test]
     fn test_apply_gain_determinism() {
         // apply_gain must be deterministic: same PCM + same gain_db → same output
+        #[expect(clippy::cast_precision_loss)] // i ∈ 0..50 — exact in f32
         let pcm: Vec<f32> = (0..50).map(|i| (i as f32 - 25.0) / 25.0).collect();
         let a = apply_gain(&pcm, -3.0);
         let b = apply_gain(&pcm, -3.0);
@@ -1955,6 +1959,7 @@ mod audio_util_tests {
     #[test]
     fn test_add_noise_determinism() {
         // Same PCM + same SNR + same seed → same output
+        #[expect(clippy::cast_precision_loss)] // i ∈ 0..200 — exact in f32
         let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
         let a = add_noise(&pcm, 25.0, 42);
         let b = add_noise(&pcm, 25.0, 42);
@@ -1965,6 +1970,7 @@ mod audio_util_tests {
     #[test]
     fn test_add_noise_seed_variation() {
         // Different seed → different output
+        #[expect(clippy::cast_precision_loss)] // i ∈ 0..200 — exact in f32
         let pcm: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) / 100.0).collect();
         let a = add_noise(&pcm, 25.0, 42);
         let b = add_noise(&pcm, 25.0, 99);
@@ -1974,6 +1980,7 @@ mod audio_util_tests {
     #[test]
     fn test_add_noise_snr_approximation() {
         // At very high SNR (100 dB), the output should be very close to input
+        #[expect(clippy::cast_precision_loss)] // i ∈ 0..1000 — exact in f32
         let pcm: Vec<f32> = (0..1000).map(|i| (i as f32 - 500.0) / 500.0).collect();
         let noisy = add_noise(&pcm, 100.0, 42);
         // Compute actual SNR of output vs input
@@ -2010,6 +2017,7 @@ mod audio_util_tests {
     #[test]
     fn test_augmentation_variants_are_different() {
         // Verify that the 4 augmentation strategies produce different results
+        #[expect(clippy::cast_precision_loss)] // i ∈ 0..500 — exact in f32
         let pcm: Vec<f32> = (0..500).map(|i| (i as f32 - 250.0) / 250.0).collect();
         let speed_down = speed_perturbation(&pcm, 16000, 0.95);
         let speed_up = speed_perturbation(&pcm, 16000, 1.05);
@@ -2066,8 +2074,14 @@ mod gaussian_sampler_tests {
         for i in 0..DRAW_PAIRS {
             let shared = sample_gaussian_pair_clamped(&mut shared_rng);
             let reference = reference_bench_pair(&mut ref_rng);
-            assert_eq!(shared.0, reference.0, "bench z1 divergence at pair {i}");
-            assert_eq!(shared.1, reference.1, "bench z2 divergence at pair {i}");
+            #[expect(clippy::float_cmp)] // same-seed RNG must be byte-identical
+            {
+                assert_eq!(shared.0, reference.0, "bench z1 divergence at pair {i}");
+            }
+            #[expect(clippy::float_cmp)] // same-seed RNG must be byte-identical
+            {
+                assert_eq!(shared.1, reference.1, "bench z2 divergence at pair {i}");
+            }
         }
     }
 
@@ -2078,8 +2092,16 @@ mod gaussian_sampler_tests {
             let (z1, z2) = gaussian_pair_from_uniforms(u1, u2);
             let r = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f32::consts::PI * u2;
-            assert_eq!(z1, r * theta.cos(), "z1 for ({u1}, {u2})");
-            assert_eq!(z2, r * theta.sin(), "z2 for ({u1}, {u2})");
+            #[expect(clippy::float_cmp)]
+            // identical expression ordering — bit-identical by construction
+            {
+                assert_eq!(z1, r * theta.cos(), "z1 for ({u1}, {u2})");
+            }
+            #[expect(clippy::float_cmp)]
+            // identical expression ordering — bit-identical by construction
+            {
+                assert_eq!(z2, r * theta.sin(), "z2 for ({u1}, {u2})");
+            }
         }
     }
 }
@@ -2174,6 +2196,7 @@ mod reference_image_tests {
     #[test]
     fn over_cap_jpeg_exif_orientation_applied() {
         use image::GenericImageView;
+        use image::ImageDecoder;
         // 2x1 JPEG stored with EXIF orientation=6 (Rotate90): the compressed
         // output must come out 1x2 — a silently-rotated reference is exactly
         // the class of invisible corruption this pipeline exists to prevent.
@@ -2191,7 +2214,6 @@ mod reference_image_tests {
         let oriented = jpeg_with_exif_orientation(&jpeg);
 
         // Sanity: the crafted file's decoder reports the intended rotation.
-        use image::ImageDecoder;
         let reader = image::ImageReader::new(std::io::Cursor::new(&oriented))
             .with_guessed_format()
             .unwrap();

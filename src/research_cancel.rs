@@ -217,6 +217,7 @@ mod tests {
     /// Mid-run cancel: jobs + research_jobs rows + pending row + folder +
     /// archive all removed; nothing is resumable or deliverable.
     #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sweep_removes_rows_folder_and_archive_for_mid_run_cancel() {
         let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
@@ -292,6 +293,7 @@ mod tests {
     /// research_cleanup job row are removed (boot replay must have nothing to
     /// deliver, and the cleanup must not resume).
     #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sweep_removes_pending_and_cleanup_rows_for_terminalized_run() {
         let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
@@ -355,6 +357,7 @@ mod tests {
 
     /// The sweep is idempotent; a double release (racing cleanup tail) is safe.
     #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sweep_is_idempotent_and_double_release_safe() {
         let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
@@ -367,6 +370,7 @@ mod tests {
     /// The in-tx cancel gate: a completion racing a cancel must roll back —
     /// no pending row may survive, and the jobs row stays for the sweep.
     #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn complete_durable_job_rolls_back_when_run_cancelled() {
         let _lock = retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
