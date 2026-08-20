@@ -192,9 +192,12 @@ impl ModelRouting {
 /// 1. **Field declaration** — add the field here on [`ConfigData`].
 /// 2. **Macro** — add the field name to the `string_config_fields!` invocation in this file.
 ///    The macro generates `ConfigData::STRUCT_FIELDS_DEFAULT` (used by [`ConfigReload::const_new`]),
-///    [`ConfigData::string_fields()`], and [`ConfigData::set_string_field()`] from this list.  The compiler
+///    [`ConfigData::string_fields()`], [`ConfigData::set_string_field()`], and — for every field —
+///    a `pub const CONFIG_KEY_<FIELD>: &str` key constant from this list.  The compiler
 ///    enforces that every field on [`ConfigData`] is present in `STRUCT_FIELDS_DEFAULT`,
-///    so forgetting this step is a compile error.
+///    so forgetting this step is a compile error.  Use the emitted `CONFIG_KEY_<FIELD>` consts
+///    at write sites / match arms instead of raw string literals — a rename then stays
+///    compiler-tied at every use site.
 /// 3. **Typed accessor** — automatically generated. The `string_config_fields!` macro
 ///    produces typed accessor methods on [`ConfigReload`] based on each field's
 ///    annotation (`non_empty`, `or(DEFAULT)`, or `list_or(...)`) — no manual
@@ -300,6 +303,10 @@ pub struct ConfigData {
 // macro invocation updates all items automatically, eliminating the
 // entire class of sync bugs.
 //
+// The macro additionally emits a `pub const CONFIG_KEY_<FIELD>` constant per
+// field, alongside the sync items, so hand-written persist paths reference
+// keys by name instead of raw literals.
+//
 // ══ Structural protection ═════════════════════════════════════════
 //
 // `STRUCT_FIELDS_DEFAULT` is a `const Self { … }` that initialises every
@@ -342,6 +349,11 @@ pub struct ConfigData {
 /// All generated items are guaranteed to stay synchronised because they expand
 /// from the same source.
 ///
+/// The macro also emits one `pub const CONFIG_KEY_<FIELD>: &str` per field
+/// (name pasted from the field token, value `stringify!` of the same token),
+/// so write sites and match arms can reference the key without raw literals —
+/// a rename in the invocation changes the constant and its value together.
+///
 /// ## Structural drift protection
 ///
 /// The generated [`ConfigData::STRUCT_FIELDS_DEFAULT`] is a `const` value that
@@ -358,6 +370,18 @@ macro_rules! string_config_fields {
             $field:ident [ $($annotation:tt)* ]
         ),* $(,)?
     ) => {
+        // ── Config-key constants — single source of truth ──────
+        //
+        // Each field emits a `CONFIG_KEY_<FIELD>` const: the name is pasted
+        // from the field token (`:upper`), the value `stringify!`s the same
+        // token, so a rename changes both together and stale use sites fail
+        // to compile instead of silently dropping their side effect.
+        ::paste::paste! {
+            $(
+                pub const [<CONFIG_KEY_ $field:upper>]: &str = stringify!($field);
+            )*
+        }
+
         impl ConfigData {
             /// Default-initialised [`ConfigData`] with all `Option<String>` fields
             /// set to `None` and `Vec` fields empty.
@@ -893,17 +917,19 @@ async fn seed_fresh_install_defaults(
         return Ok(());
     }
     store
-        .set_kv("audio_transcription_use_local", "false")
+        .set_kv(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, "false")
         .await?;
     store
-        .set_kv("image_gen_model", DEFAULT_IMAGE_GEN_MODEL)
+        .set_kv(CONFIG_KEY_IMAGE_GEN_MODEL, DEFAULT_IMAGE_GEN_MODEL)
         .await?;
     store
-        .set_kv("image_gen_models", FRESH_INSTALL_IMAGE_GEN_MODELS)
+        .set_kv(CONFIG_KEY_IMAGE_GEN_MODELS, FRESH_INSTALL_IMAGE_GEN_MODELS)
         .await?;
-    store.set_kv("video_model", DEFAULT_VIDEO_MODEL).await?;
     store
-        .set_kv("video_models", FRESH_INSTALL_VIDEO_MODELS)
+        .set_kv(CONFIG_KEY_VIDEO_MODEL, DEFAULT_VIDEO_MODEL)
+        .await?;
+    store
+        .set_kv(CONFIG_KEY_VIDEO_MODELS, FRESH_INSTALL_VIDEO_MODELS)
         .await?;
     // mahbot-1855: default model slots hosted by DeepSeek route through the
     // DeepSeek provider on fresh installs. The rows are explicit and editable
@@ -1020,7 +1046,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
 
     // Defense in depth: the settings page renders no control for this key, but
     // refuse it structurally so no future caller can ever write it here.
-    if key == stringify!(wake_word_templates) {
+    if key == CONFIG_KEY_WAKE_WORD_TEMPLATES {
         return Ok(CONFIG.wake_word_templates().unwrap_or_default());
     }
 
@@ -1039,7 +1065,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
         // is instead validated when it itself settles, against the then-
         // committed endpoint — so a switch is two steps (endpoint first, then
         // model), each independently valid.
-        "provider_endpoint" | "provider_key" => {
+        CONFIG_KEY_PROVIDER_ENDPOINT | CONFIG_KEY_PROVIDER_KEY => {
             let mut probe = CONFIG.snapshot();
             let _ = probe.set_string_field(key, &trimmed);
             probe.normalize();
@@ -1049,7 +1075,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
             crate::providers::recreate_all(&CONFIG.snapshot()).await?;
         }
         // Telegram token change hot-reloads the listener after the write.
-        "telegram_bot_token" => {
+        CONFIG_KEY_TELEGRAM_BOT_TOKEN => {
             let old_token = CONFIG.telegram_bot_token();
             let new_token = trimmed_or_none(&trimmed);
             if new_token != old_token
@@ -1057,7 +1083,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
             {
                 crate::channels::telegram::TelegramChannel::validate_token(token).await?;
             }
-            write_kv_and_update_config("telegram_bot_token", &trimmed).await?;
+            write_kv_and_update_config(CONFIG_KEY_TELEGRAM_BOT_TOKEN, &trimmed).await?;
             let persisted = CONFIG.telegram_bot_token();
             if persisted != old_token {
                 crate::channels::telegram::restart_telegram_listener(persisted.as_deref()).await?;
@@ -1068,7 +1094,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
         // generation tool's semantics). A cleared model falls back to the
         // default — the model that would actually be used — so it is
         // validated too.
-        "image_gen_model" => {
+        CONFIG_KEY_IMAGE_GEN_MODEL => {
             let endpoint = CONFIG.provider_endpoint();
             let model_opt = trimmed_or_none(&trimmed);
             let model: &str = model_opt.as_deref().unwrap_or(DEFAULT_IMAGE_GEN_MODEL);
@@ -1076,12 +1102,12 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
                 crate::tools::image_catalog::validate_image_model_for_endpoint(model, &endpoint)
                     .await?;
             }
-            write_kv_and_update_config("image_gen_model", &trimmed).await?;
+            write_kv_and_update_config(CONFIG_KEY_IMAGE_GEN_MODEL, &trimmed).await?;
         }
         // Multimodal model changes rebuild the media transcriber (no provider
         // warmup — the provider is unaffected by this) — the transcriber
         // captures the model at build time.
-        "multimodal_model" => {
+        CONFIG_KEY_MULTIMODAL_MODEL => {
             write_kv_and_update_config(key, &trimmed).await?;
             crate::providers::recreate_media_transcriber();
         }
@@ -1555,6 +1581,35 @@ mod tests {
         );
 
         CONFIG.swap(original);
+    }
+
+    /// The persist side-effect arms and the `wake_word_templates` guard are
+    /// wired through `CONFIG_KEY_*` constants (compile-tied: a rename in
+    /// `string_config_fields!` changes both the constant name and its value,
+    /// so every arm referencing the old name fails to compile). This test
+    /// pins the vocabulary contract: every key that carries a persist side
+    /// effect (or the structural guard) must still be a real config field,
+    /// and documents the exact set a rename must keep in sync.
+    #[test]
+    fn side_effect_config_keys_are_real_fields() {
+        let known: Vec<&'static str> = ConfigData::STRUCT_FIELDS_DEFAULT
+            .string_fields()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        for key in [
+            CONFIG_KEY_PROVIDER_ENDPOINT,
+            CONFIG_KEY_PROVIDER_KEY,
+            CONFIG_KEY_TELEGRAM_BOT_TOKEN,
+            CONFIG_KEY_IMAGE_GEN_MODEL,
+            CONFIG_KEY_MULTIMODAL_MODEL,
+            CONFIG_KEY_WAKE_WORD_TEMPLATES,
+        ] {
+            assert!(
+                known.contains(&key),
+                "side-effect key '{key}' must be a real config field"
+            );
+        }
     }
 
     /// Fresh-install seed (mahbot-1825, mahbot-1834): the fresh-install

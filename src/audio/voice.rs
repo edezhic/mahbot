@@ -57,7 +57,7 @@ use crate::audio::wake_word::{
     MIN_ENROLLMENT_UTTERANCES, WAKE_WORD_EMBEDDING_DIM, WINDOW_SAMPLES, WakeWordEnrollment,
     calibrate_negatives, encode_window,
 };
-use crate::config::CONFIG;
+use crate::config::{CONFIG, CONFIG_KEY_WAKE_WORD_TEMPLATES};
 use crate::turso;
 use crate::util::UnwrapPoison;
 use crate::util::hex_string;
@@ -3712,11 +3712,11 @@ async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
         return false;
     };
     let store = crate::config_db::store();
-    if let Err(e) = store.set_kv("wake_word_templates", &json).await {
+    if let Err(e) = store.set_kv(CONFIG_KEY_WAKE_WORD_TEMPLATES, &json).await {
         warn!("Failed to persist wake word enrollment: {e}");
         return false;
     }
-    if !CONFIG.set_string_field("wake_word_templates", &json) {
+    if !CONFIG.set_string_field(CONFIG_KEY_WAKE_WORD_TEMPLATES, &json) {
         warn!(
             "Failed to update CONFIG with wake word enrollment (key not recognized by \
              set_string_field — it may have drifted from the `stringify!` arms)"

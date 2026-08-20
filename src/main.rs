@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use mahbot::channels::broadcast_and_persist_incoming_message;
 use mahbot::channels::telegram::{decode_action, user_command_entries};
-use mahbot::config::CONFIG;
+use mahbot::config::{CONFIG, CONFIG_KEY_IMAGE_GEN_MODEL, CONFIG_KEY_VIDEO_MODEL};
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::message_router;
 use mahbot::parse_bot_command;
@@ -1015,11 +1015,17 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
 
     match action.as_str() {
         "set_image_model" => {
-            handle_set_model_action(&msg, &payload, "image_gen_model", "Image generation", true)
-                .await;
+            handle_set_model_action(
+                &msg,
+                &payload,
+                CONFIG_KEY_IMAGE_GEN_MODEL,
+                "Image generation",
+                true,
+            )
+            .await;
         }
         "set_video_model" => {
-            handle_set_model_action(&msg, &payload, "video_model", "Video", false).await;
+            handle_set_model_action(&msg, &payload, CONFIG_KEY_VIDEO_MODEL, "Video", false).await;
         }
         "clear_session" => {
             // Acknowledge callback silently first (dismiss spinner)

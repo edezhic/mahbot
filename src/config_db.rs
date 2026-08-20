@@ -8,7 +8,9 @@
 //! but is intentionally unreferenced since mahbot-1822: its rows are inert
 //! orphans (schema unchanged, rows untouched, no read or write path).
 
-use crate::config::ModelRouting;
+use crate::config::{
+    CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_VOICE_ENABLED, ModelRouting,
+};
 use crate::turso::{self};
 use anyhow::Result;
 
@@ -126,18 +128,18 @@ impl ConfigStore {
         if transcription_enabled {
             tx.execute(
                 DELETE_KV_SQL,
-                turso::params!["audio_transcription_use_local"],
+                turso::params![CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL],
             )
             .await?;
         } else {
             tx.execute(
                 SET_KV_SQL,
-                turso::params!["audio_transcription_use_local", "false"],
+                turso::params![CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, "false"],
             )
             .await?;
         }
         if cascade_voice_off {
-            tx.execute(DELETE_KV_SQL, turso::params!["voice_enabled"])
+            tx.execute(DELETE_KV_SQL, turso::params![CONFIG_KEY_VOICE_ENABLED])
                 .await?;
         }
         tx.commit().await?;

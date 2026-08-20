@@ -11,7 +11,13 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::config::{CONFIG, ConfigData, ModelRouting};
+use crate::config::{
+    CONFIG, CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY,
+    CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_MULTIMODAL_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT,
+    CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_TTS_ENABLED,
+    CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL, ConfigData,
+    ModelRouting,
+};
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
@@ -392,18 +398,18 @@ const SETTLE_MS: u64 = 700;
 /// Config keys rendered as free-text inputs — persisted only after the value
 /// settles (debounce / Enter), never per keystroke.
 const TEXT_INPUT_KEYS: &[&str] = &[
-    "provider_key",
+    CONFIG_KEY_PROVIDER_KEY,
     // Retained even though the Endpoint UI control is hidden (mahbot-1813):
     // the config key stays in the schema and the settle plumbing stays wired
     // for when configurable endpoints are re-enabled. The runtime never
     // honors a persisted value today.
-    "provider_endpoint",
-    "firecrawl_key",
-    "exa_key",
-    "telegram_bot_token",
-    "manager_model",
-    "worker_model",
-    "multimodal_model",
+    CONFIG_KEY_PROVIDER_ENDPOINT,
+    CONFIG_KEY_FIRECRAWL_KEY,
+    CONFIG_KEY_EXA_KEY,
+    CONFIG_KEY_TELEGRAM_BOT_TOKEN,
+    CONFIG_KEY_MANAGER_MODEL,
+    CONFIG_KEY_WORKER_MODEL,
+    CONFIG_KEY_MULTIMODAL_MODEL,
 ];
 
 /// Config keys rendered as discrete controls (toggles / pick lists) that
@@ -411,7 +417,7 @@ const TEXT_INPUT_KEYS: &[&str] = &[
 /// generic ConfigField key since mahbot-1825 — it is a dedicated
 /// [`SettingsMessage::TranscriptionToggle`] toggle with its own transactional
 /// persist path.
-const IMMEDIATE_KEYS: &[&str] = &["web_search_provider"];
+const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER];
 
 pub struct SettingsState {
     /// Current editable snapshot, loaded from CONFIG each refresh.
@@ -957,16 +963,19 @@ impl SettingsState {
                 // Mirror into both snapshots (enabled → "" = absent row;
                 // disabled → "false"), matching the persisted row semantics.
                 let transcription_value = if enabled { "" } else { "false" };
-                let _ = self
-                    .config
-                    .set_string_field("audio_transcription_use_local", transcription_value);
-                let _ = crate::config::CONFIG
-                    .set_string_field("audio_transcription_use_local", transcription_value);
+                let _ = self.config.set_string_field(
+                    CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL,
+                    transcription_value,
+                );
+                let _ = crate::config::CONFIG.set_string_field(
+                    CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL,
+                    transcription_value,
+                );
                 // Turning transcription OFF also turns Wake Word Detection OFF
                 // (shared ASR model): stop the pipeline now.
                 if !enabled && voice_was_enabled {
-                    let _ = self.config.set_string_field("voice_enabled", "");
-                    let _ = crate::config::CONFIG.set_string_field("voice_enabled", "");
+                    let _ = self.config.set_string_field(CONFIG_KEY_VOICE_ENABLED, "");
+                    let _ = crate::config::CONFIG.set_string_field(CONFIG_KEY_VOICE_ENABLED, "");
                     sync_voice_state(false);
                 }
                 // Toggle ON: kick the model load/download in the background —
@@ -1016,13 +1025,16 @@ impl SettingsState {
                         let restore = if currently_off { "" } else { "false" };
                         let _ = self
                             .config
-                            .set_string_field("audio_transcription_use_local", restore);
+                            .set_string_field(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, restore);
                         let _ = crate::config::CONFIG
-                            .set_string_field("audio_transcription_use_local", restore);
+                            .set_string_field(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, restore);
                         // Restore the wake-word state the cascade disabled.
                         if voice_was_enabled {
-                            let _ = self.config.set_string_field("voice_enabled", "true");
-                            let _ = crate::config::CONFIG.set_string_field("voice_enabled", "true");
+                            let _ = self
+                                .config
+                                .set_string_field(CONFIG_KEY_VOICE_ENABLED, "true");
+                            let _ = crate::config::CONFIG
+                                .set_string_field(CONFIG_KEY_VOICE_ENABLED, "true");
                             sync_voice_state(true);
                         }
                         Task::none()
@@ -1036,7 +1048,7 @@ impl SettingsState {
 
             // ── Voice assistant ─────────────────────────────────
             SettingsMessage::VoiceToggle(enabled) => self.run_toggle(
-                "voice_enabled",
+                CONFIG_KEY_VOICE_ENABLED,
                 enabled,
                 |s| {
                     s.voice_toggle_gen += 1;
@@ -1046,7 +1058,7 @@ impl SettingsState {
                 sync_voice_state,
             ),
             SettingsMessage::VoiceToggleResult(g, result) => self.handle_toggle_result(
-                "voice_enabled",
+                CONFIG_KEY_VOICE_ENABLED,
                 g,
                 result,
                 |s| s.voice_toggle_gen,
@@ -1054,7 +1066,7 @@ impl SettingsState {
                 sync_voice_state,
             ),
             SettingsMessage::TtsToggle(enabled) => self.run_toggle(
-                "tts_enabled",
+                CONFIG_KEY_TTS_ENABLED,
                 enabled,
                 |s| {
                     s.tts_toggle_gen += 1;
@@ -1070,7 +1082,7 @@ impl SettingsState {
                 },
             ),
             SettingsMessage::TtsToggleResult(g, result) => self.handle_toggle_result(
-                "tts_enabled",
+                CONFIG_KEY_TTS_ENABLED,
                 g,
                 result,
                 |s| s.tts_toggle_gen,
@@ -2456,7 +2468,7 @@ impl SettingsState {
                     self.config.provider_key.as_deref().unwrap_or_default(),
                     self.password_visible.contains(&PasswordTarget::ProviderKey),
                     |v| SettingsMessage::ConfigField {
-                        key: "provider_key",
+                        key: CONFIG_KEY_PROVIDER_KEY,
                         value: v
                     },
                     SettingsMessage::TogglePasswordVisibility(PasswordTarget::ProviderKey),
@@ -2481,7 +2493,7 @@ impl SettingsState {
                 self.config.manager_model.as_deref().unwrap_or_default(),
             )
             .on_input(|v| SettingsMessage::ConfigField {
-                key: "manager_model",
+                key: CONFIG_KEY_MANAGER_MODEL,
                 value: v,
             })
             .on_submit(SettingsMessage::ConfigFieldSettleNow {
@@ -2502,7 +2514,7 @@ impl SettingsState {
                 self.config.worker_model.as_deref().unwrap_or_default(),
             )
             .on_input(|v| SettingsMessage::ConfigField {
-                key: "worker_model",
+                key: CONFIG_KEY_WORKER_MODEL,
                 value: v,
             })
             .on_submit(SettingsMessage::ConfigFieldSettleNow {
@@ -2523,7 +2535,7 @@ impl SettingsState {
                 self.config.multimodal_model.as_deref().unwrap_or_default(),
             )
             .on_input(|v| SettingsMessage::ConfigField {
-                key: "multimodal_model",
+                key: CONFIG_KEY_MULTIMODAL_MODEL,
                 value: v,
             })
             .on_submit(SettingsMessage::ConfigFieldSettleNow {
@@ -3014,7 +3026,7 @@ impl SettingsState {
                 _ => String::new(), // "Auto" → empty → None
             };
             SettingsMessage::ConfigField {
-                key: "web_search_provider",
+                key: CONFIG_KEY_WEB_SEARCH_PROVIDER,
                 value,
             }
         })
@@ -3043,7 +3055,7 @@ impl SettingsState {
                         self.password_visible
                             .contains(&PasswordTarget::FirecrawlKey),
                         |v| SettingsMessage::ConfigField {
-                            key: "firecrawl_key",
+                            key: CONFIG_KEY_FIRECRAWL_KEY,
                             value: v
                         },
                         SettingsMessage::TogglePasswordVisibility(PasswordTarget::FirecrawlKey),
@@ -3064,7 +3076,7 @@ impl SettingsState {
                         self.config.exa_key.as_deref().unwrap_or_default(),
                         self.password_visible.contains(&PasswordTarget::ExaKey),
                         |v| SettingsMessage::ConfigField {
-                            key: "exa_key",
+                            key: CONFIG_KEY_EXA_KEY,
                             value: v
                         },
                         SettingsMessage::TogglePasswordVisibility(PasswordTarget::ExaKey),
@@ -3087,7 +3099,7 @@ impl SettingsState {
                         self.password_visible
                             .contains(&PasswordTarget::TelegramToken),
                         |v| SettingsMessage::ConfigField {
-                            key: "telegram_bot_token",
+                            key: CONFIG_KEY_TELEGRAM_BOT_TOKEN,
                             value: v
                         },
                         SettingsMessage::TogglePasswordVisibility(PasswordTarget::TelegramToken),
@@ -4197,5 +4209,25 @@ mod tests {
             Some("test-model"),
             "model slot staged in the editable snapshot"
         );
+    }
+
+    /// Every config key rendered by the Settings page must be a real config
+    /// field: `TEXT_INPUT_KEYS ∪ IMMEDIATE_KEYS ⊆ ConfigData::string_fields()`.
+    /// A key outside the vocabulary would stage forever or persist an
+    /// orphaned row with no visible error — this cheap guard catches a
+    /// typo'd or removed field the moment the array drifts.
+    #[test]
+    fn settings_config_keys_are_real_config_fields() {
+        let known: Vec<&'static str> = ConfigData::STRUCT_FIELDS_DEFAULT
+            .string_fields()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        for key in TEXT_INPUT_KEYS.iter().chain(IMMEDIATE_KEYS.iter()) {
+            assert!(
+                known.contains(key),
+                "settings key '{key}' is not a config field — TEXT_INPUT_KEYS / IMMEDIATE_KEYS drifted"
+            );
+        }
     }
 }
