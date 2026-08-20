@@ -294,7 +294,6 @@ impl crate::Provider for FakeProvider {
 
     // `ScopedCallError` is deliberately large (full diagnostics payload); the
     // scripted-Result shape is the point of this test double.
-    #[allow(clippy::result_large_err)]
     async fn chat_scoped(
         &self,
         request: crate::ChatRequest,

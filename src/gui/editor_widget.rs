@@ -1167,7 +1167,6 @@ impl EditorBuffer {
     fn do_jump_to_matching_bracket(&self) {
         let text = self.text();
         let (cl, cc) = (self.cursor_line.get(), self.cursor_col.get());
-        #[allow(clippy::similar_names)]
         if let Some(pair) = find_matching_bracket(&text, cl, cc) {
             // pair is ((open_line, open_col), (close_line, close_col)).
             // If cursor is on/near the opening bracket → jump to close.

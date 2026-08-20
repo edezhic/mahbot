@@ -266,139 +266,6 @@ impl WebSearchCache {
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn test_validate_no_args() {
-        let cache = WebSearchCache::new();
-        let args = json!({});
-        let result = cache.validate_execute_args(&args);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("either `query`"),
-            "Error should mention both args"
-        );
-    }
-
-    #[test]
-    fn test_search_error_detail_string_and_nested_envelope() {
-        // String error field (Firecrawl's `{"success": false, "error": "..."}`).
-        assert_eq!(
-            search_error_detail(r#"{"success":false,"error":"upstream down"}"#).as_deref(),
-            Some("upstream down")
-        );
-        // Nested-envelope object error.
-        assert_eq!(
-            search_error_detail(r#"{"error":{"message":"invalid API key"}}"#).as_deref(),
-            Some("invalid API key")
-        );
-        // Nested raw field when no top-level message exists.
-        assert_eq!(
-            search_error_detail(
-                r#"{"error":{"code":"rate_limited","metadata":{"raw":"too many requests"}}}"#
-            )
-            .as_deref(),
-            Some("too many requests")
-        );
-        // Non-JSON body yields no detail (caller falls back to status+body).
-        assert_eq!(search_error_detail("plain text"), None);
-        assert_eq!(search_error_detail(""), None);
-    }
-
-    #[test]
-    fn test_validate_both_args() {
-        let cache = WebSearchCache::new();
-        let args = json!({"query": "test", "expand": 1});
-        let result = cache.validate_execute_args(&args);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("not both"),
-            "Error should mention not both"
-        );
-    }
-
-    #[test]
-    fn test_validate_query_too_short() {
-        let cache = WebSearchCache::new();
-        let args = json!({"query": "ab"});
-        let result = cache.validate_execute_args(&args);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("at least 3"),
-            "Error should mention min length"
-        );
-    }
-
-    #[test]
-    fn test_validate_expand_invalid_future_id() {
-        let cache = WebSearchCache::new();
-        // Cache counter starts at 1, so any id >= 1 without a prior search fails
-        let args = json!({"expand": 999_999_999});
-        let result = cache.validate_execute_args(&args);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Invalid expand id"),
-            "Error should contain 'Invalid expand id': {err}"
-        );
-    }
-
-    #[test]
-    fn test_validate_good_query() {
-        let cache = WebSearchCache::new();
-        let args = json!({"query": "rust programming"});
-        let (query, expand_id) = cache.validate_execute_args(&args).unwrap();
-        assert_eq!(query, "rust programming");
-        assert!(expand_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_cache_and_expand_roundtrip() {
-        let cache = WebSearchCache::new();
-        let id = cache
-            .cache_result(
-                "Test Title".to_string(),
-                "https://example.com".to_string(),
-                "Full text content".to_string(),
-            )
-            .await;
-        assert_eq!(id, 1, "first cached result should get id 1");
-
-        let id2 = cache
-            .cache_result(
-                "Second".to_string(),
-                "https://example.org".to_string(),
-                "More content".to_string(),
-            )
-            .await;
-        assert_eq!(id2, 2, "second cached result should get id 2");
-
-        let expanded = cache.expand_result(1).await.unwrap();
-        assert!(expanded.contains("Test Title"));
-        assert!(expanded.contains("https://example.com"));
-        assert!(expanded.contains("Full text content"));
-
-        let expanded2 = cache.expand_result(2).await.unwrap();
-        assert!(expanded2.contains("Second"));
-        assert!(expanded2.contains("More content"));
-    }
-
-    #[tokio::test]
-    async fn test_expand_missing_id() {
-        let cache = WebSearchCache::new();
-        let result = cache.expand_result(42).await;
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("No cached result"),
-            "Error should mention no cached result"
-        );
-    }
-}
-
 // ── Tool ────────────────────────────────────────────────────────────────────────
 
 /// Web search tool backed by a configurable backend (Firecrawl or Exa).
@@ -576,5 +443,137 @@ impl Tool for WebSearchTool {
             WebSearchBackend::Firecrawl { .. } => self.firecrawl_search(query).await,
             WebSearchBackend::Exa { .. } => self.exa_search(query).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_validate_no_args() {
+        let cache = WebSearchCache::new();
+        let args = json!({});
+        let result = cache.validate_execute_args(&args);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("either `query`"),
+            "Error should mention both args"
+        );
+    }
+
+    #[test]
+    fn test_search_error_detail_string_and_nested_envelope() {
+        // String error field (Firecrawl's `{"success": false, "error": "..."}`).
+        assert_eq!(
+            search_error_detail(r#"{"success":false,"error":"upstream down"}"#).as_deref(),
+            Some("upstream down")
+        );
+        // Nested-envelope object error.
+        assert_eq!(
+            search_error_detail(r#"{"error":{"message":"invalid API key"}}"#).as_deref(),
+            Some("invalid API key")
+        );
+        // Nested raw field when no top-level message exists.
+        assert_eq!(
+            search_error_detail(
+                r#"{"error":{"code":"rate_limited","metadata":{"raw":"too many requests"}}}"#
+            )
+            .as_deref(),
+            Some("too many requests")
+        );
+        // Non-JSON body yields no detail (caller falls back to status+body).
+        assert_eq!(search_error_detail("plain text"), None);
+        assert_eq!(search_error_detail(""), None);
+    }
+
+    #[test]
+    fn test_validate_both_args() {
+        let cache = WebSearchCache::new();
+        let args = json!({"query": "test", "expand": 1});
+        let result = cache.validate_execute_args(&args);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("not both"),
+            "Error should mention not both"
+        );
+    }
+
+    #[test]
+    fn test_validate_query_too_short() {
+        let cache = WebSearchCache::new();
+        let args = json!({"query": "ab"});
+        let result = cache.validate_execute_args(&args);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("at least 3"),
+            "Error should mention min length"
+        );
+    }
+
+    #[test]
+    fn test_validate_expand_invalid_future_id() {
+        let cache = WebSearchCache::new();
+        // Cache counter starts at 1, so any id >= 1 without a prior search fails
+        let args = json!({"expand": 999_999_999});
+        let result = cache.validate_execute_args(&args);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid expand id"),
+            "Error should contain 'Invalid expand id': {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_good_query() {
+        let cache = WebSearchCache::new();
+        let args = json!({"query": "rust programming"});
+        let (query, expand_id) = cache.validate_execute_args(&args).unwrap();
+        assert_eq!(query, "rust programming");
+        assert!(expand_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cache_and_expand_roundtrip() {
+        let cache = WebSearchCache::new();
+        let id = cache
+            .cache_result(
+                "Test Title".to_string(),
+                "https://example.com".to_string(),
+                "Full text content".to_string(),
+            )
+            .await;
+        assert_eq!(id, 1, "first cached result should get id 1");
+
+        let id2 = cache
+            .cache_result(
+                "Second".to_string(),
+                "https://example.org".to_string(),
+                "More content".to_string(),
+            )
+            .await;
+        assert_eq!(id2, 2, "second cached result should get id 2");
+
+        let expanded = cache.expand_result(1).await.unwrap();
+        assert!(expanded.contains("Test Title"));
+        assert!(expanded.contains("https://example.com"));
+        assert!(expanded.contains("Full text content"));
+
+        let expanded2 = cache.expand_result(2).await.unwrap();
+        assert!(expanded2.contains("Second"));
+        assert!(expanded2.contains("More content"));
+    }
+
+    #[tokio::test]
+    async fn test_expand_missing_id() {
+        let cache = WebSearchCache::new();
+        let result = cache.expand_result(42).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("No cached result"),
+            "Error should mention no cached result"
+        );
     }
 }

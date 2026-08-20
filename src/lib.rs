@@ -1223,7 +1223,6 @@ impl Reasoning {
     }
 }
 
-#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProviderUsage {
     pub input_tokens: Option<u64>,

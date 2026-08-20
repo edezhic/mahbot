@@ -1034,10 +1034,6 @@ impl HomeState {
 
     #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, msg: HomeMessage) -> Task<HomeMessage> {
-        // Allow match_same_arms on the entire update() match block: many variants
-        // return Task::none() as intercepted/intermediate messages. Narrowing to
-        // individual arms would require auditing every no-op each time one changes.
-        #[allow(clippy::match_same_arms)]
         match msg {
             HomeMessage::UserSelected(user) => {
                 if self.selected_user.as_deref() == Some(&user) {

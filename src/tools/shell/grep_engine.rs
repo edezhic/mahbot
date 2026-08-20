@@ -65,7 +65,6 @@ const HEAP_LIMIT: usize = 512 * 1024 * 1024;
 // ── Spec: the JSON protocol between parent and engine ─────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(non_snake_case, clippy::struct_excessive_bools)] // flag-letter names, grep CLI surface
 struct EngineSpec {
     /// Protocol version (mismatch → engine falls back).
     version: u32,
