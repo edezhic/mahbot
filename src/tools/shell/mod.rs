@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
+use crate::util::UnwrapPoison;
 use crate::util::scrub_credentials;
 use crate::util::strip_ansi_escapes;
 
@@ -1261,9 +1262,7 @@ fn record_spill_owner(path: std::path::PathBuf) {
         .try_with(Clone::clone)
         .unwrap_or(None);
     let key = agent.unwrap_or_else(|| NON_AGENT_SPILL_OWNER.to_string());
-    let mut map = SPILL_OWNERS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut map = SPILL_OWNERS.lock().unwrap_poison();
     map.entry(key).or_default().push(path);
 }
 
@@ -1272,9 +1271,7 @@ fn record_spill_owner(path: std::path::PathBuf) {
 /// fresh. Callers: the agent run end hook (`run_agent`) and the diagnostics
 /// runner (which passes [`NON_AGENT_SPILL_OWNER`]).
 pub(crate) fn cleanup_agent_spills(agent_id: &str) {
-    let mut map = SPILL_OWNERS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut map = SPILL_OWNERS.lock().unwrap_poison();
     let Some(paths) = map.remove(agent_id) else {
         return;
     };
@@ -2488,7 +2485,6 @@ mod tests {
     use crate::workspace::test_ws;
     use tempfile::TempDir;
 
-    use crate::util::UnwrapPoison;
     use crate::util::test::{env_lock, set_env_var};
 
     // ── Table-driven test helpers ─────────────────────────────────────

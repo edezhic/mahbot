@@ -72,14 +72,14 @@ pub fn env_lock() -> &'static std::sync::Mutex<()> {
 ///
 /// The lock is poison-tolerant: a test that panics while holding it poisons
 /// the mutex, and the next caller recovers the guard via
-/// [`PoisonError::into_inner`] instead of panicking — a single test failure
-/// cannot cascade into every subsequent retry test.
+/// [`UnwrapPoison::unwrap_poison`] instead of panicking — a single test
+/// failure cannot cascade into every subsequent retry test.
 pub fn retry_tests_lock() -> std::sync::MutexGuard<'static, ()> {
     static RETRY_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     RETRY_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_poison()
 }
 
 // ── Retry-policy guard for scoped-retry tests ──────────────
