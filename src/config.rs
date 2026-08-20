@@ -872,7 +872,7 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
 }
 
 /// Seed the fresh-install defaults into a brand-new config database
-/// (mahbot-1825, mahbot-1834).
+/// (mahbot-1825, mahbot-1834, mahbot-1855).
 ///
 /// A fresh install must not load or download any audio model until the user
 /// enables a feature, so `audio_transcription_use_local` is seeded to
@@ -905,8 +905,27 @@ async fn seed_fresh_install_defaults(
     store
         .set_kv("video_models", FRESH_INSTALL_VIDEO_MODELS)
         .await?;
+    // mahbot-1855: default model slots hosted by DeepSeek route through the
+    // DeepSeek provider on fresh installs. The rows are explicit and editable
+    // (clearing the field in the Settings UI returns the model to auto).
+    // Derived from the default-model constants filtered by the lowercase
+    // `deepseek/` prefix so the seed follows the defaults if they ever change;
+    // every other default model gets no routing override (OpenRouter
+    // auto-routes). Existing installs receive zero writes — the `fresh` guard
+    // above already returned for them.
+    for default_model in [
+        DEFAULT_MANAGER_MODEL,
+        DEFAULT_WORKER_MODEL,
+        DEFAULT_MULTIMODAL_MODEL,
+    ] {
+        if default_model.starts_with("deepseek/") {
+            store
+                .save_model_routing(default_model, Some("DeepSeek"))
+                .await?;
+        }
+    }
     tracing::info!(
-        "Fresh config database: seeded fresh-install defaults (audio transcription off; image/video generation model sets)"
+        "Fresh config database: seeded fresh-install defaults (audio transcription off; image/video generation model sets; DeepSeek routing for deepseek/* default models)"
     );
     Ok(())
 }
@@ -1622,6 +1641,15 @@ mod tests {
             ],
             "a fresh config database must be seeded with the fresh-install defaults"
         );
+        assert_eq!(
+            fresh_store.get_all_model_routings().await.unwrap(),
+            vec![
+                model_routing("deepseek/deepseek-v4-flash-0731", Some("DeepSeek")),
+                model_routing("deepseek/deepseek-v4-pro-0813", Some("DeepSeek")),
+            ],
+            "a fresh config database must seed DeepSeek routing rows for the \
+             deepseek/* default model slots (sorted by model; others get none)"
+        );
 
         // ── Existing install: the store file already exists ──
         let (existing_store, existing_dir) =
@@ -1638,6 +1666,14 @@ mod tests {
         assert!(
             existing_store.get_all_kv().await.unwrap().is_empty(),
             "an existing config database must receive zero writes"
+        );
+        assert!(
+            existing_store
+                .get_all_model_routings()
+                .await
+                .unwrap()
+                .is_empty(),
+            "an existing config database must receive zero routing rows (no backfill)"
         );
     }
 }

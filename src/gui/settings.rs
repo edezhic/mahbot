@@ -1378,9 +1378,9 @@ impl SettingsState {
             Space::new().height(16),
             self.models_section(),
             Space::new().height(16),
-            self.routing_section(),
-            Space::new().height(16),
             self.generation_section(),
+            Space::new().height(16),
+            self.routing_section(),
             Space::new().height(16),
             Self::about_section(),
         ];
@@ -3181,8 +3181,18 @@ impl SettingsState {
                 field: order_field.clone(),
             };
             let order_error = self.field_errors.get(&order_field).map(String::as_str);
+            // Placeholder is a hint only (mahbot-1855): "DeepSeek" shows for
+            // models whose ID starts with the lowercase `deepseek/` prefix
+            // (OpenRouter model IDs use lowercase vendor prefixes), and no
+            // placeholder for every other model. An empty field always means
+            // auto-routing — the hint can show while routing is auto.
+            let placeholder = if model_name.starts_with("deepseek/") {
+                "DeepSeek"
+            } else {
+                ""
+            };
             let order_input: Element<'_, SettingsMessage> =
-                text_input("DeepSeek", &current_order.unwrap_or_default())
+                text_input(placeholder, &current_order.unwrap_or_default())
                     .on_input(move |v| SettingsMessage::ModelRoutingOrder {
                         model: order_model.clone(),
                         order: v,
