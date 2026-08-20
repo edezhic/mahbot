@@ -15,8 +15,14 @@
 //!   config + outcome (exit code, abort state). The API key value is ALWAYS
 //!   scrubbed (see [`build_manifest`]).
 //!
+//! By default `<output-dir>` is `~/.mahbot/benchmarks/<model-slug>/` — one
+//! folder per model, derived from the model id — so parallel runs of different
+//! models write separate folders and take separate output locks; `--output-dir`
+//! overrides it exactly.
+//!
 //! Every artifact is mirrored into `<output-dir>/bench-openrouter/latest/`
-//! so a consumer can always read the most recent run from a stable path.
+//! so a consumer can always read the most recent run of that model from a
+//! stable path.
 //!
 //! All `build_*` functions are pure (no I/O) and unit-tested against
 //! synthetic inputs; [`write_artifacts`] and [`acquire_run_lock`] are the only

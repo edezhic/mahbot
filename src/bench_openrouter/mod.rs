@@ -20,6 +20,13 @@
 //! per-provider list of the static price and the cache-hold result ("does not
 //! cache" / TTL hold bucket / "not measured").
 //!
+//! Without `--output-dir`, `<output-dir>` defaults to
+//! `~/.mahbot/benchmarks/<model-slug>/` — a per-model folder derived from the
+//! model id ([`model_slug`]) — so parallel runs of different models write
+//! separate folders and never contend for the output lock. `--output-dir`
+//! remains an exact override (e.g. for a second run of the same model with a
+//! restricted `--providers` allowlist).
+//!
 //! # Exit codes
 //!
 //! `0` dry-run success, or a full run whose artifacts were written; `1` hard
@@ -95,6 +102,41 @@ pub(crate) struct BenchOptions {
     pub prefix_chars: usize,
     pub output_dir: PathBuf,
     pub dry_run: bool,
+}
+
+/// One lowercase hex digit for a 4-bit nibble (e.g. `0xf` → `'f'`).
+const fn hex_digit(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        _ => (b'a' + n - 10) as char,
+    }
+}
+
+/// Derive a deterministic, path-safe, collision-free folder name from a model
+/// id, used for the default per-model output directory.
+///
+/// Encoding: bytes in `[A-Za-z0-9.-]` are kept verbatim; every other byte
+/// (including `/` and `_`) is escaped as `_` + two lowercase hex digits.
+/// The mapping is injective because the escape introducer `_` is never kept
+/// verbatim (a literal `_` becomes `_5f`), so a slug unambiguously decodes
+/// back to the original id. Examples:
+///
+/// - `deepseek/deepseek-v4-flash-0731` → `deepseek_2fdeepseek-v4-flash-0731`
+/// - `a/b` → `a_2fb`, while `a-b` → `a-2fb` and `a_b` → `a_5fb` (all distinct)
+#[must_use]
+fn model_slug(model: &str) -> String {
+    let mut slug = String::with_capacity(model.len() + 8);
+    for b in model.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' => slug.push(b as char),
+            _ => {
+                slug.push('_');
+                slug.push(hex_digit(b >> 4));
+                slug.push(hex_digit(b & 0x0f));
+            }
+        }
+    }
+    slug
 }
 
 /// Fetch the value of `flag` — either the inline `--flag=value` part or the
@@ -220,13 +262,17 @@ impl BenchOptions {
             None => model_from_env_or_config(),
         };
 
-        // Output dir default: ~/.mahbot/benchmarks.
+        // Output dir: `--output-dir` is an exact override (e.g. a second run
+        // of the same model with a restricted --providers allowlist targets
+        // its own directory). When omitted, the default is per model —
+        // ~/.mahbot/benchmarks/<model-slug>/ — so parallel runs of different
+        // models write separate folders and never contend for the output lock.
         let output_dir = if let Some(d) = output_dir {
             d
         } else {
             let root = crate::config::default_config_dir()
                 .map_err(|e| CliError::Hard(format!("cannot resolve config dir: {e:#}")))?;
-            root.join("benchmarks")
+            root.join("benchmarks").join(model_slug(&model))
         };
 
         if !cap_usd.is_finite() || cap_usd <= 0.0 {
@@ -415,6 +461,8 @@ Two modes:
   (default)   Full run: TTL ladder over the selected providers, then writes
               report.json / summary.md / providers.json / manifest.json to
               <output-dir>/bench-openrouter/<run-ts>/ with a latest/ mirror.
+              Without --output-dir, <output-dir> is per model:
+              ~/.mahbot/benchmarks/<model-slug>/ (see --output-dir below).
 
 Flags:
   --model <slug>         Model id to benchmark. Resolution: --model, env
@@ -429,7 +477,14 @@ Flags:
                          0,5,30,120,300,600,1800).
   --providers <csv>      Provider tag allowlist (e.g. streamlake/fp8,deepseek/auto).
   --prefix-chars <usize> Estimated prompt prefix size in characters (default: 64000).
-  --output-dir <dir>     Report output directory (default: ~/.mahbot/benchmarks).
+  --output-dir <dir>     Exact report output directory override. Default:
+                         ~/.mahbot/benchmarks/<model-slug>/ — a per-model
+                         folder derived from the model id (path-safe, e.g.
+                         deepseek_2fdeepseek-v4-flash-0731), so parallel runs
+                         of different models never collide on the output lock.
+                         Pass --output-dir to give a second run of the same
+                         model (e.g. a --providers allowlist re-run) its own
+                         directory.
   -h, --help             Print this help and exit.
 
 Exit codes:
@@ -1277,6 +1332,87 @@ mod tests {
         assert_eq!(opts.prefix_chars, 32_000);
         assert_eq!(opts.output_dir, PathBuf::from("/tmp/out"));
         assert!(opts.dry_run);
+    }
+
+    #[test]
+    fn model_slug_derivation() {
+        // Slash is escaped; safe chars stay readable.
+        assert_eq!(
+            model_slug("deepseek/deepseek-v4-flash-0731"),
+            "deepseek_2fdeepseek-v4-flash-0731"
+        );
+        assert_eq!(model_slug("openai/gpt-5.6-luna"), "openai_2fgpt-5.6-luna");
+
+        // Only [A-Za-z0-9.-] and '_' hex escapes ever appear — the slug is
+        // path-safe for any input.
+        for id in [
+            "a/b",
+            "a_b",
+            "a-b",
+            "a.b",
+            "a b",
+            "a:b*?\"<>|",
+            "up/ér",
+            "/",
+        ] {
+            let slug = model_slug(id);
+            assert!(!slug.is_empty(), "empty slug for {id:?}");
+            assert!(
+                slug.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')),
+                "model_slug({id:?}) = {slug:?} contains an unsafe byte"
+            );
+        }
+
+        // Deterministic.
+        assert_eq!(model_slug("a/b"), model_slug("a/b"));
+
+        // Injective where a naive '/'→'-' mapping would collide.
+        assert_ne!(model_slug("a/b"), model_slug("a-b"));
+        assert_ne!(model_slug("a_b"), model_slug("a/b"));
+        assert_ne!(model_slug("a/b"), model_slug("a_2fb"));
+
+        // No collisions across a representative id set (incl. look-alikes of
+        // the escaped forms).
+        let ids = [
+            "deepseek/deepseek-v4-flash-0731",
+            "deepseek/deepseek-v4-pro-0813",
+            "openai/gpt-5.6-luna",
+            "deepseek_v4-flash-0731",
+            "deepseek-v4-flash-0731",
+            "a/b",
+            "a-b",
+            "a/b/c",
+            "a/b-c",
+            "a-b/c",
+        ];
+        let slugs: Vec<String> = ids.iter().map(|i| model_slug(i)).collect();
+        let mut uniq = slugs.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), slugs.len(), "slug collision among {slugs:?}");
+        // Determinism across the whole set.
+        assert_eq!(slugs, ids.iter().map(|i| model_slug(i)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cli_default_output_dir_is_per_model() {
+        // --output-dir omitted → the default derives the per-model folder
+        // ~/.mahbot/benchmarks/<model-slug>/.
+        let opts = BenchOptions::parse(&["--model=acme/m1".to_string(), "--dry-run".to_string()])
+            .expect("parse succeeds");
+        let root = crate::config::default_config_dir().expect("config dir resolves");
+        assert_eq!(
+            opts.output_dir,
+            root.join("benchmarks").join(model_slug("acme/m1"))
+        );
+
+        // A different model gets a different default folder.
+        let other = BenchOptions::parse(&["--model=acme/m2".to_string(), "--dry-run".to_string()])
+            .expect("parse succeeds");
+        assert_ne!(opts.output_dir, other.output_dir);
+        assert!(opts.output_dir.ends_with(model_slug("acme/m1")));
+        assert!(other.output_dir.ends_with(model_slug("acme/m2")));
     }
 
     #[test]
