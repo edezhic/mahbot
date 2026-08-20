@@ -2628,10 +2628,10 @@ fn engineer_failure_comment_classifies_causes() {
     let c = engineer_failure_comment(
         false,
         false,
-        Some("Agent exceeded maximum of 1000 LLM iterations"),
+        Some("Agent exceeded maximum of 1000 tool rounds"),
     );
     assert!(
-        c.contains("Agent exceeded maximum of 1000 LLM iterations"),
+        c.contains("Agent exceeded maximum of 1000 tool rounds"),
         "{c}"
     );
 

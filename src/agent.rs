@@ -68,29 +68,36 @@ tokio::task_local! {
         Option<crate::registry::AgentTracking>;
 }
 
-/// Maximum LLM iterations before the agent loop bails out.
+/// Maximum number of completed tool rounds before the agent loop bails out.
+///
+/// A tool round is the LLM call(s) that returned tool calls plus the execution
+/// and commit of that tool group. The counter increments only after a committed
+/// tool group; the final-answer LLM call and the image-rejection strip
+/// `continue` do not increment it, so an agent can legitimately make more LLM
+/// calls than this cap. These semantics are deliberate — do not "fix" the
+/// counter (or the strip path) to count raw LLM calls while touching this file.
 ///
 /// **DO NOT REDUCE this value without benchmarking against real ticket iteration
 /// distributions in this codebase.**
 ///
 /// # Why this is intentionally generous (1000)
 ///
-/// * Agents routinely consume hundreds of iterations in normal, legitimate work:
-///   multi-file editing with compile-error feedback loops, research → implement →
-///   review cycles, and sequential tool dependencies all require many turns — this
-///   is deliberate problem-solving, not a runaway loop.
+/// * Agents routinely consume hundreds of tool rounds in normal, legitimate
+///   work: multi-file editing with compile-error feedback loops, research →
+///   implement → review cycles, and sequential tool dependencies all require
+///   many turns — this is deliberate problem-solving, not a runaway loop.
 ///
-/// * Cost is not a concern. Even a full 1000-iteration run with the default model
+/// * Cost is not a concern. Even a full 1000-round run with the default model
 ///   (DeepSeek V4 Flash) costs well under $1, so there is zero cost reason to
 ///   lower the limit.
 ///
-/// * Running to the iteration cap is EXTREMELY rare with modern models. The limit
-///   exists only as a safety net for pathological edge cases — it is not protecting
-///   against a common or recurring problem.
+/// * Running to the tool-round cap is EXTREMELY rare with modern models. The
+///   limit exists only as a safety net for pathological edge cases — it is not
+///   protecting against a common or recurring problem.
 ///
 /// * Reducing the cap prematurely would cause legitimate long-running agents to
-///   fail mid-task, wasting more time and tokens on restarts than the iterations
-///   themselves would have consumed.
+///   fail mid-task, wasting more time and tokens on restarts than the tool
+///   rounds themselves would have consumed.
 ///
 /// Value last intentionally reviewed: 2026-07-11
 const MAX_LLM_ITERATIONS: usize = 1000;
@@ -502,7 +509,7 @@ impl Agent {
                 }
                 if iteration >= MAX_LLM_ITERATIONS {
                     anyhow::bail!(
-                        "Agent exceeded maximum of {MAX_LLM_ITERATIONS} LLM iterations \
+                        "Agent exceeded maximum of {MAX_LLM_ITERATIONS} tool rounds \
                          — model may be stuck in a tool-calling loop"
                     );
                 }
