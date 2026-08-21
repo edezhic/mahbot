@@ -1562,7 +1562,7 @@ impl TelegramChannel {
                 )
                 .await
             {
-                tracing::warn!(
+                tracing::info!(
                     status = ?html_status,
                     "Telegram sendMessage with HTML parse_mode failed; retrying without parse_mode"
                 );
