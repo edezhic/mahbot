@@ -414,21 +414,17 @@ pub(crate) struct ImageUrlPart {
 
 /// Convert a role+content pair into the appropriate [`MessageContent`] variant.
 ///
-/// When `allow_user_image_parts` is true and the role is [`ChatRole::User`], image markers
-/// (e.g. `[IMAGE:data:image/png;base64,...]`) are parsed into [`MessagePart::ImageUrl`]
-/// entries alongside the cleaned text. Otherwise the raw content is returned as
-/// [`MessageContent::Text`].
+/// For [`ChatRole::User`] content, image markers (e.g. `[IMAGE:data:image/png;base64,...]`)
+/// are ALWAYS parsed into [`MessagePart::ImageUrl`] entries alongside the cleaned
+/// text — every role now emits native image parts. Everything else
+/// is returned as [`MessageContent::Text`].
 ///
 /// The old estimator-side mirror of this marker handling
 /// (`crate::session::estimate_tokens`) was removed with the
 /// token-estimation heuristic — this conversion is now the only place
 /// marker parsing lives.
-pub(crate) fn to_message_content(
-    role: ChatRole,
-    content: &str,
-    allow_user_image_parts: bool,
-) -> MessageContent {
-    if role != ChatRole::User || !allow_user_image_parts {
+pub(crate) fn to_message_content(role: ChatRole, content: &str) -> MessageContent {
+    if role != ChatRole::User {
         return MessageContent::Text(content.to_string());
     }
 
@@ -484,10 +480,7 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    fn convert_messages_for_native(
-        messages: &[ChatMessage],
-        allow_user_image_parts: bool,
-    ) -> Vec<NativeMessage> {
+    fn convert_messages_for_native(messages: &[ChatMessage]) -> Vec<NativeMessage> {
         messages
             .iter()
             .map(|message| {
@@ -523,11 +516,7 @@ impl OpenAiCompatibleProvider {
                 else {
                     return NativeMessage {
                         role: message.role.to_string(),
-                        content: Some(to_message_content(
-                            message.role,
-                            &message.content,
-                            allow_user_image_parts,
-                        )),
+                        content: Some(to_message_content(message.role, &message.content)),
                         tool_call_id: None,
                         tool_calls: None,
                         reasoning: None,
@@ -744,8 +733,7 @@ impl OpenAiCompatibleProvider {
         client: &Client,
         request: &ProviderChatRequest,
     ) -> RequestBuilder {
-        let native =
-            Self::convert_messages_for_native(&request.messages, request.allow_image_parts);
+        let native = Self::convert_messages_for_native(&request.messages);
         let tool_specs = Self::convert_tool_specs(request.tools.as_deref());
 
         let mut extra = serde_json::Map::new();
@@ -1692,7 +1680,7 @@ mod tests {
     fn convert_messages_for_native_maps_tool_result_payload() {
         let input = vec![ChatMessage::tool_result("call_abc", "done")];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, true);
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
         assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_abc"));
         assert!(matches!(
             converted[0].content.as_ref(),
@@ -1701,18 +1689,22 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_keeps_user_image_markers_as_text_when_disabled() {
+    fn convert_messages_for_native_converts_user_image_markers_to_image_parts() {
         let input = vec![ChatMessage::user(
             "System primer [IMAGE:data:image/png;base64,abcd] user turn",
         )];
 
-        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input, false);
+        let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "user");
         assert!(matches!(
             converted[0].content.as_ref(),
-            Some(MessageContent::Text(value))
-                if value == "System primer [IMAGE:data:image/png;base64,abcd] user turn"
+            Some(MessageContent::Parts(parts))
+                if parts.iter().any(|p| matches!(
+                    p,
+                    MessagePart::ImageUrl { image_url }
+                        if image_url.url == "data:image/png;base64,abcd"
+                ))
         ));
     }
 
@@ -1841,7 +1833,8 @@ mod tests {
     }
 
     /// Stripping `[IMAGE:]` markers from history messages leaves only the text
-    /// portion, which is the behaviour needed for non-vision providers.
+    /// portion — the raw markers never reach the provider payload; the marker
+    /// scan (and native image-part conversion) consumes them first.
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
         let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
@@ -1883,8 +1876,7 @@ mod tests {
     #[test]
     fn to_message_content_converts_image_markers_to_openai_parts() {
         let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
-        let value =
-            serde_json::to_value(to_message_content(ChatRole::User, content, true)).unwrap();
+        let value = serde_json::to_value(to_message_content(ChatRole::User, content)).unwrap();
         let parts = value
             .as_array()
             .expect("multimodal content should be an array");
@@ -1896,19 +1888,10 @@ mod tests {
     }
 
     #[test]
-    fn to_message_content_keeps_markers_as_text_when_user_image_parts_disabled() {
-        let content = "Policy [IMAGE:data:image/png;base64,abcd]";
-        let value =
-            serde_json::to_value(to_message_content(ChatRole::User, content, false)).unwrap();
-        assert_eq!(value, serde_json::json!(content));
-    }
-
-    #[test]
     fn to_message_content_keeps_plain_text_for_non_user_roles() {
         let value = serde_json::to_value(to_message_content(
             ChatRole::System,
             "You are a helpful assistant.",
-            true,
         ))
         .unwrap();
         assert_eq!(value, serde_json::json!("You are a helpful assistant."));
@@ -2252,7 +2235,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].role, "assistant");
         assert_eq!(
@@ -2275,7 +2258,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
         assert_eq!(native.len(), 1);
         assert!(native[0].reasoning_content.is_none());
     }
@@ -2296,7 +2279,7 @@ mod tests {
         });
 
         let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages, true);
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
         assert_eq!(native.len(), 1);
         assert_eq!(native[0].reasoning_content.as_deref(), Some("from details"));
         assert_eq!(native[0].reasoning_details.as_ref(), Some(&details));

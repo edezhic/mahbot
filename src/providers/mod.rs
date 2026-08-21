@@ -33,7 +33,6 @@ pub(crate) fn test_request(
         messages,
         tools,
         model: "test".to_string(),
-        allow_image_parts: false,
         max_tokens: None,
         reasoning_effort: None,
         provider_order: None,
@@ -172,7 +171,7 @@ pub(crate) fn provider_routing_json(order: &str) -> Option<serde_json::Value> {
 /// Wrapped in `Arc` so we can clone-and-drop the lock before awaiting.
 static PROVIDER: RwLock<Option<Arc<dyn Provider>>> = RwLock::new(None);
 
-/// Global media transcriber (vision model for image/video descriptions).
+/// Global media transcriber (vision model for video descriptions).
 static MEDIA_TRANSCRIBER: RwLock<Option<MediaTranscriber>> = RwLock::new(None);
 
 /// Build the provider and media transcriber from config (synchronous, no I/O).
@@ -331,7 +330,8 @@ pub(crate) fn recreate_media_transcriber() {
     tracing::info!("Media transcriber recreated from updated config");
 }
 
-/// Get the global media transcriber, if a vision model is configured.
+/// Get the global media transcriber, if a vision model is configured
+/// (used for video transcription).
 #[must_use]
 pub(crate) fn media_transcriber() -> Option<MediaTranscriber> {
     MEDIA_TRANSCRIBER.read().unwrap_poison().clone()
@@ -453,8 +453,8 @@ fn create_transcriber(
 ///
 /// The transcriber captures its endpoint, model, and provider route at build
 /// time, so a change to any of those config fields requires a rebuild.
-/// Returns `None` when no API key is configured (no vision model can be
-/// used). Shared by the boot/`recreate_all` path
+/// Returns `None` when no API key is configured (no video transcription
+/// possible). Shared by the boot/`recreate_all` path
 /// ([`build_provider_and_transcriber`]) and the per-field transcription
 /// autosave ([`recreate_media_transcriber`]).
 #[must_use]

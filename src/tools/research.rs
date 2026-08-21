@@ -1143,7 +1143,7 @@ fn research_params(
             workspace: ws.name.clone(),
             ticket_id: None,
         }),
-        ..chat_request(Role::Analyst, tool_specs, Vec::new(), false)
+        ..chat_request(Role::Analyst, tool_specs, Vec::new())
     }
 }
 

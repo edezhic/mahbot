@@ -46,7 +46,7 @@ pub(crate) fn preprocess(content: &str) -> String {
 /// audio form is a legacy annotation from before the icon-combo switch (only
 /// rows already persisted in chat history / sessions carry it; new messages
 /// store the icon combo `🔊✍️` + transcription directly); the video form is
-/// produced by `enrich_message` for the Artist's multimodal VIDEO markers.
+/// produced by `enrich_message` for inbound VIDEO markers.
 /// Only the annotation header is replaced — the (often multi-line) description
 /// and any following message content are left untouched.
 fn replace_transcription(s: &str) -> String {

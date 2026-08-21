@@ -1,6 +1,6 @@
-/// Transcribes media (images via data URIs, videos via public URLs) into text
-/// descriptions during the enrichment phase, so the main agent loop only sees
-/// text. The API key is read from the live config by
+/// Transcribes videos (via public URLs produced by the ephemeral upload
+/// bridge) into text descriptions during the enrichment phase, so the main
+/// agent loop only sees text. The API key is read from the live config by
 /// [`bearer_auth_header()`](crate::util::http::bearer_auth_header) at request
 /// time, so config reloads take effect immediately without recreating the
 /// transcriber.
@@ -33,59 +33,11 @@ impl MediaTranscriber {
         crate::providers::ensure_chat_completions_url(&self.api_url)
     }
 
-    /// Call the vision-capable model to describe the image, returning a text
-    /// description suitable for embedding inline.
-    ///
-    /// `workspace` names the workspace for telemetry and for the live
-    /// non-agent call row when no agent context is present (inbound
-    /// enrichment); inside an agent run the call shows under the owning
-    /// agent's activity indicator instead (see `transcribe_media`).
-    pub async fn transcribe(
-        &self,
-        image_data_uri: &str,
-        workspace: Option<&str>,
-    ) -> anyhow::Result<String> {
-        self.transcribe_media(
-            serde_json::json!({"type": "image_url", "image_url": {"url": image_data_uri}}),
-            workspace,
-        )
-        .await
-    }
-
-    /// Single-attempt media transcription with the full tracking contract (one
-    /// live tracker — agent activity or non-agent row — plus one durable
-    /// `llm_requests` row per call). Used where no outer cap can drop the call
-    /// (images, direct URL calls); the video-file path performs the raw call
-    /// under its cap and records in the cap-owned scope instead, so a cap drop
-    /// can never lose or duplicate the durable row.
-    ///
-    /// Reasoning is disabled so a reasoning model cannot burn the token budget
-    /// and return empty content. Empty model output is treated as a failure so
-    /// every caller falls back to its annotation instead of rendering an empty
-    /// description.
-    ///
-    /// Durable telemetry: usage columns stay NULL — the raw provider envelope
-    /// is not parsed for token usage; retry_attempts is always 1.
-    async fn transcribe_media(
-        &self,
-        content_part: serde_json::Value,
-        workspace: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let (_live, call) = self.transcription_context(workspace);
-        let started = std::time::Instant::now();
-        finish_transcription(
-            &call,
-            started,
-            self.transcribe_media_raw(content_part, None).await,
-        )
-        .await
-    }
-
     /// Perform the model call and parse the assistant text, WITHOUT any live
     /// or durable telemetry — the caller owns recording (see
-    /// [`Self::transcribe_media`] / `transcribe_video_file`). When `marker` is
-    /// given, it is stamped immediately before the HTTP request is sent so the
-    /// caller's cap-drop path can attribute a timeout to the LLM call.
+    /// `transcribe_video_file`). When `marker` is given, it is stamped
+    /// immediately before the HTTP request is sent so the caller's cap-drop
+    /// path can attribute a timeout to the LLM call.
     async fn transcribe_media_raw(
         &self,
         content_part: serde_json::Value,
@@ -144,7 +96,7 @@ impl MediaTranscriber {
         // that the trusted marker scans parse — neutralize any marker-shaped
         // substring the model quoted from the media (the maximally-detailed
         // prompt explicitly captures on-screen text) so it cannot be misparsed
-        // as a media reference. Applies to image and video alike.
+        // as a media reference. Applies to video transcription output.
         Ok(RawTranscription::Success {
             text: scrub_marker_like(&text),
             finish_reason,
@@ -263,9 +215,8 @@ async fn record_transcription(
 }
 
 /// Record the durable row for a raw transcription outcome and resolve it to
-/// text (or the original error). Shared by the direct image path and the
-/// video-cap path — the single place that maps outcomes to `llm_requests`
-/// rows, so every call records exactly once.
+/// text (or the original error). The single place that maps video-transcription
+/// outcomes to `llm_requests` rows, so every call records exactly once.
 async fn finish_transcription(
     call: &crate::stats::LlmCallMeta,
     started: std::time::Instant,

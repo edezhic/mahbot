@@ -1142,20 +1142,24 @@ async fn process_channel_message(mut msg: ChannelMessage) {
 
     // Save original content before enrichment so we persist the raw
     // user-typed text to chat_history (avoids storing large data URIs from
-    // multimodal image processing in the Artist role).
+    // image processing).
     let original_content = msg.content.clone();
 
     // ── Media-marker enrichment (audio transcription, image processing) ──
     // Runs BEFORE broadcast so the GUI receives transcription text instead
-    // of raw `[AUDIO:path]` markers.  Link enrichment runs separately AFTER
-    // broadcast to avoid showing AI-generated URL summaries in the user's
-    // own message bubble.
-    let strategy = if effective_role.is_some_and(|r| r.requires_multimodal()) {
-        mahbot::channels::EnrichmentStrategy::Multimodal {
-            workspace_path: Some(ws.as_path().to_path_buf()),
-        }
-    } else {
-        mahbot::channels::EnrichmentStrategy::NonMultimodal
+    // of raw `[AUDIO:path]` markers.  Media-marker enrichment handles images
+    // for all roles (native data-URI parts, compressed for every role except
+    // Artist) and videos for all roles (workspace copy + transcription).
+    // Link enrichment runs separately AFTER broadcast to avoid showing
+    // AI-generated URL summaries in the user's own message bubble.
+    let is_artist = matches!(effective_role, Some(mahbot::Role::Artist));
+    let strategy = mahbot::channels::EnrichmentStrategy {
+        // Only attach a workspace path when an agent will actually see the
+        // message: a no-role user's message is broadcast but never routed, so
+        // workspace copies and the video transcription they trigger would be
+        // discarded work (the transcription is an LLM call).
+        workspace_path: effective_role.is_some().then(|| ws.as_path().to_path_buf()),
+        compress_images: !is_artist,
     };
     mahbot::channels::enrich_message(&mut msg, &strategy).await;
 

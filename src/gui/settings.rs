@@ -2718,7 +2718,7 @@ impl SettingsState {
             .style(super::widgets::text_input_style)
             .width(Length::Fixed(375.0))
             .into(),
-            Some("Artist, Assistant, and image/video transcription"),
+            Some("Artist, Assistant, and video transcription"),
             self.field_errors
                 .get("config:multimodal_model")
                 .map(String::as_str),

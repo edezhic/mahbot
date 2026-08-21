@@ -960,7 +960,6 @@ pub(crate) fn grouping_request(
         ],
         tools: None,
         model,
-        allow_image_parts: false,
         max_tokens,
         reasoning_effort,
         provider_order,

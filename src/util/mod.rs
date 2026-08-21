@@ -52,13 +52,12 @@ const MEDIA_MARKER_PATTERN: &str = r"\[(?P<kind>IMAGE|AUDIO|VIDEO):(?P<path>[^\]
 
 /// Matches `[IMAGE:path]`, `[AUDIO:path]`, or `[VIDEO:path]` markers in message content.
 ///
-/// **Invariant — multimodal stripping:** When enriching messages in multimodal
-/// mode, IMAGE markers are preserved (they're needed for vision API integration
-/// via `to_message_content()`), while all non-IMAGE markers (AUDIO, VIDEO, and
-/// any future marker kinds) are stripped from the content. This is enforced by
-/// the marker-stripping logic at the end of `enrich_message` which mirrors the
-/// `parse_image_markers()` pattern. Adding a new marker kind to this regex will
-/// cause it to be automatically stripped in multimodal mode unless the closure
+/// **Invariant — marker stripping:** When enriching messages, IMAGE markers
+/// are ALWAYS preserved — they're needed for native image-part integration via
+/// `to_message_content()` — while all non-IMAGE markers (AUDIO, VIDEO, and any
+/// future marker kinds) are stripped from the content by `enrich_message`,
+/// which mirrors the `parse_image_markers()` pattern. Adding a new marker kind
+/// to this regex will cause it to be automatically stripped unless the closure
 /// is explicitly updated to preserve it.
 pub(crate) static MEDIA_MARKER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(MEDIA_MARKER_PATTERN).expect("MEDIA_MARKER_RE must compile"));
@@ -384,11 +383,106 @@ pub fn truncate_tool_output(output: &str) -> String {
 }
 
 /// Read a local image file and return a base64 data URI suitable for native
-/// multimodal model input (e.g., `data:image/png;base64,...`).
+/// image-part model input (e.g., `data:image/png;base64,...`).
 pub(crate) async fn local_image_to_data_uri(path: &std::path::Path) -> anyhow::Result<String> {
     let bytes = tokio::fs::read(path).await?;
     let mime = mime_for_extension(path);
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)))
+}
+
+/// Inbound-photo compression bounds for non-Artist roles: the
+/// longest-side cap and JPEG quality of the single ingestion-time re-encode.
+pub(crate) const INBOUND_IMAGE_MAX_SIDE: u32 = 1024;
+const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;
+
+/// Input-size ceiling for the inbound-photo decode, aligned with the
+/// reference-image path's [`MAX_REFERENCE_INPUT_BYTES`] pattern: a decoded
+/// bitmap can be far larger than its compressed file, so over-cap files are
+/// refused from metadata BEFORE the file is read (the fail-open caller falls
+/// back to the original bytes as a data URI instead).
+const INBOUND_IMAGE_MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Read a local image file and return a bounded-JPEG data URI: longest side
+/// capped at [`INBOUND_IMAGE_MAX_SIDE`], quality
+/// [`INBOUND_IMAGE_JPEG_QUALITY`], alpha flattened onto white, EXIF
+/// orientation applied. Fail-open callers fall back to
+/// [`local_image_to_data_uri`] on any decode/encode error.
+pub(crate) async fn local_image_to_compressed_data_uri(
+    path: &std::path::Path,
+) -> anyhow::Result<String> {
+    // Metadata-first cap check (matches the reference-image path's bounded
+    // read): refuse over-cap files BEFORE the read, so a huge file never
+    // enters memory just to be refused.
+    let meta = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("Failed to access inbound image {}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("Inbound image {} is not a regular file", path.display());
+    }
+    if meta.len() > INBOUND_IMAGE_MAX_INPUT_BYTES {
+        anyhow::bail!(
+            "Inbound image {} is {} bytes — over the {} MiB decode cap; passing the original through",
+            path.display(),
+            meta.len(),
+            INBOUND_IMAGE_MAX_INPUT_BYTES / (1024 * 1024),
+        );
+    }
+    let bytes = tokio::fs::read(path).await?;
+    let out = with_block_in_place(|| compress_inbound_image(&bytes))?;
+    Ok(format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out)))
+}
+
+/// One bounded compression step for inbound photos: decode, apply EXIF
+/// orientation, downscale the longest side to [`INBOUND_IMAGE_MAX_SIDE`]
+/// (aspect-preserving, Triangle filter, min 1 px), flatten alpha onto white,
+/// and re-encode as JPEG at [`INBOUND_IMAGE_JPEG_QUALITY`]. Reuses the
+/// existing `exif_orientation` / `flatten_alpha_onto_white` helpers. The
+/// input-size ceiling is enforced by the caller (`local_image_to_compressed_data_uri`,
+/// metadata-first).
+fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use image::GenericImageView;
+    let mut img = image::load_from_memory(bytes).context("Failed to decode inbound image")?;
+    if let Some(orientation) = exif_orientation(bytes) {
+        img.apply_orientation(orientation);
+    }
+    let (w, h) = img.dimensions();
+    let longest = w.max(h);
+    let img = if longest > INBOUND_IMAGE_MAX_SIDE {
+        #[expect(clippy::cast_precision_loss)]
+        let scale = INBOUND_IMAGE_MAX_SIDE as f32 / longest as f32;
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let nw = (w as f32 * scale).round().max(1.0) as u32;
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let nh = (h as f32 * scale).round().max(1.0) as u32;
+        img.resize(nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgb = flatten_alpha_onto_white(&img);
+    let mut out = Vec::new();
+    {
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+            &mut out,
+            INBOUND_IMAGE_JPEG_QUALITY,
+        );
+        encoder
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .context("Failed to encode compressed inbound image")?;
+    }
+    Ok(out)
 }
 
 // ── Reference-image loading & compression (image_gen / video_gen) ────────

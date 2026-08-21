@@ -87,7 +87,6 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
 
         let request = ChatRequest {
             messages: extraction_history.clone(),
-            allow_image_parts: false, // extractions never need image parts
             ..record_request.clone()
         };
 
@@ -207,7 +206,6 @@ mod tests {
             messages: vec![],
             tools: None,
             model: "test-model".to_string(),
-            allow_image_parts: false,
             max_tokens: None,
             reasoning_effort: None,
             provider_order: None,

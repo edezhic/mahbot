@@ -1,12 +1,13 @@
 //! Channel message enrichment: media marker processing, link enrichment, file
-//! operations, and multimodal annotation strategies.
+//! operations, and per-role media handling.
 //!
 //! This module transforms [`ChannelMessage`] content before it reaches the
 //! agent pipeline. It handles:
 //! - **Media markers** (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`)
-//!   → transcription for audio and video, data URI conversion for images
-//!   (multimodal strategy) or strippping with annotation (non-multimodal
-//!   strategy)
+//!   → inbound local images become native data-URI parts for EVERY role
+//!   (byte-identical for Artist, bounded-JPEG compressed for all others);
+//!   audio is transcribed to text; video handling is workspace copy +
+//!   transcription for every role (no role split)
 //! - **Link enrichment** → prepends webpage summaries for URLs in the message
 //! - **File operations** → downloading/saving images to workspace, cleaning
 //!   up temporary files
@@ -18,10 +19,10 @@
 //! workspace uploads, or deleted.
 //!
 //! The public entry points are [`enrich_message`] and [`enrich_links`],
-//! re-exported from [`crate::channels`]. The two [`EnrichmentStrategy`]
-//! variants control how image media markers are handled: `Multimodal`
-//! preserves them as data URIs for vision-capable models, while
-//! `NonMultimodal` strips them and adds a textual annotation.
+//! re-exported from [`crate::channels`]. The [`EnrichmentStrategy`] struct
+//! carries the per-role knobs: image and video handling are unconditional
+//! (native data-URI parts for images, workspace copy + transcription for
+//! videos — every role), while image compression is role-dependent.
 
 use crate::ChannelMessage;
 use crate::tools::browser::BrowserTool;
@@ -123,38 +124,23 @@ async fn save_media_to_workspace(
     })
 }
 
-/// Strategy for message enrichment, determining how each media marker kind
-/// (IMAGE, AUDIO, VIDEO) is handled.
-///
-/// Local media reads, copies, transcriptions, and deletes are scoped to the
-/// daemon's Telegram temp dir (see module docs); out-of-scope marker paths
-/// degrade to plain-text annotations.
+/// Per-message media-enrichment behavior, decided at the channel boundary for
+/// the routed role. Image handling is unconditional (native data-URI parts for
+/// every role) and video handling is unconditional too (workspace copy +
+/// transcription for every role); only image compression is role-dependent.
 #[derive(Debug, Clone)]
-pub enum EnrichmentStrategy {
-    /// Multimodal mode:
-    /// - IMAGE markers are converted to base64 data URIs (for vision model)
-    /// - AUDIO markers are transcribed to text
-    /// - VIDEO markers are copied to workspace `uploads/`, replaced with a
-    ///   plain-text `[Saved video: path]` annotation, and transcribed to a
-    ///   text description (media transcriber) so the Artist can understand the
-    ///   clip and feed it into the video-edit flow
-    ///
-    /// When `workspace_path` is provided, copies of media files are saved to
-    /// `uploads/` for agent tool references. Reads, copies, and cleanup are
-    /// scoped to the daemon's Telegram temp dir.
-    Multimodal {
-        workspace_path: Option<std::path::PathBuf>,
-    },
-    /// Non-multimodal mode: all media markers are transcribed/extracted to
-    /// text annotations and the raw markers are stripped from the content.
-    /// Transcription (a read) and cleanup only happen for files in the
-    /// daemon's Telegram temp dir; out-of-scope markers become plain
-    /// attachment annotations.
-    NonMultimodal,
+pub struct EnrichmentStrategy {
+    /// Workspace uploads dir for saved full-resolution media copies (`None`
+    /// disables copies).
+    pub workspace_path: Option<std::path::PathBuf>,
+    /// Downscale/compress inbound local images to a bounded JPEG before they
+    /// enter the session — every role EXCEPT Artist. Artist passes through
+    /// full-resolution byte-identical.
+    pub compress_images: bool,
 }
 
-/// Outcome of processing an IMAGE marker in multimodal mode.
-enum MultimodalImageAction {
+/// Outcome of processing an IMAGE marker.
+enum ImageAction {
     /// Keep the marker unchanged (e.g. HTTP/HTTPS URL).
     Keep,
     /// Replace the marker with the given text, optionally including an
@@ -168,25 +154,28 @@ enum MultimodalImageAction {
     },
 }
 
-/// Handle an IMAGE marker in multimodal mode — convert to data URI, invalid
-/// reference, or (for out-of-scope paths) a plain-text annotation. Saves a
-/// workspace copy if `uploads_dir` is available. The returned action's
-/// `delete_temp` tells the caller whether the source temp file was consumed
-/// from the Telegram temp dir and may be cleaned up.
-async fn handle_multimodal_image(
+/// Handle an IMAGE marker — convert to a data URI, invalid reference, or (for
+/// out-of-scope paths) a plain-text annotation. Saves a workspace copy if
+/// `uploads_dir` is available. When `compress` is set the data URI is a
+/// bounded-JPEG re-encode (non-Artist roles); otherwise the original bytes
+/// pass through byte-identical (Artist). The returned action's `delete_temp`
+/// tells the caller whether the source temp file was consumed from the
+/// Telegram temp dir and may be cleaned up.
+async fn handle_image(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
-) -> MultimodalImageAction {
+    compress: bool,
+) -> ImageAction {
     // HTTP/HTTPS URLs can be sent as-is.
     if is_http_url(path) {
-        return MultimodalImageAction::Keep;
+        return ImageAction::Keep;
     }
 
     let invalid_ref = format!("[Invalid image reference: {path}]");
     if !path_obj.exists() || !path_obj.is_file() {
-        tracing::warn!(%path, "Image file not found for multimodal enrichment");
-        return MultimodalImageAction::Replace {
+        tracing::warn!(%path, "Image file not found for enrichment");
+        return ImageAction::Replace {
             replacement: invalid_ref,
             upload_annotation: None,
             delete_temp: false,
@@ -196,7 +185,7 @@ async fn handle_multimodal_image(
     // Containment: only Telegram-temp-dir files may be read, copied, or deleted.
     if !is_under_telegram_files(path_obj).await {
         tracing::warn!(%path, "Image path outside telegram temp dir — annotating without copy");
-        return MultimodalImageAction::Replace {
+        return ImageAction::Replace {
             replacement: format!("[Image: {} attached]", file_name_or_path(path)),
             upload_annotation: None,
             delete_temp: false,
@@ -208,8 +197,21 @@ async fn handle_multimodal_image(
         .await
         .map(|saved| saved.annotation);
 
-    // Convert to data URI for the API request
-    let replacement = match crate::util::local_image_to_data_uri(path_obj).await {
+    // Convert to data URI for the API request. The compressed path is
+    // fail-open: any decode/encode error falls back to the original bytes
+    // untouched; a total conversion failure degrades to the invalid ref.
+    let data_uri = if compress {
+        match crate::util::local_image_to_compressed_data_uri(path_obj).await {
+            Ok(uri) => Ok(uri),
+            Err(e) => {
+                tracing::warn!(%path, error = %e, "Image compression failed — falling back to original bytes");
+                crate::util::local_image_to_data_uri(path_obj).await
+            }
+        }
+    } else {
+        crate::util::local_image_to_data_uri(path_obj).await
+    };
+    let replacement = match data_uri {
         Ok(data_uri) => format!("[IMAGE:{data_uri}]"),
         Err(e) => {
             tracing::warn!(%path, error = %e, "Failed to convert image to data URI");
@@ -217,7 +219,7 @@ async fn handle_multimodal_image(
         }
     };
 
-    MultimodalImageAction::Replace {
+    ImageAction::Replace {
         replacement,
         upload_annotation: saved,
         delete_temp: true,
@@ -239,20 +241,20 @@ async fn is_under_telegram_files(path: &std::path::Path) -> bool {
     crate::tools::path::is_path_under_roots(&canonical, &[canonical_root])
 }
 
-/// Outcome of processing a VIDEO marker in multimodal mode: the replacement
-/// text, whether the source temp file was copied into the workspace uploads
-/// (so the Artist can feed the clip to the video-edit flow) and can be cleaned
-/// up, and the optional "[Video transcription of <name>]: <text>" annotation
-/// (prepended as an annotation block by the caller). HTTP(S) URLs become
-/// plain-text references; missing files, out-of-scope paths, and copy failures
-/// degrade to annotations while preserving the source file.
-struct MultimodalVideoAction {
+/// Outcome of processing a VIDEO marker: the replacement text, whether the
+/// source temp file was copied into the workspace uploads (so the agent can
+/// feed the clip to the video-edit flow) and can be cleaned up, and the
+/// optional "[Video transcription of <name>]: <text>" annotation
+/// (prepended as an annotation block by the caller). HTTP(S) URLs, missing
+/// files, and out-of-scope paths degrade to plain annotations; in-scope temp
+/// files are always cleaned up (whether or not the workspace copy succeeded).
+struct VideoAction {
     replacement: String,
     delete_temp: bool,
     transcription: Option<String>,
 }
 
-impl MultimodalVideoAction {
+impl VideoAction {
     /// Plain annotation: no workspace copy, no transcription.
     fn annotation(replacement: String) -> Self {
         Self {
@@ -263,25 +265,22 @@ impl MultimodalVideoAction {
     }
 }
 
-async fn handle_multimodal_video(
+async fn handle_video(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
     workspace: &str,
-) -> MultimodalVideoAction {
+) -> VideoAction {
     if is_http_url(path) {
-        return MultimodalVideoAction::annotation(format!("[Video: {path}]"));
+        return VideoAction::annotation(format!("[Video: {path}]"));
     }
     if !path_obj.exists() || !path_obj.is_file() {
-        tracing::warn!(%path, "Video file not found for multimodal enrichment");
-        return MultimodalVideoAction::annotation(format!("[Invalid video reference: {path}]"));
+        tracing::warn!(%path, "Video file not found for enrichment");
+        return VideoAction::annotation(format!("[Invalid video reference: {path}]"));
     }
     if !is_under_telegram_files(path_obj).await {
         tracing::warn!(%path, "Video path outside telegram temp dir — annotating without copy");
-        return MultimodalVideoAction::annotation(format!(
-            "[Video: {} attached]",
-            file_name_or_path(path)
-        ));
+        return VideoAction::annotation(format!("[Video: {} attached]", file_name_or_path(path)));
     }
     if let Some(saved) = save_media_to_workspace(path_obj, uploads_dir, "video", "mp4").await {
         // Transcribe the persistent workspace copy — never the temp file
@@ -290,17 +289,24 @@ async fn handle_multimodal_video(
         // [Saved video: ...] annotation.
         let transcription =
             transcribe_saved_video(&saved.dest, file_name_or_path(path), workspace).await;
-        return MultimodalVideoAction {
+        return VideoAction {
             replacement: saved.annotation,
             delete_temp: true,
             transcription,
         };
     }
-    // Copy failed — annotate and preserve the temp file.
-    MultimodalVideoAction::annotation(format!("[Video: {} attached]", file_name_or_path(path)))
+    // Copy failed (or no uploads dir — e.g. a no-role message): annotate
+    // without transcription, but the in-scope temp file is still a pure
+    // intermediate artifact and is cleaned up. `is_under_telegram_files` was
+    // verified above, so the delete stays inside the containment boundary.
+    VideoAction {
+        replacement: format!("[Video: {} attached]", file_name_or_path(path)),
+        delete_temp: true,
+        transcription: None,
+    }
 }
 
-/// Transcribe a saved workspace video copy for the Artist, returning the
+/// Transcribe a saved workspace video copy for the routed role, returning the
 /// "[Video transcription of <name>]: <text>" annotation (using the original
 /// source `file_name`). Fail-open: returns `None` (plain annotation) when the
 /// transcription fails (unavailable transcriber, unsupported format, upload
@@ -317,47 +323,27 @@ async fn transcribe_saved_video(
     Some(format!("[Video transcription of {file_name}]: {text}"))
 }
 
-/// Handle an IMAGE marker in non-multimodal mode — transcribe to text
-/// description or fall back to a generic attachment annotation.
-async fn handle_non_multimodal_image(
-    path_obj: &std::path::Path,
-    file_name: &str,
-    workspace: &str,
-) -> String {
-    if let Some(ref transcriber) = crate::providers::media_transcriber() {
-        match transcribe_image_file(path_obj, transcriber, workspace).await {
-            Ok(description) => format!("[Image: {description}]"),
-            Err(e) => {
-                tracing::warn!(path = %path_obj.display(), error = %e, "Image transcription failed");
-                format!("[Image: {file_name} attached]")
-            }
-        }
-    } else {
-        format!("[Image: {file_name} attached]")
-    }
-}
-
 /// Process all media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`)
 /// in a single pass. Each marker kind is handled according to the strategy:
 ///
-/// | Kind | Multimodal | NonMultimodal |
-/// |------|-----------|---------------|
-/// | IMAGE | data URI conversion, workspace copy | text transcription |
-/// | AUDIO | transcription | transcription |
-/// | VIDEO | workspace copy + `[Saved video: path]` + transcription | text annotation |
+/// | Kind | Behavior |
+/// |------|----------|
+/// | IMAGE | data URI conversion (byte-identical for Artist, bounded-JPEG compression for every other role) + workspace copy when in scope |
+/// | AUDIO | transcription (unchanged for all roles) |
+/// | VIDEO | workspace copy + `[Saved video: path]` + transcription (every role) |
 ///
 /// After processing, markers that were handled are stripped from the content
 /// and annotations are prepended. Temp files are cleaned up after processing,
 /// scoped to the daemon's Telegram temp dir — out-of-scope marker paths are
 /// never read, copied, or deleted and degrade to plain-text annotations.
-// Marker dispatch hub (3 kinds × 2 strategies); per-kind handling is extracted
-// into the handler functions above, keeping this loop flat on purpose.
-#[expect(clippy::too_many_lines)]
+// Marker dispatch hub (3 kinds, per-kind handling is extracted into the
+// handler functions above, keeping this loop flat on purpose).
 pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrategy) {
     let mut annotations: Vec<String> = Vec::new();
     let mut result = msg.content.clone();
     // Accumulates upload path annotations across the for-loop below.
-    // Only ever populated in Multimodal/IMAGE branch — always empty otherwise.
+    // Populated whenever a local in-scope image was copied to workspace
+    // uploads — any role.
     let mut upload_annotations: Vec<String> = Vec::new();
 
     // Temp files to remove after the loop — only ever queued for files under
@@ -365,12 +351,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     // arbitrary local files.
     let mut files_to_delete: Vec<std::path::PathBuf> = Vec::new();
 
-    let uploads_dir = match strategy {
-        EnrichmentStrategy::Multimodal { workspace_path } => {
-            workspace_path.as_ref().map(|p| p.join("uploads"))
-        }
-        EnrichmentStrategy::NonMultimodal => None,
-    };
+    let uploads_dir = strategy.workspace_path.as_ref().map(|p| p.join("uploads"));
 
     for caps in MEDIA_MARKER_RE.captures_iter(&msg.content) {
         let whole = caps.get_match();
@@ -378,45 +359,35 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
         let path_obj = std::path::Path::new(path);
 
         match kind {
-            "IMAGE" => match strategy {
-                EnrichmentStrategy::Multimodal { .. } => {
-                    match handle_multimodal_image(path, path_obj, uploads_dir.as_deref()).await {
-                        MultimodalImageAction::Keep => {
-                            // HTTP/HTTPS URL — no local file to clean up.
+            "IMAGE" => {
+                match handle_image(
+                    path,
+                    path_obj,
+                    uploads_dir.as_deref(),
+                    strategy.compress_images,
+                )
+                .await
+                {
+                    ImageAction::Keep => {
+                        // HTTP/HTTPS URL — no local file to clean up.
+                    }
+                    ImageAction::Replace {
+                        replacement,
+                        upload_annotation,
+                        delete_temp,
+                    } => {
+                        result = result.replacen(whole.as_str(), &replacement, 1);
+                        if let Some(ann) = upload_annotation {
+                            upload_annotations.push(ann);
                         }
-                        MultimodalImageAction::Replace {
-                            replacement,
-                            upload_annotation,
-                            delete_temp,
-                        } => {
-                            result = result.replacen(whole.as_str(), &replacement, 1);
-                            if let Some(ann) = upload_annotation {
-                                upload_annotations.push(ann);
-                            }
-                            // Local IMAGE temp files are cleaned up only when
-                            // consumed from the daemon's Telegram temp dir (delete_temp).
-                            if delete_temp {
-                                files_to_delete.push(path_obj.to_path_buf());
-                            }
+                        // Local IMAGE temp files are cleaned up only when
+                        // consumed from the daemon's Telegram temp dir (delete_temp).
+                        if delete_temp {
+                            files_to_delete.push(path_obj.to_path_buf());
                         }
                     }
                 }
-                EnrichmentStrategy::NonMultimodal => {
-                    let file_name = file_name_or_path(path);
-                    // Containment: only Telegram-temp-dir files are transcribed or deleted.
-                    let in_scope = is_under_telegram_files(path_obj).await;
-                    let annotation = if in_scope {
-                        handle_non_multimodal_image(path_obj, file_name, &msg.workspace).await
-                    } else {
-                        tracing::warn!(%path, "Image path outside telegram temp dir — annotating without transcription");
-                        format!("[Image: {file_name} attached]")
-                    };
-                    annotations.push(annotation);
-                    if in_scope {
-                        files_to_delete.push(path_obj.to_path_buf());
-                    }
-                }
-            },
+            }
             "AUDIO" => {
                 // Containment: only Telegram-temp-dir files are transcribed or
                 // deleted; out-of-scope markers degrade to the icon only.
@@ -428,43 +399,28 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
                     annotations.push(AUDIO_ICON.to_string());
                 }
             }
-            "VIDEO" => match strategy {
-                EnrichmentStrategy::Multimodal { .. } => {
-                    let MultimodalVideoAction {
-                        replacement,
-                        delete_temp,
-                        transcription,
-                    } = handle_multimodal_video(
-                        path,
-                        path_obj,
-                        uploads_dir.as_deref(),
-                        &msg.workspace,
-                    )
-                    .await;
-                    result = result.replacen(whole.as_str(), &replacement, 1);
-                    if let Some(annotation) = transcription {
-                        annotations.push(annotation);
-                    }
-                    if delete_temp {
-                        files_to_delete.push(path_obj.to_path_buf());
-                    }
+            "VIDEO" => {
+                let VideoAction {
+                    replacement,
+                    delete_temp,
+                    transcription,
+                } = handle_video(path, path_obj, uploads_dir.as_deref(), &msg.workspace).await;
+                result = result.replacen(whole.as_str(), &replacement, 1);
+                if let Some(annotation) = transcription {
+                    annotations.push(annotation);
                 }
-                EnrichmentStrategy::NonMultimodal => {
-                    annotations.push(format!("[Video: {} attached]", file_name_or_path(path)));
-                    // Containment: only Telegram-temp-dir files are deleted.
-                    if is_under_telegram_files(path_obj).await {
-                        files_to_delete.push(path_obj.to_path_buf());
-                    }
+                if delete_temp {
+                    files_to_delete.push(path_obj.to_path_buf());
                 }
-            },
+            }
             // NOTE: If a new marker kind is added to MEDIA_MARKER_RE in
             // util/mod.rs, a corresponding arm MUST be added here for enrichment
             // behavior (transcription, annotation, etc.). The unified stripping
-            // at the end of this function handles marker removal: in multimodal mode,
-            // only IMAGE markers are preserved (all others are stripped); in
-            // non-multimodal mode, all markers are stripped. The `_ =>` arm is
-            // unreachable for well-formed markers (the regex only matches
-            // IMAGE|AUDIO|VIDEO), but exists as a defensive guard during development.
+            // at the end of this function handles marker removal: IMAGE markers
+            // are always preserved (native image parts), all other markers are
+            // stripped. The `_ =>` arm is unreachable for well-formed markers
+            // (the regex only matches IMAGE|AUDIO|VIDEO), but exists as a
+            // defensive guard during development.
             _ => {
                 tracing::warn!(kind, %path, "Unknown media marker kind");
             }
@@ -484,33 +440,27 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
         }
     }
 
-    // ── Multimodal-specific post-processing ──
+    // ── Upload-annotation post-processing ──
     // Append upload path annotations so the model can reference saved files.
-    // `upload_annotations` accumulates across the for-loop; it is only ever
-    // populated in Multimodal mode when a local IMAGE file was successfully
-    // copied to the workspace uploads directory.
+    // `upload_annotations` accumulates across the for-loop; it is populated
+    // whenever a local in-scope image was copied to the workspace uploads
+    // directory (any role).
     if !upload_annotations.is_empty() {
         let annotation_block = upload_annotations.join("\n");
         let _ = write!(result, "\n\n{annotation_block}");
     }
 
     // ── Marker stripping and annotation prepending ──
-    // Strip media markers from the enriched content. In multimodal mode,
-    // IMAGE markers are preserved (needed for vision API integration via
-    // to_message_content); all other markers are stripped. In non-multimodal
-    // mode, all markers are stripped. The MEDIA_MARKER_PATTERN constant in
-    // util/mod.rs is the single canonical source of truth for the marker
-    // pattern; both MEDIA_MARKER_RE (case-sensitive) and TELEGRAM_MEDIA_MARKER_RE
+    // Strip media markers from the enriched content. IMAGE markers are always
+    // preserved — they carry the native image parts the routed role's model
+    // consumes via `to_message_content`; AUDIO/VIDEO (and any future marker
+    // kind) are stripped. The MEDIA_MARKER_PATTERN constant in util/mod.rs is
+    // the single canonical source of truth for the marker pattern; both
+    // MEDIA_MARKER_RE (case-sensitive) and TELEGRAM_MEDIA_MARKER_RE
     // (case-insensitive) are built from it to stay in sync.
-    //
-    // Note: using matches!() with a boolean guard means a future
-    // EnrichmentStrategy variant would silently default to marker-stripping
-    // (conservative behavior) rather than producing a compile error. This is
-    // intentional — stripping unknown markers is the safe default.
-    let keep_image = matches!(strategy, EnrichmentStrategy::Multimodal { .. });
     let cleaned = MEDIA_MARKER_RE
         .replace_all(&result, |caps: &regex::Captures| {
-            if keep_image && parse_media_marker(caps).0 == "IMAGE" {
+            if parse_media_marker(caps).0 == "IMAGE" {
                 caps.get_match().as_str().to_string()
             } else {
                 String::new()
@@ -520,8 +470,8 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
     let cleaned = cleaned.trim().to_string();
 
     // ── Prepend text annotations (if any) ──
-    // These are accumulated text descriptions for non-multimodal image files,
-    // transcribed AUDIO content, and VIDEO annotations.
+    // These are accumulated text descriptions: transcribed AUDIO content and
+    // VIDEO transcription annotations.
     msg.content = if annotations.is_empty() {
         cleaned
     } else {
@@ -539,7 +489,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrat
 /// Used by the caller to decide when enriched content (icon + transcription)
 /// can be persisted to chat history instead of the raw original: audio-only
 /// messages never leak temp file paths (raw audio markers) or embed image
-/// data URIs (multimodal IMAGE markers). Mixed audio+image/audio+video
+/// data URIs (IMAGE markers). Mixed audio+image/audio+video
 /// messages fall back to the raw persist — the raw `[AUDIO:path]` marker
 /// still reaches chat history for those (data-URI avoidance takes precedence).
 /// Purely syntactic: a hand-typed `[AUDIO:<URL>]` marker qualifies too, so its
@@ -555,20 +505,6 @@ pub fn has_only_audio_markers(content: &str) -> bool {
         }
     }
     has_audio
-}
-
-/// Transcribe a local image file into a text description.
-async fn transcribe_image_file(
-    path: &std::path::Path,
-    transcriber: &crate::providers::transcribe::MediaTranscriber,
-    workspace: &str,
-) -> anyhow::Result<String> {
-    if !path.exists() || !path.is_file() {
-        anyhow::bail!("image file not found: {}", path.display());
-    }
-
-    let data_uri = crate::util::local_image_to_data_uri(path).await?;
-    transcriber.transcribe(&data_uri, Some(workspace)).await
 }
 
 /// Extract all unique URLs from message text.
@@ -671,6 +607,8 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
 
     #[test]
     fn extract_urls_finds_http_and_https() {
@@ -746,11 +684,51 @@ mod tests {
         (tmp_root, ws_path, arbitrary)
     }
 
+    /// Generate a real decodable PNG of the given dimensions (solid gradient).
+    fn real_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([
+                u8::try_from(x % 256).expect("x % 256 fits in u8"),
+                u8::try_from(y % 256).expect("y % 256 fits in u8"),
+                128,
+            ])
+        });
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("fixture PNG must encode");
+        bytes
+    }
+
+    /// Extract the image payload embedded in a `[IMAGE:...]` data URI inside
+    /// `content` and decode it, returning the decoded image dimensions.
+    fn embedded_image_dimensions(content: &str) -> (u32, u32) {
+        use image::GenericImageView;
+        let data_uri = content
+            .split("[IMAGE:")
+            .nth(1)
+            .expect("data URI marker must be present")
+            .split(']')
+            .next()
+            .expect("data URI marker must be closed");
+        let b64 = data_uri
+            .split(',')
+            .nth(1)
+            .expect("data URI must carry a base64 payload");
+        let bytes = STANDARD.decode(b64).expect("data URI base64 must decode");
+        let img = image::load_from_memory(&bytes).expect("embedded image must decode");
+        img.dimensions()
+    }
+
     #[tokio::test]
-    async fn enrich_multimodal_image_http_url_passthrough() {
+    async fn enrich_image_http_url_passthrough() {
         let mut msg = test_msg("Check this [IMAGE:https://example.com/img.png] out");
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: None,
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
         assert_eq!(
@@ -760,10 +738,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_image_file_not_found() {
+    async fn enrich_image_file_not_found() {
         let mut msg = test_msg("Here is [IMAGE:/tmp/nonexistent_xyz_img.png] an image");
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: None,
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
         assert!(
@@ -773,10 +752,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_audio_annotation_and_strip() {
+    async fn enrich_audio_annotation_and_strip() {
         let mut msg = test_msg("Listen [AUDIO:/tmp/audio_xyz.mp3] to this");
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: None,
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
         // AUDIO marker stripped; annotation prepended (icon-only fallback since
@@ -802,7 +782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_image_valid_file_converts_to_data_uri_and_deletes_temp() {
+    async fn enrich_image_valid_file_converts_to_data_uri_and_deletes_temp() {
         // The fixture must live under the daemon's Telegram temp dir to be in
         // scope for reading (data URI) and cleanup.
         let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
@@ -819,8 +799,9 @@ mod tests {
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = test_msg(&format!("Image: [IMAGE:{path_str}]"));
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: None,
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
 
@@ -842,7 +823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_image_with_workspace_creates_upload_annotation() {
+    async fn enrich_image_with_workspace_creates_upload_annotation() {
         let tmp_root = std::env::temp_dir().join(format!("test_enrich_ws_{}", std::process::id()));
         let ws_path = tmp_root.join("myworkspace");
         tokio::fs::create_dir_all(&ws_path).await.unwrap();
@@ -863,8 +844,9 @@ mod tests {
         let img_path_str = tmp_img.to_string_lossy().to_string();
 
         let mut msg = test_msg(&format!("Image: [IMAGE:{img_path_str}]"));
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: Some(ws_path.clone()),
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
 
@@ -885,57 +867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_non_multimodal_image_annotation() {
-        let mut msg = test_msg("Here is [IMAGE:/tmp/photo_xyz.jpg] from the camera");
-        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
-        // IMAGE marker stripped, annotation prepended — the path is outside
-        // the daemon's Telegram temp dir, so it gets the plain attachment
-        // annotation without a transcription attempt.
-        assert!(
-            msg.content.contains("[Image:"),
-            "Image annotation must be present, got: {}",
-            msg.content
-        );
-        assert!(
-            !msg.content.contains("[IMAGE:"),
-            "IMAGE marker must be stripped"
-        );
-        assert!(msg.content.contains("from the camera"));
-    }
-
-    #[tokio::test]
-    async fn enrich_non_multimodal_http_image_url_passthrough() {
-        let mut msg = test_msg("Check [IMAGE:https://example.com/photo.png] online");
-        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
-        // HTTP image URL treated as attachment, annotation prepended
-        assert!(
-            msg.content.contains("[Image:"),
-            "Image annotation must be present despite HTTP URL"
-        );
-        assert!(
-            !msg.content.contains("[IMAGE:"),
-            "IMAGE marker must be stripped"
-        );
-    }
-
-    #[tokio::test]
-    async fn enrich_non_multimodal_video_annotation() {
-        let mut msg = test_msg("Watch [VIDEO:/tmp/clip_xyz.mp4] this video");
-        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
-        // VIDEO marker stripped, generic annotation prepended
-        assert!(
-            msg.content.contains("[Video: clip_xyz.mp4 attached]"),
-            "Video annotation must be present, got: {}",
-            msg.content
-        );
-        assert!(
-            !msg.content.contains("[VIDEO:"),
-            "VIDEO marker must be stripped"
-        );
-    }
-
-    #[tokio::test]
-    async fn enrich_multimodal_video_with_workspace_copies_and_annotates() {
+    async fn enrich_video_with_workspace_copies_and_annotates() {
         let tmp_root =
             std::env::temp_dir().join(format!("test_enrich_video_ws_{}", std::process::id()));
         let ws_path = tmp_root.join("myworkspace");
@@ -953,13 +885,14 @@ mod tests {
         let video_path_str = tmp_video.to_string_lossy().to_string();
 
         let mut msg = test_msg(&format!("Edit this clip: [VIDEO:{video_path_str}]"));
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: Some(ws_path.clone()),
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
 
         // Marker replaced with a [Saved video: ...] annotation pointing at the
-        // workspace uploads copy so the Artist can feed it to video_edit.
+        // workspace uploads copy so the agent can feed it to video_edit.
         assert!(
             msg.content.contains("[Saved video:"),
             "Video upload annotation must be present, got: {}",
@@ -986,7 +919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_video_outside_telegram_files_annotates_without_copy() {
+    async fn enrich_video_outside_telegram_files_annotates_without_copy() {
         // An injected marker pointing at an arbitrary readable file must not
         // be copied into uploads (exfiltration vector) or deleted.
         let (tmp_root, ws_path, arbitrary) =
@@ -994,8 +927,9 @@ mod tests {
         let marker = format!("Edit [VIDEO:{}]", arbitrary.display());
 
         let mut msg = test_msg(&marker);
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: Some(ws_path.clone()),
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
 
@@ -1019,7 +953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_image_outside_telegram_files_annotates_without_read_or_copy() {
+    async fn enrich_image_outside_telegram_files_annotates_without_read_or_copy() {
         // An injected marker pointing at an arbitrary readable file must not
         // be read into model context (data URI), copied into uploads, or
         // deleted.
@@ -1032,8 +966,9 @@ mod tests {
         let marker = format!("Look at [IMAGE:{}]", arbitrary.display());
 
         let mut msg = test_msg(&marker);
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: Some(ws_path.clone()),
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
 
@@ -1066,49 +1001,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_non_multimodal_image_outside_telegram_files_annotates_without_read_or_delete() {
-        // An injected marker pointing at an arbitrary readable file must not
-        // be transcribed (read) or deleted — the key regression: the old code
-        // deleted it.
-        let (tmp_root, _ws_path, arbitrary) = out_of_scope_fixture(
-            "test_enrich_img_nonmm",
-            "secret.png",
-            b"top secret image bytes",
-        )
-        .await;
-        let marker = format!("Look at [IMAGE:{}]", arbitrary.display());
-
-        let mut msg = test_msg(&marker);
-        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
-
+    async fn enrich_video_http_url_kept_as_plain_text() {
+        let mut msg = test_msg("Edit [VIDEO:https://example.com/clip.mp4] this");
+        let strategy = EnrichmentStrategy {
+            workspace_path: None,
+            compress_images: false,
+        };
+        enrich_message(&mut msg, &strategy).await;
+        // HTTP URL video reference is preserved as plain text (no marker strip)
         assert!(
-            msg.content.contains("[Image: secret.png attached]"),
-            "Out-of-scope path must degrade to a plain-text annotation, got: {}",
+            msg.content
+                .contains("[Video: https://example.com/clip.mp4]"),
+            "HTTP video URL must be kept as plain-text reference, got: {}",
             msg.content
         );
-        assert!(
-            !msg.content.contains("data:image"),
-            "No data URI may be produced for out-of-scope paths (would read the file)"
-        );
-        assert!(!msg.content.contains("[IMAGE:"));
-        assert!(
-            arbitrary.exists(),
-            "Source file outside the telegram temp dir must not be deleted"
-        );
-        assert_eq!(
-            tokio::fs::read(&arbitrary).await.unwrap(),
-            b"top secret image bytes",
-            "Source file contents must be unchanged"
-        );
-        // Cleanup
-        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+        assert!(!msg.content.contains("[VIDEO:"));
     }
 
     #[tokio::test]
-    async fn enrich_non_multimodal_video_outside_telegram_files_annotates_without_delete() {
+    async fn enrich_video_without_workspace_deletes_in_scope_temp() {
+        // No workspace path (e.g. a no-role user's message): the video gets a
+        // plain annotation, no transcription, but the in-scope Telegram temp
+        // file is still a pure intermediate artifact and must be cleaned up —
+        // a regression guard for the no-role gating in main.rs.
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp_video = tg_dir.join(format!(
+            "test_enrich_video_norole_{}.mp4",
+            std::process::id()
+        ));
+        tokio::fs::write(&tmp_video, b"fake mp4").await.unwrap();
+        let video_path_str = tmp_video.to_string_lossy().to_string();
+
+        let mut msg = test_msg(&format!("Watch [VIDEO:{video_path_str}] this clip"));
+        let strategy = EnrichmentStrategy {
+            workspace_path: None,
+            compress_images: true,
+        };
+        enrich_message(&mut msg, &strategy).await;
+
+        assert!(
+            msg.content.contains(&format!(
+                "[Video: {} attached]",
+                tmp_video.file_name().unwrap().to_string_lossy()
+            )),
+            "Plain video annotation must be present, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("[Saved video:"),
+            "No workspace copy may be made without an uploads dir, got: {}",
+            msg.content
+        );
+        assert!(!msg.content.contains("[VIDEO:"));
+        assert!(
+            !tmp_video.exists(),
+            "In-scope temp video must be deleted even without a workspace copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_video_outside_telegram_files_annotates_without_copy_or_delete() {
         // An injected marker pointing at an arbitrary readable file must not
-        // be deleted by the non-multimodal cleanup pass.
-        let (tmp_root, _ws_path, arbitrary) = out_of_scope_fixture(
+        // be copied into uploads (exfiltration vector) or deleted.
+        let (tmp_root, ws_path, arbitrary) = out_of_scope_fixture(
             "test_enrich_video_nonmm",
             "secret.mp4",
             b"top secret video bytes",
@@ -1117,7 +1073,11 @@ mod tests {
         let marker = format!("Watch [VIDEO:{}]", arbitrary.display());
 
         let mut msg = test_msg(&marker);
-        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
+        let strategy = EnrichmentStrategy {
+            workspace_path: Some(ws_path.clone()),
+            compress_images: true,
+        };
+        enrich_message(&mut msg, &strategy).await;
 
         assert!(
             msg.content.contains("[Video: secret.mp4 attached]"),
@@ -1134,48 +1094,143 @@ mod tests {
             b"top secret video bytes",
             "Source file contents must be unchanged"
         );
+        assert!(
+            !ws_path.join("uploads").exists(),
+            "No uploads copy may be created for out-of-scope paths"
+        );
         // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_video_http_url_kept_as_plain_text() {
-        let mut msg = test_msg("Edit [VIDEO:https://example.com/clip.mp4] this");
-        let strategy = EnrichmentStrategy::Multimodal {
-            workspace_path: None,
+    async fn enrich_non_artist_image_compressed_to_jpeg_data_uri() {
+        // Real 1500x1000 PNG: the longest side exceeds the 1024 px cap, so the
+        // ingestion-time re-encode must downscale it to a bounded JPEG while
+        // the workspace copy stays the full-resolution original.
+        let source_bytes = real_png(1500, 1000);
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp = tg_dir.join(format!("test_enrich_compress_{}.png", std::process::id()));
+        tokio::fs::write(&tmp, &source_bytes).await.unwrap();
+        let path_str = tmp.to_string_lossy().to_string();
+
+        let tmp_root =
+            std::env::temp_dir().join(format!("test_enrich_compress_ws_{}", std::process::id()));
+        let ws_path = tmp_root.join("myworkspace");
+        tokio::fs::create_dir_all(&ws_path).await.unwrap();
+
+        let mut msg = test_msg(&format!("Photo: [IMAGE:{path_str}]"));
+        let strategy = EnrichmentStrategy {
+            workspace_path: Some(ws_path.clone()),
+            compress_images: true,
         };
         enrich_message(&mut msg, &strategy).await;
-        // HTTP URL video reference is preserved as plain text (no marker strip)
+
         assert!(
-            msg.content
-                .contains("[Video: https://example.com/clip.mp4]"),
-            "HTTP video URL must be kept as plain-text reference, got: {}",
+            msg.content.contains("[IMAGE:data:image/jpeg;base64,"),
+            "Compressed JPEG data URI expected, got: {}",
             msg.content
         );
-        assert!(!msg.content.contains("[VIDEO:"));
+        assert!(
+            !msg.content.contains("data:image/png"),
+            "Original PNG data URI must not appear, got: {}",
+            msg.content
+        );
+        let (dw, dh) = embedded_image_dimensions(&msg.content);
+        assert!(
+            dw.max(dh) <= crate::util::INBOUND_IMAGE_MAX_SIDE,
+            "Compressed image longest side {} must be ≤ 1024",
+            dw.max(dh)
+        );
+        // The workspace copy is the full-resolution original, byte-identical.
+        let uploads_dir = ws_path.join("uploads");
+        let mut entries = tokio::fs::read_dir(&uploads_dir).await.unwrap();
+        let entry = entries
+            .next_entry()
+            .await
+            .unwrap()
+            .expect("one upload copy");
+        let copy_bytes = tokio::fs::read(entry.path()).await.unwrap();
+        assert_eq!(
+            copy_bytes, source_bytes,
+            "Workspace copy must be byte-identical to the source PNG"
+        );
+        // Temp file deleted
+        assert!(
+            !tmp.exists(),
+            "Temp image file must be deleted after enrichment"
+        );
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
     #[tokio::test]
-    async fn enrich_non_multimodal_all_markers_stripped_and_annotated() {
-        // The `_xyz`-suffixed paths are outside the daemon's Telegram temp dir,
-        // so IMAGE/AUDIO never attempt transcription (a read) and no cleanup is
-        // queued — all three degrade to their plain-text annotations.
-        let mut msg = test_msg(
-            "Check [IMAGE:/tmp/img_xyz.png] and listen [AUDIO:/tmp/audio_xyz.mp3] and watch [VIDEO:/tmp/vid_xyz.mp4]",
+    async fn enrich_artist_image_byte_identical_data_uri() {
+        let source_bytes = real_png(64, 48);
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp = tg_dir.join(format!("test_enrich_artist_{}.png", std::process::id()));
+        tokio::fs::write(&tmp, &source_bytes).await.unwrap();
+        let path_str = tmp.to_string_lossy().to_string();
+
+        let mut msg = test_msg(&format!("Art: [IMAGE:{path_str}]"));
+        let strategy = EnrichmentStrategy {
+            workspace_path: None,
+            compress_images: false,
+        };
+        enrich_message(&mut msg, &strategy).await;
+
+        let expected = format!(
+            "[IMAGE:data:image/png;base64,{}]",
+            STANDARD.encode(&source_bytes)
         );
-        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
-        // All markers stripped
-        assert!(!msg.content.contains("[IMAGE:"));
-        assert!(!msg.content.contains("[AUDIO:"));
-        assert!(!msg.content.contains("[VIDEO:"));
-        // Annotations for all three
-        assert!(msg.content.contains("[Image:"), "Image annotation missing");
-        assert!(msg.content.contains("🔊✍️"), "Audio annotation missing");
-        assert!(msg.content.contains("[Video:"), "Video annotation missing");
-        // Original text preserved
-        assert!(msg.content.contains("Check"));
-        assert!(msg.content.contains("listen"));
-        assert!(msg.content.contains("watch"));
+        assert!(
+            msg.content.contains(&expected),
+            "Artist data URI must be byte-identical to the source, got: {}",
+            msg.content
+        );
+        // Temp file deleted
+        assert!(
+            !tmp.exists(),
+            "Temp image file must be deleted after enrichment"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_image_compression_failure_passes_original_through() {
+        // Undecodable bytes: the compressed path fails open and the original
+        // bytes pass through untouched as a data URI.
+        let source_bytes = b"not an image";
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp = tg_dir.join(format!(
+            "test_enrich_compress_fail_{}.png",
+            std::process::id()
+        ));
+        tokio::fs::write(&tmp, source_bytes).await.unwrap();
+        let path_str = tmp.to_string_lossy().to_string();
+
+        let mut msg = test_msg(&format!("Photo: [IMAGE:{path_str}]"));
+        let strategy = EnrichmentStrategy {
+            workspace_path: None,
+            compress_images: true,
+        };
+        enrich_message(&mut msg, &strategy).await;
+
+        let expected = format!(
+            "[IMAGE:data:image/png;base64,{}]",
+            STANDARD.encode(source_bytes)
+        );
+        assert!(
+            msg.content.contains(&expected),
+            "Compression failure must pass the original bytes through, got: {}",
+            msg.content
+        );
+        // Temp file deleted
+        assert!(
+            !tmp.exists(),
+            "Temp image file must be deleted after enrichment"
+        );
     }
 
     #[tokio::test]
@@ -1189,7 +1244,11 @@ mod tests {
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = test_msg(&format!("Audio: [AUDIO:{path_str}]"));
-        enrich_message(&mut msg, &EnrichmentStrategy::NonMultimodal).await;
+        let strategy = EnrichmentStrategy {
+            workspace_path: None,
+            compress_images: false,
+        };
+        enrich_message(&mut msg, &strategy).await;
 
         // Temp file must be deleted even when transcription fails — the audio
         // file is a pure intermediate artifact (no transcriber in tests).
@@ -1202,18 +1261,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_combined_image_preserved_audio_annotated() {
+    async fn enrich_combined_image_preserved_audio_annotated() {
         let msg_content = "Here [IMAGE:https://example.com/img.png] and [AUDIO:/tmp/sound_xyz.mp3]";
         let mut msg = test_msg(msg_content);
-        let strategy = EnrichmentStrategy::Multimodal {
+        let strategy = EnrichmentStrategy {
             workspace_path: None,
+            compress_images: false,
         };
         enrich_message(&mut msg, &strategy).await;
 
         // IMAGE http URL kept
         assert!(
             msg.content.contains("[IMAGE:https://example.com/img.png]"),
-            "IMAGE with http URL must be preserved in multimodal mode, got: {}",
+            "IMAGE with http URL must be preserved, got: {}",
             msg.content
         );
         // AUDIO marker stripped, annotation present
@@ -1235,21 +1295,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_multimodal_no_annotations_when_no_markers() {
+    async fn enrich_no_annotations_when_no_markers() {
         assert_no_markers_unchanged(
-            EnrichmentStrategy::Multimodal {
+            EnrichmentStrategy {
                 workspace_path: None,
+                compress_images: false,
             },
             "Just a plain message with no markers",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn enrich_non_multimodal_no_annotations_when_no_markers() {
-        assert_no_markers_unchanged(
-            EnrichmentStrategy::NonMultimodal,
-            "Plain text, no markers here",
         )
         .await;
     }

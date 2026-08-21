@@ -184,7 +184,6 @@ pub(crate) fn chat_request(
     role: crate::Role,
     tool_specs: Option<Vec<crate::ToolSpec>>,
     messages: Vec<ChatMessage>,
-    allow_image_parts: bool,
 ) -> ChatRequest {
     let model = crate::config::CONFIG.role_model(role);
     let routing = crate::config::CONFIG.model_routing(&model);
@@ -192,7 +191,6 @@ pub(crate) fn chat_request(
         messages,
         tools: tool_specs,
         model,
-        allow_image_parts,
         max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
         reasoning_effort: Some(
             crate::role::role_info(&role)
@@ -873,8 +871,7 @@ impl Agent {
 
     async fn llm_call(&mut self) -> anyhow::Result<ChatResponse> {
         let messages = self.session.history().to_vec();
-        let request =
-            self.build_chat_request(messages.clone(), self.role.requires_multimodal(), "agent");
+        let request = self.build_chat_request(messages.clone(), "agent");
 
         let policy = crate::retry::RetryPolicy::current();
         let response = crate::retry::agent_chat(request, &policy)
@@ -1070,8 +1067,7 @@ impl Agent {
                 tail_grew = false;
                 let mut messages = base.clone();
                 messages.extend(tail.iter().cloned());
-                let built =
-                    self.build_chat_request(messages, self.role.requires_multimodal(), purpose);
+                let built = self.build_chat_request(messages, purpose);
                 last_request = Some(built.clone());
                 built
             } else {
@@ -1329,9 +1325,8 @@ impl Agent {
         Ok(())
     }
 
-    /// Build a [`ChatRequest`] from the given messages and image-parts flag,
-    /// using the agent's current model, tools, reasoning-effort, and
-    /// provider-routing settings.
+    /// Build a [`ChatRequest`] from the given messages, using the agent's
+    /// current model, tools, reasoning-effort, and provider-routing settings.
     ///
     /// All parameter sources are lazily resolved each call so that runtime
     /// hot-reload (model, routing) is reflected immediately. Reasoning effort
@@ -1349,12 +1344,7 @@ impl Agent {
     ///
     /// [`Self::extract_verdict`] calls this method internally to derive its
     /// parameter set.  [`Self::summarize`] calls this method directly.
-    fn build_chat_request(
-        &self,
-        messages: Vec<ChatMessage>,
-        allow_image_parts: bool,
-        purpose: &'static str,
-    ) -> ChatRequest {
+    fn build_chat_request(&self, messages: Vec<ChatMessage>, purpose: &'static str) -> ChatRequest {
         ChatRequest {
             meta: Some(crate::ChatRequestMeta {
                 purpose,
@@ -1363,12 +1353,7 @@ impl Agent {
                 workspace: self.workspace.name.clone(),
                 ticket_id: self.ticket.as_ref().map(|t| t.id.clone()),
             }),
-            ..chat_request(
-                self.role,
-                Some(self.tool_specs.clone()),
-                messages,
-                allow_image_parts,
-            )
+            ..chat_request(self.role, Some(self.tool_specs.clone()), messages)
         }
     }
 
@@ -1400,7 +1385,7 @@ impl Agent {
             self.generation,
             "extracting",
         );
-        let params = self.build_chat_request(vec![], false, "extraction");
+        let params = self.build_chat_request(vec![], "extraction");
         crate::extraction::retry_extract_structured_scoped(
             self.session.history(),
             extraction_prompt,
@@ -1428,11 +1413,7 @@ impl Agent {
 
         let policy = crate::retry::RetryPolicy::current();
         let chat_resp = crate::retry::agent_chat(
-            self.build_chat_request(
-                history.clone(),
-                self.role.requires_multimodal(),
-                "summarize",
-            ),
+            self.build_chat_request(history.clone(), "summarize"),
             &policy,
         )
         .await

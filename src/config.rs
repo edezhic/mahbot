@@ -251,8 +251,7 @@ pub struct ConfigData {
     /// Model slot for all worker roles (Engineer, Analyst, Coder, QA,
     /// Reviewer, Discovery, Maintainer, Sanitation).
     pub worker_model: Option<String>,
-    /// Model slot for multimodal roles (Artist, Assistant) and image/video
-    /// transcription.
+    /// Model slot for Artist and Assistant roles and video transcription.
     pub multimodal_model: Option<String>,
     /// Image generation model.
     pub image_gen_model: Option<String>,
@@ -907,8 +906,8 @@ impl ConfigReload {
     /// Resolve the configured model for a role from the three model slots.
     ///
     /// Manager uses the manager slot; Artist and Assistant use the multimodal
-    /// slot (they need vision); every other role uses the worker slot. Unset
-    /// slots fall back to their code default.
+    /// slot; every other role uses the worker slot. Unset slots fall back to
+    /// their code default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
         match role {

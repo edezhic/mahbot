@@ -55,18 +55,6 @@ pub(crate) const SANITATION_ROLE: &str = "sanitation_admin";
 pub struct RoleInfo {
     /// Whether this role has a discovery prompt for workspace exploration.
     pub has_discovery: bool,
-    /// Whether this role requires a vision-capable (multimodal) model.
-    ///
-    /// Controls two downstream behaviors:
-    /// 1. **Message enrichment** (in `main.rs`): local image files are uploaded as
-    ///    data URIs instead of being transcribed to text.
-    /// 2. **Provider payload format** (in `agent.rs`): user-provided image markers
-    ///    are embedded as `image_url` parts in the chat request.
-    ///
-    /// Only [`Role::Artist`] currently sets this to `true`.
-    /// Note: image/video *generation* tools ([`ImageGenTool`], [`VideoGenTool`])
-    /// use their own generation model configuration and do **not** depend on this flag.
-    pub requires_multimodal: bool,
     /// Badge foreground color as an RGB tuple.
     ///
     /// Converted to an [`iced::Color`] badge in `gui/theme.rs`. The badge
@@ -87,10 +75,12 @@ pub struct RoleInfo {
 /// Default values shared by most [`Role`] variants in [`role_info()`].
 ///
 /// Used via struct update syntax (`..BASE_ROLE_INFO`) to keep each arm
-/// concise and make future field additions cheap.
+/// concise and make future field additions cheap. Arms that override every
+/// field (Discovery, Artist, Assistant) spell them out — clippy's
+/// `needless_update` fires when the base contributes nothing, so the update
+/// syntax is only valid when at least one field comes from the base.
 const BASE_ROLE_INFO: RoleInfo = RoleInfo {
     has_discovery: true,
-    requires_multimodal: false,
     badge_fg: (0.0, 0.0, 0.0),
     default_reasoning_effort: "high",
     display_label: "",
@@ -140,11 +130,9 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             default_reasoning_effort: "xhigh",
             badge_fg: (0.227, 0.663, 0.624),
             display_label: "Discovery",
-            ..BASE_ROLE_INFO
         },
         Role::Artist => &RoleInfo {
             has_discovery: false,
-            requires_multimodal: true,
             badge_fg: (0.808, 0.365, 0.592),
             default_reasoning_effort: "high",
             display_label: "Artist",
@@ -165,7 +153,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             badge_fg: (0.153, 0.820, 0.757),
             default_reasoning_effort: "xhigh",
             display_label: "Assistant",
-            ..BASE_ROLE_INFO
         },
     }
 }
@@ -202,12 +189,6 @@ impl Role {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         self.into()
-    }
-
-    /// Whether this role requires a vision-capable (multimodal) model.
-    #[must_use]
-    pub const fn requires_multimodal(&self) -> bool {
-        role_info(self).requires_multimodal
     }
 
     /// Human-readable display label (e.g. `"QA"` for [`Role::Qa`]).
@@ -418,22 +399,6 @@ mod tests {
 
         // Error case
         assert!("unknown_role".parse::<crate::Role>().is_err());
-    }
-
-    #[test]
-    fn requires_multimodal_only_artist() {
-        // Only Artist should require multimodal; every other role should not.
-        for role in Role::iter() {
-            let info = super::role_info(&role);
-            let expected = matches!(role, crate::Role::Artist);
-            assert_eq!(
-                info.requires_multimodal,
-                expected,
-                "{}: expected requires_multimodal={expected}, got {}",
-                role.as_str(),
-                info.requires_multimodal
-            );
-        }
     }
 
     #[test]

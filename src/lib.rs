@@ -1273,7 +1273,7 @@ pub(crate) struct ChatRequestMeta {
     /// Purpose tag: "agent" (agent loop incl. direct chat / discovery /
     /// sub-agents / maintainer), "extraction", "summarize", "consolidate",
     /// "research_wrap_up" (deadline wrap-up extraction), "media_transcription"
-    /// (vision-model transcription of inbound media / video tool results);
+    /// (vision-model transcription of inbound videos / video tool results);
     /// "agent-continuation" / "summarize-continuation" tag the operation-level
     /// reasoning-only-stop recovery issued by
     /// [`crate::agent::Agent::recover_reasoning_only_stop`] — one row per
@@ -1291,7 +1291,6 @@ pub(crate) struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<ToolSpec>>,
     pub model: String,
-    pub allow_image_parts: bool,
     /// Maximum tokens for the model to generate.
     /// When `Some(n)`, sent as `max_tokens` in the API request body.
     /// When `None`, the parameter is omitted (provider defaults apply).

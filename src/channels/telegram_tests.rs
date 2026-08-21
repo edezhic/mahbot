@@ -1052,7 +1052,7 @@ fn attachment_content_format_rules() {
 }
 
 #[test]
-fn attachment_multimodal_and_helpers() {
+fn attachment_image_and_video_helpers() {
     // has_extension over telegram's receive-path IMAGE_EXTENSIONS
     for p in [
         "photo.png",

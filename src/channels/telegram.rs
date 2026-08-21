@@ -358,10 +358,11 @@ fn format_sender_label(from: &serde_json::Value) -> String {
 
 /// Build the user-facing content string for an incoming attachment.
 ///
-/// Photos with a recognized image extension use `[IMAGE:/path]` so the
-/// multimodal pipeline can validate vision capability.  When the extension
-/// is not recognized the optional `mime_type` is consulted as a secondary
-/// signal (e.g. Document + no extension + "image/jpeg" → still `[IMAGE:]`).
+/// Photos with a recognized image extension use `[IMAGE:/path]` so
+/// enrichment can convert them to native image parts for the routed role's
+/// model.  When the extension is not recognized the optional `mime_type` is
+/// consulted as a secondary signal (e.g. Document + no extension +
+/// "image/jpeg" → still `[IMAGE:]`).
 /// Videos (native `video`/`video_note`/`animation` messages, or documents
 /// with a video MIME/extension) use `[VIDEO:/path]` so enrichment can copy
 /// them into the workspace uploads and route them into the video-edit flow.

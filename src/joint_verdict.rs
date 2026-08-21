@@ -124,7 +124,6 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
         messages: vec![ChatMessage::system(&system), ChatMessage::user(&user)],
         tools: None,
         model,
-        allow_image_parts: false,
         max_tokens: Some(PIPELINE_GROUPING_MAX_TOKENS),
         reasoning_effort: Some(
             crate::role::role_info(&role)
