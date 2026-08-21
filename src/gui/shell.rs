@@ -370,7 +370,7 @@ impl ShellState {
 
     // ── Update ───────────────────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: ShellMessage) -> Task<ShellMessage> {
         match msg {
             ShellMessage::WorkspaceSelected(name, path) => {

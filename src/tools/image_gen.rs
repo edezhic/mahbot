@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 pub struct ImageGenTool;
 
 #[async_trait]
-#[allow(clippy::too_many_lines)]
 impl Tool for ImageGenTool {
     fn name(&self) -> &'static str {
         "image_gen"
@@ -546,7 +545,7 @@ fn validate_reference_count(
     count: usize,
 ) -> anyhow::Result<()> {
     match info.range_max("input_references") {
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         Some(max) if count as i64 > max => anyhow::bail!(
             "Model `{model}` supports at most {max} reference image(s), \
              got {count}. Retry with fewer images.",
@@ -626,7 +625,6 @@ fn detect_aspect_ratio_from_image(path: &Path) -> Option<&'static str> {
 /// Find the closest canonical aspect ratio string for the given dimensions.
 ///
 /// Returns `None` when either dimension is zero.
-#[allow(clippy::cast_precision_loss)]
 fn find_closest_aspect_ratio(width: u32, height: u32) -> Option<&'static str> {
     // Guard against zero dimensions (would produce ∞ or panic at division)
     if width == 0 || height == 0 {
@@ -1011,7 +1009,7 @@ mod tests {
 
     /// Helper: convert a f64 ratio into integer width/height that produce
     /// the same ratio (within rounding). Used to construct test inputs.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn ratio_tuple_from_f64(ratio: f64) -> (u32, u32) {
         // Scale to avoid integer division rounding errors:
         // multiply by a large power of 10 then reduce.

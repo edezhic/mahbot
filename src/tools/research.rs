@@ -1630,7 +1630,7 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
 /// raws for the fail-open report). Decomposer plans are steering, not
 /// evidence — the failure still counts in `run_stats.failed_analysts`, and
 /// the run aborts with an explicit error if no plan parses.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn round0_decompose(
     ws: &Workspace,
     question: &str,
@@ -1828,7 +1828,7 @@ fn validate_merged_plan(plan: &MergedPlan, plans: &[DecompositionPlan]) -> Resul
 /// checkpoints FIRST, then runs the wrap-up stage — a crash mid-wrap-up must
 /// not lose the round-1 evidence), or `None` when the analyst budget is
 /// exhausted before dispatch.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn round1_research(
     ws: &Workspace,
     question: &str,
@@ -1980,7 +1980,7 @@ fn gap_items(gaps: &[Gap]) -> Vec<String> {
 /// of analysts aborted by the round deadline (the caller runs the wrap-up
 /// stage AFTER collecting the round's evidence so ledger registrations from
 /// recovered analysts cannot skew the round's saturation counters).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn run_gap_round(
     ws: &Workspace,
     question: &str,
@@ -2088,7 +2088,7 @@ fn unclaim_coder_round(state: &mut ResearchState, round_key: usize) {
 /// checks then skip the following gap rounds, fail-open). The coder's response
 /// text is NOT inserted into the report; failures and skips are marked in the
 /// report, never silent.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn run_coder_round(
     job_id: &str,
     run_root: &str,
@@ -2175,7 +2175,7 @@ async fn run_coder_round(
 /// retry bounds before returning Failed, so a second full coder session would
 /// only double the LLM spend of a confirmed failure (design: "Сбой кодера =
 /// fail-open").
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn run_coder_gated(
     job_id: &str,
     run_root: &str,
@@ -2229,7 +2229,7 @@ async fn run_coder_gated(
 /// failed post-progress round (key ≥ 1) is FINAL — the loop resumes at the
 /// advanced round_index and never revisits the key (fail-open per design:
 /// "Сбой кодера = fail-open", skip marker in the report).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn gap_rounds(
     ws: &Workspace,
     question: &str,
@@ -2686,7 +2686,7 @@ struct SynthesisOutput {
 /// never silent success. An exhaustion with no usable output at all (transport
 /// failures / empty responses) errors — the caller's partial-report fail-open
 /// path applies.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn synthesize(
     ws: &Workspace,
     question: &str,
@@ -2870,7 +2870,7 @@ fn verification_targets(acc: &AccumulatedEvidence) -> (Vec<VerificationTarget>, 
 /// rounds must not re-ask them) — repeats here inflate the summary's
 /// repeat-queries line but never the per-round saturation signal
 /// (`EvidenceRound::repeat_queries` is untouched).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn research_verification_pass(
     ws: &Workspace,
     acc: &AccumulatedEvidence,
@@ -3044,7 +3044,7 @@ fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
 
 /// Render the run summary: rounds, agents vs budget, tool calls, searches,
 /// wall time, unresolved gaps, and any abstention or incomplete marker.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn render_run_summary(
     run_stats: &RunStats,
     budget: &ResearchBudget,
@@ -3204,7 +3204,7 @@ enum ResearchExit {
 /// final synthesis, verification gate, and the run summary. `job_id` names
 /// the durable research job whose `research_jobs.state` checkpoint is loaded
 /// on entry and saved at every stage boundary.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn run_deep_research(
     ws: &Workspace,
     question: &str,
@@ -3609,7 +3609,7 @@ mod tests {
     /// consults the process-global drain flag and aborts early while it is
     /// set (project convention: retry_tests_lock).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn research_capped_delivers_partial_report_to_caller() {
         let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
@@ -3698,7 +3698,7 @@ mod tests {
     /// durable envelope, and delivers to the ORIGINAL caller
     /// (role/user/channel persisted on the job row, never the Manager).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn resume_research_run_continues_at_synthesis_stage() {
         crate::util::test::init_management_test_stores().await;
         let _lock = crate::util::test::retry_tests_lock();
@@ -3837,7 +3837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn test_synthesis_truncated_output_is_marked_and_transport_fails_open() {
         let _lock = crate::util::test::retry_tests_lock();
         let _policy_guard =
@@ -4341,7 +4341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn test_annotate_round_confirm_failure_fail_open() {
         // End-to-end fail-open: the annotation pass succeeds, the confirm pass
         // fails entirely (transport) — every mutating verdict becomes weak

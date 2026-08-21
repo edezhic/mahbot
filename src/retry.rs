@@ -598,7 +598,7 @@ impl RetryLoop {
     /// index of the attempt that just completed. Callers indexing by a
     /// separate counter (e.g. consecutive transport failures) must add their
     /// own round-based guard — the final-attempt skip does not fire for them.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn sleep_between(&self, attempt: u32) -> Result<(), FailureClass> {
         if attempt >= self.policy.max_attempts {
             return Ok(());
@@ -802,7 +802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn agent_chat_rides_out_sustained_outage_and_recovers() {
         let _guard = crate::util::test::retry_tests_lock();
         // The binding agent-loop budget (13 attempts): the first 12 attempts
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn agent_chat_wall_clock_cap_binds() {
         let _guard = crate::util::test::retry_tests_lock();
         // 13 attempts but a 100 ms wall cap and 1 s backoff — the cap binds.

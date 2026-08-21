@@ -901,7 +901,7 @@ fn test_parse_attachment_metadata() {
 // ── Attachment content format tests ──────────────────────────────
 
 #[test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn attachment_content_format_rules() {
     // photo → [IMAGE:]
     let c = format_attachment_content(
@@ -1368,7 +1368,7 @@ fn test_strip_html_tags() {
 
 // ── extend_past_open_tag tests ─────────────────────────────
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[test]
 fn test_extend_past_open_tag() {
     struct Case {

@@ -106,7 +106,7 @@ const TAB_WIDTH: u16 = 4;
 /// bounded prefix is enough to prove the collapse. The +4 covers the UTF-8
 /// char-boundary floor of the prefix cut.
 fn shape_ceiling(avail: f32, need: u32) -> usize {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let per_line = (avail as usize).max(1) * 4;
     per_line.saturating_mul(need as usize).saturating_add(4)
 }
@@ -137,7 +137,7 @@ fn preview_line_char_budget(
         .layout(BODY_FONT_SIZE, Some(1_000.0), Wrap::None, None, None)
         .first()
         .map_or(0.0, |l| l.w);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let budget = ((avail / advance.max(1.0)) as usize).saturating_sub(1);
     budget.max(1)
 }
@@ -173,7 +173,7 @@ pub(crate) struct MessageMeasure {
 /// Quantize a text width into a bucket so sub-pixel layout jitter does not
 /// invalidate the per-message measurement cache; a real window resize moves
 /// the bucket and triggers re-measurement.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn width_bucket(width: f32) -> u32 {
     (width.max(0.0) / 16.0) as u32
 }
@@ -189,7 +189,6 @@ pub(crate) fn width_bucket(width: f32) -> u32 {
 /// copying the (potentially hundreds of KB) display text again.
 ///
 /// [`parse_messages_to_md_items`]: crate::gui::sessions::parse_messages_to_md_items
-#[allow(clippy::too_many_lines)]
 pub(crate) fn measure_message(
     display_text: impl Into<Arc<str>>,
     width: f32,
@@ -214,7 +213,7 @@ pub(crate) fn re_measure(cached: &MessageMeasure, width: f32) -> MessageMeasure 
 
 /// Shared core of [`measure_message`] / [`re_measure`]: layout the already
 /// media-processed display text at `width` and count wrapped lines.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn measure_processed(
     source: Arc<str>,
     processed: Arc<str>,

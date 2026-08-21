@@ -284,7 +284,7 @@ async fn dispatch_durable_analyze(
 /// Spawn the analyze job + roster (one tx), run the analysts, checkpoint per-agent
 /// outcomes, consolidate. `pre_done` carries slots already completed (resume)
 /// with their stored raw-response outcomes.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn run_analyze_with_job(
     ws: &Workspace,
     analyze: &str,
@@ -648,7 +648,7 @@ pub(crate) async fn complete_durable_job_and_route(
 
 /// A single claim with source and confidence, extracted from an analyst's
 /// response. Shared with the deep research tool (`research.rs`).
-#[allow(clippy::struct_field_names)] // field name matches the JSON schema key
+#[expect(clippy::struct_field_names)] // field name matches the JSON schema key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Claim {
     pub claim: String,
@@ -799,7 +799,7 @@ pub(crate) fn round_timeout() -> Duration {
 /// One analyst's outcome in a parallel round. `Failed` covers members that
 /// never completed (stuck past the round deadline, panicked, or cancelled) —
 /// the reason is surfaced, never silent.
-#[allow(clippy::large_enum_variant)] // Agent is inherently large; the enum is transient
+#[expect(clippy::large_enum_variant)] // Agent is inherently large; the enum is transient
 enum AnalyzeRun {
     Completed {
         agent: Agent,
@@ -1380,7 +1380,7 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
 /// sanitizer needs them at dispatch time — successful writers never appear in
 /// wrap-up snapshots; the ids ride the return value so the shared helper
 /// keeps no write-only out-parameter).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_claim_verifiers(
     ws: &Workspace,
     id_prefix: &str,
@@ -1458,7 +1458,7 @@ pub(crate) async fn dispatch_claim_verifiers(
 ///
 /// `question` is the research run's question — threaded as the run group's
 /// header label (purely presentational).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn run_claim_verifier(
     ws: &Workspace,
     agent_id: &str,
@@ -1983,7 +1983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_fail_open_delivers_raw_reports() {
         let _guard = retry_tests_lock();
         let _policy_guard =
@@ -2021,7 +2021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_non_retryable_fails_open() {
         let _guard = retry_tests_lock();
         let _policy_guard =
@@ -2057,7 +2057,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_success_synthesizes() {
         let _guard = retry_tests_lock();
         let _policy_guard =
@@ -2078,7 +2078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_single_parseable_source_skips_grouping() {
         let _guard = retry_tests_lock();
         let _policy_guard =
@@ -2113,7 +2113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_fail_open_mixed_failure_classes() {
         let _guard = retry_tests_lock();
         let _policy_guard =
@@ -2142,7 +2142,7 @@ mod tests {
     /// delivered with the extraction-failure marker (fail-open at the
     /// extraction step, not the synthesis step).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_extraction_fail_open_delivers_raw_reports() {
         let _lock = retry_tests_lock();
         let _policy_guard =
@@ -2200,7 +2200,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_async_envelope_carries_marker() {
         // The async dispatch path (tokio::spawn in AnalyzeTool::execute) builds
         // its envelope via build_async_analyze_message — this test drives the REAL
@@ -2249,7 +2249,7 @@ mod tests {
     /// 2/3 + tail 1/3) — the fail-open marker is head-placed so it survives
     /// even when the consolidated output overflows the budget.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn fail_open_marker_survives_sync_truncation() {
         let _guard = retry_tests_lock();
         let _policy_guard =
@@ -2308,7 +2308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_partial_success_with_remainder() {
         let _guard = retry_tests_lock();
         let _policy_guard =
@@ -2367,7 +2367,7 @@ mod tests {
     /// process-global drain flag and aborts early while it is set (project
     /// convention: retry_tests_lock).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn resume_analyze_round_reuses_existing_job() {
         let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;
@@ -2445,7 +2445,7 @@ mod tests {
     /// the process-global drain flag and aborts early while it is set (project
     /// convention: retry_tests_lock).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn analyze_capped_envelope_delivers_error_to_caller() {
         let _lock = crate::util::test::retry_tests_lock();
         crate::util::test::init_management_test_stores().await;

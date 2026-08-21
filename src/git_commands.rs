@@ -586,7 +586,7 @@ pub async fn run_git_diff_stats(repo_path: &Path) -> anyhow::Result<(i64, i64)> 
             read_untracked_file(&repo_path.join(path), MAX_UNTRACKED_SIZE).await
         {
             // All lines in an untracked file count as added lines
-            #[allow(clippy::cast_possible_wrap)]
+            #[expect(clippy::cast_possible_wrap)]
             let line_count = text.lines().count() as i64;
             added += line_count;
         }

@@ -635,7 +635,7 @@ enum MatchMode {
 // Lenient parse so a swapped binary's spec reaches the version check and
 // execs the real grep in place (the sentinel would need a parent re-run).
 #[serde(default)]
-#[allow(non_snake_case, clippy::struct_excessive_bools)] // flag-letter names, grep CLI surface
+#[expect(non_snake_case, clippy::struct_excessive_bools)] // flag-letter names, grep CLI surface
 struct GrepFlags {
     n: bool,
     i: bool,
@@ -800,7 +800,7 @@ struct ParsedGrep {
     fallback_prefix: Vec<String>,
 }
 
-#[allow(clippy::too_many_lines)] // BSD-getopt flag table is inherently long
+#[expect(clippy::too_many_lines)] // BSD-getopt flag table is inherently long
 /// Parse a grep segment's words (after the verb) with BSD-getopt semantics:
 /// GNU-style permutation, value-taking options consuming the rest of their
 /// token, last-wins -G/-E/-F, the macOS option cluster, and the verified flag
@@ -2155,7 +2155,7 @@ fn emit_error(spec: &EngineSpec, out: &mut Output, display: &str, message: &str)
 
 // ── Sink: BSD-grep-compatible output formatting ───────────────────────────
 
-#[allow(clippy::struct_excessive_bools)] // grep CLI flag surface
+#[expect(clippy::struct_excessive_bools)] // grep CLI flag surface
 struct GrepSink<'a> {
     spec: &'a EngineSpec,
     display: &'a str,

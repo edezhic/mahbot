@@ -738,7 +738,7 @@ async fn notify_ticket(
     );
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn run_management() {
     // Boot recovery scan: first statement of run_management,
     // BEFORE reset_inflight_tickets. Replays pending envelopes, materializes
@@ -3089,7 +3089,7 @@ pub(crate) fn stage_role(name: &str) -> Option<Role> {
 /// `ticket_title` is threaded into the synthesis call's Running Agents group
 /// header label (purely presentational — the ticket group keeps its name even
 /// when only the synthesis call remains after the round's agents deregistered).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn build_round_joint_comment(
     stage: &str,
     results: &[ParallelVerdict],
@@ -3177,8 +3177,7 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
 /// concurrently (leader-staggered: the first member starts immediately, the
 /// rest after its first LLM call so they hit its cached prefix; skipped on
 /// boot resume).
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_lines)]
 async fn run_parallel_agents(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
@@ -3577,7 +3576,6 @@ fn ticket_stage_slot_task(
 /// Spawn a ticket_stage job + roster in ONE transaction (before any agent
 /// session write). The job row carries the rendered prompt template; each
 /// roster row carries the FINAL per-agent prompt. Returns the job id + slots.
-#[allow(clippy::too_many_arguments)]
 async fn spawn_ticket_stage_round(
     ticket: &Ticket,
     ws: &Workspace,
@@ -3644,7 +3642,7 @@ async fn spawn_ticket_stage_round(
 /// be ignored by resume paths, and would let the purge's live-session
 /// protection clause miss an active round. The anchor's NULL-seat row and this
 /// round's roster row coexist under the composite PK (job_id, agent_id).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn spawn_single_slot_round(
     job_id: &str,
     ticket: &Ticket,
@@ -4387,7 +4385,7 @@ fn bounce_breaker_trip_comment() -> String {
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_analyst_verdicts`].
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn process_verifier_verdicts(
     ws: &Workspace,
     ticket: &Ticket,
@@ -4883,7 +4881,6 @@ async fn verifier_git_state(ws: &Workspace, vi: VerifierInfo) -> (bool, &Path, b
 /// See [`dispatch_backlog_analysts`] for the full rationale — the same
 /// structural reasons apply here (parallel agents via [`run_parallel_agents`],
 /// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim).
-#[allow(clippy::too_many_lines)]
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
     // ── Skip-review check for Reviewers ──────────────────────────────
     // Skip ONLY when the current content is identical to the reviewed base

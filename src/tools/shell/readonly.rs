@@ -770,7 +770,7 @@ fn walk_command<'a>(
 /// temp bindings, and the mutator/git/flag dispatch. Operates on the
 /// AST-reconstructed words; redirects and substitutions are validated by the
 /// walker, not here.
-#[allow(clippy::too_many_lines)] // security-critical command validator
+#[expect(clippy::too_many_lines)] // security-critical command validator
 fn check_words(
     words: &mut [&str],
     state: &mut ValidationState,
@@ -5414,7 +5414,6 @@ mod tests {
 
         run_cases(&cases);
     }
-    #[allow(clippy::too_many_lines)] // data-driven bypass battery
     /// Git exec vectors: flags/config/env channels that run programs are
     /// rejected, even on allowlisted subcommands. Includes the analyst-flagged
     /// gaps (repo redirect, --config-env/--config-file, export channel,

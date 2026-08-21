@@ -354,7 +354,7 @@ fn reject(outcome: &mut RoundOutcome, cause: FailureClass, msg: String) {
 /// immediately. Validation is strictly structural — ids in range, no
 /// duplicate placement, set completeness, contradiction ≥2 distinct agents
 /// (see [`ItemTable`] for the accepted wrong-but-valid-id risk).
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome {
     let RoundInput {
         summary,
@@ -715,7 +715,7 @@ fn append_repair_instructions(
 /// row), but a Fallback operation may still carry both an earlier
 /// summary-only round's success row and the operation-level failure row — the
 /// accepted summary is discarded by the fallback render.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn run_grouping_repair(
     ws: &Workspace,
     purpose: &'static str,
@@ -942,7 +942,7 @@ pub(crate) async fn run_grouping_repair(
 /// consumer-supplied model/effort/routing/max_tokens. The `meta` purpose and
 /// agent id are filled in here so every consumer shares the same telemetry
 /// shape (the registry entry uses the same purpose string).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn grouping_request(
     ws: &Workspace,
     purpose: &'static str,
@@ -990,7 +990,7 @@ mod tests {
     /// coordination. Unchanged template regions (prefix, lead-in line, schema
     /// tail) are derived from the asset so unrelated prompt edits don't force
     /// syncing this test.
-    #[allow(clippy::too_many_lines)] // 5 framings × scenarios: exhaustive byte pin of the moved prose
+    #[expect(clippy::too_many_lines)] // 5 framings × scenarios: exhaustive byte pin of the moved prose
     #[test]
     fn repair_instructions_assembly_is_byte_exact() {
         // State: item 0 frozen in one group; item 1 stays in the remainder.

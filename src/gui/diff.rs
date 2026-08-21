@@ -371,7 +371,7 @@ impl DiffState {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: DiffMessage) -> Task<DiffMessage> {
         match msg {
             DiffMessage::WorkspaceSelected(name, path_override) => {
@@ -734,7 +734,7 @@ impl DiffState {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, DiffMessage> {
         let has_changes = !self.diff_files.is_empty();
         let show_commit_bar =
@@ -1025,7 +1025,6 @@ impl DiffState {
         col.into()
     }
 
-    #[allow(clippy::too_many_lines)]
     fn render_file_node<'a>(
         &'a self,
         node: &'a widgets::TreeNode,
@@ -1146,7 +1145,7 @@ impl DiffState {
 
     /// Return the diff content panel: file headers, binary/too-large placeholders,
     /// truncation warnings, and per-file [`DiffBufferWidget`]s interleaved.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn build_diff_content(&self) -> Element<'_, DiffMessage> {
         if self.diff_files.is_empty() {
             return container(
@@ -1830,7 +1829,6 @@ mod tests {
 
     // ── TreeNavEnter tests ──────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_tree_nav_enter() {
         struct Case {
@@ -2172,7 +2170,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[test]
     fn test_truncation_index() {
         struct Case {

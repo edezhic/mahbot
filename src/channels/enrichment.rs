@@ -352,7 +352,7 @@ async fn handle_non_multimodal_image(
 /// never read, copied, or deleted and degrade to plain-text annotations.
 // Marker dispatch hub (3 kinds × 2 strategies); per-kind handling is extracted
 // into the handler functions above, keeping this loop flat on purpose.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn enrich_message(msg: &mut ChannelMessage, strategy: &EnrichmentStrategy) {
     let mut annotations: Vec<String> = Vec::new();
     let mut result = msg.content.clone();

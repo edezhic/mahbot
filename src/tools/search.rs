@@ -521,7 +521,6 @@ impl Tool for SearchTool {
         false // indexed search, no mutations
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         ws: &crate::Workspace,

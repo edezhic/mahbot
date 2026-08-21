@@ -244,7 +244,7 @@ async fn setup_ticket(
 /// provider (project convention: retry_tests_lock).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn transition_ticket_to_done_buffer_and_notify() {
     let _lock = crate::util::test::retry_tests_lock();
     let ws = setup_db_workspace("drains_buffer").await;
@@ -554,7 +554,7 @@ fn install_synthesis_test_seams(
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn process_verifier_verdicts_cases() {
     struct Case {
         name: &'static str,
@@ -713,7 +713,7 @@ async fn process_verifier_verdicts_cases() {
 /// unchanged, assignment preserved, no comment written).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
@@ -783,7 +783,7 @@ async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
 /// dispatch.
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn circuit_breaker_on_moved_ticket_is_silent_noop() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
@@ -842,7 +842,7 @@ async fn circuit_breaker_on_moved_ticket_is_silent_noop() {
 /// concurrent boot reset would clobber the InReview fixture).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn resume_verifier_round_replays_stored_outcomes() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
@@ -1007,7 +1007,7 @@ async fn panicked_round_member_maps_to_contained_no_response() {
 /// concurrent boot reset would clobber the InDevelopment fixture).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn resume_engineer_round_continues_anchor_session() {
     init_management_test_stores().await;
     // Main LLM response + engineer-summary extraction (2 calls).
@@ -1147,7 +1147,7 @@ async fn resume_engineer_round_continues_anchor_session() {
 /// concurrent boot reset would clobber the InSanitation fixture).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn resume_sanitation_round_continues_session_and_passes() {
     init_management_test_stores().await;
     // Main LLM response + SanitationVerdict extraction (2 calls).
@@ -1281,7 +1281,7 @@ impl crate::Provider for PanicProvider {
 /// process-global drain flag).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn dispatch_panic_during_drain_skips_failed_transition() {
     init_management_test_stores().await;
     let _lock = crate::util::test::retry_tests_lock();
@@ -1371,7 +1371,7 @@ async fn dispatch_panic_during_drain_skips_failed_transition() {
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn eleventh_bounce_fails_ticket() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
@@ -1441,7 +1441,7 @@ async fn eleventh_bounce_fails_ticket() {
 /// retry_tests_lock).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
     let _lock = crate::util::test::retry_tests_lock();
     init_management_test_stores().await;
@@ -1610,7 +1610,7 @@ fn blocks_claim_gate_matrix() {
 ///   group tolerate extra rows (they assert on their own fixture IDs).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global provider seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global provider seams
 async fn paused_workspace_holds_backlog_and_rfd_until_unpause() {
     let _lock = crate::util::test::retry_tests_lock();
     let ws = setup_db_workspace("pause_gate").await;
@@ -1695,7 +1695,7 @@ async fn paused_workspace_holds_backlog_and_rfd_until_unpause() {
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn process_analyst_verdicts_cases() {
     struct Case {
         name: &'static str,
@@ -1794,7 +1794,7 @@ async fn process_analyst_verdicts_cases() {
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn analyst_round_fails_open_with_fallback_comment() {
     init_management_test_stores().await;
     // Script every synthesis attempt as a transport failure → exhaustion →
@@ -2250,7 +2250,6 @@ async fn process_sanitation_verdict_cases() {
 ///
 /// Serialized with the reset_inflight_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
 async fn dispatch_diagnostics_cases() {
@@ -2675,7 +2674,7 @@ fn engineer_failure_comment_scrubs_and_truncates() {
 /// (credential-scrubbed), while a valid item list renders the compact bullet
 /// summary (also scrubbed).
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn engineer_comment_text_fail_open_and_renders() {
     use crate::util::test::{
         FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -2770,7 +2769,7 @@ fn engineer_finalize_test_agent(ws: &Workspace, ticket: &Ticket, suffix: &str) -
 /// Manager notification both carry it.
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn engineer_hard_failure_bounces_to_ready_for_development() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
@@ -2839,7 +2838,7 @@ async fn engineer_hard_failure_bounces_to_ready_for_development() {
 /// notify_ticket's last-comment lookup surfaces the error).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
@@ -2929,7 +2928,7 @@ async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
 /// ticket Failed + workspace paused, never auto-re-queued (no bounce).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
 async fn engineer_cancel_fails_ticket_without_bounce() {
     init_management_test_stores().await;
     let (_lock, _policy_guard, _provider_guard) =
@@ -2983,7 +2982,7 @@ async fn engineer_cancel_fails_ticket_without_bounce() {
 /// a bug that completed the job on the drain bail would flip it to 'done'.
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
     init_management_test_stores().await;
     let _lock = crate::util::test::retry_tests_lock();
@@ -3066,7 +3065,7 @@ async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
 /// excluded inside [`pause_workspace_on_failure`]).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
     init_management_test_stores().await;
     let _lock = crate::util::test::retry_tests_lock();

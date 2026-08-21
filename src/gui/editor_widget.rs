@@ -2105,7 +2105,7 @@ where
         widget::tree::Tag::of::<EditorWidgetState>()
     }
 
-    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    #[expect(clippy::cast_precision_loss)]
     fn layout(
         &mut self,
         tree: &mut Tree,
@@ -2291,7 +2291,7 @@ where
         draw_cursor(renderer, &buffer_for_draw, &text_geo, state, self.buffer);
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -2636,7 +2636,7 @@ where
                             } else {
                                 // Cursor not in any shaped run — use
                                 // estimated y position
-                                #[allow(clippy::cast_precision_loss)]
+                                #[expect(clippy::cast_precision_loss)]
                                 let est_y =
                                     cursor.line as f32 * metrics.line_height - state.scroll_y;
                                 let run_h = metrics.line_height;
@@ -3179,7 +3179,6 @@ const fn is_cursor_movement_key(key: &key::Key) -> bool {
 /// `text` field (dead key / IME / AltGr composition). Only used for
 /// distinguishing AltGr from shortcuts on non-macOS — character insertion
 /// itself is handled in `on_event`.
-#[allow(clippy::too_many_lines)]
 fn map_key_to_action(
     key: &key::Key,
     modifiers: keyboard::Modifiers,

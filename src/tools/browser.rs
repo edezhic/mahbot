@@ -665,7 +665,7 @@ impl Tool for BrowserTool {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn execute(&self, _ws: &Workspace, args: Value) -> anyhow::Result<String> {
         let mut normalized_notes: Vec<String> = Vec::new();
         let (tab, tab_note) = normalize_tab(&args);
@@ -1333,7 +1333,7 @@ mod tests {
 
     // ── build_args: Find variants ────────────────────────────────────────
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[test]
     fn build_args_for_find_variants() {
         struct Case {

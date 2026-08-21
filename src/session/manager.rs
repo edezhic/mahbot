@@ -112,7 +112,7 @@ impl Session {
     /// `round_ts` pins the timestamp of the appended user message (one value
     /// per round for byte-identical first messages across parallel members);
     /// `None` stamps now.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn init(
         &mut self,
         agent_id: &str,

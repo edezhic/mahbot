@@ -259,7 +259,7 @@ impl SpawnChild {
 /// MUST commit before the agent's first session write. The kind is derived
 /// from the child via [`SpawnChild::kind_str`] — closing the drift window of
 /// an inconsistent (kind, child) pair.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn spawn_job(
     conn: &Connection,
     id: &str,
@@ -1129,7 +1129,7 @@ async fn rollback_stranded_tickets(rollbacks: &[(String, String, bool)]) -> bool
 /// message skips the last_activity upsert) and retry_count + 1 (the
 /// MAX_BOOT_REDISPATCH cap counts boot-resume attempts; in-job retries are
 /// not counted).
-#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+#[expect(clippy::cast_possible_truncation, clippy::too_many_lines)]
 pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableStage>> {
     let start = std::time::Instant::now();
     let conn = &crate::session::store().conn;
@@ -1652,7 +1652,7 @@ mod tests {
     /// guard fires on Err of job_caller the same way) must quiet-return
     /// without resurrecting anything.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn resume_job_preamble_abort_and_missing_quiet_return() {
         let _lock = crate::util::test::retry_tests_lock();
         let (store, _tmp) = crate::open_test_store!(crate::session::SessionStore, "session");

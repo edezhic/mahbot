@@ -1826,7 +1826,7 @@ async fn repair_btree_index_if_desynced(
 /// An unreadable table surfaces as `Unreadable` (recreate justified).
 /// Actionable resource conditions (ENOSPC/EMFILE/permission) propagate as
 /// `Err` — they must never trigger a quarantine.
-#[allow(clippy::too_many_lines)] // one linear boot-repair flow, split across helpers
+#[expect(clippy::too_many_lines)] // one linear boot-repair flow, split across helpers
 async fn migrate_overflow_aliased_store(
     conn: Connection,
     db_path: &Path,

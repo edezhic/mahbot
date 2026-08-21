@@ -2077,7 +2077,7 @@ impl DetectionInstrumentation {
 }
 
 /// Runtime state for the voice pipeline main loop.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub(crate) struct PipelineCtx {
     mic_rx: Option<mpsc::Receiver<Vec<f32>>>,
     mic_stream: Option<cpal::Stream>,
@@ -2905,7 +2905,7 @@ impl PipelineCtx {
 
     /// Accumulate audio during a mic-button recording; auto-send at the
     /// 10-minute cap.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     async fn handle_manual_recording_audio(&mut self, samples: &[f32]) {
         self.command_buffer.extend_from_slice(samples);
         let duration_secs = self.command_buffer.len() as f64 / f64::from(SAMPLE_RATE);
@@ -3342,7 +3342,7 @@ async fn finalize_enrollment_pipeline() -> bool {
 }
 
 /// Run the voice pipeline background task.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub async fn run_voice_pipeline() {
     info!("Voice pipeline starting...");
 
@@ -3608,7 +3608,7 @@ pub async fn run_voice_pipeline() {
 
                 // Cap is ~360k at 16kHz, well within f64 mantissa precision.
                 let collected_secs = {
-                    #[allow(clippy::cast_precision_loss)]
+                    #[expect(clippy::cast_precision_loss)]
                     {
                         (ctx.negatives_speech_samples as f64) / f64::from(SAMPLE_RATE)
                     }
@@ -3734,7 +3734,7 @@ async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
 ///
 /// Silence duration is measured in audio samples (not wall-clock time) so that
 /// system load / processing delays don't affect recording cutoff consistency.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
     ctx.command_buffer.extend_from_slice(&samples);
     let speech = is_speech_with_threshold(&samples, ctx.vad_threshold);
@@ -3838,7 +3838,7 @@ fn check_enrollment_utterance_length(duration_ms: u64) -> Result<(), String> {
 /// The utterance is encoded ONCE (no PCM augmentation — the prototype-cosine
 /// pipeline needs no variant expansion).  Rejects utterances shorter than
 /// 400 ms and updates the enrollment UI status with per-utterance quality.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     if !models_ready() {
         warn!("Models not ready for enrollment");
@@ -3928,7 +3928,7 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 /// 5. **Detection→recording handoff** — on detection the ring is moved into
 ///    [`PipelineCtx::command_buffer`] with a Soft reset so recording starts
 ///    with the pre-wake context.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // ── Cooldown check ──
     // If we recently detected the wake word, skip ALL processing for this
@@ -4146,7 +4146,6 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
 /// - No speech yet: caller's `Enrolling` text persists (or no-speech warning)
 /// - Speech detected: `ListeningDuringEnrollment`
 /// - Speech ended, awaiting silence: `WaitingForSilenceDuringEnrollment`
-#[allow(clippy::too_many_lines)]
 fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
     ctx.audio_buffer.extend_from_slice(samples);
 

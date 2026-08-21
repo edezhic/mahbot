@@ -435,7 +435,7 @@ async fn resolve_workspace(workspace_name: &str) -> anyhow::Result<Option<Worksp
 /// Cleanup (removing this consumer's entry from the router table) is handled
 /// by the outer wrapper in [`route()`], which runs on both normal exit and
 /// (via `catch_unwind`) panic exit.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJob>) {
     let shutdown = crate::shutdown::shutdown_token();
 

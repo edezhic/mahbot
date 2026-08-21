@@ -851,7 +851,7 @@ async fn sweep_media_at_budgeted(userspaces_root: &Path, budget_bytes: usize) ->
     Ok(deleted)
 }
 
-#[allow(clippy::too_many_lines)] // per-phase guards (fail-open, empty-base, overflow, budget, coverage) are sequential and inline
+#[expect(clippy::too_many_lines)] // per-phase guards (fail-open, empty-base, overflow, budget, coverage) are sequential and inline
 async fn sweep_user_media(
     user_name: &str,
     user_path: &Path,

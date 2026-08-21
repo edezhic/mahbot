@@ -134,7 +134,7 @@ pub(crate) fn write_artifacts(
 #[must_use]
 // The 9-arg signature is the spec'd manifest surface (scrubbed argv + config +
 // outcome); bundling would obscure the manifest's fixed keys.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn build_manifest(
     args: &[String],
     opts: &BenchOptions,

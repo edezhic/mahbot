@@ -475,7 +475,7 @@ fn decode_opus_from_ogg(data: &[u8], path: &Path) -> Result<(Vec<f32>, i32)> {
 /// If a pure-Rust MP3 decoder is needed in the future, one could replace this
 /// with a subprocess call to `ffmpeg` (handling all audio formats) or a
 /// pure-Rust MP3 crate like `mp3-dl`.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn decode_mp3(data: &[u8], path: &Path) -> Result<(Vec<f32>, i32)> {
     use minimp3::Decoder as Mp3Decoder;
 
@@ -568,7 +568,7 @@ fn model_files() -> [ModelFile; 3] {
 /// On SHA256 mismatch, the partially downloaded file is removed so the next
 /// attempt re-downloads from scratch.
 async fn download_file(client: &reqwest::Client, file: &ModelFile, dest: &Path) -> Result<()> {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn calc_pct(downloaded: u64, total_size: u64) -> f64 {
         (downloaded as f64 / total_size as f64 * 100.0).min(100.0)
     }

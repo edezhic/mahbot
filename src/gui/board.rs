@@ -611,7 +611,7 @@ impl BoardState {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: BoardMessage) -> Task<BoardMessage> {
         match msg {
             BoardMessage::Refreshed(tickets) => {
@@ -1175,7 +1175,7 @@ impl BoardState {
     }
 
     /// Render a single ticket card: clickable title, ID, phase badge, and action icons.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn render_ticket_card<'a>(&'a self, ticket: &'a Ticket) -> Element<'a, BoardMessage> {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 

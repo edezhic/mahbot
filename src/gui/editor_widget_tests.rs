@@ -122,7 +122,7 @@ fn test_enter_at_end_of_highlighted_file_no_trailing_newline() {
 }
 
 #[test]
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn test_backspace_delete_cases() {
     // (name, action, input, cursor pos, expected text, expected cursor)
     #[rustfmt::skip]
@@ -310,7 +310,7 @@ fn test_line_comment_prefix() {
 
 // ── Toggle line comment ───────────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[test]
 fn test_toggle_line_comment() {
     struct Case {
@@ -493,7 +493,7 @@ fn test_jump_to_matching_bracket() {
 // ── Delete line ────────────────────────────────────────────────
 
 #[test]
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn test_delete_line_cases() {
     // (name, input, cursor line, selection end, expected text, expected line, expected column)
     #[rustfmt::skip]
@@ -524,7 +524,7 @@ fn test_delete_line_cases() {
 // ── Duplicate line ─────────────────────────────────────────────
 
 #[test]
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn test_duplicate_line_cases() {
     // (name, input, cursor line, selection end, expected text, expected line, expected column)
     #[rustfmt::skip]
@@ -553,7 +553,7 @@ fn test_duplicate_line_cases() {
 // ── Move line up/down ──────────────────────────────────────────
 
 #[test]
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn test_move_line_cases() {
     // (name, action, input, cursor line, selection end, expected text, expected line, expected column)
     #[rustfmt::skip]

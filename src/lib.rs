@@ -709,7 +709,7 @@ pub struct Agent {
     /// Session persistence key; also serves as the registry agent ID.
     /// Direct-chat agents use `{channel}_{sender}_{role}_{ws_name}` as the key (stable across messages).
     /// Sub-agents and ticket handlers use a fresh NanoID per invocation.
-    #[allow(clippy::struct_field_names)]
+    #[expect(clippy::struct_field_names)]
     pub(crate) agent_id: String,
     /// The agent's role (Manager, Engineer, Analyst, etc.).
     role: Role,
@@ -801,7 +801,7 @@ pub(crate) struct Verdict {
 ///   float spellings of that band (101.0, 255.0) fail closed.
 /// - Everything else (non-numeric, negative, the (10,11) gap, fractions
 ///   outside the bands) fails closed — range checks precede any cast.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn de_verdict_score<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1190,7 +1190,7 @@ pub(crate) struct ToolResultPayload {
     pub content: String,
 }
 
-#[allow(clippy::struct_field_names)]
+#[expect(clippy::struct_field_names)]
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Reasoning {
     pub reasoning: Option<String>,

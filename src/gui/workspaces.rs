@@ -48,7 +48,7 @@ pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
 }
 
 #[derive(Debug, Clone)]
-#[allow(private_interfaces)] // ContextKind is deliberately pub(crate) (see gui/mod.rs Message)
+#[expect(private_interfaces)] // ContextKind is deliberately pub(crate) (see gui/mod.rs Message)
 pub enum WorkspacesMessage {
     Refreshed(Vec<Workspace>),
     RefreshError(String),
@@ -182,12 +182,12 @@ impl WorkspacesState {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: WorkspacesMessage) -> Task<WorkspacesMessage> {
         // Allow match_same_arms: separate error variants that happen to share the
         // same error-handling body after initial processing (e.g. logging variant
         // info). Narrowing per-arm would duplicate the handler across variants.
-        #[allow(clippy::match_same_arms)]
+        #[expect(clippy::match_same_arms)]
         match msg {
             WorkspacesMessage::Refreshed(ws_list) => {
                 self.workspaces = ws_list;

@@ -458,7 +458,7 @@ struct Layer {
 
 impl Layer {
     /// Forward pass through one encoder layer.
-    #[allow(clippy::many_single_char_names)]
+    #[expect(clippy::many_single_char_names)]
     fn forward(
         &self,
         x: &Tensor,
@@ -497,7 +497,7 @@ impl Layer {
     }
 
     /// Bidirectional multi-head attention with RoPE (no KV cache).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn apply_attention(
         q: &Tensor,
         k: &Tensor,
@@ -530,7 +530,7 @@ impl Layer {
         let k = rope_slow(&k, cos, sin)?;
 
         // Scaled dot-product attention (no causal mask — full bidirectional)
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         let scale = 1.0_f64 / (head_dim as f64).sqrt();
         let att = q.matmul(&k.t()?)?;
         let att = (att * scale)?;
@@ -599,7 +599,7 @@ impl Embedder {
     /// Does NOT download — the caller is responsible for ensuring the files exist.
     /// Returns an error if files are missing, corrupted, or the model architecture
     /// is unexpected.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn load(model_path: &Path, tokenizer_path: &Path) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| {
             anyhow!(
@@ -835,24 +835,19 @@ impl Embedder {
 /// Returns `(cos, sin)` each with shape `[MAX_SEQ_LEN, head_dim/2]`.
 /// These are consumed by `rope_slow` which internally duplicates them
 /// along the last dimension to match `head_dim`.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_lossless
-)]
 fn precompute_freqs_cis(
     head_dim: usize,
     freq_base: f32,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    #[allow(clippy::cast_precision_loss, clippy::cast_lossless)]
+    #[expect(clippy::cast_precision_loss)]
     let theta: Vec<f32> = (0..head_dim)
         .step_by(2)
         .map(|i| 1.0_f32 / freq_base.powf(i as f32 / head_dim as f32))
         .collect();
 
     let theta = Tensor::from_vec(theta, (head_dim / 2,), device)?;
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     let positions = Tensor::arange(0u32, MAX_SEQ_LEN as u32, device)?
         .to_dtype(DType::F32)?
         .reshape((MAX_SEQ_LEN, 1))?;
@@ -918,7 +913,7 @@ fn last_token_pool_and_l2_normalize(
     let seq_lengths: Vec<i64> = attention_mask.sum(1)?.to_vec1()?;
 
     for (i, &seq_len) in seq_lengths.iter().enumerate().take(batch_size) {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let last_pos = (seq_len - 1).max(0) as usize;
 
         // Extract embedding at last position: [batch, seq, hidden] -> [hidden]

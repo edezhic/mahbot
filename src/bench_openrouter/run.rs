@@ -648,7 +648,7 @@ impl ProviderRun {
 /// Run one provider's warmup + TTL ladder. Never panics on provider behavior:
 /// every failure degrades to a [`ProviderRun::not_measured`] result (after the
 /// auth/quota abort side-effects) or a ladder-derived cache-hold bucket.
-#[allow(
+#[expect(
     clippy::too_many_arguments,     // the full protocol inputs; bundled would obscure the call site
     clippy::too_many_lines,         // one long sequential protocol implementation
     clippy::cast_precision_loss,    // gap seconds (u64) → f64 for the nominal-gap bookkeeping

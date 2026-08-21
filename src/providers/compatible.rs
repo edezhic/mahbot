@@ -916,7 +916,6 @@ impl Provider for OpenAiCompatibleProvider {
     /// Scoped single-attempt chat: one HTTP request, no
     /// provider-internal retries, idle-timeout body reads, per-attempt total
     /// bounded by the remaining operation deadline.
-    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     async fn chat_scoped(
         &self,
         request: ProviderChatRequest,
@@ -1101,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn resolve_tool_call_name_cases() {
         let cases: &[(&str, Option<&str>, Option<&str>, Option<&str>)] = &[
             (
@@ -1141,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn resolve_tool_call_arguments_cases() {
         let cases: &[(&str, Option<&str>, Option<&str>, Option<&str>, Option<&str>)] = &[
             (

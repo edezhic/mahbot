@@ -1093,7 +1093,7 @@ fn encode_text(engine: &TtsEngine, text: &str) -> (Vec<i64>, usize) {
 /// This is extracted for testability — see `test_encode_text_with_indexer`.
 fn encode_text_with_indexer(unicode_indexer: &[i32], text: &str) -> (Vec<i64>, usize) {
     let unk_id = unicode_indexer.first().copied().unwrap_or(0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let max_idx = unicode_indexer.len() as i32 - 1;
     let ids: Vec<i64> = text
         .chars()
@@ -1125,7 +1125,7 @@ fn build_inputs(inputs: Vec<(&str, Tensor)>) -> HashMap<String, Tensor> {
 // ── Synthesis pipeline ───────────────────────────────────────────────
 
 /// Synthesize audio for a single text chunk. Returns PCM f32 samples.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
@@ -1286,11 +1286,6 @@ fn synthesize_internal(
 /// entire response. The user hears partial audio (all succeeding chunks)
 /// rather than silence from an aborted synthesis. Only fatal errors
 /// (cancellation, receiver drop) are propagated.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
 fn synthesize_chunked_streaming(
     engine: &TtsEngine,
     text: &str,
@@ -1418,7 +1413,7 @@ pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     // Convert all samples to little-endian i16 bytes
     for &s in samples {
         let clamped = s.clamp(-1.0, 1.0);
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let sample_i16 = (clamped * 32767.0) as i16;
         buf.extend_from_slice(&sample_i16.to_le_bytes());
     }
@@ -1428,7 +1423,7 @@ pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
 
 // ── Async speak ──────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
     let mut cancel_rx = cancel_rx;
 

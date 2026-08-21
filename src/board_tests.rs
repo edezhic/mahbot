@@ -960,7 +960,6 @@ async fn test_claim_ticket_in_workspace_respects_claim_grace() {
 
 /// Table-driven tests for [`PipelineCheck::Enforce`] — claims with pipeline occupancy
 /// checking enabled.
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_claim_ticket_in_workspace_if_pipeline_free() {
     /// The pipeline scenario for a single test case.
@@ -1104,7 +1103,6 @@ async fn test_create_ticket_with_prerequisites() {
 
 /// Matrix of invalid prerequisite/supersede inputs for `create_ticket` and
 /// `supersede_and_create`.
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_invalid_inputs() {
     let cases = [
@@ -2165,7 +2163,7 @@ async fn test_set_assigned_to_none() {
 /// `ticket_from_row` deserialization path, including manual
 /// field-by-field extraction via `row.get::<Type>(COL_TICKET_*)`
 /// and default-value handling.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[tokio::test]
 async fn test_ticket_roundtrip_all_fields() {
     let (store, _tmp) = open_test_store().await;

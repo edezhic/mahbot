@@ -85,7 +85,6 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut O
 /// is unambiguous even when the list omits it; merged entries render without
 /// a remove button. Accepts a `target` to build the correct parameterized
 /// `SettingsMessage::ModelPicker` values internally.
-#[allow(clippy::too_many_lines)]
 fn model_picker_list<'a>(
     target: ModelPickerTarget,
     models_field: Option<&'a str>,
@@ -821,7 +820,7 @@ impl SettingsState {
         self.settle_now(field, value)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: SettingsMessage) -> Task<SettingsMessage> {
         match msg {
             // ── Config field edits ─────────────────────────────
@@ -1435,7 +1434,7 @@ impl SettingsState {
 
     /// Render the workspaces section for the Settings page. No inner
     /// scrollable — rows expand the outer Settings scrollable naturally.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn workspaces_section(&self) -> Element<'_, SettingsMessage> {
         let ws = &self.workspaces_state;
 
@@ -1792,7 +1791,7 @@ impl SettingsState {
     }
 
     /// Render the users section for the Settings page.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn users_section(&self, active_user: Option<&str>) -> Element<'_, SettingsMessage> {
         let us = &self.users_state;
 
@@ -2331,7 +2330,6 @@ impl SettingsState {
     }
 
     /// Build the diagnostics modal dialog content for the given workspace.
-    #[allow(clippy::too_many_lines)]
     fn diagnostics_dialog(&self, diag_ws_name: &str) -> Element<'_, SettingsMessage> {
         let ws_name = diag_ws_name.to_string();
         let ws_state = &self.workspaces_state;
@@ -2563,7 +2561,7 @@ impl SettingsState {
     // enrolled-phrase display, multi-line progress/Cancel) sits below the
     // three rows, unchanged.
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn audio_section(&self) -> Element<'_, SettingsMessage> {
         use iced::widget::Text;
 
@@ -3349,7 +3347,7 @@ fn role_checkbox_row<'a>(
 /// Settles on Enter in addition to the debounce timer. Optional inline error.
 /// `highlight` switches to the accent attention style (used for the provider
 /// API key while unset).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn password_input<'a>(
     placeholder: &str,
     value: &str,
@@ -3460,7 +3458,7 @@ struct DialogField<'a> {
 ///
 /// Layout: title, spacer(16), field rows (8 px between), spacer(16),
 /// middle (if any), spacer(16), footer.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn modal_dialog<'a>(
     title: String,
     fields: &[DialogField<'a>],

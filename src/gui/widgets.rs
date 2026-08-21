@@ -317,7 +317,6 @@ pub struct ChatComposerOptions<'a, M> {
 /// optional right-edge controls, and whether the send button greys on empty
 /// input).
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn chat_composer<'a, M: Clone + 'a>(
     content: &'a text_editor::Content,
     on_action: impl Fn(text_editor::Action) -> M + 'a,
@@ -812,7 +811,7 @@ pub const LUCIDE_ADVANCE: f32 = 1.0;
 ///
 /// Exact for every glyph the tree renders — see [`JETBRAINS_MONO_ADVANCE`].
 #[must_use]
-#[allow(clippy::cast_precision_loss)] // usize glyph count → px width
+#[expect(clippy::cast_precision_loss)] // usize glyph count → px width
 pub fn mono_text_width(chars: usize, size: f32) -> f32 {
     chars as f32 * size * JETBRAINS_MONO_ADVANCE
 }
@@ -916,7 +915,7 @@ pub fn collect_tree_row_widths(
 /// [`TREE_MIN_WIDTH`]..=[`TREE_MAX_WIDTH`]. A tree whose rows all fit at the
 /// minimum width stays at [`TREE_MIN_WIDTH`].
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // viewport px → row index
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // viewport px → row index
 pub fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
     let widest = match file_tree.viewport_h {
         Some(viewport_h) if viewport_h > 0.0 => {
@@ -979,7 +978,7 @@ pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_FONT_SIZE * 1.3;
 /// This method updates [`FileTree::scroll_y`] directly so that consecutive
 /// calls during the same frame see an accurate scroll offset even before the
 /// `on_scroll` callback fires.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 pub fn scroll_to_tree_focus<Message: 'static>(
     file_tree: &mut FileTree,
     mode: ScrollMode,
@@ -1256,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn focus_path_cases() {
         // (name, nodes, path, expected return, expected focus index)
         #[rustfmt::skip]
@@ -1294,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn focused_tree_node_cases() {
         // (name, nodes, focused, focus index, expected node)
         #[rustfmt::skip]
@@ -1322,7 +1321,6 @@ mod tests {
     // ── nav_up / nav_down tests ──────────────────────────────────────
 
     #[test]
-    #[allow(clippy::type_complexity)]
     fn nav_cases() {
         // (name, direction, focused, start index, expected moved, expected index)
         let cases: &[(&str, &str, bool, usize, bool, usize)] = &[
@@ -1399,7 +1397,7 @@ mod tests {
     // ── focused_is_expanded_dir tests ────────────────────────────────
 
     #[test]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn focused_is_expanded_dir_cases() {
         // (name, nodes, focused, expanded dir, expected)
         #[rustfmt::skip]
@@ -1464,7 +1462,7 @@ mod tests {
         expected: &'static str,
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[test]
     fn tree_guide_prefix_cases() {
         let cases = [
@@ -1787,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_precision_loss)] // test-only encoding closure (depth, name length)
+    #[expect(clippy::cast_precision_loss)] // test-only encoding closure (depth, name length)
     fn collect_tree_row_widths_mirrors_render_order() {
         // src (dir, expanded) → src/main.rs, src/lib.rs; Cargo.toml at root.
         let mut tree = FileTree::new(iced::widget::Id::new("w"));

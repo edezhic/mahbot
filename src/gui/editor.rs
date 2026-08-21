@@ -71,7 +71,7 @@ const TAB_DIRTY_EXTRA: f32 = 8.0 + 2.0;
 /// error to a few px per tab, and the delta-based reveal in
 /// [`EditorState::scroll_to_active_tab`] never amplifies it into a
 /// right-edge clamp.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn estimate_tab_width(tab: &Tab) -> f32 {
     let name_w = tab.file_name.chars().count() as f32 * TAB_CHAR_ADVANCE;
     let dirty = if tab.is_dirty { TAB_DIRTY_EXTRA } else { 0.0 };
@@ -1395,7 +1395,6 @@ fn finish_git_load<T: Default>(
 /// 2. Initialises the search engine if needed.
 /// 3. Runs `picker.grep()` on the blocking thread pool.
 /// 4. Extracts owned data from `GrepResult` while holding the picker lock.
-#[allow(clippy::too_many_lines)]
 async fn run_global_search(
     ws_path: String,
     ws_name: String,
@@ -1977,7 +1976,6 @@ impl EditorState {
     /// `tab_scroll_x` is updated synchronously so consecutive selections
     /// within the same frame (e.g. held Ctrl+Tab) judge visibility against
     /// the offset this call produced, before `on_scroll` fires.
-    #[allow(clippy::cast_precision_loss)]
     fn scroll_to_active_tab(&mut self) -> Task<EditorMessage> {
         if self.tabs.is_empty() {
             return Task::none();
@@ -2320,7 +2318,7 @@ impl EditorState {
         iced::widget::operation::focus::<EditorMessage>(Id::new(NEW_ITEM_INPUT_ID))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: EditorMessage) -> Task<EditorMessage> {
         match msg {
             EditorMessage::WorkspaceSelected(ref name, ref path) => {
@@ -2546,7 +2544,6 @@ impl EditorState {
     // ── Extracted handler methods ────────────────────────────────────
 
     /// Handle workspace selection — initializes file tree, loads tabs, sets up workspace.
-    #[allow(clippy::too_many_lines)]
     fn workspace_selected(&mut self, name: &str, path: Option<&str>) -> Task<EditorMessage> {
         // Accept personal workspaces when a path is provided.
         if name.is_empty() && path.is_none() {
@@ -3445,7 +3442,7 @@ impl EditorState {
             return Task::none();
         };
         let abs_path = match_result.abs_path.clone();
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation)]
         let line_number = match_result.line_number as usize;
 
         // Close the search panel.
@@ -3600,7 +3597,6 @@ impl EditorState {
     }
 
     /// Handle rename-submit — validates and performs the async rename operation.
-    #[allow(clippy::too_many_lines)]
     fn rename_submit(&mut self) -> Task<EditorMessage> {
         let Some(ModalKind::Rename(target)) = self.active_modal.clone() else {
             return Task::none();
@@ -3726,7 +3722,7 @@ impl EditorState {
 
     /// Handle rename-completed — updates paths, tab data, tree, and filesystem
     /// state after an async rename operation.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn rename_completed(
         &mut self,
         old_path: &str,
@@ -4551,7 +4547,6 @@ impl EditorState {
         self.file_tree.nav_and_scroll::<EditorMessage>(direction)
     }
 
-    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn view(&self) -> Element<'_, EditorMessage> {
         // ── No workspace selected — placeholder ──────────────────────
@@ -4784,7 +4779,7 @@ impl EditorState {
     ///   placed *before* the three shared items listed above.
     /// * `full_path` — workspace-relative path used to compute absolute/relative
     ///   paths for the shared context menu items.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn render_tree_node_row<'a>(
         &'a self,
         guide: String,
@@ -4848,7 +4843,6 @@ impl EditorState {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn render_dir_node<'a>(
         &'a self,
         node: &'a widgets::TreeNode,
@@ -5350,7 +5344,6 @@ impl EditorState {
     }
 
     /// Build an [`Element`] from an editor content reference.
-    #[allow(clippy::too_many_arguments)]
     fn build_highlighted_editor<'a>(
         content: &'a super::editor_widget::EditorBuffer,
         buffer_key: Option<&'a str>,
@@ -5586,7 +5579,6 @@ impl EditorState {
 /// translate keyboard events into editor actions.  It is extracted to a
 /// standalone function so that `subscription()` focuses on timer setup and
 /// the shortcut logic is independently readable (and potentially testable).
-#[allow(clippy::too_many_lines)]
 fn map_editor_shortcut(event: keyboard::Event) -> Option<EditorMessage> {
     use keyboard::Key;
     let (key, modifiers, physical_key) = super::parse_key_press(event)?;

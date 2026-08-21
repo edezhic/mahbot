@@ -288,7 +288,7 @@ fn join_capped(values: &[String], cap: usize) -> String {
 /// otherwise as a capped comma list. Duplicates are collapsed before the
 /// contiguity check so `[5,6,6,8]` never renders as "5-8" (7 would be
 /// advertised as supported).
-#[allow(clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_wrap)]
 fn format_durations(durations: &[i64]) -> String {
     if let [single] = durations {
         return single.to_string();

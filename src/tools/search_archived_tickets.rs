@@ -91,7 +91,7 @@ impl SearchArchivedTicketsTool {
         Ok(results
             .into_iter()
             .map(|(id, score)| {
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(clippy::cast_possible_truncation)]
                 (id, score as f32)
             })
             .collect())

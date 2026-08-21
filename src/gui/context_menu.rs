@@ -387,7 +387,7 @@ fn item_index_from_y(rel_y: f32, item_count: usize) -> Option<usize> {
     if rel_y < 0.0 {
         return None;
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let idx = (rel_y / MENU_ITEM_HEIGHT) as usize;
     (idx < item_count).then_some(idx)
 }
@@ -400,7 +400,7 @@ where
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         let item_count = self.menu_items.len();
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(clippy::cast_precision_loss)]
         let menu_height = item_count as f32 * MENU_ITEM_HEIGHT + MENU_PADDING * 2.0;
 
         // Compute the widest label using the renderer's text measurement.
@@ -474,7 +474,7 @@ where
         let text_size = Pixels(MENU_FONT_SIZE);
 
         for (i, item) in self.menu_items.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let item_y = bounds.y + MENU_PADDING + i as f32 * MENU_ITEM_HEIGHT;
             let item_bounds = Rectangle {
                 x: bounds.x,

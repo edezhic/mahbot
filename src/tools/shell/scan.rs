@@ -188,7 +188,6 @@ fn heredoc_terminator_matches(
 /// - Heredoc bodies that contain the delimiter within quotes are not detected
 ///   (a heredoc body containing a quoted delimiter line would end early).
 /// - Multi-line engineered inputs are unlikely in practice.
-#[allow(clippy::too_many_lines)] // security-critical heredoc state machine
 pub(super) fn strip_heredoc_bodies(command: &str) -> String {
     let chars: Vec<(usize, char)> = command.char_indices().collect();
     let mut out = String::with_capacity(command.len());

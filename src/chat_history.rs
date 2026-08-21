@@ -142,7 +142,7 @@ impl ChatHistoryStore {
         ws2: Option<&str>,
         before_id: Option<i64>,
     ) -> Result<(Vec<ChatHistoryEntry>, bool)> {
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         let query_limit = HISTORY_LIMIT as i64 + 1; // fetch one extra to detect has_more
         let rows = match ws2 {
             // Two-workspace merge (selected + personal): OR predicate, merged

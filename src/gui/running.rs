@@ -73,7 +73,7 @@ const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
 /// confirmation lives on the [`Dashboard`](super::Dashboard) so the dialog
 /// requires no per-run page state beyond the pending confirmation itself.
 #[derive(Debug, Clone)]
-#[allow(clippy::enum_variant_names)] // the Cancel* names are deliberate — one cancel flow, four stages
+#[expect(clippy::enum_variant_names)] // the Cancel* names are deliberate — one cancel flow, four stages
 pub(crate) enum RunningMessage {
     /// Cancel button pressed on a research-run group header. Carries the
     /// run's durable job id — NEVER rendered as text; the button action

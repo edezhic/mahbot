@@ -384,7 +384,7 @@ fn item_index_from_y(rel_y: f32, item_count: usize) -> Option<usize> {
         return None;
     }
     let slot = ITEM_HEIGHT + ITEM_SPACING;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let idx = (rel_y / slot) as usize;
     if idx >= item_count {
         return None;
@@ -392,7 +392,7 @@ fn item_index_from_y(rel_y: f32, item_count: usize) -> Option<usize> {
     // Only the ITEM_HEIGHT-tall portion of each slot is a hit target; the
     // trailing ITEM_SPACING gap between items must not map to the item
     // above it (no hover highlight / action on dead space).
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     let within_item = rel_y - idx as f32 * slot < ITEM_HEIGHT;
     within_item.then_some(idx)
 }
@@ -431,9 +431,9 @@ fn popup_position(anchor: Rectangle, menu_size: Size, viewport: Size, gap: f32) 
 /// Popup height for `item_count` entries: panel padding on both sides plus
 /// item slots separated by `ITEM_SPACING`.
 fn menu_height(item_count: usize) -> f32 {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     let items = item_count as f32;
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     let gaps = item_count.saturating_sub(1) as f32;
     MENU_PADDING * 2.0 + items * ITEM_HEIGHT + gaps * ITEM_SPACING
 }
@@ -501,7 +501,7 @@ where
 
         let slot = ITEM_HEIGHT + ITEM_SPACING;
         for (i, item) in self.items.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let item_y = bounds.y + MENU_PADDING + i as f32 * slot;
             let item_bounds = Rectangle {
                 x: bounds.x,
@@ -509,7 +509,6 @@ where
                 width: bounds.width,
                 height: ITEM_HEIGHT,
             };
-            #[allow(clippy::cast_precision_loss)]
             let label_width = self.label_widths.get(i).copied().unwrap_or_default();
             draw_item(
                 renderer,

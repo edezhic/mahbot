@@ -225,7 +225,7 @@ impl SessionsState {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(crate) fn update(&mut self, msg: SessionsMessage) -> Task<SessionsMessage> {
         match msg {
             SessionsMessage::AnimTick(instant) => {
@@ -416,7 +416,7 @@ impl SessionsState {
     /// messages, group tool-call rounds, and apply the 3-line collapse rule
     /// to regular messages and stray tool results (tool rounds and thinking
     /// blocks keep their own collapse).
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn render_transcript<'a>(
         messages: &'a [ChatMessage],
         ctx: &TranscriptCtx<'a>,
@@ -866,7 +866,7 @@ impl SessionsState {
             .into()
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub(crate) fn view(&self) -> Element<'_, SessionsMessage> {
         let mut content = column![];
 

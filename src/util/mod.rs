@@ -144,7 +144,7 @@ pub(crate) fn is_word_char(c: char) -> bool {
 ///
 /// Returns `u64` — sufficient for timestamps up to ~500 million years from now.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -544,7 +544,7 @@ pub(crate) async fn load_reference_image(
         if step >= REFERENCE_COMPRESSION_LADDER.len() {
             // Exact bytes + decimal MB ("1500000 bytes (1.5 MB)") — errors
             // must not confuse MiB with MB.
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             let cap = format!(
                 "{} bytes ({:.1} MB)",
                 max_bytes,
@@ -647,13 +647,13 @@ fn compress_reference_step(bytes: &[u8], step: usize) -> anyhow::Result<Vec<u8>>
     }
     let img = if scale < 1.0 {
         let (w, h) = img.dimensions();
-        #[allow(
+        #[expect(
             clippy::cast_precision_loss,
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss
         )]
         let nw = (w as f32 * scale).round().max(1.0) as u32;
-        #[allow(
+        #[expect(
             clippy::cast_precision_loss,
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss
@@ -705,17 +705,8 @@ fn flatten_alpha_onto_white(img: &image::DynamicImage) -> image::RgbImage {
     let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
     for (x, y, px) in rgba.enumerate_pixels() {
         let [r, g, b, a] = px.0;
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
         let alpha = f32::from(a) / 255.0;
-        #[allow(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let blend = |c: u8| (f32::from(c) * alpha + 255.0 * (1.0 - alpha)).round() as u8;
         rgb.put_pixel(x, y, image::Rgb([blend(r), blend(g), blend(b)]));
     }
@@ -1130,7 +1121,7 @@ fn unescape_c_style(input: &str) -> Option<String> {
 /// If aliasing artifacts prove problematic, a sinc-based resampler can be
 /// substituted here — all call sites benefit automatically.
 #[must_use]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
@@ -1616,7 +1607,6 @@ mod unescape_c_style_tests {
 ///
 /// Only used by the voice-pipeline benchmark (`voice-tests` feature) — the
 /// production wake-word pipeline no longer performs PCM augmentation.
-#[allow(clippy::cast_precision_loss)]
 #[cfg(feature = "voice-tests")]
 pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f32> {
     const NUM_OCTAVES: usize = 16;
@@ -1686,7 +1676,6 @@ pub(crate) enum NoiseColor {
 /// target, clamped mix) with the color selector.  `Brown` is a leaky
 /// integration of white noise (DC-free-ish, low-frequency dominant).
 /// Bench-only (`voice-tests`).
-#[allow(clippy::cast_precision_loss)]
 #[cfg(feature = "voice-tests")]
 pub(crate) fn add_noise_color(pcm: &[f32], snr_db: f32, color: NoiseColor, seed: u64) -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -1719,7 +1708,7 @@ pub(crate) fn add_noise_color(pcm: &[f32], snr_db: f32, color: NoiseColor, seed:
 /// instead of hand-rolling `sum(x²)/n → sqrt`.  Callers that need a
 /// divide-by-zero floor for degenerate all-zero input apply `.max(1e-10)` at
 /// the call site — it is deliberately NOT part of this function.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -1772,7 +1761,7 @@ pub(crate) fn sample_gaussian_pair_clamped(rng: &mut impl rand::Rng) -> (f32, f3
 /// performs PCM augmentation.
 #[must_use]
 #[cfg(feature = "voice-tests")]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
@@ -2128,7 +2117,6 @@ mod reference_image_tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::cast_possible_truncation)]
     async fn over_cap_is_compressed_under_cap() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("big.png");

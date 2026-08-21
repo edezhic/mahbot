@@ -244,7 +244,7 @@ impl ModelCallMarker {
 /// Record one durable `llm_requests` row for a media-transcription call
 /// (fail-open; usage columns stay NULL, retry_attempts always 1).
 /// `finish_reason` on success, `failure_class` on failure.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 async fn record_transcription(
     call: &crate::stats::LlmCallMeta,
     started: std::time::Instant,

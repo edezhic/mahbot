@@ -58,7 +58,7 @@ pub(crate) const VALIDATED_MIX_OUTPUT: f64 = 0.009;
 /// adjustment here.
 #[must_use]
 // usize→f64 is exact for request counts far below 2^53; cost math needs floats.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 pub(crate) fn estimate_cost(
     price: &Pricing,
     total_tokens: f64,
@@ -388,7 +388,7 @@ fn pad_to_three(
 /// never more than the healthy count (`ceil(0.8H) <= H`); the plan builder
 /// special-cases H == 0 → 0 separately.
 #[must_use]
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
@@ -431,7 +431,7 @@ fn median_of(indices: &[usize], input: &[SelectionInput]) -> f64 {
 /// the whole cap.
 #[must_use]
 // usize→f64 is exact for counts far below 2^53; the guard is a cost ratio.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 pub(crate) fn plan_cost(
     selected: &[SelectionDecision],
     inputs: &[SelectionInput],

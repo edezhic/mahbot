@@ -112,7 +112,7 @@ pub(crate) async fn broadcast_and_persist_agent_response(
 /// responses, and any future message types.  The caller is responsible
 /// for generating a stable [`message_id`] and [`timestamp`] if they need
 /// to correlate the broadcast event with a persist operation.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn broadcast_chat_event(
     message_id: &str,
     user_name: &str,

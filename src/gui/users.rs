@@ -161,7 +161,7 @@ impl UsersState {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: UsersMessage) -> Task<UsersMessage> {
         match msg {
             UsersMessage::Refreshed(users, ws_options) => {

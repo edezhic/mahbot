@@ -189,7 +189,7 @@ pub(crate) fn compute_gutter_digits(line_numbers: &[(Option<usize>, Option<usize
 
 /// Pixel width for a dual-column old/new line-number gutter.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 const fn gutter_width_from_digits(digits: usize) -> f32 {
     digits as f32 * GUTTER_DIGIT_WIDTH * 2.0 + 14.0
 }
@@ -462,7 +462,7 @@ where
         layout::Node::new(Size::new(bounds.width, total_height + self.padding * 2.0))
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn draw(
         &self,
         tree: &Tree,
@@ -1177,7 +1177,7 @@ mod tests {
     fn test_gutter_column_positions_are_right_edges() {
         let width = gutter_width_from_digits(3);
         let (old_right, new_right) = gutter_column_right_edges(10.0, 8.0, width);
-        #[allow(clippy::float_cmp)]
+        #[expect(clippy::float_cmp)]
         {
             assert_eq!(old_right, 10.0 + 8.0 + width / 2.0);
             assert_eq!(new_right, 10.0 + 8.0 + width);

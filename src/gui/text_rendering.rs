@@ -106,7 +106,7 @@ pub(crate) fn reshape_and_shape(
 /// lines. Each source line is capped at [`MAX_VISUAL_LINES_PER_SOURCE`]
 /// visual lines as a safety limit against pathological single lines
 /// (e.g. no-whitespace megabyte lines).
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 pub(crate) fn compute_total_height(
     buffer: &mut cosmic_text::Buffer,
     font_sys: &mut cosmic_text::FontSystem,
@@ -209,7 +209,7 @@ pub(crate) fn gutter_clip_rect(
 ///
 /// * `x_offset` / `width` — the highlight position and span returned by
 ///   [`LayoutRun::highlight`].
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn draw_highlight_background<Renderer>(
     renderer: &mut Renderer,
     text_clip: Rectangle,
@@ -288,7 +288,7 @@ pub(crate) fn draw_buffer_text<Renderer>(
 /// once runs fall entirely below the range, since runs are yielded in
 /// ascending y order — so per-frame cost scales with the visible content.
 /// Pass `None` to process every run (previous behaviour).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn draw_run_highlights<Renderer, F>(
     renderer: &mut Renderer,
     buffer: &cosmic_text::Buffer,
@@ -342,7 +342,7 @@ pub(crate) fn draw_run_highlights<Renderer, F>(
 
 /// Convert an [`iced::Color`] (f32 RGBA components, 0.0–1.0) to
 /// [`cosmic_text::Color`] (u8 RGB).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn iced_color_to_cosmic(c: Color) -> cosmic_text::Color {
     let r = (c.r * 255.0).round() as u8;
     let g = (c.g * 255.0).round() as u8;

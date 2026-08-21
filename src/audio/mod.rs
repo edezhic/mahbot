@@ -122,7 +122,7 @@ pub(crate) async fn run_download_retry_loop<D, L, F>(
 /// [`DownloadSizeCheck::None`](crate::util::http::DownloadSizeCheck::None),
 /// spawn_blocking pre-check) or `embedder.rs` (existence-only pre-check,
 /// [`DownloadSizeCheck::Exact`](crate::util::http::DownloadSizeCheck::Exact)).
-#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+#[expect(clippy::cast_precision_loss, clippy::too_many_arguments)]
 pub(crate) async fn ensure_downloaded(
     client: Option<&reqwest::Client>,
     path: &Path,

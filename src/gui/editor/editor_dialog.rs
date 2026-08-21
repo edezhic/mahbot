@@ -350,7 +350,7 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
 
 /// Build the global search (find-in-files) overlay: a search input with
 /// status line and results list, wrapped in a centered overlay dialog.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) fn build_global_search_overlay(
     gs: &GlobalSearchState,
 ) -> Element<'static, EditorMessage> {

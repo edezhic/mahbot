@@ -709,7 +709,7 @@ async fn dry_run(opts: &BenchOptions) -> i32 {
 /// point).
 // One long sequential orchestration (steps 1-15); splitting it
 // would obscure the step ordering.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn full_run(opts: &BenchOptions) -> i32 {
     use std::sync::Mutex;
     use std::time::Duration;
@@ -958,7 +958,7 @@ pub(crate) fn rounds_per_provider(ladder_secs: &[u64]) -> usize {
 /// (`prefix_chars / chars-per-token`) across all rounds, plus the fixed
 /// prompt-history growth.
 #[must_use]
-#[allow(clippy::cast_precision_loss)] // usize→f64 exact below 2^53; estimate math
+#[expect(clippy::cast_precision_loss)] // usize→f64 exact below 2^53; estimate math
 pub(crate) fn total_tokens_estimate(prefix_chars: usize, rounds: usize) -> f64 {
     (prefix_chars as f64 / CHARS_PER_TOKEN) * rounds as f64 + HISTORY_GROWTH_TOKENS
 }

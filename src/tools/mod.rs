@@ -459,7 +459,7 @@ impl VideoJobLabels {
 /// poll for completion (1-hour wall-clock deadline), download the result, and
 /// validate it is a real MP4. Returns the video bytes; callers save the file
 /// and format the media marker.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn fetch_async_video(
     api_base: &str,
     body: &serde_json::Value,

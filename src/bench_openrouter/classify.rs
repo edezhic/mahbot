@@ -53,7 +53,7 @@ impl CacheClassification {
 /// ratio < 0.1 → Drop, in between → Partial.
 #[must_use]
 // u64→f64 is exact for token counts far below 2^53 — ratio math needs floats.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 pub(crate) fn classify_round(cached: u64, expected_cached: u64) -> CacheClassification {
     if expected_cached == 0 {
         return CacheClassification::NotSupported;
@@ -232,7 +232,7 @@ pub(crate) fn format_bucket(lo: f64, hi: f64) -> String {
 /// `{h}h` (else, rounded).
 #[must_use]
 // Inputs are non-negative gap seconds; round-then-truncate is the intent.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn format_duration(secs: f64) -> String {
     if secs == 0.0 {
         "0s".to_string()

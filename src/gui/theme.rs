@@ -388,7 +388,7 @@ pub fn format_hhmmss(ts: &str) -> &str {
 /// Values that would round up past a unit boundary are rendered in the next
 /// unit (999_999 → "1.0M", never "1000.0k"). Shared by the Running Agents
 /// card and the Sessions page session cards.
-#[allow(clippy::cast_precision_loss)] // token counts are far below f64's 2^53 exact range
+#[expect(clippy::cast_precision_loss)] // token counts are far below f64's 2^53 exact range
 pub(crate) fn format_compact_tokens(tokens: u64) -> String {
     if tokens < 1_000 {
         tokens.to_string()

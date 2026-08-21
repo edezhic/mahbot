@@ -223,7 +223,7 @@ impl Agent {
     /// parent is a ticket; callers of analyze/research rounds pass the
     /// question/task text explicitly.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // one positional arg per construction field; callers use literals
+    #[expect(clippy::too_many_arguments)] // one positional arg per construction field; callers use literals
     pub fn new(
         agent_id: String,
         role: crate::Role,
@@ -749,7 +749,6 @@ impl Agent {
     }
 
     /// Execute a single tool call and return the result.
-    #[allow(clippy::too_many_lines)]
     async fn execute_tool(
         &self,
         call_name: &str,
@@ -1704,7 +1703,7 @@ where
 ///
 /// Returns `(agent, Some(response))` on success.
 /// Returns `(agent, None)` on cancellation (discard result) or error (already logged).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     agent_id: String,
     role: crate::Role,
@@ -2029,7 +2028,6 @@ mod tests {
     /// concurrent test consulting is_draining() could be misclassified during
     /// the assertion window (project convention: retry_tests_lock).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn failure_classification_recognizes_drain() {
         let _guard = crate::util::test::retry_tests_lock();
         let agent = make_agent(vec![]);
@@ -2124,7 +2122,7 @@ mod tests {
     // ── extract_media_from_outcomes tests ───────────────────────────────────
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn extract_media_outcomes_consolidated() {
         enum ToolDef {
             /// [`Media`] carries a marker prefix; [`NonMedia`] uses a unit variant because
@@ -2656,7 +2654,7 @@ mod tests {
     /// retry budget exhausts) still fires the first-call signal — followers
     /// are released immediately instead of waiting out the bound.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn leader_first_call_failure_still_fires_signal() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -2766,7 +2764,7 @@ mod tests {
     /// (assistant reasoning payload + the resume nudge), and the nudge never
     /// appears in the original request.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_recovers_reasoning_only_stop_via_continuation() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -2806,7 +2804,7 @@ mod tests {
     /// appends its own (assistant reasoning + nudge) pair, so the request
     /// prefix stays byte-stable and only the tail grows.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_accumulates_tail_until_answer() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -2865,7 +2863,7 @@ mod tests {
     /// error, no provider-retry-exhaustion marker, no transcript trace, and
     /// granular "no_response" classification.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_exhaustion_fails_safely_without_leaking() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -2930,7 +2928,7 @@ mod tests {
     /// retried request is byte-identical, and exhaustion derives the final
     /// class from the last recorded failure (Transport, not NoResponse).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_transport_error_does_not_duplicate_tail() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -2984,7 +2982,7 @@ mod tests {
     /// A non-retryable provider error mid-recovery breaks immediately instead
     /// of burning the remaining budget, and keeps the granular class.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_non_retryable_error_breaks_immediately() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -3023,7 +3021,7 @@ mod tests {
     /// masked, even when the break happens before the first attempt (no
     /// request was ever sent, so there is also nothing to record in telemetry).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn recover_reasoning_only_stop_abort_classifies_as_shutdown() {
         let _guard = crate::util::test::retry_tests_lock();
         let agent = make_agent(vec![]);
@@ -3059,7 +3057,7 @@ mod tests {
     /// "a FAILED call never updates the value" invariant), even though the
     /// invisible in-class response carried real usage.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_exhaustion_does_not_update_session_length() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -3099,7 +3097,7 @@ mod tests {
     /// RESOLVING response only — the in-class response the continuation
     /// consumed is never recorded (no inflated value, no wasted double write).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_success_records_only_resolving_usage() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -3127,7 +3125,7 @@ mod tests {
 
     /// A normal answer or a tool-call turn never enters the continuation path.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_skips_continuation_for_normal_and_tool_call_turns() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -3168,7 +3166,7 @@ mod tests {
     /// Summarize recovers a reasoning-only stop via the same bounded
     /// continuation; the continuation answer becomes the summary.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn summarize_recovers_reasoning_only_stop_via_continuation() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -3201,7 +3199,7 @@ mod tests {
     /// empty-response error fires (warn + full history in `maybe_summarize`),
     /// and the thinking never leaks into the error.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn summarize_continuation_exhaustion_fails_open_without_leaking() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -3358,7 +3356,7 @@ mod tests {
     /// call carries the corrected message and the agent answers.
     #[tokio::test]
     #[serial_test::serial(active_models)] // seeds the process-global catalog caches
-    #[allow(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
     async fn rejected_input_image_is_stripped_and_run_continues() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -3448,7 +3446,7 @@ mod tests {
     /// failure path and the image stays in the session.
     #[tokio::test]
     #[serial_test::serial(active_models)] // seeds the process-global catalog caches
-    #[allow(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
     async fn text_content_rejection_follows_normal_failure_path() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
@@ -3492,7 +3490,7 @@ mod tests {
     /// retry loop).
     #[tokio::test]
     #[serial_test::serial(active_models)] // seeds the process-global catalog caches
-    #[allow(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
+    #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
     async fn subsequent_failure_after_strip_takes_normal_failure_path() {
         use crate::util::test::{
             FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,

@@ -274,7 +274,7 @@ impl LogsState {
         Subscription::batch([stream_sub, window::frames().map(LogMessage::AnimTick)])
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: LogMessage, log_store: &LogStore) -> Task<LogMessage> {
         match msg {
             LogMessage::Refreshed(tab, generation, entries, total) => {
@@ -555,7 +555,7 @@ impl LogsState {
     /// Render the bottom bar: pause button, pagination controls, and the
     /// search input. Pagination and search are bound to the active tab; pause
     /// is a single global control that works from every tab.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn bottom_bar(&self) -> Element<'_, LogMessage> {
         let (page, total_pages) = match self.tab_data(self.active_tab) {
             Some(d) => (d.pagination.page, d.pagination.total_pages()),
@@ -754,7 +754,6 @@ impl LogsState {
         base.into()
     }
 
-    #[allow(clippy::too_many_lines)]
     fn render_log_entry(entry: &LogEntry, fade_progress: f32) -> Element<'_, LogMessage> {
         let (level_color, level_bg) = theme::log_level_color(&entry.level);
 

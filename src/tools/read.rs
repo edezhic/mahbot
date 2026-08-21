@@ -623,7 +623,7 @@ struct LanguageSupport {
 }
 
 /// Single source of truth mapping extensions to tree-sitter language and symbol query.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn language_support(ext: &str) -> Option<LanguageSupport> {
     const TS_SYMBOL_QUERY: &str = r"(
             [

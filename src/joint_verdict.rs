@@ -165,7 +165,6 @@ pub(crate) async fn build_joint_comment(
 /// Run the repair-mode synthesis pass through the shared consensus core
 /// (1 full call + up to N-1 repair rounds; frozen groups; per-group
 /// acceptance; deterministic remainder placement; narrowed fail-open).
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) async fn run_synthesis(
     round: &JointRound<'_>,
     role: Role,
@@ -203,7 +202,6 @@ pub(crate) async fn run_synthesis(
 /// are not rendered — scores + issues are already persisted in the verdict
 /// store.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub(crate) fn render_joint_comment(
     round: &JointRound<'_>,
     outcome: &crate::consensus::RepairOutcome,

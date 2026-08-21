@@ -642,7 +642,6 @@ impl Tool for VideoEditTool {
         )
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         ws: &crate::Workspace,

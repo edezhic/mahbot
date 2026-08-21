@@ -80,7 +80,7 @@ pub struct ScoredResult {
 ///
 /// Encapsulates the rank-to-reciprocal-score mapping so it can be applied
 /// independently to each search source before summing across sources.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn accumulate_rrf(scores: &mut HashMap<String, f32>, mut results: Vec<(String, f32)>) {
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     for (rank, (id, _)) in results.into_iter().enumerate() {

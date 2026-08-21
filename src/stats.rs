@@ -428,7 +428,7 @@ async fn persist_llm_request(rec: &LlmRequestRecord) {
 }
 
 /// Emit a success LLM request stat for a completed operation.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) async fn record_llm_success(
     request: &crate::ChatRequest,
     started: std::time::Instant,
@@ -447,7 +447,7 @@ pub(crate) async fn record_llm_success(
 }
 
 /// Emit a failure LLM request stat for an exhausted operation.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 pub(crate) async fn record_llm_failure(
     request: &crate::ChatRequest,
     started: std::time::Instant,
@@ -532,7 +532,6 @@ mod tests {
     /// Integration test: write per-call records via flush_batch, then verify
     /// they can be read back via query_tool_usage and query_tool_errors.
     /// Uses the logs store (the consolidated home of the stats tables).
-    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn flush_and_query_round_trip() {
         let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");

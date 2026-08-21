@@ -89,7 +89,6 @@ impl EditTool {
     }
 
     /// Edit an existing file by replacing `old_string` with `new_string`.
-    #[allow(clippy::too_many_lines)]
     async fn execute_edit(
         &self,
         ws: &Workspace,

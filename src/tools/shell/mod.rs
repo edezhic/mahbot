@@ -751,7 +751,7 @@ impl ShellTool {
     /// The `formatted_output` includes the `[exit status: N]` annotation for
     /// non-zero exits and signal termination (same format as [`execute()`]).
     /// Credentials are already scrubbed from the returned output.
-    #[allow(clippy::too_many_lines)] // orchestration: validation, engine hook, containment
+    #[expect(clippy::too_many_lines)] // orchestration: validation, engine hook, containment
     pub(crate) async fn execute_with_status(
         &self,
         ws: &Workspace,
@@ -1468,7 +1468,7 @@ fn segment_ends_case(segment: &str) -> bool {
 /// stripped command into (segment, connector) pairs. Returns `None` when a
 /// connector follows an empty segment in a mode that errors on it (grep;
 /// blank-line and case-arm `;;` exceptions apply).
-#[allow(clippy::too_many_lines)] // quote/substitution state machine
+#[expect(clippy::too_many_lines)] // quote/substitution state machine
 pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut current = String::new();
@@ -2069,7 +2069,7 @@ fn parse_ls_line(line: &str) -> Option<(char, String, String)> {
 }
 
 /// Format a raw byte count into a human-readable size string.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn human_readable_size(size: &str) -> String {
     if let Ok(bytes) = size.parse::<u64>() {
         if bytes >= 1_000_000_000 {
@@ -2671,7 +2671,7 @@ mod tests {
         check_cargo_test_filter(cases);
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[test]
     fn profile_selection_cases() {
         // Profile selection/dispatch tests — consolidated table.
@@ -2834,7 +2834,7 @@ mod tests {
         check_shell_output(cases);
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     #[test]
     fn tool_profile_cases() {
         // Specific tool profile tests — consolidated table.

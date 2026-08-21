@@ -224,7 +224,7 @@ impl GitState {
     // ── Update / message handling ─────────────────────────────────
 
     /// Process a [`GitMessage`] and return any resulting tasks.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: GitMessage) -> Task<GitMessage> {
         match msg {
             // ── Refresh results ─────────────────────────────────

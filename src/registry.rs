@@ -202,7 +202,7 @@ impl AgentRegistry {
     /// `parent_label` is the human-readable label of the agent's DIRECT PARENT
     /// INVOCATION (ticket title / analyze question / research question) for the
     /// Running Agents group header — purely presentational.
-    #[allow(clippy::too_many_arguments)] // one positional arg per handle field; callers use literals
+    #[expect(clippy::too_many_arguments)] // one positional arg per handle field; callers use literals
     pub fn register(
         &self,
         agent_id: String,

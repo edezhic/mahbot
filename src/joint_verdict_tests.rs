@@ -534,7 +534,7 @@ fn synthesis_request_uses_global_flat_item_ids() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn run_synthesis_end_to_end_zero_based_contract() {
     let _lock = crate::util::test::retry_tests_lock();
     let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -595,7 +595,7 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn repair_rounds_freeze_groups_and_converge() {
     let _lock = crate::util::test::retry_tests_lock();
     let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -659,7 +659,7 @@ async fn repair_rounds_freeze_groups_and_converge() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn repair_zero_progress_with_no_frozen_groups_falls_back() {
     let _lock = crate::util::test::retry_tests_lock();
     let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -696,7 +696,7 @@ async fn repair_zero_progress_with_no_frozen_groups_falls_back() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn repair_contradiction_reference_renders_disputed() {
     let _lock = crate::util::test::retry_tests_lock();
     let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -742,7 +742,7 @@ async fn repair_contradiction_reference_renders_disputed() {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn repair_rejects_empty_member_group() {
     let _lock = crate::util::test::retry_tests_lock();
     let _policy = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());

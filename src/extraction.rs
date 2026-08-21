@@ -42,7 +42,7 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 /// Terminal failure is [`RetryExhausted`] — it carries the
 /// last-attempt raw text (`last_raw`, for verdict-extraction ticket comments) plus
 /// the per-attempt diagnostics trail.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     history: &[ChatMessage],
     extraction_prompt: &str,
@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_consecutive_transport_errors() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_truncated_envelope_parse_errors() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_llm_parse_failure_via_reprompt() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn exhausts_attempts_with_bounded_call_count() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn non_retryable_error_propagates_immediately() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn transport_final_failure_clears_earlier_text_from_last_raw() {
         // Mixed sequence: an early attempt produces text (parse failure), then
         // later attempts die on transport. The ticket comment must NOT label the
@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn tool_call_final_attempt_keeps_empty_last_raw() {
         // A tool-call final attempt (empty text) survives as Some("") so the
         // comment can state "final attempt was a tool call".
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn attempts_byte_identical_except_reprompt() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
@@ -402,7 +402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn score_out_of_range_never_passes_and_reprompts() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn score_out_of_range_all_attempts_classifies_as_out_of_range() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn wall_clock_cap_binds_before_attempt_exhaustion() {
         let _guard = retry_tests_lock();
         // 7 attempts but a 100 ms wall cap and 1 s backoff — the cap binds.
@@ -479,8 +479,7 @@ mod tests {
     /// row keeps cost/provider NULL (no envelope on the failure path).
     /// Catches the extraction path drifting from the recorded request.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // comprehensive end-to-end telemetry guard
-    #[allow(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn extraction_rows_record_base_params_and_retry_context() {
         let _guard = retry_tests_lock();
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());

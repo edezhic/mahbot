@@ -42,7 +42,7 @@ impl DiscoveryClient {
     /// construction in the process installs it idempotently.
     #[must_use]
     // Spec-pinned 60s request timeout (from_secs states the 60s intent directly).
-    #[allow(clippy::duration_suboptimal_units)]
+    #[expect(clippy::duration_suboptimal_units)]
     pub(crate) fn new(key: String) -> Self {
         install_ring_provider();
         let client = reqwest::Client::builder()

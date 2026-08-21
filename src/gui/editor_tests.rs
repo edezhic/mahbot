@@ -615,7 +615,7 @@ fn test_toggle_dir_no_workspace_returns_none() {
 
 // ── Git status porcelain parsing tests ─────────────────────────
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[test]
 fn test_parse_git_status_porcelain() {
     struct Case {
@@ -782,7 +782,7 @@ fn test_is_find_bar_open() {
     assert!(!state.is_find_bar_open());
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[test]
 fn test_find_replace_auto_advance() {
     // Verifies cursor auto-advance after find_replace across five scenarios:
@@ -1004,7 +1004,7 @@ fn test_navigate_find_match_only_affects_find_tab() {
 
 // ── Tree arrow-key navigation tests ─────────────────────────────
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 #[test]
 fn test_tree_nav_left_right() {
     struct Case {
@@ -1752,7 +1752,7 @@ fn test_rename_mutual_exclusion_cancelled_by_other_modals() {
 fn test_rekey_keys() {
     // (name, old_prefix, new_prefix, keys, expected pairs)
     #[rustfmt::skip]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     let cases: &[(&str, &str, &str, &[&str], &[(&str, &str)])] = &[
         ("empty", "old/", "new/", &[], &[]),
         ("no_match", "old/", "new/", &["a", "b"], &[]),

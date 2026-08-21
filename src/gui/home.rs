@@ -504,7 +504,6 @@ impl HomeState {
     /// [`DisplayMessage`], marks the canonical ID as seen, clears `sending`,
     /// and returns `Some(snap_task)` so the caller can early-return.
     /// Returns `None` when no replacement was performed.
-    #[allow(clippy::too_many_arguments)]
     fn replace_optimistic(
         &mut self,
         optimistic_id: Option<&str>,
@@ -600,7 +599,6 @@ impl HomeState {
     /// The caller should call [`maybe_snap()`](Self::maybe_snap)
     /// unconditionally after this (snap is always safe when nothing was
     /// appended).
-    #[allow(clippy::too_many_arguments)]
     fn append_message(
         &mut self,
         user_name: &str,
@@ -622,7 +620,7 @@ impl HomeState {
         ));
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn view(
         &self,
         active_role: Option<Role>,
@@ -1032,7 +1030,7 @@ impl HomeState {
         iced::Subscription::batch(subs)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: HomeMessage) -> Task<HomeMessage> {
         match msg {
             HomeMessage::UserSelected(user) => {

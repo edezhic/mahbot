@@ -233,7 +233,7 @@ impl ToggleKind {
 }
 
 #[derive(Debug, Clone)]
-#[allow(private_interfaces)]
+#[expect(private_interfaces)]
 pub enum Message {
     /// MahBot finished async startup (or failed). On success, [`BOOT_LOG_STORE`] is set.
     Boot(Result<(), String>),
@@ -1118,7 +1118,7 @@ impl Dashboard {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // ── Centralized Toast and LinkClicked interception ──────────
         // Intercepted at the Dashboard level (before page dispatch)
@@ -1483,7 +1483,7 @@ impl Dashboard {
     }
 
     /// Handle a TTS download progress event.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn handle_tts_download_event(
         &mut self,
         event: crate::audio::tts::TtsDownloadEvent,
@@ -1667,7 +1667,7 @@ impl Dashboard {
             .is_some_and(|n| !n.is_empty())
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, Message> {
         if let Some(err) = &self.boot_error {
             return container(
@@ -2755,7 +2755,7 @@ impl Dashboard {
         let Some((file_name, progress)) = &self.tts_download_progress else {
             return Space::new().width(0).into();
         };
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (progress * 100.0).round() as u32;
         let label = format!("TTS: {file_name} {pct}%");
         container(text(label).size(12).color(theme::TEXT_MUTED))
@@ -2867,7 +2867,7 @@ pub struct WindowState {
 
 impl WindowState {
     /// Position to use when restoring the window.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     #[must_use]
     pub const fn position(&self) -> iced::window::Position {
         iced::window::Position::Specific(iced::Point::new(self.x as f32, self.y as f32))
@@ -2902,7 +2902,7 @@ pub fn read_window_state() -> WindowState {
 }
 
 /// Save current window geometry and last-used workspace to `~/.mahbot/window-state.json`.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn save_window_state(
     pos: iced::Point,
     size: iced::Size,
