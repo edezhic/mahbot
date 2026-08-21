@@ -10,7 +10,6 @@ use crate::util::UnwrapPoison;
 pub struct MediaTranscriber {
     api_url: String,
     model: String,
-    provider_route: Option<String>,
 }
 
 /// Overall cap for one video transcription (ephemeral upload + model call).
@@ -21,12 +20,8 @@ const VIDEO_TRANSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 impl MediaTranscriber {
     #[must_use]
-    pub(crate) fn new(api_url: String, model: String, provider_route: Option<String>) -> Self {
-        Self {
-            api_url,
-            model,
-            provider_route,
-        }
+    pub(crate) fn new(api_url: String, model: String) -> Self {
+        Self { api_url, model }
     }
 
     fn chat_url(&self) -> String {
@@ -44,7 +39,7 @@ impl MediaTranscriber {
         marker: Option<&ModelCallMarker>,
     ) -> anyhow::Result<RawTranscription> {
         let prompt = crate::prompt::load_prompt("media_transcription.md");
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "model": self.model,
             "messages": [
                 {
@@ -58,12 +53,6 @@ impl MediaTranscriber {
             "max_tokens": 2048,
             "reasoning": {"enabled": false},
         });
-
-        if let Some(route) = &self.provider_route
-            && let Some(routing) = crate::providers::provider_routing_json(route)
-        {
-            body["provider"] = routing;
-        }
 
         if let Some(marker) = marker {
             marker.mark();
@@ -151,7 +140,7 @@ impl MediaTranscriber {
                 ticket_id: None,
             },
             model: self.model.clone(),
-            provider_order: self.provider_route.clone(),
+            provider_order: None,
         };
         (live, call)
     }

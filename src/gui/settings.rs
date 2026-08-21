@@ -13,9 +13,9 @@ use crate::Role;
 use crate::Workspace;
 use crate::config::{
     CONFIG, CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY,
-    CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_MULTIMODAL_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT,
-    CONFIG_KEY_PROVIDER_ENDPOINT_KEY, CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
-    CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER,
+    CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
+    CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_TTS_ENABLED,
+    CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL, CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER,
     CONFIG_KEY_WORKER_MODEL, ConfigData, ModelRouting,
 };
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
@@ -414,7 +414,7 @@ const TEXT_INPUT_KEYS: &[&str] = &[
     CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_MANAGER_MODEL,
     CONFIG_KEY_WORKER_MODEL,
-    CONFIG_KEY_MULTIMODAL_MODEL,
+    CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
 ];
 
 /// Config keys rendered as discrete controls (toggles / pick lists) that
@@ -2676,7 +2676,7 @@ impl SettingsState {
             .style(super::widgets::text_input_style)
             .width(Length::Fixed(375.0))
             .into(),
-            Some("Manager"),
+            Some("Manager, Assistant"),
             self.field_errors
                 .get("config:manager_model")
                 .map(String::as_str),
@@ -2697,35 +2697,40 @@ impl SettingsState {
             .style(super::widgets::text_input_style)
             .width(Length::Fixed(375.0))
             .into(),
-            Some("Engineer, Analyst, Coder, QA, Reviewer, Discovery, Maintainer, Sanitation"),
+            Some(
+                "Artist, Engineer, Analyst, Coder, QA, Reviewer, Discovery, Maintainer, Sanitation",
+            ),
             self.field_errors
                 .get("config:worker_model")
                 .map(String::as_str),
         );
-        let multimodal_row = field_row_with_error(
-            "Multimodal",
+        let video_transcription_row = field_row_with_error(
+            "Video Transcription",
             text_input(
-                crate::config::DEFAULT_MULTIMODAL_MODEL,
-                self.config.multimodal_model.as_deref().unwrap_or_default(),
+                crate::config::DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
+                self.config
+                    .video_transcription_model
+                    .as_deref()
+                    .unwrap_or_default(),
             )
             .on_input(|v| SettingsMessage::ConfigField {
-                key: CONFIG_KEY_MULTIMODAL_MODEL,
+                key: CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
                 value: v,
             })
             .on_submit(SettingsMessage::ConfigFieldSettleNow {
-                field: "config:multimodal_model".into(),
+                field: "config:video_transcription_model".into(),
             })
             .style(super::widgets::text_input_style)
             .width(Length::Fixed(375.0))
             .into(),
-            Some("Artist, Assistant, and video transcription"),
+            Some("Video transcription only"),
             self.field_errors
-                .get("config:multimodal_model")
+                .get("config:video_transcription_model")
                 .map(String::as_str),
         );
         section(
             "Models",
-            column![manager_row, worker_row, multimodal_row].spacing(4),
+            column![manager_row, worker_row, video_transcription_row].spacing(4),
         )
     }
 
@@ -3327,8 +3332,9 @@ impl SettingsState {
     }
 
     fn routing_section(&self) -> Element<'_, SettingsMessage> {
-        // The three effective model slots — saved routing rows for models
-        // outside these slots are not rendered (they are inert orphans).
+        // The two routable model slots (manager and worker) — saved routing
+        // rows for models outside these slots are not rendered (they are inert
+        // orphans). The video-transcription model never consults routing.
         let mut model_names: BTreeSet<String> = BTreeSet::new();
         model_names.insert(crate::config::resolve_or(
             self.config.manager_model.clone(),
@@ -3337,10 +3343,6 @@ impl SettingsState {
         model_names.insert(crate::config::resolve_or(
             self.config.worker_model.clone(),
             crate::config::DEFAULT_WORKER_MODEL,
-        ));
-        model_names.insert(crate::config::resolve_or(
-            self.config.multimodal_model.clone(),
-            crate::config::DEFAULT_MULTIMODAL_MODEL,
         ));
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();

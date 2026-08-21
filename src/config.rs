@@ -57,12 +57,13 @@
 //!
 //! `config_kv` table → hardcoded slot default (`const` in this module)
 //!
-//! The three model slots — `manager_model`, `worker_model`, `multimodal_model`
-//! — are ordinary Chain 1 fields. [`ConfigReload::role_model`] maps every role
-//! onto exactly one slot:
+//! The three model slots — `manager_model`, `worker_model`,
+//! `video_transcription_model` — are ordinary Chain 1 fields.
+//! [`ConfigReload::role_model`] maps every role onto exactly one slot:
 //!
-//! > `Role::Manager` → manager slot; `Role::Artist` | `Role::Assistant` →
-//! > multimodal slot; every other role → worker slot
+//! > `Role::Manager` | `Role::Assistant` → manager slot; every other role
+//! > (including Artist) → worker slot. The video-transcription slot backs
+//! > only video transcription — no role uses it.
 //!
 //! Unset slots fall back to their `DEFAULT_*_MODEL` constant. The legacy
 //! `config_role` table (per-role overrides) is no longer read or written —
@@ -106,7 +107,9 @@
 //! untouched, and no code path reads or writes them. (`adaptive_k`'s accessor
 //! is `fixed` since mahbot-1825 — the persisted row is never read — and the
 //! settings UI no longer renders a control for it, so nothing writes the row
-//! either.)
+//! either.) The renamed `multimodal_model` config_kv key is likewise inert
+//! since mahbot-1891 — the slot is now `video_transcription_model`, so any
+//! legacy row under the old key is no longer read.
 //!
 //! # See also
 //!
@@ -130,7 +133,7 @@ pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1
 
 pub(crate) const DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-pro-0813";
 pub(crate) const DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
-pub(crate) const DEFAULT_MULTIMODAL_MODEL: &str = "qwen/qwen3.7-flash";
+pub(crate) const DEFAULT_VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.7-flash";
 
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
 const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
@@ -251,8 +254,8 @@ pub struct ConfigData {
     /// Model slot for all worker roles (Engineer, Analyst, Coder, QA,
     /// Reviewer, Discovery, Maintainer, Sanitation).
     pub worker_model: Option<String>,
-    /// Model slot for Artist and Assistant roles and video transcription.
-    pub multimodal_model: Option<String>,
+    /// Model slot for video transcription (no role uses it).
+    pub video_transcription_model: Option<String>,
     /// Image generation model.
     pub image_gen_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
@@ -543,7 +546,7 @@ string_config_fields! {
     provider_endpoint_key [non_empty],
     manager_model [or(DEFAULT_MANAGER_MODEL)],
     worker_model [or(DEFAULT_WORKER_MODEL)],
-    multimodal_model [or(DEFAULT_MULTIMODAL_MODEL)],
+    video_transcription_model [or(DEFAULT_VIDEO_TRANSCRIPTION_MODEL)],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
     video_model [or(DEFAULT_VIDEO_MODEL)],
@@ -905,14 +908,13 @@ impl ConfigReload {
 
     /// Resolve the configured model for a role from the three model slots.
     ///
-    /// Manager uses the manager slot; Artist and Assistant use the multimodal
-    /// slot; every other role uses the worker slot. Unset slots fall back to
-    /// their code default.
+    /// Manager and Assistant use the manager slot; every other role (including
+    /// Artist) uses the worker slot. Unset slots fall back to their code
+    /// default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
         match role {
-            Role::Manager => self.manager_model(),
-            Role::Artist | Role::Assistant => self.multimodal_model(),
+            Role::Manager | Role::Assistant => self.manager_model(),
             _ => self.worker_model(),
         }
     }
@@ -1036,13 +1038,11 @@ async fn seed_fresh_install_defaults(
     // Derived from the default-model constants filtered by the lowercase
     // `deepseek/` prefix so the seed follows the defaults if they ever change;
     // every other default model gets no routing override (OpenRouter
-    // auto-routes). Existing installs receive zero writes — the `fresh` guard
-    // above already returned for them.
-    for default_model in [
-        DEFAULT_MANAGER_MODEL,
-        DEFAULT_WORKER_MODEL,
-        DEFAULT_MULTIMODAL_MODEL,
-    ] {
+    // auto-routes). The video-transcription default gets no routing seed —
+    // routing applies only to the manager and worker model slots. Existing
+    // installs receive zero writes — the `fresh` guard above already returned
+    // for them.
+    for default_model in [DEFAULT_MANAGER_MODEL, DEFAULT_WORKER_MODEL] {
         if default_model.starts_with("deepseek/") {
             store
                 .save_model_routing(default_model, Some("DeepSeek"))
@@ -1300,10 +1300,10 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
             }
             write_kv_and_update_config(CONFIG_KEY_IMAGE_GEN_MODEL, &trimmed).await?;
         }
-        // Multimodal model changes rebuild the media transcriber (no provider
-        // warmup — the provider is unaffected by this) — the transcriber
-        // captures the model at build time.
-        CONFIG_KEY_MULTIMODAL_MODEL => {
+        // Video transcription model changes rebuild the media transcriber (no
+        // provider warmup — the provider is unaffected by this) — the
+        // transcriber captures the model at build time.
+        CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL => {
             write_kv_and_update_config(key, &trimmed).await?;
             crate::providers::recreate_media_transcriber();
         }
@@ -1321,17 +1321,13 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
 
 /// Persist a settled per-model routing `provider_order` (`""` clears it).
 ///
-/// Returns the canonical order value. When the routed model is the effective
-/// Multimodal model, the media transcriber is rebuilt — it captures its
-/// provider route at build time.
+/// Returns the canonical order value. Routing applies only to the manager and
+/// worker model slots — the video-transcription model never consults routing,
+/// so persisting a routing row for it is a no-op for the transcriber.
 pub async fn persist_settled_routing_order(model: &str, order: &str) -> Result<String> {
     let _guard = persist_lock().lock().await;
     let order = trimmed_or_none(order);
-    let persisted = save_routing_row(model, order).await?;
-    if CONFIG.multimodal_model() == model {
-        crate::providers::recreate_media_transcriber();
-    }
-    Ok(persisted)
+    save_routing_row(model, order).await
 }
 
 /// Write a single routing row (UPSERT or DELETE-if-empty) and mirror it into
@@ -1517,9 +1513,9 @@ mod tests {
             "unset worker_model falls back to default"
         );
         assert_eq!(
-            reload.multimodal_model(),
-            DEFAULT_MULTIMODAL_MODEL,
-            "unset multimodal_model falls back to default"
+            reload.video_transcription_model(),
+            DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
+            "unset video_transcription_model falls back to default"
         );
 
         // ── or: persisted provider_endpoint is honored (custom endpoint) ──
@@ -1867,7 +1863,7 @@ mod tests {
             CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
             CONFIG_KEY_TELEGRAM_BOT_TOKEN,
             CONFIG_KEY_IMAGE_GEN_MODEL,
-            CONFIG_KEY_MULTIMODAL_MODEL,
+            CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
             CONFIG_KEY_WAKE_WORD_TEMPLATES,
         ] {
             assert!(

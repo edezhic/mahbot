@@ -318,11 +318,10 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData, background_
 
 /// Rebuild only the media transcriber singleton from the current `CONFIG`.
 ///
-/// Used by the settings page's per-field autosave when the Multimodal model
-/// slot or its provider routing settles — the media transcriber captures its
-/// model/provider route at build time, so a change must rebuild it, but no
-/// provider warmup (network call) is needed: the provider itself is
-/// unaffected by these settings.
+/// Used by the settings page's per-field autosave when the video transcription
+/// model slot settles — the media transcriber captures its model at build
+/// time, so a change must rebuild it, but no provider warmup (network call) is
+/// needed: the provider itself is unaffected by this setting.
 pub(crate) fn recreate_media_transcriber() {
     let config = CONFIG.snapshot();
     let transcriber = build_media_transcriber(&config);
@@ -438,45 +437,35 @@ fn create_transcriber(
     api_url: Option<&str>,
     api_key: Option<&str>,
     model: Option<&str>,
-    provider: Option<&str>,
 ) -> Option<MediaTranscriber> {
     api_key.and_then(trimmed_or_none)?;
     let model = model.and_then(trimmed_or_none)?;
-    let route = provider.and_then(trimmed_or_none);
     let base_url = api_url
         .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT)
         .to_string();
-    Some(MediaTranscriber::new(base_url, model, route))
+    Some(MediaTranscriber::new(base_url, model))
 }
 
 /// Build the media transcriber from a config snapshot (synchronous, no I/O).
 ///
-/// The transcriber captures its endpoint, model, and provider route at build
-/// time, so a change to any of those config fields requires a rebuild.
-/// Returns `None` when no API key is configured (no video transcription
-/// possible). Shared by the boot/`recreate_all` path
-/// ([`build_provider_and_transcriber`]) and the per-field transcription
-/// autosave ([`recreate_media_transcriber`]).
+/// The transcriber captures its endpoint and model at build time, so a change
+/// to either config field requires a rebuild. Returns `None` when no API key
+/// is configured (no video transcription possible). Shared by the
+/// boot/`recreate_all` path ([`build_provider_and_transcriber`]) and the
+/// per-field transcription autosave ([`recreate_media_transcriber`]).
 #[must_use]
 fn build_media_transcriber(config: &crate::config::ConfigData) -> Option<MediaTranscriber> {
     // Media always targets the default OpenRouter endpoint regardless of a
-    // custom chat endpoint — mahbot-1884.
+    // custom chat endpoint — mahbot-1884. The video-transcription slot never
+    // consults provider routing — the request carries no routing block.
     let model = resolve_or(
-        config.multimodal_model.clone(),
-        crate::config::DEFAULT_MULTIMODAL_MODEL,
+        config.video_transcription_model.clone(),
+        crate::config::DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
     );
-    // The transcriber captures its provider route at build time; the route
-    // comes from the routing row for the resolved Multimodal model.
-    let route = config
-        .model_routings
-        .iter()
-        .find(|mr| mr.model == model)
-        .and_then(|mr| mr.provider_order.clone());
     create_transcriber(
         Some(crate::config::DEFAULT_PROVIDER_ENDPOINT),
         config.provider_key.as_deref(),
         Some(model.as_str()),
-        route.as_deref(),
     )
 }
 
