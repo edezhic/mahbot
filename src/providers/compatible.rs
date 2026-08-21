@@ -364,11 +364,59 @@ impl NativeMessage {
 
 // ── Message content types for API serialization ──
 
-/// Parse `[IMAGE:path]` markers from content, returning cleaned text and extracted paths.
+/// Image subtypes DeepSeek (and the OpenAI image_url shape) will actually
+/// decode. Placeholders like `data:image/...;base64,...` must not match.
+const NATIVE_IMAGE_SUBTYPES: &[&str] = &["jpeg", "jpg", "png", "gif", "webp"];
+
+/// True when `path` is a payload the chat-completions `image_url` field accepts:
+/// a `data:image/{jpeg|png|gif|webp};base64,…` URI with a base64 alphabet
+/// payload, or an http(s) URL. Prose / path / ellipsis markers
+/// (`[IMAGE:...]`, `[IMAGE:data:image/jpeg;base64,...]`, `[IMAGE:/tmp/a.png]`)
+/// stay in the surrounding text.
+#[must_use]
+fn is_native_image_url(path: &str) -> bool {
+    if crate::util::is_http_url(path) {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix("data:image/") else {
+        return false;
+    };
+    let Some((head, payload)) = rest.rsplit_once(";base64,") else {
+        return false;
+    };
+    if !is_base64_payload(payload) {
+        return false;
+    }
+    let subtype = head.split(';').next().unwrap_or("").trim();
+    NATIVE_IMAGE_SUBTYPES
+        .iter()
+        .any(|allowed| subtype.eq_ignore_ascii_case(allowed))
+}
+
+/// Non-empty base64 (std or URL-safe), allowing whitespace. Dots / quotes /
+/// prose leftovers fail this check so `[IMAGE:data:image/jpeg;base64,...]`
+/// is not treated as an image.
+#[must_use]
+fn is_base64_payload(s: &str) -> bool {
+    let mut n = 0usize;
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'-' | b'_' | b'=' => n += 1,
+            b' ' | b'\t' | b'\n' | b'\r' => {}
+            _ => return false,
+        }
+    }
+    n > 0
+}
+
+/// Parse `[IMAGE:…]` markers from content, returning cleaned text and extracted
+/// native image payloads.
 ///
 /// Uses the shared [`MEDIA_MARKER_RE`](crate::util::MEDIA_MARKER_RE) to find markers.
-/// Non‑IMAGE markers (e.g. `[AUDIO:…]`) are left untouched in the cleaned text.
-/// Empty `[IMAGE:]` markers are preserved verbatim.
+/// Only data-URI and http(s) IMAGE payloads are extracted (and stripped from
+/// the cleaned text) — those become [`MessagePart::ImageUrl`]. Prose/path
+/// IMAGE markers, empty `[IMAGE:]`, and non‑IMAGE markers (e.g. `[AUDIO:…]`)
+/// are left untouched in the cleaned text.
 #[must_use]
 pub(crate) fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
@@ -378,12 +426,12 @@ pub(crate) fn parse_image_markers(content: &str) -> (String, Vec<String>) {
             let (kind, path) = crate::util::parse_media_marker(caps);
             let path = path.trim();
 
-            if kind == "IMAGE" {
+            if kind == "IMAGE" && is_native_image_url(path) {
                 refs.push(path.to_string());
-                // IMAGE markers are stripped — don't emit anything.
+                // Native IMAGE payloads are stripped — they become image parts.
                 String::new()
             } else {
-                // AUDIO/VIDEO markers are preserved verbatim.
+                // AUDIO/VIDEO markers and non-native IMAGE markers stay verbatim.
                 caps.get_match().as_str().to_string()
             }
         })
@@ -414,10 +462,11 @@ pub(crate) struct ImageUrlPart {
 
 /// Convert a role+content pair into the appropriate [`MessageContent`] variant.
 ///
-/// For [`ChatRole::User`] content, image markers (e.g. `[IMAGE:data:image/png;base64,...]`)
-/// are ALWAYS parsed into [`MessagePart::ImageUrl`] entries alongside the cleaned
-/// text — every role now emits native image parts. Everything else
-/// is returned as [`MessageContent::Text`].
+/// For [`ChatRole::User`] content, native image payloads (`data:image/…;base64,…`
+/// and http(s) URLs inside `[IMAGE:…]`) are parsed into [`MessagePart::ImageUrl`]
+/// entries alongside the cleaned text — every role now emits native image parts.
+/// Prose/path markers stay in the text. Everything else is returned as
+/// [`MessageContent::Text`].
 ///
 /// The old estimator-side mirror of this marker handling
 /// (`crate::session::estimate_tokens`) was removed with the
@@ -1814,12 +1863,15 @@ mod tests {
 
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
-        let input = "Check this [IMAGE:/tmp/a.png] and this [IMAGE:https://example.com/b.jpg]";
+        let input = concat!(
+            "Check this [IMAGE:data:image/png;base64,abcd] and this ",
+            "[IMAGE:https://example.com/b.jpg]"
+        );
         let (cleaned, refs) = parse_image_markers(input);
 
         assert_eq!(cleaned, "Check this  and this");
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0], "/tmp/a.png");
+        assert_eq!(refs[0], "data:image/png;base64,abcd");
         assert_eq!(refs[1], "https://example.com/b.jpg");
     }
 
@@ -1832,23 +1884,23 @@ mod tests {
         assert!(refs.is_empty());
     }
 
-    /// Stripping `[IMAGE:]` markers from history messages leaves only the text
-    /// portion — the raw markers never reach the provider payload; the marker
-    /// scan (and native image-part conversion) consumes them first.
+    /// Stripping native `[IMAGE:]` payloads from history messages leaves only
+    /// the text portion — those markers never reach the provider as text; the
+    /// marker scan (and native image-part conversion) consumes them first.
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
-        let input = "[IMAGE:/tmp/photo.jpg]\n\nDescribe this screenshot";
+        let input = "[IMAGE:data:image/jpeg;base64,abcd]\n\nDescribe this screenshot";
         let (cleaned, refs) = parse_image_markers(input);
         assert_eq!(cleaned, "Describe this screenshot");
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0], "/tmp/photo.jpg");
+        assert_eq!(refs[0], "data:image/jpeg;base64,abcd");
     }
 
     /// An image-only message (no caption) should produce an empty string after
     /// marker stripping, so callers can drop it from history.
     #[test]
     fn parse_image_markers_image_only_message_becomes_empty() {
-        let input = "[IMAGE:/tmp/photo.jpg]";
+        let input = "[IMAGE:data:image/jpeg;base64,abcd]";
         let (cleaned, refs) = parse_image_markers(input);
         assert!(
             cleaned.is_empty(),
@@ -1857,9 +1909,10 @@ mod tests {
         assert_eq!(refs.len(), 1);
     }
 
-    /// Non‑IMAGE markers (AUDIO, VIDEO) are preserved verbatim in the cleaned
-    /// output while IMAGE markers are stripped. This test covers the mixed case
-    /// to prevent regression of the preservation behaviour.
+    /// Non‑IMAGE markers (AUDIO, VIDEO) and non-native IMAGE markers (file
+    /// paths, prose placeholders) are preserved verbatim in the cleaned
+    /// output. This test covers the mixed case to prevent regression of the
+    /// preservation behaviour.
     #[test]
     fn parse_image_markers_preserves_audio_and_video_markers() {
         let input =
@@ -1868,9 +1921,24 @@ mod tests {
 
         assert_eq!(
             cleaned,
-            "[AUDIO:/tmp/sound.mp3] Listen to this [VIDEO:/tmp/clip.mp4] and"
+            "[AUDIO:/tmp/sound.mp3] Listen to this [VIDEO:/tmp/clip.mp4] and [IMAGE:/tmp/img.png]"
         );
-        assert_eq!(refs, vec!["/tmp/img.png"]);
+        assert!(refs.is_empty());
+    }
+
+    /// Prose placeholders written as `[IMAGE:...]` / `[IMAGE:path]` / ellipsis
+    /// data-URIs must stay in the text — they are not image payloads and must
+    /// not become `image_url` parts (DeepSeek rejects them as unsupported).
+    #[test]
+    fn parse_image_markers_keeps_prose_placeholders() {
+        let input = concat!(
+            "tool, command, [IMAGE:...] marker, or [IMAGE:path] syntax, ",
+            "or [IMAGE:data:image/...;base64,...], ",
+            "or [IMAGE:data:image/jpeg;base64,...]"
+        );
+        let (cleaned, refs) = parse_image_markers(input);
+        assert_eq!(cleaned, input);
+        assert!(refs.is_empty());
     }
 
     #[test]
@@ -1883,6 +1951,27 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "Describe this");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
+    }
+
+    #[test]
+    fn to_message_content_keeps_prose_image_markers_as_text() {
+        let content = "List any existing mechanism (tool, command, [IMAGE:...] marker, data URI)";
+        let value = serde_json::to_value(to_message_content(ChatRole::User, content)).unwrap();
+        assert_eq!(value, serde_json::json!(content));
+    }
+
+    #[test]
+    fn to_message_content_mixes_prose_marker_with_native_payload() {
+        let content = "see [IMAGE:...] and [IMAGE:data:image/png;base64,abcd]";
+        let value = serde_json::to_value(to_message_content(ChatRole::User, content)).unwrap();
+        let parts = value
+            .as_array()
+            .expect("mixed content should be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "see [IMAGE:...] and");
         assert_eq!(parts[1]["type"], "image_url");
         assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
     }
