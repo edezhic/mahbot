@@ -285,8 +285,7 @@ impl Role {
     /// Ticket tools are bound to `ws` at construction time — all their
     /// operations are confined to that workspace.
     #[must_use]
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    pub(crate) fn tools(&self, ws: &Workspace) -> Vec<Box<dyn Tool>> {
+    pub(crate) fn tools(self, ws: &Workspace) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
                 let mut t = Self::full_core_tools();

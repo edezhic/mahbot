@@ -182,20 +182,20 @@ static MEDIA_TRANSCRIBER: RwLock<Option<MediaTranscriber>> = RwLock::new(None);
 /// and differ only in warmup handling.
 fn build_provider_and_transcriber(
     config: &crate::config::ConfigData,
-) -> anyhow::Result<(Arc<dyn Provider>, Option<MediaTranscriber>)> {
+) -> (Arc<dyn Provider>, Option<MediaTranscriber>) {
     // Runtime endpoint is hardcoded: only the default endpoint is supported
     // right now (any persisted custom value is not honored — mahbot-1813).
     let provider: Arc<dyn Provider> = create_provider(
         config.provider_key.as_deref(),
         Some(crate::config::DEFAULT_PROVIDER_ENDPOINT),
-    )?
+    )
     .into();
 
     // Construct the transcriber eagerly — purely synchronous CPU work with no
     // I/O, so there's no reason to wait until after the warmup HTTP call.
     let media_transcriber = build_media_transcriber(config);
 
-    Ok((provider, media_transcriber))
+    (provider, media_transcriber)
 }
 
 /// Initialize the global provider and transcriber singletons from CONFIG.
@@ -214,7 +214,7 @@ fn build_provider_and_transcriber(
 /// boot instead of being awaited here.
 pub fn init_global() -> anyhow::Result<()> {
     let config = CONFIG.snapshot();
-    let (provider, media_transcriber) = build_provider_and_transcriber(&config)?;
+    let (provider, media_transcriber) = build_provider_and_transcriber(&config);
 
     // Swap both globals now — warmup is a pool pre-warm, not a readiness gate.
     *PROVIDER.write().unwrap_poison() = Some(provider.clone());
@@ -250,7 +250,7 @@ pub(crate) async fn warmup_provider_from_config(
     let provider = create_provider(
         config.provider_key.as_deref(),
         Some(crate::config::DEFAULT_PROVIDER_ENDPOINT),
-    )?;
+    );
     provider.warmup().await?;
     Ok(())
 }
@@ -268,7 +268,7 @@ pub(crate) async fn warmup_provider_from_config(
 /// spawned — subsequent transcription requests return a placeholder until
 /// the download completes.
 pub(crate) async fn recreate_all(config: &crate::config::ConfigData) -> anyhow::Result<()> {
-    let (provider, media_transcriber) = build_provider_and_transcriber(config)?;
+    let (provider, media_transcriber) = build_provider_and_transcriber(config);
 
     // Config-save path: warmup is AWAITED and FATAL here — on failure the
     // globals keep the previous provider (the new config was already
@@ -361,11 +361,7 @@ pub(crate) fn restore_provider_for_test(previous: Option<Arc<dyn Provider>>) {
 ///
 /// Returns an [`OpenAiCompatibleProvider`]; retry orchestration lives in
 /// [`crate::retry`].
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn create_provider(
-    api_key: Option<&str>,
-    endpoint: Option<&str>,
-) -> anyhow::Result<Box<dyn Provider>> {
+pub(crate) fn create_provider(api_key: Option<&str>, endpoint: Option<&str>) -> Box<dyn Provider> {
     let key_owned = api_key.and_then(trimmed_or_none);
     let resolved_key = key_owned.as_deref();
     let base_url = endpoint
@@ -381,7 +377,7 @@ pub(crate) fn create_provider(
     let base = OpenAiCompatibleProvider::new("OpenRouter", base_url.as_str(), resolved_key)
         .with_extra_headers(headers);
 
-    Ok(Box::new(base))
+    Box::new(base)
 }
 
 /// Build the media transcriber from flat config options.

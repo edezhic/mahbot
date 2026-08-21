@@ -177,10 +177,8 @@ impl SelectionDecision {
 /// verbatim elsewhere): `-1` unknown, `-2` verify-live, `-3` fallback-only,
 /// `-5`/`-10` exclude. None of them is healthy.
 #[must_use]
-// Signature matches EndpointInfo.status (an Option<String>); callers pass it by reference.
-#[allow(clippy::ref_option)]
-pub(crate) fn is_healthy_status(s: &Option<String>) -> bool {
-    s.as_deref() == Some("0")
+pub(crate) fn is_healthy_status(s: Option<&str>) -> bool {
+    s == Some("0")
 }
 
 /// True iff the endpoint tag is a `:free` variant.
@@ -209,9 +207,9 @@ pub(crate) fn classify_endpoint(
         match endpoint.context_length {
             None => Some(ExclusionReason::ContextUnknown),
             Some(cl) if cl < min_context => Some(ExclusionReason::ContextTooSmall(cl)),
-            Some(_) if !is_healthy_status(&endpoint.status) => Some(ExclusionReason::Status(
-                endpoint.status.clone().unwrap_or_default(),
-            )),
+            Some(_) if !is_healthy_status(endpoint.status.as_deref()) => Some(
+                ExclusionReason::Status(endpoint.status.clone().unwrap_or_default()),
+            ),
             Some(_) => None,
         }
     };
@@ -485,11 +483,11 @@ mod tests {
 
     #[test]
     fn healthy_status_parsing() {
-        assert!(is_healthy_status(&Some("0".to_string())));
+        assert!(is_healthy_status(Some("0")));
         for s in ["-1", "-2", "-3", "-5", "-10", "", "abc"] {
-            assert!(!is_healthy_status(&Some(s.to_string())), "status {s:?}");
+            assert!(!is_healthy_status(Some(s)), "status {s:?}");
         }
-        assert!(!is_healthy_status(&None));
+        assert!(!is_healthy_status(None));
     }
 
     #[test]
