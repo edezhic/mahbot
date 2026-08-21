@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use iced::window;
 use iced_fonts::lucide;
 
+use super::ToastMessage;
+use super::context_menu::{ContextMenu, MenuItem};
 use super::session_preview::{
     MAX_PREVIEW_LINES, MessageMeasure, measure_message, re_measure, width_bucket,
 };
@@ -111,6 +113,14 @@ pub(crate) enum SessionsMessage {
 
     /// A link was clicked in rendered markdown.
     LinkClicked(String),
+
+    /// A toast notification to surface from the dashboard.
+    Toast(ToastMessage),
+    /// Delete a session (context-menu action).
+    DeleteSession(String),
+    /// A session delete finished — remove it from the list. The bool is the
+    /// store-reported row deletion (`true` when a real removal happened).
+    SessionDeleted(String, bool),
 }
 
 #[derive(Debug, Clone)]
@@ -381,17 +391,54 @@ impl SessionsState {
                 }
                 Task::none()
             }
+            SessionsMessage::DeleteSession(key) => Task::perform(
+                async move {
+                    let store = crate::session::store();
+                    let deleted = store.delete(&key).await.map_err(|e| e.to_string())?;
+                    Ok::<_, String>((key, deleted))
+                },
+                |res| match res {
+                    Ok((key, deleted)) => SessionsMessage::SessionDeleted(key, deleted),
+                    Err(e) => SessionsMessage::Toast(ToastMessage::Error(e)),
+                },
+            ),
+            SessionsMessage::SessionDeleted(key, deleted) => {
+                self.sessions.retain(|s| s.agent_id != key);
+                self.rebuild_session_cache();
+                if self.selected_session.as_deref() == Some(&key) {
+                    self.clear_selection();
+                }
+                // Only claim a "Deleted" success when a real row removal
+                // happened; an already-absent session (cleaned up elsewhere)
+                // just vanishes from the list without an inaccurate toast.
+                if deleted {
+                    Task::done(SessionsMessage::Toast(ToastMessage::Deleted))
+                } else {
+                    Task::none()
+                }
+            }
+            SessionsMessage::Toast(_) | SessionsMessage::LinkClicked(_) => Task::none(),
             SessionsMessage::Escape => {
-                self.selected_session = None;
-                self.selected_messages.clear();
-                self.expanded_thinking_blocks.clear();
-                self.expanded_tool_rounds.clear();
-                self.expanded_messages.clear();
-                self.measure_cache.borrow_mut().clear();
+                self.clear_selection();
                 Task::none()
             }
-            SessionsMessage::LinkClicked(_) => Task::none(),
         }
+    }
+
+    /// Clear the currently selected session and ALL per-session transcript
+    /// state, returning the transcript column to its placeholder.
+    fn clear_selection(&mut self) {
+        self.selected_session = None;
+        self.selected_messages.clear();
+        self.selected_md_items.clear();
+        self.selected_loading = false;
+        self.expanded_tool_rounds.clear();
+        self.expanded_thinking_blocks.clear();
+        self.expanded_messages.clear();
+        self.messages_refreshing = false;
+        self.auto_scroll_enabled = false;
+        self.measure_cache.borrow_mut().clear();
+        self.selected_anim.set_target(0.0);
     }
 
     /// Rebuild the cached session list display data. Called when `self.sessions`
@@ -890,80 +937,91 @@ impl SessionsState {
                 for item in cached {
                     let is_selected = self.selected_session.as_deref() == Some(&item.key);
 
-                    let sess_row = container(
-                        column![
-                            row![
-                                button(
-                                    container(
-                                        column![
-                                            text(&item.label).size(13).color(theme::TEXT_PRIMARY),
-                                            {
-                                                // Meta row: message count, then the
-                                                // token length when one was ever
-                                                // recorded (older sessions show no
-                                                // token value), then the timestamp.
-                                                // The 8px `Space` separators (with
-                                                // the row's 4px spacing) preserve
-                                                // the original msg-count → timestamp
-                                                // gap exactly.
-                                                let mut meta_row = row![
-                                                    text(&item.msg_count_label)
-                                                        .size(11)
-                                                        .color(theme::TEXT_MUTED)
-                                                ]
-                                                .spacing(4);
-                                                if let Some(token) = &item.token_label {
-                                                    meta_row =
-                                                        meta_row.push(Space::new().width(8)).push(
-                                                            text(token)
-                                                                .size(11)
-                                                                .color(theme::TEXT_MUTED),
-                                                        );
-                                                }
-                                                meta_row.push(Space::new().width(8)).push(
-                                                    text(&item.timestamp_label)
-                                                        .size(11)
-                                                        .color(theme::TEXT_MUTED),
-                                                )
-                                            },
-                                        ]
-                                        .spacing(2),
+                    let sess_row: Element<'_, SessionsMessage> = ContextMenu::new(
+                        container(
+                            column![
+                                row![
+                                    button(
+                                        container(
+                                            column![
+                                                text(&item.label)
+                                                    .size(13)
+                                                    .color(theme::TEXT_PRIMARY),
+                                                {
+                                                    // Meta row: message count, then the
+                                                    // token length when one was ever
+                                                    // recorded (older sessions show no
+                                                    // token value), then the timestamp.
+                                                    // The 8px `Space` separators (with
+                                                    // the row's 4px spacing) preserve
+                                                    // the original msg-count → timestamp
+                                                    // gap exactly.
+                                                    let mut meta_row = row![
+                                                        text(&item.msg_count_label)
+                                                            .size(11)
+                                                            .color(theme::TEXT_MUTED)
+                                                    ]
+                                                    .spacing(4);
+                                                    if let Some(token) = &item.token_label {
+                                                        meta_row = meta_row
+                                                            .push(Space::new().width(8))
+                                                            .push(
+                                                                text(token)
+                                                                    .size(11)
+                                                                    .color(theme::TEXT_MUTED),
+                                                            );
+                                                    }
+                                                    meta_row.push(Space::new().width(8)).push(
+                                                        text(&item.timestamp_label)
+                                                            .size(11)
+                                                            .color(theme::TEXT_MUTED),
+                                                    )
+                                                },
+                                            ]
+                                            .spacing(2),
+                                        )
+                                        .padding(6)
+                                        .width(Length::Fill)
+                                        .style(
+                                            move |_theme: &iced::Theme| container::Style {
+                                                background: {
+                                                    let t = if is_selected {
+                                                        selected_progress
+                                                    } else {
+                                                        0.0f32
+                                                    };
+                                                    if t > 0.01 {
+                                                        Some(iced::Background::Color(
+                                                            iced::Color::from_rgba(
+                                                                theme::ACCENT_DIM.r,
+                                                                theme::ACCENT_DIM.g,
+                                                                theme::ACCENT_DIM.b,
+                                                                theme::ACCENT_DIM.a * t,
+                                                            ),
+                                                        ))
+                                                    } else {
+                                                        None
+                                                    }
+                                                },
+                                                ..container::Style::default()
+                                            }
+                                        ),
                                     )
-                                    .padding(6)
-                                    .width(Length::Fill)
-                                    .style(
-                                        move |_theme: &iced::Theme| container::Style {
-                                            background: {
-                                                let t = if is_selected {
-                                                    selected_progress
-                                                } else {
-                                                    0.0f32
-                                                };
-                                                if t > 0.01 {
-                                                    Some(iced::Background::Color(
-                                                        iced::Color::from_rgba(
-                                                            theme::ACCENT_DIM.r,
-                                                            theme::ACCENT_DIM.g,
-                                                            theme::ACCENT_DIM.b,
-                                                            theme::ACCENT_DIM.a * t,
-                                                        ),
-                                                    ))
-                                                } else {
-                                                    None
-                                                }
-                                            },
-                                            ..container::Style::default()
-                                        }
-                                    ),
-                                )
-                                .style(theme::button_text)
-                                .on_press(SessionsMessage::SelectSession(item.key.clone())),
+                                    .style(theme::button_text)
+                                    .on_press(SessionsMessage::SelectSession(item.key.clone())),
+                                ]
+                                .align_y(Alignment::Center),
                             ]
-                            .align_y(Alignment::Center),
-                        ]
-                        .spacing(2),
+                            .spacing(2),
+                        )
+                        .style(theme::surface_card_style),
+                        vec![MenuItem::with_icon(
+                            iced_fonts::lucide::advanced_text::trash,
+                            "Delete".into(),
+                            SessionsMessage::DeleteSession(item.key.clone()),
+                        )],
                     )
-                    .style(theme::surface_card_style);
+                    .into();
 
                     session_list = session_list.push(sess_row);
                 }

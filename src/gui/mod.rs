@@ -335,6 +335,7 @@ impl Message {
             | Message::DiffModal(diff::DiffMessage::Toast(tm))
             | Message::Git(git::GitMessage::Toast(tm))
             | Message::Editor(editor::EditorMessage::Toast(tm))
+            | Message::Sessions(sessions::SessionsMessage::Toast(tm))
             | Message::Settings(
                 settings::SettingsMessage::Toast(tm)
                 | settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Toast(tm))

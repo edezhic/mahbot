@@ -1966,9 +1966,7 @@ mod tests {
     fn to_message_content_mixes_prose_marker_with_native_payload() {
         let content = "see [IMAGE:...] and [IMAGE:data:image/png;base64,abcd]";
         let value = serde_json::to_value(to_message_content(ChatRole::User, content)).unwrap();
-        let parts = value
-            .as_array()
-            .expect("mixed content should be an array");
+        let parts = value.as_array().expect("mixed content should be an array");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "see [IMAGE:...] and");
