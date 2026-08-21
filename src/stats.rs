@@ -629,7 +629,7 @@ mod tests {
         let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
         let rec = LlmRequestRecord {
             purpose: "agent",
-            agent_id: "gui_alice_ws1_engineer".to_string(),
+            agent_id: "alice_ws1_engineer".to_string(),
             role: "engineer".to_string(),
             workspace: "ws1".to_string(),
             ticket_id: Some("42".to_string()),
@@ -665,7 +665,7 @@ mod tests {
                         duration_ms, retry_attempts, finish_reason, \
                         failure_class, success \
                  FROM llm_requests WHERE agent_id = ?1",
-                crate::turso::params!["gui_alice_ws1_engineer"],
+                crate::turso::params!["alice_ws1_engineer"],
             )
             .await
             .expect("query llm request");
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(row.get::<String>(0).expect("purpose"), "agent");
         assert_eq!(
             row.get::<String>(1).expect("agent_id"),
-            "gui_alice_ws1_engineer"
+            "alice_ws1_engineer"
         );
         assert_eq!(row.get::<String>(2).expect("role"), "engineer");
         assert_eq!(row.get::<String>(3).expect("workspace"), "ws1");

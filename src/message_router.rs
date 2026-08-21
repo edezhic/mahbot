@@ -21,8 +21,8 @@
 //! # Response delivery
 //!
 //! - [`Role::Manager`] broadcasts to all workspace users.
-//! - Other roles deliver to the specific user who triggered the job, via the
-//!   originating channel (scoped to `job.channel`).
+//! - Other roles broadcast to all of the triggering user's channel bindings
+//!   (Manager model generalized).
 
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -252,7 +252,8 @@ pub fn route(agent_id: &str, job: AgentJob) {
 /// Route a user message to the agent for the given role in a workspace.
 ///
 /// Computes the agent ID via [`crate::session::resolve_agent_id`] (Manager
-/// role → `manager_{ws_name}`, others → channel-scoped direct ID) and enqueues
+/// role → `manager_{ws_name}`, others → channel-agnostic direct ID per
+/// user+workspace+role) and enqueues
 /// a [`JobKind::UserMessage`] job. Surrounding per-site pipelines (broadcast,
 /// persistence, enrichment) remain at the call sites.
 ///
@@ -271,8 +272,15 @@ pub async fn route_user_message(
     role: Role,
     reply_target: Option<String>,
 ) {
-    let agent_id =
-        crate::session::resolve_agent_id(&channel, &user_name, role.as_str(), &workspace_name);
+    // Invariant: the routed user identity is never an empty string. A real
+    // admin user is always seeded. Normalize defensively so no path can create
+    // a malformed identity (bare "_ws_role" key) or persist/reply under an
+    // empty user. (direct_agent_id also normalizes the ID key; this layer
+    // normalizes the delivery payload.)
+    let user_name =
+        crate::session::normalize_user_name(&user_name, "route_user_message").to_string();
+
+    let agent_id = crate::session::resolve_agent_id(&user_name, role.as_str(), &workspace_name);
     let mut job = AgentJob {
         content,
         workspace_name,
@@ -593,8 +601,8 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
 
         // ── Response delivery ─────────────────────────────────────────
         // Manager: broadcast + persist to all workspace users.
-        // Other roles: send reply to the specific user (or use fallback
-        // for unregistered users).
+        // Other roles: broadcast to all of the triggering user's channel
+        // bindings (or use fallback for unregistered users).
         match role {
             Role::Manager => {
                 deliver_manager_response(&response, &users, &job).await;
@@ -796,30 +804,29 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
     }
 }
 
-/// Deliver a response to a single user (Assistant and other per-user roles).
+/// Deliver a response to a single registered user, broadcasting it to ALL of
+/// the user's channel bindings (the Manager model generalized to every role).
 ///
 /// `user` is the resolved [`UserRecord`] for the job's sender — guaranteed
 /// non-empty by the consumer loop before calling this function.
 ///
-/// Delivery is scoped to the originating channel type (`job.channel`), then
-/// further scoped to the specific `reply_target` when one is available on the
-/// job (e.g. Telegram chat_id).  This makes registered-user delivery
-/// consistent with the unregistered-user fallback, which sends only to the
-/// original message's reply target.
+/// Broadcast+persist is performed exactly once per response (tagged with the
+/// originating channel); transport delivery iterates all registered channels
+/// and every binding, using each binding's own reply_target. A user registered
+/// on multiple channels sees the reply on all of them, regardless of the
+/// channel the request came in on.
 ///
-/// Without `reply_target` (non-user-facing jobs like ticket notifications or
-/// AnalyzeTool results), all matching channel bindings receive the response.
-///
-/// Broadcast+persist is always performed exactly once per response, and the
-/// response is always sent via the originating channel type so it reaches
-/// the user through the expected transport.
+/// `job.reply_target` is not used to scope transport delivery for registered
+/// users — each binding supplies its own reply_target on its own channel, the
+/// broadcast model the Manager generalizes (though the Manager transport loop
+/// currently does not filter a binding to its channel; this function does).
 async fn deliver_single_user_response(
     response: &str,
     user: &UserRecord,
     job: &AgentJob,
     role: &Role,
 ) {
-    // Broadcast + persist
+    // Broadcast + persist (tagged with the originating channel).
     let channel = job.channel.as_str();
     broadcast_and_persist_agent_response(
         &user.name,
@@ -830,39 +837,40 @@ async fn deliver_single_user_response(
     )
     .await;
 
-    // Send only via the originating channel — not all registered channels.
-    let Some(chan) = crate::channel_registry().get(channel) else {
+    let channels = crate::channel_registry().list();
+    if channels.is_empty() {
+        error!(
+            workspace = %job.workspace_name,
+            user = %user.name,
+            "Message router [{role}]: no channels registered",
+        );
         return;
-    };
+    }
 
-    let content = telegram_delivery_content(channel, *role, &user.roles, response);
-
-    for binding in &user.channels {
-        // Only send on the channel that matches the job's origin
-        if binding.channel != channel {
-            continue;
-        }
-
-        // When the original message had a specific reply target (e.g. Telegram
-        // chat_id), scope delivery to only the binding whose reply_target
-        // matches — this makes registered-user delivery consistent with the
-        // unregistered-user fallback.
-        if let Some(ref target) = job.reply_target
-            && binding.reply_target.as_deref() != Some(target.as_str())
-        {
-            continue;
-        }
-
-        let target_addr = binding.reply_target.as_deref().unwrap_or(&user.name);
-        if let DeliverOutcome::Failed(e) =
-            deliver_on_channel(chan.as_ref(), &user.name, target_addr, &content).await
-        {
-            error!(
-                channel = %channel,
-                user = %user.name,
-                "Message router [{role}]: failed to send response to {}: {e}",
-                user.name,
-            );
+    for (channel_name, chan) in &channels {
+        let content = telegram_delivery_content(channel_name, *role, &user.roles, response);
+        for binding in &user.channels {
+            if binding.channel != *channel_name {
+                continue;
+            }
+            let target_addr = binding.reply_target.as_deref().unwrap_or(&user.name);
+            match deliver_on_channel(chan.as_ref(), &user.name, target_addr, &content).await {
+                DeliverOutcome::Failed(e) => error!(
+                    channel = %channel_name,
+                    user = %user.name,
+                    "Message router [{role}]: failed to send response to {}: {e}",
+                    user.name,
+                ),
+                DeliverOutcome::Unresolvable => warn!(
+                    channel = %channel_name,
+                    user = %user.name,
+                    "Message router [{role}]: cannot resolve recipient on {} for {} — \
+                     response was persisted but not delivered via transport",
+                    channel_name,
+                    user.name,
+                ),
+                DeliverOutcome::Sent => {}
+            }
         }
     }
 }
@@ -882,9 +890,14 @@ async fn deliver_single_user_response(
 pub async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, role: &Role) {
     let ch = job.channel.as_str();
 
+    // Invariant: never persist/reply under an empty user — seed 'admin'
+    // (covers inline confirmations like the clear-session reply path).
+    let user_name =
+        crate::session::normalize_user_name(&job.user_name, "deliver_unregistered_user_response");
+
     // Broadcast + persist (works with just strings, no UserRecord needed).
     broadcast_and_persist_agent_response(
-        &job.user_name,
+        user_name,
         ch,
         response,
         Some(role.as_str().to_string()),
@@ -899,18 +912,18 @@ pub async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, 
 
     // Use reply_target from the original message when available (e.g. Telegram
     // chat_id), falling back to user_name.
-    let reply_target = job.reply_target.as_deref().unwrap_or(&job.user_name);
-    match deliver_on_channel(chan.as_ref(), &job.user_name, reply_target, response).await {
+    let reply_target = job.reply_target.as_deref().unwrap_or(user_name);
+    match deliver_on_channel(chan.as_ref(), user_name, reply_target, response).await {
         DeliverOutcome::Unresolvable => warn!(
             workspace = %job.workspace_name,
-            user = %job.user_name,
+            user = %user_name,
             channel = %ch,
             "Message router [{role}]: cannot resolve recipient for unregistered user — \
              response was persisted but not delivered via transport",
         ),
         DeliverOutcome::Failed(e) => error!(
             channel = %ch,
-            user = %job.user_name,
+            user = %user_name,
             "Message router [{role}]: failed to send response to unregistered user: {e}",
         ),
         DeliverOutcome::Sent => {}
@@ -1134,6 +1147,39 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    /// A channel name unique to the message_router delivery tests, so the
+    /// spy registration never collides with a real "telegram" channel that a
+    /// parallel test (e.g. telegram_tests) may have already registered.
+    const TEST_SPY_CHANNEL: &str = "__test_spy_channel";
+
+    /// A spy channel that records sent messages in a shared [`Vec`].
+    struct TestSpyChannel {
+        sent: Arc<std::sync::Mutex<Vec<SendMessage>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Channel for TestSpyChannel {
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.lock().unwrap_poison().push(message.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            TEST_SPY_CHANNEL
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
     /// Set up DB stores + channel registry for response-delivery tests.
     async fn setup_response_test_infra() {
         crate::util::test::init_management_test_stores().await;
@@ -1263,8 +1309,11 @@ mod tests {
             .await;
     }
 
-    /// `deliver_single_user_response` completes without error when the
-    /// user has a channel binding matching the job's origin channel.
+    /// `deliver_single_user_response` completes without error and broadcasts
+    /// to all of the user's channel bindings (the Manager model generalized to
+    /// a single role). Here admin is bound to "gui" and the job originates on
+    /// "gui" — broadcast+persist runs and transport delivery reaches the
+    /// matching "gui" binding. No-panic is the assertion.
     #[tokio::test]
     async fn test_deliver_single_user_response() {
         setup_response_test_infra().await;
@@ -1290,16 +1339,16 @@ mod tests {
             pending_job_id: None,
         };
 
-        // Should complete without panic — sends response via "gui" channel.
+        // Should complete without panic — broadcasts to the "gui" binding.
         deliver_single_user_response("response to registered user", &user, &job, &Role::Assistant)
             .await;
     }
 
-    /// `deliver_single_user_response` handles the case where the user has
-    /// NO channel binding matching the job's origin — only broadcast+persist
-    /// runs, transport delivery is skipped.
+    /// `deliver_single_user_response` handles the case where the user has NO
+    /// channel bindings at all — only broadcast+persist runs, transport
+    /// delivery is skipped. No-panic is the assertion.
     #[tokio::test]
-    async fn test_deliver_single_user_no_matching_binding() {
+    async fn test_deliver_single_user_no_bindings() {
         setup_response_test_infra().await;
 
         // Admin user exists but has no "gui" channel binding.
@@ -1317,7 +1366,7 @@ mod tests {
         };
 
         // Should complete without panic — broadcast+persist runs, transport
-        // delivery is skipped because there's no matching "gui" binding.
+        // delivery is skipped because there are no matching bindings.
         deliver_single_user_response(
             "response to registered user without matching binding",
             &user,
@@ -1325,6 +1374,54 @@ mod tests {
             &Role::Assistant,
         )
         .await;
+    }
+
+    /// `deliver_single_user_response` broadcasts the reply to ALL of the user's
+    /// channel bindings. Admin is bound to both "gui" and a registered spy
+    /// channel; the job originates on "gui" but the reply reaches every
+    /// registered channel the user is bound to. The spy captures at least one
+    /// send.
+    #[tokio::test]
+    async fn test_deliver_single_user_broadcasts_to_all_bindings() {
+        setup_response_test_infra().await;
+
+        let store = crate::users::USER_STORE.get().unwrap();
+        store
+            .bind_channel("admin", "gui", "admin")
+            .await
+            .expect("bind admin to gui channel");
+
+        // Register a spy channel under a unique name so it is always ours.
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::channel_registry().register(Arc::new(TestSpyChannel {
+            sent: Arc::clone(&sent),
+        }) as Arc<dyn crate::Channel>);
+        store
+            .bind_channel("admin", TEST_SPY_CHANNEL, "admin")
+            .await
+            .expect("bind admin to spy channel");
+
+        let user = resolve_single_user("admin").await.unwrap();
+
+        let job = AgentJob {
+            content: "hello".to_string(),
+            workspace_name: "default".to_string(),
+            user_name: "admin".to_string(),
+            channel: "gui".to_string(),
+            kind: JobKind::UserMessage,
+            role: Role::Assistant,
+            reply_target: None,
+            pending_job_id: None,
+        };
+
+        deliver_single_user_response("broadcast to all bindings", &user, &job, &Role::Assistant)
+            .await;
+
+        let captured = sent.lock().unwrap_poison();
+        assert!(
+            !captured.is_empty(),
+            "spy channel should have captured at least one broadcast send",
+        );
     }
 
     /// `deliver_manager_response` broadcasts to all workspace users without

@@ -51,7 +51,6 @@
 //! enrollment schema under the `wake_word_templates` config key; old v1 records
 //! are rejected (re-enrollment required).
 
-use crate::ChatDirection;
 use crate::audio::wake_word::{
     self, ENROLLMENT_CONSISTENCY_MIN_FRACTION, ENROLLMENT_CONSISTENCY_MIN_SIMILARITY,
     MIN_ENROLLMENT_UTTERANCES, WAKE_WORD_EMBEDDING_DIM, WINDOW_SAMPLES, WakeWordEnrollment,
@@ -1760,38 +1759,22 @@ pub(crate) fn segment_utterances_by_vad(
 // ── Voice command routing ────────────────────────────────────────────────
 
 async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace: &str) {
-    if user_name.is_empty() {
-        // No active user (admin fallback): broadcast-only — there is no user
-        // to persist under or mirror to.
-        let message_id = crate::generate_id();
-        let timestamp = crate::turso::now();
-        crate::channels::broadcast_chat_event(
-            &message_id,
-            "",
-            transcript,
-            ChatDirection::User,
-            "voice",
-            None,
-            workspace,
-            None,
-            &timestamp,
-        );
-    } else {
-        // Broadcast, persist, and mirror through the canonical incoming-message
-        // pipeline — exactly the GUI text path — so the transcription reaches
-        // Telegram with the same bindings and format. Voice is a strictly local
-        // source, so the mirror cannot echo (see `mirror_gui_message_to_telegram`).
-        let msg = crate::ChannelMessage {
-            user_name: user_name.to_string(),
-            reply_target: String::new(),
-            content: transcript.to_string(),
-            channel: "voice".to_string(),
-            workspace: workspace.to_string(),
-            optimistic_id: None,
-            callback_query_id: None,
-        };
-        crate::channels::broadcast_and_persist_incoming_message(&msg, transcript, transcript).await;
-    }
+    // Broadcast, persist, and mirror through the canonical incoming-message
+    // pipeline — exactly the GUI text path — so the transcription reaches
+    // Telegram with the same bindings and format. Voice is a strictly local
+    // source, so the mirror cannot echo (see `mirror_gui_message_to_telegram`).
+    // Callers always pass a non-empty user name (the active user, or "admin"
+    // for the no-active-user fallback) — the "no empty user" invariant.
+    let msg = crate::ChannelMessage {
+        user_name: user_name.to_string(),
+        reply_target: String::new(),
+        content: transcript.to_string(),
+        channel: "voice".to_string(),
+        workspace: workspace.to_string(),
+        optimistic_id: None,
+        callback_query_id: None,
+    };
+    crate::channels::broadcast_and_persist_incoming_message(&msg, transcript, transcript).await;
 }
 
 /// Route a transcribed voice command to the appropriate agent.
@@ -1854,18 +1837,18 @@ async fn route_to_agent(text: String) {
         admin_pool[0]
     };
     // Assistant/Artist fall back to admin's personal workspace. The routed
-    // user_name stays empty (pre-existing fallback behavior), so "admin"
-    // stands in for the personal identity — an empty name would produce a
-    // broken `personal:` path.
+    // user_name is "admin" (the seeded admin identity) — an empty name would
+    // produce a broken `personal:` path and a malformed bare "_ws_role"
+    // session key, so the no-active-user fallback routes as the admin user.
     let (role, ws) = crate::users::effective_role_and_workspace(role, ws, "admin", &admin_pool);
 
     info!("Voice command -> {role} (workspace: {})", ws.name);
-    broadcast_voice_transcript(&text, "", &ws.name).await;
+    broadcast_voice_transcript(&text, "admin", &ws.name).await;
 
     crate::message_router::route_user_message(
         text,
         ws.name,
-        String::new(),
+        "admin".to_string(),
         "voice".to_string(),
         role,
         None,

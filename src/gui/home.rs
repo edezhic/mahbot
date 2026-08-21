@@ -1210,7 +1210,6 @@ impl HomeState {
                         let (effective_role, ws) =
                             crate::users::resolve_session_target(&sender).await;
                         let _ = crate::session::clear_session(
-                            "gui",
                             &sender,
                             effective_role.as_str(),
                             &ws.name,

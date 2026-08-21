@@ -15,11 +15,11 @@
 //! # Exclusion list
 //!
 //! The poller skips `manager_*` (Manager has its own lifecycle) plus every
-//! prefix in [`TRANSIENT_AGENT_ID_PREFIXES`] (transient or background-only
-//! agents).
+//! prefix in [`crate::session::TRANSIENT_AGENT_ID_PREFIXES`] (transient or
+//! background-only agents).
 //!
-//! Only direct user-agent sessions (format `{channel}_{user}_{ws}_{role}`)
-//! are eligible for recovery.
+//! Only direct user-agent sessions (format `{user}_{ws}_{role}`) are eligible
+//! for recovery.
 //!
 //! # Retry safety design
 //!
@@ -43,7 +43,6 @@ use chrono::{DateTime, Utc};
 use crate::message_router::{AgentJob, JobKind};
 use crate::registry::AGENT_REGISTRY;
 use crate::session::SessionContext;
-use crate::session::TRANSIENT_AGENT_ID_PREFIXES;
 use crate::{ChatRole, Role};
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -190,11 +189,11 @@ pub async fn run_dead_session_recovery_loop() {
 // ── Core detection + recovery logic ─────────────────────────────────────────
 
 /// Agent-ID prefixes excluded from dead-session recovery: `manager_` plus all
-/// [`TRANSIENT_AGENT_ID_PREFIXES`]. `manager_` stays out of the slice itself
-/// (Manager sessions must survive and keep their shared context) — this
-/// builds the union from it without duplicating the prefix list.
+/// [`crate::session::TRANSIENT_AGENT_ID_PREFIXES`]. `manager_` stays out of the
+/// slice itself (Manager sessions must survive and keep their shared context) —
+/// this builds the union from it without duplicating the prefix list.
 fn excluded_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
-    std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
+    crate::session::reserved_agent_id_prefixes()
 }
 
 /// Classify a session by its last persisted message role: is it a
@@ -322,13 +321,19 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 }
 
 /// Returns `true` if the agent ID belongs to a session that should NOT be
-/// recovered by the poller (`manager_` plus every [`TRANSIENT_AGENT_ID_PREFIXES`] prefix).
+/// recovered by the poller (`manager_` plus every
+/// [`crate::session::TRANSIENT_AGENT_ID_PREFIXES`] prefix).
 ///
 /// Note: the poller itself uses SQL-side filtering now — this function is
 /// retained for test coverage and as documentation of the exclusion criteria.
 #[cfg(test)]
 fn is_excluded_agent_id(agent_id: &str) -> bool {
-    excluded_agent_id_prefixes().any(|p| agent_id.starts_with(p))
+    excluded_agent_id_prefixes().any(|p| {
+        let bare = p.trim_end_matches('_');
+        // Faithful to SQL `LIKE 'prefix_%'`: the `_` consumes exactly one char
+        // after the bare reserved word, so a bare word alone is NOT excluded.
+        agent_id.len() > bare.len() && crate::session::starts_with_ignore_ascii_case(agent_id, bare)
+    })
 }
 
 /// Route a recovery job for a dead session with validated context.
@@ -393,21 +398,44 @@ mod tests {
     fn test_is_excluded_agent_id_direct_session() {
         // Direct user-agent sessions should NOT be excluded by the union of
         // `TRANSIENT_AGENT_ID_PREFIXES` and `"manager_"`.
-        assert!(!is_excluded_agent_id("gui_alice_main_workspace_engineer"));
-        assert!(!is_excluded_agent_id("telegram_bob_my_project_analyst"));
-        assert!(!is_excluded_agent_id(
-            "voice_charlie_personal_work_assistant"
-        ));
+        assert!(!is_excluded_agent_id("alice_main_workspace_engineer"));
+        assert!(!is_excluded_agent_id("bob_my_project_analyst"));
+        assert!(!is_excluded_agent_id("charlie_personal_work_assistant"));
     }
 
     #[test]
     fn test_direct_session_underscore_in_names_not_mistaken_for_exclusion() {
         // Even if user/workspace names contain underscores,
-        // the start of the agent_id is the channel name ("telegram"),
+        // the start of the agent_id is the user name ("some_user"),
         // which doesn't match any excluded prefix.
         assert!(!is_excluded_agent_id(
-            "telegram_some_user_my_cool_workspace_reviewer"
+            "some_user_my_cool_workspace_reviewer"
         ));
+    }
+
+    #[test]
+    fn test_direct_session_colliding_user_name_not_mistaken_for_exclusion() {
+        // A real user whose name collides with a reserved prefix is escaped by
+        // `direct_agent_id` (a `user_` prefix), so their session is never
+        // mistaken for a transient/background session and is never skipped by
+        // the poller.
+        assert!(!is_excluded_agent_id(&crate::session::direct_agent_id(
+            "manager", "engineer", "ws",
+        )));
+        assert!(!is_excluded_agent_id(&crate::session::direct_agent_id(
+            "ticket_bob",
+            "analyst",
+            "ws",
+        )));
+    }
+
+    #[test]
+    fn test_is_excluded_agent_id_case_variant_reserved_word() {
+        // The production SQL exclusion is `LIKE 'prefix_%'` (case-insensitive
+        // for ASCII), so a case-variant reserved word is also excluded here.
+        assert!(is_excluded_agent_id("Ticket_suffix"));
+        assert!(is_excluded_agent_id("tIcKeT_suffix"));
+        assert!(is_excluded_agent_id("Manager_bob"));
     }
 
     #[test]

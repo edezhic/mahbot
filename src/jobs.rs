@@ -501,12 +501,7 @@ async fn delete_job_tx(tx: &TxGuard<'_>, job_id: &str) -> Result<()> {
 /// internally, so this is the single canonical form — analyze/research delivery
 /// paths call it instead of reimplementing the branch.
 pub(crate) fn envelope_target(job: &AgentJob) -> String {
-    crate::session::resolve_agent_id(
-        &job.channel,
-        &job.user_name,
-        job.role.as_str(),
-        &job.workspace_name,
-    )
+    crate::session::resolve_agent_id(&job.user_name, job.role.as_str(), &job.workspace_name)
 }
 
 /// Caller identity + task of a job, read from the `jobs` row ALONE — child

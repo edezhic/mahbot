@@ -754,13 +754,7 @@ async fn handle_clear_session(msg: &ChannelMessage) {
     // with Analyst fallback, personal-workspace Manager→Analyst remap, and
     // Assistant/Artist pinning.
     let (effective_role, ws) = mahbot::users::resolve_session_target(&msg.user_name).await;
-    let reply = clear_session(
-        &msg.channel,
-        &msg.user_name,
-        effective_role.as_str(),
-        &ws.name,
-    )
-    .await;
+    let reply = clear_session(&msg.user_name, effective_role.as_str(), &ws.name).await;
     deliver_clear_reply(&reply, msg, &ws, effective_role).await;
 }
 

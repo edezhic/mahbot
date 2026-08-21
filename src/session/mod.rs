@@ -10,6 +10,7 @@ use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
 use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use std::borrow::Cow;
 
 // The summarization LLM call lives in `crate::Agent::summarize` so that all
 // parameters (model, reasoning_effort, tools, provider routing)
@@ -222,7 +223,9 @@ crate::columns! {
 ///
 /// User-facing agents — those the user can directly converse with — persist
 /// indefinitely and are intentionally excluded:
-/// - Direct chat: `{channel}_{user_name}_{ws_name}_{role}`
+/// - Direct chat: `{user}_{ws_name}_{role}` — a real user whose name collides
+///   with a reserved prefix is escaped with a `user_` prefix (see
+///   [`safe_user_segment`]).
 /// - Manager: `manager_{ws_name}` — the Manager session carries both chat conversation
 ///   and notification context and must never be added here.
 ///
@@ -861,20 +864,100 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     Ok(deleted)
 }
 
+/// Reserved agent-ID prefix union: `manager_` plus every
+/// [`TRANSIENT_AGENT_ID_PREFIXES`] entry.
+///
+/// These identify non-user-facing session keys (Manager / transient /
+/// background). The dead-session poller excludes the whole union, while
+/// [`cleanup_old_transient_sessions`] purges only the transient entries
+/// (`manager_` is intentionally excluded there). Both match via SQL
+/// `LIKE 'prefix_%'`, which SQLite applies case-insensitively for ASCII.
+pub(crate) fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
+    std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
+}
+
+/// Case-insensitive (ASCII) [`str::starts_with`], matching Turso's `LIKE`
+/// semantics for the reserved-prefix exclusion.
+pub(crate) fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Normalize a routed user identity, enforcing the never-empty-user invariant.
+///
+/// Returns the seeded `admin` name for an empty input, otherwise the input
+/// unchanged. `context` labels the calling layer in the [`tracing::warn!`]
+/// canary so a malformed `admin` fallback is traceable. This is the single
+/// source of the `admin` fallback, shared by the ID chokepoint
+/// ([`direct_agent_id`]) and the delivery-payload layers
+/// ([`crate::message_router::route_user_message`],
+/// [`crate::message_router::deliver_unregistered_user_response`]).
+pub(crate) fn normalize_user_name<'a>(user_name: &'a str, context: &str) -> &'a str {
+    if user_name.is_empty() {
+        tracing::warn!(
+            context = %context,
+            "empty user_name — falling back to seeded 'admin'",
+        );
+        "admin"
+    } else {
+        user_name
+    }
+}
+
+/// Does a user name collide with a reserved agent-ID prefix when it becomes the
+/// leading segment of a direct agent ID? Such a name would otherwise be purged by
+/// the SQL exclusion `LIKE 'prefix_%'` (case-insensitive for ASCII, `_` = any one
+/// char), so `ticket`, `ticketx`, and `TicketBob` all collide. Names already
+/// starting with `user_` are also treated as colliding to keep [`safe_user_segment`]
+/// injective.
+#[must_use]
+fn user_segment_collides(user_name: &str) -> bool {
+    let touches_reserved = reserved_agent_id_prefixes()
+        .any(|prefix| starts_with_ignore_ascii_case(user_name, prefix.trim_end_matches('_')));
+    touches_reserved || starts_with_ignore_ascii_case(user_name, "user_")
+}
+
+/// Escape a user name for the leading segment of a direct agent ID by prefixing
+/// colliding names ([`user_segment_collides`]) with `user_`, so their session is
+/// never mistaken for a transient/background one. The escape is injective: a name
+/// already starting with `user_` is ALSO escaped (`user_ticket` →
+/// `user_user_ticket`), so `ticket` → `user_ticket` can never collide with a
+/// distinct real user named `user_ticket`.
+#[must_use]
+fn safe_user_segment(user_name: &str) -> Cow<'_, str> {
+    if user_segment_collides(user_name) {
+        Cow::Owned(format!("user_{user_name}"))
+    } else {
+        Cow::Borrowed(user_name)
+    }
+}
+
 /// Construct an agent ID for direct user-to-agent chat.
 ///
-/// Format: `{channel}_{user_name}_{ws_name}_{role}`
+/// Format: `{user}_{ws_name}_{role}` — channel-agnostic: one conversation per
+/// (user + workspace + role) regardless of the originating channel.
 /// Role is the last segment for consistent identification in logs and
 /// debugging. The role-last format is immune to underscores in user/workspace
 /// names since the role is always the final `_`-delimited segment, but note
 /// that the router no longer parses agent ID strings — the role is embedded
 /// directly in [`AgentJob`](crate::message_router::AgentJob).
 /// This ID is stable across messages — the same ID is used for every message
-/// in the same channel/user/role/workspace combination, accumulating conversation
+/// in the same user/role/workspace combination, accumulating conversation
 /// history within a single session.
+///
+/// A real user whose name collides with a reserved transient/manager prefix is
+/// escaped with a `user_` prefix (see [`safe_user_segment`]) so their
+/// conversation is never mistaken for a transient/background agent.
 #[must_use]
-pub fn direct_agent_id(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
-    format!("{channel}_{user_name}_{ws_name}_{role}")
+pub fn direct_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
+    // Invariant: the routed user identity is never an empty string
+    // ([`normalize_user_name`]). Guard the ID itself so no bare "_ws_role" key
+    // can ever be produced — the single chokepoint for every direct ID builder
+    // (resolve_agent_id, envelope_target). route_user_message also normalizes
+    // the delivery payload; the two layers are complementary (that one feeds
+    // `job.user_name`, this one the ID key), not redundant.
+    let user_name = normalize_user_name(user_name, "direct_agent_id");
+    format!("{}_{}_{}", safe_user_segment(user_name), ws_name, role)
 }
 
 /// Construct a base agent ID for ticket-driven agent work.
@@ -907,8 +990,8 @@ pub fn manager_agent_id(ws_name: &str) -> String {
 /// format based on role.
 ///
 /// - **Manager** agents use workspace-scoped IDs (`manager_{ws_name}`).
-/// - **Non-Manager** agents use channel-scoped IDs
-///   (`{channel}_{user_name}_{ws_name}_{role}`).
+/// - **Non-Manager** agents use channel-agnostic per (user + workspace + role)
+///   IDs (`{user}_{ws_name}_{role}`).
 ///
 /// This is a convenience wrapper around [`manager_agent_id`] and
 /// [`direct_agent_id`] that selects the right format based on
@@ -916,20 +999,20 @@ pub fn manager_agent_id(ws_name: &str) -> String {
 ///
 /// # Parameter order
 ///
-/// Matches [`direct_agent_id`]: `channel` first, then `user_name`,
-/// `role`, and `ws_name` last.
+/// Matches [`direct_agent_id`]: `user_name` first, then `role`,
+/// and `ws_name` last.
 #[must_use]
-pub fn resolve_agent_id(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
+pub fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
     if role == "manager" {
         manager_agent_id(ws_name)
     } else {
-        direct_agent_id(channel, user_name, role, ws_name)
+        direct_agent_id(user_name, role, ws_name)
     }
 }
 
-/// Clear the session for a channel/user/role/workspace, returning the result message.
-pub async fn clear_session(channel: &str, user_name: &str, role: &str, ws_name: &str) -> String {
-    Session::delete(&resolve_agent_id(channel, user_name, role, ws_name)).await
+/// Clear the session for a user/role/workspace, returning the result message.
+pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> String {
+    Session::delete(&resolve_agent_id(user_name, role, ws_name)).await
 }
 
 /// Construct an agent ID for Maintainer agents (workspace-scoped, unique per run).
@@ -1796,14 +1879,12 @@ mod tests {
 //    an unregistered prefix means transient sessions never get cleaned up (leak).
 //
 // Limitations: `forward_no_collision_with_user_facing_agent_ids` covers
-// `direct_agent_id()` and `manager_agent_id()` patterns.
+// `direct_agent_id()` and `manager_agent_id()` patterns. Direct IDs start with
+// the user segment, so a user name that collides with a reserved prefix
+// (`manager_` or any transient prefix) is escaped by [`safe_user_segment`].
 // `reverse_transient_builders_use_registered_prefixes` covers all transient
 // builders (one per prefix in TRANSIENT_AGENT_ID_PREFIXES). If a new transient
 // role adds an agent ID builder, add it to the reverse test.
-// Channel-name collision (a channel registered as "ticket" or "analyze") is an
-// orthogonal risk — `starts_with` matches the first key segment (channel
-// name), which cannot be guarded by assertion because channel names are
-// dynamic. Awareness during channel registration is required.
 //
 // All builders are pure string functions — these are cheap synchronous tests.
 // Assertion `Fix:` messages guide corrective action when an invariant breaks.
@@ -1812,41 +1893,101 @@ mod tests {
 mod transient_prefix_tests {
     use super::*;
 
-    /// Known channel identifiers in the system. Must never produce agent IDs
-    /// matching a transient prefix.
-    const SAFE_CHANNELS: &[&str] = &["telegram", "gui"];
-
     #[test]
     fn forward_no_collision_with_user_facing_agent_ids() {
-        // For every transient prefix, verify that none of the user-facing
-        // agent ID patterns start with it. Direct IDs have the format
-        // {channel}_{user}_{ws}_{role}, and `starts_with` only checks the
-        // first segment (channel name). Since safe channels ("telegram",
-        // "gui") don't match any transient prefix, the workspace and role
-        // segments have no effect on the assertion outcome — a single role
-        // and workspace suffice.
+        // Every reserved prefix (manager_ plus all transient prefixes) is a
+        // possible leading segment of a direct agent ID. A real user whose
+        // name collides with a reserved prefix is escaped with a `user_`
+        // prefix by `safe_user_segment`, so their conversation is never
+        // mistaken for a transient/background agent.
+        let reserved_prefixes = std::iter::once("manager_")
+            .chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
+            .collect::<Vec<_>>();
+
+        for prefix in &reserved_prefixes {
+            let bare_word = prefix.trim_end_matches('_');
+
+            // Capitalized variant (uppercase only the first char) covers the
+            // ASCII case-insensitivity of SQLite LIKE, e.g. `Ticket`, `Manager`.
+            let capitalized = {
+                let mut chars = bare_word.chars();
+                match chars.next() {
+                    Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                    None => bare_word.to_string(),
+                }
+            };
+
+            // Forms 1–5: bare word, underscore separator, the no-underscore
+            // SQL-LIKE gap (e.g. "ticketx"), a capitalized variant, and a
+            // capitalized+suffixed variant. Each must be escaped by
+            // `safe_user_segment` so the produced ID never starts
+            // (case-insensitively) with the bare reserved word.
+            let user_names: [String; 5] = [
+                bare_word.to_string(),
+                format!("{bare_word}_bob"),
+                format!("{bare_word}x"),
+                capitalized.clone(),
+                format!("{capitalized}Bob"),
+            ];
+            for user_name in &user_names {
+                let key = direct_agent_id(user_name, "analyst", "test-ws");
+                assert!(
+                    !starts_with_ignore_ascii_case(&key, bare_word),
+                    "DIRECT AGENT ID COLLISION: bare-word='{bare_word}' \
+                     (case-insensitive) matches id='{key}' (user='{user_name}'). \
+                     Fix: safe_user_segment must escape any user name starting \
+                     (case-insensitively) with '{bare_word}'.",
+                );
+            }
+
+            // Form 6 (injective escape): a real user whose name already begins
+            // with `user_` is escaped AGAIN, so `user_{bare_word}` (the escape
+            // of the bare reserved word) can never collide with a distinct
+            // real user literally named `user_{bare_word}`.
+            let user_word = format!("user_{bare_word}");
+            let escaped_key = direct_agent_id(&user_word, "analyst", "test-ws");
+            assert!(
+                escaped_key.starts_with("user_user_"),
+                "real user '{user_word}' should be double-escaped to start \
+                 with 'user_user_', got '{escaped_key}'",
+            );
+            assert_ne!(
+                escaped_key,
+                direct_agent_id(bare_word, "analyst", "test-ws"),
+                "escape of '{bare_word}' collides with escape of '{user_word}'",
+            );
+        }
+
+        // Manager uses a separate ID format (manager_{ws_name}) — it must
+        // never collide with a transient prefix.
         for prefix in TRANSIENT_AGENT_ID_PREFIXES {
-            // Manager uses a separate ID format (manager_{ws_name}).
             let manager_key = manager_agent_id("test-ws");
             assert!(
                 !manager_key.starts_with(prefix),
-                "MANAGER AGENT ID COLLISION: \
-                 prefix='{prefix}' matches id='{manager_key}'. \
+                "MANAGER AGENT ID COLLISION: prefix='{prefix}' \
+                 matches id='{manager_key}'. \
                  Fix: remove '{prefix}' from TRANSIENT_AGENT_ID_PREFIXES \
                  or change the manager_agent_id pattern.",
             );
+        }
 
-            // Direct chat IDs across all safe channels.
-            for channel in SAFE_CHANNELS {
-                let key = direct_agent_id(channel, "testuser", "analyst", "test-ws");
-                assert!(
-                    !key.starts_with(prefix),
-                    "DIRECT AGENT ID COLLISION: prefix='{prefix}' \
-                     matches id='{key}' (channel='{channel}'). \
-                     Fix: remove '{prefix}' from TRANSIENT_AGENT_ID_PREFIXES \
-                     or change the agent ID pattern.",
-                );
-            }
+        // A normal user is NOT escaped — the id keeps its raw user segment.
+        assert_eq!(
+            direct_agent_id("alice", "analyst", "test-ws"),
+            "alice_test-ws_analyst",
+        );
+
+        // A bare reserved word IS escaped with a `user_` prefix so its session
+        // is never mistaken for the manager/transient session with the same
+        // prefix.
+        for prefix in &reserved_prefixes {
+            let bare_word = prefix.trim_end_matches('_');
+            let key = direct_agent_id(bare_word, "analyst", "test-ws");
+            assert!(
+                key.starts_with("user_"),
+                "bare reserved word '{bare_word}' should be escaped to start \
+                 with 'user_', got '{key}'",
+            );
         }
     }
 
@@ -1908,25 +2049,25 @@ mod transient_prefix_tests {
     #[test]
     fn resolve_agent_id_manager_dispatch() {
         // Manager role produces a manager-scoped ID.
-        let key = resolve_agent_id("telegram", "alice", "manager", "my-workspace");
+        let key = resolve_agent_id("alice", "manager", "my-workspace");
         assert_eq!(key, "manager_my-workspace");
     }
 
     #[test]
     fn resolve_agent_id_non_manager_dispatch() {
-        // Non-Manager role produces a direct channel-scoped ID.
+        // Non-Manager role produces a direct channel-agnostic ID.
         // Role is the LAST segment.
-        let key = resolve_agent_id("discord", "bob", "engineer", "my-workspace");
-        assert_eq!(key, "discord_bob_my-workspace_engineer");
+        let key = resolve_agent_id("bob", "engineer", "my-workspace");
+        assert_eq!(key, "bob_my-workspace_engineer");
     }
 
     #[test]
     fn resolve_agent_id_lowercase_manager() {
         // The dispatching uses string comparison `"manager"` — verify it works
         // (matches Role::Manager.as_str() which is lowercase).
-        let key = resolve_agent_id("gui", "carol", "Manager", "ws");
+        let key = resolve_agent_id("carol", "Manager", "ws");
         assert_ne!(key, "manager_ws", "capital-M 'Manager' should NOT match");
-        assert_eq!(key, "gui_carol_ws_Manager");
+        assert_eq!(key, "carol_ws_Manager");
     }
 }
 
