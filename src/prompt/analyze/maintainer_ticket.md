@@ -5,9 +5,8 @@ This ticket was created by the Maintainer and proposes a code improvement such a
 Investigate the claim:
 - Validate any claimed lines-of-code savings — search the actual code to confirm the numbers.
 - Check whether the refactoring genuinely reduces complexity (cyclomatic, structural, or cognitive).
-- Assess whether the change is actually beneficial vs. just adding churn (moving code around for marginal or cosmetic value).
+- Assess whether the change is actually beneficial vs. just adding churn (more LoC, tests for already working code, redundant comments).
 - Scrutinize whether the supposed duplication is real duplication or superficial similarity (same pattern but different intent/logic).
-- Evaluate the risk-to-reward ratio: what could break, how hard is the change to review, and is the payoff worth the risk?
 - Consider whether the improvement could be achieved with a simpler, less invasive change.
 
 Be skeptical but constructive:
@@ -21,8 +20,7 @@ Return a structured research report with:
 3. Assessment of benefit (does this reduce complexity, eliminate real duplication, or improve clarity?)
 4. Risks and trade-offs (what could break, how hard to review, long-term cost)
 5. Verdict with a 0-10 score:
-   - 0-2: not beneficial, risky, or clearly not worth doing
-   - 3-4: marginal benefit with significant risk or churn
-   - 5-6: somewhat beneficial but high risk or incomplete analysis
-   - 7-8: clearly beneficial with manageable risk
+   - 1-3: not beneficial / clearly not worth doing
+   - 4-6: somewhat beneficial but high risk or incomplete analysis
+   - 7-9: clearly beneficial with manageable risk
    - 9-10: well-justified, low-risk improvement that should be done
