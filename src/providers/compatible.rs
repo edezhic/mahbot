@@ -760,13 +760,27 @@ impl OpenAiCompatibleProvider {
             extra.insert("provider".to_string(), routing);
         }
 
-        // Reasoning effort
-        if let Some(effort) = request
-            .reasoning_effort
-            .as_deref()
-            .filter(|e| !e.is_empty())
-        {
-            extra.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+        // Reasoning effort — model-family-aware for custom endpoints
+        // (mahbot-1888). The default OpenRouter endpoint stays byte-identical
+        // to pre-mahbot-1888: the effort passes through unchanged (OpenRouter
+        // normalizes the value per model). Custom endpoints get the family's
+        // native field/value vocabulary (e.g. Ollama 400s on `xhigh`), so
+        // reasoning works by default on self-hosted servers too.
+        match reasoning_fields_for_request(
+            &self.base_url,
+            &request.model,
+            request.reasoning_effort.as_deref(),
+        ) {
+            ReasoningFields::Effort(value) => {
+                extra.insert("reasoning_effort".to_string(), serde_json::json!(value));
+            }
+            ReasoningFields::ThinkingEnabled => {
+                extra.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({ "type": "enabled" }),
+                );
+            }
+            ReasoningFields::Omit => {}
         }
 
         let payload = ChatCompletionRequest {
@@ -790,6 +804,151 @@ impl OpenAiCompatibleProvider {
             builder = builder.header("Authorization", format!("Bearer {credential}"));
         }
         builder
+    }
+}
+
+// ── Model-family reasoning translation for custom endpoints (mahbot-1888) ──
+
+/// Reasoning-field outcome for a chat-completions request after
+/// model-family translation (mahbot-1888).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReasoningFields {
+    /// Send `reasoning_effort: <value>`.
+    Effort(String),
+    /// Send `thinking: {"type": "enabled"}` and NO `reasoning_effort` (MiMo).
+    ThinkingEnabled,
+    /// Send neither `reasoning_effort` nor `thinking` (MiniMax, or no effort).
+    Omit,
+}
+
+/// Pure, deterministic translation of a role's reasoning effort into the
+/// request fields a chat-completions endpoint accepts. Computed at
+/// request-build time so every retry attempt stays byte-identical.
+///
+/// - No effort (`None`/empty) → no reasoning fields, regardless of endpoint.
+/// - Default OpenRouter endpoint → the effort passes through unchanged
+///   (byte-identical to pre-mahbot-1888 behavior; OpenRouter normalizes the
+///   value per model).
+/// - Custom endpoint → [`translate_for_custom_endpoint`] applies the
+///   model family's native field/value vocabulary.
+#[must_use]
+fn reasoning_fields_for_request(
+    endpoint: &str,
+    model: &str,
+    effort: Option<&str>,
+) -> ReasoningFields {
+    let Some(effort) = effort.filter(|e| !e.is_empty()) else {
+        return ReasoningFields::Omit;
+    };
+    if crate::config::is_default_endpoint(endpoint) {
+        return ReasoningFields::Effort(effort.to_string());
+    }
+    translate_for_custom_endpoint(model, effort)
+}
+
+/// Per-model-family reasoning vocabulary for custom (non-OpenRouter)
+/// endpoints: OpenRouter normalizes `reasoning_effort` per model, but each
+/// self-hosted family has its own accepted values/field shapes (Ollama 400s
+/// on `xhigh`; MiMo and MiniMax have no effort parameter at all).
+///
+/// Detection is a bare case-insensitive substring match, first-match-wins in
+/// [`ReasoningFamily`] declaration order. NO version parsing: older siblings
+/// that contain a family name (minimax-m2.x, gemini-3.1, deepseek-v3.x,
+/// kimi-k2.x, glm-4.x, grok-4.5...) receive the latest-family vocabulary.
+/// "No support for old versions" means no guarantee and no version-specific
+/// code — NOT routing them to the fallback — so an older sibling may reject
+/// the emitted value (accepted, documented limitation).
+#[must_use]
+fn translate_for_custom_endpoint(model: &str, effort: &str) -> ReasoningFields {
+    let family = detect_family(model);
+    match family {
+        // MiMo: no reasoning_effort parameter — enable thinking via the
+        // `thinking` object instead. The family's field shape dominates for
+        // ANY present effort value (incl. theoretical medium/low/minimal/none):
+        // there is no effort field to pass through on this family.
+        ReasoningFamily::Mimo => ReasoningFields::ThinkingEnabled,
+        // MiniMax M3: thinking is on by default on the OpenAI-compatible
+        // endpoint — omit reasoning_effort AND the thinking object. The
+        // "thinking:{type:adaptive} if verified" clause is deliberately NOT
+        // implemented: there is no live endpoint to verify it, so omit-both
+        // is the only behavior. Field shape dominates for any effort value.
+        ReasoningFamily::MiniMax => ReasoningFields::Omit,
+        _ => {
+            let value = match (family, effort) {
+                // hy3 (Tencent): xhigh→high, high→low — the mapped value must
+                // be sent so reasoning is actually enabled/raised. Note:
+                // Tencent silently raises low→high whenever tools are present
+                // (i.e. on all mahbot agent calls), so the one-step-below-max
+                // intent is defeated on the hot path — harmless, still below
+                // max.
+                // gemini 3.7 Flash: xhigh→high, high→medium.
+                (ReasoningFamily::Hy3 | ReasoningFamily::Gemini, "xhigh") => "high",
+                (ReasoningFamily::Hy3, "high") => "low",
+                (ReasoningFamily::Gemini, "high") => "medium",
+                // deepseek v4 / kimi k3 / glm 5.x: max is the top level.
+                // The fallback (any unknown family, incl. GPT models) shares
+                // this shape. Accepted residual risk: `max` 400s on
+                // OpenAI-native GPT-5.x and strict {low,medium,high}-only
+                // servers (vLLM/LM Studio) — Ollama accepts it, so the common
+                // self-hosted case is covered.
+                (
+                    ReasoningFamily::Deepseek
+                    | ReasoningFamily::Kimi
+                    | ReasoningFamily::Glm
+                    | ReasoningFamily::Fallback,
+                    "xhigh",
+                ) => "max",
+                // muse-spark / grok already accept xhigh; every unmapped
+                // effort value (medium/low/minimal/none) passes through
+                // unchanged for the effort-bearing families.
+                _ => effort,
+            };
+            ReasoningFields::Effort(value.to_string())
+        }
+    }
+}
+
+/// Reasoning-effort vocabulary families (mahbot-1888). Declaration order is
+/// the family-detection order: a case-insensitive substring match on the
+/// model name, first-match-wins (deepseek, kimi, glm, hy3, muse-spark, grok,
+/// gemini, mimo, minimax), then the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningFamily {
+    Deepseek,
+    Kimi,
+    Glm,
+    Hy3,
+    MuseSpark,
+    Grok,
+    Gemini,
+    Mimo,
+    MiniMax,
+    Fallback,
+}
+
+#[must_use]
+fn detect_family(model: &str) -> ReasoningFamily {
+    let m = model.to_ascii_lowercase();
+    if m.contains("deepseek") {
+        ReasoningFamily::Deepseek
+    } else if m.contains("kimi") {
+        ReasoningFamily::Kimi
+    } else if m.contains("glm") {
+        ReasoningFamily::Glm
+    } else if m.contains("hy3") {
+        ReasoningFamily::Hy3
+    } else if m.contains("muse-spark") {
+        ReasoningFamily::MuseSpark
+    } else if m.contains("grok") {
+        ReasoningFamily::Grok
+    } else if m.contains("gemini") {
+        ReasoningFamily::Gemini
+    } else if m.contains("mimo") {
+        ReasoningFamily::Mimo
+    } else if m.contains("minimax") {
+        ReasoningFamily::MiniMax
+    } else {
+        ReasoningFamily::Fallback
     }
 }
 
@@ -1104,8 +1263,8 @@ mod tests {
     /// Provider routing is OpenRouter-only (mahbot-1884 req 7): asserted on
     /// the serialized request body at the builder choke point — the block is
     /// sent for the default endpoint and suppressed for a custom endpoint,
-    /// while `reasoning_effort` passes through unchanged in both cases
-    /// (req 6).
+    /// while `reasoning_effort` is sent unchanged to the default endpoint and
+    /// translated per model family on custom endpoints (mahbot-1888).
     #[test]
     fn provider_routing_block_suppressed_for_custom_endpoint() {
         let mut request = test_request(vec![ChatMessage::user("hello")], None);
@@ -1147,7 +1306,9 @@ mod tests {
             "reasoning_effort must be sent to the default endpoint: {or_body}"
         );
 
-        // Custom endpoint → routing block suppressed, reasoning_effort unchanged.
+        // Custom endpoint → routing block suppressed; reasoning_effort is
+        // translated for the custom endpoint's model family (mahbot-1888).
+        // The 'test' model matches no family → fallback → xhigh→max.
         let custom_provider =
             OpenAiCompatibleProvider::new("Custom endpoint", "http://localhost:8080/v1", None);
         let custom_body = body(&custom_provider);
@@ -1156,9 +1317,238 @@ mod tests {
             "custom endpoint must not receive the OpenRouter routing block: {custom_body}"
         );
         assert!(
-            custom_body.contains("xhigh"),
-            "reasoning_effort must still be sent to custom endpoints: {custom_body}"
+            custom_body.contains("\"reasoning_effort\":\"max\""),
+            "custom endpoints must receive the translated reasoning effort (fallback 'test' model: xhigh→max): {custom_body}"
         );
+        assert!(
+            !custom_body.contains("xhigh"),
+            "custom endpoints must not receive the untranslated effort: {custom_body}"
+        );
+    }
+
+    /// Full model-family × effort translation table for custom endpoints
+    /// (mahbot-1888): every family, the fallback, unmapped-effort passthrough,
+    /// field-shape dominance for MiMo/MiniMax, family over-capture of older
+    /// siblings, case-insensitivity, and first-match-wins ordering. Also
+    /// asserts requirement 2: the OpenRouter path stays byte-identical
+    /// ("xhigh"/"high" unchanged) for every case.
+    #[test]
+    fn reasoning_translation_table_for_custom_endpoints() {
+        use ReasoningFields::{Effort, Omit, ThinkingEnabled};
+
+        // (label, model, effort, expected fields on a custom endpoint)
+        let cases: &[(&str, &str, &str, ReasoningFields)] = &[
+            // deepseek (v4): xhigh→max, high→high.
+            (
+                "deepseek v4 xhigh",
+                "deepseek/deepseek-v4-pro-0813",
+                "xhigh",
+                Effort("max".into()),
+            ),
+            (
+                "deepseek v4 high",
+                "deepseek/deepseek-v4-pro-0813",
+                "high",
+                Effort("high".into()),
+            ),
+            // Older deepseek v3 still matches the family (documented
+            // over-capture — no version-specific handling).
+            (
+                "deepseek v3 (older sibling, family match)",
+                "deepseek/deepseek-v3",
+                "xhigh",
+                Effort("max".into()),
+            ),
+            // kimi (k3): xhigh→max, high→high.
+            (
+                "kimi k3 xhigh",
+                "moonshotai/kimi-k3",
+                "xhigh",
+                Effort("max".into()),
+            ),
+            (
+                "kimi k3 high",
+                "moonshotai/kimi-k3",
+                "high",
+                Effort("high".into()),
+            ),
+            // glm (5.x): xhigh→max, high→high.
+            (
+                "glm 5.3 xhigh",
+                "zai-org/glm-5.3",
+                "xhigh",
+                Effort("max".into()),
+            ),
+            (
+                "glm 5.3 high",
+                "zai-org/glm-5.3",
+                "high",
+                Effort("high".into()),
+            ),
+            // hy3 (Tencent): xhigh→high, high→low.
+            (
+                "hy3 xhigh",
+                "tencent/hunyuan-hy3",
+                "xhigh",
+                Effort("high".into()),
+            ),
+            (
+                "hy3 high",
+                "tencent/hunyuan-hy3",
+                "high",
+                Effort("low".into()),
+            ),
+            // muse-spark: xhigh→xhigh, high→high.
+            (
+                "muse-spark xhigh",
+                "meta/muse-spark-1.2",
+                "xhigh",
+                Effort("xhigh".into()),
+            ),
+            (
+                "muse-spark high",
+                "meta/muse-spark-1.2",
+                "high",
+                Effort("high".into()),
+            ),
+            // grok: xhigh→xhigh, high→high.
+            (
+                "grok xhigh",
+                "x-ai/grok-4.6",
+                "xhigh",
+                Effort("xhigh".into()),
+            ),
+            ("grok high", "x-ai/grok-4.6", "high", Effort("high".into())),
+            // gemini 3.7 Flash: xhigh→high, high→medium.
+            (
+                "gemini xhigh",
+                "google/gemini-3.7-flash",
+                "xhigh",
+                Effort("high".into()),
+            ),
+            (
+                "gemini high",
+                "google/gemini-3.7-flash",
+                "high",
+                Effort("medium".into()),
+            ),
+            // MiMo: field-shape dominates — thinking:{type:enabled}, no
+            // effort — for ANY present effort value (incl. theoretical
+            // medium/low/minimal/none).
+            ("mimo xhigh", "xiaomi/mimo", "xhigh", ThinkingEnabled),
+            (
+                "mimo medium (field-shape dominates)",
+                "xiaomi/mimo-7b",
+                "medium",
+                ThinkingEnabled,
+            ),
+            // MiniMax: omit everything for ANY present effort value (M3
+            // thinking is on by default on the OpenAI-compatible endpoint).
+            ("minimax m3 xhigh", "minimax/minimax-m3", "xhigh", Omit),
+            (
+                "minimax m3 low (field-shape dominates)",
+                "minimax/minimax-m3",
+                "low",
+                Omit,
+            ),
+            // Older minimax m2.x still matches the family (documented
+            // over-capture).
+            (
+                "minimax m2.1 (older sibling, family match)",
+                "minimax/minimax-m2.1",
+                "high",
+                Omit,
+            ),
+            // Fallback (unknown families, incl. GPT models): xhigh→max,
+            // high→high; unmapped values pass through unchanged.
+            (
+                "fallback gpt xhigh",
+                "openai/gpt-5.6",
+                "xhigh",
+                Effort("max".into()),
+            ),
+            (
+                "fallback high",
+                "openai/gpt-4.1",
+                "high",
+                Effort("high".into()),
+            ),
+            (
+                "fallback medium passes through",
+                "openai/gpt-5.6",
+                "medium",
+                Effort("medium".into()),
+            ),
+            (
+                "fallback none passes through",
+                "openai/gpt-5.6",
+                "none",
+                Effort("none".into()),
+            ),
+            // Unmapped effort passes through for effort-bearing families too.
+            (
+                "deepseek medium passes through",
+                "deepseek/deepseek-v4",
+                "medium",
+                Effort("medium".into()),
+            ),
+            (
+                "gemini minimal passes through",
+                "google/gemini-3.7-flash",
+                "minimal",
+                Effort("minimal".into()),
+            ),
+            // Case-insensitive family detection.
+            (
+                "DeepSeek case-insensitive",
+                "DEEPSEEK/deepseek-v4",
+                "xhigh",
+                Effort("max".into()),
+            ),
+            // First-match-wins ordering: 'deepseek-hy3' matches deepseek
+            // first (family declaration order).
+            (
+                "deepseek-hy3 first-match deepseek",
+                "deepseek-hy3",
+                "xhigh",
+                Effort("max".into()),
+            ),
+        ];
+
+        let custom_endpoint = "http://localhost:8080/v1";
+        for (label, model, effort, expected) in cases {
+            let actual = reasoning_fields_for_request(custom_endpoint, model, Some(effort));
+            assert_eq!(&actual, expected, "{label}: model={model} effort={effort}");
+        }
+
+        // No effort (None or empty) → no reasoning fields on either endpoint.
+        assert_eq!(
+            reasoning_fields_for_request(custom_endpoint, "deepseek/deepseek-v4", None),
+            Omit
+        );
+        assert_eq!(
+            reasoning_fields_for_request(custom_endpoint, "deepseek/deepseek-v4", Some("")),
+            Omit
+        );
+        assert_eq!(
+            reasoning_fields_for_request(
+                crate::config::DEFAULT_PROVIDER_ENDPOINT,
+                "deepseek/deepseek-v4",
+                None
+            ),
+            Omit
+        );
+
+        // Requirement 2 — the OpenRouter path stays byte-identical: every
+        // family/effort passes through unchanged (no translation).
+        let or_endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
+        for (label, model, effort, _) in cases {
+            assert_eq!(
+                reasoning_fields_for_request(or_endpoint, model, Some(effort)),
+                Effort(effort.to_string()),
+                "OpenRouter must pass effort through unchanged: {label} model={model}"
+            );
+        }
     }
 
     #[test]

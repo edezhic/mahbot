@@ -2619,7 +2619,7 @@ impl SettingsState {
                 .width(Length::Fixed(375.0))
                 .into(),
                 Some(
-                    "Self-hosted servers must accept the reasoning_effort field; an unreachable endpoint still saves (with a warning)",
+                    "Reasoning effort is auto-translated per model family (e.g. Ollama max/high, MiMo thinking field, MiniMax none); unknown models fall back to max/high. An unreachable endpoint still saves (with a warning)",
                 ),
                 endpoint_error,
             );
