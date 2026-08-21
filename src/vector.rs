@@ -51,17 +51,10 @@ pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
 /// Deserialize bytes to f32 vector (little-endian)
 #[must_use]
 pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            // chunks_exact(4) guarantees every yielded chunk is exactly 4 bytes,
-            // so try_into() is infallible here.
-            let arr: [u8; 4] = chunk
-                .try_into()
-                .expect("chunks_exact(4) yields 4-byte chunks");
-            f32::from_le_bytes(arr)
-        })
-        .collect()
+    // as_chunks::<4>() yields exactly-4-byte chunks (trailing partial bytes are
+    // ignored — matching the old chunks_exact behavior), so no try_into dance.
+    let (chunks, _remainder) = bytes.as_chunks::<4>();
+    chunks.iter().map(|arr| f32::from_le_bytes(*arr)).collect()
 }
 
 /// Reciprocal Rank Fusion smoothing constant.

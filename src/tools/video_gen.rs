@@ -86,8 +86,10 @@ impl Tool for VideoGenTool {
         let generate_audio = super::get_opt_bool(&args, "generate_audio");
         let seed = super::get_opt_i64(&args, "seed");
 
-        // Build the API base URL (strip /chat/completions if present)
-        let endpoint = crate::config::CONFIG.provider_endpoint();
+        // Build the API base URL (strip /chat/completions if present).
+        // Video generation always targets OpenRouter (mahbot-1884) — a custom
+        // chat endpoint never serves video models.
+        let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
         let api_base = crate::providers::ensure_base_url(&endpoint);
 
         // ── Build the video generation request body ─────────────────────

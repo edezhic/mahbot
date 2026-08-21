@@ -14,9 +14,9 @@ use crate::Workspace;
 use crate::config::{
     CONFIG, CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY,
     CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_MULTIMODAL_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT,
-    CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_TTS_ENABLED,
-    CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL, ConfigData,
-    ModelRouting,
+    CONFIG_KEY_PROVIDER_ENDPOINT_KEY, CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
+    CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER,
+    CONFIG_KEY_WORKER_MODEL, ConfigData, ModelRouting,
 };
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
@@ -249,6 +249,7 @@ pub enum PasswordTarget {
     FirecrawlKey,
     ExaKey,
     TelegramToken,
+    EndpointKey,
 }
 
 #[derive(Debug, Clone)]
@@ -280,16 +281,24 @@ pub enum SettingsMessage {
     ConfigFieldSettleNow {
         field: String,
     },
-    /// Result of an async per-field persist. `Ok` carries the canonical
-    /// persisted value (trimmed, `None` collapsed to `""`) so the display
-    /// snapshot re-syncs to exactly what was written — not the raw typed
-    /// value. The handler applies it only when the generation is still
-    /// current (a stale result is dropped).
+    /// Result of an async per-field persist. `Ok` carries a
+    /// [`crate::config::PersistOutcome`]: the canonical persisted value
+    /// (trimmed, `None` collapsed to `""`) plus an optional non-fatal warning
+    /// (e.g. an unreachable custom endpoint saved anyway). The handler
+    /// applies the value only when the generation is still current (a stale
+    /// result is dropped).
     ConfigFieldSaveResult {
         field: String,
         generation: u64,
-        result: Result<String, String>,
+        result: Result<crate::config::PersistOutcome, String>,
     },
+    /// Toggle the custom chat-completions endpoint section (mahbot-1884).
+    /// ON only reveals the endpoint fields — nothing is staged, settled, or
+    /// persisted (an endpoint becomes active when the user settles a
+    /// genuinely non-default URL). OFF reverts to OpenRouter: closes the
+    /// section and settles the endpoint field with `""`, so the persist
+    /// path clears both persisted endpoint rows.
+    CustomEndpointToggle(bool),
     /// Per-model provider routing edits
     ModelRoutingOrder {
         model: String,
@@ -398,11 +407,8 @@ const SETTLE_MS: u64 = 700;
 /// settles (debounce / Enter), never per keystroke.
 const TEXT_INPUT_KEYS: &[&str] = &[
     CONFIG_KEY_PROVIDER_KEY,
-    // Retained even though the Endpoint UI control is hidden (mahbot-1813):
-    // the config key stays in the schema and the settle plumbing stays wired
-    // for when configurable endpoints are re-enabled. The runtime never
-    // honors a persisted value today.
     CONFIG_KEY_PROVIDER_ENDPOINT,
+    CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
     CONFIG_KEY_FIRECRAWL_KEY,
     CONFIG_KEY_EXA_KEY,
     CONFIG_KEY_TELEGRAM_BOT_TOKEN,
@@ -445,10 +451,24 @@ pub struct SettingsState {
     /// Per-field inline errors from rejected settles (invalid values are
     /// never persisted — the error is shown next to the offending control).
     field_errors: HashMap<String, String>,
-    /// Last error message from the voice/TTS toggle paths (bottom banner).
+    /// Inline warning from the last custom-endpoint save (non-fatal — e.g.
+    /// an unreachable endpoint saved anyway, mahbot-1884). Only the
+    /// endpoint persist arm can produce a warning, so a single slot
+    /// suffices — a keyed map here would be single-key dead state.
+    endpoint_warning: Option<String>,
+    /// Last error message rendered in the bottom banner — voice/TTS toggle
+    /// failures and failed custom-endpoint saves.
     error: Option<String>,
     /// Which password fields are currently visible.
     password_visible: HashSet<PasswordTarget>,
+    /// Whether the custom-endpoint section was revealed by the user this
+    /// session (UI-only). An active custom endpoint keeps the section open
+    /// across renders without this flag. Distinct from
+    /// [`Self::custom_endpoint_active_ui`]: revealing the fields alone does
+    /// not configure a custom endpoint (nothing is persisted on reveal).
+    /// A failed endpoint save closes the section (the runtime stayed on
+    /// OpenRouter), so the toggle never shows ON while nothing is configured.
+    custom_revealed: bool,
 
     // ── Workspace management state ──────────────────────────────
     pub(crate) workspaces_state: workspaces::WorkspacesState,
@@ -521,8 +541,10 @@ impl SettingsState {
             in_flight_persists: HashSet::new(),
             pending_persists: HashMap::new(),
             field_errors: HashMap::new(),
+            endpoint_warning: None,
             error: None,
             password_visible: HashSet::new(),
+            custom_revealed: false,
             workspaces_state: workspaces::WorkspacesState::new(),
             users_state: users::UsersState::new(),
             show_add_workspace_modal: false,
@@ -551,6 +573,17 @@ impl SettingsState {
         self.config = CONFIG.snapshot();
         self.error = None;
         self.field_errors.clear();
+        self.endpoint_warning = None;
+    }
+
+    /// Whether a genuinely non-default custom chat endpoint is staged or
+    /// persisted in the editable snapshot (normalized — trivial variants of
+    /// the default OpenRouter URL never count). Single predicate for the
+    /// OpenRouter-key highlight, the toggle state, and the Provider Routing
+    /// annotation (mahbot-1884), so UI state can never diverge from the
+    /// normalized runtime endpoint.
+    fn custom_endpoint_active_ui(&self) -> bool {
+        crate::config::is_custom_endpoint(&crate::config::effective_chat_endpoint(&self.config))
     }
 
     /// Close the add-workspace modal and reset all form fields.
@@ -775,6 +808,12 @@ impl SettingsState {
     /// persisted value. Discrete-state controls (toggles, pick lists, and the
     /// model pickers' optimistic active/list markers) revert; free-text inputs
     /// keep the typed value so the user can correct it.
+    ///
+    /// `config:provider_endpoint` is treated as discrete because it defines the
+    /// chat provider mode (custom vs default): a failed save (e.g. the
+    /// toggle-off cascade) must not leave the UI showing a mode the runtime
+    /// isn't in — the field reverts and the toggle re-derives from the
+    /// persisted value.
     fn field_reverts_on_error(field: &str) -> bool {
         matches!(
             field,
@@ -783,6 +822,7 @@ impl SettingsState {
                 | "config:image_gen_models"
                 | "config:video_model"
                 | "config:video_models"
+                | "config:provider_endpoint"
         )
     }
 
@@ -910,22 +950,77 @@ impl SettingsState {
                     return Task::none();
                 }
                 match result {
-                    Ok(canonical) => {
+                    Ok(outcome) => {
                         self.field_errors.remove(&field);
-                        self.apply_persisted_value(&field, &canonical);
+                        self.apply_persisted_value(&field, &outcome.value);
+                        // Only the endpoint persist arm can produce a warning —
+                        // a key-field result must never touch the endpoint
+                        // warning slot.
+                        if field == "config:provider_endpoint" {
+                            self.endpoint_warning = outcome.warning;
+                        }
                         Task::none()
                     }
                     Err(e) => {
-                        self.field_errors.insert(field.clone(), e);
+                        self.field_errors.insert(field.clone(), e.clone());
+                        if field == "config:provider_endpoint" {
+                            self.endpoint_warning = None;
+                        }
                         if Self::field_reverts_on_error(&field) {
                             // Discrete-state controls (toggles/pickers) roll
                             // back to the last persisted value; free text
                             // keeps the typed value for correction.
                             self.revert_field(&field);
+                            // A failed endpoint save means no configuration change — close
+                            // the revealed section so the toggle cannot show ON while the
+                            // runtime stays on OpenRouter. The error stays visible in the
+                            // bottom banner (the inline row hides with the section) and
+                            // re-appears inline if the user reveals the section again.
+                            if field == "config:provider_endpoint" {
+                                self.custom_revealed = false;
+                                self.error = Some(e);
+                                // Toggle-off clears both endpoint fields as one discrete
+                                // action — a failed endpoint persist must restore the key
+                                // field too, so the UI cannot show a half-reverted custom
+                                // setup (endpoint defaulted, key cleared).
+                                self.revert_field("config:provider_endpoint_key");
+                            }
                         }
                         Task::none()
                     }
                 }
+            }
+            SettingsMessage::CustomEndpointToggle(true) => {
+                // ON: reveal the custom-endpoint fields. Nothing is persisted
+                // here — the endpoint becomes active only when the user
+                // settles a genuinely non-default URL
+                // ([`Self::custom_endpoint_active_ui`]), so a reveal alone
+                // never leaves a spurious persisted row, and the toggle state
+                // never diverges from the normalized runtime endpoint.
+                self.custom_revealed = true;
+                self.field_errors
+                    .remove(&format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT}"));
+                Task::none()
+            }
+            SettingsMessage::CustomEndpointToggle(false) => {
+                // OFF: revert to OpenRouter and clear both persisted rows. Bump
+                // generation for both fields (drops pending settles/results),
+                // remove pending persists, clear both from the editable
+                // snapshot, then settle the endpoint field with `""` — the
+                // persist path cascades the provider_endpoint_key row deletion.
+                self.custom_revealed = false;
+                let endpoint_field = format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT}");
+                let key_field = format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT_KEY}");
+                self.bump_gen(&endpoint_field);
+                self.bump_gen(&key_field);
+                self.pending_persists.remove(&endpoint_field);
+                self.pending_persists.remove(&key_field);
+                self.config.provider_endpoint = None;
+                self.config.provider_endpoint_key = None;
+                self.field_errors.remove(&endpoint_field);
+                self.field_errors.remove(&key_field);
+                self.endpoint_warning = None;
+                self.settle_now(&endpoint_field, String::new())
             }
             SettingsMessage::ModelRoutingOrder { model, order } => {
                 let field = format!("routing_order:{model}");
@@ -1255,10 +1350,10 @@ impl SettingsState {
                         // Image-gen additions are validated against the catalog
                         // (fail-open when it is unavailable) before the list is
                         // mutated; the input buffer is kept on rejection so the
-                        // user can correct it. The runtime endpoint is hardcoded
-                        // (mahbot-1813), so validation always runs against the
-                        // default endpoint — a persisted custom value is not
-                        // honored and must not gate model additions.
+                        // user can correct it. Image models always run on
+                        // OpenRouter (mahbot-1884), so validation always runs
+                        // against the default endpoint — a custom chat endpoint
+                        // must not gate media model additions.
                         ModelPickerTarget::ImageGen => {
                             let model = self.model_picker_inputs[t.idx()].trim().to_string();
                             if model.is_empty() {
@@ -2451,15 +2546,26 @@ impl SettingsState {
         // The API key field is highlighted until a valid (trimmed non-empty)
         // key is present. Computed per-render from the editable snapshot, so
         // the highlight clears on the first typed character and re-arms when
-        // the field is cleared to empty/whitespace.
-        let api_key_unset = self
-            .config
-            .provider_key
-            .as_deref()
-            .is_none_or(|key| key.trim().is_empty());
-        section(
-            "Provider",
-            column![field_row(
+        // the field is cleared to empty/whitespace. With a genuinely custom
+        // endpoint active (mahbot-1884) the OpenRouter key is only needed for
+        // media, so a keyless custom endpoint user's key field is not
+        // highlighted.
+        let custom_active = self.custom_endpoint_active_ui();
+        let api_key_unset = !custom_active
+            && self
+                .config
+                .provider_key
+                .as_deref()
+                .is_none_or(|key| key.trim().is_empty());
+        // The custom-endpoint section is open when a custom endpoint is active
+        // OR the user revealed it this session. The toggle reflects this —
+        // OFF means default mode with the section closed, so the toggle state
+        // tracks the section's visibility and never implies a custom endpoint
+        // is configured when only the normalized predicate says otherwise.
+        let custom_section_open = custom_active || self.custom_revealed;
+
+        let mut rows: Vec<Element<'_, SettingsMessage>> = vec![
+            field_row(
                 "OpenRouter key",
                 password_input(
                     "sk-or-v1-...",
@@ -2467,11 +2573,11 @@ impl SettingsState {
                     self.password_visible.contains(&PasswordTarget::ProviderKey),
                     |v| SettingsMessage::ConfigField {
                         key: CONFIG_KEY_PROVIDER_KEY,
-                        value: v
+                        value: v,
                     },
                     SettingsMessage::TogglePasswordVisibility(PasswordTarget::ProviderKey),
                     SettingsMessage::ConfigFieldSettleNow {
-                        field: "config:provider_key".to_string()
+                        field: "config:provider_key".to_string(),
                     },
                     self.field_errors
                         .get("config:provider_key")
@@ -2479,8 +2585,78 @@ impl SettingsState {
                     api_key_unset,
                 ),
                 None,
-            )],
-        )
+            ),
+            field_row(
+                "Custom endpoint",
+                toggler(custom_section_open)
+                    .on_toggle(SettingsMessage::CustomEndpointToggle)
+                    .into(),
+                Some(
+                    "Route chat requests to a self-hosted OpenAI-compatible server (e.g. Ollama, LM Studio, vLLM)",
+                ),
+            ),
+        ];
+
+        if custom_section_open {
+            // Endpoint URL — free text, settled on Enter / debounce. An
+            // unreachable endpoint still saves (with an inline warning).
+            let endpoint_field = format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT}");
+            let endpoint_error = self.field_errors.get(&endpoint_field).map(String::as_str);
+            let mut endpoint_row = field_row_with_error(
+                "Endpoint URL",
+                text_input(
+                    "https://openrouter.ai/api/v1",
+                    self.config.provider_endpoint.as_deref().unwrap_or_default(),
+                )
+                .on_input(|v| SettingsMessage::ConfigField {
+                    key: CONFIG_KEY_PROVIDER_ENDPOINT,
+                    value: v,
+                })
+                .on_submit(SettingsMessage::ConfigFieldSettleNow {
+                    field: endpoint_field.clone(),
+                })
+                .style(super::widgets::text_input_style)
+                .width(Length::Fixed(375.0))
+                .into(),
+                Some(
+                    "Self-hosted servers must accept the reasoning_effort field; an unreachable endpoint still saves (with a warning)",
+                ),
+                endpoint_error,
+            );
+            if let Some(w) = self.endpoint_warning.as_ref() {
+                endpoint_row = column![endpoint_row, inline_warning(w, 188.0)]
+                    .spacing(2)
+                    .into();
+            }
+            rows.push(endpoint_row);
+
+            // Endpoint key (optional) — only ever sent to the custom endpoint.
+            let key_field = format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT_KEY}");
+            rows.push(field_row(
+                "Endpoint key (optional)",
+                password_input(
+                    "Leave empty for keyless servers",
+                    self.config
+                        .provider_endpoint_key
+                        .as_deref()
+                        .unwrap_or_default(),
+                    self.password_visible.contains(&PasswordTarget::EndpointKey),
+                    |v| SettingsMessage::ConfigField {
+                        key: CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
+                        value: v,
+                    },
+                    SettingsMessage::TogglePasswordVisibility(PasswordTarget::EndpointKey),
+                    SettingsMessage::ConfigFieldSettleNow {
+                        field: key_field.clone(),
+                    },
+                    self.field_errors.get(&key_field).map(String::as_str),
+                    false,
+                ),
+                Some("Only sent to the custom endpoint — never to OpenRouter"),
+            ));
+        }
+
+        section("Provider", Column::with_children(rows).spacing(4))
     }
 
     fn models_section(&self) -> Element<'_, SettingsMessage> {
@@ -3168,6 +3344,18 @@ impl SettingsState {
         ));
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
+        // With a custom chat endpoint staged, provider routing is a no-op —
+        // surface that so the section isn't misleading (mahbot-1884 req 8).
+        if self.custom_endpoint_active_ui() {
+            rows.push(
+                text(
+                    "Provider routing only applies to OpenRouter — the custom endpoint ignores it.",
+                )
+                .size(10)
+                .color(theme::STATUS_WARNING)
+                .into(),
+            );
+        }
         for model_name in &model_names {
             // Look up the current routing entry for this model
             let current = self
@@ -3290,6 +3478,15 @@ fn field_row<'a>(
 /// indented `left_pad` px to align with the input column.
 fn inline_error(err: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
     container(text(err).size(10).color(theme::STATUS_ERROR))
+        .padding(iced::Padding::default().left(left_pad))
+        .into()
+}
+
+/// The inline warning label rendered under a control: small, warning-colored,
+/// indented `left_pad` px to align with the input column. Non-fatal — the
+/// value was still saved (e.g. an unreachable custom endpoint).
+fn inline_warning(msg: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
+    container(text(msg).size(10).color(theme::STATUS_WARNING))
         .padding(iced::Padding::default().left(left_pad))
         .into()
 }
@@ -3424,12 +3621,19 @@ fn delete_confirm_button<'a>(
 /// - `routing_order:<model>` — per-model rows
 ///
 /// Returns the canonical persisted value.
-async fn persist_settled_field(field: &str, value: &str) -> anyhow::Result<String> {
+async fn persist_settled_field(
+    field: &str,
+    value: &str,
+) -> anyhow::Result<crate::config::PersistOutcome> {
     if let Some(key) = field.strip_prefix("config:") {
         return crate::config::persist_settled_string_field(key, value).await;
     }
     if let Some(model) = field.strip_prefix("routing_order:") {
-        return crate::config::persist_settled_routing_order(model, value).await;
+        let value = crate::config::persist_settled_routing_order(model, value).await?;
+        return Ok(crate::config::PersistOutcome {
+            value,
+            warning: None,
+        });
     }
     anyhow::bail!("unknown settings field: {field}");
 }
@@ -3988,7 +4192,10 @@ mod tests {
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
             field: "config:manager_model".into(),
             generation: 1,
-            result: Ok("model-a".into()),
+            result: Ok(crate::config::PersistOutcome {
+                value: "model-a".into(),
+                warning: None,
+            }),
         });
         assert_eq!(
             state.config.manager_model.as_deref(),
@@ -4041,7 +4248,10 @@ mod tests {
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
             field: "config:web_search_provider".into(),
             generation: 1,
-            result: Ok("exa".into()),
+            result: Ok(crate::config::PersistOutcome {
+                value: "exa".into(),
+                warning: None,
+            }),
         });
         assert!(
             !state
@@ -4105,7 +4315,10 @@ mod tests {
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
             field: "config:web_search_provider".into(),
             generation: 1,
-            result: Ok("exa".into()),
+            result: Ok(crate::config::PersistOutcome {
+                value: "exa".into(),
+                warning: None,
+            }),
         });
         assert!(
             !state
@@ -4125,7 +4338,10 @@ mod tests {
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
             field: "config:web_search_provider".into(),
             generation: 2,
-            result: Ok(String::new()), // the flushed (older) value's canonical
+            result: Ok(crate::config::PersistOutcome {
+                value: String::new(), // the flushed (older) value's canonical
+                warning: None,
+            }),
         });
         assert_eq!(
             state.config.web_search_provider.as_deref(),
@@ -4227,5 +4443,84 @@ mod tests {
                 "settings key '{key}' is not a config field — TEXT_INPUT_KEYS / IMMEDIATE_KEYS drifted"
             );
         }
+    }
+
+    /// Custom-endpoint toggle state machine (mahbot-1884): ON reveals the
+    /// endpoint fields only — nothing is staged, persisted, or settle-armed;
+    /// OFF closes the section and clears both endpoint fields from the
+    /// editable snapshot (the async persist path then removes the persisted
+    /// rows). A failed endpoint save re-closes the revealed section. The
+    /// returned Tasks are dropped — the async persist never runs here
+    /// (matching the other settings tests).
+    #[test]
+    fn custom_endpoint_toggle_state_machine() {
+        let mut state = SettingsState::new();
+        assert!(
+            state.config.provider_endpoint.is_none(),
+            "precondition: no custom endpoint staged"
+        );
+        assert!(
+            !state.custom_revealed,
+            "precondition: custom section closed"
+        );
+
+        // ON: reveal only — nothing persisted, no settle armed, the editable
+        // snapshot is untouched (an endpoint becomes active only once the
+        // user settles a genuinely non-default URL).
+        let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
+        assert!(
+            state.custom_revealed,
+            "ON reveals the custom-endpoint fields"
+        );
+        assert!(
+            state.config.provider_endpoint.is_none(),
+            "ON must not stage or persist an endpoint — a reveal alone must not configure one"
+        );
+        assert!(
+            state.field_gen.get("config:provider_endpoint").is_none(),
+            "ON must not arm a settle — no spurious persisted row"
+        );
+
+        // OFF: revert to OpenRouter, close the section, clear both fields,
+        // drop pending settles.
+        let _task = state.update(SettingsMessage::CustomEndpointToggle(false));
+        assert!(!state.custom_revealed, "OFF closes the section");
+        assert!(
+            state.config.provider_endpoint.is_none(),
+            "OFF clears the endpoint field"
+        );
+        assert!(
+            state.config.provider_endpoint_key.is_none(),
+            "OFF clears the endpoint key field"
+        );
+        assert!(
+            state.field_gen.contains_key("config:provider_endpoint_key"),
+            "OFF bumps the key field's generation (drops pending settles/results)"
+        );
+
+        // A failed endpoint save re-closes the revealed section: the toggle
+        // must not show ON while the runtime stays on OpenRouter, and the
+        // error surfaces in the bottom banner (the inline row hides with the
+        // section).
+        let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
+        assert!(state.custom_revealed, "re-reveal opens the section");
+        let endpoint_generation = state
+            .field_gen
+            .get("config:provider_endpoint")
+            .copied()
+            .unwrap_or(0);
+        let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "config:provider_endpoint".into(),
+            generation: endpoint_generation,
+            result: Err("invalid endpoint URL".into()),
+        });
+        assert!(
+            !state.custom_revealed,
+            "failed endpoint save closes the revealed section"
+        );
+        assert!(
+            state.error.is_some(),
+            "failed endpoint save surfaces in the bottom banner"
+        );
     }
 }

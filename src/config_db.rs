@@ -463,7 +463,14 @@ mod tests {
         let persisted = crate::config::persist_settled_string_field("exa_key", "  exa-abc  ")
             .await
             .unwrap();
-        assert_eq!(persisted, "exa-abc", "canonical trimmed value returned");
+        assert_eq!(
+            persisted.value, "exa-abc",
+            "canonical trimmed value returned"
+        );
+        assert!(
+            persisted.warning.is_none(),
+            "plain field carries no warning"
+        );
         assert_eq!(
             store.get_kv("exa_key").await.unwrap().as_deref(),
             Some("exa-abc"),
@@ -478,11 +485,61 @@ mod tests {
         let persisted = crate::config::persist_settled_string_field("exa_key", "   ")
             .await
             .unwrap();
-        assert_eq!(persisted, "", "cleared value returns empty");
+        assert_eq!(persisted.value, "", "cleared value returns empty");
         assert!(
             store.get_kv("exa_key").await.unwrap().is_none(),
             "cleared value deletes the row"
         );
         crate::config::CONFIG.swap(original);
+    }
+
+    /// An unreachable custom chat endpoint is saved anyway (mahbot-1884): the
+    /// persist path warns (non-fatal) instead of rejecting, so a self-hosted
+    /// endpoint can be configured before its server is reachable. Port 1 →
+    /// immediate connection refused — fast, no external network.
+    #[tokio::test]
+    #[serial_test::serial(config_persist)]
+    async fn test_persist_settled_unreachable_custom_endpoint_saves_with_warning() {
+        crate::util::test::init_test_stores().await;
+        let store = crate::config_db::store();
+        let _ = store.delete_kv("provider_endpoint").await;
+        let _ = store.delete_kv("provider_endpoint_key").await;
+        // Restore the global CONFIG on exit: the persist below mutates it.
+        let original = crate::config::CONFIG.snapshot();
+        // The persist path rebuilds the provider/transcriber singletons too —
+        // snapshot them so the test leaves the process globals untouched.
+        let prev_provider = crate::providers::snapshot_provider_for_test();
+        let prev_transcriber = crate::providers::snapshot_transcriber_for_test();
+
+        let outcome = crate::config::persist_settled_string_field(
+            "provider_endpoint",
+            "http://127.0.0.1:1/v1",
+        )
+        .await
+        .expect("unreachable endpoint must still save");
+        assert_eq!(
+            outcome.value, "http://127.0.0.1:1/v1",
+            "the unreachable value is the canonical persisted value"
+        );
+        let warning = outcome
+            .warning
+            .expect("unreachable endpoint must carry a warning");
+        assert!(
+            warning.contains("unreachable"),
+            "warning should mention unreachability, got: {warning}"
+        );
+        assert_eq!(
+            store.get_kv("provider_endpoint").await.unwrap().as_deref(),
+            Some("http://127.0.0.1:1/v1"),
+            "saved despite being unreachable"
+        );
+
+        // Clean up the shared store and restore the global CONFIG +
+        // provider/transcriber singletons.
+        let _ = store.delete_kv("provider_endpoint").await;
+        let _ = store.delete_kv("provider_endpoint_key").await;
+        crate::config::CONFIG.swap(original);
+        crate::providers::restore_provider_for_test(prev_provider);
+        crate::providers::restore_transcriber_for_test(prev_transcriber);
     }
 }

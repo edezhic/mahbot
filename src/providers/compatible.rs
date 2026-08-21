@@ -750,10 +750,12 @@ impl OpenAiCompatibleProvider {
 
         let mut extra = serde_json::Map::new();
 
-        // Provider routing — per-request values only; no global fallback.
-        // If provider_order is present and non-empty, build the routing block.
+        // Provider routing — OpenRouter-only (mahbot-1884 req 7): the block
+        // has no meaning outside OpenRouter, so it is never sent to custom
+        // endpoints.
         if let Some(order) = &request.provider_order
             && let Some(routing) = provider_routing_json(order)
+            && crate::config::is_default_endpoint(&self.base_url)
         {
             extra.insert("provider".to_string(), routing);
         }
@@ -1096,6 +1098,66 @@ mod tests {
         assert!(
             !err_msg.contains("API key not set"),
             "should not get credential error, got: {err_msg}"
+        );
+    }
+
+    /// Provider routing is OpenRouter-only (mahbot-1884 req 7): asserted on
+    /// the serialized request body at the builder choke point — the block is
+    /// sent for the default endpoint and suppressed for a custom endpoint,
+    /// while `reasoning_effort` passes through unchanged in both cases
+    /// (req 6).
+    #[test]
+    fn provider_routing_block_suppressed_for_custom_endpoint() {
+        let mut request = test_request(vec![ChatMessage::user("hello")], None);
+        request.provider_order = Some("DeepSeek".to_string());
+        request.reasoning_effort = Some("xhigh".to_string());
+
+        let body = |p: &OpenAiCompatibleProvider| {
+            let req = p
+                .build_http_request_with_client(p.http_client_scoped(), &request)
+                .build()
+                .expect("request builds");
+            String::from_utf8(
+                req.body()
+                    .expect("full body")
+                    .as_bytes()
+                    .expect("bytes")
+                    .to_vec(),
+            )
+            .expect("utf8 body")
+        };
+
+        // Default endpoint → routing block present, reasoning_effort present.
+        let or_provider = OpenAiCompatibleProvider::new(
+            "OpenRouter",
+            crate::config::DEFAULT_PROVIDER_ENDPOINT,
+            Some("sk-or"),
+        );
+        let or_body = body(&or_provider);
+        assert!(
+            or_body.contains("\"provider\""),
+            "default endpoint must send the routing block: {or_body}"
+        );
+        assert!(
+            or_body.contains("DeepSeek"),
+            "routing order must be inside the block: {or_body}"
+        );
+        assert!(
+            or_body.contains("xhigh"),
+            "reasoning_effort must be sent to the default endpoint: {or_body}"
+        );
+
+        // Custom endpoint → routing block suppressed, reasoning_effort unchanged.
+        let custom_provider =
+            OpenAiCompatibleProvider::new("Custom endpoint", "http://localhost:8080/v1", None);
+        let custom_body = body(&custom_provider);
+        assert!(
+            !custom_body.contains("\"provider\""),
+            "custom endpoint must not receive the OpenRouter routing block: {custom_body}"
+        );
+        assert!(
+            custom_body.contains("xhigh"),
+            "reasoning_effort must still be sent to custom endpoints: {custom_body}"
         );
     }
 

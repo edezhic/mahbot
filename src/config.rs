@@ -41,6 +41,18 @@
 //! Fields **not** in this chain (e.g. `model_routings`) have their own
 //! dedicated table and reload path.
 //!
+//! ### Custom chat-completions endpoint (mahbot-1884)
+//!
+//! `provider_endpoint` is an `or(DEFAULT_PROVIDER_ENDPOINT)` field: a
+//! persisted value (a self-hosted OpenAI-compatible endpoint — Ollama,
+//! LM Studio, llama.cpp, vLLM, LiteLLM) is honored at runtime, falling back
+//! to OpenRouter when unset. `provider_endpoint_key` is the custom
+//! endpoint's own optional API key (many self-hosted servers are keyless) —
+//! it is only ever sent to the custom endpoint, never to OpenRouter. Media
+//! features (image/video generation, catalogs, media transcription) always
+//! use `DEFAULT_PROVIDER_ENDPOINT` + `provider_key` regardless of the
+//! custom chat endpoint.
+//!
 //! ## Chain 2: Three model slots
 //!
 //! `config_kv` table → hardcoded slot default (`const` in this module)
@@ -230,6 +242,10 @@ pub struct ConfigData {
     pub provider_key: Option<String>,
     /// Base URL for the OpenAI-compatible LLM provider.
     pub provider_endpoint: Option<String>,
+    /// API key for the custom chat-completions endpoint (optional — many
+    /// self-hosted servers are keyless). Only ever sent to the custom endpoint,
+    /// never to OpenRouter.
+    pub provider_endpoint_key: Option<String>,
     /// Model slot for the Manager role.
     pub manager_model: Option<String>,
     /// Model slot for all worker roles (Engineer, Analyst, Coder, QA,
@@ -524,7 +540,8 @@ macro_rules! string_config_fields {
 
 string_config_fields! {
     provider_key [non_empty],
-    provider_endpoint [fixed(DEFAULT_PROVIDER_ENDPOINT)],
+    provider_endpoint [or(DEFAULT_PROVIDER_ENDPOINT)],
+    provider_endpoint_key [non_empty],
     manager_model [or(DEFAULT_MANAGER_MODEL)],
     worker_model [or(DEFAULT_WORKER_MODEL)],
     multimodal_model [or(DEFAULT_MULTIMODAL_MODEL)],
@@ -632,6 +649,89 @@ pub(crate) fn resolve_list_or(
         }
     }
     vec![resolve_or(fallback_field, default_value)]
+}
+
+/// Normalize an endpoint URL for comparison: trim surrounding whitespace,
+/// lowercase the scheme and host (not the path), strip trailing slashes, and
+/// strip a trailing `/chat/completions` suffix. The default OpenRouter URL and
+/// trivial variants (trailing slash, whitespace, scheme/host case,
+/// chat-completions suffix) must never count as a custom endpoint.
+#[must_use]
+pub(crate) fn normalize_endpoint_url(url: &str) -> String {
+    let t = url.trim().trim_end_matches('/');
+    // Strip one trailing `/chat/completions` suffix (after slash-stripping the
+    // suffix has no trailing slash). Handles a URL ending exactly in
+    // `/chat/completions`.
+    let t = t
+        .strip_suffix("/chat/completions")
+        .unwrap_or(t)
+        .trim_end_matches('/');
+    // Lowercase scheme + host, preserve the path as-is.
+    if let Some(scheme_end) = t.find("://") {
+        let scheme_and_dots = &t[..=scheme_end];
+        let rest = &t[scheme_end + 3..];
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        let path = &rest[authority_end..];
+        format!(
+            "{}{}{}",
+            scheme_and_dots.to_ascii_lowercase(),
+            authority.to_ascii_lowercase(),
+            path
+        )
+    } else {
+        // No scheme — validation rejects such values anyway; return unchanged.
+        t.to_string()
+    }
+}
+
+/// Whether `endpoint` is the default OpenRouter chat-completions endpoint
+/// (modulo trivial variants — see [`normalize_endpoint_url`]).
+#[must_use]
+pub(crate) fn is_default_endpoint(endpoint: &str) -> bool {
+    normalize_endpoint_url(endpoint) == normalize_endpoint_url(DEFAULT_PROVIDER_ENDPOINT)
+}
+
+/// Whether `endpoint` is a genuinely non-default (custom) endpoint.
+#[must_use]
+pub(crate) fn is_custom_endpoint(endpoint: &str) -> bool {
+    !is_default_endpoint(endpoint)
+}
+
+/// Whether a custom chat-completions endpoint is currently active in the
+/// global CONFIG (default URL and trivial variants never count as custom).
+#[must_use]
+pub(crate) fn custom_endpoint_active() -> bool {
+    is_custom_endpoint(&CONFIG.provider_endpoint())
+}
+
+/// Effective chat-completions endpoint for a config snapshot: the persisted
+/// endpoint when set (custom), else the default.
+#[must_use]
+pub(crate) fn effective_chat_endpoint(config: &ConfigData) -> String {
+    resolve_or(config.provider_endpoint.clone(), DEFAULT_PROVIDER_ENDPOINT)
+}
+
+/// Credential for chat-completions requests under `config`: the custom
+/// endpoint's own key when a custom endpoint is active (None = keyless, no
+/// Authorization header), otherwise the OpenRouter key. The OpenRouter key is
+/// NEVER sent to a custom endpoint.
+#[must_use]
+pub(crate) fn chat_credential(config: &ConfigData) -> Option<String> {
+    let ep = effective_chat_endpoint(config);
+    if is_custom_endpoint(&ep) {
+        non_empty(config.provider_endpoint_key.clone())
+    } else {
+        non_empty(config.provider_key.clone())
+    }
+}
+
+/// Whether the LLM provider is configured: a non-empty OpenRouter key OR an
+/// active custom endpoint (keyless custom endpoints included). Used by the
+/// pipeline pickup gate and the GUI boot-to-Settings redirect.
+#[must_use]
+pub(crate) fn provider_configured() -> bool {
+    custom_endpoint_active() || CONFIG.provider_key().is_some()
 }
 
 // ── ConfigReload — global singleton ──────────────────────────────
@@ -1036,26 +1136,45 @@ pub async fn reload_from_db() -> Result<()> {
 // by the voice pipeline (`persist_enrollment` in `voice.rs`), which writes
 // the key directly, and any GUI write would create a dual-writer race.
 
+/// Outcome of persisting a settled config field: the canonical persisted value
+/// plus an optional non-fatal warning (e.g. an unreachable custom endpoint that
+/// was saved anyway — mahbot-1884).
+///
+/// `pub` (not `pub(crate)`) because it flows through the public
+/// [`crate::gui::settings::SettingsMessage`] enum's persist-result variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistOutcome {
+    pub value: String,
+    pub warning: Option<String>,
+}
+
 /// Persist a single settled string config field.
 ///
 /// `key` must be a `config_kv` key (see [`ConfigData::string_fields`]).
-/// Returns the canonical persisted value.
-pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<String> {
+/// Returns the canonical persisted value plus an optional non-fatal warning.
+pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<PersistOutcome> {
     let _guard = persist_lock().lock().await;
     let trimmed = value.trim().to_string();
 
     // Defense in depth: the settings page renders no control for this key, but
     // refuse it structurally so no future caller can ever write it here.
     if key == CONFIG_KEY_WAKE_WORD_TEMPLATES {
-        return Ok(CONFIG.wake_word_templates().unwrap_or_default());
+        return Ok(PersistOutcome {
+            value: CONFIG.wake_word_templates().unwrap_or_default(),
+            warning: None,
+        });
     }
 
     match key {
-        // Provider endpoint/key changes re-init the provider and transcriber.
-        // Ordering: validate → warmup (pre-commit) → write → recreate
-        // (post-commit). The probe is the live config with only this field
-        // applied, so concurrent changes to other fields are never clobbered
-        // (the persist lock serializes settles anyway).
+        // Provider endpoint changes re-init the provider and transcriber.
+        // Ordering: validate (structural) → write → cascade → warmup
+        // (best-effort: an unreachable custom endpoint saves with a warning,
+        // so a self-hosted server can be configured before it is reachable) →
+        // recreate (runtime switches to the saved
+        // endpoint even when unreachable — only structural validation and DB
+        // writes can fail a save now). The probe is the live config with only
+        // this field applied, so concurrent changes to other fields are never
+        // clobbered (the persist lock serializes settles anyway).
         //
         // Note: the active image model is deliberately NOT re-validated here.
         // The image-model catalog is endpoint-keyed, and validating the
@@ -1065,14 +1184,88 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
         // is instead validated when it itself settles, against the then-
         // committed endpoint — so a switch is two steps (endpoint first, then
         // model), each independently valid.
-        CONFIG_KEY_PROVIDER_ENDPOINT | CONFIG_KEY_PROVIDER_KEY => {
+        CONFIG_KEY_PROVIDER_ENDPOINT => {
             let mut probe = CONFIG.snapshot();
             let _ = probe.set_string_field(key, &trimmed);
             probe.normalize();
             validate_config(&probe)?;
-            crate::providers::warmup_provider_from_config(&probe).await?;
+
             write_kv_and_update_config(key, &trimmed).await?;
-            crate::providers::recreate_all(&CONFIG.snapshot()).await?;
+
+            // Cascade: settling a default or empty endpoint removes the custom
+            // endpoint's key row — the key is only meaningful while a custom
+            // endpoint is active. Covers both the toggle-off "" and typing the
+            // default URL back. The endpoint row is written FIRST so a failure
+            // on the write leaves the key row intact (consistent state); a
+            // failure on the cascade leaves a stale key row, which is never
+            // read (harmless per the orphaned-key policy) — so the cleanup is
+            // best-effort and never fails the save.
+            if trimmed.is_empty() || crate::config::is_default_endpoint(&trimmed) {
+                let store = crate::config_db::store();
+                match store.delete_kv(CONFIG_KEY_PROVIDER_ENDPOINT_KEY).await {
+                    Ok(()) => {
+                        let _ = CONFIG.set_string_field(CONFIG_KEY_PROVIDER_ENDPOINT_KEY, "");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to clear custom endpoint key row (harmless orphan)"
+                        );
+                    }
+                }
+            }
+
+            // Warmup is best-effort AND custom-only: an unreachable custom
+            // endpoint is saved anyway (with a warning) so a self-hosted
+            // server can be configured before it is reachable. Reverting to
+            // the default (empty or default URL — toggle-off / typing the
+            // default back) is NOT probed: a transient OpenRouter outage
+            // must not surface an 'unreachable' warning on a deliberate
+            // revert.
+            let effective = effective_chat_endpoint(&probe);
+            let warning = if crate::config::is_custom_endpoint(&effective) {
+                match crate::providers::warmup_provider_from_config(&probe).await {
+                    Ok(()) => None,
+                    Err(e) => {
+                        let msg = format!("Saved, but {effective} is unreachable right now: {e:#}");
+                        tracing::warn!(key, endpoint = %effective, "Provider warmup failed (non-fatal, value saved): {e:#}");
+                        Some(msg)
+                    }
+                }
+            } else {
+                None
+            };
+
+            // The foreground warmup above (or its deliberate skip on revert)
+            // is the only warmup this save performs — recreate_all must not
+            // fire a second background warmup of the same endpoint.
+            crate::providers::recreate_all(&CONFIG.snapshot(), false).await;
+            return Ok(PersistOutcome {
+                value: trimmed_or_none(&trimmed).unwrap_or_default(),
+                warning,
+            });
+        }
+        // Provider key changes re-init the provider with the new credential.
+        // No warn-and-save here: warmup is a connection-pool pre-warm that
+        // never validates keys (a GET that ignores auth status), so key saves
+        // are structurally validated + written, and `recreate_all` rebuilds the
+        // provider with the new credential (warmup runs as a non-fatal
+        // background task inside it). This keeps the req-9 custom-endpoint
+        // warning channel off the key fields — a warmup failure while a custom
+        // endpoint is active must not surface an 'unreachable' warning under
+        // the OpenRouter key field.
+        CONFIG_KEY_PROVIDER_KEY | CONFIG_KEY_PROVIDER_ENDPOINT_KEY => {
+            let mut probe = CONFIG.snapshot();
+            let _ = probe.set_string_field(key, &trimmed);
+            probe.normalize();
+            validate_config(&probe)?;
+
+            write_kv_and_update_config(key, &trimmed).await?;
+            crate::providers::recreate_all(&CONFIG.snapshot(), true).await;
+            return Ok(PersistOutcome {
+                value: trimmed_or_none(&trimmed).unwrap_or_default(),
+                warning: None,
+            });
         }
         // Telegram token change hot-reloads the listener after the write.
         CONFIG_KEY_TELEGRAM_BOT_TOKEN => {
@@ -1094,8 +1287,12 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
         // generation tool's semantics). A cleared model falls back to the
         // default — the model that would actually be used — so it is
         // validated too.
+        //
+        // Image models always run on OpenRouter — the catalog is
+        // endpoint-keyed on the default (mahbot-1884), so validation never
+        // consults a custom chat endpoint.
         CONFIG_KEY_IMAGE_GEN_MODEL => {
-            let endpoint = CONFIG.provider_endpoint();
+            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
             let model_opt = trimmed_or_none(&trimmed);
             let model: &str = model_opt.as_deref().unwrap_or(DEFAULT_IMAGE_GEN_MODEL);
             if model != CONFIG.image_gen_model() {
@@ -1117,7 +1314,10 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Stri
         }
     }
 
-    Ok(trimmed_or_none(&trimmed).unwrap_or_default())
+    Ok(PersistOutcome {
+        value: trimmed_or_none(&trimmed).unwrap_or_default(),
+        warning: None,
+    })
 }
 
 /// Persist a settled per-model routing `provider_order` (`""` clears it).
@@ -1290,8 +1490,7 @@ mod tests {
     }
 
     /// Smoke test: macro-generated accessors roundtrip correctly for one
-    /// representative field of each pattern (`non_empty`, `or`, `fixed`,
-    /// `list_or`).
+    /// representative field of each pattern (`non_empty`, `or`, `list_or`).
     ///
     /// Structural sync (every field has a correctly-typed accessor) is guaranteed
     /// at compile time by the macro — this test only verifies runtime semantics.
@@ -1324,15 +1523,18 @@ mod tests {
             "unset multimodal_model falls back to default"
         );
 
-        // ── fixed: always returns the constant, ignoring persisted values ──
-        let mut fixed_cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
-        assert!(fixed_cfg.set_string_field("provider_endpoint", "https://custom.example/v1"));
-        reload.swap(fixed_cfg);
+        // ── or: persisted provider_endpoint is honored (custom endpoint) ──
+        let mut custom_cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(custom_cfg.set_string_field("provider_endpoint", "https://custom.example/v1"));
+        reload.swap(custom_cfg);
         assert_eq!(
             reload.provider_endpoint(),
-            DEFAULT_PROVIDER_ENDPOINT,
-            "fixed field ignores a persisted custom value"
+            "https://custom.example/v1",
+            "or field honors a persisted custom value"
         );
+        // and falls back to the default when unset
+        reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
+        assert_eq!(reload.provider_endpoint(), DEFAULT_PROVIDER_ENDPOINT);
 
         // ── non_empty: empty/whitespace → None ──
         let mut empty = ConfigData::STRUCT_FIELDS_DEFAULT;
@@ -1369,6 +1571,69 @@ mod tests {
         assert_eq!(trimmed_or_none("  value  "), Some("value".to_string()));
         assert_eq!(trimmed_or_none(" "), None);
         assert_eq!(trimmed_or_none(""), None);
+    }
+
+    /// Endpoint normalization (mahbot-1884): trivial variants of the default
+    /// OpenRouter URL — trailing slash, surrounding whitespace, uppercase
+    /// scheme/host, a trailing `/chat/completions` suffix — must never count
+    /// as a custom endpoint, while a genuinely different URL must.
+    #[test]
+    fn endpoint_normalization_default_vs_custom() {
+        // Exact default.
+        assert!(is_default_endpoint(DEFAULT_PROVIDER_ENDPOINT));
+        // Trailing slash.
+        assert!(is_default_endpoint("https://openrouter.ai/api/v1/"));
+        // Surrounding whitespace.
+        assert!(is_default_endpoint("  https://openrouter.ai/api/v1  "));
+        // Uppercase scheme/host.
+        assert!(is_default_endpoint("HTTPS://OPENROUTER.AI/api/v1"));
+        // Chat-completions suffix (both bare and trailing-slash variants).
+        assert!(is_default_endpoint(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
+        assert!(is_default_endpoint(
+            "https://openrouter.ai/api/v1/chat/completions/"
+        ));
+        // A genuinely custom endpoint.
+        assert!(is_custom_endpoint("http://localhost:8080/v1"));
+        assert!(is_custom_endpoint("https://custom.example/v1"));
+        assert!(!is_custom_endpoint(DEFAULT_PROVIDER_ENDPOINT));
+    }
+
+    /// Chat-credential key isolation (mahbot-1884): the OpenRouter key is
+    /// only ever used for the default endpoint. A custom endpoint uses its
+    /// own key; when that key is empty NO Authorization header is sent
+    /// (keyless servers) — the OpenRouter key must never reach a custom
+    /// endpoint.
+    #[test]
+    fn chat_credential_isolates_keys_per_endpoint() {
+        // Default endpoint → OpenRouter key.
+        let mut cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(cfg.set_string_field("provider_key", "sk-or"));
+        assert_eq!(chat_credential(&cfg).as_deref(), Some("sk-or"));
+
+        // Custom endpoint with its own key → the custom key (OR key ignored).
+        let mut cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(cfg.set_string_field("provider_key", "sk-or"));
+        assert!(cfg.set_string_field("provider_endpoint", "http://localhost:8080/v1"));
+        assert!(cfg.set_string_field("provider_endpoint_key", "sk-custom"));
+        assert_eq!(chat_credential(&cfg).as_deref(), Some("sk-custom"));
+
+        // Custom endpoint, keyless (empty custom key), OR key set → None:
+        // the OR key must never be sent to a custom endpoint.
+        let mut cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(cfg.set_string_field("provider_key", "sk-or"));
+        assert!(cfg.set_string_field("provider_endpoint", "http://localhost:8080/v1"));
+        assert!(cfg.set_string_field("provider_endpoint_key", ""));
+        assert_eq!(chat_credential(&cfg), None);
+
+        // Custom endpoint, keyless, no OR key → None (keyless operation).
+        let mut cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(cfg.set_string_field("provider_endpoint", "http://localhost:8080/v1"));
+        assert_eq!(chat_credential(&cfg), None);
+
+        // Default endpoint, no key → None.
+        assert_eq!(chat_credential(&ConfigData::STRUCT_FIELDS_DEFAULT), None);
     }
 
     // NOTE: Per-struct normalize tests (`model_routing_normalize`) have been
@@ -1570,7 +1835,7 @@ mod tests {
         // the call must not error and must not alter CONFIG.
         let result = persist_settled_string_field("wake_word_templates", "garbage").await;
         assert_eq!(
-            result.unwrap(),
+            result.unwrap().value,
             template_json,
             "guard must return the current templates unchanged"
         );
@@ -1600,6 +1865,7 @@ mod tests {
         for key in [
             CONFIG_KEY_PROVIDER_ENDPOINT,
             CONFIG_KEY_PROVIDER_KEY,
+            CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
             CONFIG_KEY_TELEGRAM_BOT_TOKEN,
             CONFIG_KEY_IMAGE_GEN_MODEL,
             CONFIG_KEY_MULTIMODAL_MODEL,

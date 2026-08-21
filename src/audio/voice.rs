@@ -935,7 +935,7 @@ pub(crate) fn is_speech_with_detector(
     // (FRAME_LENGTH) from the wake-word / enrollment paths, which naturally
     // splits into two 256-sample chunks.  Always process both chunks to keep
     // the detector's sliding window in sync with the actual audio stream.
-    for chunk in samples.chunks_exact(256) {
+    for chunk in samples.as_chunks::<256>().0 {
         if detector.predict_f32(&clamp_frame(chunk)) >= threshold {
             any_speech = true;
         }
@@ -1093,9 +1093,11 @@ pub(crate) fn read_pcm_cache(path: &Path) -> Option<Vec<f32>> {
         let _ = std::fs::remove_file(path);
         return None;
     }
-    let samples = data
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    let samples: Vec<f32> = data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     Some(samples)
 }

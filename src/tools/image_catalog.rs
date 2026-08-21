@@ -151,10 +151,11 @@ static CATALOG: crate::tools::catalog_cache::Catalog<ImageCatalog> =
         parse_catalog,
     );
 
-/// Return the cached catalog for the currently configured provider endpoint.
+/// Return the cached catalog for the default OpenRouter endpoint — media
+/// always targets OpenRouter (mahbot-1884), never a custom chat endpoint.
 pub(crate) async fn get_catalog() -> Option<Arc<ImageCatalog>> {
-    let endpoint = crate::config::CONFIG.provider_endpoint();
-    get_catalog_for_endpoint(&endpoint).await
+    let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
+    get_catalog_for_endpoint(endpoint).await
 }
 
 /// Return the cached catalog for `endpoint` if fresh, otherwise fetch it
@@ -167,7 +168,8 @@ pub(crate) async fn get_catalog_for_endpoint(endpoint: &str) -> Option<Arc<Image
 /// Test-only: seed the shared cache (no network).
 #[cfg(test)]
 pub(crate) fn seed_cache(catalog: Option<Arc<ImageCatalog>>) {
-    let endpoint = crate::providers::ensure_base_url(&crate::config::CONFIG.provider_endpoint());
+    // Media always targets OpenRouter (mahbot-1884) — seed the default key.
+    let endpoint = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
     CATALOG.seed(&endpoint, catalog);
 }
 
@@ -213,8 +215,10 @@ pub(crate) fn check_image_capability<'a>(
 ///
 /// - Catalog available and the model is absent from it or text-only.
 pub async fn validate_image_model(model: &str) -> anyhow::Result<()> {
-    let endpoint = crate::config::CONFIG.provider_endpoint();
-    validate_image_model_for_endpoint(model, &endpoint).await
+    // Media always targets OpenRouter (mahbot-1884) — validate against the
+    // default endpoint, never a custom chat endpoint.
+    let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
+    validate_image_model_for_endpoint(model, endpoint).await
 }
 
 /// Like [`validate_image_model`], but against the catalog for the explicit

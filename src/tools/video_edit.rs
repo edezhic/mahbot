@@ -756,7 +756,9 @@ impl Tool for VideoEditTool {
             body["duration"] = json!(d);
         }
 
-        let endpoint = crate::config::CONFIG.provider_endpoint();
+        // Video editing always targets OpenRouter (mahbot-1884) — a custom
+        // chat endpoint never serves video models.
+        let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
         let api_base = crate::providers::ensure_base_url(&endpoint);
 
         let video_bytes =

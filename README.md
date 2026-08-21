@@ -16,7 +16,7 @@ Batteries included:
 - __Out-of-the-box__ workspace discovery for per-role contexts, auto-detected diagnostics commands. No need for plugins, AGENTS/CLAUDE/other.md files or custom configurations. Just add the API key and state your wishes
 - __Specialized artist__ agent for image & video generation/editing as a little treat on top
 
-At the moment only supports OpenRouter as the provider, and by default configured to use the DeepSeek 4 Flash. More providers will definitely be added in the future, but as of now that's the best price/performance/simplicity combo known to me. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
+OpenRouter is the default provider, and by default mahbot is configured to use the DeepSeek 4 Flash. A custom self-hosted OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp, vLLM, LiteLLM) can be configured in Settings for chat requests. Note that media features (image/video generation, catalogs, media transcription) always use OpenRouter — so an OpenRouter key is still needed for those even when a custom endpoint handles chat. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
 
 ## The Pipeline
 
@@ -46,8 +46,9 @@ cargo install mahbot
 
 Then run `mahbot` to start the service, and you'll be asked to configure:
 
-**Required:**
-- OpenRouter API key
+**Required (one of):**
+- OpenRouter API key, or
+- a custom OpenAI-compatible endpoint (with an optional key) — e.g. Ollama, LM Studio, llama.cpp, vLLM, LiteLLM
 
 **Optional:**
 - Exa and/or Firecrawl API keys — for the `web_search` tool

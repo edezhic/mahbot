@@ -644,13 +644,16 @@ impl Dashboard {
                     std::convert::identity,
                 );
 
-                // Start on Settings while no API key is configured. The
+                // Start on Settings while no LLM provider is configured. The
                 // decision must be made here, after the config is fully
                 // loaded (bootstrap_mahbot finished), not in the initial
                 // loading state where CONFIG still holds defaults. A trimmed
                 // non-empty key counts as set — `provider_key()` collapses
-                // empty/whitespace to None, so those re-arm this startup.
-                let settings_start = if crate::config::CONFIG.provider_key().is_none() {
+                // empty/whitespace to None, so those re-arm this startup. An
+                // active custom endpoint counts as configured too (mahbot-1884)
+                // — a keyless custom endpoint user must not be parked on
+                // Settings.
+                let settings_start = if !crate::config::provider_configured() {
                     self.navigate_to(Page::Settings)
                 } else {
                     Task::none()

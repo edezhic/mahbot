@@ -263,8 +263,10 @@ impl<'a> Reader<'a> {
                     bail!("malformed packed float field (length {})", sub.len());
                 }
                 Ok(sub
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect())
             }
             other => bail!("unexpected wire type {other:?} for packed float field"),
@@ -281,12 +283,10 @@ impl<'a> Reader<'a> {
                     bail!("malformed packed double field (length {})", sub.len());
                 }
                 Ok(sub
-                    .chunks_exact(8)
-                    .map(|c| {
-                        f64::from_bits(u64::from_le_bytes([
-                            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
-                        ]))
-                    })
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| f64::from_bits(u64::from_le_bytes(*c)))
                     .collect())
             }
             other => bail!("unexpected wire type {other:?} for packed double field"),
@@ -633,8 +633,10 @@ fn raw_to_tensor(t: &RawTensor) -> Result<Tensor> {
         let data: Vec<i64> = match &t.data {
             TensorPayload::Int32(v) => v.iter().map(|&x| i64::from(x)).collect(),
             TensorPayload::Raw(b) => b
-                .chunks_exact(4)
-                .map(|c| i64::from(i32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i64::from(i32::from_le_bytes(*c)))
                 .collect(),
             _ => bail!("INT32 tensor '{}' has an incompatible payload", t.name),
         };

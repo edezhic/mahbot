@@ -447,11 +447,12 @@ fn decode_opus_from_ogg(data: &[u8], path: &Path) -> Result<(Vec<f32>, i32)> {
                 if channels == 1 {
                     samples.extend_from_slice(&pcm[..n_per_channel]);
                 } else {
-                    // Stereo → mono by averaging.
+                    // Stereo → mono by averaging (midpoint avoids overflow and
+                    // rounds identically to (l + r) * 0.5 for normal samples).
                     for i in 0..n_per_channel {
                         let l = pcm[i * 2];
                         let r = pcm[i * 2 + 1];
-                        samples.push((l + r) * 0.5);
+                        samples.push(l.midpoint(r));
                     }
                 }
             }

@@ -1414,14 +1414,6 @@ async fn process_single_workspace(ws: Workspace) {
     .await;
 }
 
-/// Whether the LLM provider is configured: a non-empty provider key.
-/// In-memory check only — no network or LLM call. The runtime endpoint is
-/// hardcoded (mahbot-1813), so a keyless custom endpoint no longer counts
-/// as provider configured.
-fn provider_configured() -> bool {
-    crate::config::CONFIG.provider_key().is_some()
-}
-
 /// Pickup step: claim a `Pending` workspace into its first discovery when the
 /// LLM provider is configured and no provider-failure cooldown is armed.
 ///
@@ -1491,7 +1483,7 @@ async fn pickup_claim(ws: &Workspace) -> Option<(i64, bool)> {
     if ws.status != WorkspaceStatus::Pending {
         return None;
     }
-    if !provider_configured() {
+    if !crate::config::provider_configured() {
         return None;
     }
     if crate::workspace::pending_pickup_cooldown_active(&ws.name) {

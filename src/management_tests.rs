@@ -3343,18 +3343,21 @@ async fn pickup_claim_claims_when_provider_configured() {
 
 #[tokio::test]
 #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
-async fn pickup_claim_does_not_claim_without_key_even_with_custom_endpoint_persisted() {
+async fn pickup_claim_claims_without_key_when_custom_endpoint_persisted() {
     init_management_test_stores().await;
-    // The runtime endpoint is hardcoded (mahbot-1813) — a persisted custom
-    // endpoint is no longer honored, so without a provider key the pickup
-    // must hold the workspace in pending (no claim, no discovery spawn).
+    // A keyless custom endpoint counts as provider configured (mahbot-1884) —
+    // the runtime honors a persisted custom endpoint, so without an OpenRouter
+    // key the pickup must still claim the workspace into discovery.
     let _cfg = ConfigGuard::new(None, Some("http://localhost:8080/v1"));
     let ws = create_test_workspace("/tmp/test_pickup_endpoint", "ws_pickup_endpoint").await;
 
     let claimed = pickup_claim(&ws).await;
+    let (generation, discover_diagnostics) = claimed
+        .expect("a persisted custom endpoint without a key must count as provider configured");
+    assert_eq!(generation, 0, "fresh workspace has discovery_generation 0");
     assert!(
-        claimed.is_none(),
-        "a persisted custom endpoint without a key must NOT count as provider configured"
+        discover_diagnostics,
+        "no diagnostics exist yet → first discovery must run diagnostics"
     );
 
     let stored = crate::workspace::store()
@@ -3364,8 +3367,12 @@ async fn pickup_claim_does_not_claim_without_key_even_with_custom_endpoint_persi
         .expect("exists");
     assert_eq!(
         stored.status,
-        WorkspaceStatus::Pending,
-        "no provider key → workspace stays pending despite the persisted endpoint"
+        WorkspaceStatus::Analyzing,
+        "keyless custom endpoint → pending workspace claimed into discovery"
+    );
+    assert!(
+        stored.paused,
+        "the claim must set the analysis pause (blocks pipeline claims while discovery runs)"
     );
 }
 
