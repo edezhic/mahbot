@@ -11,6 +11,10 @@
 //! - `[VIDEO:path]` → 🎬 emoji + placeholder text
 //! - `[Audio transcription of ...]: text` → 🔊 emoji + transcribed text
 //! - `[Video transcription of ...]: text` → 🎬 emoji + transcribed text
+//! - `[Saved image: path]` → stripped (the image renders separately from its
+//!   data-URI marker, so the upload annotation is pure display noise)
+//! - `[Saved video: path]` → `🎬 Video: filename` (there is no separate video
+//!   renderer, so the clip path must stay visible rather than be hidden)
 //!
 //! The pre-processing is applied **before** `markdown::parse()` so the
 //! standard markdown pipeline naturally produces `Item::Image` from the
@@ -47,7 +51,8 @@ pub(crate) fn preprocess(content: &str) -> String {
     // and "Video" which overlap with the raw `[AUDIO:...]`/`[VIDEO:...]`
     // patterns.  Handle them first.
     let s = replace_transcription(content);
-    replace_media_markers(&s)
+    let s = replace_media_markers(&s);
+    replace_saved_annotations(&s)
 }
 
 /// `[Audio transcription of {filename}]: {text}` → 🔊, `[Video transcription
@@ -91,6 +96,41 @@ fn replace_media_markers(s: &str) -> String {
                 // matches IMAGE|AUDIO|VIDEO), but defend against future changes.
                 _ => caps.get_match().as_str().to_string(),
             }
+        })
+        .to_string()
+}
+
+/// Handle the `[Saved <kind>: path]` upload annotations produced by the channel
+/// enrichment layer. These are **not** `[KIND:path]` markers (so the canonical
+/// [`MEDIA_MARKER_RE`] leaves them untouched), and they are model-facing only —
+/// the GUI strips/rewrites them for display.
+///
+/// - `[Saved image: path]` → stripped entirely. The image already renders
+///   separately from its accompanying `[IMAGE:data:…]` marker, so the upload
+///   annotation (with the blank-line separator enrichment inserts before it) is
+///   pure display noise.
+/// - `[Saved video: path]` → `🎬 Video: filename`. Video enrichment replaces the
+///   `[VIDEO:path]` marker in place with the `[Saved video: ...]` annotation and
+///   has **no** separate video renderer, so blanket-stripping it would hide the
+///   clip. Rewriting it to the same placeholder the raw `[VIDEO:path]` marker
+///   produces keeps the clip path visible.
+fn replace_saved_annotations(s: &str) -> String {
+    // `\n*` eats the blank-line separator enrichment inserts before the
+    // trailing image annotation so no stray whitespace remains in the display.
+    static SAVED_IMAGE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\n*\[Saved image: [^\]]*\]")
+            .expect("saved image annotation regex must compile")
+    });
+    static SAVED_VIDEO_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\[Saved video: ([^\]]*)\]")
+            .expect("saved video annotation regex must compile")
+    });
+
+    let s = SAVED_IMAGE_RE.replace_all(s, "").to_string();
+    SAVED_VIDEO_RE
+        .replace_all(&s, |caps: &regex::Captures| {
+            let path = caps.get(1).map_or("", |m| m.as_str());
+            format!("🎬 Video: {}", file_name_or_path(path))
         })
         .to_string()
 }
@@ -488,6 +528,46 @@ mod tests {
     #[test]
     fn empty_string() {
         assert_eq!(preprocess(""), "");
+    }
+
+    #[test]
+    fn strip_saved_image_annotation() {
+        // The upload annotation is display noise: the image renders separately
+        // from its data-URI marker, so `[Saved image: ...]` and the blank-line
+        // separator enrichment inserts before it are removed.
+        assert_eq!(
+            preprocess("[IMAGE:data:image/png;base64,AAAA]\n\n[Saved image: /uploads/img.png]"),
+            "![Image](data:image/png;base64,AAAA)"
+        );
+    }
+
+    #[test]
+    fn strip_saved_image_annotation_at_start() {
+        // An annotation with no preceding content/separator is still stripped.
+        assert_eq!(preprocess("[Saved image: /uploads/img.png]"), "");
+    }
+
+    #[test]
+    fn saved_video_annotation_becomes_placeholder() {
+        // Video enrichment replaces `[VIDEO:path]` in place with the
+        // `[Saved video: ...]` annotation; there is no separate video renderer,
+        // so the path must stay visible as a clip placeholder.
+        assert_eq!(
+            preprocess("Clip [Saved video: /uploads/clip.mp4] here"),
+            "Clip 🎬 Video: clip.mp4 here"
+        );
+    }
+
+    #[test]
+    fn saved_video_annotation_keeps_clip_visible_with_transcription() {
+        // Full video flow: transcription annotation + saved-video annotation.
+        // Both must render (the clip path must not be hidden).
+        assert_eq!(
+            preprocess(
+                "[Video transcription of clip.mp4]: Line one\n\n[Saved video: /uploads/clip.mp4]"
+            ),
+            "🎬 Line one\n\n🎬 Video: clip.mp4"
+        );
     }
 
     #[test]
