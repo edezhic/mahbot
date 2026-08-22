@@ -131,8 +131,13 @@ use tokio::fs;
 
 pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 
-pub(crate) const DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-pro-0813";
-pub(crate) const DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
+pub(crate) const DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
+pub(crate) const DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
+
+// The previous compiled defaults for the manager/worker slots, kept only for
+// the one-time migration in `migrate_old_default_models`.
+const OLD_DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-pro-0813";
+const OLD_DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
 pub(crate) const DEFAULT_VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.7-flash";
 
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
@@ -1069,6 +1074,37 @@ async fn seed_fresh_install_defaults_from_flag(
     seed_fresh_install_defaults(fresh, store).await
 }
 
+/// One-time idempotent migration (mahbot-1898): rewrite persisted
+/// `config_kv` rows that still hold the *previous* manager/worker default
+/// model to the new vision-capable default. Matching is exact on the full
+/// provider-prefixed string, so only rows the user never overrode are
+/// touched; the video-transcription slot and every other key are untouched.
+/// Safe to run on every boot — a no-op once no row matches.
+async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Result<()> {
+    let changed_manager = store
+        .migrate_kv_if_equals(
+            CONFIG_KEY_MANAGER_MODEL,
+            OLD_DEFAULT_MANAGER_MODEL,
+            DEFAULT_MANAGER_MODEL,
+        )
+        .await?;
+    let changed_worker = store
+        .migrate_kv_if_equals(
+            CONFIG_KEY_WORKER_MODEL,
+            OLD_DEFAULT_WORKER_MODEL,
+            DEFAULT_WORKER_MODEL,
+        )
+        .await?;
+    if changed_manager > 0 || changed_worker > 0 {
+        tracing::info!(
+            manager_rows = changed_manager,
+            worker_rows = changed_worker,
+            "Migrated stored old default models to the vision-capable default"
+        );
+    }
+    Ok(())
+}
+
 /// Reload config from the `config.db` database, atomically swapping the
 /// runtime config. Called at startup (after config_db init) to overlay
 /// persisted settings on top of hardcoded defaults.
@@ -1083,6 +1119,10 @@ pub async fn reload_from_db() -> Result<()> {
     // Existing installs are never written (the flag is only set when config.db
     // did not exist before the store open).
     seed_fresh_install_defaults_from_flag(store).await?;
+
+    // Rewrite persisted old-default manager/worker rows to the new default
+    // before the overlay below, so this boot serves the migrated value.
+    migrate_old_default_models(store).await?;
 
     let kvs = store.get_all_kv().await?;
     for (key, value) in &kvs {
@@ -1949,12 +1989,10 @@ mod tests {
         );
         assert_eq!(
             fresh_store.get_all_model_routings().await.unwrap(),
-            vec![
-                model_routing("deepseek/deepseek-v4-flash-0731", Some("DeepSeek")),
-                model_routing("deepseek/deepseek-v4-pro-0813", Some("DeepSeek")),
-            ],
-            "a fresh config database must seed DeepSeek routing rows for the \
-             deepseek/* default model slots (sorted by model; others get none)"
+            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("DeepSeek"))],
+            "a fresh config database must seed a single DeepSeek routing row for \
+             the vision-capable default model shared by the manager and worker \
+             slots (others get none)"
         );
 
         // ── Existing install: the store file already exists ──
@@ -1980,6 +2018,135 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "an existing config database must receive zero routing rows (no backfill)"
+        );
+    }
+
+    /// One-time migration: persisted `config_kv` rows holding the previous
+    /// manager/worker default model are rewritten to the new vision-capable
+    /// default, and only those rows (and only when they match the exact old
+    /// default) are touched. Re-running is a no-op.
+    #[tokio::test]
+    async fn migrate_old_default_models_rewrites_only_stale_slot_rows() {
+        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+
+        // Existing-install snapshot at the time of the default swap: both slots
+        // still hold the previous defaults; the video-transcription slot and an
+        // unrelated key must remain untouched.
+        store
+            .set_kv(CONFIG_KEY_MANAGER_MODEL, OLD_DEFAULT_MANAGER_MODEL)
+            .await
+            .unwrap();
+        store
+            .set_kv(CONFIG_KEY_WORKER_MODEL, OLD_DEFAULT_WORKER_MODEL)
+            .await
+            .unwrap();
+        store
+            .set_kv(CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL, "qwen/qwen3.7-flash")
+            .await
+            .unwrap();
+        store
+            .set_kv(CONFIG_KEY_PROVIDER_KEY, "sk-example")
+            .await
+            .unwrap();
+
+        migrate_old_default_models(&store).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_MANAGER_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(DEFAULT_MANAGER_MODEL),
+            "manager slot holding the old default must be migrated"
+        );
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_WORKER_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(DEFAULT_WORKER_MODEL),
+            "worker slot holding the old default must be migrated"
+        );
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("qwen/qwen3.7-flash"),
+            "the video-transcription slot must never be touched"
+        );
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_PROVIDER_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sk-example"),
+            "unrelated config keys must never be touched"
+        );
+
+        // Idempotent: a second run changes nothing.
+        migrate_old_default_models(&store).await.unwrap();
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_MANAGER_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(DEFAULT_MANAGER_MODEL),
+            "re-running the migration must be a no-op"
+        );
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_WORKER_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(DEFAULT_WORKER_MODEL),
+            "re-running the migration must be a no-op"
+        );
+    }
+
+    /// The migration must be a no-op when a slot already holds the target
+    /// default or a genuine user override — it must never overwrite a
+    /// user-configured model.
+    #[tokio::test]
+    async fn migrate_old_default_models_noop_for_target_and_user_overrides() {
+        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+
+        // Already at the target default.
+        store
+            .set_kv(CONFIG_KEY_MANAGER_MODEL, DEFAULT_MANAGER_MODEL)
+            .await
+            .unwrap();
+        // A genuine user override (not the old default) must be preserved.
+        store
+            .set_kv(CONFIG_KEY_WORKER_MODEL, "user/private-model")
+            .await
+            .unwrap();
+
+        migrate_old_default_models(&store).await.unwrap();
+
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_MANAGER_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(DEFAULT_MANAGER_MODEL),
+            "a slot already at the target must be untouched"
+        );
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_WORKER_MODEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("user/private-model"),
+            "a genuine user override must be preserved"
         );
     }
 }

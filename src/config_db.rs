@@ -84,6 +84,9 @@ const SET_KV_SQL: &str = "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
 
 const DELETE_KV_SQL: &str = "DELETE FROM config_kv WHERE key = ?1";
 
+const MIGRATE_KV_IF_EQUALS_SQL: &str = "UPDATE config_kv SET value = ?3 \
+     WHERE key = ?1 AND value = ?2";
+
 // ── Per-row UPSERT / DELETE (config_model_routing) ──
 
 const UPSERT_MODEL_ROUTING_SQL: &str = "INSERT INTO config_model_routing (model, provider_order) \
@@ -109,6 +112,29 @@ impl ConfigStore {
             .execute(DELETE_KV_SQL, turso::params![key])
             .await?;
         Ok(())
+    }
+
+    /// Conditionally rewrite a `config_kv` value: set `value` to `new_value`
+    /// only when the existing row holds exactly `old_value`. Returns the
+    /// number of rows changed (`0` when absent, already at `new_value`, or
+    /// holding a different value). Idempotent by construction: once every
+    /// matching row is rewritten, later calls are no-ops. Returns the count
+    /// (rather than `()`) so the caller can log when it actually changes
+    /// something.
+    pub async fn migrate_kv_if_equals(
+        &self,
+        key: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> Result<u64> {
+        let changed = self
+            .conn
+            .execute(
+                MIGRATE_KV_IF_EQUALS_SQL,
+                turso::params![key, old_value, new_value],
+            )
+            .await?;
+        Ok(changed)
     }
 
     /// Persist the transcription toggle and its wake-word cascade atomically
@@ -304,6 +330,48 @@ mod tests {
             vec![("beta".to_string(), "second".to_string())],
             "only the undeleted item should remain"
         );
+    }
+
+    /// `migrate_kv_if_equals` only rewrites a row whose value equals `old_value`,
+    /// and reports the affected-row count (0 = no-op).
+    #[tokio::test]
+    async fn test_migrate_kv_if_equals_conditional_rewrite() {
+        let (store, _dir) = setup().await;
+
+        // Row with the old value → rewritten, reports 1.
+        store.set_kv("slot", "OLD").await.unwrap();
+        let changed = store
+            .migrate_kv_if_equals("slot", "OLD", "NEW")
+            .await
+            .unwrap();
+        assert_eq!(changed, 1, "exact match must be rewritten");
+        assert_eq!(store.get_kv("slot").await.unwrap().as_deref(), Some("NEW"));
+
+        // Already at target → no-op, reports 0.
+        let changed = store
+            .migrate_kv_if_equals("slot", "OLD", "NEW")
+            .await
+            .unwrap();
+        assert_eq!(changed, 0, "already at target must be untouched");
+
+        // A different value (user override) → untouched, reports 0.
+        store.set_kv("slot", "OTHER").await.unwrap();
+        let changed = store
+            .migrate_kv_if_equals("slot", "OLD", "NEW")
+            .await
+            .unwrap();
+        assert_eq!(changed, 0, "a different value must be untouched");
+        assert_eq!(
+            store.get_kv("slot").await.unwrap().as_deref(),
+            Some("OTHER")
+        );
+
+        // Absent key → no-op, reports 0.
+        let changed = store
+            .migrate_kv_if_equals("absent", "OLD", "NEW")
+            .await
+            .unwrap();
+        assert_eq!(changed, 0, "an absent key must be a no-op");
     }
 
     // ── Per-row save (settings-page autosave) ─────────────────────
