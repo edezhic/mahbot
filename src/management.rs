@@ -260,12 +260,12 @@ enum NotifyPolicy {
 /// writing to a closure.
 ///
 #[derive(Debug)]
-struct TransitionCtx<'a> {
-    ticket: &'a Ticket,
+struct TransitionCtx<'t, 'l> {
+    ticket: &'t Ticket,
     source: TicketPhase,
     target: TicketPhase,
     notify: NotifyPolicy,
-    log_label: &'a str,
+    log_label: &'l str,
     /// True when this Failed transition was a circuit-breaker drain — the
     /// failure notification then describes the drain instead of the
     /// auto-pause. Read only on Failed transitions; the readers are the
@@ -274,6 +274,45 @@ struct TransitionCtx<'a> {
     /// Every Failed site must set it explicitly so the notification renders
     /// the sentence matching the mechanism that ran.
     breaker_trip: bool,
+}
+
+impl<'t, 'l> TransitionCtx<'t, 'l> {
+    fn new(
+        ticket: &'t Ticket,
+        source: TicketPhase,
+        target: TicketPhase,
+        notify: NotifyPolicy,
+        log_label: &'l str,
+    ) -> Self {
+        Self {
+            ticket,
+            source,
+            target,
+            notify,
+            log_label,
+            breaker_trip: false,
+        }
+    }
+    fn notifying(
+        ticket: &'t Ticket,
+        source: TicketPhase,
+        target: TicketPhase,
+        log_label: &'l str,
+    ) -> Self {
+        Self::new(ticket, source, target, NotifyPolicy::Notify, log_label)
+    }
+    fn buffered(
+        ticket: &'t Ticket,
+        source: TicketPhase,
+        target: TicketPhase,
+        log_label: &'l str,
+    ) -> Self {
+        Self::new(ticket, source, target, NotifyPolicy::Buffer, log_label)
+    }
+    fn with_breaker(mut self, breaker_trip: bool) -> Self {
+        self.breaker_trip = breaker_trip;
+        self
+    }
 }
 
 /// Result of a stage-finalization comment+transition.
@@ -327,7 +366,7 @@ enum FinalizeOutcome {
 /// executing on the ticket.
 #[must_use]
 async fn with_comment_and_transition<F>(
-    ctx: TransitionCtx<'_>,
+    ctx: TransitionCtx<'_, '_>,
     write_comments: F,
 ) -> FinalizeOutcome
 where
@@ -411,7 +450,11 @@ where
 /// Both `role` and `text` are required — the compiler guarantees a comment
 /// is always written.
 #[must_use]
-async fn comment_and_transition(ctx: TransitionCtx<'_>, role: &str, text: &str) -> FinalizeOutcome {
+async fn comment_and_transition(
+    ctx: TransitionCtx<'_, '_>,
+    role: &str,
+    text: &str,
+) -> FinalizeOutcome {
     let ticket = ctx.ticket;
 
     with_comment_and_transition(ctx, async |tx| {
@@ -431,7 +474,7 @@ async fn comment_and_transition(ctx: TransitionCtx<'_>, role: &str, text: &str) 
 /// already logged the warning, so nothing more is emitted here. Must be the
 /// caller's final step.
 async fn comment_and_transition_or_bail(
-    ctx: TransitionCtx<'_>,
+    ctx: TransitionCtx<'_, '_>,
     role: &str,
     text: &str,
     message: &str,
@@ -1038,14 +1081,12 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
             // externally while the dispatch was running.
             let panic_comment = format!("❌ Dispatch panicked: {msg}{pause_note}");
             let _ = comment_and_transition(
-                TransitionCtx {
-                    ticket: &ticket_for_failure,
-                    source: expected_phase,
-                    target: TicketPhase::Failed,
-                    notify: NotifyPolicy::Notify,
-                    log_label: "dispatch panic",
-                    breaker_trip: false,
-                },
+                TransitionCtx::notifying(
+                    &ticket_for_failure,
+                    expected_phase,
+                    TicketPhase::Failed,
+                    "dispatch panic",
+                ),
                 SYSTEM_ROLE,
                 &panic_comment,
             )
@@ -1811,14 +1852,12 @@ async fn finalize_engineer_round(
     if let Some(text) = response {
         let comment_text = engineer_comment_text(agent, text).await;
         comment_and_transition_or_bail(
-            TransitionCtx {
+            TransitionCtx::buffered(
                 ticket,
-                source: TicketPhase::InDevelopment,
-                target: TicketPhase::InDiagnostics,
-                notify: NotifyPolicy::Buffer,
-                log_label: "Engineer",
-                breaker_trip: false,
-            },
+                TicketPhase::InDevelopment,
+                TicketPhase::InDiagnostics,
+                "Engineer",
+            ),
             Role::Engineer.as_str(),
             &comment_text,
             if resumed {
@@ -1915,14 +1954,12 @@ async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) 
         // User-initiated cancellation keeps today's semantics: ticket Failed
         // + workspace pause, never auto-re-queued.
         comment_and_transition_or_bail(
-            TransitionCtx {
+            TransitionCtx::notifying(
                 ticket,
-                source: TicketPhase::InDevelopment,
-                target: TicketPhase::Failed,
-                notify: NotifyPolicy::Notify,
-                log_label: "Engineer",
-                breaker_trip: false,
-            },
+                TicketPhase::InDevelopment,
+                TicketPhase::Failed,
+                "Engineer",
+            ),
             SYSTEM_ROLE,
             &comment_text,
             if resumed {
@@ -1956,18 +1993,9 @@ async fn bounce_engineer_hard_failure(ticket: &Ticket, comment_text: &str, resum
         TicketPhase::ReadyForDevelopment
     };
 
+    // Not a circuit-breaker drain: siblings are NOT moved to Planning, so the Failed notification must render the paused-workspace sentence, not the drain sentence.
     let outcome = with_comment_and_transition(
-        TransitionCtx {
-            ticket,
-            source: TicketPhase::InDevelopment,
-            target,
-            notify: NotifyPolicy::Notify,
-            log_label: "Engineer",
-            // Not a circuit-breaker drain: siblings are NOT moved to
-            // Planning, so the Failed notification must render the
-            // paused-workspace sentence, not the drain sentence.
-            breaker_trip: false,
-        },
+        TransitionCtx::notifying(ticket, TicketPhase::InDevelopment, target, "Engineer"),
         async |tx| {
             // Trip comment first, failure comment last — notify_ticket
             // renders comments.last() as the failure details, so the
@@ -2219,17 +2247,9 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
 /// Transition a ticket to Done with a descriptive reason from the given source phase.
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
-    let log_label = "Finalize";
     if matches!(
         comment_and_transition(
-            TransitionCtx {
-                ticket,
-                source,
-                target: TicketPhase::Done,
-                notify: notify_policy,
-                log_label,
-                breaker_trip: false,
-            },
+            TransitionCtx::new(ticket, source, TicketPhase::Done, notify_policy, "Finalize"),
             SYSTEM_ROLE,
             comment,
         )
@@ -2375,14 +2395,7 @@ async fn finalize_commit_and_transition(
 
     if matches!(
         with_comment_and_transition(
-            TransitionCtx {
-                ticket,
-                source,
-                target: TicketPhase::Done,
-                notify: notify_policy,
-                log_label: &log_label,
-                breaker_trip: false,
-            },
+            TransitionCtx::new(ticket, source, TicketPhase::Done, notify_policy, &log_label),
             async |tx| {
                 BoardStore::set_commit_info_tx(
                     tx,
@@ -2736,14 +2749,12 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             rationale = verdict.rationale
         );
         comment_and_transition_or_bail(
-            TransitionCtx {
+            TransitionCtx::buffered(
                 ticket,
-                source: TicketPhase::InSanitation,
-                target: TicketPhase::SanitationPassed,
-                notify: NotifyPolicy::Buffer,
-                log_label: "Sanitation",
-                breaker_trip: false,
-            },
+                TicketPhase::InSanitation,
+                TicketPhase::SanitationPassed,
+                "Sanitation",
+            ),
             Role::Sanitation.as_str(),
             &comment,
             "Sanitation passed — transitioned to SanitationPassed",
@@ -2776,14 +2787,12 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
         // transaction. This matches the pattern used by all other verdict paths.
         if !matches!(
             with_comment_and_transition(
-                TransitionCtx {
+                TransitionCtx::buffered(
                     ticket,
-                    source: TicketPhase::InSanitation,
-                    target: TicketPhase::ReadyForDevelopment,
-                    notify: NotifyPolicy::Buffer,
-                    log_label: "Sanitation",
-                    breaker_trip: false,
-                },
+                    TicketPhase::InSanitation,
+                    TicketPhase::ReadyForDevelopment,
+                    "Sanitation"
+                ),
                 async |tx| {
                     BoardStore::add_comment_tx(
                         tx,
@@ -2996,14 +3005,12 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         };
 
     comment_and_transition_or_bail(
-        TransitionCtx {
-            ticket: &ticket,
-            source: TicketPhase::InDiagnostics,
-            target: target_phase,
-            notify: NotifyPolicy::Buffer,
-            log_label: "Diagnostics",
-            breaker_trip: false,
-        },
+        TransitionCtx::buffered(
+            &ticket,
+            TicketPhase::InDiagnostics,
+            target_phase,
+            "Diagnostics",
+        ),
         DIAGNOSTICS_ROLE,
         &comment_body,
         outcome_log,
@@ -4018,14 +4025,12 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
 
     if !matches!(
         with_comment_and_transition(
-            TransitionCtx {
+            TransitionCtx::notifying(
                 ticket,
-                source: TicketPhase::Analysis,
-                target: TicketPhase::Planning,
-                notify: NotifyPolicy::Notify,
-                log_label: "Analyst",
-                breaker_trip: false,
-            },
+                TicketPhase::Analysis,
+                TicketPhase::Planning,
+                "Analyst"
+            ),
             async |tx| {
                 BoardStore::add_comment_tx(
                     tx,
@@ -4282,14 +4287,8 @@ async fn try_trip_circuit_breaker(
 
     let breaker_label = format!("{log_label} circuit breaker");
     match comment_and_transition(
-        TransitionCtx {
-            ticket,
-            source: source_phase,
-            target: TicketPhase::Failed,
-            notify: NotifyPolicy::Notify,
-            log_label: &breaker_label,
-            breaker_trip: true,
-        },
+        TransitionCtx::notifying(ticket, source_phase, TicketPhase::Failed, &breaker_label)
+            .with_breaker(true),
         SYSTEM_ROLE,
         &msg,
     )
@@ -4501,14 +4500,14 @@ async fn process_verifier_verdicts(
 
     if !matches!(
         with_comment_and_transition(
-            TransitionCtx {
+            TransitionCtx::new(
                 ticket,
-                source: verifier.active_phase,
+                verifier.active_phase,
                 target,
                 notify,
-                log_label: verifier.log_label,
-                breaker_trip: bounce_trip,
-            },
+                verifier.log_label
+            )
+            .with_breaker(bounce_trip),
             async |tx| {
                 if let Some(comment) = &joint_comment {
                     BoardStore::add_comment_tx(tx, &ticket.id, stage_name(verifier.role), comment)
@@ -4902,14 +4901,12 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
                     "Content identical to reviewed base — skipping reviewer dispatch",
                 );
                 let _ = comment_and_transition(
-                    TransitionCtx {
-                        ticket: &ticket,
-                        source: vi.active_phase,
-                        target: TicketPhase::Reviewed,
-                        notify: NotifyPolicy::Buffer,
-                        log_label: vi.log_label,
-                        breaker_trip: false,
-                    },
+                    TransitionCtx::buffered(
+                        &ticket,
+                        vi.active_phase,
+                        TicketPhase::Reviewed,
+                        vi.log_label,
+                    ),
                     SYSTEM_ROLE,
                     "Content is identical to the reviewed base recorded for this ticket \
                      (same HEAD commit and index tree, no working-tree changes). \
