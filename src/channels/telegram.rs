@@ -1946,7 +1946,7 @@ impl TelegramChannel {
         let resp = match self.http_client().post(&url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Telegram poll error: {e}");
+                tracing::info!("Telegram poll error: {e}");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 return PollOutcome::Transport;
             }
