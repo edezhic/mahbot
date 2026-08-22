@@ -175,6 +175,7 @@ fn count_matching_comments(comments: &[TicketComment], role: &str, marker: &str)
 /// Returns `false` otherwise — the ticket may have been moved externally,
 /// not found in the database, or a database error occurred.
 /// The caller should abort its current work on this ticket.
+/// Canonical fail-closed contract for the two wrappers below.
 #[must_use]
 async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> bool {
     match board().get_ticket_phase(ticket_id).await {
@@ -201,15 +202,13 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
-/// True when the ticket is not in the expected phase — moved externally, or
-/// failed-closed on a missing row / DB error: the stage job is completed and
-/// the caller should bail. (The sibling [`phase_changed_and_clear_assignment`]
-/// clears `assigned_to` instead, for the single-agent re-dispatch rounds.)
+/// Bails when not in expected phase: completes stage job via [`complete_ticket_stage_job`],
+/// does NOT touch `assigned_to` (parallel rounds keep `assigned_to=NULL` owned by
+/// [`run_parallel_agents`]). See [`is_ticket_in_phase`] for the fail-closed contract
+/// (moved externally / missing row / DB error → bail). Sibling [`phase_changed_and_clear_assignment`]
+/// clears `assigned_to` instead for single-slot re-dispatch rounds.
 ///
-/// Three guard sites: the analysis round ([`maybe_escalate_analysis`],
-/// [`finalize_analysis_round`]), the verifier round ([`dispatch_verifiers`]),
-/// and the resume path pre-dispatch ([`resume_analysis_round`],
-/// [`resume_verifier_round`], [`resume_stage_round`]).
+/// Three guard sites: analysis round ([`maybe_escalate_analysis`], [`finalize_analysis_round`]), verifier round ([`dispatch_verifiers`]), resume path ([`resume_analysis_round`], [`resume_verifier_round`], [`resume_stage_round`]).
 #[must_use]
 async fn complete_job_and_bail_if_phase_moved(
     ticket_id: &str,
@@ -223,19 +222,13 @@ async fn complete_job_and_bail_if_phase_moved(
     false
 }
 
-/// Checks whether the ticket is still in the expected phase and, if it has
-/// moved externally, clears `assigned_to` to allow re-dispatch on the next
-/// poll cycle.
+/// Bails when not in expected phase: clears `assigned_to` via [`clear_assigned_to_no_cancel`]
+/// to unblock re-dispatch for single-agent rounds. See [`is_ticket_in_phase`] for the
+/// fail-closed contract (moved externally / missing row / DB error → bail). Sibling
+/// [`complete_job_and_bail_if_phase_moved`] terminalizes the stage job instead and does
+/// not touch `assigned_to`.
 ///
-/// Returns `true` when the phase changed — in that case `assigned_to` is
-/// cleared and the caller should abort its current work on this ticket.
-/// Returns `false` when the ticket is still in the expected phase (no action
-/// taken).
-///
-/// All call sites ([`finalize_engineer_round`], [`finalize_sanitation_round`],
-/// [`dispatch_diagnostics`]) have previously set `assigned_to` via
-/// [`claim_ticket_in_workspace`] or [`claim_diagnostics`], so clearing it
-/// here is essential to prevent a stale assignment from blocking re-dispatch.
+/// Call sites ([`finalize_engineer_round`], [`finalize_sanitation_round`], [`dispatch_diagnostics`]) have previously set `assigned_to` via [`claim_ticket_in_workspace`] or [`claim_diagnostics`], so clearing it here prevents a stale assignment from blocking re-dispatch.
 #[must_use]
 async fn phase_changed_and_clear_assignment(ticket_id: &str, expected: TicketPhase) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
