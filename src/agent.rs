@@ -78,7 +78,7 @@ tokio::task_local! {
 /// calls than this cap. These semantics are deliberate — do not "fix" the
 /// counter (or the strip path) to count raw LLM calls while touching this file.
 ///
-/// **DO NOT REDUCE this value without benchmarking against real ticket iteration
+/// **DO NOT REDUCE this value without benchmarking against real ticket tool-round
 /// distributions in this codebase.**
 ///
 /// # Why this is intentionally generous (1000)
@@ -101,7 +101,7 @@ tokio::task_local! {
 ///   rounds themselves would have consumed.
 ///
 /// Value last intentionally reviewed: 2026-07-11
-const MAX_LLM_ITERATIONS: usize = 1000;
+const MAX_TOOL_ROUNDS: usize = 1000;
 
 /// Maximum length of serialized arguments stored in per-call stats.
 /// Longer arguments are truncated at a UTF-8-safe boundary.
@@ -320,7 +320,7 @@ impl Agent {
         // from the Running Agents page) must never run a round — even when it
         // registers AFTER the registry's cancel sweep (the late-register
         // race). The token is pre-cancelled, so the agent's llm_loop bails at
-        // its first iteration-top check and the round yields no response.
+        // its first tool-round-top check and the round yields no response.
         if let Some(crate::registry::ParentKey::Research(run_id)) = &parent_key
             && crate::research_cancel::is_cancelled(run_id)
         {
@@ -552,13 +552,13 @@ impl Agent {
     async fn llm_loop(&mut self) -> anyhow::Result<String> {
         let span = tracing::info_span!("agent", agent_id = %self.agent_id, role = %self.role, workspace = %self.workspace.path);
         async {
-            let mut iteration = 0usize;
+            let mut tool_rounds = 0usize;
             let mut accumulated_media_paths: Vec<(&'static str, String)> = Vec::new();
             loop {
                 if self.cancel_token.is_cancelled() {
                     anyhow::bail!("Agent cancelled by user");
                 }
-                // Shutdown/drain: checked at iteration top (after the previous
+                // Shutdown/drain: checked at tool-round top (after the previous
                 // tool group's commit) so the CURRENT tool group completes —
                 // no new LLM call starts once the drain begins (or the token
                 // fires). The round is resumed at boot via the job row
@@ -566,9 +566,9 @@ impl Agent {
                 if crate::shutdown::aborting() {
                     anyhow::bail!("Agent round cut short by shutdown/drain — resumes at boot");
                 }
-                if iteration >= MAX_LLM_ITERATIONS {
+                if tool_rounds >= MAX_TOOL_ROUNDS {
                     anyhow::bail!(
-                        "Agent exceeded maximum of {MAX_LLM_ITERATIONS} tool rounds \
+                        "Agent exceeded maximum of {MAX_TOOL_ROUNDS} tool rounds \
                          — model may be stuck in a tool-calling loop"
                     );
                 }
@@ -582,7 +582,7 @@ impl Agent {
                 // completes, success or failure — the wait is fail-open;
                 // Notify's stored permit covers a fire-before-wait race.
                 let llm_result = self.llm_call().await;
-                if iteration == 0
+                if tool_rounds == 0
                     && let Some(notify) = &self.first_call_notify
                 {
                     notify.notify_one();
@@ -593,7 +593,7 @@ impl Agent {
                 // image must not fail the run wholesale nor stay sticky in the
                 // session. Strip the image markers from the most recent user
                 // message (durable-first) and continue the loop — the next
-                // iteration re-runs `llm_call` with the corrected message as
+                // tool round re-runs `llm_call` with the corrected message as
                 // part of the NORMAL loop, not a dedicated retry step. No
                 // retry guard: a subsequent failure whose most recent user
                 // message no longer contains image markers takes the normal
@@ -604,7 +604,7 @@ impl Agent {
                 // request diverges from its followers' byte-stable prefix —
                 // fail-open by design, and moot for the direct-chat Artist
                 // scenario that exercises this path (management rounds never
-                // send images). Note: the retried call re-runs the iteration-0
+                // send images). Note: the retried call re-runs the tool-round-0
                 // `notify_one` above, but the stagger has a single waiter (the
                 // `select!` in `spawn_staggered_round`, already consumed) — the
                 // second notification stores an unconsumed permit and is
@@ -623,7 +623,7 @@ impl Agent {
                     tracing::info!(
                         agent_id = %self.agent_id,
                         role = %self.role,
-                        iteration,
+                        tool_rounds,
                         "Stripped provider-rejected input image from the most recent user \
                          message — continuing the normal loop"
                     );
@@ -636,7 +636,7 @@ impl Agent {
                     history_content,
                 } = prepare_assistant_turn(
                     llm_result
-                        .with_context(|| format!("LLM step failed at iteration {iteration}"))?,
+                        .with_context(|| format!("LLM step failed at tool round {tool_rounds}"))?,
                 );
 
                 if tool_calls.is_empty() {
@@ -667,7 +667,7 @@ impl Agent {
                 self.commit_tool_results(&tool_calls, &all_outcomes, &history_content)
                     .await?;
 
-                iteration += 1;
+                tool_rounds += 1;
             }
         }
         .instrument(span)
@@ -818,7 +818,7 @@ impl Agent {
         // user pressing Stop), bail immediately without executing the tool.  This
         // prevents side-effecting tools (shell commands, file edits, sub-agents)
         // from running after cancellation.  The `llm_loop` checks cancellation at
-        // the top of each iteration, but tool calls dispatched before that check
+        // the top of each tool round, but tool calls dispatched before that check
         // can still reach this method.
         if self.cancel_token.is_cancelled() {
             let reason = "Agent cancelled — tool execution skipped";
@@ -988,7 +988,7 @@ impl Agent {
         // changes the content. If they ever drift — e.g. a malformed `[IMAGE:`
         // fragment passes detection but the regex leaves it verbatim — a
         // no-change rewrite would report `Rewritten` and the loop `continue`
-        // below would skip `iteration += 1`, an unbounded retry loop. Treat a
+        // below would skip `tool_rounds += 1`, an unbounded retry loop. Treat a
         // no-change strip as a non-strip: keep the original error path.
         let content = {
             let original = &self.session.history()[idx].content;
@@ -1282,7 +1282,7 @@ impl Agent {
     }
 
     /// Persist tool results to the session store and push them into the in-memory
-    /// history (via the session) for the next LLM iteration.
+    /// history (via the session) for the next tool round.
     ///
     /// All messages (assistant call + tool results) are batch-persisted in a single
     /// DB transaction, eliminating orphaned assistant calls on crash mid-loop.
@@ -1373,7 +1373,7 @@ impl Agent {
     /// Drain any incoming messages from the router (e.g., ticket comments)
     /// and inject them into the session history.
     ///
-    /// Called at the start of each LLM loop iteration, before the LLM call.
+    /// Called at the start of each tool round, before the LLM call.
     /// Messages are persisted to the session DB AND pushed to in-memory
     /// history so they survive crashes and are visible to the model.
     ///
@@ -1423,7 +1423,7 @@ impl Agent {
 
         // Persist to session DB — best-effort. The comment is already saved in
         // the board DB, so losing the session copy is recoverable. Log and
-        // continue rather than aborting the LLM iteration.
+        // continue rather than aborting the tool round.
         if let Err(e) = self
             .session
             .persist_messages(&self.agent_id, &messages)
@@ -1435,7 +1435,7 @@ impl Agent {
                 "Failed to persist incoming messages to session DB — continuing without persistence",
             );
             // Still deliver to in-memory history so the model sees them this
-            // iteration; the unpersisted tail is flushed next persist.
+            // tool round; the unpersisted tail is flushed next persist.
             self.session.push_messages_unpersisted(&messages);
         }
 
