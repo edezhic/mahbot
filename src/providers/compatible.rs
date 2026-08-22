@@ -12,12 +12,17 @@ use crate::{
     ChatRole, Provider, ProviderUsage, Reasoning, ToolCall as ProviderToolCall, ToolSpec,
 };
 use async_trait::async_trait;
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use futures_util::StreamExt;
 use reqwest::{
     Client, RequestBuilder,
     header::{HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -369,54 +374,89 @@ impl NativeMessage {
 const NATIVE_IMAGE_SUBTYPES: &[&str] = &["jpeg", "jpg", "png", "gif", "webp"];
 
 /// True when `path` is a payload the chat-completions `image_url` field accepts:
-/// a `data:image/{jpeg|png|gif|webp};base64,…` URI with a base64 alphabet
-/// payload, or an http(s) URL. Prose / path / ellipsis markers
-/// (`[IMAGE:...]`, `[IMAGE:data:image/jpeg;base64,...]`, `[IMAGE:/tmp/a.png]`)
-/// stay in the surrounding text.
+/// an http(s) URL, or a `data:image/{jpeg|png|gif|webp};base64,…` URI whose
+/// payload is valid base64 **and** decodes to a real jpeg/png/gif/webp raster.
+/// Prose / path / ellipsis / fake-base64 markers stay in the surrounding text.
 #[must_use]
 fn is_native_image_url(path: &str) -> bool {
     if crate::util::is_http_url(path) {
         return true;
     }
-    let Some(rest) = path.strip_prefix("data:image/") else {
+    let Some(bytes) = decode_image_data_uri_payload(path) else {
         return false;
     };
-    let Some((head, payload)) = rest.rsplit_once(";base64,") else {
-        return false;
-    };
-    if !is_base64_payload(payload) {
-        return false;
-    }
-    let subtype = head.split(';').next().unwrap_or("").trim();
-    NATIVE_IMAGE_SUBTYPES
-        .iter()
-        .any(|allowed| subtype.eq_ignore_ascii_case(allowed))
+    is_supported_raster(&bytes)
 }
 
-/// Non-empty base64 (std or URL-safe), allowing whitespace. Dots / quotes /
-/// prose leftovers fail this check so `[IMAGE:data:image/jpeg;base64,...]`
-/// is not treated as an image.
+/// Pull the base64 payload out of a `data:image/<subtype>[;params];base64,…`
+/// URI and decode it. `None` for a non-image MIME, empty payload, or bytes
+/// that are not valid standard / URL-safe base64.
 #[must_use]
-fn is_base64_payload(s: &str) -> bool {
-    let mut n = 0usize;
-    for b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'-' | b'_' | b'=' => n += 1,
-            b' ' | b'\t' | b'\n' | b'\r' => {}
-            _ => return false,
-        }
+fn decode_image_data_uri_payload(path: &str) -> Option<Vec<u8>> {
+    let rest = path.strip_prefix("data:image/")?;
+    let (head, payload) = rest.rsplit_once(";base64,")?;
+    let subtype = head.split(';').next().unwrap_or("").trim();
+    if !NATIVE_IMAGE_SUBTYPES
+        .iter()
+        .any(|allowed| subtype.eq_ignore_ascii_case(allowed))
+    {
+        return None;
     }
-    n > 0
+    decode_base64_payload(payload)
+}
+
+/// Decode standard or URL-safe base64, stripping ASCII whitespace. Rejects
+/// alphabet lookalikes that are not actually decodable (`...`, truncated pad).
+#[must_use]
+fn decode_base64_payload(s: &str) -> Option<Vec<u8>> {
+    let compact: Cow<'_, [u8]> = if s.as_bytes().iter().any(u8::is_ascii_whitespace) {
+        Cow::Owned(
+            s.bytes()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect::<Vec<u8>>(),
+        )
+    } else {
+        Cow::Borrowed(s.as_bytes())
+    };
+    if compact.is_empty() {
+        return None;
+    }
+    STANDARD
+        .decode(compact.as_ref())
+        .ok()
+        .or_else(|| URL_SAFE.decode(compact.as_ref()).ok())
+        .or_else(|| URL_SAFE_NO_PAD.decode(compact.as_ref()).ok())
+}
+
+/// True when `bytes` sniff as jpeg/png/gif/webp **and** decode as a raster
+/// (catches valid-base64 garbage like `abcd` and truncated files whose magic
+/// still looks like PNG).
+#[must_use]
+fn is_supported_raster(bytes: &[u8]) -> bool {
+    let Ok(format) = image::guess_format(bytes) else {
+        return false;
+    };
+    if !matches!(
+        format,
+        image::ImageFormat::Jpeg
+            | image::ImageFormat::Png
+            | image::ImageFormat::Gif
+            | image::ImageFormat::WebP
+    ) {
+        return false;
+    }
+    image::load_from_memory(bytes).is_ok()
 }
 
 /// Parse `[IMAGE:…]` markers from content, returning cleaned text and extracted
 /// native image payloads.
 ///
 /// Uses the shared [`MEDIA_MARKER_RE`](crate::util::MEDIA_MARKER_RE) to find markers.
-/// Only data-URI and http(s) IMAGE payloads are extracted (and stripped from
-/// the cleaned text) — those become [`MessagePart::ImageUrl`]. Prose/path
-/// IMAGE markers, empty `[IMAGE:]`, and non‑IMAGE markers (e.g. `[AUDIO:…]`)
-/// are left untouched in the cleaned text.
+/// Only data-URI payloads that decode to a jpeg/png/gif/webp raster, plus
+/// http(s) IMAGE payloads, are extracted (and stripped from the cleaned text)
+/// — those become [`MessagePart::ImageUrl`]. Prose/path IMAGE markers, empty
+/// `[IMAGE:]`, fake/truncated data URIs, and non‑IMAGE markers (e.g.
+/// `[AUDIO:…]`) are left untouched in the cleaned text.
 #[must_use]
 pub(crate) fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
@@ -462,11 +502,12 @@ pub(crate) struct ImageUrlPart {
 
 /// Convert a role+content pair into the appropriate [`MessageContent`] variant.
 ///
-/// For [`ChatRole::User`] content, native image payloads (`data:image/…;base64,…`
-/// and http(s) URLs inside `[IMAGE:…]`) are parsed into [`MessagePart::ImageUrl`]
-/// entries alongside the cleaned text — every role now emits native image parts.
-/// Prose/path markers stay in the text. Everything else is returned as
-/// [`MessageContent::Text`].
+/// For [`ChatRole::User`] content, native image payloads (data URIs that
+/// decode to a real jpeg/png/gif/webp raster, and http(s) URLs inside
+/// `[IMAGE:…]`) are parsed into [`MessagePart::ImageUrl`] entries alongside
+/// the cleaned text — every role now emits native image parts. Prose/path
+/// markers and fake/truncated data URIs stay in the text. Everything else is
+/// returned as [`MessageContent::Text`].
 ///
 /// The old estimator-side mirror of this marker handling
 /// (`crate::session::estimate_tokens`) was removed with the
@@ -1283,6 +1324,17 @@ mod tests {
     use super::*;
     use crate::providers::test_request;
 
+    /// 1×1 red PNG as a data URI — used wherever tests need a payload that
+    /// survives [`is_native_image_url`]'s decode + raster sniff.
+    fn tiny_png_data_uri() -> String {
+        use std::io::Cursor;
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("test PNG must encode");
+        format!("data:image/png;base64,{}", STANDARD.encode(&buf))
+    }
+
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
         let p = OpenAiCompatibleProvider::new("Local", "http://127.0.0.1:1", None);
@@ -1739,9 +1791,10 @@ mod tests {
 
     #[test]
     fn convert_messages_for_native_converts_user_image_markers_to_image_parts() {
-        let input = vec![ChatMessage::user(
-            "System primer [IMAGE:data:image/png;base64,abcd] user turn",
-        )];
+        let uri = tiny_png_data_uri();
+        let input = vec![ChatMessage::user(format!(
+            "System primer [IMAGE:{uri}] user turn"
+        ))];
 
         let converted = OpenAiCompatibleProvider::convert_messages_for_native(&input);
         assert_eq!(converted.len(), 1);
@@ -1752,7 +1805,7 @@ mod tests {
                 if parts.iter().any(|p| matches!(
                     p,
                     MessagePart::ImageUrl { image_url }
-                        if image_url.url == "data:image/png;base64,abcd"
+                        if image_url.url == uri
                 ))
         ));
     }
@@ -1863,15 +1916,13 @@ mod tests {
 
     #[test]
     fn parse_image_markers_extracts_multiple_markers() {
-        let input = concat!(
-            "Check this [IMAGE:data:image/png;base64,abcd] and this ",
-            "[IMAGE:https://example.com/b.jpg]"
-        );
-        let (cleaned, refs) = parse_image_markers(input);
+        let uri = tiny_png_data_uri();
+        let input = format!("Check this [IMAGE:{uri}] and this [IMAGE:https://example.com/b.jpg]");
+        let (cleaned, refs) = parse_image_markers(&input);
 
         assert_eq!(cleaned, "Check this  and this");
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0], "data:image/png;base64,abcd");
+        assert_eq!(refs[0], uri);
         assert_eq!(refs[1], "https://example.com/b.jpg");
     }
 
@@ -1889,19 +1940,21 @@ mod tests {
     /// marker scan (and native image-part conversion) consumes them first.
     #[test]
     fn parse_image_markers_strips_markers_leaving_caption() {
-        let input = "[IMAGE:data:image/jpeg;base64,abcd]\n\nDescribe this screenshot";
-        let (cleaned, refs) = parse_image_markers(input);
+        let uri = tiny_png_data_uri();
+        let input = format!("[IMAGE:{uri}]\n\nDescribe this screenshot");
+        let (cleaned, refs) = parse_image_markers(&input);
         assert_eq!(cleaned, "Describe this screenshot");
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0], "data:image/jpeg;base64,abcd");
+        assert_eq!(refs[0], uri);
     }
 
     /// An image-only message (no caption) should produce an empty string after
     /// marker stripping, so callers can drop it from history.
     #[test]
     fn parse_image_markers_image_only_message_becomes_empty() {
-        let input = "[IMAGE:data:image/jpeg;base64,abcd]";
-        let (cleaned, refs) = parse_image_markers(input);
+        let uri = tiny_png_data_uri();
+        let input = format!("[IMAGE:{uri}]");
+        let (cleaned, refs) = parse_image_markers(&input);
         assert!(
             cleaned.is_empty(),
             "expected empty string, got: {cleaned:?}"
@@ -1934,17 +1987,38 @@ mod tests {
         let input = concat!(
             "tool, command, [IMAGE:...] marker, or [IMAGE:path] syntax, ",
             "or [IMAGE:data:image/...;base64,...], ",
-            "or [IMAGE:data:image/jpeg;base64,...]"
+            "or [IMAGE:data:image/jpeg;base64,...], ",
+            "or [IMAGE:data:image/png;base64,abcd]"
         );
         let (cleaned, refs) = parse_image_markers(input);
         assert_eq!(cleaned, input);
         assert!(refs.is_empty());
     }
 
+    /// A truncated PNG (valid magic + IHDR, no IDAT) must stay in the text —
+    /// DeepSeek rejects it as an unsupported/invalid image.
+    #[test]
+    fn parse_image_markers_rejects_truncated_raster() {
+        let uri = tiny_png_data_uri();
+        let b64 = uri
+            .strip_prefix("data:image/png;base64,")
+            .expect("tiny png uri");
+        let bytes = STANDARD.decode(b64).expect("tiny png base64");
+        let truncated = &bytes[..bytes.len().min(33)];
+        let input = format!(
+            "[IMAGE:data:image/png;base64,{}]",
+            STANDARD.encode(truncated)
+        );
+        let (cleaned, refs) = parse_image_markers(&input);
+        assert_eq!(cleaned, input);
+        assert!(refs.is_empty());
+    }
+
     #[test]
     fn to_message_content_converts_image_markers_to_openai_parts() {
-        let content = "Describe this\n\n[IMAGE:data:image/png;base64,abcd]";
-        let value = serde_json::to_value(to_message_content(ChatRole::User, content)).unwrap();
+        let uri = tiny_png_data_uri();
+        let content = format!("Describe this\n\n[IMAGE:{uri}]");
+        let value = serde_json::to_value(to_message_content(ChatRole::User, &content)).unwrap();
         let parts = value
             .as_array()
             .expect("multimodal content should be an array");
@@ -1952,7 +2026,7 @@ mod tests {
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "Describe this");
         assert_eq!(parts[1]["type"], "image_url");
-        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
+        assert_eq!(parts[1]["image_url"]["url"], uri);
     }
 
     #[test]
@@ -1964,14 +2038,17 @@ mod tests {
 
     #[test]
     fn to_message_content_mixes_prose_marker_with_native_payload() {
-        let content = "see [IMAGE:...] and [IMAGE:data:image/png;base64,abcd]";
-        let value = serde_json::to_value(to_message_content(ChatRole::User, content)).unwrap();
-        let parts = value.as_array().expect("mixed content should be an array");
+        let uri = tiny_png_data_uri();
+        let content = format!("see [IMAGE:...] and [IMAGE:{uri}]");
+        let value = serde_json::to_value(to_message_content(ChatRole::User, &content)).unwrap();
+        let parts = value
+            .as_array()
+            .expect("mixed content should be an array");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "see [IMAGE:...] and");
         assert_eq!(parts[1]["type"], "image_url");
-        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,abcd");
+        assert_eq!(parts[1]["image_url"]["url"], uri);
     }
 
     #[test]
