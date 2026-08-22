@@ -34,7 +34,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
 use super::users;
-use super::widget_helpers;
 use super::widgets;
 use super::workspaces;
 
@@ -2254,34 +2253,34 @@ impl SettingsState {
     fn render_modal_overlay(&self) -> Element<'_, SettingsMessage> {
         if self.show_add_workspace_modal {
             let dialog = self.add_workspace_dialog();
-            widget_helpers::modal_backdrop(dialog, SettingsMessage::ToggleAddWorkspaceModal, 0.5)
+            widgets::modal_backdrop(dialog, SettingsMessage::ToggleAddWorkspaceModal, 0.5)
         } else if self.show_add_user_modal {
             let dialog = self.add_user_dialog();
-            widget_helpers::modal_backdrop(dialog, SettingsMessage::ToggleAddUserModal, 0.5)
+            widgets::modal_backdrop(dialog, SettingsMessage::ToggleAddUserModal, 0.5)
         } else if let Some(ref del_user) = self.users_state.delete_target {
             let dialog = Self::user_delete_dialog(del_user);
-            widget_helpers::modal_backdrop(
+            widgets::modal_backdrop(
                 dialog,
                 SettingsMessage::UserMsg(users::UsersMessage::CancelDelete),
                 0.5,
             )
         } else if let Some(ref pool_user) = self.users_state.pool_edit_target {
             let dialog = self.pool_edit_dialog(pool_user);
-            widget_helpers::modal_backdrop(
+            widgets::modal_backdrop(
                 dialog,
                 SettingsMessage::UserMsg(users::UsersMessage::ClosePoolEdit),
                 0.5,
             )
         } else if let Some(ref diag_ws_name) = self.workspaces_state.diagnostics_modal {
             let dialog = self.diagnostics_dialog(diag_ws_name);
-            widget_helpers::modal_backdrop(
+            widgets::modal_backdrop(
                 dialog,
                 SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::Escape),
                 0.5,
             )
         } else {
             // Keep Stack widget type stable
-            iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
+            iced::widget::stack([widgets::empty_stack_placeholder()]).into()
         }
     }
 

@@ -16,8 +16,7 @@ use iced_fonts::lucide;
 
 use super::common::MAX_INPUT_CHARS;
 use super::theme;
-use super::widget_helpers;
-use super::widgets::{badge_pill, diff_stats_row, role_badge, selectable_text};
+use super::widgets::{self, badge_pill, diff_stats_row, role_badge, selectable_text};
 
 /// Phases where an agent is actively running on the ticket. Cancelling a
 /// ticket in one of these phases aborts an in-flight agent run — the
@@ -1332,7 +1331,7 @@ impl BoardState {
                 .padding(24)
                 .style(theme::dialog_container_style);
 
-                widget_helpers::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
+                widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             } else if self.selected_ticket.is_none()
                 && let Some(ref err) = self.detail_error
             {
@@ -1359,7 +1358,7 @@ impl BoardState {
                 .padding(24)
                 .style(theme::dialog_container_style);
 
-                widget_helpers::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
+                widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             } else {
                 let detail = self.modal_detail();
                 let dialog = container(detail)
@@ -1367,12 +1366,12 @@ impl BoardState {
                     .padding(24)
                     .style(theme::dialog_container_style);
 
-                widget_helpers::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
+                widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             }
         } else {
             // Keep Stack widget type stable to prevent MouseArea state
             // from becoming orphaned when the modal closes.
-            iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
+            iced::widget::stack([widgets::empty_stack_placeholder()]).into()
         };
 
         let confirm_layer = if let Some(ref ticket_id) = self.pending_cancel {
@@ -1381,7 +1380,7 @@ impl BoardState {
             // Type-stable placeholder so child 1's tag — and therefore the
             // outer Stack's shape — does not change when the confirmation
             // is dismissed.
-            iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into()
+            iced::widget::stack([widgets::empty_stack_placeholder()]).into()
         };
 
         iced::widget::stack([detail_layer, confirm_layer]).into()
@@ -1439,7 +1438,7 @@ impl BoardState {
         .padding(24)
         .style(theme::dialog_container_style);
 
-        widget_helpers::modal_backdrop(dialog, BoardMessage::DismissCancel, 0.5)
+        widgets::modal_backdrop(dialog, BoardMessage::DismissCancel, 0.5)
     }
 
     /// Render the ticket detail modal content.

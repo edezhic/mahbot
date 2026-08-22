@@ -10,7 +10,6 @@ use iced::{Alignment, Color, Element, Length, widget::Id};
 use iced_fonts::lucide;
 
 use crate::gui::theme;
-use crate::gui::widget_helpers;
 use crate::gui::widgets;
 
 use super::{
@@ -39,7 +38,7 @@ pub(super) fn wrap_dialog<'a>(
     cancel_msg: EditorMessage,
     opacity: f32,
 ) -> Element<'a, EditorMessage> {
-    widget_helpers::modal_backdrop(
+    widgets::modal_backdrop(
         container(content)
             .width(width)
             .padding(24)
@@ -139,7 +138,7 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, 
         .padding(12)
         .style(theme::dialog_container_style);
 
-    widget_helpers::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
+    widgets::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
 }
 
 // ── Close dialog ──────────────────────────────────────────────────
@@ -525,5 +524,5 @@ pub(super) fn build_global_search_overlay(
         .padding(12)
         .style(theme::dialog_container_style);
 
-    widget_helpers::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
+    widgets::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
 }

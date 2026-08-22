@@ -41,7 +41,6 @@ use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
 use super::editor_widget::{EditorBuffer, byte_offset_to_line_col};
 use super::theme;
-use super::widget_helpers;
 use super::widgets::{self, FileTree, TreeNavDirection};
 
 mod editor_dialog;
@@ -4578,7 +4577,7 @@ impl EditorState {
         // destroys widget state (scroll positions, ContextMenu overlay states),
         // causing stale overlay-to-tab associations. Always return a Stack
         // with a zero-size placeholder when no overlay is present.
-        let placeholder: Element<'_, EditorMessage> = widget_helpers::empty_stack_placeholder();
+        let placeholder: Element<'_, EditorMessage> = widgets::empty_stack_placeholder();
 
         let overlay: Element<'_, EditorMessage> = match &self.active_modal {
             Some(ModalKind::CloseDialog(tab_idx)) => editor_dialog::build_close_dialog(

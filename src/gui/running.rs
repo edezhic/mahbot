@@ -45,7 +45,6 @@ use iced::{Alignment, Element, Length};
 
 use iced_fonts::lucide;
 
-use super::widget_helpers;
 use super::{Message, WorkspaceInfo};
 
 /// Maximum display length (Unicode chars) of an analyze/research group header
@@ -141,7 +140,7 @@ pub(crate) fn view(
     let confirm_layer: Element<'_, RunningMessage> = if let Some(run_key) = pending_cancel {
         cancel_confirm_dialog(run_key)
     } else {
-        stack([widget_helpers::empty_stack_placeholder()]).into()
+        stack([widgets::empty_stack_placeholder()]).into()
     };
     let stacked: Element<'_, RunningMessage> = stack([page, confirm_layer]).into();
     stacked.map(Message::RunningAgents)
@@ -546,7 +545,7 @@ fn cancel_confirm_dialog(run_key: &str) -> Element<'static, RunningMessage> {
     .padding(24)
     .style(theme::dialog_container_style);
 
-    widget_helpers::modal_backdrop(dialog, RunningMessage::CancelDismissed, 0.5)
+    widgets::modal_backdrop(dialog, RunningMessage::CancelDismissed, 0.5)
 }
 
 /// Fallback label for workspaces outside the dashboard's registered set

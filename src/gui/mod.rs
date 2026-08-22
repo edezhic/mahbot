@@ -31,7 +31,6 @@ pub(crate) mod text_rendering;
 pub(crate) mod theme;
 pub(crate) mod tool_failures;
 pub(crate) mod users;
-pub(crate) mod widget_helpers;
 pub(crate) mod widgets;
 pub(crate) mod workspaces;
 
@@ -1775,7 +1774,7 @@ impl Dashboard {
         // to destroy the entire widget tree, losing scroll positions, cursor
         // states, and all other widget state.
         let overlay: Element<'_, Message> = if self.toasts.is_empty() {
-            widget_helpers::empty_stack_placeholder()
+            widgets::empty_stack_placeholder()
         } else {
             let mut toast_col = Column::new().spacing(6).align_x(Alignment::Center);
             for toast in &self.toasts {
@@ -1812,7 +1811,7 @@ impl Dashboard {
         let diff_overlay: Element<'_, Message> = if self.show_diff_modal {
             render_diff_modal(&self.diff_state)
         } else {
-            widget_helpers::empty_stack_placeholder()
+            widgets::empty_stack_placeholder()
         };
 
         // ── Branch management modal overlay ─────────────────────────
@@ -1820,7 +1819,7 @@ impl Dashboard {
             let inner = self.git_state.view().map(Message::Git);
             modal_overlay(inner, Message::Git(git::GitMessage::CloseModal))
         } else {
-            widget_helpers::empty_stack_placeholder()
+            widgets::empty_stack_placeholder()
         };
 
         // ── Self-update confirmation modal overlay ─────────────────
@@ -1855,7 +1854,7 @@ fn modal_overlay<'a>(
     .width(Length::Fill)
     .height(Length::Fill);
 
-    widget_helpers::modal_backdrop(centered, on_close, 0.5)
+    widgets::modal_backdrop(centered, on_close, 0.5)
 }
 
 /// Render the diff modal (80% width, 100% height, centered).
@@ -2370,7 +2369,7 @@ impl Dashboard {
         if !self.show_update_confirm {
             // Keep the Stack widget type stable across open/close transitions
             // (see `empty_stack_placeholder`): the open state is a Stack.
-            return iced::widget::stack([widget_helpers::empty_stack_placeholder()]).into();
+            return iced::widget::stack([widgets::empty_stack_placeholder()]).into();
         }
         let dialog = container(
             column![
@@ -2409,7 +2408,7 @@ impl Dashboard {
         .padding(24)
         .style(theme::dialog_container_style);
 
-        widget_helpers::modal_backdrop(dialog, Message::CancelUpdate, 0.5)
+        widgets::modal_backdrop(dialog, Message::CancelUpdate, 0.5)
     }
 
     /// Render the self-update button in the footer bar.
