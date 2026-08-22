@@ -92,10 +92,16 @@
 //! # Orphaned database keys
 //!
 //! Rows in `config_kv` without a corresponding [`ConfigData`] field are
-//! silently ignored (`tracing::debug!("Unknown config key, ignoring")` in
-//! [`reload_from_db`]) and left as harmless ghosts — no `DROP`/`DELETE`
-//! migration. They are naturally overwritten if a future config key reuses the
-//! name.
+//! lazily purged on reload: [`reload_from_db`] logs each unknown key at
+//! `debug`, then best-effort deletes garbage rows (debug on success, warn
+//! on transient failure without failing boot) while the two intentional
+//! shared namespaces `nightly_discovery_last_pass_at`
+//! (`src/workspace.rs:1572`) and `telegram_role_pin:*`
+//! (`src/channels/telegram.rs:515`) are left untouched. Downgrade
+//! resurrection is therefore lost — under the previous ghost policy orphans
+//! were retained and would re-appear on downgrade, now they are deleted on
+//! first reboot. New orphans cannot be created via the settings path because
+//! [`write_kv_and_update_config`] rejects unknown keys before any DB write.
 //!
 //! # See also
 //!
@@ -1068,9 +1074,27 @@ pub async fn reload_from_db() -> Result<()> {
     migrate_old_default_models(store).await?;
 
     let kvs = store.get_all_kv().await?;
+    // Keep in sync with crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY and
+    // crate::channels::telegram::ROLE_PIN_KV_PREFIX (private constants).
+    let mut unknown_garbage_keys: Vec<String> = Vec::new();
     for (key, value) in &kvs {
         if !config.set_string_field(key, value) {
             tracing::debug!(key, "Unknown config key, ignoring");
+            // Preserved shared namespaces — leave untouched.
+            if key != "nightly_discovery_last_pass_at" && !key.starts_with("telegram_role_pin:") {
+                unknown_garbage_keys.push(key.clone());
+            }
+        }
+    }
+    if !unknown_garbage_keys.is_empty() {
+        tracing::debug!(keys=?unknown_garbage_keys, "Purging unknown config_kv orphans");
+    }
+    for key in unknown_garbage_keys {
+        match store.delete_kv(&key).await {
+            Ok(()) => tracing::debug!(key, "Purged unknown config_kv orphan"),
+            Err(e) => {
+                tracing::warn!(key, error=%e, "Failed to purge unknown config_kv orphan (transient, ignoring)");
+            }
         }
     }
 

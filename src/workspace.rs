@@ -1567,8 +1567,9 @@ pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
 /// workspaces table: the schema has no migration path (new columns are
 /// invisible on existing live databases) and workspace rows are deleted
 /// during rediscovery, so the timestamp must live in a table that outlives
-/// workspace churn. Orphaned `config_kv` keys are ignored by the config
-/// reload path, so this key is invisible to the settings system.
+/// workspace churn. Unknown `config_kv` keys are purged on reload, except the
+/// preserved shared namespaces (this key and telegram_role_pin:*) which are left
+/// untouched.
 const NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY: &str = "nightly_discovery_last_pass_at";
 
 /// Returns `true` when the given local hour falls within the nightly
