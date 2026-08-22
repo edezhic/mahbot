@@ -2705,8 +2705,10 @@ async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
 // ── ticket_stage roster helpers ──────────────────────────────────────────
 // These pin the agent-id / angle-cycling contract shared by
 // `spawn_ticket_stage_round` (fresh dispatch) and `append_ticket_stage_slots`
-// (analysis escalation). The helpers are the single home for both rules — if
-// the shape ever changes, these tests are the first to notice.
+// (analysis escalation). The fresh-dispatch paths funnel their job+child-row
+// spawn tail through `spawn_ticket_stage_job`. The helpers are the single
+// home for both rules — if the shape ever changes, these tests are the first
+// to notice.
 
 /// The agent-id helper must produce the exact documented shape
 /// `ticket_{ticket_id}_{idx}_{suffix}_{role}` for both dispatch paths.

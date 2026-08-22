@@ -3557,9 +3557,59 @@ fn ticket_stage_slot_task(
     }
 }
 
-/// Spawn a ticket_stage job + roster in ONE transaction (before any agent
-/// session write). The job row carries the rendered prompt template; each
-/// roster row carries the FINAL per-agent prompt. Returns the job id + slots.
+/// Spawn the shared ticket_stage `spawn_job` tail: compute the next round and
+/// insert the job + agents + `ticket_stage_jobs` child row in ONE transaction
+/// (before any agent session write).
+///
+/// This is the single home for the [`crate::jobs::SpawnChild::TicketStage`]
+/// row-shape — the same shape resume paths read. The child row is inserted in
+/// the SAME tx as the job (all kinds use the shared in-tx child pattern — a
+/// missing child row is impossible for a committed job), so the round is
+/// computed BEFORE the spawn tx on the same `conn`.
+///
+/// Deliberately PARTIAL abstraction: only the spawn tail is shared. The two
+/// call sites keep their distinct agent-id contract —
+/// [`spawn_ticket_stage_round`] builds a generated roster,
+/// [`spawn_single_slot_round`] pins an exact single slot — and hand their
+/// `agents` slice here. Do not expect the whole spawn operation to be unified;
+/// each caller still owns its roster construction.
+#[expect(clippy::too_many_arguments)]
+async fn spawn_ticket_stage_job(
+    job_id: &str,
+    ticket: &Ticket,
+    ws: &Workspace,
+    stage: &str,
+    phase: TicketPhase,
+    role: Role,
+    prompt: &str,
+    agents: &[crate::jobs::NewAgent],
+) -> anyhow::Result<()> {
+    let conn = &crate::session::store().conn;
+    let round = next_ticket_stage_round(conn, &ticket.id, stage).await;
+    crate::jobs::spawn_job(
+        conn,
+        job_id,
+        prompt,
+        &ws.name,
+        "",
+        "",
+        role,
+        agents,
+        &crate::jobs::SpawnChild::TicketStage {
+            ticket_id: ticket.id.clone(),
+            stage: stage.to_string(),
+            phase: phase.as_ref().to_string(),
+            round,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Spawn a ticket_stage job + roster via [`spawn_ticket_stage_job`] in ONE
+/// transaction (before any agent session write). The job row carries the
+/// rendered prompt template; each roster row carries the FINAL per-agent
+/// prompt. Returns the job id + slots.
 async fn spawn_ticket_stage_round(
     ticket: &Ticket,
     ws: &Workspace,
@@ -3594,28 +3644,7 @@ async fn spawn_ticket_stage_round(
             task: s.task.clone(),
         })
         .collect();
-    // Round + child row computed BEFORE the spawn tx: the ticket_stage_jobs
-    // child row is inserted in the SAME tx as the job (all kinds use the
-    // shared in-tx child pattern — a missing child row is impossible for a
-    // committed job).
-    let round = next_ticket_stage_round(&crate::session::store().conn, &ticket.id, stage).await;
-    crate::jobs::spawn_job(
-        &crate::session::store().conn,
-        &job_id,
-        prompt,
-        &ws.name,
-        "",
-        "",
-        role,
-        &agents,
-        &crate::jobs::SpawnChild::TicketStage {
-            ticket_id: ticket.id.clone(),
-            stage: stage.to_string(),
-            phase: phase.as_ref().to_string(),
-            round,
-        },
-    )
-    .await?;
+    spawn_ticket_stage_job(&job_id, ticket, ws, stage, phase, role, prompt, &agents).await?;
     Ok((job_id, slots))
 }
 
@@ -3626,6 +3655,9 @@ async fn spawn_ticket_stage_round(
 /// be ignored by resume paths, and would let the purge's live-session
 /// protection clause miss an active round. The anchor's NULL-seat row and this
 /// round's roster row coexist under the composite PK (job_id, agent_id).
+///
+/// The spawn tail is shared with [`spawn_ticket_stage_round`] via
+/// [`spawn_ticket_stage_job`].
 #[expect(clippy::too_many_arguments)]
 async fn spawn_single_slot_round(
     job_id: &str,
@@ -3644,26 +3676,20 @@ async fn spawn_single_slot_round(
         status: crate::jobs::RowStatus::Launched,
         outcome: None,
     };
-    crate::jobs::spawn_job(
-        &crate::session::store().conn,
+    spawn_ticket_stage_job(
         job_id,
-        prompt,
-        &ws.name,
-        "",
-        "",
+        ticket,
+        ws,
+        stage,
+        phase,
         role,
+        prompt,
         &[crate::jobs::NewAgent {
             agent_id: agent_id.to_string(),
             kind: agent_kind_for_role(role),
             idx: Some(0),
             task: prompt.to_string(),
         }],
-        &crate::jobs::SpawnChild::TicketStage {
-            ticket_id: ticket.id.clone(),
-            stage: stage.to_string(),
-            phase: phase.as_ref().to_string(),
-            round: next_ticket_stage_round(&crate::session::store().conn, &ticket.id, stage).await,
-        },
     )
     .await?;
     Ok(slot)
@@ -3875,7 +3901,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 ///
 /// `task` is the message the agents were dispatched with — on fresh dispatch
 /// the in-memory prompt, on resume re-read from `jobs.task`. Equal by
-/// construction of [`spawn_ticket_stage_round`] (it stores the message as
+/// construction of [`spawn_ticket_stage_job`] (it stores the message as
 /// `jobs.task`); if that ever changes, the resume path silently diverges.
 ///
 /// Analysis stays fail-open — the ticket always advances to Planning, the
