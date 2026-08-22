@@ -1984,8 +1984,7 @@ async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) 
 /// notification surfaces it (`notify_ticket` renders the last comment as the
 /// failure details). `resumed` selects the observability log prefix.
 async fn bounce_engineer_hard_failure(ticket: &Ticket, comment_text: &str, resumed: bool) {
-    let bounce_trip = usize::try_from(ticket.bounce_count).unwrap_or(usize::MAX)
-        >= crate::joint_verdict::MAX_BOUNCES;
+    let bounce_trip = bounce_exhausted(ticket.bounce_count);
     let trip_comment = bounce_trip.then(bounce_breaker_trip_comment);
     let target = if bounce_trip {
         TicketPhase::Failed
@@ -4363,6 +4362,53 @@ fn bounce_breaker_trip_comment() -> String {
     )
 }
 
+/// Returns `true` when the bounce budget is exhausted and the ticket must fail
+/// instead of bouncing back to [`TicketPhase::ReadyForDevelopment`].
+///
+/// Uses `usize::try_from(bounce_count).unwrap_or(usize::MAX) >= MAX_BOUNCES`
+/// so a negative `bounce_count` (corrupted row) or a value that does not fit
+/// in `usize` maps to `usize::MAX` and therefore to exhausted — fail-closed
+/// rather than bouncing forever. A plain `i64 >= MAX_BOUNCES as i64`
+/// comparison would treat negatives as "not exhausted" and would not clamp
+/// overflow on 32-bit targets where `usize::MAX < i64::MAX`.
+#[must_use]
+fn bounce_exhausted(bounce_count: i64) -> bool {
+    usize::try_from(bounce_count).unwrap_or(usize::MAX) >= crate::joint_verdict::MAX_BOUNCES
+}
+
+/// Pure 3-way verifier bounce target table.
+///
+/// - `all_failed == true`  → [`TicketPhase::Failed`] (terminal, even if
+///   `exhausted` is true).
+/// - `any_failed == true`  → [`TicketPhase::Failed`] when `exhausted`,
+///   otherwise [`TicketPhase::ReadyForDevelopment`] (bounce back with
+///   incremented counter).
+/// - otherwise             → `success_phase` (all verifiers passed).
+///
+/// This helper is the verifier 3-way only. The engineer hard-failure path is
+/// intentionally 2-way (`Failed` vs `ReadyForDevelopment`) and should call
+/// only [`bounce_exhausted`] directly without this helper to avoid threading a
+/// dummy `success_phase` argument through a path that never uses it.
+#[must_use]
+fn decide_verifier_bounce_target(
+    all_failed: bool,
+    any_failed: bool,
+    exhausted: bool,
+    success_phase: TicketPhase,
+) -> TicketPhase {
+    if all_failed {
+        TicketPhase::Failed
+    } else if any_failed {
+        if exhausted {
+            TicketPhase::Failed
+        } else {
+            TicketPhase::ReadyForDevelopment
+        }
+    } else {
+        success_phase
+    }
+}
+
 /// Process parallel verifier results: add failing comments, determine pass/fail,
 /// and update ticket phase accordingly.
 ///
@@ -4408,29 +4454,29 @@ async fn process_verifier_verdicts(
 
     // Bounce-based circuit breaker: the 11th bounce fails the ticket. The
     // counter is incremented atomically with the bounce-back transition.
-    let mut bounce_trip = false;
+    // The ticket's counter is authoritative here: it was loaded at claim
+    // time and only the bounce-back transition (which happens AFTER this
+    // check) increments it, so no re-fetch can differ from it.
+    let exhausted = bounce_exhausted(ticket.bounce_count);
     // Determine transition parameters based on the three-way branch:
     //   all-failed → Failed (notify, with failure comment)
     //   any-failed → ReadyForDevelopment (buffer, pipeline reservation),
     //                unless the bounce breaker trips → Failed
     //   all-passed → verifier.success_phase (buffer)
-    let (target, notify) = if all_failed {
-        (TicketPhase::Failed, NotifyPolicy::Notify)
+    let target =
+        decide_verifier_bounce_target(all_failed, any_failed, exhausted, verifier.success_phase);
+    let notify = if all_failed {
+        NotifyPolicy::Notify
     } else if any_failed {
-        // The ticket's counter is authoritative here: it was loaded at claim
-        // time and only the bounce-back transition (which happens AFTER this
-        // check) increments it, so no re-fetch can differ from it.
-        if usize::try_from(ticket.bounce_count).unwrap_or(usize::MAX)
-            >= crate::joint_verdict::MAX_BOUNCES
-        {
-            bounce_trip = true;
-            (TicketPhase::Failed, NotifyPolicy::Notify)
+        if exhausted {
+            NotifyPolicy::Notify
         } else {
-            (TicketPhase::ReadyForDevelopment, NotifyPolicy::Buffer)
+            NotifyPolicy::Buffer
         }
     } else {
-        (verifier.success_phase, NotifyPolicy::Buffer)
+        NotifyPolicy::Buffer
     };
+    let bounce_trip = any_failed && exhausted && !all_failed;
     // No exit-time ticket rollback: during the graceful drain a
     // failed round must NOT drive the ticket to Failed, bounce it, or pause
     // the workspace — the job stays status='launched' for boot resume, which
