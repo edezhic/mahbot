@@ -1415,10 +1415,40 @@ async fn write_kv_and_update_config(key: &str, trimmed: &str) -> Result<()> {
 /// [`normalize_string_fields`][ConfigData::normalize_string_fields] (which `normalize` calls unconditionally for **every** field regardless
 /// of its per-field annotation — `non_empty`, `or(…)`, or `list_or(…)`).
 fn validate_config(config: &ConfigData) -> Result<()> {
-    if let Some(ref ep) = config.provider_endpoint
-        && !is_http_url(ep)
-    {
-        anyhow::bail!("Provider endpoint must be a valid URL starting with https:// or http://");
+    if let Some(ref ep) = config.provider_endpoint {
+        if !is_http_url(ep) {
+            anyhow::bail!(
+                "Provider endpoint must be a valid URL starting with https:// or http://"
+            );
+        }
+        // Empty-host rejection — only in config validation, not in
+        // `is_http_url` (which intentionally stays prefix-only). For values
+        // where `is_http_url(ep)` is true (scheme is case-sensitive
+        // `http://`/`https://`), extract authority = substring after `://` up
+        // to first `/`, `?`, `#` or end, trim, and reject if empty or
+        // starts-with `:`.
+        //
+        // Intentionally NOT rejected here beyond the empty-host check:
+        // `https://exa mple.com` (embedded space) passes this check and is
+        // deferred to warmup — do not over-tighten to reject it here.
+        // IPv6 literals (`[::1]`) and userinfo (`user:pass@host`) are out of
+        // scope for this check.
+        // The authority double-trim (overall `normalize` trim + this
+        // `authority.trim()`) is required to catch `https://   /v1` where the
+        // authority is whitespace-only.
+        let rest = ep
+            .strip_prefix("https://")
+            .or_else(|| ep.strip_prefix("http://"))
+            .unwrap();
+        let auth_end = rest
+            .find(['/', '?', '#'])
+            .unwrap_or(rest.len());
+        let authority = rest[..auth_end].trim();
+        if authority.is_empty() || authority.starts_with(':') {
+            anyhow::bail!(
+                "Provider endpoint must be a valid URL starting with https:// or http://"
+            );
+        }
     }
 
     if let Some(ref key) = config.provider_key
