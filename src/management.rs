@@ -3170,6 +3170,62 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
     }
 }
 
+fn format_parallel_assigned_to(launched: &[&TicketStageSlot]) -> String {
+    launched
+        .iter()
+        .map(|s| s.agent_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+async fn checkpoint_parallel_outcomes(
+    job_id: &str,
+    launched: &[&TicketStageSlot],
+    run_results: &[ParallelVerdict],
+) -> std::collections::HashMap<String, ParallelVerdict> {
+    let conn = &crate::session::store().conn;
+    let mut by_agent = std::collections::HashMap::with_capacity(launched.len());
+    for (slot, result) in launched.iter().zip(run_results) {
+        let outcome = serialize_verdict_outcome(result);
+        let status = if matches!(result, ParallelVerdict::NoResponse(_)) {
+            crate::jobs::RowStatus::Failed
+        } else {
+            crate::jobs::RowStatus::Done
+        };
+        if let Err(e) =
+            crate::jobs::write_agent_outcome(conn, job_id, &slot.agent_id, status, Some(&outcome))
+                .await
+        {
+            warn!(
+                job = %job_id,
+                agent = %slot.agent_id,
+                error = %e,
+                "Failed to checkpoint agent outcome",
+            );
+        }
+        by_agent.insert(slot.agent_id.clone(), result.clone());
+    }
+    by_agent
+}
+
+fn assemble_parallel_results(
+    slots: &[TicketStageSlot],
+    by_agent: &std::collections::HashMap<String, ParallelVerdict>,
+) -> Vec<ParallelVerdict> {
+    let mut results = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if slot.status == crate::jobs::RowStatus::Done {
+            let outcome = slot.outcome.clone().unwrap_or_default();
+            results.push(deserialize_verdict_outcome(&outcome));
+        } else if let Some(r) = by_agent.get(slot.agent_id.as_str()) {
+            results.push(r.clone());
+        } else {
+            unreachable!("every non-Done slot is launched and recorded 1:1 in by_agent");
+        }
+    }
+    results
+}
+
 /// Run `count` agents of the same role in parallel, then extract structured verdicts
 /// from their responses.
 ///
@@ -3188,7 +3244,6 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
 /// concurrently (leader-staggered: the first member starts immediately, the
 /// rest after its first LLM call so they hit its cached prefix; skipped on
 /// boot resume).
-#[expect(clippy::too_many_lines)]
 async fn run_parallel_agents(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
@@ -3211,13 +3266,7 @@ async fn run_parallel_agents(
         .map(|s| message_router::register_agent(&s.agent_id))
         .collect();
 
-    // Set assigned_to to the launched agent IDs (no cancellation — agents are
-    // already registered and running would be cancelled).
-    let assigned_to_str = launched
-        .iter()
-        .map(|s| s.agent_id.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
+    let assigned_to_str = format_parallel_assigned_to(&launched);
     if !assigned_to_str.is_empty()
         && let Err(e) = board()
             .set_assigned_to_no_cancel(&ticket.id, Some(&assigned_to_str))
@@ -3235,8 +3284,7 @@ async fn run_parallel_agents(
     // resolves to ParallelVerdict::NoResponse below — the round continues
     // fail-open and the member checkpoints Failed, matching the analyze/research
     // round semantics.
-    let mut results: Vec<ParallelVerdict> = Vec::with_capacity(slots.len());
-    {
+    let results = {
         let members: Vec<_> = launched
             .iter()
             .zip(receivers)
@@ -3345,50 +3393,9 @@ async fn run_parallel_agents(
             }
         }
 
-        // ── Checkpoint: write per-agent outcomes BEFORE ParallelVerdict
-        // construction completes (no read-modify-write race). ──
-        let conn = &crate::session::store().conn;
-        let mut by_agent: std::collections::HashMap<&str, &ParallelVerdict> =
-            std::collections::HashMap::new();
-        for (slot, result) in launched.iter().zip(&run_results) {
-            let outcome = serialize_verdict_outcome(result);
-            let status = if matches!(result, ParallelVerdict::NoResponse(_)) {
-                crate::jobs::RowStatus::Failed
-            } else {
-                crate::jobs::RowStatus::Done
-            };
-            if let Err(e) = crate::jobs::write_agent_outcome(
-                conn,
-                job_id,
-                &slot.agent_id,
-                status,
-                Some(&outcome),
-            )
-            .await
-            {
-                warn!(
-                    job = %job_id,
-                    agent = %slot.agent_id,
-                    error = %e,
-                    "Failed to checkpoint agent outcome",
-                );
-            }
-            by_agent.insert(slot.agent_id.as_str(), result);
-        }
-
-        // ── Assemble results in dispatch order: done slots replay their
-        // stored outcome; launched slots use the fresh run. ──
-        for slot in slots {
-            if slot.status == crate::jobs::RowStatus::Done {
-                let outcome = slot.outcome.clone().unwrap_or_default();
-                results.push(deserialize_verdict_outcome(&outcome));
-            } else if let Some(r) = by_agent.get(slot.agent_id.as_str()) {
-                results.push((*r).clone());
-            } else {
-                unreachable!("every non-Done slot is launched and recorded 1:1 in by_agent");
-            }
-        }
-    }
+        let by_agent = checkpoint_parallel_outcomes(job_id, &launched, &run_results).await;
+        assemble_parallel_results(slots, &by_agent)
+    };
 
     // ── Cleanup: clear assigned_to (no cancel, agents already done) ────
     if let Err(e) = board().set_assigned_to_no_cancel(&ticket.id, None).await {
@@ -4362,33 +4369,14 @@ fn bounce_breaker_trip_comment() -> String {
     )
 }
 
-/// Returns `true` when the bounce budget is exhausted and the ticket must fail
-/// instead of bouncing back to [`TicketPhase::ReadyForDevelopment`].
-///
-/// Uses `usize::try_from(bounce_count).unwrap_or(usize::MAX) >= MAX_BOUNCES`
-/// so a negative `bounce_count` (corrupted row) or a value that does not fit
-/// in `usize` maps to `usize::MAX` and therefore to exhausted — fail-closed
-/// rather than bouncing forever. A plain `i64 >= MAX_BOUNCES as i64`
-/// comparison would treat negatives as "not exhausted" and would not clamp
-/// overflow on 32-bit targets where `usize::MAX < i64::MAX`.
+/// Returns true when bounce budget is exhausted (`bounce_count >= MAX_BOUNCES`).
+/// Negative or overflow counts are treated as exhausted (fail-closed).
 #[must_use]
 fn bounce_exhausted(bounce_count: i64) -> bool {
     usize::try_from(bounce_count).unwrap_or(usize::MAX) >= crate::joint_verdict::MAX_BOUNCES
 }
 
-/// Pure 3-way verifier bounce target table.
-///
-/// - `all_failed == true`  → [`TicketPhase::Failed`] (terminal, even if
-///   `exhausted` is true).
-/// - `any_failed == true`  → [`TicketPhase::Failed`] when `exhausted`,
-///   otherwise [`TicketPhase::ReadyForDevelopment`] (bounce back with
-///   incremented counter).
-/// - otherwise             → `success_phase` (all verifiers passed).
-///
-/// This helper is the verifier 3-way only. The engineer hard-failure path is
-/// intentionally 2-way (`Failed` vs `ReadyForDevelopment`) and should call
-/// only [`bounce_exhausted`] directly without this helper to avoid threading a
-/// dummy `success_phase` argument through a path that never uses it.
+/// Maps verifier outcome to target phase: all-failed → Failed, any-failed → Failed if exhausted else ReadyForDevelopment, otherwise success_phase.
 #[must_use]
 fn decide_verifier_bounce_target(
     all_failed: bool,
