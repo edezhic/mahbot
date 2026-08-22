@@ -828,14 +828,21 @@ impl OpenAiCompatibleProvider {
 
         let mut extra = serde_json::Map::new();
 
-        // Provider routing — OpenRouter-only (mahbot-1884 req 7): the block
-        // has no meaning outside OpenRouter, so it is never sent to custom
-        // endpoints.
-        if let Some(order) = &request.provider_order
-            && let Some(routing) = provider_routing_json(order)
-            && crate::config::is_default_endpoint(&self.base_url)
-        {
-            extra.insert("provider".to_string(), routing);
+        // OpenRouter provider preferences — OpenRouter-only (mahbot-1884 req 7):
+        // the block has no meaning outside OpenRouter, so it is never sent to
+        // custom endpoints. Per-request `data_collection: allow` overrides the
+        // account-level strict privacy default so data-collecting paid endpoints
+        // remain reachable; optional routing fields are merged into the same
+        // object when configured.
+        if crate::config::is_default_endpoint(&self.base_url) {
+            let mut provider = request
+                .provider_order
+                .as_deref()
+                .and_then(provider_routing_json)
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            provider.insert("data_collection".to_string(), serde_json::json!("allow"));
+            extra.insert("provider".to_string(), serde_json::Value::Object(provider));
         }
 
         // Reasoning effort — model-family-aware for custom endpoints
@@ -1384,15 +1391,45 @@ mod tests {
         let or_body = body(&or_provider);
         assert!(
             or_body.contains("\"provider\""),
-            "default endpoint must send the routing block: {or_body}"
+            "default endpoint must send the provider block: {or_body}"
         );
         assert!(
             or_body.contains("DeepSeek"),
             "routing order must be inside the block: {or_body}"
         );
         assert!(
+            or_body.contains("\"data_collection\":\"allow\""),
+            "default endpoint must override account privacy with data_collection allow: {or_body}"
+        );
+        assert!(
             or_body.contains("xhigh"),
             "reasoning_effort must be sent to the default endpoint: {or_body}"
+        );
+
+        // Default endpoint without routing still sends data_collection allow.
+        let mut no_routing = test_request(vec![ChatMessage::user("hello")], None);
+        no_routing.provider_order = None;
+        let no_routing_body = {
+            let req = or_provider
+                .build_http_request_with_client(or_provider.http_client_scoped(), &no_routing)
+                .build()
+                .expect("request builds");
+            String::from_utf8(
+                req.body()
+                    .expect("full body")
+                    .as_bytes()
+                    .expect("bytes")
+                    .to_vec(),
+            )
+            .expect("utf8 body")
+        };
+        assert!(
+            no_routing_body.contains("\"data_collection\":\"allow\""),
+            "default endpoint must send data_collection allow even without routing: {no_routing_body}"
+        );
+        assert!(
+            !no_routing_body.contains("\"order\""),
+            "no routing order when provider_order is unset: {no_routing_body}"
         );
 
         // Custom endpoint → routing block suppressed; reasoning_effort is
@@ -2041,9 +2078,7 @@ mod tests {
         let uri = tiny_png_data_uri();
         let content = format!("see [IMAGE:...] and [IMAGE:{uri}]");
         let value = serde_json::to_value(to_message_content(ChatRole::User, &content)).unwrap();
-        let parts = value
-            .as_array()
-            .expect("mixed content should be an array");
+        let parts = value.as_array().expect("mixed content should be an array");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "see [IMAGE:...] and");
