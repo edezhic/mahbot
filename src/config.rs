@@ -1293,8 +1293,10 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
             let model_opt = trimmed_or_none(&trimmed);
             let model: &str = model_opt.as_deref().unwrap_or(DEFAULT_IMAGE_GEN_MODEL);
             if model != CONFIG.image_gen_model() {
-                crate::tools::image_catalog::validate_image_model_for_endpoint(model, &endpoint)
-                    .await?;
+                crate::tools::media_catalog::image::validate_image_model_for_endpoint(
+                    model, &endpoint,
+                )
+                .await?;
             }
             write_kv_and_update_config(CONFIG_KEY_IMAGE_GEN_MODEL, &trimmed).await?;
         }

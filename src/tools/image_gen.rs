@@ -1,5 +1,5 @@
 use crate::retry::RETRY_AFTER_MAX_MS;
-use crate::tools::image_catalog::{ImageModelInfo, check_image_capability};
+use crate::tools::media_catalog::image::{ImageModelInfo, check_image_capability};
 use crate::util::error::retry_after_header;
 use crate::util::http::{bearer_auth_header, read_error_body};
 use crate::{Tool, Workspace};
@@ -60,7 +60,7 @@ impl Tool for ImageGenTool {
 
         // Capability and parameter decisions come from the catalog; a catalog
         // outage degrades to minimal user-provided parameters (fail-open).
-        let catalog = crate::tools::image_catalog::get_catalog().await;
+        let catalog = crate::tools::media_catalog::image::get_catalog().await;
         let info = match &catalog {
             Some(catalog) => Some(check_image_capability(&model, catalog)?),
             None => None,
@@ -724,7 +724,7 @@ fn extension_for_media_type(media_type: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::image_catalog::{ImageCatalog, parse_catalog};
+    use crate::tools::media_catalog::image::{ImageCatalog, parse_catalog};
 
     /// Fixture catalog covering a hybrid image model (resolution + reference
     /// caps), a recraft-like model (aspect ratio only, declares "auto"), and a

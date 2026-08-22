@@ -702,11 +702,11 @@ mod tests {
         // the change path exercises the change-only fallback hermetically.
         // Unlike a None seed (1-min negative-cache Backoff residue), the
         // caches stay Fresh — no cross-test coupling.
-        crate::tools::image_catalog::seed_cache(Some(std::sync::Arc::new(
-            crate::tools::image_catalog::ImageCatalog::default(),
+        crate::tools::media_catalog::image::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::media_catalog::image::ImageCatalog::default(),
         )));
-        crate::tools::video_catalog::seed_cache(Some(std::sync::Arc::new(
-            crate::tools::video_catalog::VideoCatalog::default(),
+        crate::tools::media_catalog::video::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::media_catalog::video::VideoCatalog::default(),
         )));
         let agent_id = "test_artist_change";
 
@@ -763,11 +763,11 @@ mod tests {
     #[serial_test::serial(active_models)]
     async fn prepend_model_change_preserves_absent_sections() {
         crate::util::test::init_test_stores().await;
-        crate::tools::image_catalog::seed_cache(Some(std::sync::Arc::new(
-            crate::tools::image_catalog::ImageCatalog::default(),
+        crate::tools::media_catalog::image::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::media_catalog::image::ImageCatalog::default(),
         )));
-        crate::tools::video_catalog::seed_cache(Some(std::sync::Arc::new(
-            crate::tools::video_catalog::VideoCatalog::default(),
+        crate::tools::media_catalog::video::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::media_catalog::video::VideoCatalog::default(),
         )));
         let agent_id = "test_artist_partial";
 

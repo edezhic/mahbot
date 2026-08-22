@@ -3441,11 +3441,11 @@ mod tests {
     /// Seed empty model catalogs so the Artist active-models block renders
     /// nothing and performs no network fetch (hermetic e2e).
     fn seed_empty_catalogs() {
-        crate::tools::image_catalog::seed_cache(Some(std::sync::Arc::new(
-            crate::tools::image_catalog::ImageCatalog::default(),
+        crate::tools::media_catalog::image::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::media_catalog::image::ImageCatalog::default(),
         )));
-        crate::tools::video_catalog::seed_cache(Some(std::sync::Arc::new(
-            crate::tools::video_catalog::VideoCatalog::default(),
+        crate::tools::media_catalog::video::seed_cache(Some(std::sync::Arc::new(
+            crate::tools::media_catalog::video::VideoCatalog::default(),
         )));
     }
 

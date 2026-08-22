@@ -1362,7 +1362,7 @@ impl SettingsState {
                             let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
                             Task::perform(
                                 async move {
-                                    let ok = crate::tools::image_catalog::
+                                    let ok = crate::tools::media_catalog::image::
                                         validate_image_model_for_endpoint(&model, &endpoint)
                                         .await
                                         .map_err(|e| e.to_string());

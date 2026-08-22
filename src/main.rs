@@ -1066,7 +1066,7 @@ async fn handle_set_model_action(
     // (fail-open when the catalog is unavailable — matching the generation
     // tool's semantics).
     if validate_image
-        && let Err(e) = mahbot::tools::image_catalog::validate_image_model(payload).await
+        && let Err(e) = mahbot::tools::media_catalog::image::validate_image_model(payload).await
     {
         answer_telegram_callback(msg, Some(format!("Invalid image model: {e}"))).await;
         return;

@@ -13,8 +13,8 @@
 use std::fmt::Write;
 
 use crate::config::CONFIG;
-use crate::tools::image_catalog::{self, ImageModelInfo, ParameterConstraint};
-use crate::tools::video_catalog::{self, VideoModelInfo};
+use crate::tools::media_catalog::image::{self, ImageModelInfo, ParameterConstraint};
+use crate::tools::media_catalog::video::{self, VideoModelInfo};
 
 /// Cap per-list rendering — future catalogs must not bloat every Artist turn.
 const MAX_LIST_VALUES: usize = 16;
@@ -134,11 +134,11 @@ async fn render_side(kind: ModelKind, model: Option<&str>) -> Option<(String, St
 /// block and the mid-session change-info). Returns `None` when the model is
 /// absent from the catalog, the catalog is unavailable, and the model has no
 /// static edit nuances — callers fall back to a change-only line. The catalog
-/// fetch is timeout-bounded internally (see [`crate::tools::catalog_cache`]).
+/// fetch is timeout-bounded internally (see [`crate::tools::media_catalog`]).
 pub(crate) async fn render_section(kind: ModelKind, model: &str) -> Option<String> {
     match kind {
         ModelKind::Image => {
-            let catalog = image_catalog::get_catalog().await?;
+            let catalog = image::get_catalog().await?;
             catalog
                 .find(model)
                 .and_then(|info| render_image_section(model, info))
@@ -147,7 +147,7 @@ pub(crate) async fn render_section(kind: ModelKind, model: &str) -> Option<Strin
             // Catalog fields are optional: static per-model edit nuances render
             // even when the catalog is unavailable (fail-open must not drop
             // nuance text on model switch).
-            let catalog = video_catalog::get_catalog().await;
+            let catalog = video::get_catalog().await;
             let info = catalog.as_ref().and_then(|c| c.find(model));
             render_video_section(model, info)
         }
