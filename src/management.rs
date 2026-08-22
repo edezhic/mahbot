@@ -1269,6 +1269,10 @@ where
 ///    ([`pickup_pending_workspace`]).
 /// 1. **Pipeline claims** — atomic source→target phase transitions
 ///    (`run_claim_pipeline`).
+///
+///    Steps 2-5 run concurrently via `tokio::join!` in
+///    [`process_single_workspace`] (see there for DB serialization and
+///    snapshot-timing notes):
 /// 2. **DiagnosticsCheck** — dispatch unassigned `InDiagnostics` tickets
 ///    so diagnostics commands (fmt, lint, build, test) continue running.
 /// 3. **SanitationPassed → Done** — auto-commit tickets that have passed
@@ -1327,9 +1331,11 @@ async fn poll_round() {
 
 /// Process the poll steps for a single workspace.
 ///
-/// Steps are issued in order because claims must be ordered and the git tree
-/// is shared; per-ticket work runs concurrently in detached tasks. Across
-/// workspaces this function is called concurrently by [`poll_round`].
+/// Steps 0-1 are issued in order because claims must be ordered and the git tree
+/// is shared; steps 2-5 are concurrent via `tokio::join!` (see inline comments
+/// below for serialization and snapshot notes). Per-ticket work runs concurrently
+/// in detached tasks. Across workspaces this function is called concurrently by
+/// [`poll_round`].
 async fn process_single_workspace(ws: Workspace) {
     // 0. Pending-workspace pickup — a pending workspace (added without a
     // provider key, or returned to pending after provider-class discovery
@@ -1347,64 +1353,78 @@ async fn process_single_workspace(ws: Workspace) {
     // 1. Pipeline claims — atomic source→target transitions
     run_claim_pipeline(&ws).await;
 
-    // 2. DiagnosticsCheck — diagnostics keeps the ticket in InDiagnostics
-    // while running, so the claim loop isn't applicable. Tickets that already
-    // have assigned_to set are mid-execution and must not be re-dispatched;
-    // transient DB listing errors are safe — tickets stay in phase and are
-    // re-dispatched on the next poll cycle (~1s).
-    spawn_for_each_ticket_in_phase(TicketPhase::InDiagnostics, &ws, |ticket, ws| async move {
-        if ticket.assigned_to.is_some() {
-            return;
-        }
-        spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws);
-    })
-    .await;
-
-    // 3. SanitationPassed → Done (auto-commit), following the same pattern
-    // as the QaPassed→Done commit flow.
-    spawn_for_each_ticket_in_phase(
-        TicketPhase::SanitationPassed,
-        &ws,
-        |ticket, ws| async move {
-            let Some(porcelain) = ensure_git_or_done_and_get_status(
-                &ticket,
-                &ws,
-                TicketPhase::SanitationPassed,
-                "finalize",
-            )
-            .await
-            else {
+    // 2-5. Concurrent poll listings via `tokio::join!` — the four phase listings
+    // are independent and each already handles its own errors per phase
+    // (see `spawn_for_each_ticket_in_phase`). DB listings serialize on
+    // `Arc<Mutex<turso::Connection>>`, so the benefit is async scheduling tail
+    // latency removal on the 1s poll loop, not DB parallelism.
+    //
+    // Snapshot timing: `handle_qa_passed` claims run in detached `tokio::spawn`
+    // tasks, so a concurrent `InSanitation` listing may snapshot before
+    // just-claimed tickets appear and will pick them up next poll cycle (~1s) —
+    // already tolerated by existing design (tickets re-dispatched next cycle).
+    // This is true even sequentially; concurrent join only changes listing
+    // snapshot interleaving, not claim completion.
+    tokio::join!(
+        // 2. DiagnosticsCheck — diagnostics keeps the ticket
+        // in InDiagnostics while running, so the claim loop isn't applicable.
+        // Tickets that already have assigned_to set are mid-execution and must not
+        // be re-dispatched; transient DB listing errors are safe — tickets stay
+        // in phase and are re-dispatched on the next poll cycle (~1s).
+        spawn_for_each_ticket_in_phase(TicketPhase::InDiagnostics, &ws, |ticket, ws| async move {
+            if ticket.assigned_to.is_some() {
                 return;
-            };
-            finalize_ticket_with_git_status(ticket, ws, TicketPhase::SanitationPassed, &porcelain)
+            }
+            spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws);
+        }),
+        // 3. SanitationPassed → Done (auto-commit),
+        // following the same pattern as the QaPassed→Done commit flow.
+        spawn_for_each_ticket_in_phase(
+            TicketPhase::SanitationPassed,
+            &ws,
+            |ticket, ws| async move {
+                let Some(porcelain) = ensure_git_or_done_and_get_status(
+                    &ticket,
+                    &ws,
+                    TicketPhase::SanitationPassed,
+                    "finalize",
+                )
+                .await
+                else {
+                    return;
+                };
+                finalize_ticket_with_git_status(
+                    ticket,
+                    ws,
+                    TicketPhase::SanitationPassed,
+                    &porcelain,
+                )
                 .await;
-        },
-    )
-    .await;
-
-    // 4. Handle QaPassed tickets.
-    //
-    // For each QaPassed ticket, check whether the working tree has new/untracked
-    // files. If it does, claim the ticket to InSanitation and dispatch a sanitation
-    // agent. Otherwise, commit directly and transition to Done (existing behavior).
-    //
-    // Spawned via tokio::spawn (inside spawn_for_each_ticket_in_phase) to prevent
-    // git operations from blocking the poll loop. The ticket stays in QaPassed
-    // until either the claim or the commit succeeds, so re-dispatch is harmless.
-    spawn_for_each_ticket_in_phase(TicketPhase::QaPassed, &ws, handle_qa_passed).await;
-
-    // 5. SanitationCheck — handle_qa_passed (step 4) runs in spawned tasks concurrent
-    //    with this step. It may: (a) claim QaPassed→InSanitation with assigned_to set,
-    //    or (b) commit the ticket directly to Done. Tickets that already have
-    //    assigned_to set are mid-execution and are skipped — neither path races with
-    //    this step because the ticket is either in a different phase or already assigned.
-    spawn_for_each_ticket_in_phase(TicketPhase::InSanitation, &ws, |ticket, ws| async move {
-        if ticket.assigned_to.is_some() {
-            return;
-        }
-        spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
-    })
-    .await;
+            },
+        ),
+        // 4. Handle QaPassed tickets.
+        //
+        // For each QaPassed ticket, check whether the working tree has new/untracked
+        // files. If it does, claim the ticket to InSanitation and dispatch a sanitation
+        // agent. Otherwise, commit directly and transition to Done (existing behavior).
+        //
+        // Spawned via tokio::spawn (inside spawn_for_each_ticket_in_phase) to prevent
+        // git operations from blocking the poll loop. The ticket stays in QaPassed
+        // until either the claim or the commit succeeds, so re-dispatch is harmless.
+        spawn_for_each_ticket_in_phase(TicketPhase::QaPassed, &ws, handle_qa_passed),
+        // 5. SanitationCheck — handle_qa_passed (step 4) runs
+        // in spawned tasks concurrent with this step. It may: (a) claim
+        // QaPassed→InSanitation with assigned_to set, or (b) commit the ticket
+        // directly to Done. Tickets that already have assigned_to set are
+        // mid-execution and are skipped — neither path races with this step
+        // because the ticket is either in a different phase or already assigned.
+        spawn_for_each_ticket_in_phase(TicketPhase::InSanitation, &ws, |ticket, ws| async move {
+            if ticket.assigned_to.is_some() {
+                return;
+            }
+            spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
+        }),
+    );
 }
 
 /// Pickup step: claim a `Pending` workspace into its first discovery when the
