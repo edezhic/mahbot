@@ -4528,10 +4528,8 @@ async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
 /// Shadow instrumentation: the counterfactual signals are logged at info
 /// level so the formula can be validated against a cohort after launch.
 async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
-    let low =
-        i64::try_from(crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN).unwrap_or(i64::MAX);
-    let high =
-        i64::try_from(crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN).unwrap_or(i64::MAX);
+    let low = crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN;
+    let high = crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN;
 
     match working_tree_churn(repo_path).await {
         Ok(total) => {
