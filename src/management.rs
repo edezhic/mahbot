@@ -781,66 +781,49 @@ pub async fn run_management() {
         };
         match stage {
             // research/analyze jobs carry no ticket — re-dispatch the orchestrator.
-            ResumableStage::Research {
-                job_id,
-                capped: false,
-                ..
-            } => {
-                info!(job = %job_id, "Resuming research run at boot");
-                let ws = workspace.clone();
-                tokio::spawn(async move {
-                    crate::tools::research::resume_research_run(&job_id, &ws).await;
-                });
+            ResumableStage::Research { job_id, capped, .. } => {
+                let ws = workspace;
+                if capped {
+                    // Over-cap research: deliver the partial report from the last
+                    // checkpoint (the envelope is the caller's only result path).
+                    info!(
+                        job = %job_id,
+                        "Delivering research partial report (boot re-dispatch cap exceeded)",
+                    );
+                    tokio::spawn(async move {
+                        crate::tools::research::research_capped_partial_report(&job_id, &ws).await;
+                    });
+                } else {
+                    info!(job = %job_id, "Resuming research run at boot");
+                    tokio::spawn(async move {
+                        crate::tools::research::resume_research_run(&job_id, &ws).await;
+                    });
+                }
             }
-            // Over-cap research: deliver the partial report from the last
-            // checkpoint (the envelope is the caller's only result path).
-            ResumableStage::Research {
-                job_id,
-                capped: true,
-                ..
-            } => {
-                info!(
-                    job = %job_id,
-                    "Delivering research partial report (boot re-dispatch cap exceeded)",
-                );
-                let ws = workspace.clone();
-                tokio::spawn(async move {
-                    crate::tools::research::research_capped_partial_report(&job_id, &ws).await;
-                });
-            }
-            ResumableStage::Analyze {
-                job_id,
-                capped: false,
-                ..
-            } => {
-                info!(job = %job_id, "Resuming analyze round at boot");
-                let ws = workspace.clone();
-                tokio::spawn(async move {
-                    crate::tools::analyze::resume_analyze_round(&job_id, &ws).await;
-                });
-            }
-            // Over-cap analyze: deliver the failure envelope to the original
-            // caller (the <analyze-tool-result> envelope is the async-analyze caller's
-            // only result path — "failed = terminal … surface to user").
-            ResumableStage::Analyze {
-                job_id,
-                capped: true,
-                ..
-            } => {
-                info!(
-                    job = %job_id,
-                    "Delivering analyze failure envelope (boot re-dispatch cap exceeded)",
-                );
-                let ws = workspace.clone();
-                tokio::spawn(async move {
-                    crate::tools::analyze::analyze_capped_envelope(&job_id, &ws).await;
-                });
+            ResumableStage::Analyze { job_id, capped, .. } => {
+                let ws = workspace;
+                if capped {
+                    // Over-cap analyze: deliver the failure envelope to the original
+                    // caller (the <analyze-tool-result> envelope is the async-analyze caller's
+                    // only result path — "failed = terminal … surface to user").
+                    info!(
+                        job = %job_id,
+                        "Delivering analyze failure envelope (boot re-dispatch cap exceeded)",
+                    );
+                    tokio::spawn(async move {
+                        crate::tools::analyze::analyze_capped_envelope(&job_id, &ws).await;
+                    });
+                } else {
+                    info!(job = %job_id, "Resuming analyze round at boot");
+                    tokio::spawn(async move {
+                        crate::tools::analyze::resume_analyze_round(&job_id, &ws).await;
+                    });
+                }
             }
             ResumableStage::ResearchCleanup { job_id, .. } => {
                 info!(job = %job_id, "Resuming research cleanup agent at boot");
-                let ws = workspace.clone();
                 tokio::spawn(async move {
-                    crate::research_cleanup::resume_research_cleanup(&job_id, &ws).await;
+                    crate::research_cleanup::resume_research_cleanup(&job_id, &workspace).await;
                 });
             }
             ResumableStage::TicketStage {
