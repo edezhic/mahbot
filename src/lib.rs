@@ -1103,6 +1103,26 @@ pub(crate) trait Tool: Send + Sync {
             crate::util::truncate_tool_output(output)
         }
     }
+
+    /// Build an optional per-call image payload to be injected as a synthetic
+    /// User-role message after this tool's result block, so a vision-capable
+    /// model can see an on-disk image as a native image part.
+    ///
+    /// Default `None` — most tools produce no image. The read tool overrides
+    /// this to re-encode a raster (PNG/JPEG/WebP) file into a bounded JPEG
+    /// data-URI. It is the single decoder for native images — `execute` only
+    /// cheap-sniffs magic bytes, so the decode happens here, once, guarded by
+    /// a robust file-magic check rather than the annotation wording. Safety:
+    /// the path must obey the same workspace-boundary validation as
+    /// [`Tool::execute`] — an arbitrary `[IMAGE:/path]` reference embedded in
+    /// model text is never resolved here.
+    async fn image_payload(
+        &self,
+        _ws: &crate::Workspace,
+        _args: &serde_json::Value,
+    ) -> Option<crate::tools::ImagePayload> {
+        None
+    }
 }
 
 // ── Chat role enum ─────────────────────────────────────────────

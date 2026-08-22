@@ -262,10 +262,80 @@ pub(crate) fn format_tool_failure_feedback(
 }
 
 /// Outcome for a tool execution.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ToolExecutionOutcome {
     pub output: String,
     pub success: bool,
+    /// Optional per-call image payload: a compressed JPEG data-URI that the
+    /// agent loop injects as a synthetic User-role message AFTER the round's
+    /// tool-result block, so a vision-capable model sees the on-disk image as a
+    /// native image part. Never rides inside `output` (the shared 5 KB tool-output
+    /// budget would truncate it).
+    pub image_payload: Option<ImagePayload>,
+}
+
+/// Per-call image payload produced by a tool that reads an on-disk raster image
+/// (the Read tool). The agent loop injects `[IMAGE:{data_uri}]` as a synthetic
+/// persisted User-role message after the round's tool results.
+///
+/// `width`/`height` are the post-EXIF/post-resize dimensions of the *encoded*
+/// JPEG the data-URI carries, and `format` is the uppercase source-format label
+/// (`"PNG" | "JPEG" | "WEBP"`). Together they let the agent loop build the
+/// definitive attached/already-attached annotation from the payload metadata
+/// rather than rewriting a hardcoded sentence in a tool-result string.
+#[derive(Debug)]
+pub(crate) struct ImagePayload {
+    /// Canonical (resolved) path of the image — surfaced in the tool-result
+    /// annotation (`Read image file {path} ...`) and the debug log. The dedup
+    /// key used by the agent loop is `data_uri`, not `path`.
+    pub path: String,
+    /// Bounded JPEG data-URI (`data:image/jpeg;base64,...`).
+    pub data_uri: String,
+    /// Post-EXIF/post-resize width of the encoded JPEG (px).
+    pub width: u32,
+    /// Post-EXIF/post-resize height of the encoded JPEG (px).
+    pub height: u32,
+    /// Uppercase source-format label: `"PNG" | "JPEG" | "WEBP"`.
+    pub format: String,
+    /// `Some` when the read resolved a typo'd path to a unique filename match;
+    /// preserved in the tool-result annotation so the model keeps the typo
+    /// context (mirrors the `[Recovered path: ...]` note shown for text reads).
+    pub recovery_note: Option<String>,
+}
+
+impl ImagePayload {
+    /// Tool-result annotation for a FRESH attachment (the image is injected as a
+    /// new synthetic user message).
+    #[must_use]
+    pub(crate) fn attached_annotation(&self) -> String {
+        let base = format!(
+            "Read image file {} ({}x{}, {}). Image content attached to the conversation as a native image.",
+            self.path, self.width, self.height, self.format
+        );
+        self.with_recovery_note(base)
+    }
+
+    /// Tool-result annotation for a DEDUPED repeat read (image already attached;
+    /// the read returns a reference rather than re-adding it).
+    #[must_use]
+    pub(crate) fn already_attached_annotation(&self) -> String {
+        let base = format!(
+            "Read image file {} ({}x{}, {}). Image content is already attached to the conversation as a native image.",
+            self.path, self.width, self.height, self.format
+        );
+        self.with_recovery_note(base)
+    }
+
+    /// Prepend the read's recovery note (when the path was recovered) to the
+    /// annotation so recovered image reads keep the same `[Recovered path: ...]`
+    /// context that recovered text reads already show.
+    #[must_use]
+    fn with_recovery_note(&self, base: String) -> String {
+        match &self.recovery_note {
+            Some(note) => format!("{note}\n{base}"),
+            None => base,
+        }
+    }
 }
 
 /// Normalize a tool call name and arguments, repairing common agent mistakes.

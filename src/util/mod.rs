@@ -410,6 +410,27 @@ const INBOUND_IMAGE_MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 pub(crate) async fn local_image_to_compressed_data_uri(
     path: &std::path::Path,
 ) -> anyhow::Result<String> {
+    Ok(local_image_to_compressed_data_uri_with_meta(path)
+        .await?
+        .data_uri)
+}
+
+/// Result of bounded inbound-image compression, with the post-EXIF/post-resize
+/// dimensions and the source-format label for annotation rendering.
+pub(crate) struct CompressedImageMeta {
+    pub data_uri: String,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+}
+
+/// Read a local image file and return a bounded-JPEG data URI together with the
+/// post-EXIF/post-resize dimensions of the encoded JPEG. Single source of truth
+/// for the image payload's annotation dims (they describe the very encode the
+/// data-URI carries).
+pub(crate) async fn local_image_to_compressed_data_uri_with_meta(
+    path: &std::path::Path,
+) -> anyhow::Result<CompressedImageMeta> {
     // Metadata-first cap check (matches the reference-image path's bounded
     // read): refuse over-cap files BEFORE the read, so a huge file never
     // enters memory just to be refused.
@@ -428,20 +449,48 @@ pub(crate) async fn local_image_to_compressed_data_uri(
         );
     }
     let bytes = tokio::fs::read(path).await?;
-    let out = with_block_in_place(|| compress_inbound_image(&bytes))?;
-    Ok(format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out)))
+    let (out, width, height, format) = with_block_in_place(|| compress_inbound_image(&bytes))?;
+    Ok(CompressedImageMeta {
+        data_uri: format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out)),
+        width,
+        height,
+        format,
+    })
+}
+
+/// Map a decodable raster format to its uppercase source-format label used in
+/// image annotations (`"PNG" | "JPEG" | "WEBP"`). Returns `None` for any format
+/// mahbot does not attach natively (GIF/BMP/...). This is the single source of
+/// the native PNG/JPEG/WebP set: both the read tool's content sniff and the
+/// inbound-compression path derive their format decision here, so a future
+/// change to the native set only touches this one function (no drift risk).
+#[must_use]
+pub(crate) fn image_format_native_label(fmt: image::ImageFormat) -> Option<&'static str> {
+    use image::ImageFormat;
+    match fmt {
+        ImageFormat::Png => Some("PNG"),
+        ImageFormat::Jpeg => Some("JPEG"),
+        ImageFormat::WebP => Some("WEBP"),
+        _ => None,
+    }
 }
 
 /// One bounded compression step for inbound photos: decode, apply EXIF
 /// orientation, downscale the longest side to [`INBOUND_IMAGE_MAX_SIDE`]
 /// (aspect-preserving, Triangle filter, min 1 px), flatten alpha onto white,
-/// and re-encode as JPEG at [`INBOUND_IMAGE_JPEG_QUALITY`]. Reuses the
-/// existing `exif_orientation` / `flatten_alpha_onto_white` helpers. The
-/// input-size ceiling is enforced by the caller (`local_image_to_compressed_data_uri`,
-/// metadata-first).
-fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// and re-encode as JPEG at [`INBOUND_IMAGE_JPEG_QUALITY`]. Returns the
+/// encoded bytes, the final (post-resize/post-flatten) dimensions, and the
+/// uppercase source-format label (`"PNG" | "JPEG" | "WEBP"`, falling back to
+/// `"IMAGE"`). Reuses the existing `exif_orientation` /
+/// `flatten_alpha_onto_white` helpers. The input-size ceiling is enforced by
+/// the caller (`local_image_to_compressed_data_uri_with_meta`, metadata-first).
+fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32, String)> {
     use image::GenericImageView;
     let mut img = image::load_from_memory(bytes).context("Failed to decode inbound image")?;
+    let format = match image::guess_format(bytes) {
+        Ok(f) => image_format_native_label(f).unwrap_or("IMAGE"),
+        Err(_) => "IMAGE",
+    };
     if let Some(orientation) = exif_orientation(bytes) {
         img.apply_orientation(orientation);
     }
@@ -467,6 +516,7 @@ fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
         img
     };
     let rgb = flatten_alpha_onto_white(&img);
+    let (width, height) = rgb.dimensions();
     let mut out = Vec::new();
     {
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
@@ -482,7 +532,7 @@ fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
             )
             .context("Failed to encode compressed inbound image")?;
     }
-    Ok(out)
+    Ok((out, width, height, format.to_string()))
 }
 
 // ── Reference-image loading & compression (image_gen / video_gen) ────────

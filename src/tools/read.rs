@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -36,6 +36,153 @@ fn is_sensitive_file_path(path: &str) -> bool {
     }
 }
 
+/// Classify a file's bytes for the image-aware Read behaviour.
+enum SniffedImage {
+    /// A native raster (PNG/JPEG/WebP) that can be attached as a native image.
+    /// The base annotation is claim-neutral (no "attached" sentence) and
+    /// dims-less — the authoritative post-EXIF dims come from the payload the
+    /// agent loop actually injects.
+    Native { label: String },
+    /// A recognised-but-unsupported image format (GIF/BMP/...). Reported
+    /// gracefully rather than decoded to garbage.
+    Unsupported { label: String },
+}
+
+/// Cheap magic-sniff `bytes` for a raster image. Returns `None` for non-images
+/// (SVG, text, arbitrary binary) so those keep the text/lossy path. Only
+/// PNG/JPEG/WebP are treatable as native; any other recognised format (GIF,
+/// BMP, ...) is reported as unsupported. No decode is performed here — the
+/// decode is deferred to [`ReadTool::image_payload`], the single decoder.
+#[must_use]
+fn sniff_read_image(bytes: &[u8]) -> Option<SniffedImage> {
+    let format = image::guess_format(bytes).ok()?;
+    match crate::util::image_format_native_label(format) {
+        Some(label) => Some(SniffedImage::Native {
+            label: label.to_string(),
+        }),
+        None => Some(SniffedImage::Unsupported {
+            label: format!("{format:?}").to_ascii_uppercase(),
+        }),
+    }
+}
+
+/// FIFO-safe file-magic gate: true only when `path` (a regular file) begins
+/// with PNG/JPEG/WebP magic. Reuses [`sniff_read_image`] so the native-format
+/// decision has a single source — no duplicated format-match arms, no drift
+/// risk. Returns `false` for text, unsupported formats, and FIFO/special files
+/// without a full read or decode. This is the robust gate `image_payload` uses
+/// instead of the annotation wording.
+async fn is_native_image_file(path: &Path) -> bool {
+    use tokio::io::AsyncReadExt;
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    // FIFO/special files are never reopened — a stream cannot be sampled
+    // without blocking.
+    if !meta.is_file() {
+        return false;
+    }
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return false;
+    };
+    let mut buf = [0u8; 64];
+    let Ok(n) = file.read(&mut buf).await else {
+        return false;
+    };
+    matches!(
+        sniff_read_image(&buf[..n]),
+        Some(SniffedImage::Native { .. })
+    )
+}
+
+/// Produce the annotation text for a content-mode read that discovered a raster
+/// image. Shared between the UTF-8 and binary fallback paths so the annotation
+/// is byte-identical either way.
+#[must_use]
+fn image_read_annotation(path: &Path, kind: SniffedImage) -> String {
+    match kind {
+        SniffedImage::Native { label } => {
+            // Claim-neutral, dims-less base: the agent loop appends the
+            // 'attached'/'already attached' qualifier (with the authoritative
+            // post-EXIF dims) from the payload it actually injects, so a read
+            // that cannot be injected (over-cap, decode failure) never falsely
+            // claims an attachment.
+            format!("Read image file {} ({label}).", path.display())
+        }
+        SniffedImage::Unsupported { label } => {
+            format!(
+                "Read image file {} — unsupported image format \
+                 ({label}); cannot attach as a native image (only PNG, JPEG, \
+                 WebP supported).",
+                path.display()
+            )
+        }
+    }
+}
+
+/// Candidate paths for a literal `path` that `resolve_read_target` could not
+/// resolve (a typo/missing path). Queried by filename, as
+/// [`recover_missing_path`](ReadTool::recover_missing_path) does. This is the
+/// single recovery-search source shared by the read-annotation path and
+/// `image_payload`'s resolve path, so the two can never drift apart.
+async fn find_recovery_candidates(ws: &Workspace, path: &str) -> Vec<String> {
+    let hint = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path);
+    SearchTool::find_file_paths(ws, hint, 8)
+        .await
+        .unwrap_or_default()
+}
+
+/// The `[Recovered path: ...]` note shown when a literal `path` was recovered to
+/// a single high-confidence filename match. Shared so the annotation path and
+/// the injection path word it identically.
+#[must_use]
+fn recovery_note(path: &str, recovered: &str) -> String {
+    format!("[Recovered path: requested '{path}', using '{recovered}']")
+}
+
+/// Outcome of resolving a content-read `path`: the canonical path to read, plus
+/// the recovery note when the literal path was recovered to a unique match.
+struct ResolvedRead {
+    path: PathBuf,
+    recovery_note: Option<String>,
+}
+
+/// Resolve a content-read `path` to a readable file path, mirroring the
+/// recovery that `execute` applies via `recover_missing_path`: if the literal
+/// path does not exist (and only then), a single high-confidence filename match
+/// is used so a recovered raster can still be attached by `image_payload`
+/// (which receives the original, possibly typo'd, `path`). Returns `None` when
+/// the path is missing and no unique match exists, and when it does not resolve
+/// at all.
+async fn resolve_for_read(ws: &Workspace, path: &str) -> Option<ResolvedRead> {
+    match super::path::resolve_read_target(ws.as_path(), path).await {
+        Ok(resolved) => {
+            return Some(ResolvedRead {
+                path: resolved,
+                recovery_note: None,
+            });
+        }
+        Err(e) if !e.to_string().contains("File not found") => return None,
+        Err(_) => {}
+    }
+    let matches = find_recovery_candidates(ws, path).await;
+    if matches.len() != 1 {
+        return None;
+    }
+    let recovered = &matches[0];
+    let resolved = super::path::resolve_read_target(ws.as_path(), recovered)
+        .await
+        .ok()?;
+    Some(ResolvedRead {
+        path: resolved,
+        recovery_note: Some(recovery_note(path, recovered)),
+    })
+}
+
 #[async_trait]
 impl Tool for ReadTool {
     fn name(&self) -> &'static str {
@@ -52,7 +199,7 @@ impl Tool for ReadTool {
                 "mode": {
                     "type": "string",
                     "enum": ["content", "symbols", "zoom"],
-                    "description": "Read mode. 'content' (default): line-numbered file read. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name.",
+                    "description": "Read mode. 'content' (default): line-numbered file read, or — for a raster image (PNG, JPEG, WebP) — attaches it to the conversation as a native image rather than reading text. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name.",
                     "default": "content"
                 },
                 "symbol": {
@@ -147,6 +294,46 @@ impl Tool for ReadTool {
         // Fallback (lossy binary output, etc.): standard head+tail truncation
         crate::util::truncate_tool_output(output)
     }
+
+    async fn image_payload(
+        &self,
+        ws: &Workspace,
+        args: &serde_json::Value,
+    ) -> Option<crate::tools::ImagePayload> {
+        // Robust file-magic gate (NOT the annotation wording): only a PNG/JPEG/
+        // WebP raster opens the decode+encode below. This runs AFTER path
+        // resolution, so text/unsupported reads still pay resolve + metadata +
+        // a 64-byte sniff — but never a full read/decode of the file.
+        let path = super::get_str(args, "path").ok()?.to_string();
+        // Image behaviour is content-mode only (symbols/zoom run tree-sitter).
+        if super::get_opt_str(args, "mode").unwrap_or("content") != "content" {
+            return None;
+        }
+        if super::path::contains_glob(&path, true) {
+            return None;
+        }
+        // Resolve the literal path, or — for a typo'd path that `execute`
+        // already recovered to a unique match — the recovered path, so a
+        // recovered raster is attached rather than only annotated.
+        let res = resolve_for_read(ws, &path).await?;
+        if !is_native_image_file(&res.path).await {
+            return None;
+        }
+        // The compressed encode applies EXIF orientation and reports the
+        // post-EXIF/post-resize dims + source-format label; its metadata-first
+        // `is_file()` guard keeps a FIFO/special file from being reopened.
+        let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&res.path)
+            .await
+            .ok()?;
+        Some(crate::tools::ImagePayload {
+            path: res.path.display().to_string(),
+            data_uri: meta.data_uri,
+            width: meta.width,
+            height: meta.height,
+            format: meta.format,
+            recovery_note: res.recovery_note,
+        })
+    }
 }
 
 impl ReadTool {
@@ -237,15 +424,7 @@ impl ReadTool {
         args: &serde_json::Value,
         original_err: &str,
     ) -> anyhow::Result<String> {
-        let hint = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(path);
-
-        let matches = SearchTool::find_file_paths(ws, hint, 8)
-            .await
-            .unwrap_or_default();
+        let matches = find_recovery_candidates(ws, path).await;
         if matches.is_empty() {
             anyhow::bail!("{original_err}");
         }
@@ -253,7 +432,7 @@ impl ReadTool {
         if matches.len() == 1 {
             let recovered = &matches[0];
             let resolved = super::path::resolve_read_target(ws.as_path(), recovered).await?;
-            let note = format!("[Recovered path: requested '{path}', using '{recovered}']");
+            let note = recovery_note(path, recovered);
             return self.read_resolved(ws, &resolved, Some(&note), args).await;
         }
 
@@ -267,7 +446,17 @@ impl ReadTool {
         args: &serde_json::Value,
     ) -> anyhow::Result<String> {
         match tokio::fs::read_to_string(resolved_path).await {
-            Ok(contents) => Ok(format_content(&contents, args)),
+            Ok(contents) => {
+                // A raster can be valid UTF-8 (e.g. a minimal GIF patch / a
+                // NUL-padded header) — sniff magic bytes before treating it as
+                // text so it gets the image annotation rather than rendering as
+                // garbage. SVG, source, and other text are not image magic and
+                // stay readable.
+                if let Some(kind) = sniff_read_image(contents.as_bytes()) {
+                    return Ok(image_read_annotation(resolved_path, kind));
+                }
+                Ok(format_content(&contents, args))
+            }
             Err(e) => {
                 // Not valid UTF-8 — read raw bytes and try to extract text
                 let bytes = tokio::fs::read(resolved_path).await.map_err(|ee| {
@@ -276,6 +465,13 @@ impl ReadTool {
                          Failed to read file: {ee}"
                     )
                 })?;
+
+                // Content-sniff (magic bytes, never the extension) so SVG and
+                // other text files stay readable as text and only real raster
+                // images take the image path.
+                if let Some(kind) = sniff_read_image(&bytes) {
+                    return Ok(image_read_annotation(resolved_path, kind));
+                }
 
                 // Lossy fallback — replaces invalid bytes with U+FFFD
                 let lossy = String::from_utf8_lossy(&bytes).into_owned();
@@ -1210,6 +1406,249 @@ mod tests {
             result.contains("hi"),
             "lossy output must preserve valid ASCII, got: {result:?}",
         );
+    }
+
+    /// Encode a tiny solid-red PNG (test helper).
+    fn tiny_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        use std::io::Cursor;
+        let img = ::image::RgbaImage::from_pixel(width, height, ::image::Rgba([255, 0, 0, 255]));
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ::image::ImageFormat::Png)
+            .expect("test PNG must encode");
+        buf
+    }
+
+    /// Content-mode read of a native raster returns the image annotation and
+    /// attaches the image to the conversation instead of lossy garbage.
+    #[tokio::test]
+    async fn file_read_native_image_returns_annotation() {
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        let png = tiny_png_bytes(4, 4);
+        tokio::fs::write(ws_path.join("tiny.png"), &png)
+            .await
+            .unwrap();
+
+        let result = ReadTool
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "tiny.png"}))
+            .await
+            .expect("native image read must succeed");
+        // The ReadTool's execute output is claim-neutral — the agent loop
+        // appends the 'attached'/'already attached' qualifier from the payload
+        // it actually injects, so a read that cannot be injected never falsely
+        // claims an attachment.
+        assert!(result.contains("Read image file"), "got: {result}");
+        assert!(result.contains("PNG"), "got: {result}");
+        assert!(
+            !result.contains("attached to the conversation"),
+            "read output must stay claim-neutral, got: {result}"
+        );
+    }
+
+    /// A recognised-but-unsupported raster (GIF) is reported gracefully, not
+    /// decoded into garbage or treated as an error.
+    #[tokio::test]
+    async fn file_read_unsupported_image_reports_unsupported() {
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        let mut gif: Vec<u8> = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0u8; 20]);
+        tokio::fs::write(ws_path.join("bad.gif"), &gif)
+            .await
+            .unwrap();
+
+        let result = ReadTool
+            .execute(&Workspace::from_path(&ws_path), json!({"path": "bad.gif"}))
+            .await
+            .expect("unsupported image read must succeed");
+        assert!(result.contains("unsupported image format"), "got: {result}");
+        assert!(result.contains("GIF"), "got: {result}");
+    }
+
+    /// A native raster with valid magic + header dimensions but a corrupt /
+    /// truncated body (no pixel data) is still reported as a PNG (the cheap
+    /// magic sniff only looks at the leading magic bytes) but never claims an
+    /// attachment — the decode is deferred to `image_payload`, so the base
+    /// annotation stays honest about what the read itself demonstrated.
+    #[tokio::test]
+    async fn file_read_corrupt_image_does_not_claim_attachment() {
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        let png = tiny_png_bytes(4, 4);
+        // Truncate to the PNG signature + IHDR (valid magic + header dimensions,
+        // but no IDAT/IEND) — must be reported, not claimed as attached.
+        let truncated = &png[..33];
+        assert!(image::guess_format(truncated).is_ok());
+        tokio::fs::write(ws_path.join("corrupt.png"), truncated)
+            .await
+            .unwrap();
+
+        let result = ReadTool
+            .execute(
+                &Workspace::from_path(&ws_path),
+                json!({"path": "corrupt.png"}),
+            )
+            .await
+            .expect("corrupt image read must succeed");
+        assert!(result.contains("Read image file"), "got: {result}");
+        assert!(result.contains("PNG"), "got: {result}");
+        assert!(
+            !result.contains("attached to the conversation"),
+            "corrupt image must not claim attachment, got: {result}"
+        );
+    }
+
+    /// A native image read produces a compressed JPEG data-URI payload that the
+    /// agent loop injects as a synthetic user message.
+    #[tokio::test]
+    async fn file_read_image_payload_produces_data_uri() {
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        let png = tiny_png_bytes(4, 4);
+        tokio::fs::write(ws_path.join("tiny.png"), &png)
+            .await
+            .unwrap();
+        let ws = Workspace::from_path(&ws_path);
+
+        let payload = ReadTool
+            .image_payload(&ws, &json!({"path": "tiny.png"}))
+            .await;
+        let payload = payload.expect("image payload must be produced");
+        assert!(
+            payload.data_uri.starts_with("data:image/jpeg;base64,"),
+            "unexpected data-uri: {}",
+            payload.data_uri
+        );
+        assert_eq!(payload.width, 4, "unexpected payload width");
+        assert_eq!(payload.height, 4, "unexpected payload height");
+        assert_eq!(payload.format, "PNG", "unexpected payload format");
+        // `payload.path` is the canonicalized resolved path (resolve_read_target
+        // canonicalizes, which on macOS resolves the /tmp → /private/tmp symlink).
+        let expected_path = tokio::fs::canonicalize(ws_path.join("tiny.png"))
+            .await
+            .unwrap();
+        assert_eq!(
+            payload.path,
+            expected_path.display().to_string(),
+            "unexpected payload path"
+        );
+    }
+
+    /// Non-image files (text) produce no image payload.
+    #[tokio::test]
+    async fn image_payload_non_image_returns_none() {
+        let (_dir, ws_path) = temp_workspace(&[("hello.txt", "hello world")]);
+        let ws = Workspace::from_path(&ws_path);
+        let payload = ReadTool
+            .image_payload(&ws, &json!({"path": "hello.txt"}))
+            .await;
+        assert!(payload.is_none());
+    }
+
+    /// End-to-end pipeline regression: `execute` produces a claim-neutral
+    /// base, then `image_payload` (the single decoder) produces the payload
+    /// that the agent loop would inject — validated without passing the
+    /// annotation wording to the gate.
+    #[tokio::test]
+    async fn execute_then_payload_attaches_native_image() {
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        let png = tiny_png_bytes(4, 4);
+        tokio::fs::write(ws_path.join("tiny.png"), &png)
+            .await
+            .unwrap();
+        let ws = Workspace::from_path(&ws_path);
+
+        let result = ReadTool
+            .execute(&ws, json!({"path": "tiny.png"}))
+            .await
+            .expect("native image read must succeed");
+        assert!(result.contains("Read image file"), "got: {result}");
+        assert!(result.contains("PNG"), "got: {result}");
+        assert!(
+            !result.contains("attached to the conversation"),
+            "execute output must stay claim-neutral, got: {result}"
+        );
+
+        let payload = ReadTool
+            .image_payload(&ws, &json!({"path": "tiny.png"}))
+            .await
+            .expect("pipeline image payload must be produced");
+        assert_eq!(payload.width, 4, "unexpected payload width");
+        assert_eq!(payload.height, 4, "unexpected payload height");
+        assert_eq!(payload.format, "PNG", "unexpected payload format");
+    }
+
+    /// Regression: a typo'd image path that `execute` recovers to a unique
+    /// match is actually attached by `image_payload` (not just annotated), and
+    /// the payload carries the `[Recovered path: ...]` note. Pins the symmetry
+    /// between `recover_missing_path` and `resolve_for_read` so the recovery
+    /// logic cannot drift back into the 'annotated but not attached' gap.
+    #[tokio::test]
+    async fn recovered_image_path_is_attached() {
+        // The fuzzy search needs the global search-engine registry plus a
+        // configured storage root (for the persistent query tracker).
+        crate::util::test::init_test_stores().await;
+
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        let png = tiny_png_bytes(4, 4);
+        tokio::fs::write(ws_path.join("tiny_image.png"), &png)
+            .await
+            .unwrap();
+        let ws = Workspace::from_path(&ws_path);
+
+        // execute with a typo'd path that the fuzzy matcher recovers to the file.
+        let result = ReadTool
+            .execute(&ws, json!({"path": "tiny_imag.png"}))
+            .await
+            .expect("recovered image read must succeed");
+        assert!(result.contains("[Recovered path:"), "got: {result}");
+        assert!(result.contains("Read image file"), "got: {result}");
+
+        // image_payload must attach the recovered image (not just annotate it),
+        // and surface the recovery note for the tool-result annotation.
+        let payload = ReadTool
+            .image_payload(&ws, &json!({"path": "tiny_imag.png"}))
+            .await
+            .expect("recovered image payload must be produced");
+        assert_eq!(payload.width, 4, "unexpected payload width");
+        assert_eq!(payload.height, 4, "unexpected payload height");
+        assert_eq!(payload.format, "PNG", "unexpected payload format");
+        let note = payload
+            .recovery_note
+            .expect("recovered read must carry a recovery note");
+        assert!(note.contains("tiny_imag.png"), "note: {note}");
+    }
+
+    /// A payload's recovered-path note is prepended to the tool-result
+    /// annotation, so recovered image reads keep the same `[Recovered path: ...]`
+    /// context that recovered text reads already show.
+    #[test]
+    fn image_payload_recovery_note_prepends_annotation() {
+        let payload = crate::tools::ImagePayload {
+            path: "/tmp/y.png".into(),
+            data_uri: "data:image/jpeg;base64,aaa".into(),
+            width: 4,
+            height: 4,
+            format: "PNG".into(),
+            recovery_note: Some("[Recovered path: requested 'x.png', using 'y.png']".into()),
+        };
+        let fresh = payload.attached_annotation();
+        assert!(
+            fresh.starts_with("[Recovered path: requested 'x.png', using 'y.png']\n"),
+            "fresh must keep the recovery note: {fresh}"
+        );
+        assert!(
+            fresh.contains("Image content attached to the conversation as a native image."),
+            "fresh: {fresh}"
+        );
+        let dup = payload.already_attached_annotation();
+        assert!(
+            dup.starts_with("[Recovered path: requested 'x.png', using 'y.png']\n"),
+            "dup must keep the recovery note: {dup}"
+        );
+        assert!(dup.contains("already attached"), "dup: {dup}");
     }
 
     /// Short output should pass through unchanged.

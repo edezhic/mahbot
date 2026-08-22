@@ -8,8 +8,8 @@ use tracing::Instrument;
 use crate::providers::reasoning_roundtrip::assistant_replay_payload;
 use crate::session::Session;
 use crate::tools::{
-    ToolExecutionOutcome, find_tool, format_tool_failure_feedback, normalize_tool_call,
-    scrub_tool_output,
+    ImagePayload, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
+    normalize_tool_call, scrub_tool_output,
 };
 use crate::util::{MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker, scrub_credentials};
 use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
@@ -153,6 +153,27 @@ fn extract_media_from_outcomes(
         }
     }
     paths
+}
+
+/// Collect the values carried by `[IMAGE:...]` markers already present in the
+/// session's user messages (the read tool's synthetic injection data-URIs, or
+/// file paths from other tools' media markers). Used as the dedup key for the
+/// read tool's synthetic image injection: a repeat read of an already-attached
+/// image (same marker value) is not injected again.
+fn existing_image_marker_values(history: &[ChatMessage]) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for msg in history {
+        if msg.role != crate::ChatRole::User {
+            continue;
+        }
+        for caps in MEDIA_MARKER_RE.captures_iter(&msg.content) {
+            let (kind, path) = parse_media_marker(&caps);
+            if kind == "IMAGE" {
+                set.insert(path.to_string());
+            }
+        }
+    }
+    set
 }
 
 /// One-pass derivation of a role's advertised tools and their specs — the
@@ -741,6 +762,7 @@ impl Agent {
             ToolExecutionOutcome {
                 output: format_tool_failure_feedback(call_name, call_arguments, &reason),
                 success: false,
+                image_payload: None,
             },
             reason,
         )
@@ -820,10 +842,13 @@ impl Agent {
                             duration_ms = duration.as_millis(),
                             "Tool execution completed"
                         );
+                        let image_payload =
+                            tool.image_payload(&self.workspace, &tool_arguments).await;
                         (
                             ToolExecutionOutcome {
                                 output: scrub_tool_output(tool, &tool_arguments, &output_text),
                                 success: true,
+                                image_payload,
                             },
                             String::new(),
                         )
@@ -1234,13 +1259,59 @@ impl Agent {
         let mut db_messages = Vec::with_capacity(1 + outcomes.len());
         db_messages.push(assistant_call);
 
+        // Data-URIs already attached in the session (prior rounds) — the dedup
+        // key for the read-tool's "already attached" reference. Computed lazily
+        // (only once the first image payload is encountered) so rounds with no
+        // image read skip the full-history scan entirely.
+        let mut seen_data_uris: Option<std::collections::HashSet<String>> = None;
+
+        // Synthetic User-role image messages are injected AFTER the whole
+        // tool-result block (preserves OpenAI-compatible tool-stream contiguity:
+        // assistant(tool_calls) → tool_result_* → user(IMAGE_*)). Injecting one
+        // per image inline would interleave a user message between tool results.
+        let mut fresh_image_payloads: Vec<&ImagePayload> = Vec::new();
+
         for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
             let tool = find_tool(tools, &call.name);
-            let output = match tool {
+            let mut output = match tool {
                 Some(t) => t.format_output(&outcome.output),
                 None => crate::util::truncate_tool_output(&outcome.output),
             };
+
+            // The data-URI never rides inside the tool-result string (the shared
+            // 5 KB budget would truncate it); it is delivered as a standalone
+            // user message so the vision-capable model sees a native image part.
+            // Dedup: a repeat read of an already-attached image (same data-URI)
+            // is not re-injected — the read returns a reference to it instead.
+            if let Some(payload) = &outcome.image_payload {
+                let seen = seen_data_uris
+                    .get_or_insert_with(|| existing_image_marker_values(self.session.history()));
+                if seen.insert(payload.data_uri.clone()) {
+                    fresh_image_payloads.push(payload);
+                    // Fresh attachment: tool result reflects the actual injection,
+                    // built from the payload metadata (post-EXIF dims) so it never
+                    // drifts from read.rs wording.
+                    output = payload.attached_annotation();
+                } else {
+                    // Deduped repeat read: the image is already attached; return a
+                    // reference rather than adding it again.
+                    output = payload.already_attached_annotation();
+                }
+            }
+
             db_messages.push(ChatMessage::tool_result(&call.id, &output));
+        }
+
+        // Inject all fresh image user messages AFTER the round's tool-result
+        // block.
+        for payload in fresh_image_payloads {
+            tracing::debug!(
+                agent_id = %self.agent_id,
+                role = %self.role,
+                path = %payload.path,
+                "Injecting read image as a synthetic user message"
+            );
+            db_messages.push(ChatMessage::user(format!("[IMAGE:{}]", payload.data_uri)));
         }
 
         // Batch-persist all messages in a single transaction (preceded by
@@ -2279,6 +2350,7 @@ mod tests {
                 .map(|o| ToolExecutionOutcome {
                     output: o.output.to_string(),
                     success: o.success,
+                    image_payload: None,
                 })
                 .collect();
 
@@ -3528,6 +3600,245 @@ mod tests {
                 .content
                 .contains("rejected by the provider's content-inspection check"),
             "phrase present after a single strip"
+        );
+    }
+
+    /// Collect IMAGE marker data-URIs from user messages — the dedup key for the
+    /// read tool's synthetic image injection. Only IMAGE markers are collected;
+    /// AUDIO/VIDEO markers and plain text are ignored.
+    #[test]
+    fn existing_image_marker_values_extracts_image_markers() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("[IMAGE:data:image/jpeg;base64,aaa] see this"),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user("plain text, no marker"),
+            ChatMessage::user("[AUDIO:data:audio/ogg;base64,zzz]"),
+        ];
+        let set = existing_image_marker_values(&history);
+        assert_eq!(
+            set.len(),
+            1,
+            "only IMAGE markers are collected, got: {set:?}"
+        );
+        assert!(set.contains("data:image/jpeg;base64,aaa"));
+    }
+
+    /// `commit_tool_results` injects the synthetic image user message AFTER the
+    /// round's tool-result block (preserving tool-message contiguity) and dedups
+    /// a repeat read of an already-attached image.
+    #[tokio::test]
+    async fn commit_tool_results_injects_image_after_tool_results_with_dedup() {
+        crate::util::test::init_test_stores().await;
+
+        let mut agent = make_agent(vec![]);
+        // Seed a prior round: an image with this data-URI is already attached.
+        agent.session.push_messages_unpersisted(&[ChatMessage::user(
+            "[IMAGE:data:image/jpeg;base64,prior]",
+        )]);
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "call1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a.png"}),
+            },
+            ToolCall {
+                id: "call2".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "b.png"}),
+            },
+        ];
+        let outcomes = vec![
+            ToolExecutionOutcome {
+                output: "Read image file /a.png (1x1, PNG).".into(),
+                success: true,
+                image_payload: Some(ImagePayload {
+                    path: "/a.png".into(),
+                    data_uri: "data:image/jpeg;base64,prior".into(),
+                    width: 1,
+                    height: 1,
+                    format: "PNG".into(),
+                    recovery_note: None,
+                }),
+            },
+            ToolExecutionOutcome {
+                output: "Read image file /b.png (1x1, PNG).".into(),
+                success: true,
+                image_payload: Some(ImagePayload {
+                    path: "/b.png".into(),
+                    data_uri: "data:image/jpeg;base64,fresh".into(),
+                    width: 1,
+                    height: 1,
+                    format: "PNG".into(),
+                    recovery_note: None,
+                }),
+            },
+        ];
+
+        agent
+            .commit_tool_results(&tool_calls, &outcomes, "assistant with tool_calls")
+            .await
+            .expect("commit_tool_results must succeed");
+
+        let history = agent.session.history();
+        let roles: Vec<crate::ChatRole> = history.iter().map(|m| m.role).collect();
+        // Order: [prior user, assistant(tool_calls), tool_result(call1),
+        // tool_result(call2), user(fresh)] — the fresh image is injected AFTER
+        // both tool results, and the 'prior' image is NOT re-injected.
+        assert_eq!(
+            roles,
+            vec![
+                crate::ChatRole::User,
+                crate::ChatRole::Assistant,
+                crate::ChatRole::Tool,
+                crate::ChatRole::Tool,
+                crate::ChatRole::User,
+            ],
+            "unexpected message ordering: {roles:?}"
+        );
+
+        let image_users: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::User && m.content.contains("[IMAGE:data:"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            image_users.len(),
+            2,
+            "prior + fresh image messages, got: {image_users:?}"
+        );
+        assert!(
+            image_users.contains(&"[IMAGE:data:image/jpeg;base64,prior]"),
+            "prior image survives in history: {image_users:?}"
+        );
+        assert!(
+            image_users.contains(&"[IMAGE:data:image/jpeg;base64,fresh]"),
+            "fresh image injected once: {image_users:?}"
+        );
+        // Dedup: the repeat read of the already-attached 'prior' image is not
+        // re-injected; the fresh image is injected exactly once.
+        let fresh_count = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::User && m.content.contains("base64,fresh"))
+            .count();
+        assert_eq!(fresh_count, 1, "a fresh image is injected exactly once");
+        // The persisted tool-result text is built from the payload metadata (no
+        // brittle string rewrite): the deduped repeat read returns the
+        // 'already attached' reference and the fresh read returns the 'attached'
+        // wording. Tool-result content is a JSON envelope (`{"tool_call_id",
+        // "content"}`), so parse out the `content` field.
+        let tool_results: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::Tool)
+            .map(|m| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&m.content).expect("tool result is valid JSON");
+                crate::util::json::get_str(&v, "content")
+                    .expect("tool result has content")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            tool_results,
+            vec![
+                "Read image file /a.png (1x1, PNG). Image content is already attached to the conversation as a native image.",
+                "Read image file /b.png (1x1, PNG). Image content attached to the conversation as a native image.",
+            ],
+            "unexpected tool-result text: {tool_results:?}"
+        );
+    }
+
+    /// Two identical image reads within the SAME round (same data-URI) are
+    /// deduped by `seen_data_uris`: only the first is injected; the second
+    /// returns the 'already-attached' reference.
+    #[tokio::test]
+    async fn commit_tool_results_dedups_identical_reads_in_same_round() {
+        crate::util::test::init_test_stores().await;
+
+        let mut agent = make_agent(vec![]);
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "callA".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a.png"}),
+            },
+            ToolCall {
+                id: "callB".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "a.png"}),
+            },
+        ];
+        let outcomes = vec![
+            ToolExecutionOutcome {
+                output: "Read image file /a.png (PNG).".into(),
+                success: true,
+                image_payload: Some(ImagePayload {
+                    path: "/a.png".into(),
+                    data_uri: "data:image/jpeg;base64,same".into(),
+                    width: 1,
+                    height: 1,
+                    format: "PNG".into(),
+                    recovery_note: None,
+                }),
+            },
+            ToolExecutionOutcome {
+                output: "Read image file /a.png (PNG).".into(),
+                success: true,
+                image_payload: Some(ImagePayload {
+                    path: "/a.png".into(),
+                    data_uri: "data:image/jpeg;base64,same".into(),
+                    width: 1,
+                    height: 1,
+                    format: "PNG".into(),
+                    recovery_note: None,
+                }),
+            },
+        ];
+
+        agent
+            .commit_tool_results(&tool_calls, &outcomes, "assistant with tool_calls")
+            .await
+            .expect("commit_tool_results must succeed");
+
+        let history = agent.session.history();
+        let image_users: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.role == crate::ChatRole::User
+                    && m.content.contains("[IMAGE:data:image/jpeg;base64,same]")
+            })
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            image_users.len(),
+            1,
+            "identical reads in one round inject exactly once, got: {image_users:?}"
+        );
+
+        // The first tool result claims a fresh attachment; the second returns a
+        // reference (already attached).
+        let tool_results: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::Tool)
+            .map(|m| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&m.content).expect("tool result is valid JSON");
+                crate::util::json::get_str(&v, "content")
+                    .expect("tool result has content")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 2, "two tool results persisted");
+        assert!(
+            tool_results[0].contains("attached to the conversation as a native image")
+                && !tool_results[0].contains("already"),
+            "first read claims a fresh attachment: {tool_results:?}"
+        );
+        assert!(
+            tool_results[1].contains("already attached to the conversation"),
+            "second read returns a reference: {tool_results:?}"
         );
     }
 }

@@ -7,6 +7,8 @@ Modes:
 - `symbols`: Lists all AST-level symbols (functions, structs, impl blocks, etc.) with line ranges. Supports Rust, JavaScript/TypeScript, and Python files. Use this to get a quick overview of a file's structure.
 - `zoom`: Extract a single symbol's full source by name (requires `symbol` parameter). Use with the output of `symbols` mode to drill into specific definitions.
 
+When a content-mode path is a raster image (PNG, JPEG, or WebP), the tool reads and attaches it to the conversation as a native image the model can inspect, instead of returning lossy text. Other binary formats that cannot be decoded (e.g. GIF, BMP, HEIC) are reported as unsupported. Reading the same image twice returns a reference to the already-attached image rather than adding it again.
+
 Path restrictions: paths must be within the project workspace, or within common dependency source directories (see below). Absolute paths are allowed for temp files (e.g. $TMPDIR/* spill files from shell output) and dependency sources. Files larger than 10 MB are rejected. PDF files are automatically extracted to plain text.
 
 ## Dependency source access
