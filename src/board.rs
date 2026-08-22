@@ -157,12 +157,18 @@ crate::columns! {
 /// pre-development threshold (Analysis + Planning + ReadyForDevelopment) and is no longer
 /// directly suppressed by this constant.
 ///
-/// Note: [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
+/// Note: the set includes four transitory handoff phases (DiagnosticsDone, Reviewed,
+/// QaPassed, SanitationPassed) in which no agent is running — the poller advances them
+/// within seconds. They still count as pipeline-occupied because they block new Engineer
+/// claims for the workspace until advanced; they are not states where agents are actively
+/// working for an extended period.
+///
+/// [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
 /// of these (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) plus Analysis — see its
-/// docs for rationale. The remaining four phases (DiagnosticsDone, SanitationPassed, Reviewed, QaPassed) are transitory
-/// handoff states intentionally excluded from reset. The `tests::test_pipeline_blockers_coverage`
-/// test enforces that every non-transitory pipeline blocker has a corresponding reset transition.
-const PIPELINE_BLOCKING_PHASES: &[TicketPhase] = &[
+/// docs for rationale. The remaining four transitory handoff phases are intentionally excluded
+/// from reset. The `tests::test_pipeline_occupancy_coverage`
+/// test enforces that every non-transitory pipeline occupant has a corresponding reset transition.
+const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
     TicketPhase::DiagnosticsDone,
@@ -177,16 +183,16 @@ const PIPELINE_BLOCKING_PHASES: &[TicketPhase] = &[
 /// The sanitation pipeline — only one ticket per workspace may be in these
 /// phases at a time (serialization enforced by [`BoardStore::claim_sanitation`]).
 ///
-/// Subset of [`PIPELINE_BLOCKING_PHASES`].
+/// Subset of [`PIPELINE_OCCUPIED_PHASES`].
 const SANITATION_PIPELINE_PHASES: &[TicketPhase] =
     &[TicketPhase::InSanitation, TicketPhase::SanitationPassed];
 
-/// Pipeline-blocking phases that are transitory handoff states — no agent is
+/// Pipeline-occupied phases that are transitory handoff states — no agent is
 /// mid-execution in these phases, so they don't need a reset transition. The
 /// poller picks them up within seconds.
 ///
-/// This is a subset of [`PIPELINE_BLOCKING_PHASES`]. The relationship is
-/// mechanically verified by `tests::test_pipeline_blockers_coverage`.
+/// This is a subset of [`PIPELINE_OCCUPIED_PHASES`]. The relationship is
+/// mechanically verified by `tests::test_pipeline_occupancy_coverage`.
 #[cfg(test)]
 const TRANSITORY_HANDOFF_PHASES: &[TicketPhase] = &[
     TicketPhase::DiagnosticsDone,
@@ -485,7 +491,7 @@ pub enum TicketPhase {
 }
 
 impl TicketPhase {
-    /// Returns `true` for transitory handoff phases — pipeline-blocking
+    /// Returns `true` for transitory handoff phases — pipeline-occupied
     /// phases where no agent is mid-execution.
     ///
     /// Delegates to `TRANSITORY_HANDOFF_PHASES` so the transitory handoff set can never
@@ -519,15 +525,19 @@ impl TicketPhase {
         TERMINAL_PHASES.contains(self)
     }
 
-    /// Returns `true` if the ticket is in a pipeline-blocking phase.
+    /// Returns `true` if the ticket is in a pipeline-occupied phase.
     ///
-    /// Tickets in these phases are actively being worked on by agents
-    /// (development, diagnostics, review, QA). Automated tools (create,
-    /// update, add_comment) should refuse to modify them to prevent
-    /// race conditions with running agents.
+    /// Tickets in these phases occupy the dev/review/QA pipeline — only one
+    /// ticket per workspace may be in the pipeline at a time. Most of these
+    /// phases have an agent actively working on the ticket (development,
+    /// diagnostics, review, QA), but four are transitory handoff phases
+    /// (DiagnosticsDone, Reviewed, QaPassed, SanitationPassed) with no agent
+    /// running — the poller advances them within seconds. Automated tools
+    /// (create, update, add_comment) refuse to modify tickets in any of these
+    /// phases to prevent race conditions during phase transitions.
     #[must_use]
-    pub fn is_pipeline_blocking(&self) -> bool {
-        PIPELINE_BLOCKING_PHASES.contains(self)
+    pub fn is_pipeline_occupied(&self) -> bool {
+        PIPELINE_OCCUPIED_PHASES.contains(self)
     }
 
     /// Human-readable display label with spaces instead of underscores
@@ -661,18 +671,18 @@ struct ResetTransition {
 
 /// Controls whether the pipeline-occupancy check is enforced when claiming tickets.
 ///
-/// Pipeline-blocking tickets (those in [`PIPELINE_BLOCKING_PHASES`]) prevent
+/// Pipeline-occupied tickets (those in [`PIPELINE_OCCUPIED_PHASES`]) prevent
 /// multiple tickets from being worked concurrently in the same workspace.
 ///
 /// - [`Skip`](Self::Skip): claim the next available ticket without checking
-///   for pipeline blockers (used by parallel phases like analysis, review, QA).
-/// - [`Enforce`](Self::Enforce): only claim if no pipeline-blocking ticket exists
+///   for pipeline occupants (used by parallel phases like analysis, review, QA).
+/// - [`Enforce`](Self::Enforce): only claim if no pipeline-occupied ticket exists
 ///   in the workspace (used by serial phases like development, diagnostics, sanitation).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PipelineCheck {
     /// Skip pipeline occupancy check — claim the next available ticket.
     Skip,
-    /// Only claim if no pipeline-blocking ticket exists in the workspace.
+    /// Only claim if no pipeline-occupied ticket exists in the workspace.
     Enforce,
 }
 
@@ -1002,18 +1012,18 @@ impl BoardStore {
     /// pass `None` and are unaffected.
     ///
     /// When `pipeline_check` is [`PipelineCheck::Enforce`], the claim is rejected
-    /// (returns `None`) if any pipeline-blocking ticket exists in the same workspace. The
+    /// (returns `None`) if any pipeline-occupied ticket exists in the same workspace. The
     /// occupancy check is part of the same atomic SQL UPDATE statement (no
-    /// separate SELECT + UPDATE window). Pipeline-blocking phases are defined
-    /// in [`PIPELINE_BLOCKING_PHASES`].
+    /// separate SELECT + UPDATE window). Pipeline-occupied phases are defined
+    /// in [`PIPELINE_OCCUPIED_PHASES`].
     ///
     /// Note that a reserved ReadyForDevelopment ticket (one with
-    /// `pipeline_reservation = 1`) is **not** treated as a pipeline blocker for
-    /// the purpose of this claim — [`has_pipeline_blocker_for_workspace`] (a
-    /// test-only query) considers such tickets blockers, but the claim subquery
+    /// `pipeline_reservation = 1`) is **not** treated as a pipeline occupant for
+    /// the purpose of this claim — [`has_pipeline_occupant_for_workspace`] (a
+    /// test-only query) considers such tickets occupants, but the claim subquery
     /// orders by `pipeline_reservation DESC` and clears reservation on claim,
     /// so a reserved ticket at ReadyForDevelopment will be claimed before any
-    /// other ticket at the same phase — no pipeline blocking needed.
+    /// other ticket at the same phase — no pipeline occupancy check needed.
     ///
     /// When `pipeline_check` is [`PipelineCheck::Skip`], the claim uses a
     /// simple LIMIT 1 subquery with no pipeline gating. This is used for phases
@@ -1053,12 +1063,12 @@ impl BoardStore {
             phase_list_sql_fragment(UNBLOCKING_PHASES),
         );
 
-        let pipeline_blocker_clause = if pipeline_check == PipelineCheck::Enforce {
-            let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
+        let pipeline_occupied_clause = if pipeline_check == PipelineCheck::Enforce {
+            let occupied_sql = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES);
             format!(
                 "AND NOT EXISTS (SELECT 1 FROM tickets t2 \
                  WHERE t2.workspace_name = t1.workspace_name \
-                 AND t2.phase IN ({blocker_sql}) \
+                 AND t2.phase IN ({occupied_sql}) \
                  AND t2.id != t1.id) "
             )
         } else {
@@ -1079,7 +1089,7 @@ impl BoardStore {
              WHERE id = (SELECT t1.id FROM tickets t1 \
              WHERE t1.phase = ?3 AND t1.assigned_to IS NULL AND t1.workspace_name = ?4 \
              AND t1.is_archived = 0 \
-             {grace_clause}{pipeline_blocker_clause}{prereq_filter} \
+             {grace_clause}{pipeline_occupied_clause}{prereq_filter} \
              ORDER BY t1.pipeline_reservation DESC, t1.priority ASC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}"
         );
@@ -1442,7 +1452,7 @@ impl BoardStore {
     /// with no running agent, so cancellation is unnecessary.
     pub async fn claim_sanitation(&self, ticket_id: &str, assigned_to: &str) -> Result<bool> {
         let now = turso::now();
-        let blocker = phase_list_sql_fragment(SANITATION_PIPELINE_PHASES);
+        let occupied_sql = phase_list_sql_fragment(SANITATION_PIPELINE_PHASES);
         let sql = format!(
             "UPDATE tickets SET phase = ?1, assigned_to = ?2, updated_at = ?3 \
              WHERE id = ?4 AND phase = ?5 AND is_archived = 0 \
@@ -1450,7 +1460,7 @@ impl BoardStore {
                WHERE t2.workspace_name = \
                  (SELECT workspace_name FROM tickets WHERE id = ?4) \
                AND t2.id != ?4 \
-               AND t2.phase IN ({blocker}))"
+               AND t2.phase IN ({occupied_sql}))"
         );
         let rows = self
             .conn
@@ -1588,18 +1598,18 @@ impl BoardStore {
     }
 
     /// Transition pairs for crash/restart recovery (extracted so tests can verify
-    /// coverage against [`PIPELINE_BLOCKING_PHASES`] without duplicating the pairs).
+    /// coverage against [`PIPELINE_OCCUPIED_PHASES`] without duplicating the pairs).
     ///
     /// Each entry maps a phase where an agent may have crashed mid-work back to the
     /// phase the ticket should resume in. Must be kept in sync with
-    /// [`PIPELINE_BLOCKING_PHASES`] — see `tests::test_pipeline_blockers_coverage`.
+    /// [`PIPELINE_OCCUPIED_PHASES`] — see `tests::test_pipeline_occupancy_coverage`.
     ///
     /// Asymmetry: `Analysis → Backlog` is included (backlog analysts may crash mid-analysis),
-    /// but `Analysis` is intentionally NOT in [`PIPELINE_BLOCKING_PHASES`] (it's a pre-flight
-    /// phase, not a pipeline blocker).
+    /// but `Analysis` is intentionally NOT in [`PIPELINE_OCCUPIED_PHASES`] (it's a pre-flight
+    /// phase, not a pipeline occupant).
     ///
     /// Transitory handoff phases (DiagnosticsDone, SanitationPassed, Reviewed, QaPassed) are pipeline
-    /// blocking but don't need a reset entry — the poller picks them up within seconds
+    /// occupied but don't need a reset entry — the poller picks them up within seconds
     /// of restart, so no agent session is mid-execution in those states.
     ///
     /// `pipeline_reservation` choice per entry:
@@ -1668,10 +1678,10 @@ impl BoardStore {
     /// Reset all in-flight tickets to their ready state (for crash/restart recovery).
     ///
     /// Resets:
-    /// - 5 of the 9 `PIPELINE_BLOCKING_PHASES` where agents may have been mid-work
+    /// - 5 of the 9 `PIPELINE_OCCUPIED_PHASES` where agents may have been mid-work
     ///   (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) — roll back to
     ///   their pre-pipeline state
-    /// - `Analysis` (not a pipeline blocker, but backlog analysts may crash mid-work)
+    /// - `Analysis` (not a pipeline occupant, but backlog analysts may crash mid-work)
     ///
     /// Tickets that are bounced to `ReadyForDevelopment` (InDevelopment and InDiagnostics)
     /// get `pipeline_reservation = 1` so they are claimed before any fresh
@@ -1681,7 +1691,7 @@ impl BoardStore {
     /// that the poller picks up within the next poll cycle.
     ///
     /// Uses `Self::RESET_TRANSITIONS` (extracted as an associated const so tests
-    /// can verify coverage against `PIPELINE_BLOCKING_PHASES`).
+    /// can verify coverage against `PIPELINE_OCCUPIED_PHASES`).
     ///
     /// `exclude_ticket_ids`: tickets with a RESUMED active job at boot must be
     /// skipped — resetting them to a claimable phase would re-claim via the 1s
@@ -1723,13 +1733,13 @@ impl BoardStore {
 
     /// Shared implementation for checking if a workspace has active tickets.
     ///
-    /// Returns `true` if any ticket in the workspace has a pipeline-blocking
-    /// phase ([`PIPELINE_BLOCKING_PHASES`]), or a
+    /// Returns `true` if any ticket in the workspace has a pipeline-occupied
+    /// phase ([`PIPELINE_OCCUPIED_PHASES`]), or a
     /// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) ticket,
     /// optionally excluding a specific ticket ID.
     ///
     /// [`has_active_tickets_excluding`] delegates to this helper. The test-only
-    /// [`has_pipeline_blocker_for_workspace`] delegates too, with
+    /// [`has_pipeline_occupant_for_workspace`] delegates too, with
     /// `require_rfd_reservation = true`.
     ///
     /// # Parameters
@@ -1740,13 +1750,13 @@ impl BoardStore {
     ///   `(?2 IS NULL OR id != ?2)` short-circuits to `TRUE`).
     /// * `require_rfd_reservation` — When `true`, only ReadyForDevelopment
     ///   tickets with `pipeline_reservation = 1` are counted as active (used
-    ///   by the pipeline-blocker check). When `false`, all ReadyForDevelopment
+    ///   by the pipeline-occupant check). When `false`, all ReadyForDevelopment
     ///   tickets are active regardless of reservation (notification-suppression
     ///   policy for [`has_active_tickets_excluding`]).
     ///
     /// Excludes archived tickets — the only phases that ever get archived are
     /// `Done` and `Cancelled`, neither of which appears in
-    /// `PIPELINE_BLOCKING_PHASES`, so this is a defensive consistency measure.
+    /// `PIPELINE_OCCUPIED_PHASES`, so this is a defensive consistency measure.
     ///
     /// # Parameter binding note
     ///
@@ -1763,7 +1773,7 @@ impl BoardStore {
         exclude_ticket_id: Option<&str>,
         require_rfd_reservation: bool,
     ) -> Result<bool> {
-        let blocker_sql = phase_list_sql_fragment(PIPELINE_BLOCKING_PHASES);
+        let occupied_sql = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES);
         let rfd_condition = if require_rfd_reservation {
             "(phase = ?3 AND pipeline_reservation = 1)".to_string()
         } else {
@@ -1771,7 +1781,7 @@ impl BoardStore {
         };
         let sql = format!(
             "SELECT 1 FROM tickets WHERE \
-             (phase IN ({blocker_sql}) OR {rfd_condition}) \
+             (phase IN ({occupied_sql}) OR {rfd_condition}) \
              AND workspace_name = ?1 AND is_archived = 0 \
              AND (?2 IS NULL OR id != ?2) LIMIT 1",
         );
@@ -1784,10 +1794,10 @@ impl BoardStore {
     }
 
     /// Returns `true` if the given workspace has any ticket with a
-    /// pipeline-blocking phase (dev/review/QA), OR any reserved
+    /// pipeline-occupied phase (dev/review/QA), OR any reserved
     /// ReadyForDevelopment ticket that was bounced back and is awaiting rework.
     ///
-    /// **Test-only query** — retained to provide coverage of the pipeline-blocker
+    /// **Test-only query** — retained to provide coverage of the pipeline-occupant
     /// SQL variant. Production code uses [`has_active_tickets_excluding`] or
     /// [`count_by_phase`].
     ///
@@ -1807,9 +1817,9 @@ impl BoardStore {
     ///
     /// Excludes archived tickets — the only phases that ever get archived are
     /// `Done` and `Cancelled`, neither of which appears in
-    /// `PIPELINE_BLOCKING_PHASES`, so this is a defensive consistency measure.
+    /// `PIPELINE_OCCUPIED_PHASES`, so this is a defensive consistency measure.
     #[cfg(test)]
-    pub(crate) async fn has_pipeline_blocker_for_workspace(
+    pub(crate) async fn has_pipeline_occupant_for_workspace(
         &self,
         workspace_name: &str,
     ) -> Result<bool> {
@@ -1819,14 +1829,14 @@ impl BoardStore {
 
     /// Check if the workspace has any active tickets other than the excluded one.
     ///
-    /// "Active" means a ticket whose phase is either a pipeline-blocking phase
-    /// (`PIPELINE_BLOCKING_PHASES`) or [`TicketPhase::ReadyForDevelopment`]
+    /// "Active" means a ticket whose phase is either a pipeline-occupied phase
+    /// (`PIPELINE_OCCUPIED_PHASES`) or [`TicketPhase::ReadyForDevelopment`]
     /// (regardless of `pipeline_reservation` — unstarted backlog tickets are
     /// considered active to suppress Done notifications until the pipeline is
     /// fully drained).
     ///
     /// Delegates to `has_active_tickets_internal`. The test-only
-    /// `has_pipeline_blocker_for_workspace` additionally requires
+    /// `has_pipeline_occupant_for_workspace` additionally requires
     /// `pipeline_reservation = 1` for ReadyForDevelopment tickets.
     ///
     /// Non-active phases (not matched by the query): `Done`, `Cancelled`,
@@ -2192,7 +2202,7 @@ impl BoardStore {
 
     /// Partition tickets into the three kanban columns, in the same order the
     /// GUI board displays them: completed ([`TicketPhase::is_unblocking`]),
-    /// pipeline ([`TicketPhase::is_pipeline_blocking`] plus
+    /// pipeline ([`TicketPhase::is_pipeline_occupied`] plus
     /// `ReadyForDevelopment`), pending (everything else — the safe fallback
     /// for unclassified phases). Archived tickets are excluded.
     ///
@@ -2214,7 +2224,7 @@ impl BoardStore {
             }
             if ticket.phase.is_unblocking() {
                 completed.push(ticket);
-            } else if ticket.phase.is_pipeline_blocking()
+            } else if ticket.phase.is_pipeline_occupied()
                 || ticket.phase == TicketPhase::ReadyForDevelopment
             {
                 pipeline.push(ticket);

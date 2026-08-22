@@ -218,7 +218,7 @@ impl Tool for CreateTicketTool {
             priority,
         );
         if let Some(supersede_id) = supersede_id {
-            guard_not_pipeline_blocking(store, &supersede_id).await?;
+            guard_not_pipeline_occupied(store, &supersede_id).await?;
 
             let id = store.supersede_and_create(&supersede_id, &params).await?;
             Ok(format!(
@@ -275,8 +275,8 @@ impl Tool for UpdateTicketTool {
 
         let store = board_store();
 
-        // Guard: refuse to update a ticket that is in a pipeline-blocking phase.
-        guard_not_pipeline_blocking(store, &ticket_id).await?;
+        // Guard: refuse to update a ticket that is in a pipeline-occupied phase.
+        guard_not_pipeline_occupied(store, &ticket_id).await?;
 
         store
             .transition_to(&ticket_id, None, parsed_phase, None)
@@ -472,15 +472,15 @@ impl Tool for AddCommentTool {
     }
 }
 
-/// Guard: refuse to proceed if the ticket is in a pipeline-blocking phase.
+/// Guard: refuse to proceed if the ticket is in a pipeline-occupied phase.
 /// All three user-facing ticket tools use this to prevent modifications
 /// to in-flight tickets during automated pipeline processing.
-async fn guard_not_pipeline_blocking(
+async fn guard_not_pipeline_occupied(
     store: &crate::board::BoardStore,
     ticket_id: &str,
 ) -> Result<()> {
     if let Some(current_phase) = store.get_ticket_phase(ticket_id).await?
-        && current_phase.is_pipeline_blocking()
+        && current_phase.is_pipeline_occupied()
     {
         anyhow::bail!(
             "Ticket {ticket_id} is currently in phase '{current_phase}' — \
@@ -712,54 +712,54 @@ mod tests {
         assert!(result.is_err(), "Invalid phase should fail");
     }
 
-    // ── Pipeline-blocking guard tests ────────────────────────────
+    // ── Pipeline-occupied guard tests ────────────────────────────
 
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
-    async fn test_guard_not_pipeline_blocking_cases() {
+    async fn test_guard_not_pipeline_occupied_cases() {
         crate::util::test::init_test_stores().await;
 
         let store = board_store();
         let ws = test_ws("/ws");
 
-        let blocking_id = TicketBuilder::new(store, &ws)
-            .title("BlockingGuard")
+        let occupied_id = TicketBuilder::new(store, &ws)
+            .title("OccupiedGuard")
             .desc("in development")
             .phase(TicketPhase::InDevelopment)
             .create()
             .await
             .expect("create");
 
-        let nonblocking_id = TicketBuilder::new(store, &ws)
-            .title("NonBlockingGuard")
+        let unoccupied_id = TicketBuilder::new(store, &ws)
+            .title("UnoccupiedGuard")
             .desc("backlog")
             .phase(TicketPhase::Backlog)
             .create()
             .await
             .expect("create");
 
-        let result = guard_not_pipeline_blocking(store, &blocking_id).await;
-        assert!(result.is_err(), "Blocking-phase ticket should be rejected");
+        let result = guard_not_pipeline_occupied(store, &occupied_id).await;
+        assert!(result.is_err(), "Occupied-phase ticket should be rejected");
         let err = format!("{}", result.unwrap_err());
         assert!(
             err.contains("in-flight"),
             "Error should mention in-flight restriction"
         );
 
-        let result = guard_not_pipeline_blocking(store, &nonblocking_id).await;
-        assert!(result.is_ok(), "Non-blocking ticket should pass the guard");
+        let result = guard_not_pipeline_occupied(store, &unoccupied_id).await;
+        assert!(result.is_ok(), "Unoccupied ticket should pass the guard");
 
         // Non-existent ticket silently passes (nothing to block)
-        let result = guard_not_pipeline_blocking(store, "nonexistent_id").await;
+        let result = guard_not_pipeline_occupied(store, "nonexistent_id").await;
         assert!(
             result.is_ok(),
             "Non-existent ticket should silently pass the guard"
         );
     }
 
-    /// Create a ticket in a pipeline-blocking phase (InDevelopment).
-    /// Used by wiring tests below to verify tools call `guard_not_pipeline_blocking`.
-    async fn create_blocking_ticket() -> String {
+    /// Create a ticket in a pipeline-occupied phase (InDevelopment).
+    /// Used by wiring tests below to verify tools call `guard_not_pipeline_occupied`.
+    async fn create_occupied_ticket() -> String {
         crate::util::test::init_test_stores().await;
         let store = board_store();
         TicketBuilder::new(store, &test_ws("/ws"))
@@ -774,21 +774,21 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
     async fn test_update_ticket_blocked_by_pipeline() {
-        let id = create_blocking_ticket().await;
+        let id = create_occupied_ticket().await;
         let ws = test_ws("/ws");
         let result = UpdateTicketTool::new(&ws)
             .execute(&ws, json!({"ticket_id": id, "phase": "backlog"}))
             .await;
         assert!(
             result.is_err(),
-            "Pipeline-blocking ticket should reject update"
+            "Pipeline-occupied ticket should reject update"
         );
     }
 
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
     async fn test_create_ticket_supersede_blocked_by_pipeline() {
-        let id = create_blocking_ticket().await;
+        let id = create_occupied_ticket().await;
         let ws = test_ws("/ws");
         let result = CreateTicketTool::new("test", &ws)
             .execute(
@@ -798,7 +798,7 @@ mod tests {
             .await;
         assert!(
             result.is_err(),
-            "Supersede should be rejected for pipeline-blocking tickets"
+            "Supersede should be rejected for pipeline-occupied tickets"
         );
     }
 
@@ -889,8 +889,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_comment_allowed_on_pipeline_blocking() {
-        let id = create_blocking_ticket().await;
+    async fn test_add_comment_allowed_on_pipeline_occupied() {
+        let id = create_occupied_ticket().await;
         let ws = test_ws("/ws");
         let result = AddCommentTool::new(&ws)
             .execute(
@@ -900,7 +900,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "Comments should be allowed on pipeline-blocking tickets"
+            "Comments should be allowed on pipeline-occupied tickets"
         );
     }
 

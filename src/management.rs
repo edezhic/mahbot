@@ -2101,7 +2101,7 @@ async fn run_stage_agent_round(
 ///
 /// If other active tickets remain in the workspace, the notification is
 /// buffered so the Manager only gets one notification when the last ticket
-/// finishes. Active tickets = `PIPELINE_BLOCKING_PHASES` + `ReadyForDevelopment`.
+/// finishes. Active tickets = `PIPELINE_OCCUPIED_PHASES` + `ReadyForDevelopment`.
 ///
 /// # Race condition
 ///

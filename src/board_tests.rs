@@ -431,9 +431,9 @@ async fn test_claim_prefers_reserved_ticket() {
         "Reservation should be 0 in DB after claim"
     );
 
-    // After the reserved ticket is claimed (now InDevelopment, pipeline-blocking),
+    // After the reserved ticket is claimed (now InDevelopment, pipeline-occupied),
     // the fresh ticket is still at ReadyForDevelopment but cannot be claimed
-    // because the pipeline is blocked. Verify the fresh ticket remains untouched.
+    // because the pipeline is occupied. Verify the fresh ticket remains untouched.
     let fresh = expect_ticket(&store, &fresh_id).await;
     assert_eq!(
         fresh.phase,
@@ -595,21 +595,21 @@ async fn test_clear_terminal_reservations_sweep() {
 }
 
 #[tokio::test]
-async fn test_has_pipeline_blocker_reserved() {
+async fn test_has_pipeline_occupant_reserved() {
     let (store, _tmp) = open_test_store().await;
     let ws = test_ws_named("/ws", "ws");
 
-    // A fresh ReadyForDevelopment ticket should NOT be a blocker
+    // A fresh ReadyForDevelopment ticket should NOT be a pipeline occupant
     let id = make_ticket(&store, &ws, "Fresh", TicketPhase::ReadyForDevelopment).await;
     assert!(
         !store
-            .has_pipeline_blocker_for_workspace("ws")
+            .has_pipeline_occupant_for_workspace("ws")
             .await
             .expect("check"),
-        "Fresh ReadyForDevelopment ticket should not be a pipeline blocker"
+        "Fresh ReadyForDevelopment ticket should not be a pipeline occupant"
     );
 
-    // After setting reservation, it should be a blocker
+    // After setting reservation, it should be a pipeline occupant
     store
         .transition_to(
             &id,
@@ -621,13 +621,13 @@ async fn test_has_pipeline_blocker_reserved() {
         .expect("set reservation");
     assert!(
         store
-            .has_pipeline_blocker_for_workspace("ws")
+            .has_pipeline_occupant_for_workspace("ws")
             .await
             .expect("check"),
-        "Reserved ReadyForDevelopment ticket should be a pipeline blocker"
+        "Reserved ReadyForDevelopment ticket should be a pipeline occupant"
     );
 
-    // After removing reservation, it should not be a blocker
+    // After removing reservation, it should not be a pipeline occupant
     store
         .transition_to(
             &id,
@@ -639,10 +639,10 @@ async fn test_has_pipeline_blocker_reserved() {
         .expect("clear reservation");
     assert!(
         !store
-            .has_pipeline_blocker_for_workspace("ws")
+            .has_pipeline_occupant_for_workspace("ws")
             .await
             .expect("check"),
-        "Non-reserved ReadyForDevelopment ticket should not be a pipeline blocker again"
+        "Non-reserved ReadyForDevelopment ticket should not be a pipeline occupant again"
     );
 }
 
@@ -683,11 +683,11 @@ async fn create_non_active_tickets(store: &BoardStore) -> Vec<String> {
 }
 
 /// Verify that [`BoardStore::has_active_tickets_excluding`] correctly identifies
-/// active tickets (PIPELINE_BLOCKING_PHASES + ReadyForDevelopment) per workspace,
+/// active tickets (PIPELINE_OCCUPIED_PHASES + ReadyForDevelopment) per workspace,
 /// excluding a specified ticket ID.
 ///
 /// Active tickets include all ReadyForDevelopment tickets regardless of
-/// `pipeline_reservation`, unlike [`has_pipeline_blocker_for_workspace`] which
+/// `pipeline_reservation`, unlike [`has_pipeline_occupant_for_workspace`] which
 /// requires `pipeline_reservation = 1`. This is intentional — unstarted backlog
 /// tickets are considered active to suppress Done notifications until the pipeline
 /// is fully drained.
@@ -696,7 +696,7 @@ async fn test_has_active_tickets_excluding() {
     let (store, _tmp) = open_test_store().await;
     let ws = test_ws_named("/ws", "ws");
 
-    // Create one ticket per active phase: all PIPELINE_BLOCKING_PHASES + ReadyForDevelopment
+    // Create one ticket per active phase: all PIPELINE_OCCUPIED_PHASES + ReadyForDevelopment
     let rfd_id = make_ticket(&store, &ws, "RFD", TicketPhase::ReadyForDevelopment).await;
     let in_dev_id = make_ticket(&store, &ws, "InDev", TicketPhase::InDevelopment).await;
     let done_id = make_ticket(&store, &ws, "Done", TicketPhase::Done).await;
@@ -786,31 +786,31 @@ async fn test_has_active_tickets_excluding() {
     .await;
 }
 
-/// Verify that every non-transitory pipeline-blocking phase has a reset transition.
+/// Verify that every non-transitory pipeline-occupied phase has a reset transition.
 ///
-/// [`PIPELINE_BLOCKING_PHASES`] defines 9 phases; 5 of them (InDevelopment,
+/// [`PIPELINE_OCCUPIED_PHASES`] defines 9 phases; 5 of them (InDevelopment,
 /// InDiagnostics, InSanitation, InReview, InQa) have entries in
 /// [`RESET_TRANSITIONS`]. The remaining 4 phases
 /// ([`TRANSITORY_HANDOFF_PHASES`]) are transitory handoff states that the
 /// poller picks up within seconds — no agent is mid-execution in those states,
 /// so they don't need reset entries.
 ///
-/// This test does NOT assert the reverse direction (reset → pipeline blocker),
+/// This test does NOT assert the reverse direction (reset → pipeline occupant),
 /// because [`RESET_TRANSITIONS`] also includes `Analysis → Backlog`, and `Analysis`
-/// is intentionally not a pipeline blocker (it's a pre-flight phase).
+/// is intentionally not a pipeline occupant (it's a pre-flight phase).
 ///
 /// It also mechanically verifies that [`TRANSITORY_HANDOFF_PHASES`] is a subset of
-/// [`PIPELINE_BLOCKING_PHASES`], ensuring the two sets stay in sync.
+/// [`PIPELINE_OCCUPIED_PHASES`], ensuring the two sets stay in sync.
 #[test]
-fn test_pipeline_blockers_coverage() {
-    // Verify that every transitory handoff phase is a pipeline blocker.
+fn test_pipeline_occupancy_coverage() {
+    // Verify that every transitory handoff phase is a pipeline occupant.
     for phase in TRANSITORY_HANDOFF_PHASES {
         assert!(
-            PIPELINE_BLOCKING_PHASES.contains(phase),
+            PIPELINE_OCCUPIED_PHASES.contains(phase),
             "\
 TRANSITORY_HANDOFF_PHASES contains `{phase}` which is not in \
-PIPELINE_BLOCKING_PHASES. Every transitory handoff phase must also \
-be a pipeline blocker.\
+PIPELINE_OCCUPIED_PHASES. Every transitory handoff phase must also \
+be a pipeline occupant.\
                 ",
         );
     }
@@ -821,12 +821,12 @@ be a pipeline blocker.\
         .map(|t| t.from)
         .collect();
 
-    for phase in PIPELINE_BLOCKING_PHASES {
+    for phase in PIPELINE_OCCUPIED_PHASES {
         let has_reset = reset_from.contains(phase);
         assert!(
             has_reset || phase.is_transitory_handoff(),
             "\
-PIPELINE_BLOCKING_PHASES contains `{phase}` which has no corresponding \
+PIPELINE_OCCUPIED_PHASES contains `{phase}` which has no corresponding \
 entry in RESET_TRANSITIONS and is not a transitory handoff phase \
 (see `TicketPhase::is_transitory_handoff`). Either add a reset transition to \
 RESET_TRANSITIONS, or mark the phase as transitory handoff in that method \
@@ -964,12 +964,12 @@ async fn test_claim_ticket_in_workspace_respects_claim_grace() {
 async fn test_claim_ticket_in_workspace_if_pipeline_free() {
     /// The pipeline scenario for a single test case.
     enum Scenario {
-        /// Blocker in the same workspace — claim should be blocked.
+        /// Occupant in the same workspace — claim should be blocked.
         SameWorkspace(TicketPhase),
-        /// Blocker in a different workspace — claim should succeed.
+        /// Occupant in a different workspace — claim should succeed.
         DifferentWorkspace(TicketPhase),
-        /// No blocker — claim should succeed.
-        NoBlocker,
+        /// No occupant — claim should succeed.
+        NoOccupant,
     }
 
     struct Case {
@@ -991,9 +991,9 @@ async fn test_claim_ticket_in_workspace_if_pipeline_free() {
             scenario: Scenario::DifferentWorkspace(TicketPhase::InDevelopment),
         },
         Case {
-            name: "no blocker succeeds",
+            name: "no occupant succeeds",
             suffix: "none",
-            scenario: Scenario::NoBlocker,
+            scenario: Scenario::NoOccupant,
         },
     ];
 
@@ -1003,13 +1003,13 @@ async fn test_claim_ticket_in_workspace_if_pipeline_free() {
         let suffix = case.suffix;
 
         // Derive workspace names from the scenario.
-        let (claim_ws_name, blocker_ws_name) = match &case.scenario {
+        let (claim_ws_name, occupied_ws_name) = match &case.scenario {
             Scenario::DifferentWorkspace(_) => (
                 format!("ws_{suffix}_claimable"),
-                format!("ws_{suffix}_blocker"),
+                format!("ws_{suffix}_occupied"),
             ),
-            // SameWorkspace and NoBlocker both use a single workspace name.
-            Scenario::SameWorkspace(_) | Scenario::NoBlocker => {
+            // SameWorkspace and NoOccupant both use a single workspace name.
+            Scenario::SameWorkspace(_) | Scenario::NoOccupant => {
                 let name = format!("ws_{suffix}");
                 (name.clone(), name)
             }
@@ -1017,21 +1017,21 @@ async fn test_claim_ticket_in_workspace_if_pipeline_free() {
 
         let expected_claim = !matches!(case.scenario, Scenario::SameWorkspace(_));
 
-        let blocker_ws = test_ws_named(&format!("/{blocker_ws_name}"), &blocker_ws_name);
+        let occupied_ws = test_ws_named(&format!("/{occupied_ws_name}"), &occupied_ws_name);
         let claimable_ws = test_ws_named(&format!("/{claim_ws_name}"), &claim_ws_name);
 
-        // Create a pipeline blocker (if any)
+        // Create a pipeline occupant (if any)
         if let Scenario::SameWorkspace(phase) | Scenario::DifferentWorkspace(phase) = &case.scenario
         {
-            // When blocker and claimable share a workspace, place the
-            // blocker in the claimable's workspace (they are the same).
-            let blocker_target = match &case.scenario {
-                Scenario::DifferentWorkspace(_) => &blocker_ws,
+            // When the occupant and claimable share a workspace, place the
+            // occupant in the claimable's workspace (they are the same).
+            let occupant_target = match &case.scenario {
+                Scenario::DifferentWorkspace(_) => &occupied_ws,
                 Scenario::SameWorkspace(_) => &claimable_ws,
-                // Not reachable: NoBlocker is guarded by the enclosing if-let.
-                Scenario::NoBlocker => unreachable!(),
+                // Not reachable: NoOccupant is guarded by the enclosing if-let.
+                Scenario::NoOccupant => unreachable!(),
             };
-            make_ticket(&store, blocker_target, "Blocker", *phase).await;
+            make_ticket(&store, occupant_target, "Occupant", *phase).await;
         }
 
         // Create a claimable ticket
