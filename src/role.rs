@@ -12,19 +12,20 @@ use strum::IntoEnumIterator;
 use crate::Role;
 
 /// Role string for diagnostics comments — used both when posting diagnostics
-/// comments and in the circuit breaker filter. Must stay in sync between
-/// both sites to prevent silent miscounting on re-dispatch.
+/// comments and when filtering comments for failure counting. Must stay in sync
+/// between both sites to prevent silent miscounting on re-dispatch.
 pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 
 /// Role string for system comments — used when posting system comments on
-/// tickets (notifications, circuit breaker trip comments, agent summaries)
-/// and when filtering comments in circuit breaker [`CircuitBreakerKind::should_trip`]
-/// implementations. Must stay in sync between all sites to prevent silent miscounting.
+/// tickets (notifications, bounce breaker trip comments, agent summaries)
+/// and when filtering comments for failure counting. Must stay in sync between
+/// all sites to prevent silent miscounting.
 pub(crate) const SYSTEM_ROLE: &str = "system";
 
 /// Role string for sanitation comments — used both when posting sanitation
-/// failure marker comments and in the circuit breaker filter. Must stay in
-/// sync between both sites to prevent silent miscounting on re-dispatch.
+/// failure marker comments and when filtering comments for failure counting.
+/// Must stay in sync between both sites to prevent silent miscounting on
+/// re-dispatch.
 pub(crate) const SANITATION_ROLE: &str = "sanitation_admin";
 
 // ── RoleInfo ──────────────────────────────────────────────────────────────

@@ -1,201 +1,20 @@
 use super::*;
-use crate::prompt::{load_prompt, substitute};
+use crate::board::TicketComment;
+use crate::prompt::load_prompt;
 use crate::util::test::make_ticket;
 use crate::util::test::{
     JobRowBuilder, create_test_workspace, expect_ticket, expect_ticket_phase,
-    init_management_test_stores, init_test_stores,
+    init_management_test_stores,
 };
 use crate::workspace::test_ws_named;
 
-/// The bounce-based breaker allows exactly [`MAX_BOUNCES`] bounces — the 11th
-/// bounce fails the ticket. The comment-based breakers (Sanitation,
-/// Diagnostics) must trip before the bounce budget so repeated agent
-/// failures never ride on the bounce budget.
 #[test]
-fn bounce_breaker_max_is_ten_and_comment_breakers_trip_before() {
-    let bounce_max = crate::joint_verdict::MAX_BOUNCES;
-    assert_eq!(bounce_max, 10, "MAX_BOUNCES must be 10");
-    for kind in [
-        CircuitBreakerKind::Sanitation,
-        CircuitBreakerKind::Diagnostics,
-    ] {
-        assert!(
-            kind.max_count() < bounce_max,
-            "{kind:?}.max_count() ({}) must be less than the bounce budget ({bounce_max})",
-            kind.max_count(),
-        );
-    }
-}
-
-/// Verify the self-counting prevention invariant for non-terminal circuit
-/// breakers (Sanitation, Diagnostics).
-///
-/// When a circuit breaker trips, it writes a comment to the ticket. On
-/// re-evaluation, that trip comment must **not** be counted by the same
-/// breaker variant — otherwise the breaker would trip again on every
-/// subsequent poll cycle, creating an infinite loop.
-///
-/// ## How each variant prevents self-counting
-///
-/// | Variant | Role filter | Content filter |
-/// |---------|-------------|----------------|
-/// | **Sanitation** | `SYSTEM_ROLE` ≠ `SANITATION_ROLE` ✅ | content does **not** contain `sanitation_failed.md` ✅ |
-/// | **Diagnostics** | `SYSTEM_ROLE` ≠ `DIAGNOSTICS_ROLE` ✅ | content does **not** contain `diagnostics_failed.md` ✅ |
-///
-/// Both Sanitation and Diagnostics breakers now have role-based protection:
-/// trip comments (written with `SYSTEM_ROLE`) are structurally excluded from
-/// counting because the filter checks a different role. This is more robust
-/// than content-substring exclusion alone.
-///
-/// This test verifies both the content-substring exclusion (the 80% case) and
-/// — by feeding [`CircuitBreakerKind::should_trip`] with a [`TicketComment`]
-/// constructed from the actual trip message — that the full filtering logic
-/// would not count a trip comment (the 100% case).
-#[tokio::test]
-async fn circuit_breaker_self_counting_prevention() {
-    init_test_stores().await;
-
-    // ── Sanitation breaker: dual role + content exclusion ──
-    {
-        let msg = CircuitBreakerKind::Sanitation.trip_message(99, 3);
-
-        // Full should_trip verification: a comment with SYSTEM_ROLE (the role actually
-        // used by try_trip_circuit_breaker) and the trip message content should not be
-        // counted (role mismatch: SYSTEM_ROLE ≠ SANITATION_ROLE).
-        let trip_comment = TicketComment {
-            role: SYSTEM_ROLE.to_owned(),
-            content: msg,
-            created_at: String::new(),
-        };
-        assert!(
-            CircuitBreakerKind::Sanitation
-                .should_trip(&[trip_comment])
-                .is_none(),
-            "Sanitation breaker must NOT count its own trip comment \
-             (role mismatch: SYSTEM_ROLE != SANITATION_ROLE)",
-        );
-    }
-
-    // ── Diagnostics breaker: dual role + content exclusion ──
-    {
-        let msg = CircuitBreakerKind::Diagnostics.trip_message(99, 4);
-
-        // The trip message must NOT contain the diagnostics_failed.md marker string.
-        let failed_marker = load_prompt("pipeline/diagnostics_failed.md");
-        assert!(
-            !msg.contains(failed_marker.as_str()),
-            "Diagnostics trip message must not contain the diagnostics_failed.md marker string \
-             ({failed_marker:?}), otherwise self-counting would occur on re-evaluation. Trip message: {msg:?}",
-        );
-
-        // Full should_trip verification: a comment with SYSTEM_ROLE (the role actually
-        // used by try_trip_circuit_breaker) and the trip message content should not be
-        // counted (role mismatch: SYSTEM_ROLE ≠ DIAGNOSTICS_ROLE).
-        let trip_comment = TicketComment {
-            role: SYSTEM_ROLE.to_owned(),
-            content: msg,
-            created_at: String::new(),
-        };
-        assert!(
-            CircuitBreakerKind::Diagnostics
-                .should_trip(&[trip_comment])
-                .is_none(),
-            "Diagnostics breaker must NOT count its own trip comment \
-             (role mismatch: SYSTEM_ROLE != DIAGNOSTICS_ROLE)",
-        );
-    }
-}
-
-/// Verify that when the circuit breaker trips on a ticket, all other
-/// ReadyForDevelopment tickets in the same workspace are moved to Planning.
-/// Tickets in other workspaces must not be affected.
-#[tokio::test]
-async fn circuit_breaker_moves_other_ready_for_development_tickets_to_planning() {
-    init_management_test_stores().await;
-
-    let ws_a = test_ws_named("/ws_a", "ws_a");
-    let ws_b = test_ws_named("/ws_b", "ws_b");
-
-    // Create ticket A in workspace A — this will trip the circuit breaker.
-    let trip_id = make_ticket(
-        board(),
-        &ws_a,
-        "Trip Ticket",
-        TicketPhase::ReadyForDevelopment,
-    )
-    .await;
-
-    // Create ticket B in workspace A — this should be moved to Planning when A trips.
-    let victim_id = make_ticket(
-        board(),
-        &ws_a,
-        "Victim Ticket",
-        TicketPhase::ReadyForDevelopment,
-    )
-    .await;
-
-    // Create ticket C in workspace B — this must NOT be moved.
-    let other_ws_id = make_ticket(
-        board(),
-        &ws_b,
-        "Other Workspace Ticket",
-        TicketPhase::ReadyForDevelopment,
-    )
-    .await;
-
-    // Trip ticket A's circuit breaker: 4 cumulative sanitation failures
-    // (max 3) — the drain behavior is breaker-agnostic, and the bounce
-    // breaker has no pre-flight arm (it is enforced mid-round).
-    for _ in 0..4 {
-        add_breaker_failure(CircuitBreakerKind::Sanitation, &trip_id).await;
-    }
-
-    // Fetch ticket A and trip the circuit breaker.
-    let ticket_a = expect_ticket(board(), &trip_id).await;
-
-    let tripped = try_trip_circuit_breaker(
-        &ticket_a,
-        TicketPhase::ReadyForDevelopment,
-        Some(CircuitBreakerKind::Sanitation),
-        "test",
-    )
-    .await;
-
-    assert!(tripped, "circuit breaker should have tripped");
-
-    // After the breaker trips, drain siblings so the Manager can triage
-    // without new tickets auto-starting.
-    drain_ready_for_development_siblings(&ticket_a).await;
-
-    // ── Verify ticket A is Failed ──
-    {
-        let ticket_a = expect_ticket(board(), &trip_id).await;
-        assert_eq!(
-            ticket_a.phase,
-            TicketPhase::Failed,
-            "tripped ticket A should be Failed"
-        );
-    }
-
-    // ── Verify ticket B (same workspace) is Planning ──
-    {
-        let ticket_b = expect_ticket(board(), &victim_id).await;
-        assert_eq!(
-            ticket_b.phase,
-            TicketPhase::Planning,
-            "other ReadyForDevelopment ticket B in same workspace should be Planning"
-        );
-    }
-
-    // ── Verify ticket C (different workspace) is still ReadyForDevelopment ──
-    {
-        let ticket_c = expect_ticket(board(), &other_ws_id).await;
-        assert_eq!(
-            ticket_c.phase,
-            TicketPhase::ReadyForDevelopment,
-            "ticket C in different workspace must not be moved"
-        );
-    }
+fn bounce_breaker_max_is_ten() {
+    assert_eq!(
+        crate::joint_verdict::MAX_BOUNCES,
+        10,
+        "MAX_BOUNCES must be 10"
+    );
 }
 
 // ── transition_ticket_to_done — conditional notification ─────────
@@ -308,142 +127,6 @@ async fn transition_ticket_to_done_buffer_and_notify() {
     );
 }
 
-// ── try_trip_circuit_breaker — failure counting ──────────────────
-
-/// Verify that circuit breaker counting logic works correctly for each
-/// breaker variant.
-///
-/// For each variant:
-/// - Adds `max_count` failures — verifies the breaker does NOT trip and phase
-///   remains unchanged
-/// - Adds one more failure — verifies the breaker trips, transitions to Failed,
-///   and writes a trip comment with the "Circuit breaker" marker as a
-///   [`SYSTEM_ROLE`] comment.
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the fixture phases).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-async fn breaker_counts_failures() {
-    struct BreakerCase {
-        name: &'static str,
-        kind: CircuitBreakerKind,
-        source_phase: TicketPhase,
-        log_label: &'static str,
-        ws_suffix: &'static str,
-    }
-
-    init_management_test_stores().await;
-
-    let cases = [
-        BreakerCase {
-            name: "Sanitation",
-            kind: CircuitBreakerKind::Sanitation,
-            source_phase: TicketPhase::InSanitation,
-            log_label: "Sanitation",
-            ws_suffix: "san_breaker_test",
-        },
-        BreakerCase {
-            name: "Diagnostics",
-            kind: CircuitBreakerKind::Diagnostics,
-            source_phase: TicketPhase::InDiagnostics,
-            log_label: "Diagnostics",
-            ws_suffix: "diag_breaker_test",
-        },
-    ];
-
-    for case in &cases {
-        let max_count = case.kind.max_count();
-        let below_max = max_count; // Won't trip (count == max_count is still ≤ max_count)
-        let trip_at = max_count + 1; // Will trip (count > max_count)
-
-        let ticket_id = make_ticket(
-            board(),
-            &test_ws_named("/tmp/test", case.ws_suffix),
-            &format!("{} Breaker Test", case.log_label),
-            case.source_phase,
-        )
-        .await;
-
-        // Add max-count failures — should NOT trip.
-        for _ in 0..below_max {
-            add_breaker_failure(case.kind, &ticket_id).await;
-        }
-
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        assert!(
-            !try_trip_circuit_breaker(&ticket, case.source_phase, Some(case.kind), case.log_label,)
-                .await,
-            "case {}: should NOT trip with {} failures (max: {})",
-            case.name,
-            below_max,
-            case.kind.max_count(),
-        );
-
-        // Verify phase is unchanged after non-trip.
-        let phase = expect_ticket_phase(board(), &ticket_id).await;
-        assert_eq!(
-            phase,
-            case.source_phase,
-            "case {}: phase should remain {} after {} non-tripping failures (max: {})",
-            case.name,
-            case.source_phase,
-            below_max,
-            case.kind.max_count(),
-        );
-
-        // Add one more failure to reach the trip count.
-        // Breaker trips when count > max_count.
-        for _ in below_max..trip_at {
-            add_breaker_failure(case.kind, &ticket_id).await;
-        }
-
-        // Re-fetch ticket (try_trip_circuit_breaker uses cached comments
-        // when available — expect_ticket uses LoadComments::Yes, so the
-        // cached path is exercised here).
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        let tripped =
-            try_trip_circuit_breaker(&ticket, case.source_phase, Some(case.kind), case.log_label)
-                .await;
-        assert!(
-            tripped,
-            "case {}: should trip with {} failures (max: {}, {} > {})",
-            case.name,
-            trip_at,
-            case.kind.max_count(),
-            trip_at,
-            case.kind.max_count(),
-        );
-
-        // Verify the ticket is now Failed
-        let phase = expect_ticket_phase(board(), &ticket_id).await;
-        assert_eq!(
-            phase,
-            TicketPhase::Failed,
-            "case {}: circuit breaker should transition to Failed",
-            case.name,
-        );
-
-        // Verify the trip comment was written correctly:
-        // must be a SYSTEM_ROLE comment containing "circuit breaker"
-        let comments = board()
-            .get_comments(&ticket_id)
-            .await
-            .expect("get_comments");
-        let has_breaker_comment = comments
-            .iter()
-            .any(|c| c.role == SYSTEM_ROLE && c.content.to_lowercase().contains("circuit breaker"));
-        assert!(
-            has_breaker_comment,
-            "case {}: should have a SYSTEM_ROLE comment with the circuit breaker message \
-             (containing 'circuit breaker')",
-            case.name,
-        );
-    }
-}
-
 // ── Setup helpers ──────────────────────────────────────────────────────
 
 /// Shared helper: create a passing verdict (score >= REVIEW_QA_THRESHOLD).
@@ -465,39 +148,6 @@ fn fail_verdict() -> crate::Verdict {
 /// Helper: a `ParallelVerdict` with no response.
 fn no_verdict() -> ParallelVerdict {
     ParallelVerdict::NoResponse("agent produced no response".into())
-}
-
-/// Add a failure comment for circuit breaker testing, matching the
-/// comment format used for the given breaker variant.
-///
-/// For [`CircuitBreakerKind::Sanitation`], adds a [`SANITATION_ROLE`] comment
-/// composed from `sanitation_circuit_breaker_comment.md` using `sanitation_failed.md`.
-/// For [`CircuitBreakerKind::Diagnostics`], adds a [`DIAGNOSTICS_ROLE`] comment with
-/// `diagnostics_failed.md` and `{{failed_at}}` = `"test_step"`.
-async fn add_breaker_failure(kind: CircuitBreakerKind, ticket_id: &str) {
-    let (role, comment) = match kind {
-        CircuitBreakerKind::Sanitation => (
-            SANITATION_ROLE,
-            substitute(
-                &load_prompt("pipeline/sanitation_circuit_breaker_comment.md"),
-                &[
-                    (
-                        "{{sanitation_failed_marker}}",
-                        load_prompt("pipeline/sanitation_failed.md").as_str(),
-                    ),
-                    ("{{count}}", "1"),
-                ],
-            ),
-        ),
-        CircuitBreakerKind::Diagnostics => (
-            DIAGNOSTICS_ROLE,
-            format!(
-                "---\n{} test_step",
-                load_prompt("pipeline/diagnostics_failed.md")
-            ),
-        ),
-    };
-    let _ = board().add_comment(ticket_id, role, &comment).await;
 }
 
 /// Helper: wrap a passing verdict (reviewer/QA flow).
@@ -772,62 +422,6 @@ async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
             .iter()
             .any(|c| c.role == stage_name(REVIEWER_VI.role)),
         "a skipped round must not write a joint comment"
-    );
-}
-
-/// A circuit breaker whose ticket was moved externally while the stage
-/// finished is a silent no-op at the transition site too: the CAS guard miss
-/// must NOT surface as a "may loop indefinitely" failure (that error fires
-/// only on genuine write failures) and must NOT clobber the external mover's
-/// assignment. The breaker still reports tripped so the caller aborts
-/// dispatch.
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
-async fn circuit_breaker_on_moved_ticket_is_silent_noop() {
-    init_management_test_stores().await;
-    let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
-
-    let ws = test_ws_named("/tmp/test", "cb_moved");
-    let ticket_id = make_ticket(board(), &ws, "CB Moved", TicketPhase::InSanitation).await;
-    for _ in 0..4 {
-        add_breaker_failure(CircuitBreakerKind::Sanitation, &ticket_id).await;
-    }
-
-    // The Manager moves the ticket externally while the sanitation stage
-    // finishes; the mover's claim must survive the breaker's Failed attempt.
-    board()
-        .transition_to(&ticket_id, None, TicketPhase::Planning, None)
-        .await
-        .expect("external move to Planning");
-    board()
-        .set_assigned_to_no_cancel(&ticket_id, Some("external-mover"))
-        .await
-        .expect("external mover claims the ticket");
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert!(
-        try_trip_circuit_breaker(
-            &ticket,
-            TicketPhase::InSanitation,
-            Some(CircuitBreakerKind::Sanitation),
-            "Sanitation",
-        )
-        .await,
-        "breaker still reports tripped — the caller must abort dispatch"
-    );
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        ticket.phase,
-        TicketPhase::Planning,
-        "the moved ticket must be left untouched (no Failed transition)"
-    );
-    assert_eq!(
-        ticket.assigned_to.as_deref(),
-        Some("external-mover"),
-        "guard miss must not clear the external mover's assignment"
     );
 }
 
@@ -1429,9 +1023,7 @@ async fn eleventh_bounce_fails_ticket() {
 
 /// Regression guard for the auto-pause trigger boundaries:
 ///
-/// - A technical failure (all verifier agents failing) pauses the workspace.
-/// - A circuit-breaker trip does NOT pause (it keeps its drain-to-Planning
-///   handling) — the pause must be site-gated, not a generic Failed hook.
+/// A technical failure (all verifier agents failing) pauses the workspace.
 ///
 /// Serialized with the reset_inflight_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases). Also serialized
@@ -1442,44 +1034,10 @@ async fn eleventh_bounce_fails_ticket() {
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-async fn technical_failure_pauses_workspace_but_circuit_breaker_does_not() {
+async fn technical_failure_pauses_workspace() {
     let _lock = crate::util::test::retry_tests_lock();
     init_management_test_stores().await;
 
-    // ── Circuit-breaker trip must NOT pause the workspace ──────────────
-    let ws_breaker = create_test_workspace("/tmp/pause_breaker_ws", "ws_pause_breaker").await;
-    let breaker_id = make_ticket(
-        board(),
-        &ws_breaker,
-        "Breaker Trip",
-        TicketPhase::InSanitation,
-    )
-    .await;
-    for _ in 0..4 {
-        add_breaker_failure(CircuitBreakerKind::Sanitation, &breaker_id).await;
-    }
-    let ticket = expect_ticket(board(), &breaker_id).await;
-    assert!(
-        try_trip_circuit_breaker(
-            &ticket,
-            TicketPhase::InSanitation,
-            Some(CircuitBreakerKind::Sanitation),
-            "Sanitation",
-        )
-        .await,
-        "breaker should trip"
-    );
-    let ws = crate::workspace::store()
-        .get_by_name("ws_pause_breaker")
-        .await
-        .expect("get workspace")
-        .expect("workspace exists");
-    assert!(
-        !ws.paused,
-        "circuit-breaker trip must NOT pause the workspace"
-    );
-
-    // ── Verifier all-failed must pause the workspace ───────────────────
     let ws_verifier = create_test_workspace("/tmp/pause_verifier_ws", "ws_pause_verifier").await;
     let verifier_id = make_ticket(
         board(),
@@ -2114,7 +1672,7 @@ async fn process_sanitation_verdict_cases() {
     /// All scenarios of [`process_sanitation_verdict`]. The two comment-marker
     /// fields use different types: [`Case::sanit_markers`] is `&[&str]`
     /// because a Sanitation role comment is *always* created; [`Case::sys_markers`]
-    /// is `Option<Vec<&'static str>>` because a [`SANITATION_ROLE`] circuit-breaker
+    /// is `Option<Vec<&'static str>>` because a [`SANITATION_ROLE`] failure-marker
     /// comment is *conditional* (only appears on `pass=false`) and its marker value
     /// is loaded from a prompt file at runtime.
     struct Case {

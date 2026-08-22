@@ -31,7 +31,7 @@ use futures_util::FutureExt;
 use futures_util::future::join_all;
 
 use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
-use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketComment, TicketPhase};
+use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketPhase};
 use crate::git_commands::{
     has_unstaged_changes, list_new_or_untracked_files, parse_new_files_from_porcelain,
     run_git_add_all, run_git_diff_stats, run_git_head, run_git_status, run_git_write_tree,
@@ -95,80 +95,6 @@ async fn clear_assigned_to_no_cancel(ticket_id: &str, context: &str) {
             "Failed to clear assigned_to: {context}",
         );
     }
-}
-
-// ── Circuit breaker kind ──────────────────────────────────────────────────────
-
-/// Identifies which circuit breaker variant to use for phase-guard checks
-/// and trip logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CircuitBreakerKind {
-    /// Sanitation-failure breaker: trips when cumulative sanitation failures
-    /// exceed 3.
-    Sanitation,
-    /// Diagnostics-failure breaker: trips when cumulative diagnostics failures
-    /// exceed 4.
-    Diagnostics,
-}
-
-impl CircuitBreakerKind {
-    /// Returns the maximum tolerated failure count for this breaker variant.
-    /// The breaker trips when [`should_trip`](CircuitBreakerKind::should_trip) returns
-    /// `Some` (the count exceeds this maximum).
-    const fn max_count(self) -> usize {
-        match self {
-            Self::Sanitation => 3,
-            Self::Diagnostics => 4,
-        }
-    }
-
-    /// Determine whether this breaker variant should trip.
-    ///
-    /// Counts failures matching this variant's criteria. If the count exceeds
-    /// the variant's `max_count`, returns `Some((count, max_count))`. Returns
-    /// `None` if the breaker should not trip (count ≤ max_count).
-    fn should_trip(self, comments: &[TicketComment]) -> Option<(usize, usize)> {
-        let max_count = self.max_count();
-        let count = match self {
-            Self::Sanitation => count_matching_comments(
-                comments,
-                SANITATION_ROLE,
-                &load_prompt("pipeline/sanitation_failed.md"),
-            ),
-            Self::Diagnostics => count_matching_comments(
-                comments,
-                DIAGNOSTICS_ROLE,
-                &load_prompt("pipeline/diagnostics_failed.md"),
-            ),
-        };
-
-        if count <= max_count {
-            None
-        } else {
-            Some((count, max_count))
-        }
-    }
-
-    /// Format the trip message for this breaker variant.
-    fn trip_message(self, count: usize, max_count: usize) -> String {
-        match self {
-            Self::Sanitation => format!(
-                "❌ Sanitation circuit breaker tripped after {count} cumulative failures. \
-                 (max: {max_count})",
-            ),
-            Self::Diagnostics => {
-                format!("❌ Circuit breaker: {count} prior diagnostic failures. Failing ticket.")
-            }
-        }
-    }
-}
-
-/// Count ticket comments matching a specific role and marker substring.
-fn count_matching_comments(comments: &[TicketComment], role: &str, marker: &str) -> usize {
-    comments
-        .iter()
-        .filter(|c| c.role == role && c.content.contains(marker))
-        .count()
 }
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
@@ -266,10 +192,10 @@ struct TransitionCtx<'t, 'l> {
     target: TicketPhase,
     notify: NotifyPolicy,
     log_label: &'l str,
-    /// True when this Failed transition was a circuit-breaker drain — the
+    /// True when this Failed transition was a bounce-breaker drain — the
     /// failure notification then describes the drain instead of the
     /// auto-pause. Read only on Failed transitions; the readers are the
-    /// circuit-breaker trip (`true`) and the technical-failure sites —
+    /// bounce breaker trip (`true`) and the technical-failure sites —
     /// dispatch panic, engineer failure, verifier all-failed (`false`).
     /// Every Failed site must set it explicitly so the notification renders
     /// the sentence matching the mechanism that ran.
@@ -547,20 +473,21 @@ fn paused_workspace_sentence() -> &'static str {
 ///
 /// # Circuit-breaker exclusion
 ///
-/// This is intentionally NOT called from [`try_trip_circuit_breaker`] — the
-/// comment-based breaker trips keep their existing drain-to-Planning handling
-/// and must not pause. The engineer hard-failure bounce trip is the one
-/// exception: it pauses at the engineer failure site, before
-/// the Failed transition, because the budget-exhausting failure is a
-/// technical failure like any other engineer failure. Callers are the
+/// Bounce breaker trips keep their drain-to-Planning handling and must not
+/// pause. The engineer hard-failure bounce trip is the one exception: it
+/// pauses at the engineer failure site, before the Failed transition, because
+/// the budget-exhausting failure is a technical failure like any other engineer
+/// failure. Sanitation/diagnostics failures now retry indefinitely without
+/// tripping, so they never reach this helper and never pause. Callers are the
 /// technical-failure sites: dispatch panic, engineer agent failure (including
 /// its bounce-budget trip), all verifier agents failing, and the GUI cancel
 /// of an in-flight agent run.
 ///
 /// # Scope
 ///
-/// Sanitation/diagnostics agent failures never reach this helper: they retry,
-/// then trip their circuit breaker (which must not pause). Analyst failures
+/// Sanitation/diagnostics agent failures never reach this helper: they record a
+/// failure marker via `record_sanitation_failure`/diagnostics path and clear
+/// `assigned_to` for indefinite retry. Analyst failures
 /// never fail the ticket (analysts always advance to Planning), and mixed
 /// verifier rounds (some failures + a sub-threshold verdict) bounce to
 /// ReadyForDevelopment without pausing. Analyze-tool sub-agent failures (parallel
@@ -612,7 +539,7 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
 
 /// Fetch the last ticket comment (any role) as the failure details for a
 /// Manager notification. The transition closure writes the failure comment
-/// LAST (after any circuit-breaker trip comment), so it is the last comment
+/// LAST (after any bounce-breaker trip comment), so it is the last comment
 /// and carries the concrete error. Falls back to a generic message when no
 /// comment exists or the read fails.
 async fn last_comment_as_failure_details(ticket_id: &str) -> String {
@@ -717,12 +644,12 @@ async fn notify_ticket(
         source == TicketPhase::InDevelopment && target_phase == TicketPhase::ReadyForDevelopment;
     if target_phase == TicketPhase::Failed || engineer_bounce {
         // The transition closure wrote the failure comment LAST (after any
-        // circuit-breaker trip comment), so the last comment carries the
+        // bounce-breaker trip comment), so the last comment carries the
         // concrete error.
         let failure_details = last_comment_as_failure_details(&ticket.id).await;
 
         // The workspace_status sentence is chosen from the failure MECHANISM,
-        // not from `ws.paused` alone: a circuit-breaker drain moved tickets
+        // not from `ws.paused` alone: a bounce-breaker drain moved tickets
         // back to Planning (regardless of pause state), while a technical
         // failure auto-pauses when `ws.paused` is set. When a technical
         // failure could not pause (set_paused error), neither claim is made.
@@ -961,10 +888,11 @@ pub async fn run_management() {
 /// This is a plain `fn` (not `async`) because both `info!()` and
 /// `tokio::spawn()` are synchronous operations — no `.await` needed.
 ///
-/// When the circuit breaker trips for a ticket, all sibling
-/// [`TicketPhase::ReadyForDevelopment`] tickets in the same workspace are
-/// drained to [`TicketPhase::Planning`] so the Manager can triage the failure
-/// without new tickets auto-starting.
+/// When the bounce breaker trips (enforced in
+/// [`process_verifier_verdicts`]/[`bounce_engineer_hard_failure`]) siblings are
+/// drained: all other [`TicketPhase::ReadyForDevelopment`] tickets in the same
+/// workspace are moved to [`TicketPhase::Planning`] so the Manager can triage
+/// the failure without new tickets auto-starting.
 ///
 /// # Panic safety
 ///
@@ -975,8 +903,6 @@ pub async fn run_management() {
 fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     let phase_info = phase.info();
     let expected_phase = phase_info.expected_phase;
-    let kind = phase_info.circuit_breaker_kind;
-    let log_label = phase_info.log_label;
 
     info!(
         ticket = %ticket.id,
@@ -999,38 +925,14 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // ── Pre-flight guard checks ──
         //
         // Adding a new PollPhase variant requires adding a row in
-        // PollPhase::info() which now also carries the circuit_breaker_kind
-        // and log_label fields (enforced by the single match in info()).
-        // The bounce breaker is not pre-flight (it is enforced at the bounce
-        // sites: review/QA in process_verifier_verdicts and engineer hard
-        // failures in bounce_engineer_hard_failure) — phases without a
-        // pre-flight breaker pass `None` and try_trip_circuit_breaker returns
-        // false immediately.
+        // PollPhase::info() which carries the log_label field (enforced by the
+        // single match in info()). The bounce breaker is enforced at the bounce
+        // sites (review/QA in process_verifier_verdicts and engineer hard
+        // failures in bounce_engineer_hard_failure), not pre-flight.
         //
         // The post-agent phase_changed_and_clear_assignment check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
         if !is_ticket_in_phase(&ticket.id, expected_phase).await {
-            return;
-        }
-        if try_trip_circuit_breaker(&ticket, expected_phase, kind, log_label).await {
-            // Circuit breaker tripped — unconditionally drain the development
-            // pipeline regardless of which pre-flight breaker type fired
-            // (Sanitation or Diagnostics; the bounce breaker has no pre-flight
-            // arm and is enforced at its bounce sites instead). This is a
-            // deliberate invariant:
-            //
-            //   Any breaker trip signals a potentially dirty workspace. If the
-            //   drain were narrowed to only some breaker types, the Engineer
-            //   could pick up an unrelated ReadyForDevelopment ticket while the
-            //   workspace still has unfinished changes from the failed ticket —
-            //   leading to cascading failures, wasted API credits, and confused
-            //   agents.
-            //
-            //   Draining ALL ReadyForDevelopment tickets forces the Manager to
-            //   triage the failed ticket first, inspect workspace state, deal
-            //   with any uncommitted changes, and ensure the tree is clean
-            //   before unrelated work safely resumes.
-            drain_ready_for_development_siblings(&ticket).await;
             return;
         }
 
@@ -1102,7 +1004,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
 #[derive(Copy, Clone)]
 struct VerifierInfo {
     role: Role,
-    /// Human-readable label used in logs and circuit-breaker messages.
+    /// Human-readable label used in logs and bounce-breaker messages.
     ///
     /// Conventions:
     /// - Prefer Title Case: `"Sanitation"`, `"Diagnostics"`, `"Engineer"`
@@ -1147,8 +1049,8 @@ const QA_VI: VerifierInfo = VerifierInfo {
 
 /// Static metadata for a single poll phase.
 ///
-/// All phase-specific data lives here — including the circuit-breaker kind and
-/// log label — sourced from the single [`PollPhase::info()`] match. Adding any
+/// All phase-specific data lives here — including pipeline_check, claim_grace,
+/// and log label — sourced from the single [`PollPhase::info()`] match. Adding any
 /// phase requires one row in that match.
 #[derive(Copy, Clone)]
 struct PollPhaseInfo {
@@ -1157,29 +1059,22 @@ struct PollPhaseInfo {
     /// blocks claims when another pipeline ticket is active in the workspace;
     /// [`Skip`](PipelineCheck::Skip) allows concurrent claims.
     pipeline_check: PipelineCheck,
-    /// Which circuit breaker variant to use for phase-guard checks.
-    /// `None` for phases without a pre-flight breaker — the bounce breaker
-    /// has no pre-flight arm (it is enforced at the bounce sites:
-    /// review/QA in `process_verifier_verdicts`, engineer hard failures in
-    /// `bounce_engineer_hard_failure`).
-    circuit_breaker_kind: Option<CircuitBreakerKind>,
     /// Fresh-ticket grace for claims: when `Some`, tickets created within
     /// this window are not claimed (only the BacklogAnalysis phase sets it —
     /// see [`BoardStore::BACKLOG_CLAIM_GRACE`]).
     claim_grace: Option<ChronoDuration>,
-    /// Human-readable label used in logs and circuit-breaker messages.
+    /// Human-readable label used in logs and bounce-breaker messages.
     /// PascalCase for roles ("Engineer", "Analyst"), "QA" for the QA verifier.
     log_label: &'static str,
 }
 
 impl PollPhaseInfo {
     /// Create a new [`PollPhaseInfo`] with standard defaults:
-    /// [`PipelineCheck::Skip`] and no pre-flight circuit breaker (`None`).
+    /// [`PipelineCheck::Skip`] and no extra configuration.
     const fn new(expected_phase: TicketPhase, log_label: &'static str) -> Self {
         Self {
             expected_phase,
             pipeline_check: PipelineCheck::Skip,
-            circuit_breaker_kind: None,
             claim_grace: None,
             log_label,
         }
@@ -1220,13 +1115,9 @@ impl PollPhase {
                 // SanitationCheck is excluded from CLAIM_PHASES since the
                 // actual QaPassed→InSanitation transition happens via
                 // claim_sanitation in handle_qa_passed.
-                circuit_breaker_kind: Some(CircuitBreakerKind::Sanitation),
                 ..PollPhaseInfo::new(TicketPhase::InSanitation, "Sanitation")
             },
-            Self::DiagnosticsCheck => PollPhaseInfo {
-                circuit_breaker_kind: Some(CircuitBreakerKind::Diagnostics),
-                ..PollPhaseInfo::new(TicketPhase::InDiagnostics, "Diagnostics")
-            },
+            Self::DiagnosticsCheck => PollPhaseInfo::new(TicketPhase::InDiagnostics, "Diagnostics"),
             Self::VerifierCheck(vi) => PollPhaseInfo::new(vi.active_phase, vi.log_label),
         }
     }
@@ -1889,7 +1780,7 @@ async fn finalize_engineer_round(
 /// - **Hard failure** ("Agent failed") → the workspace pauses and the ticket
 ///   bounces back to ReadyForDevelopment for an automatic retry, consuming
 ///   the same bounce budget as review/QA bounces. When the budget is
-///   exhausted the ticket moves to Failed via the circuit breaker — still
+///   exhausted the ticket moves to Failed via the bounce breaker — still
 ///   with the workspace paused and WITHOUT draining ReadyForDevelopment
 ///   siblings. The concrete error is recorded as a `SYSTEM_ROLE`
 ///   comment so it survives into the retry's rework feedback (dispatch_engineer
@@ -1978,7 +1869,7 @@ async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) 
 /// Bounce a hard-failed engineer ticket back to ReadyForDevelopment for an
 /// automatic retry, sharing the review/QA bounce budget. The counter is
 /// bumped atomically with the transition (drift-free invariant). When the
-/// budget is exhausted the ticket fails via the circuit breaker — workspace
+/// budget is exhausted the ticket fails via the bounce breaker — workspace
 /// still paused, ReadyForDevelopment siblings NOT drained (unlike the
 /// verifier trip). The concrete-error comment is written LAST so the Manager
 /// notification surfaces it (`notify_ticket` renders the last comment as the
@@ -1992,7 +1883,7 @@ async fn bounce_engineer_hard_failure(ticket: &Ticket, comment_text: &str, resum
         TicketPhase::ReadyForDevelopment
     };
 
-    // Not a circuit-breaker drain: siblings are NOT moved to Planning, so the Failed notification must render the paused-workspace sentence, not the drain sentence.
+    // Not a bounce-breaker drain: siblings are NOT moved to Planning, so the Failed notification must render the paused-workspace sentence, not the drain sentence.
     let outcome = with_comment_and_transition(
         TransitionCtx::notifying(ticket, TicketPhase::InDevelopment, target, "Engineer"),
         async |tx| {
@@ -2493,8 +2384,8 @@ async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
     }
 }
 
-/// Record a sanitation failure: add a [`SANITATION_ROLE`] comment for the circuit breaker
-/// and clear assigned_to so the ticket can be re-dispatched.
+/// Record a sanitation failure: add a [`SANITATION_ROLE`] comment as a failure
+/// marker and clear assigned_to so the ticket can be re-dispatched.
 ///
 /// `raw_dump`: when the failure is a verdict
 /// extraction failure, the last-attempt raw response is dumped into the
@@ -2530,7 +2421,7 @@ async fn record_sanitation_failure(
         warn!(
             ticket = %ticket_id,
             error = %e,
-            "Failed to record sanitation failure (circuit-breaker comment + assigned_to clear)",
+            "Failed to record sanitation failure (failure marker comment + assigned_to clear)",
         );
     }
 }
@@ -2601,9 +2492,9 @@ async fn finalize_sanitation_round(
     let resumed_suffix = if resumed { " (resumed)" } else { "" };
     if response.is_none() {
         // Agent failed or was cancelled — record failure and clear assigned_to
-        // for re-dispatch retry. The marker comment lets the sanitation circuit
-        // breaker detect repeated failures. (Past the guard above, response
-        // None here is a real failure.)
+        // for re-dispatch retry. The marker comment records the failure for
+        // triage; sanitation retries indefinitely without a circuit breaker.
+        // (Past the guard above, response None here is a real failure.)
         warn!(
             ticket = %ticket.id,
             "Sanitation agent returned no output{resumed_suffix} — clearing assigned_to for retry"
@@ -2769,6 +2660,9 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             ],
         );
         // Pre-build the system comment so we can pass it into the transaction.
+        // Template filename is legacy (`sanitation_circuit_breaker_comment.md`);
+        // now just a failure-marker comment — sanitation retries indefinitely
+        // without a breaker, the marker is for triage only.
         let count_str = verdict.garbage_files.len().to_string();
         let sys_comment = substitute(
             &load_prompt("pipeline/sanitation_circuit_breaker_comment.md"),
@@ -2909,8 +2803,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// Run diagnostics commands after the engineer completes development.
 ///
 /// Called by [`PollPhase::DiagnosticsCheck`] via [`spawn_dispatch`].
-/// The circuit-breaker guard is handled centrally there, consistent with all
-/// other dispatchers. Uses [`BoardStore::claim_diagnostics`] to set
+/// Uses [`BoardStore::claim_diagnostics`] to set
 /// `assigned_to` and prevent
 /// double-dispatch. Unlike the pipeline-phase dispatchers (which are dispatched
 /// from the atomic claim loop and already own the ticket by the time their
@@ -2921,9 +2814,6 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// After execution, transitions the ticket to either `DiagnosticsDone` (all
 /// passed) or `ReadyForDevelopment` (any failure).
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
-    // Circuit breaker check happens in spawn_dispatch before entering this
-    // function — consistent with all other dispatchers.
-
     match board()
         .claim_diagnostics(&ticket.id, DIAGNOSTICS_ROLE)
         .await
@@ -3851,7 +3741,8 @@ async fn maybe_escalate_analysis(
 /// - Planning (notify) when any analyst fails, with the joint comment giving
 ///   the Manager the depth (analysis is fail-open)
 ///
-/// The circuit-breaker guard is handled centrally by [`spawn_dispatch`].
+/// No pre-flight circuit breaker is checked in [`spawn_dispatch`] for this
+/// phase — bounce logic is verifier-only; analysis always advances to Planning.
 ///
 /// ## Note: no `clear_assigned_to_no_cancel` on post-run phase check
 ///
@@ -4132,9 +4023,9 @@ fn format_analyst_summary(
     format!("{total} analysts reviewed this ticket. {description}.")
 }
 
-// ── Shared Circuit Breaker ──────────────────────────────
+// ── Bounce breaker sibling drain ──────────────────────────────
 
-/// After a ticket fails via circuit breaker, move all other ReadyForDevelopment
+/// After a ticket fails via bounce breaker, move all other ReadyForDevelopment
 /// tickets in the same workspace to Planning so the Manager can triage the
 /// failure without new tickets auto-starting.
 ///
@@ -4142,16 +4033,12 @@ fn format_analyst_summary(
 /// Manager intervention to advance. This prevents new tickets from silently
 /// proceeding while existing failures are investigated.
 ///
-/// # Critical invariant: all breaker types trigger the drain
+/// # Critical invariant: only the bounce breaker triggers the drain
 ///
-/// This function is called unconditionally after **any** circuit breaker trip
-/// that reaches the pre-flight breaker path (Sanitation, Diagnostics) or the
-/// review/QA bounce trip (the mid-round bounce breaker). This is intentional and
-/// conservative: any breaker trip signals that the workspace may be in a dirty
-/// or contaminated state. If the drain were narrowed to only some breaker
-/// types, an unrelated `ReadyForDevelopment` ticket could auto-start while the
-/// workspace still has unfinished changes from the failed ticket — leading to
-/// cascading failures, wasted API credits, and confused agents.
+/// This function is called after the bounce breaker trip (the mid-round bounce
+/// breaker in review/QA). Only the bounce breaker triggers the drain;
+/// Sanitation/Diagnostics failures now retry indefinitely without draining
+/// (approved behavior change).
 ///
 /// The engineer hard-failure bounce trip is the deliberate exception: it does
 /// NOT call this function — it pauses the workspace instead, which blocks new
@@ -4168,15 +4055,15 @@ fn format_analyst_summary(
 /// guarantee workspace cleanliness before starting new development work.
 ///
 /// Does not push individual buffer entries for the moved tickets; the user is
-/// already notified about the primary ticket's circuit breaker failure, so
+/// already notified about the primary ticket's bounce breaker failure, so
 /// per-sibling notifications are noise.
 ///
 /// # Precondition
-/// The circuit breaker must have tripped for `ticket` (i.e.,
-/// [`try_trip_circuit_breaker`] returned `true` and the transition to
-/// `Failed` has been attempted). The drain operates on the workspace
-/// identified by `ticket.workspace_name` and is safe to call even if the
-/// transition failed — the important invariant is that a breaker tripped,
+/// The bounce breaker must have tripped for `ticket` (i.e.,
+/// `process_verifier_verdicts` or `bounce_engineer_hard_failure` tripped and
+/// the transition to `Failed` has been attempted). The drain operates on the
+/// workspace identified by `ticket.workspace_name` and is safe to call even if
+/// the transition failed — the important invariant is that a breaker tripped,
 /// so the pipeline should pause.
 async fn drain_ready_for_development_siblings(ticket: &Ticket) {
     match board()
@@ -4187,13 +4074,13 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
             info!(
                 tickets = updated,
                 workspace = %ticket.workspace_name,
-                "Moved {updated} ReadyForDevelopment ticket(s) to Planning after circuit breaker trip",
+                "Moved {updated} ReadyForDevelopment ticket(s) to Planning after bounce breaker trip",
             );
         }
         Ok(_) => {
             debug!(
                 workspace = %ticket.workspace_name,
-                "No ReadyForDevelopment siblings to drain after circuit breaker trip",
+                "No ReadyForDevelopment siblings to drain after bounce breaker trip",
             );
         }
         Err(e) => {
@@ -4206,118 +4093,6 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
             );
         }
     }
-}
-
-/// Shared circuit breaker skeleton: obtain comments, evaluate via
-/// [`CircuitBreakerKind::should_trip`], format the trip message via
-/// [`CircuitBreakerKind::trip_message`], add a system comment, then
-/// transition to [`TicketPhase::Failed`].
-///
-/// The two comment-based breakers (Sanitation, Diagnostics) delegate to this
-/// helper, supplying their variant logic via the [`CircuitBreakerKind`] enum.
-/// This eliminates ~80% structural duplication while preserving exact
-/// behavioral semantics. Phases without a pre-flight breaker pass `None` and
-/// this returns `false` immediately — the bounce breaker is not pre-flight:
-/// it is enforced at the bounce sites, which fail the ticket atomically with
-/// the bounce-back when the counter is at
-/// [`MAX_BOUNCES`](crate::joint_verdict::MAX_BOUNCES): review/QA bounces in
-/// [`process_verifier_verdicts`] and engineer hard-failure bounces in
-/// [`bounce_engineer_hard_failure`].
-///
-/// The Manager is notified when the ticket transitions to [`TicketPhase::Failed`].
-///
-/// # Self-counting prevention
-///
-/// Each breaker variant naturally excludes its own trip comment from counting:
-///
-/// * **Sanitation breaker** — filters comments by role `"sanitation_admin"` and content
-///   containing the value of the `sanitation_failed.md` prompt;
-///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
-///   are never counted.
-/// * **Diagnostics breaker** — filters comments by role `"diagnostics"` and content
-///   containing the value of the `diagnostics_failed.md` prompt;
-///   trip comments always use role `SYSTEM_ROLE` (set by this function), so they
-///   are never counted.
-///
-/// See each variant's [`CircuitBreakerKind::should_trip`] implementation for
-/// the exact filtering logic.
-///
-/// # Return value
-///
-/// Returns `true` if the breaker tripped — the caller MUST abort dispatch.
-/// Returns `true` even on transition failure (the caller should still abort
-/// rather than dispatching an agent to a stale or unreachable ticket).
-#[must_use]
-async fn try_trip_circuit_breaker(
-    ticket: &Ticket,
-    source_phase: TicketPhase,
-    kind: Option<CircuitBreakerKind>,
-    log_label: &str,
-) -> bool {
-    let Some(kind) = kind else {
-        return false;
-    };
-    let comments = if ticket.comments.is_empty() {
-        // Comments are only pre-loaded for claim-pipeline tickets
-        // (LoadComments::Yes via claim_ticket_in_workspace). Tickets listed by
-        // the poll loop's in-phase dispatchers (LoadComments::No) have an empty
-        // vec — fetch from DB.
-        match board().get_comments(&ticket.id).await {
-            Ok(c) => std::borrow::Cow::Owned(c),
-            Err(e) => {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Failed to fetch comments for circuit breaker — proceeding anyway"
-                );
-                return false;
-            }
-        }
-    } else {
-        std::borrow::Cow::Borrowed(ticket.comments.as_slice())
-    };
-
-    let Some((count, max_count)) = kind.should_trip(&comments) else {
-        return false;
-    };
-
-    let msg = kind.trip_message(count, max_count);
-
-    info!(
-        ticket = %ticket.id,
-        count,
-        max_count,
-        log_label,
-        "Circuit breaker tripped at {count}/{max_count} ({log_label}) — failing ticket"
-    );
-
-    let breaker_label = format!("{log_label} circuit breaker");
-    match comment_and_transition(
-        TransitionCtx::notifying(ticket, source_phase, TicketPhase::Failed, &breaker_label)
-            .with_breaker(true),
-        SYSTEM_ROLE,
-        &msg,
-    )
-    .await
-    {
-        // Guard applied, or the ticket was already moved externally
-        // (cancelled, superseded, ...) while the stage finished — nothing to
-        // fail, no loop risk.
-        FinalizeOutcome::Applied | FinalizeOutcome::Moved => {}
-        // Genuine write failure: the breaker tripped but the Failed transition
-        // did not land — the ticket is still claimable in the source phase and
-        // will be re-dispatched, so the loop is real.
-        FinalizeOutcome::Failed => {
-            error!(
-                ticket = %ticket.id,
-                source_phase = %source_phase,
-                log_label = %breaker_label,
-                "Circuit breaker transition to Failed failed — ticket may loop indefinitely",
-            );
-        }
-    }
-
-    true
 }
 
 /// Aggregate per-agent failure reasons for a failed verifier round.
@@ -4409,9 +4184,9 @@ fn decide_verifier_bounce_target(
 ///
 /// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
 ///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (directly via
-///    [`transition_to_tx`](BoardStore::transition_to_tx)). The circuit
-///    breaker is already checked in [`spawn_dispatch`] before agents start, so only
-///    the bounce-back is needed here.
+///    [`transition_to_tx`](BoardStore::transition_to_tx)). No pre-flight breaker
+///    exists in [`spawn_dispatch`] for verifiers; bounce budget is checked here
+///    (see `bounce_exhausted`), so only the bounce-back is needed here.
 ///
 /// 3. **All passed** (all at or above threshold) → transition to the verifier's
 ///    `success_phase` with [`NotifyPolicy::Buffer`]. No immediate notification fires —
@@ -4486,7 +4261,7 @@ async fn process_verifier_verdicts(
     // generic "no response") and auto-pause the workspace BEFORE the Failed
     // transition so the failure notification reflects the paused workspace.
     // Shutdown is excluded inside the pause helper. The bounce breaker is
-    // excluded from pausing, like all other circuit-breaker trips.
+    // excluded from pausing, like all other bounce-breaker trips.
     let (failure_comment, reasons) = if all_failed {
         let pause_note =
             pause_workspace_on_failure(ticket, "all verifier agents failed to produce verdicts")
@@ -4568,7 +4343,7 @@ async fn process_verifier_verdicts(
 
     // A bounce-breaker trip fails the ticket with a dirty workspace — drain
     // ReadyForDevelopment siblings so the Engineer cannot pick up unrelated
-    // work on top of the failed tree (mirrors the pre-flight breaker drain).
+    // work on top of the failed tree.
     if bounce_trip {
         drain_ready_for_development_siblings(ticket).await;
     }
