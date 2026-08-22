@@ -857,15 +857,11 @@ impl ConfigReload {
     /// parameter. When no routing is configured, all fields except `model` are `None`.
     #[must_use]
     pub fn model_routing(&self, model: &str) -> ModelRouting {
-        let guard = self.read();
-        if let Some(mr) = guard.model_routings.iter().find(|mr| mr.model == model) {
-            mr.clone()
-        } else {
-            ModelRouting {
+        self.model_routing_by_key(model)
+            .unwrap_or_else(|| ModelRouting {
                 model: model.to_string(),
                 provider_order: None,
-            }
-        }
+            })
     }
 
     // ── Role model resolution (three slots) ─────────────────────
