@@ -1,4 +1,4 @@
-Headless browser for navigating web pages, interacting with elements, and extracting content. Returns an accessibility-tree snapshot for AI consumption.
+Headless browser for navigating web pages, interacting with elements, extracting content, and capturing screenshots for visual inspection. Returns an accessibility-tree snapshot for AI consumption.
 
 ## Required parameter
 `tab` — a logical session name. Use `"default"` for most browsing. Use different names to keep multiple pages open simultaneously. Same tab = serialized operations on that page.
@@ -20,6 +20,9 @@ Use `find` with locators to click, fill, hover, or focus elements. Use `click` w
 * `snapshot` — shows page structure (accessibility tree), not full text content. It is naturally compact; use `get_text` for detailed content extraction.
 * `eval { js: "..." }` — run arbitrary JavaScript to inspect or extract data. Returns the result serialized as a string. See `## JS eval notes` below.
 * `snapshot { compact: false, depth: 5 }` — more detailed accessibility tree.
+
+### 5. Visually inspect the rendered page: `screenshot`
+Capture a screenshot of the current tab and inject it into your conversation as a native image, so you can see exactly how the page is rendered. The screenshot is for your own analysis — you do not need to echo it or reference its path. Use it after `open`/`find`/`click` when visual layout, styling, or rendered state matters more than the accessibility tree.
 
 ## JS eval notes
 * `const`/`let` declarations are scoped to individual `page.evaluate()` calls — they do NOT cause redeclaration errors across separate `eval` calls.

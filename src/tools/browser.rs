@@ -8,6 +8,7 @@ use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -86,6 +87,11 @@ pub enum BrowserAction {
         /// Zero-based index for `by: "nth"`. Required when `by` is "nth".
         index: Option<u32>,
     },
+    /// Capture a screenshot of the current page as a PNG on disk and inject
+    /// it into the agent's conversation context as a native image part, so
+    /// the model can visually inspect the rendered page. The output path is
+    /// chosen by the tool (under the safe temp root), never by the model.
+    Screenshot {},
 }
 
 /// Helper for `#[serde(default = "true_val")]` on boolean fields.
@@ -103,6 +109,11 @@ pub struct BrowserTool {
     /// Per-tab locks — only serializes operations on the same tab.
     /// Different tabs can run concurrently without blocking each other.
     tab_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Path of the most recent screenshot written by a `screenshot` action.
+    /// Read by `image_payload` to attach the PNG as a native image part. The
+    /// call is guarded by the action being `Screenshot`, so a stale value from
+    /// a prior round can never be re-attached to a non-screenshot call.
+    last_screenshot: std::sync::Mutex<Option<String>>,
 }
 
 impl BrowserTool {
@@ -426,6 +437,9 @@ impl BrowserTool {
                 }
                 Ok(args)
             }
+            BrowserAction::Screenshot { .. } => {
+                anyhow::bail!("Screenshot is handled in execute(), not build_args")
+            }
         }
     }
 }
@@ -562,6 +576,7 @@ impl Tool for BrowserTool {
         super::browser_daemon::is_advertised()
     }
 
+    #[expect(clippy::too_many_lines)]
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -648,7 +663,13 @@ impl Tool for BrowserTool {
                                 "type": "integer",
                                 "description": "Zero-based index for `by: \"nth\"`. Required when by is 'nth'."
                             }
-                        }))
+                        })),
+                        action_schema(
+                            "screenshot",
+                            "Capture a screenshot of the current page as a PNG and inject it into the conversation as a native image, so you can visually inspect the rendered page",
+                            &[],
+                            &json!({}),
+                        )
                     ]
                 },
                 "tab": {
@@ -760,6 +781,11 @@ impl Tool for BrowserTool {
             return Ok(Self::with_normalization_notes(body, &normalized_notes));
         }
 
+        if let BrowserAction::Screenshot { .. } = &action {
+            let output = self.capture_screenshot(&tab).await?;
+            return Ok(Self::with_normalization_notes(output, &normalized_notes));
+        }
+
         let cli_args = Self::build_args(&action)?;
         let str_args: Vec<&str> = cli_args.iter().map(String::as_str).collect();
         let response = self.run_command(&str_args, &tab).await?;
@@ -826,6 +852,38 @@ impl Tool for BrowserTool {
 
         Ok(Self::with_normalization_notes(output, &normalized_notes))
     }
+
+    async fn image_payload(
+        &self,
+        _ws: &Workspace,
+        args: &serde_json::Value,
+    ) -> Option<crate::tools::ImagePayload> {
+        // Only a successful `screenshot` action produces an image payload.
+        // Re-parse the action so a stale `last_screenshot` from a prior round
+        // is never re-attached to a non-screenshot call.
+        let action_value = args.get("action")?.clone();
+        let (action_value, _) = normalize_action(action_value, args).ok()?;
+        let action: BrowserAction = serde_json::from_value(action_value).ok()?;
+        if !matches!(action, BrowserAction::Screenshot { .. }) {
+            return None;
+        }
+        let path = self.last_screenshot.lock().unwrap_poison().clone()?;
+        let p = PathBuf::from(&path);
+        // Only a real PNG/JPEG/WebP raster opens the decode (fails open on a
+        // non-raster/over-cap file, mirroring the read tool's payload path).
+        let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&p)
+            .await
+            .ok()?;
+        Some(crate::tools::ImagePayload {
+            path,
+            data_uri: meta.data_uri,
+            width: meta.width,
+            height: meta.height,
+            format: meta.format,
+            recovery_note: None,
+            source: crate::tools::ImagePayloadSource::Browser,
+        })
+    }
 }
 
 impl BrowserTool {
@@ -836,6 +894,46 @@ impl BrowserTool {
             return output;
         }
         format!("[normalized] {}\n{output}", notes.join("; "))
+    }
+
+    /// Capture a screenshot of the current tab to a PNG under the safe temp
+    /// root, record its path, and return a textual result describing it. The
+    /// per-tab lock is already held by the caller.
+    async fn capture_screenshot(&self, tab: &str) -> anyhow::Result<String> {
+        let path = Self::screenshot_output_path(tab)?;
+        let path_str = path.to_string_lossy().into_owned();
+        let str_args = ["screenshot", path_str.as_str()];
+        let _response = self.run_command(&str_args, tab).await?;
+        // The CLI may report success yet write nothing (e.g. a capture that
+        // produced no pixels) — fail loudly so the model does not chase a
+        // phantom image.
+        if !path.is_file() {
+            anyhow::bail!(
+                "Browser screenshot reported success but no PNG was written at {}",
+                path.display()
+            );
+        }
+        *self.last_screenshot.lock().unwrap_poison() = Some(path_str.clone());
+        Ok(format!(
+            "[Tab: {tab}] Captured a browser screenshot: {path_str}. [IMAGE:{path_str}]"
+        ))
+    }
+
+    /// Build a screenshot output path under the pinned temp root (or OS temp
+    /// in tests) — one of the allowed temp roots. The filename is derived from
+    /// a sanitized tab name plus a random nonce so a model-supplied `tab`
+    /// (which is user-controlled) can never traverse out of the temp root.
+    fn screenshot_output_path(tab: &str) -> anyhow::Result<PathBuf> {
+        let dir = std::env::temp_dir().join("browser-screenshots");
+        std::fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "Failed to create browser screenshot directory {}",
+                dir.display()
+            )
+        })?;
+        let slug = sanitize_filename_component(tab);
+        let nonce = rand::random::<u64>();
+        Ok(dir.join(format!("{slug}_{nonce:016x}.png")))
     }
 }
 
@@ -848,6 +946,29 @@ impl BrowserTool {
 fn is_blank_page_url(url: &str) -> bool {
     let url = url.trim();
     url.is_empty() || url.starts_with("about:blank")
+}
+
+/// Reduce a name to a single safe filename component (ASCII alphanumerics,
+/// `-`, `_`), so a model-supplied value (e.g. a browser `tab`) can never
+/// inject path separators or `..` traversal into a tool-chosen output path.
+fn sanitize_filename_component(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push_str("default");
+    }
+    if out.len() > 40 {
+        out.truncate(40);
+    }
+    out
 }
 
 /// Enhance chrome-use error messages with actionable hints for known
@@ -881,6 +1002,7 @@ const KNOWN_ACTIONS: &[&str] = &[
     "press",
     "eval",
     "find",
+    "screenshot",
 ];
 
 /// Expected action shape, echoed verbatim in corrective errors so the model
@@ -891,7 +1013,8 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
     {\"get_innertext\":{\"selector\":\"...\"}}, {\"get_url\":{}}, \
     {\"press\":{\"key\":\"...\"}}, {\"eval\":{\"js\":\"...\"}}, \
     {\"find\":{\"by\":\"text|role|label|placeholder|alt|title|testid|first|last|nth\",\
-    \"value\":\"...\",\"action\":\"click|fill|type|hover|focus|check|uncheck|text\"}}";
+    \"value\":\"...\",\"action\":\"click|fill|type|hover|focus|check|uncheck|text\"}}, \
+    {\"screenshot\":{}}";
 
 /// Corrective error for an unrecoverable action shape, listing the exact
 /// expected form instead of raw serde text.
@@ -1508,11 +1631,11 @@ mod tests {
             .as_array()
             .expect("oneOf should be an array");
 
-        // There are exactly 9 browser actions.
+        // There are exactly 10 browser actions.
         assert_eq!(
             action_schemas.len(),
-            9,
-            "expected 9 actions, got {}",
+            10,
+            "expected 10 actions, got {}",
             action_schemas.len()
         );
 
@@ -1536,6 +1659,7 @@ mod tests {
             "press",
             "eval",
             "find",
+            "screenshot",
         ] {
             assert!(
                 action_names.contains(expected),
@@ -1543,8 +1667,8 @@ mod tests {
             );
         }
 
-        // Structural invariants: snapshot and get_url must lack inner "required";
-        // all other actions must have it.
+        // Structural invariants: snapshot, get_url and screenshot must lack inner
+        // "required"; all other actions must have it.
         for s in action_schemas {
             let inner = s
                 .get("properties")
@@ -1558,7 +1682,7 @@ mod tests {
                 .map_or("?", String::as_str);
 
             let has_inner_required = inner.is_some_and(|obj| obj.contains_key("required"));
-            if name == "snapshot" || name == "get_url" {
+            if name == "snapshot" || name == "get_url" || name == "screenshot" {
                 assert!(
                     !has_inner_required,
                     "{name} should NOT have inner 'required'"
@@ -1910,7 +2034,7 @@ mod tests {
         let payload = |name: &str| -> Value {
             match name {
                 "open" => json!({"url": "https://example.com"}),
-                "snapshot" | "get_url" => json!({}),
+                "snapshot" | "get_url" | "screenshot" => json!({}),
                 "click" => json!({"selector": "@e1"}),
                 "get_text" => json!({"selector": "body"}),
                 "get_inner_text" | "get_innertext" | "innertext" => {
@@ -1943,11 +2067,106 @@ mod tests {
             "press",
             "eval",
             "find",
+            "screenshot",
         ] {
             assert!(
                 KNOWN_ACTIONS.contains(&name),
                 "KNOWN_ACTIONS is missing variant {name}"
             );
         }
+    }
+
+    #[test]
+    fn build_args_rejects_screenshot() {
+        let action = BrowserAction::Screenshot {};
+        assert!(
+            BrowserTool::build_args(&action).is_err(),
+            "Screenshot must be handled in execute(), not build_args"
+        );
+    }
+
+    #[test]
+    fn screenshot_action_normalizes_and_parses() {
+        // Canonical tagged object.
+        let action = serde_json::json!({"screenshot": {}});
+        let parsed: BrowserAction = serde_json::from_value(action.clone()).unwrap();
+        assert!(matches!(parsed, BrowserAction::Screenshot {}));
+
+        // Plain action name with a tab sibling.
+        let args = serde_json::json!({"action": "screenshot", "tab": "docs"});
+        let (normalized, note) =
+            normalize_action(args.get("action").cloned().unwrap(), &args).unwrap();
+        assert!(
+            note.is_some(),
+            "screenshot should record a normalization note"
+        );
+        let parsed: BrowserAction = serde_json::from_value(normalized).unwrap();
+        assert!(matches!(parsed, BrowserAction::Screenshot {}));
+    }
+
+    #[test]
+    fn screenshot_output_path_is_safe_and_unique() {
+        // A hostile tab name must not escape the temp dir.
+        let p = BrowserTool::screenshot_output_path("../../etc/cron.d").unwrap();
+        let file_name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!file_name.contains('/') && !file_name.contains('\\'));
+        assert!(file_name.ends_with(".png"));
+        // Two calls yield different files (random nonce).
+        let p2 = BrowserTool::screenshot_output_path("default").unwrap();
+        assert_ne!(p, p2);
+    }
+
+    #[tokio::test]
+    async fn image_payload_attaches_browser_screenshot() {
+        // Build a tiny PNG on disk.
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let dir = std::env::temp_dir().join("mahbot-browser-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_path = dir.join("shot.png");
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&png_path, &buf).unwrap();
+
+        let tool = BrowserTool::default();
+        *tool.last_screenshot.lock().unwrap_poison() =
+            Some(png_path.to_string_lossy().into_owned());
+
+        let payload = tool
+            .image_payload(
+                &crate::Workspace::default(),
+                &serde_json::json!({"action": "screenshot", "tab": "default"}),
+            )
+            .await
+            .expect("screenshot must produce an image payload");
+        assert_eq!(payload.source, crate::tools::ImagePayloadSource::Browser);
+        assert_eq!(payload.format, "PNG");
+        assert!(payload.data_uri.starts_with("data:image/jpeg;base64,"));
+        assert!(
+            payload
+                .attached_annotation()
+                .starts_with("Browser screenshot"),
+            "annotation must describe it as a browser screenshot: {}",
+            payload.attached_annotation()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn image_payload_ignores_non_screenshot_actions() {
+        let tool = BrowserTool::default();
+        // A stale path must not be attached to a non-screenshot action.
+        *tool.last_screenshot.lock().unwrap_poison() = Some("/tmp/stale.png".to_string());
+        let payload = tool
+            .image_payload(
+                &crate::Workspace::default(),
+                &serde_json::json!({"action": "open", "url": "https://example.com", "tab": "default"}),
+            )
+            .await;
+        assert!(
+            payload.is_none(),
+            "non-screenshot action must yield no payload"
+        );
     }
 }

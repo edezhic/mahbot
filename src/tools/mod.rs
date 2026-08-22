@@ -275,9 +275,9 @@ pub(crate) struct ToolExecutionOutcome {
 }
 
 /// Discriminates the tool that produced an [`ImagePayload`] so the agent loop can
-/// label the injected image with the actual operation ("Read" vs "Generated")
-/// without knowing which tool produced it — the loop selects the annotation purely
-/// by dedup.
+/// label the injected image with the actual opening phrase ("Read image file",
+/// "Generated image file", "Browser screenshot") without knowing which tool
+/// produced it — the loop selects the annotation purely by dedup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImagePayloadSource {
     /// On-disk raster read by the read tool.
@@ -285,16 +285,21 @@ pub(crate) enum ImagePayloadSource {
     /// Tool-produced image (e.g. image_gen), or one derived by the agent loop
     /// from a tool's `[IMAGE:path]` marker.
     Generated,
+    /// Screenshot captured by the browser tool (injected as a native image for
+    /// the agent's own visual analysis).
+    Browser,
 }
 
 impl ImagePayloadSource {
-    /// Verb that opens the injected-image annotation, e.g. "Read" for the read
-    /// tool's on-disk raster, "Generated" for a tool-produced image.
+    /// Opening phrase of the injected-image annotation, e.g. "Read image file"
+    /// for the read tool's on-disk raster, "Generated image file" for a
+    /// tool-produced image, "Browser screenshot" for the browser's capture.
     #[must_use]
-    pub(crate) fn verb(self) -> &'static str {
+    pub(crate) fn opener(self) -> &'static str {
         match self {
-            Self::Read => "Read",
-            Self::Generated => "Generated",
+            Self::Read => "Read image file",
+            Self::Generated => "Generated image file",
+            Self::Browser => "Browser screenshot",
         }
     }
 }
@@ -313,7 +318,7 @@ impl ImagePayloadSource {
 #[derive(Debug, Clone)]
 pub(crate) struct ImagePayload {
     /// Canonical (resolved) path of the image — surfaced in the tool-result
-    /// annotation (`{verb} image file {path} ...`) and the debug log. The dedup
+    /// annotation (`{opener} {path} ...`) and the debug log. The dedup
     /// key used by the agent loop is `data_uri`, not `path`.
     pub path: String,
     /// Bounded JPEG data-URI (`data:image/jpeg;base64,...`).
@@ -328,8 +333,8 @@ pub(crate) struct ImagePayload {
     /// preserved in the tool-result annotation so the model keeps the typo
     /// context (mirrors the `[Recovered path: ...]` note shown for text reads).
     pub recovery_note: Option<String>,
-    /// Tool that produced the image, selecting the annotation verb ("Read" vs
-    /// "Generated").
+    /// Tool that produced the image, selecting the annotation opener
+    /// ("Read image file", "Generated image file", "Browser screenshot").
     pub source: ImagePayloadSource,
 }
 
@@ -339,8 +344,8 @@ impl ImagePayload {
     #[must_use]
     pub(crate) fn attached_annotation(&self) -> String {
         let base = format!(
-            "{} image file {} ({}x{}, {}). Image content attached to the conversation as a native image.",
-            self.source.verb(),
+            "{} {} ({}x{}, {}). Image content attached to the conversation as a native image.",
+            self.source.opener(),
             self.path,
             self.width,
             self.height,
@@ -354,8 +359,8 @@ impl ImagePayload {
     #[must_use]
     pub(crate) fn already_attached_annotation(&self) -> String {
         let base = format!(
-            "{} image file {} ({}x{}, {}). Image content is already attached to the conversation as a native image.",
-            self.source.verb(),
+            "{} {} ({}x{}, {}). Image content is already attached to the conversation as a native image.",
+            self.source.opener(),
             self.path,
             self.width,
             self.height,
