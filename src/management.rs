@@ -477,17 +477,19 @@ fn paused_workspace_sentence() -> &'static str {
 /// pause. The engineer hard-failure bounce trip is the one exception: it
 /// pauses at the engineer failure site, before the Failed transition, because
 /// the budget-exhausting failure is a technical failure like any other engineer
-/// failure. Sanitation/diagnostics failures now retry indefinitely without
-/// tripping, so they never reach this helper and never pause. Callers are the
+/// failure. Verdict-based sanitation/diagnostics bounces now share the same
+/// breaker and drain on exhaustion (without pausing); the infinite-retry paths
+/// (`record_sanitation_failure` and diagnostics skip) never trip and never pause. Callers are the
 /// technical-failure sites: dispatch panic, engineer agent failure (including
 /// its bounce-budget trip), all verifier agents failing, and the GUI cancel
 /// of an in-flight agent run.
 ///
 /// # Scope
 ///
-/// Sanitation/diagnostics agent failures never reach this helper: they record a
-/// failure marker via `record_sanitation_failure`/diagnostics path and clear
-/// `assigned_to` for indefinite retry. Analyst failures
+/// Sanitation/diagnostics *verdict* failures share the bounce budget and trip
+/// via the breaker (drain, no pause); the `record_sanitation_failure` and
+/// diagnostics-skip paths record a failure marker and clear
+/// `assigned_to` for indefinite retry without consuming budget. Analyst failures
 /// never fail the ticket (analysts always advance to Planning), and mixed
 /// verifier rounds (some failures + a sub-threshold verdict) bounce to
 /// ReadyForDevelopment without pausing. Analyze-tool sub-agent failures (parallel
@@ -2493,8 +2495,9 @@ async fn finalize_sanitation_round(
     if response.is_none() {
         // Agent failed or was cancelled — record failure and clear assigned_to
         // for re-dispatch retry. The marker comment records the failure for
-        // triage; sanitation retries indefinitely without a circuit breaker.
-        // (Past the guard above, response None here is a real failure.)
+        // triage; this no-output path stays infinite-retry without consuming
+        // the bounce budget (only verdict-based garbage bounces share the
+        // breaker). (Past the guard above, response None here is a real failure.)
         warn!(
             ticket = %ticket.id,
             "Sanitation agent returned no output{resumed_suffix} — clearing assigned_to for retry"
@@ -2623,10 +2626,12 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 ///
 /// - If **clean** (pass = true): transitions to [`TicketPhase::SanitationPassed`]
 ///   (transitory handoff before auto-commit).
-/// - If **garbage detected** (pass = false): adds a comment listing the offending
-///   files and transitions the ticket to [`TicketPhase::ReadyForDevelopment`] with a
-///   pipeline reservation (via [`comment_and_transition`]), matching the existing review/QA
-///   failure pattern.
+/// - If **garbage detected** (pass = false): bounces to
+///   [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation and
+///   increments the shared bounce counter; on exhaustion (bounce_count >=
+///   MAX_BOUNCES) fails to [`TicketPhase::Failed`] via the bounce breaker
+///   (drain, SYSTEM_ROLE trip comment + concrete failure last). Shares the
+///   review/QA/engineer bounce budget.
 async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVerdict) {
     if verdict.pass {
         let passed_suffix = if verdict.garbage_files.is_empty() {
@@ -2659,61 +2664,67 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 ("{{rationale}}", &verdict.rationale),
             ],
         );
-        // Pre-build the system comment so we can pass it into the transaction.
-        // Template filename is legacy (`sanitation_circuit_breaker_comment.md`);
-        // now just a failure-marker comment — sanitation retries indefinitely
-        // without a breaker, the marker is for triage only.
-        let count_str = verdict.garbage_files.len().to_string();
-        let sys_comment = substitute(
-            &load_prompt("pipeline/sanitation_circuit_breaker_comment.md"),
-            &[
-                (
-                    "{{sanitation_failed_marker}}",
-                    &load_prompt("pipeline/sanitation_failed.md"),
-                ),
-                ("{{count}}", &count_str),
-            ],
-        );
+        let exhausted = bounce_exhausted(ticket.bounce_count);
+        let target = if exhausted {
+            TicketPhase::Failed
+        } else {
+            TicketPhase::ReadyForDevelopment
+        };
+        let notify = if exhausted {
+            NotifyPolicy::Notify
+        } else {
+            NotifyPolicy::Buffer
+        };
 
-        // Write both comments and transition atomically via
-        // [`with_comment_and_transition`], which wraps all writes in a single
-        // transaction. This matches the pattern used by all other verdict paths.
-        if !matches!(
-            with_comment_and_transition(
-                TransitionCtx::buffered(
-                    ticket,
-                    TicketPhase::InSanitation,
-                    TicketPhase::ReadyForDevelopment,
-                    "Sanitation"
-                ),
-                async |tx| {
-                    BoardStore::add_comment_tx(
-                        tx,
-                        &ticket.id,
-                        Role::Sanitation.as_str(),
-                        comment.as_str(),
-                    )
-                    .await?;
-                    BoardStore::add_comment_tx(
-                        tx,
-                        &ticket.id,
-                        SANITATION_ROLE,
-                        sys_comment.as_str(),
-                    )
-                    .await?;
-                    Ok(())
-                },
+        let outcome = with_comment_and_transition(
+            TransitionCtx::new(
+                ticket,
+                TicketPhase::InSanitation,
+                target,
+                notify,
+                "Sanitation",
             )
-            .await,
-            FinalizeOutcome::Applied
-        ) {
+            .with_breaker(exhausted),
+            async |tx| {
+                if exhausted {
+                    BoardStore::add_comment_tx(
+                        tx,
+                        &ticket.id,
+                        SYSTEM_ROLE,
+                        &bounce_breaker_trip_comment(),
+                    )
+                    .await?;
+                }
+                BoardStore::add_comment_tx(
+                    tx,
+                    &ticket.id,
+                    Role::Sanitation.as_str(),
+                    comment.as_str(),
+                )
+                .await?;
+                if !exhausted {
+                    BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
+                }
+                Ok(())
+            },
+        )
+        .await;
+        if !matches!(outcome, FinalizeOutcome::Applied) {
             return;
         }
-
-        info!(
-            ticket = %ticket.id,
-            "Sanitation failed — bounced back to ReadyForDevelopment with pipeline reservation",
-        );
+        if exhausted {
+            drain_ready_for_development_siblings(ticket).await;
+            info!(
+                ticket = %ticket.id,
+                "Bounce circuit breaker tripped ({} bounces) — ticket failed",
+                crate::joint_verdict::MAX_BOUNCES,
+            );
+        } else {
+            info!(
+                ticket = %ticket.id,
+                "Sanitation failed — bounced back to ReadyForDevelopment with pipeline reservation",
+            );
+        }
     }
 }
 
@@ -2815,6 +2826,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// sequentially via [`run_diagnostics_commands`]. Stops at the first failure.
 /// After execution, transitions the ticket to either `DiagnosticsDone` (all
 /// passed) or `ReadyForDevelopment` (any failure).
+#[expect(clippy::too_many_lines)]
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     match board()
         .claim_diagnostics(&ticket.id, DIAGNOSTICS_ROLE)
@@ -2840,73 +2852,135 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Separate the decision (target phase + comment body + outcome log) from
     // the action (single transition call), matching the dispatch_engineer
-    // precedent.
-    let (target_phase, comment_body, outcome_log): (TicketPhase, String, &str) =
-        match crate::workspace::store().get_diagnostics(&ws.name).await {
-            Ok(Some(cmds)) if !cmds.is_empty() => {
-                // Run commands sequentially in the prescribed order.
-                let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
+    // precedent. C2 (diagnostics failure) shares the verifier/engineer bounce
+    // budget and circuit breaker; C1/B/Err skip without consuming budget.
+    match crate::workspace::store().get_diagnostics(&ws.name).await {
+        Ok(Some(cmds)) if !cmds.is_empty() => {
+            // Run commands sequentially in the prescribed order.
+            let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
 
-                // Post-run check: verify ticket hasn't been moved externally while
-                // diagnostics commands ran.
-                if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDiagnostics).await
-                {
+            // Post-run check: verify ticket hasn't been moved externally while
+            // diagnostics commands ran.
+            if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDiagnostics).await {
+                return;
+            }
+
+            if all_passed {
+                // Path C1: All diagnostics passed — transition to DiagnosticsDone.
+                comment_and_transition_or_bail(
+                    TransitionCtx::buffered(
+                        &ticket,
+                        TicketPhase::InDiagnostics,
+                        TicketPhase::DiagnosticsDone,
+                        "Diagnostics",
+                    ),
+                    DIAGNOSTICS_ROLE,
+                    &comment,
+                    "Diagnostics finished — transitioned ticket",
+                )
+                .await;
+            } else {
+                // Path C2: Diagnostics failed — bounce with shared budget.
+                let exhausted = bounce_exhausted(ticket.bounce_count);
+                let target = if exhausted {
+                    TicketPhase::Failed
+                } else {
+                    TicketPhase::ReadyForDevelopment
+                };
+                let notify = if exhausted {
+                    NotifyPolicy::Notify
+                } else {
+                    NotifyPolicy::Buffer
+                };
+                let outcome = with_comment_and_transition(
+                    TransitionCtx::new(
+                        &ticket,
+                        TicketPhase::InDiagnostics,
+                        target,
+                        notify,
+                        "Diagnostics",
+                    )
+                    .with_breaker(exhausted),
+                    async |tx| {
+                        if exhausted {
+                            BoardStore::add_comment_tx(
+                                tx,
+                                &ticket.id,
+                                SYSTEM_ROLE,
+                                &bounce_breaker_trip_comment(),
+                            )
+                            .await?;
+                        }
+                        BoardStore::add_comment_tx(
+                            tx,
+                            &ticket.id,
+                            DIAGNOSTICS_ROLE,
+                            comment.as_str(),
+                        )
+                        .await?;
+                        if !exhausted {
+                            BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+                if !matches!(outcome, FinalizeOutcome::Applied) {
                     return;
                 }
-
-                if all_passed {
-                    // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                    (
-                        TicketPhase::DiagnosticsDone,
-                        comment,
-                        "Diagnostics finished — transitioned ticket",
-                    )
+                if exhausted {
+                    drain_ready_for_development_siblings(&ticket).await;
+                    info!(
+                        ticket = %ticket.id,
+                        "Bounce circuit breaker tripped ({} bounces) — ticket failed",
+                        crate::joint_verdict::MAX_BOUNCES,
+                    );
                 } else {
-                    // Path C2: Diagnostics failed — bounce back to development.
-                    (
-                        TicketPhase::ReadyForDevelopment,
-                        comment,
+                    info!(
+                        ticket = %ticket.id,
+                        target = %target,
                         "Diagnostics failed — transitioned ticket",
-                    )
+                    );
                 }
             }
-            Ok(_) => {
-                // Path B: No diagnostics commands configured (or empty list) — skip.
-                (
+        }
+        Ok(_) => {
+            // Path B: No diagnostics commands configured (or empty list) — skip.
+            comment_and_transition_or_bail(
+                TransitionCtx::buffered(
+                    &ticket,
+                    TicketPhase::InDiagnostics,
                     TicketPhase::DiagnosticsDone,
-                    "No diagnostics commands are configured for this workspace \
-                     — diagnostics skipped."
-                        .to_string(),
-                    "Diagnostics skipped — transitioned ticket",
-                )
-            }
-            Err(e) => {
-                // Path A: DB error loading diagnostics — log and skip.
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
-                );
-                (
+                    "Diagnostics",
+                ),
+                DIAGNOSTICS_ROLE,
+                "No diagnostics commands are configured for this workspace \
+                 — diagnostics skipped.",
+                "Diagnostics skipped — transitioned ticket",
+            )
+            .await;
+        }
+        Err(e) => {
+            // Path A: DB error loading diagnostics — log and skip.
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
+            );
+            comment_and_transition_or_bail(
+                TransitionCtx::buffered(
+                    &ticket,
+                    TicketPhase::InDiagnostics,
                     TicketPhase::DiagnosticsDone,
-                    format!("Could not load diagnostics commands due to a database error: {e}"),
-                    "Diagnostics failed — transitioned ticket",
-                )
-            }
-        };
-
-    comment_and_transition_or_bail(
-        TransitionCtx::buffered(
-            &ticket,
-            TicketPhase::InDiagnostics,
-            target_phase,
-            "Diagnostics",
-        ),
-        DIAGNOSTICS_ROLE,
-        &comment_body,
-        outcome_log,
-    )
-    .await;
+                    "Diagnostics",
+                ),
+                DIAGNOSTICS_ROLE,
+                &format!("Could not load diagnostics commands due to a database error: {e}"),
+                "Diagnostics failed — transitioned ticket",
+            )
+            .await;
+        }
+    }
 }
 
 // ── Parallel agent helpers (shared) ─────────────────────────────────────
@@ -4037,10 +4111,10 @@ fn format_analyst_summary(
 ///
 /// # Critical invariant: only the bounce breaker triggers the drain
 ///
-/// This function is called after the bounce breaker trip (the mid-round bounce
-/// breaker in review/QA). Only the bounce breaker triggers the drain;
-/// Sanitation/Diagnostics failures now retry indefinitely without draining
-/// (approved behavior change).
+/// This function is called after a bounce breaker trip (review/QA,
+/// sanitation verdict failure, or diagnostics failure). Only the bounce
+/// breaker triggers the drain; non-tripping bounces and the infinite-retry
+/// paths (`record_sanitation_failure`, diagnostics skip) do not drain.
 ///
 /// The engineer hard-failure bounce trip is the deliberate exception: it does
 /// NOT call this function — it pauses the workspace instead, which blocks new

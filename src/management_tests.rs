@@ -1690,11 +1690,6 @@ async fn process_sanitation_verdict_cases() {
 
     init_management_test_stores().await;
 
-    let sanitation_failed_marker: &'static str =
-        load_prompt("pipeline/sanitation_failed.md").leak();
-    let sys_markers_val: &'static [&'static str] =
-        Box::leak(vec![sanitation_failed_marker].into_boxed_slice());
-
     let clean = crate::SanitationVerdict {
         pass: true,
         garbage_files: vec![],
@@ -1728,7 +1723,7 @@ async fn process_sanitation_verdict_cases() {
             expected_phase: TicketPhase::ReadyForDevelopment,
             expected_pipeline_reservation: true,
             sanit_markers: &["node_modules/"],
-            sys_markers: Some(sys_markers_val),
+            sys_markers: None,
         },
         Case {
             name: "pass=true with reviewed files → SanitationPassed (files reviewed)",
