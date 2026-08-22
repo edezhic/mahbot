@@ -1635,7 +1635,7 @@ mod tests {
             arguments: serde_json::json!({}),
         };
         ChatMessage::assistant(
-            crate::providers::reasoning_roundtrip::assistant_replay_payload(
+            crate::providers::reasoning::assistant_replay_payload(
                 Some("prologue"),
                 std::slice::from_ref(&tc),
                 None,
@@ -1694,12 +1694,8 @@ mod tests {
             reasoning_details: None,
         };
         let reasoning_msg = ChatMessage::assistant(
-            crate::providers::reasoning_roundtrip::assistant_replay_payload(
-                Some(""),
-                &[],
-                Some(&reasoning),
-            )
-            .to_string(),
+            crate::providers::reasoning::assistant_replay_payload(Some(""), &[], Some(&reasoning))
+                .to_string(),
         );
         let window =
             select_retention_window(&[reasoning_msg, ChatMessage::assistant("{\"result\": 42}")]);
@@ -2103,7 +2099,7 @@ pub(crate) fn decode_native_history_message(
 
         // Extract reasoning fields for the Assistant variant.
         let (r, rc, rd) =
-            crate::providers::reasoning_roundtrip::json_lossless_assistant_reasoning_fields(value);
+            crate::providers::reasoning::json_lossless_assistant_reasoning_fields(value);
         let reasoning = Reasoning::from_optional_parts(r, rc, rd);
 
         let tool_calls = value

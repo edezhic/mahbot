@@ -2,7 +2,7 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
-use crate::providers::reasoning_roundtrip;
+use crate::providers::reasoning;
 use crate::providers::{ScopedCallError, ensure_chat_completions_url, provider_routing_json};
 use crate::retry::{FailureClass, RetryFailureRecord};
 use crate::util::error::{HttpError, retry_after_header};
@@ -616,7 +616,7 @@ impl OpenAiCompatibleProvider {
                 };
                 let has_tool_calls = tool_calls.as_ref().is_some_and(|c| !c.is_empty());
                 let (r_reasoning, r_content, r_details) =
-                    reasoning_roundtrip::native_reasoning_triple_for_replay(
+                    reasoning::native_reasoning_triple_for_replay(
                         reasoning.as_ref(),
                         has_tool_calls,
                     );

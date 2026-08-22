@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::Context;
 use tracing::Instrument;
 
-use crate::providers::reasoning_roundtrip::assistant_replay_payload;
+use crate::providers::reasoning::assistant_replay_payload;
 use crate::session::Session;
 use crate::tools::{
     ImagePayload, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,

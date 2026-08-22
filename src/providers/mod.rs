@@ -6,7 +6,6 @@
 
 pub(crate) mod compatible;
 pub(crate) mod reasoning;
-pub(crate) mod reasoning_roundtrip;
 pub(crate) mod reliable;
 pub(crate) mod transcribe;
 
