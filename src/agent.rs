@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -174,6 +175,45 @@ fn existing_image_marker_values(history: &[ChatMessage]) -> std::collections::Ha
         }
     }
     set
+}
+
+/// Derive an [`ImagePayload`] from a successful tool's raw output when the tool
+/// did not supply its own payload but returned a real on-disk `[IMAGE:path]`
+/// marker, so a tool-produced image (e.g. image_gen) reaches the agent's own
+/// context automatically. Fails open (`None`) when the marker path is not
+/// absolute or cannot be compressed into a bounded JPEG data-URI (e.g. an SVG,
+/// which the compressor cannot rasterize) — the user still receives the file via
+/// the marker in the raw output.
+async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> {
+    // Cheap guard: skip the regex scan for outputs carrying no image marker.
+    if !output.contains("[IMAGE:") {
+        return None;
+    }
+    for caps in MEDIA_MARKER_RE.captures_iter(output) {
+        let (kind, path) = parse_media_marker(&caps);
+        if kind != "IMAGE" {
+            continue;
+        }
+        let p = Path::new(path);
+        if !p.is_absolute() {
+            continue;
+        }
+        let Ok(meta) = crate::util::local_image_to_compressed_data_uri_with_meta(p).await else {
+            // Fail open for this marker (missing file, non-raster e.g. SVG,
+            // over-cap input). The marker stays in the raw output for delivery.
+            continue;
+        };
+        return Some(ImagePayload {
+            path: p.display().to_string(),
+            data_uri: meta.data_uri,
+            width: meta.width,
+            height: meta.height,
+            format: meta.format,
+            recovery_note: None,
+            source: crate::tools::ImagePayloadSource::Generated,
+        });
+    }
+    None
 }
 
 /// One-pass derivation of a role's advertised tools and their specs — the
@@ -1269,7 +1309,7 @@ impl Agent {
         // tool-result block (preserves OpenAI-compatible tool-stream contiguity:
         // assistant(tool_calls) → tool_result_* → user(IMAGE_*)). Injecting one
         // per image inline would interleave a user message between tool results.
-        let mut fresh_image_payloads: Vec<&ImagePayload> = Vec::new();
+        let mut fresh_image_payloads: Vec<ImagePayload> = Vec::new();
 
         for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
             let tool = find_tool(tools, &call.name);
@@ -1278,23 +1318,26 @@ impl Agent {
                 None => crate::util::truncate_tool_output(&outcome.output),
             };
 
-            // The data-URI never rides inside the tool-result string (the shared
-            // 5 KB budget would truncate it); it is delivered as a standalone
-            // user message so the vision-capable model sees a native image part.
-            // Dedup: a repeat read of an already-attached image (same data-URI)
-            // is not re-injected — the read returns a reference to it instead.
-            if let Some(payload) = &outcome.image_payload {
+            // The outcome's own payload (read tool) takes precedence; otherwise
+            // derive an injected image from a real on-disk `[IMAGE:path]` marker in
+            // a successful tool output (image_gen) so a tool-produced image reaches
+            // the agent's own context. Derivation fails open: a non-rasterizable
+            // path (e.g. SVG) yields no payload while the marker stays in the raw
+            // output for user delivery.
+            let derived_payload = if outcome.image_payload.is_none() && outcome.success {
+                derive_image_payload_from_marker(&outcome.output).await
+            } else {
+                None
+            };
+            let payload = outcome.image_payload.as_ref().or(derived_payload.as_ref());
+
+            if let Some(payload) = payload {
                 let seen = seen_data_uris
                     .get_or_insert_with(|| existing_image_marker_values(self.session.history()));
                 if seen.insert(payload.data_uri.clone()) {
-                    fresh_image_payloads.push(payload);
-                    // Fresh attachment: tool result reflects the actual injection,
-                    // built from the payload metadata (post-EXIF dims) so it never
-                    // drifts from read.rs wording.
+                    fresh_image_payloads.push(payload.clone());
                     output = payload.attached_annotation();
                 } else {
-                    // Deduped repeat read: the image is already attached; return a
-                    // reference rather than adding it again.
                     output = payload.already_attached_annotation();
                 }
             }
@@ -1303,15 +1346,18 @@ impl Agent {
         }
 
         // Inject all fresh image user messages AFTER the round's tool-result
-        // block.
+        // block, each carrying the provenance tag so the model can tell a
+        // tool-injected image apart from a user-uploaded one.
         for payload in fresh_image_payloads {
             tracing::debug!(
                 agent_id = %self.agent_id,
                 role = %self.role,
                 path = %payload.path,
-                "Injecting read image as a synthetic user message"
+                "Injecting tool image as a synthetic user message"
             );
-            db_messages.push(ChatMessage::user(format!("[IMAGE:{}]", payload.data_uri)));
+            db_messages.push(ChatMessage::user(crate::util::injected_image_user_message(
+                &payload.data_uri,
+            )));
         }
 
         // Batch-persist all messages in a single transaction (preceded by
@@ -3628,6 +3674,7 @@ mod tests {
     /// round's tool-result block (preserving tool-message contiguity) and dedups
     /// a repeat read of an already-attached image.
     #[tokio::test]
+    #[expect(clippy::too_many_lines)]
     async fn commit_tool_results_injects_image_after_tool_results_with_dedup() {
         crate::util::test::init_test_stores().await;
 
@@ -3660,6 +3707,7 @@ mod tests {
                     height: 1,
                     format: "PNG".into(),
                     recovery_note: None,
+                    source: crate::tools::ImagePayloadSource::Read,
                 }),
             },
             ToolExecutionOutcome {
@@ -3672,6 +3720,7 @@ mod tests {
                     height: 1,
                     format: "PNG".into(),
                     recovery_note: None,
+                    source: crate::tools::ImagePayloadSource::Read,
                 }),
             },
         ];
@@ -3713,8 +3762,18 @@ mod tests {
             "prior image survives in history: {image_users:?}"
         );
         assert!(
-            image_users.contains(&"[IMAGE:data:image/jpeg;base64,fresh]"),
+            image_users
+                .iter()
+                .any(|s| s.contains("[IMAGE:data:image/jpeg;base64,fresh]")),
             "fresh image injected once: {image_users:?}"
+        );
+        let fresh_msg = image_users
+            .iter()
+            .find(|s| s.contains("base64,fresh"))
+            .expect("fresh image message present");
+        assert!(
+            fresh_msg.starts_with("<injected-tool-result-image>\n[IMAGE:data:image/jpeg;base64,"),
+            "injected image carries the provenance tag: {fresh_msg:?}"
         );
         // Dedup: the repeat read of the already-attached 'prior' image is not
         // re-injected; the fresh image is injected exactly once.
@@ -3781,6 +3840,7 @@ mod tests {
                     height: 1,
                     format: "PNG".into(),
                     recovery_note: None,
+                    source: crate::tools::ImagePayloadSource::Read,
                 }),
             },
             ToolExecutionOutcome {
@@ -3793,6 +3853,7 @@ mod tests {
                     height: 1,
                     format: "PNG".into(),
                     recovery_note: None,
+                    source: crate::tools::ImagePayloadSource::Read,
                 }),
             },
         ];
@@ -3839,6 +3900,91 @@ mod tests {
         assert!(
             tool_results[1].contains("already attached to the conversation"),
             "second read returns a reference: {tool_results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_tool_results_derives_generated_image_and_tags_it() {
+        crate::util::test::init_test_stores().await;
+
+        // A real on-disk raster at an absolute path so the derivation can compress it.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let png_path = dir.path().join("generated.png");
+        std::fs::write(&png_path, crate::util::test::noisy_png(4, 4)).expect("write png");
+        let abs = std::fs::canonicalize(&png_path).expect("canonicalize");
+
+        let tool = Box::new(MediaTestTool {
+            name: "image_gen",
+            marker: "[IMAGE:",
+        }) as Box<dyn Tool>;
+        let mut agent = make_agent(vec![tool]);
+
+        let marker = format!("[IMAGE:{}]", abs.display());
+        let tool_calls = vec![ToolCall {
+            id: "callgen".into(),
+            name: "image_gen".into(),
+            arguments: serde_json::json!({}),
+        }];
+        let outcomes = vec![ToolExecutionOutcome {
+            output: marker.clone(),
+            success: true,
+            image_payload: None,
+        }];
+
+        agent
+            .commit_tool_results(&tool_calls, &outcomes, "assistant with tool_call")
+            .await
+            .expect("commit_tool_results must succeed");
+
+        let history = agent.session.history();
+        // The derived image is injected as a synthetic user message AFTER the tool result.
+        let image_users: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.role == crate::ChatRole::User
+                    && m.content.contains("[IMAGE:data:image/jpeg;base64,")
+            })
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            image_users.len(),
+            1,
+            "generated image injected once: {image_users:?}"
+        );
+        assert!(
+            image_users[0]
+                .starts_with("<injected-tool-result-image>\n[IMAGE:data:image/jpeg;base64,"),
+            "injected image carries the provenance tag: {image_users:?}"
+        );
+
+        // The tool-result uses the Generated verb, not "Read".
+        let tool_results: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::Tool)
+            .map(|m| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&m.content).expect("tool result JSON");
+                crate::util::json::get_str(&v, "content")
+                    .expect("content")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 1);
+        assert!(
+            tool_results[0].starts_with("Generated image file"),
+            "generated annotation: {tool_results:?}"
+        );
+        assert!(
+            !tool_results[0].starts_with("Read image file"),
+            "must not be a Read annotation: {tool_results:?}"
+        );
+
+        // User delivery via the marker in the raw output is preserved.
+        let media = extract_media_from_outcomes(&agent.tools, &tool_calls, &outcomes);
+        assert_eq!(
+            media,
+            vec![("[IMAGE:", abs.display().to_string())],
+            "marker preserved for user delivery: {media:?}"
         );
     }
 }

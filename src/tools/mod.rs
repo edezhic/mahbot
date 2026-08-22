@@ -274,19 +274,46 @@ pub(crate) struct ToolExecutionOutcome {
     pub image_payload: Option<ImagePayload>,
 }
 
+/// Discriminates the tool that produced an [`ImagePayload`] so the agent loop can
+/// label the injected image with the actual operation ("Read" vs "Generated")
+/// without knowing which tool produced it — the loop selects the annotation purely
+/// by dedup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImagePayloadSource {
+    /// On-disk raster read by the read tool.
+    Read,
+    /// Tool-produced image (e.g. image_gen), or one derived by the agent loop
+    /// from a tool's `[IMAGE:path]` marker.
+    Generated,
+}
+
+impl ImagePayloadSource {
+    /// Verb that opens the injected-image annotation, e.g. "Read" for the read
+    /// tool's on-disk raster, "Generated" for a tool-produced image.
+    #[must_use]
+    pub(crate) fn verb(self) -> &'static str {
+        match self {
+            Self::Read => "Read",
+            Self::Generated => "Generated",
+        }
+    }
+}
+
 /// Per-call image payload produced by a tool that reads an on-disk raster image
-/// (the Read tool). The agent loop injects `[IMAGE:{data_uri}]` as a synthetic
-/// persisted User-role message after the round's tool results.
+/// (the Read tool), or a tool-produced/derived image (e.g. image_gen) the agent
+/// loop derives from a real on-disk `[IMAGE:path]` marker. The agent loop injects
+/// `[IMAGE:{data_uri}]` as a synthetic persisted User-role message after the
+/// round's tool results.
 ///
 /// `width`/`height` are the post-EXIF/post-resize dimensions of the *encoded*
 /// JPEG the data-URI carries, and `format` is the uppercase source-format label
 /// (`"PNG" | "JPEG" | "WEBP"`). Together they let the agent loop build the
 /// definitive attached/already-attached annotation from the payload metadata
 /// rather than rewriting a hardcoded sentence in a tool-result string.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ImagePayload {
     /// Canonical (resolved) path of the image — surfaced in the tool-result
-    /// annotation (`Read image file {path} ...`) and the debug log. The dedup
+    /// annotation (`{verb} image file {path} ...`) and the debug log. The dedup
     /// key used by the agent loop is `data_uri`, not `path`.
     pub path: String,
     /// Bounded JPEG data-URI (`data:image/jpeg;base64,...`).
@@ -301,6 +328,9 @@ pub(crate) struct ImagePayload {
     /// preserved in the tool-result annotation so the model keeps the typo
     /// context (mirrors the `[Recovered path: ...]` note shown for text reads).
     pub recovery_note: Option<String>,
+    /// Tool that produced the image, selecting the annotation verb ("Read" vs
+    /// "Generated").
+    pub source: ImagePayloadSource,
 }
 
 impl ImagePayload {
@@ -309,8 +339,12 @@ impl ImagePayload {
     #[must_use]
     pub(crate) fn attached_annotation(&self) -> String {
         let base = format!(
-            "Read image file {} ({}x{}, {}). Image content attached to the conversation as a native image.",
-            self.path, self.width, self.height, self.format
+            "{} image file {} ({}x{}, {}). Image content attached to the conversation as a native image.",
+            self.source.verb(),
+            self.path,
+            self.width,
+            self.height,
+            self.format
         );
         self.with_recovery_note(base)
     }
@@ -320,8 +354,12 @@ impl ImagePayload {
     #[must_use]
     pub(crate) fn already_attached_annotation(&self) -> String {
         let base = format!(
-            "Read image file {} ({}x{}, {}). Image content is already attached to the conversation as a native image.",
-            self.path, self.width, self.height, self.format
+            "{} image file {} ({}x{}, {}). Image content is already attached to the conversation as a native image.",
+            self.source.verb(),
+            self.path,
+            self.width,
+            self.height,
+            self.format
         );
         self.with_recovery_note(base)
     }
@@ -701,6 +739,36 @@ mod tests {
         let parsed: ToolSpec =
             serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
         assert_eq!(parsed.name, "test");
+    }
+
+    // ── ImagePayload source verb ──────────────────────────────────
+
+    #[test]
+    fn image_payload_generated_verb_annotation() {
+        let payload = ImagePayload {
+            path: "/gen/img.png".into(),
+            data_uri: "data:image/jpeg;base64,aaa".into(),
+            width: 4,
+            height: 4,
+            format: "PNG".into(),
+            recovery_note: None,
+            source: ImagePayloadSource::Generated,
+        };
+        let fresh = payload.attached_annotation();
+        assert!(
+            fresh.starts_with("Generated image file /gen/img.png"),
+            "fresh: {fresh}"
+        );
+        assert!(
+            !fresh.starts_with("Read image file"),
+            "must not be Read: {fresh}"
+        );
+        let dup = payload.already_attached_annotation();
+        assert!(
+            dup.starts_with("Generated image file /gen/img.png"),
+            "dup: {dup}"
+        );
+        assert!(dup.contains("already attached"), "dup: {dup}");
     }
 
     // ── find_tool aliases ──────────────────────────────────────────

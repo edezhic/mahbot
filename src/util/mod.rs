@@ -93,6 +93,20 @@ pub(crate) fn parse_media_marker<'h>(caps: &regex::Captures<'h>) -> (&'h str, &'
     (kind, path)
 }
 
+/// Provenance tag prepended to every synthetic User-role image message the agent
+/// loop injects, so a vision-capable model can distinguish a tool-injected image
+/// from a user-uploaded one. Consumed (with the image marker) by the image-strip
+/// path so a stripped message reads cleanly.
+pub(crate) const INJECTED_IMAGE_TAG: &str = "<injected-tool-result-image>";
+
+/// Compose the synthetic User-role message carrying a tool-injected image: the
+/// provenance tag followed by the `[IMAGE:{data_uri}]` marker the provider layer
+/// turns into a native image part.
+#[must_use]
+pub(crate) fn injected_image_user_message(data_uri: &str) -> String {
+    format!("{INJECTED_IMAGE_TAG}\n[IMAGE:{data_uri}]")
+}
+
 /// Truncate a string to `max_chars` Unicode characters, appending "…" if truncated.
 #[must_use]
 pub fn truncate(input: &str, max_chars: usize) -> String {

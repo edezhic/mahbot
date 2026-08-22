@@ -332,6 +332,7 @@ impl Tool for ReadTool {
             height: meta.height,
             format: meta.format,
             recovery_note: res.recovery_note,
+            source: crate::tools::ImagePayloadSource::Read,
         })
     }
 }
@@ -1633,6 +1634,7 @@ mod tests {
             height: 4,
             format: "PNG".into(),
             recovery_note: Some("[Recovered path: requested 'x.png', using 'y.png']".into()),
+            source: crate::tools::ImagePayloadSource::Read,
         };
         let fresh = payload.attached_annotation();
         assert!(

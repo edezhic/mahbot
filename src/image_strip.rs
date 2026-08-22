@@ -36,6 +36,7 @@
 
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::RetryExhausted;
+use crate::util::INJECTED_IMAGE_TAG;
 use crate::{ChatMessage, ChatRole};
 
 /// Provider content-inspection error code that identifies the rejection
@@ -181,10 +182,20 @@ pub(crate) fn strip_image_markers(content: &str, reason: Option<&str>) -> String
             continue;
         }
         let whole = caps.get_match();
-        out.push_str(&content[last_end..whole.start()]);
         if first {
+            let seg = &content[last_end..whole.start()];
+            // A synthetic tool-injected image message carries a provenance
+            // tag that must not dangle next to the replacement phrase.
+            if seg.contains(INJECTED_IMAGE_TAG) {
+                let cleaned = seg.replace(INJECTED_IMAGE_TAG, "").trim().to_string();
+                out.push_str(&cleaned);
+            } else {
+                out.push_str(seg);
+            }
             out.push_str(&phrase);
             first = false;
+        } else {
+            out.push_str(&content[last_end..whole.start()]);
         }
         last_end = whole.end();
     }
@@ -386,6 +397,27 @@ mod tests {
         // Empty `[IMAGE:]` does not match the marker regex — preserved.
         let content = "hello [IMAGE:] world";
         assert_eq!(strip_image_markers(content, None), content);
+    }
+
+    #[test]
+    fn strip_consumes_injected_image_tag_with_marker() {
+        let content = "<injected-tool-result-image>\n[IMAGE:data:image/jpeg;base64,abc]";
+        let out = strip_image_markers(content, Some("blocked"));
+        assert!(!out.contains("[IMAGE:"), "image marker removed: {out}");
+        assert!(
+            !out.contains("<injected-tool-result-image>"),
+            "provenance tag consumed: {out}"
+        );
+        assert!(
+            out.contains("rejected by the provider's content-inspection check"),
+            "phrase present: {out}"
+        );
+        assert!(
+            !out.starts_with("<injected-tool-result-image>"),
+            "no dangling tag next to the phrase: {out}"
+        );
+        assert!(!out.contains('\n'), "no dangling newline prefix: {out:?}");
+        assert!(!out.starts_with(' '), "no leading whitespace: {out:?}");
     }
 
     #[test]
