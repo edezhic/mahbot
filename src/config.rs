@@ -61,9 +61,10 @@
 //! `video_transcription_model` — are ordinary Chain 1 fields.
 //! [`ConfigReload::role_model`] maps every role onto exactly one slot:
 //!
-//! > `Role::Manager` | `Role::Assistant` → manager slot; every other role
-//! > (including Artist) → worker slot. The video-transcription slot backs
-//! > only video transcription — no role uses it.
+//! > Manager group (`Role::Manager`, `Role::Assistant`, `Role::Discovery`,
+//! > `Role::Engineer`) → manager slot; every other role (Artist, Analyst,
+//! > Coder, QA, Reviewer, Maintainer, Sanitation) → worker slot. The
+//! > video-transcription slot backs only video transcription — no role uses it.
 //!
 //! Unset slots fall back to their `DEFAULT_*_MODEL` constant. Historical
 //! per-role overrides are no longer used — legacy rows are inert ghosts if
@@ -239,10 +240,10 @@ pub struct ConfigData {
     /// self-hosted servers are keyless). Only ever sent to the custom endpoint,
     /// never to OpenRouter.
     pub provider_endpoint_key: Option<String>,
-    /// Model slot for the Manager role.
+    /// Model slot for the Manager group (Manager, Assistant, Discovery, Engineer).
     pub manager_model: Option<String>,
-    /// Model slot for all worker roles (Engineer, Analyst, Coder, QA,
-    /// Reviewer, Discovery, Maintainer, Sanitation).
+    /// Model slot for all worker roles (Artist, Analyst, Coder, QA,
+    /// Reviewer, Maintainer, Sanitation).
     pub worker_model: Option<String>,
     /// Model slot for video transcription (no role uses it).
     pub video_transcription_model: Option<String>,
@@ -868,13 +869,16 @@ impl ConfigReload {
 
     /// Resolve the configured model for a role from the three model slots.
     ///
-    /// Manager and Assistant use the manager slot; every other role (including
-    /// Artist) uses the worker slot. Unset slots fall back to their code
-    /// default.
+    /// The manager group (Manager, Assistant, Discovery, Engineer) uses the
+    /// manager slot; every other role (Artist, Analyst, Coder, QA, Reviewer,
+    /// Maintainer, Sanitation) uses the worker slot. Unset slots fall back to
+    /// their code default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
         match role {
-            Role::Manager | Role::Assistant => self.manager_model(),
+            Role::Manager | Role::Assistant | Role::Discovery | Role::Engineer => {
+                self.manager_model()
+            }
             _ => self.worker_model(),
         }
     }
@@ -1579,6 +1583,35 @@ mod tests {
             reload.image_gen_models(),
             vec!["model-a", "model-b", "model-c"]
         );
+    }
+
+    #[test]
+    fn role_model_maps_roles_to_slots() {
+        let reload = ConfigReload::const_new();
+        let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
+        assert!(config.set_string_field("manager_model", "manager-slot-model"));
+        assert!(config.set_string_field("worker_model", "worker-slot-model"));
+        reload.swap(config);
+
+        for role in [
+            Role::Manager,
+            Role::Assistant,
+            Role::Discovery,
+            Role::Engineer,
+        ] {
+            assert_eq!(reload.role_model(role), "manager-slot-model");
+        }
+        for role in [
+            Role::Analyst,
+            Role::Coder,
+            Role::Qa,
+            Role::Reviewer,
+            Role::Artist,
+            Role::Maintainer,
+            Role::Sanitation,
+        ] {
+            assert_eq!(reload.role_model(role), "worker-slot-model");
+        }
     }
 
     #[test]

@@ -2676,7 +2676,7 @@ impl SettingsState {
             .style(super::widgets::text_input_style)
             .width(Length::Fixed(375.0))
             .into(),
-            Some("Manager, Assistant"),
+            Some("Manager, Assistant, Discovery, Engineer"),
             self.field_errors
                 .get("config:manager_model")
                 .map(String::as_str),
@@ -2697,9 +2697,7 @@ impl SettingsState {
             .style(super::widgets::text_input_style)
             .width(Length::Fixed(375.0))
             .into(),
-            Some(
-                "Artist, Engineer, Analyst, Coder, QA, Reviewer, Discovery, Maintainer, Sanitation",
-            ),
+            Some("Artist, Analyst, Coder, QA, Reviewer, Maintainer, Sanitation"),
             self.field_errors
                 .get("config:worker_model")
                 .map(String::as_str),
