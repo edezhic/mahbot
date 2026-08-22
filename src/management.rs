@@ -1795,10 +1795,10 @@ async fn finalize_engineer_round(
 ///   the same bounce budget as review/QA bounces. When the budget is
 ///   exhausted the ticket moves to Failed via the bounce breaker — still
 ///   with the workspace paused and WITHOUT draining ReadyForDevelopment
-///   siblings. The concrete error is recorded as a `SYSTEM_ROLE`
-///   comment so it survives into the retry's rework feedback (dispatch_engineer
-///   builds feedback from comments after the last engineer-role comment) and
-///   into the Manager notification.
+///   siblings. The concrete error is recorded as an `Engineer` role
+///   comment (the unified failure-comment role) so the Manager notification
+///   surfaces it (notify_ticket renders the last comment as the failure
+///   details).
 /// - **Shutdown/drain race** (token/drain landing after the first drain-cut
 ///   check and before the transition commit — re-checked after the
 ///   workspace-pause await) → no bounce, no Failed transition; the job stays
@@ -1888,48 +1888,27 @@ async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) 
 /// notification surfaces it (`notify_ticket` renders the last comment as the
 /// failure details). `resumed` selects the observability log prefix.
 async fn bounce_engineer_hard_failure(ticket: &Ticket, comment_text: &str, resumed: bool) {
-    let bounce_trip = bounce_exhausted(ticket.bounce_count);
-    let trip_comment = bounce_trip.then(bounce_breaker_trip_comment);
-    let target = if bounce_trip {
-        TicketPhase::Failed
-    } else {
-        TicketPhase::ReadyForDevelopment
-    };
-
-    // Not a bounce-breaker drain: siblings are NOT moved to Planning, so the Failed notification must render the paused-workspace sentence, not the drain sentence.
-    let outcome = with_comment_and_transition(
-        TransitionCtx::notifying(ticket, TicketPhase::InDevelopment, target, "Engineer"),
-        async |tx| {
-            // Trip comment first, failure comment last — notify_ticket
-            // renders comments.last() as the failure details, so the
-            // Manager sees the concrete error, not just the trip message.
-            if let Some(comment) = &trip_comment {
-                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment).await?;
-            }
-            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment_text).await?;
-            // The failing bounce is not counted (stays at the max).
-            if !bounce_trip {
-                BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
-            }
-            Ok(())
-        },
+    let resumed_prefix = if resumed { "Resumed " } else { "" };
+    finalize_bounce_with_breaker(
+        ticket,
+        TicketPhase::InDevelopment,
+        "Engineer",
+        // The engineer notifies the Manager on EVERY bounce — if the engineer
+        // cannot work, escalate immediately (not just on the terminal trip).
+        /* notify_on_bounce */ true,
+        // The engineer trip pauses (in the caller) and does NOT drain siblings.
+        /* drains_siblings */ false,
+        // Unified failure-comment role: the failing stage's role, not SYSTEM_ROLE.
+        Role::Engineer.as_str(),
+        comment_text,
+        Some(&format!(
+            "{resumed_prefix}Engineer hard failure exhausted the bounce budget — ticket failed"
+        )),
+        &format!(
+            "{resumed_prefix}Engineer hard failure — ticket bounced to ReadyForDevelopment for retry"
+        ),
     )
     .await;
-
-    if matches!(outcome, FinalizeOutcome::Applied) {
-        let resumed_prefix = if resumed { "Resumed " } else { "" };
-        if bounce_trip {
-            info!(
-                ticket = %ticket.id,
-                "{resumed_prefix}Engineer hard failure exhausted the bounce budget — ticket failed",
-            );
-        } else {
-            info!(
-                ticket = %ticket.id,
-                "{resumed_prefix}Engineer hard failure — ticket bounced to ReadyForDevelopment for retry",
-            );
-        }
-    }
 }
 
 /// Run an Engineer agent to implement the ticket.
@@ -2680,67 +2659,24 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 ("{{rationale}}", &verdict.rationale),
             ],
         );
-        let exhausted = bounce_exhausted(ticket.bounce_count);
-        let target = if exhausted {
-            TicketPhase::Failed
-        } else {
-            TicketPhase::ReadyForDevelopment
-        };
-        let notify = if exhausted {
-            NotifyPolicy::Notify
-        } else {
-            NotifyPolicy::Buffer
-        };
-
-        let outcome = with_comment_and_transition(
-            TransitionCtx::new(
-                ticket,
-                TicketPhase::InSanitation,
-                target,
-                notify,
-                "Sanitation",
-            )
-            .with_breaker(exhausted),
-            async |tx| {
-                if exhausted {
-                    BoardStore::add_comment_tx(
-                        tx,
-                        &ticket.id,
-                        SYSTEM_ROLE,
-                        &bounce_breaker_trip_comment(),
-                    )
-                    .await?;
-                }
-                BoardStore::add_comment_tx(
-                    tx,
-                    &ticket.id,
-                    Role::Sanitation.as_str(),
-                    comment.as_str(),
-                )
-                .await?;
-                if !exhausted {
-                    BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
-                }
-                Ok(())
-            },
+        // Verdict bounce shares the review/QA/engineer bounce budget and trips
+        // the breaker on exhaustion (drain siblings, no pause).
+        finalize_bounce_with_breaker(
+            ticket,
+            TicketPhase::InSanitation,
+            "Sanitation",
+            // Verdict paths buffer on a non-terminal bounce, notify on the trip.
+            /* notify_on_bounce */
+            false,
+            // Verdict breaker-trips drain ReadyForDevelopment siblings.
+            /* drains_siblings */
+            true,
+            Role::Sanitation.as_str(),
+            &comment,
+            None,
+            "Sanitation failed — bounced back to ReadyForDevelopment with pipeline reservation",
         )
         .await;
-        if !matches!(outcome, FinalizeOutcome::Applied) {
-            return;
-        }
-        if exhausted {
-            drain_ready_for_development_siblings(ticket).await;
-            info!(
-                ticket = %ticket.id,
-                "Bounce circuit breaker tripped ({} bounces) — ticket failed",
-                crate::joint_verdict::MAX_BOUNCES,
-            );
-        } else {
-            info!(
-                ticket = %ticket.id,
-                "Sanitation failed — bounced back to ReadyForDevelopment with pipeline reservation",
-            );
-        }
     }
 }
 
@@ -2845,7 +2781,6 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// sequentially via [`run_diagnostics_commands`]. Stops at the first failure.
 /// After execution, transitions the ticket to either `DiagnosticsDone` (all
 /// passed) or `ReadyForDevelopment` (any failure).
-#[expect(clippy::too_many_lines)]
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
     match board()
         .claim_diagnostics(&ticket.id, DIAGNOSTICS_ROLE)
@@ -2900,67 +2835,22 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
                 .await;
             } else {
                 // Path C2: Diagnostics failed — bounce with shared budget.
-                let exhausted = bounce_exhausted(ticket.bounce_count);
-                let target = if exhausted {
-                    TicketPhase::Failed
-                } else {
-                    TicketPhase::ReadyForDevelopment
-                };
-                let notify = if exhausted {
-                    NotifyPolicy::Notify
-                } else {
-                    NotifyPolicy::Buffer
-                };
-                let outcome = with_comment_and_transition(
-                    TransitionCtx::new(
-                        &ticket,
-                        TicketPhase::InDiagnostics,
-                        target,
-                        notify,
-                        "Diagnostics",
-                    )
-                    .with_breaker(exhausted),
-                    async |tx| {
-                        if exhausted {
-                            BoardStore::add_comment_tx(
-                                tx,
-                                &ticket.id,
-                                SYSTEM_ROLE,
-                                &bounce_breaker_trip_comment(),
-                            )
-                            .await?;
-                        }
-                        BoardStore::add_comment_tx(
-                            tx,
-                            &ticket.id,
-                            DIAGNOSTICS_ROLE,
-                            comment.as_str(),
-                        )
-                        .await?;
-                        if !exhausted {
-                            BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
-                        }
-                        Ok(())
-                    },
+                finalize_bounce_with_breaker(
+                    &ticket,
+                    TicketPhase::InDiagnostics,
+                    "Diagnostics",
+                    // Verdict paths buffer on a non-terminal bounce, notify on the trip.
+                    /* notify_on_bounce */
+                    false,
+                    // Verdict breaker-trips drain ReadyForDevelopment siblings.
+                    /* drains_siblings */
+                    true,
+                    DIAGNOSTICS_ROLE,
+                    comment.as_str(),
+                    None,
+                    "Diagnostics failed — transitioned ticket",
                 )
                 .await;
-                if !matches!(outcome, FinalizeOutcome::Applied) {
-                    return;
-                }
-                if exhausted {
-                    drain_ready_for_development_siblings(&ticket).await;
-                    info!(
-                        ticket = %ticket.id,
-                        "Bounce circuit breaker tripped ({} bounces) — ticket failed",
-                        crate::joint_verdict::MAX_BOUNCES,
-                    );
-                } else {
-                    info!(
-                        ticket = %ticket.id,
-                        target = %target,
-                        "Diagnostics failed — transitioned ticket",
-                    );
-                }
             }
         }
         Ok(_) => {
@@ -4273,25 +4163,97 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
     usize::try_from(bounce_count).unwrap_or(usize::MAX) >= crate::joint_verdict::MAX_BOUNCES
 }
 
-/// Maps verifier outcome to target phase: all-failed → Failed, any-failed → Failed if exhausted else ReadyForDevelopment, otherwise success_phase.
-#[must_use]
-fn decide_verifier_bounce_target(
-    all_failed: bool,
-    any_failed: bool,
-    exhausted: bool,
-    success_phase: TicketPhase,
-) -> TicketPhase {
-    if all_failed {
+/// Shared bounce-with-circuit-breaker finalizer.
+///
+/// Computes the exhausted/target split from the ticket's shared bounce budget
+/// ([`bounce_exhausted`]) and the notify policy from `target` + `notify_on_bounce`
+/// (engineer notifies on EVERY bounce; verdict paths buffer a non-terminal
+/// bounce and notify on the trip). Writes the breaker-trip comment (SYSTEM_ROLE)
+/// followed by the failure comment (`failure_role`), increments the counter only
+/// when the ticket bounces to ReadyForDevelopment, and on a trip either drains
+/// ReadyForDevelopment siblings (`drains_siblings`) or relies on the workspace
+/// already being paused (the engineer path pauses in its caller).
+///
+/// Comment order is normalized to `[breaker, failure]` failure-last so
+/// `notify_ticket`'s last-comment lookup surfaces the concrete error. The
+/// notification's drain-vs-pause sentence is driven by `drains_siblings`, NOT
+/// by `target == Failed` alone — the engineer trip also lands on Failed but
+/// pauses.
+///
+/// Returns the [`FinalizeOutcome`] so the verifier can map `Applied` to its
+/// bool; the other callers ignore it.
+#[expect(clippy::too_many_arguments)] // the genuinely-varying axes of the four callers
+async fn finalize_bounce_with_breaker(
+    ticket: &Ticket,
+    source: TicketPhase,
+    log_label: &str,
+    notify_on_bounce: bool,
+    drains_siblings: bool,
+    failure_role: &str,
+    failure_comment: &str,
+    trip_log: Option<&str>,
+    bounce_log: &str,
+) -> FinalizeOutcome {
+    let exhausted = bounce_exhausted(ticket.bounce_count);
+    let target = if exhausted {
         TicketPhase::Failed
-    } else if any_failed {
-        if exhausted {
-            TicketPhase::Failed
-        } else {
-            TicketPhase::ReadyForDevelopment
-        }
     } else {
-        success_phase
+        TicketPhase::ReadyForDevelopment
+    };
+    let notify = if target == TicketPhase::Failed || notify_on_bounce {
+        NotifyPolicy::Notify
+    } else {
+        NotifyPolicy::Buffer
+    };
+    let trip_comment = exhausted.then(bounce_breaker_trip_comment);
+    // The verdict paths share one trip-log sentence; the engineer path passes
+    // its own (it names the stage and the resumed prefix). The default is
+    // built lazily so it isn't allocated when the caller supplies `Some`.
+    let default_trip_log;
+    let trip_log = if let Some(log) = trip_log {
+        log
+    } else {
+        default_trip_log = format!(
+            "Bounce circuit breaker tripped ({} bounces) — ticket failed",
+            crate::joint_verdict::MAX_BOUNCES,
+        );
+        &default_trip_log
+    };
+
+    // `breaker_trip` (and thus the notification's drain sentence) follows the
+    // drain mechanism, not `target == Failed`: the engineer trip lands on
+    // Failed but pauses, so it must render the paused-sentence, not the
+    // drain sentence.
+    let ctx = TransitionCtx::new(ticket, source, target, notify, log_label)
+        .with_breaker(target == TicketPhase::Failed && drains_siblings);
+
+    let outcome = with_comment_and_transition(ctx, async |tx| {
+        // [breaker, failure] failure-last so the last comment carries the
+        // concrete error (notify_ticket renders comments.last() as the
+        // failure details).
+        if let Some(comment) = &trip_comment {
+            BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment).await?;
+        }
+        BoardStore::add_comment_tx(tx, &ticket.id, failure_role, failure_comment).await?;
+        // The failing bounce is not counted (stays at the max).
+        if target == TicketPhase::ReadyForDevelopment {
+            BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
+        }
+        Ok(())
+    })
+    .await;
+
+    if matches!(outcome, FinalizeOutcome::Applied) {
+        if target == TicketPhase::Failed {
+            if drains_siblings {
+                drain_ready_for_development_siblings(ticket).await;
+            }
+            info!(ticket = %ticket.id, "{}", trip_log);
+        } else {
+            info!(ticket = %ticket.id, target = %target, "{}", bounce_log);
+        }
     }
+    outcome
 }
 
 /// Process parallel verifier results: add failing comments, determine pass/fail,
@@ -4302,13 +4264,17 @@ fn decide_verifier_bounce_target(
 /// 1. **All agents failed to produce a verdict** (every result has `verdict: None`
 ///    — crashed, timed out, or unparseable output) → transition to [`TicketPhase::Failed`]
 ///    with [`NotifyPolicy::Notify`]. This is a terminal failure; retrying would waste
-///    credits on a fundamentally broken dispatch.
+///    credits on a fundamentally broken dispatch. Kept outside the shared
+///    bounce-with-breaker helper: it is not a bounce (no breaker, no joint
+///    comment, no increment, and it pauses the workspace).
 ///
-/// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → transition back to
-///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (directly via
-///    [`transition_to_tx`](BoardStore::transition_to_tx)). No pre-flight breaker
-///    exists in [`spawn_dispatch`] for verifiers; bounce budget is checked here
-///    (see `bounce_exhausted`), so only the bounce-back is needed here.
+/// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → bounce back to
+///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (or fail on
+///    breaker exhaustion), delegating to [`finalize_bounce_with_breaker`]. No
+///    pre-flight breaker exists in [`spawn_dispatch`] for verifiers; the helper
+///    checks the shared bounce budget, drains ReadyForDevelopment siblings on a
+///    trip, and writes the joint comment LAST (after the breaker trip comment)
+///    so `notify_ticket` surfaces the concrete findings.
 ///
 /// 3. **All passed** (all at or above threshold) → transition to the verifier's
 ///    `success_phase` with [`NotifyPolicy::Buffer`]. No immediate notification fires —
@@ -4337,31 +4303,6 @@ async fn process_verifier_verdicts(
         _ => true,
     });
 
-    // Bounce-based circuit breaker: the 11th bounce fails the ticket. The
-    // counter is incremented atomically with the bounce-back transition.
-    // The ticket's counter is authoritative here: it was loaded at claim
-    // time and only the bounce-back transition (which happens AFTER this
-    // check) increments it, so no re-fetch can differ from it.
-    let exhausted = bounce_exhausted(ticket.bounce_count);
-    // Determine transition parameters based on the three-way branch:
-    //   all-failed → Failed (notify, with failure comment)
-    //   any-failed → ReadyForDevelopment (buffer, pipeline reservation),
-    //                unless the bounce breaker trips → Failed
-    //   all-passed → verifier.success_phase (buffer)
-    let target =
-        decide_verifier_bounce_target(all_failed, any_failed, exhausted, verifier.success_phase);
-    let notify = if all_failed {
-        NotifyPolicy::Notify
-    } else if any_failed {
-        if exhausted {
-            NotifyPolicy::Notify
-        } else {
-            NotifyPolicy::Buffer
-        }
-    } else {
-        NotifyPolicy::Buffer
-    };
-    let bounce_trip = any_failed && exhausted && !all_failed;
     // No exit-time ticket rollback: during the graceful drain a
     // failed round must NOT drive the ticket to Failed, bounce it, or pause
     // the workspace — the job stays status='launched' for boot resume, which
@@ -4379,36 +4320,11 @@ async fn process_verifier_verdicts(
         return false;
     }
 
-    // Preserve the per-agent failure reasons (previously collapsed into a
-    // generic "no response") and auto-pause the workspace BEFORE the Failed
-    // transition so the failure notification reflects the paused workspace.
-    // Shutdown is excluded inside the pause helper. The bounce breaker is
-    // excluded from pausing, like all other bounce-breaker trips.
-    let (failure_comment, reasons) = if all_failed {
-        let pause_note =
-            pause_workspace_on_failure(ticket, "all verifier agents failed to produce verdicts")
-                .await;
-        let reasons = verifier_failure_reasons(results);
-        let header = substitute(
-            &load_prompt("pipeline/verifiers_all_failed.md"),
-            &[("{{agent_type}}", verifier.log_label)],
-        );
-        let body = format!("{reasons}{pause_note}");
-        let failure_comment = crate::util::truncate_sandwich(
-            &crate::util::scrub_credentials(&format!("{header}\n{body}")),
-            crate::util::FAILURE_DETAIL_CAP,
-            "verifier failure",
-        );
-        (failure_comment, reasons)
-    } else {
-        (String::new(), String::new())
-    };
-
     // One joint comment replaces the per-agent failing comments — written
     // after every round EXCEPT all-failed rounds (those keep their dedicated
-    // SYSTEM_ROLE failure comment; a joint comment would duplicate it).
-    // Synthesis runs BEFORE the transition (never holding the board write
-    // lock); the comment+transition transaction stays short.
+    // failure comment; a joint comment would duplicate it). Synthesis runs
+    // BEFORE any transition (never holding the board write lock); the
+    // comment+transition transaction stays short.
     let joint_comment = if all_failed {
         None
     } else {
@@ -4427,50 +4343,45 @@ async fn process_verifier_verdicts(
         )
     };
 
-    let bounce_breaker_comment = bounce_trip.then(bounce_breaker_trip_comment);
-
-    if !matches!(
-        with_comment_and_transition(
-            TransitionCtx::new(
-                ticket,
-                verifier.active_phase,
-                target,
-                notify,
-                verifier.log_label
-            )
-            .with_breaker(bounce_trip),
-            async |tx| {
-                if let Some(comment) = &joint_comment {
-                    BoardStore::add_comment_tx(tx, &ticket.id, stage_name(verifier.role), comment)
-                        .await?;
-                }
-                if let Some(comment) = &bounce_breaker_comment {
-                    BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment).await?;
-                }
-                if all_failed {
-                    BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &failure_comment)
-                        .await?;
-                }
-                if target == TicketPhase::ReadyForDevelopment {
-                    BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
-                }
-                Ok(())
-            },
-        )
-        .await,
-        FinalizeOutcome::Applied
-    ) {
-        return false;
-    }
-
-    // A bounce-breaker trip fails the ticket with a dirty workspace — drain
-    // ReadyForDevelopment siblings so the Engineer cannot pick up unrelated
-    // work on top of the failed tree.
-    if bounce_trip {
-        drain_ready_for_development_siblings(ticket).await;
-    }
-
+    // All-failed: terminal Failed (NOT a bounce — kept outside the helper so
+    // the pass path and the terminal-failure path are not hidden). Pause the
+    // workspace, write the per-agent reasons failure comment, no breaker or
+    // joint comment, and never consume the bounce budget. Checked before
+    // `!any_failed` so a degenerate empty result slice (vacuously all-failed)
+    // still fails the ticket instead of hitting the all-passed joint-comment
+    // expectation.
     if all_failed {
+        let pause_note =
+            pause_workspace_on_failure(ticket, "all verifier agents failed to produce verdicts")
+                .await;
+        let reasons = verifier_failure_reasons(results);
+        let header = substitute(
+            &load_prompt("pipeline/verifiers_all_failed.md"),
+            &[("{{agent_type}}", verifier.log_label)],
+        );
+        let body = format!("{reasons}{pause_note}");
+        let failure_comment = crate::util::truncate_sandwich(
+            &crate::util::scrub_credentials(&format!("{header}\n{body}")),
+            crate::util::FAILURE_DETAIL_CAP,
+            "verifier failure",
+        );
+        if !matches!(
+            comment_and_transition(
+                TransitionCtx::new(
+                    ticket,
+                    verifier.active_phase,
+                    TicketPhase::Failed,
+                    NotifyPolicy::Notify,
+                    verifier.log_label
+                ),
+                SYSTEM_ROLE,
+                &failure_comment,
+            )
+            .await,
+            FinalizeOutcome::Applied
+        ) {
+            return false;
+        }
         info!(
             ticket = %ticket.id,
             reasons = %crate::util::truncate_sandwich(
@@ -4481,26 +4392,69 @@ async fn process_verifier_verdicts(
             "{log_label}: all verifier agents failed to produce verdicts — ticket moved to Failed",
             log_label = verifier.log_label,
         );
-    } else if bounce_trip {
-        info!(
-            ticket = %ticket.id,
-            "Bounce circuit breaker tripped ({MAX_BOUNCES} bounces) — ticket failed",
-            MAX_BOUNCES = crate::joint_verdict::MAX_BOUNCES,
-        );
-    } else if any_failed {
-        info!(
-            ticket = %ticket.id,
-            "{log_label} failed — pipeline reservation set for rework priority",
-            log_label = verifier.log_label,
-        );
-    } else {
+        return true;
+    }
+
+    // All-passed: advance to the verifier's success_phase (buffered). Kept
+    // outside the helper so the pass path is not hidden.
+    if !any_failed {
+        let joint = joint_comment
+            .as_deref()
+            .expect("joint comment built for a non-all-failed round");
+        if !matches!(
+            comment_and_transition(
+                TransitionCtx::buffered(
+                    ticket,
+                    verifier.active_phase,
+                    verifier.success_phase,
+                    verifier.log_label
+                ),
+                stage_name(verifier.role),
+                joint,
+            )
+            .await,
+            FinalizeOutcome::Applied
+        ) {
+            return false;
+        }
         info!(
             ticket = %ticket.id,
             "{log_label}: all passed (≥ {REVIEW_QA_THRESHOLD}/10)",
             log_label = verifier.log_label,
+            REVIEW_QA_THRESHOLD = REVIEW_QA_THRESHOLD,
         );
+        return true;
     }
-    true
+
+    // Bounce (some failed + a sub-threshold verdict, not all-failed): delegate
+    // to the shared helper. The joint comment carries the concrete review/QA
+    // findings and is written LAST (after the breaker trip comment) so
+    // notify_ticket's last-comment lookup surfaces them, not the generic trip
+    // text. The helper computes exhausted/target and the notify policy, drains
+    // RFD siblings on the trip, and returns the outcome for the bool mapping.
+    let joint = joint_comment
+        .as_deref()
+        .expect("joint comment built for a non-all-failed round");
+    let outcome = finalize_bounce_with_breaker(
+        ticket,
+        verifier.active_phase,
+        verifier.log_label,
+        // Verdict paths buffer on a non-terminal bounce, notify on the trip.
+        /* notify_on_bounce */
+        false,
+        // Verdict breaker-trips drain ReadyForDevelopment siblings.
+        /* drains_siblings */
+        true,
+        stage_name(verifier.role),
+        joint,
+        None,
+        &format!(
+            "{log_label} failed — pipeline reservation set for rework priority",
+            log_label = verifier.log_label,
+        ),
+    )
+    .await;
+    matches!(outcome, FinalizeOutcome::Applied)
 }
 
 /// Decide whether the reviewer pass may be skipped for a ticket.

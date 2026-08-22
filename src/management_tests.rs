@@ -2317,9 +2317,8 @@ fn engineer_finalize_test_agent(ws: &Workspace, ticket: &Ticket, suffix: &str) -
 /// A genuine hard "Agent failed" outcome must NOT fail the ticket: it bounces
 /// back to ReadyForDevelopment (sharing the review/QA bounce budget, with the
 /// pipeline reservation for rework priority), pauses the workspace, and
-/// records the concrete error as a SYSTEM_ROLE comment — so the retry's
-/// feedback window (comments after the last engineer-role comment) and the
-/// Manager notification both carry it.
+/// records the concrete error as an Engineer-role comment (the unified
+/// failure-comment role) so the Manager notification surfaces it.
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
 #[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
@@ -2367,9 +2366,9 @@ async fn engineer_hard_failure_bounces_to_ready_for_development() {
         .expect("get comments");
     let last = comments.last().expect("failure comment written");
     assert_eq!(
-        last.role, SYSTEM_ROLE,
-        "the failure comment must use SYSTEM_ROLE so the retry feedback window \
-         (comments after the last engineer-role comment) includes it"
+        last.role,
+        Role::Engineer.as_str(),
+        "the failure comment must use the unified failure-comment role (the failing stage's role)"
     );
     assert!(
         last.content.contains("OpenRouter 500: service is too busy"),
@@ -2472,8 +2471,9 @@ async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
          notification's last-comment lookup surfaces the concrete error"
     );
     assert_eq!(
-        comments[failure_idx].role, SYSTEM_ROLE,
-        "the failure comment must be SYSTEM_ROLE"
+        comments[failure_idx].role,
+        Role::Engineer.as_str(),
+        "the failure comment must use the unified failure-comment role (the failing stage's role)"
     );
 }
 
