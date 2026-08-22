@@ -1066,12 +1066,12 @@ fn resolved_shell_path() -> String {
 }
 
 /// Baseline `TMPDIR` binding of the sanitized session environment.
-/// The daemon's private temp root when pinned (see `crate::temp_root`),
+/// The daemon's private temp root when pinned (see `crate::temp`),
 /// otherwise the historical `"/tmp"` baseline (tests, non-unix). Single-sourced
 /// so the read-only validator's temp-variable model (see `baseline_env_value`)
 /// can't drift from the actual env.
 pub(crate) fn shell_tmpdir() -> String {
-    crate::temp_root::shell_tmpdir()
+    crate::temp::shell_tmpdir()
 }
 
 fn baseline_env_value(name: &str) -> Option<String> {

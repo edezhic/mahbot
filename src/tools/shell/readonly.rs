@@ -1967,13 +1967,13 @@ fn bind_assignments<'a>(
 /// the bare-mktemp landing root plus one level. The concrete value is unknown,
 /// but any `mktemp` result lives exactly one level below a temp root, so
 /// `..` chains over this anchor produce the same under-temp verdict as the
-/// real value. The landing root is [`crate::temp_root::bare_mktemp_landing_root`]
+/// real value. The landing root is [`crate::temp::bare_mktemp_landing_root`]
 /// — on macOS bare `mktemp` ignores `TMPDIR` and lands in the legacy darwin
 /// dir (`/var/folders/.../T`), so the anchor must model THAT root, not the
 /// (pinned) `TMPDIR`. The legacy root is preserved in `allowed_temp_roots()`,
 /// so the anchor still resolves under an allowed root.
 fn temp_anchor_path(ctx: &CheckContext) -> String {
-    let root = crate::temp_root::bare_mktemp_landing_root();
+    let root = crate::temp::bare_mktemp_landing_root();
     // Fall back to the first allowed root when the landing root is not among
     // the context's roots (tests construct hermetic contexts).
     let root = if ctx.temp_roots.contains(&root) {

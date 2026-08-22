@@ -526,7 +526,7 @@ fn main() -> Result<()> {
     // temp use (config, logs, stores, shell children). The debug,
     // __grep-engine and bench-openrouter subcommands above must NOT create
     // the root (they exit before this point).
-    mahbot::temp_root::init_temp_root()?;
+    mahbot::temp::init_temp_root()?;
 
     // Detect self-update availability mode before any async work.
     let update_mode = mahbot::self_update::update_mode();

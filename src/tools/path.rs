@@ -581,7 +581,7 @@ static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     // where bare `mktemp -d` STILL lands (it ignores TMPDIR). Preserving it
     // keeps the readonly guard's coverage exactly as broad as before the pin
     // (no write restrictions are added by the consolidation).
-    if let Some(legacy) = crate::temp_root::legacy_temp_dir() {
+    if let Some(legacy) = crate::temp::legacy_temp_dir() {
         add_path_with_canonical(&mut dirs, legacy.to_path_buf());
         add_path_with_canonical(&mut dirs, legacy.join(".agent"));
     }

@@ -1695,7 +1695,7 @@ fn has_new_commits(last_analyzed_commit: Option<&str>, current_hash: &str) -> bo
 ///   an unpause right after an empty pass waits for the next eligible night
 ///   (manual Reanalyze stays available and ungated).
 /// * **Temp-dir cleaner**: each allowed pass also dispatches the periodic
-///   temp-dir cleaner (`crate::temp_cleanup`) fire-and-forget from inside
+///   temp-dir cleaner (`crate::temp`) fire-and-forget from inside
 ///   the gated block, so it inherits the at-most-once-per-7-days cadence
 ///   and is fully isolated from workspace processing.
 /// * **Pass-start timestamp write failure**: fail-closed — the pass is
@@ -1742,7 +1742,7 @@ pub async fn run_nightly_check_loop() {
         // from the discovery pass: a dispatch failure only logs and the pass
         // proceeds (and vice versa — a pass failure never blocks the next
         // week's cleaner).
-        if let Err(e) = crate::temp_cleanup::dispatch_temp_cleanup().await {
+        if let Err(e) = crate::temp::dispatch_temp_cleanup().await {
             tracing::warn!(error = %e, "Nightly check: temp-dir cleaner dispatch failed — discovery pass continues");
         }
 

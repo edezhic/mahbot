@@ -16,7 +16,7 @@
 //! deletes the whole folder, then terminalizes the cleanup row. Folders of
 //! crashed runs are left for the OS — the daemon builds no mechanisms for
 //! crash leftovers, so there are no boot or periodic run-folder sweeps. The
-//! only periodic temp sweep (the temp-dir cleaner, see `crate::temp_cleanup`)
+//! only periodic temp sweep (the temp-dir cleaner, see `crate::temp`)
 //! protects research run folders by prompt instruction — the daemon builds
 //! no programmatic run-folder sweeps.
 //!
@@ -395,7 +395,7 @@ pub(crate) async fn dispatch_cleanup_for_pending_envelope(
 /// transient-prefix invariant test in session/mod.rs asserts against it, so a
 /// format change is caught by tests instead of silently leaking sessions.
 /// Shared by ALL transient `cleanup_` Sanitation agents: the research-run
-/// cleanup AND the periodic temp-dir cleaner (`crate::temp_cleanup`), so the
+/// cleanup AND the periodic temp-dir cleaner (`crate::temp`), so the
 /// transient-prefix invariant test covers both.
 #[must_use]
 pub(crate) fn cleanup_agent_id(job_id: &str) -> String {

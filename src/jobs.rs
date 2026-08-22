@@ -226,7 +226,7 @@ pub(crate) enum SpawnChild {
     /// the folder is released by the cleanup tail (folder first, row last).
     ResearchCleanup,
     /// A periodic OS temp-dir cleaner Sanitation agent (fire-and-forget, see
-    /// `crate::temp_cleanup`). No child row: the jobs row's `task` holds the
+    /// `crate::temp`). No child row: the jobs row's `task` holds the
     /// cleanup prompt. Leftover rows are terminalized at boot (never
     /// resumed) — the cleaner's ephemeral workspace is never registered.
     TempCleanup,
