@@ -134,7 +134,10 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 /// (moved externally / missing row / DB error → bail). Sibling [`phase_changed_and_clear_assignment`]
 /// clears `assigned_to` instead for single-slot re-dispatch rounds.
 ///
-/// Three guard sites: analysis round ([`maybe_escalate_analysis`], [`finalize_analysis_round`]), verifier round ([`dispatch_verifiers`]), resume path ([`resume_analysis_round`], [`resume_verifier_round`], [`resume_stage_round`]).
+/// Three guard-site categories (each grouping its callers): the analysis round
+/// ([`maybe_escalate_analysis`], [`finalize_analysis_round`]), the verifier
+/// round ([`dispatch_verifiers`]), and the resume path ([`resume_analysis_round`],
+/// [`resume_verifier_round`], [`resume_stage_round`]).
 #[must_use]
 async fn complete_job_and_bail_if_phase_moved(
     ticket_id: &str,
@@ -269,17 +272,6 @@ enum FinalizeOutcome {
 /// `Some(true)` when transitioning to [`TicketPhase::ReadyForDevelopment`]
 /// (bounce-back transitions get priority re-dispatch over fresh tickets),
 /// `None` for all other transitions.
-///
-/// Returns a [`FinalizeOutcome`]:
-/// - [`Applied`](FinalizeOutcome::Applied) — guard applied, finalization
-///   committed, notification dispatched.
-/// - [`Moved`](FinalizeOutcome::Moved) — the CAS phase guard missed: the
-///   ticket was moved externally while the stage was finishing. The
-///   transaction is rolled back silently (nothing written, no warning) and
-///   `assigned_to` is **not** cleared — the external mover already handled
-///   it.
-/// - [`Failed`](FinalizeOutcome::Failed) — genuine write failure: a warning
-///   is logged and `assigned_to` is cleared for re-dispatch.
 ///
 /// # Correctness
 ///
@@ -1213,8 +1205,9 @@ where
 ///
 /// # Concurrency safety
 ///
-/// - The [`BoardStore`] uses a single Turso connection wrapped in
-///   `Arc<tokio::sync::Mutex>>` — SQL operations serialize at the mutex,
+/// - The [`BoardStore`] wraps a single Turso connection in an
+///   `Arc<tokio::sync::Mutex<crate::turso::Connection>>` — SQL operations
+///   serialize at the mutex,
 ///   so concurrent access is safe. All workspaces share the same `board.db`;
 ///   per-workspace isolation is via SQL `WHERE workspace_name = ?` filtering.
 /// - The [`ticket_buffer`] and [`registry::AGENT_REGISTRY`] are
@@ -1571,21 +1564,18 @@ async fn run_single_agent(
 
 /// Build the failure comment for a failed Engineer run.
 ///
-/// Persists the classified cause + underlying detail so distinct root causes
-/// (LLM retry exhaustion, process shutdown, user cancellation, concrete agent
-/// errors) stop looking identical in ticket history. The generic template is
-/// retained only for genuinely-unknown causes. Error detail is credential-
-/// scrubbed then sandwich-truncated to [`crate::util::FAILURE_DETAIL_CAP`].
-///
-/// Classification order matters: the global shutdown token fires on SIGTERM/
-/// SIGINT and dashboard close, the per-agent token on /stop and dashboard
-/// close — check the global token first so shutdown isn't mislabeled as a
-/// user cancel. The generic template branch is a total-function fallback for
-/// genuinely-unknown causes (currently unreachable via run_agent's contract,
-/// which yields either a captured error or a cancelled agent) — retained per
-/// the failure-reporting contract. The failure-comment write during service
-/// shutdown is best-effort (the dispatch task is detached); acceptable —
-/// state semantics are unchanged.
+/// Receives pre-computed `shutdown`/`cancelled` booleans — the caller decides
+/// which mechanism applies, so the formatter never interprets token ordering
+/// itself. Persists the classified cause + underlying detail so distinct root
+/// causes (LLM retry exhaustion, process shutdown, user cancellation, concrete
+/// agent errors) stop looking identical in ticket history. The generic
+/// template branch is a total-function fallback for genuinely-unknown causes
+/// (currently unreachable via run_agent's contract, which yields either a
+/// captured error or a cancelled agent) — retained per the failure-reporting
+/// contract. Error detail is credential-scrubbed then sandwich-truncated to
+/// [`crate::util::FAILURE_DETAIL_CAP`]. The failure-comment write during
+/// service shutdown is best-effort (the dispatch task is detached);
+/// acceptable — state semantics are unchanged.
 fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>) -> String {
     if shutdown {
         return "Engineer failed: service shutting down — the run was interrupted \
@@ -2126,6 +2116,8 @@ async fn determine_notify_policy(workspace_name: &str, ticket_id: &str) -> Notif
     }
 }
 
+// ── Git helpers ────────────────────────────────────────────────────────
+
 /// Transition a ticket to Done with a descriptive reason from the given source phase.
 async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
@@ -2298,8 +2290,6 @@ async fn finalize_commit_and_transition(
     }
 }
 
-// ── Git helpers ────────────────────────────────────────────────────────
-
 /// Format a commit summary line for the ticket comment history.
 ///
 /// Covers all combinations: no changes, only additions, only deletions,
@@ -2312,6 +2302,8 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
         (a, r) => format!("Committed as `{short_hash}` (+{a}/-{r})"),
     }
 }
+
+// ── QaPassed → InSanitation → Done ────────────────────────────────────
 
 /// Handle a QaPassed ticket: check for untracked/new files and either
 /// transition to InSanitation for sanitation agent dispatch or commit
@@ -4256,6 +4248,8 @@ async fn finalize_bounce_with_breaker(
     outcome
 }
 
+// ── Verifier rounds & resume ──────────────────────────────────────────
+
 /// Process parallel verifier results: add failing comments, determine pass/fail,
 /// and update ticket phase accordingly.
 ///
@@ -4525,8 +4519,8 @@ async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
 /// rounds (2 → 3 → 4), which is intended. Bounces do not change the count.
 /// QA never passes through here (fixed 1).
 ///
-/// Shadow instrumentation: the counterfactual signals are logged at info
-/// level so the formula can be validated against a cohort after launch.
+/// The counterfactual signals are logged at info level as production
+/// telemetry, so the formula is validated against live cohorts.
 async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
     let low = crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN;
     let high = crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN;
@@ -4762,12 +4756,6 @@ async fn verifier_git_state(ws: &Workspace, vi: VerifierInfo) -> (bool, &Path, b
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs verifiers of the given role (reviewers use the calibrated dynamic
 /// count; QA runs a single agent), and processes the verdicts.
-///
-/// ## Note: no `clear_assigned_to_no_cancel` on post-run phase check
-///
-/// See [`dispatch_backlog_analysts`] for the full rationale — the same
-/// structural reasons apply here (parallel agents via [`run_parallel_agents`],
-/// `assigned_to` set to `NULL` during the [`claim_ticket_in_workspace`] claim).
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
     // ── Skip-review check for Reviewers ──────────────────────────────
     // Skip ONLY when the current content is identical to the reviewed base

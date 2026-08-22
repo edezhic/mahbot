@@ -36,7 +36,7 @@ async fn setup_db_workspace(suffix: &str) -> crate::Workspace {
 }
 
 /// Shorthand for [`init_management_test_stores`] + [`test_ws_named`] +
-/// [`TicketBuilder`].
+/// [`make_ticket`].
 ///
 /// Creates an in-memory workspace (no DB insertion) with the given `path`
 /// and `name`, creates a ticket with `title` and starting `phase`, and
