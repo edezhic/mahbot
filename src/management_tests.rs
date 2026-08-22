@@ -1546,7 +1546,7 @@ async fn sanitation_register_persists_registered_id() {
     // agent id `ticket_{job_id}_sanitation`).
     assert_eq!(
         agent_id,
-        format!("ticket_test-job_sanitation"),
+        "ticket_test-job_sanitation".to_string(),
         "sanitation agent ID must be job-derived for run isolation, got {agent_id}"
     );
 

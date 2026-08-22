@@ -52,7 +52,7 @@ use crate::{Agent, DiagnosticsCommands, Role, Workspace, WorkspaceStatus};
 /// Default number of parallel analyst agents per round. Reviewers use a
 /// calibrated dynamic count (see [`crate::joint_verdict::review_agent_count`]);
 /// QA runs a single tester (see [`QA_PARALLEL_AGENT_COUNT`]).
-pub(crate) const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
+const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
 
 /// QA runs exactly one tester per round — reviewers already verify the change
 /// in depth. May be revisited if a single tester proves insufficient.
@@ -1714,15 +1714,38 @@ fn stage_round_drain_cut(
     drain_cut
 }
 
+/// Shared post-run guard prologue for the single-agent stage-round finalizers
+/// ([`finalize_engineer_round`], [`finalize_sanitation_round`]): if the ticket
+/// phase moved on (analysis escalation, a fresh round, user cancel), complete
+/// the stage job and bail; else if the round was drain-cut (see
+/// [`stage_round_drain_cut`]), bail leaving the job 'launched' for boot resume.
+/// Returns `true` when the caller must return early; `false` to continue.
+async fn guard_stage_round(
+    ticket_id: &str,
+    phase: TicketPhase,
+    label: &str,
+    response: Option<&str>,
+    resumed: bool,
+    job_id: &str,
+) -> bool {
+    if phase_changed_and_clear_assignment(ticket_id, phase).await {
+        complete_ticket_stage_job(job_id).await;
+        return true;
+    }
+    if stage_round_drain_cut(ticket_id, label, response, resumed) {
+        return true;
+    }
+    false
+}
+
 /// Shared engineer post-run tail: phase/drain guards, failure handling, pause,
 /// transition, and job terminalization. Diagnostics are dispatched by the poll
 /// loop as a separate `PollPhase::DiagnosticsCheck` (see `poll_round`) — the
-/// success path only transitions to InDiagnostics. The guards live here:
-/// phase-moved → complete job and bail; drain-cut (see
-/// [`stage_round_drain_cut`]) → leave the job 'launched' for boot resume
-/// (fresh dispatches log, resumes stay silent); response `None` past the
-/// guards is a real failure or user cancel, delegated to
-/// [`handle_engineer_failure`].
+/// success path only transitions to InDiagnostics. The guards live in
+/// [`guard_stage_round`]: phase-moved → complete job and bail; drain-cut →
+/// leave the job 'launched' for boot resume (fresh dispatches log, resumes
+/// stay silent); response `None` past the guards is a real failure or user
+/// cancel, delegated to [`handle_engineer_failure`].
 ///
 /// `resumed` selects the observability log strings.
 async fn finalize_engineer_round(
@@ -1732,11 +1755,16 @@ async fn finalize_engineer_round(
     job_id: &str,
     resumed: bool,
 ) {
-    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDevelopment).await {
-        complete_ticket_stage_job(job_id).await;
-        return;
-    }
-    if stage_round_drain_cut(&ticket.id, "Engineer", response, resumed) {
+    if guard_stage_round(
+        &ticket.id,
+        TicketPhase::InDevelopment,
+        "Engineer",
+        response,
+        resumed,
+        job_id,
+    )
+    .await
+    {
         return;
     }
 
@@ -2473,10 +2501,10 @@ async fn register_agent_and_assign(
 
 /// Absorb the post-run tail shared by dispatch and resume: the phase/drain
 /// guards, the response-None failure block, verdict extraction with error
-/// handling, and the job terminalization. Guards: phase-moved → complete job
-/// and bail; drain-cut (see [`stage_round_drain_cut`]) → leave the job
-/// 'launched' for boot resume (fresh dispatches log, resumes stay silent);
-/// response-None past the guards is a real failure.
+/// handling, and the job terminalization. Guards (see [`guard_stage_round`]):
+/// phase-moved → complete job and bail; drain-cut → leave the job 'launched'
+/// for boot resume (fresh dispatches log, resumes stay silent); response-None
+/// past the guards is a real failure.
 async fn finalize_sanitation_round(
     ticket: &Ticket,
     agent: &Agent,
@@ -2484,11 +2512,16 @@ async fn finalize_sanitation_round(
     job_id: &str,
     resumed: bool,
 ) {
-    if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InSanitation).await {
-        complete_ticket_stage_job(job_id).await;
-        return;
-    }
-    if stage_round_drain_cut(&ticket.id, "Sanitation", response, resumed) {
+    if guard_stage_round(
+        &ticket.id,
+        TicketPhase::InSanitation,
+        "Sanitation",
+        response,
+        resumed,
+        job_id,
+    )
+    .await
+    {
         return;
     }
     let resumed_suffix = if resumed { " (resumed)" } else { "" };
@@ -2750,6 +2783,15 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
             continue;
         };
 
+        // Shared failure tail: header + body + state, with the loop-scoped
+        // `break` left at the two call sites below.
+        let mut mark_failed = |comment: &mut String, body: String| {
+            let _ = write!(comment, "\n\n{label} ({cmd}):\n");
+            comment.push_str(&body);
+            all_passed = false;
+            failed_at = label;
+        };
+
         let started = std::time::Instant::now();
         match ShellTool::new(ShellMode::Full)
             .execute_with_status(ws, serde_json::json!({"command": cmd}))
@@ -2766,26 +2808,20 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
             }
             Ok((output, _exit_code)) => {
                 // Failed command: keep the whole output exactly as before
-                // (including stderr and exit details).
-                let _ = write!(comment, "\n\n{label} ({cmd}):\n");
+                // (including stderr and exit details). Output is already
+                // credential-scrubbed by ShellTool's output pipeline at
+                // pipeline entry, so no further scrubbing needed.
                 let display = if output.is_empty() {
                     "(no output)".to_string()
                 } else {
                     output
                 };
-                // Output is already credential-scrubbed by ShellTool's output
-                // pipeline at pipeline entry, so no further scrubbing needed.
-                comment.push_str(&display);
-                all_passed = false;
-                failed_at = label;
+                mark_failed(&mut comment, display);
                 break;
             }
             Err(e) => {
                 // Timeout or process launch failure.
-                let _ = write!(comment, "\n\n{label} ({cmd}):\n");
-                comment.push_str(&e.to_string());
-                all_passed = false;
-                failed_at = label;
+                mark_failed(&mut comment, e.to_string());
                 break;
             }
         }
@@ -3181,8 +3217,9 @@ fn assemble_parallel_results(
     let mut results = Vec::with_capacity(slots.len());
     for slot in slots {
         if slot.status == crate::jobs::RowStatus::Done {
-            let outcome = slot.outcome.clone().unwrap_or_default();
-            results.push(deserialize_verdict_outcome(&outcome));
+            results.push(deserialize_verdict_outcome(
+                slot.outcome.as_deref().unwrap_or(""),
+            ));
         } else if let Some(r) = by_agent.get(slot.agent_id.as_str()) {
             results.push(r.clone());
         } else {
