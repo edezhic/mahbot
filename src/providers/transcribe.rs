@@ -113,7 +113,7 @@ impl MediaTranscriber {
                 ),
             }),
             None => workspace.map(|ws| LiveTrackingGuard::Call {
-                _guard: crate::call_registry::NON_AGENT_CALLS.register(
+                _guard: crate::registry::NON_AGENT_CALLS.register(
                     "media_transcription",
                     ws,
                     None,
@@ -256,7 +256,7 @@ enum LiveTrackingGuard {
         _guard: crate::registry::ActivityGuard,
     },
     Call {
-        _guard: crate::call_registry::NonAgentCallGuard,
+        _guard: crate::registry::NonAgentCallGuard,
     },
 }
 

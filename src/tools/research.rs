@@ -1227,7 +1227,7 @@ async fn wrap_up_timed_out(
     // batch actually runs (prep-only stages register nothing). Attaches to the
     // research run's group; the whole-run orchestrator guard already blocks
     // the drain-watch, so this row is purely observational.
-    let _wrap_up_call = crate::call_registry::NON_AGENT_CALLS.register(
+    let _wrap_up_call = crate::registry::NON_AGENT_CALLS.register(
         "research_wrap_up",
         &ws.name,
         Some(crate::registry::ParentKey::Research(run_key.to_string())),
@@ -1600,7 +1600,7 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     run_key: &str,
     question: &str,
 ) -> Result<T> {
-    let _call = crate::call_registry::NON_AGENT_CALLS.register(
+    let _call = crate::registry::NON_AGENT_CALLS.register(
         purpose,
         &ws.name,
         Some(crate::registry::ParentKey::Research(run_key.to_string())),
@@ -2694,7 +2694,7 @@ async fn synthesize(
     abstention: Option<&str>,
     run_key: &str,
 ) -> Result<SynthesisOutput> {
-    let _call = crate::call_registry::NON_AGENT_CALLS.register(
+    let _call = crate::registry::NON_AGENT_CALLS.register(
         "synthesize",
         &ws.name,
         Some(crate::registry::ParentKey::Research(run_key.to_string())),
@@ -3219,7 +3219,7 @@ async fn run_deep_research(
     // partial-report path, releasing the guard promptly. Registered as a
     // run-lifetime call: the Running Agents view renders it inside the run's
     // group as a run-lifetime indicator, not a transient LLM-call card.
-    let _orchestrator_guard = crate::call_registry::NON_AGENT_CALLS.register(
+    let _orchestrator_guard = crate::registry::NON_AGENT_CALLS.register(
         "research_orchestrator",
         &ws.name,
         Some(crate::registry::ParentKey::Research(job_id.to_string())),

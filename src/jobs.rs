@@ -615,7 +615,7 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
 /// LLM call in flight → every in-flight round has unwound (each running agent
 /// is registered until its finalize_session completes; orchestrator calls —
 /// analyze consolidation, research synthesis, joint-verdict grouping — are
-/// tracked in [`crate::call_registry::NON_AGENT_CALLS`]; the research
+/// tracked in [`crate::registry::NON_AGENT_CALLS`]; the research
 /// orchestrator additionally holds a whole-run guard, so the token is never
 /// fired into an inter-phase window between analyst deregistration and the
 /// next orchestrator call) → fires the global token, which the GUI
@@ -670,7 +670,7 @@ pub async fn run_drain_watch() {
         // agents unregistered AND their jobs status='launched' (never
         // re-registered), so the registries drain without them.
         if crate::registry::AGENT_REGISTRY.list().is_empty()
-            && crate::call_registry::NON_AGENT_CALLS.list().is_empty()
+            && crate::registry::NON_AGENT_CALLS.list().is_empty()
         {
             info!("Drain complete — no in-flight agents or orchestrator calls; exiting");
             shutdown();

@@ -5,7 +5,7 @@
 //!
 //! The view is a running-only window: it reads the in-memory registries
 //! ([`crate::registry::AGENT_REGISTRY`] and
-//! [`crate::call_registry::NON_AGENT_CALLS`]) at render time — no database
+//! [`crate::registry::NON_AGENT_CALLS`]) at render time — no database
 //! reads, no schema changes, no new subscriptions, no history retained
 //! between ticks. The existing 1-second UI tick re-renders the page, so the
 //! view refreshes at that cadence for free.
@@ -33,10 +33,9 @@
 //! sections). All header labels (ticket titles, analyze/research questions)
 //! are captured observationally at spawn — never read from the DB.
 
-use crate::call_registry::NonAgentCallHandle;
 use crate::gui::theme;
 use crate::gui::widgets;
-use crate::registry::{AgentHandle, ParentKey};
+use crate::registry::{AgentHandle, NonAgentCallHandle, ParentKey};
 use chrono::{DateTime, Utc};
 
 use iced::widget::{
@@ -102,7 +101,7 @@ pub(crate) fn view(
     pending_cancel: Option<&str>,
 ) -> Element<'static, Message> {
     let agents = crate::registry::AGENT_REGISTRY.list();
-    let calls = crate::call_registry::NON_AGENT_CALLS.list();
+    let calls = crate::registry::NON_AGENT_CALLS.list();
 
     // Workspace-first sections: each section holds its groups, groups
     // sorted by kind (tickets → analyze rounds → research runs →
@@ -742,7 +741,7 @@ fn render_tool_tooltip(tool: &crate::registry::RunningTool) -> Element<'static, 
 fn render_call_row(call: &CallRow) -> Element<'static, RunningMessage> {
     let h = &call.handle;
     let elapsed = format_elapsed(h.started_at);
-    let purpose = crate::call_registry::call_kind_label(h.kind);
+    let purpose = crate::registry::call_kind_label(h.kind);
 
     row![
         lucide::zap::<iced::Theme, iced::Renderer>()

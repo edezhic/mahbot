@@ -2715,7 +2715,7 @@ impl Dashboard {
     /// is a clickable button navigating to the Running Agents page.
     /// Returns `None` when none are in flight.
     fn render_non_agent_calls() -> Option<Element<'static, Message>> {
-        let handles = crate::call_registry::NON_AGENT_CALLS.list();
+        let handles = crate::registry::NON_AGENT_CALLS.list();
         if handles.is_empty() {
             return None;
         }
@@ -2737,7 +2737,7 @@ impl Dashboard {
         // deduping raw kinds first could repeat it.
         let mut labels: Vec<&str> = handles
             .iter()
-            .map(|h| crate::call_registry::call_kind_label(h.kind))
+            .map(|h| crate::registry::call_kind_label(h.kind))
             .collect();
         labels.sort_unstable();
         labels.dedup();

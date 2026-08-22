@@ -64,7 +64,7 @@ tokio::task_local! {
     /// transcription in video tool results) can attribute themselves to the
     /// owning agent's Running Agents card and telemetry. `None` outside an
     /// agent run (inbound enrichment, tests) — such calls register in
-    /// [`crate::call_registry::NON_AGENT_CALLS`] instead.
+    /// [`crate::registry::NON_AGENT_CALLS`] instead.
     pub(crate) static CURRENT_TOOL_AGENT_TRACKING:
         Option<crate::registry::AgentTracking>;
 }

@@ -118,8 +118,7 @@ pub(crate) fn is_cancelled(job_id: &str) -> bool {
 pub(crate) async fn cancel_research_run(job_id: &str) -> Result<(), String> {
     cancel(job_id);
     crate::registry::AGENT_REGISTRY.cancel_by_parent_key(&ParentKey::Research(job_id.to_string()));
-    crate::call_registry::NON_AGENT_CALLS
-        .remove_by_parent_key(&ParentKey::Research(job_id.to_string()));
+    crate::registry::NON_AGENT_CALLS.remove_by_parent_key(&ParentKey::Research(job_id.to_string()));
     sweep_cancelled_run(job_id).await
 }
 
