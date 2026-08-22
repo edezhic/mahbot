@@ -946,7 +946,7 @@ async fn resolve_single_user(user_name: &str) -> Option<UserRecord> {
 mod tests {
     use super::*;
     use crate::Role;
-    use crate::channels::gui::GuiChannel;
+    use crate::channels::GuiChannel;
     use std::sync::Arc;
 
     // ── Consumer loop lifecycle tests ─────────────────────────────────

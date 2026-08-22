@@ -1,13 +1,15 @@
 mod enrichment;
-pub mod gui;
 pub mod telegram;
-pub mod voice;
 pub use enrichment::{EnrichmentStrategy, enrich_links, enrich_message, has_only_audio_markers};
 pub use telegram::mirror_gui_message_to_telegram;
 
 use crate::chat_history::ChatHistoryInsert;
 use crate::turso;
-use crate::{ChannelMessage, ChatDirection};
+use crate::util::UnwrapPoison;
+use crate::{Channel, ChannelMessage, ChatDirection, SendMessage};
+use async_trait::async_trait;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
@@ -229,5 +231,164 @@ pub fn spawn_scoped_typing_task(
 pub async fn stop_typing(handle: tokio::task::JoinHandle<()>) {
     if let Err(error) = handle.await {
         tracing::error!("Typing task crashed: {error}");
+    }
+}
+
+// ── GuiChannel ────────────────────────────────────────────
+
+/// The GUI channel — always registered, even in dashboard-only mode.
+///
+/// Unlike Telegram which has its own async listener loop, the GUI channel uses
+/// an internal mpsc pair: the Iced UI pushes `ChannelMessage` values into
+/// `GUI_MESSAGE_TX`, and `listen()` reads them from the paired receiver,
+/// forwarding each one into the shared pipeline `tx`.
+///
+/// Outgoing agent responses are broadcast to the GUI dashboard and persisted
+/// to chat_history centrally via [`broadcast_and_persist_agent_response`].
+/// `GuiChannel::send()` is pure transport (no-op) — all broadcast+persist
+/// happens in the canonical function so every path gets consistent treatment.
+pub struct GuiChannel {
+    /// The internal receiver, stored so `listen()` can consume it.
+    gui_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<ChannelMessage>>>,
+}
+
+impl GuiChannel {
+    /// Create a new GuiChannel with an internal mpsc pair.
+    ///
+    /// Returns `(Self, gui_tx)`. The caller must:
+    /// 1. Store `gui_tx` in `GUI_MESSAGE_TX` globally
+    /// 2. Register this channel in the channel registry
+    /// 3. Call `listen(tx)` to start consuming from the internal receiver
+    #[must_use]
+    pub fn new() -> (Self, mpsc::UnboundedSender<ChannelMessage>) {
+        let (gui_tx, gui_rx) = mpsc::unbounded_channel::<ChannelMessage>();
+        let channel = Self {
+            gui_rx: std::sync::Mutex::new(Some(gui_rx)),
+        };
+        (channel, gui_tx)
+    }
+}
+
+#[async_trait]
+impl Channel for GuiChannel {
+    /// Pure transport — broadcast and persistence are handled centrally
+    /// by [`broadcast_and_persist_agent_response`].
+    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        // Take the receiver from the internal mutex. After this, we own it
+        // and can drop the &self reference.
+        let mut gui_rx = self
+            .gui_rx
+            .lock()
+            .unwrap_poison()
+            .take()
+            .expect("GuiChannel::listen() called twice");
+        // Mutex guard is dropped here.
+
+        // Forward each GUI-originated message into the shared pipeline.
+        // Broadcast+persist is handled centrally in process_channel_message().
+        while let Some(msg) = gui_rx.recv().await {
+            if tx.send(msg).await.is_err() {
+                tracing::info!("GuiChannel: pipeline closed — shutting down listener");
+                break;
+            }
+        }
+
+        tracing::info!("GuiChannel: listener stopped");
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "gui"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    /// GUI users are addressed by sender name.
+    fn resolve_recipient(&self, user_name: &str, _reply_target: &str) -> Option<String> {
+        Some(user_name.to_string())
+    }
+}
+
+// ── VoiceChannel ──────────────────────────────────────────
+
+/// The voice channel — registered so the message routing system can
+/// resolve the `"voice"` channel name when delivering agent responses.
+///
+/// There is no outbound voice transport — agent responses are broadcast
+/// to the GUI and persisted to chat_history by the standard response
+/// delivery path. The `send()` method is a no-op, matching the pattern
+/// used by [`GuiChannel`].
+///
+/// The voice pipeline runs its own mic-capture loop independently;
+/// `listen()` is a no-op because incoming voice commands flow through
+/// `crate::audio::voice::route_to_agent`, not through a channel listener.
+pub struct VoiceChannel;
+
+#[async_trait]
+impl Channel for VoiceChannel {
+    /// No-op — voice has no outbound transport. Agent responses are
+    /// broadcast to the GUI and persisted to chat_history by
+    /// [`broadcast_and_persist_agent_response`].
+    async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// No-op — the voice pipeline manages its own mic-capture loop.
+    async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "voice"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Register the voice channel in the global channel registry.
+///
+/// Called during bootstrap from `init_message_pipeline`. The channel
+/// registry must already be initialised — callers should ensure
+/// [`crate::CHANNEL_REGISTRY`] has been set before invoking this.
+///
+/// The `VoiceChannel` has a no-op `send()` (agent responses are
+/// delivered via broadcast+persist independently of the registry) and
+/// a no-op `listen()` (the voice pipeline runs its own mic-capture
+/// loop). Registration resolves the `"voice"` channel name so the
+/// message routing system can look it up when constructing replies.
+pub fn register_global() {
+    let channel: Arc<dyn Channel> = Arc::new(VoiceChannel);
+    crate::channel_registry().register(channel);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CHANNEL_REGISTRY, ChannelRegistry, channel_registry};
+
+    /// Verify that [`register_global`] correctly registers the voice
+    /// channel — i.e. the same function called by the production
+    /// bootstrap path in `init_message_pipeline`.
+    #[test]
+    fn test_voice_channel_registration() {
+        // Initialise the registry (idempotent — reuses if already set).
+        CHANNEL_REGISTRY.get_or_init(ChannelRegistry::default);
+
+        // Call the same registration function used by production.
+        register_global();
+
+        let found = channel_registry().get("voice");
+        assert!(
+            found.is_some(),
+            "VoiceChannel should be findable by 'voice' name"
+        );
     }
 }

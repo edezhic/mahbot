@@ -418,7 +418,7 @@ fn init_message_pipeline(
     // Always register the GUI channel — even in dashboard-only mode it provides
     // the bridge between the Iced UI and the message pipeline.
     {
-        use mahbot::channels::gui::GuiChannel;
+        use mahbot::channels::GuiChannel;
         let (gui_channel, gui_tx) = GuiChannel::new();
         mahbot::GUI_MESSAGE_TX
             .set(gui_tx)
@@ -437,7 +437,7 @@ fn init_message_pipeline(
     // resolve the "voice" channel name when delivering agent responses.
     // There is no listener — the voice pipeline runs its own mic-capture
     // loop managed by `run_voice_pipeline`.
-    mahbot::channels::voice::register_global();
+    mahbot::channels::register_global();
 
     rx
 }
