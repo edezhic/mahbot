@@ -151,8 +151,8 @@ pub(crate) fn ensure_base_url(url: &str) -> String {
 /// single-provider strings (transcription) — a single slug survives the
 /// split/trim/filter cycle unchanged.
 ///
-/// Fallbacks are explicitly pinned to `false` in the emitted JSON (mahbot-1822:
-/// the Allow Fallbacks option was removed from the settings and the runtime).
+/// Fallbacks are explicitly pinned to `false` in the emitted JSON — the
+/// Allow Fallbacks option was removed from the settings and the runtime.
 ///
 /// # Example
 ///
@@ -199,7 +199,7 @@ fn build_provider_and_transcriber(
     config: &crate::config::ConfigData,
 ) -> (Arc<dyn Provider>, Option<MediaTranscriber>) {
     // The effective endpoint + credential come from config: a custom
-    // chat-completions endpoint (mahbot-1884) when one is persisted, else the
+    // chat-completions endpoint when one is persisted, else the
     // default OpenRouter endpoint + OpenRouter key. The custom endpoint's own
     // key (if any) is used only for the custom endpoint — never the OpenRouter
     // key.
@@ -217,7 +217,7 @@ fn build_provider_and_transcriber(
 
 /// Initialize the global provider and transcriber singletons from CONFIG.
 ///
-/// Non-blocking by design (mahbot-1709 decision 4): the globals are swapped in
+/// Non-blocking by design (decision 4): the globals are swapped in
 /// BEFORE the warmup HTTP round-trip so boot never waits on it (worst case the
 /// endpoint is blackholed for minutes — a failure is non-fatal, retries happen
 /// at request time). The warmup runs as a detached background task and only
@@ -240,7 +240,7 @@ pub fn init_global() -> anyhow::Result<()> {
     // Background warmup (non-fatal). The provider is Arc-cloned so the task
     // outlives init_global; the endpoint string is captured for the log.
     // The endpoint is the effective chat endpoint — a persisted custom value
-    // is honored (mahbot-1884).
+    // is honored.
     let endpoint_str = crate::config::effective_chat_endpoint(&config);
     tokio::spawn(async move {
         if let Err(e) = provider.warmup().await {
@@ -257,7 +257,7 @@ pub fn init_global() -> anyhow::Result<()> {
 /// (the provider responds to a warmup request). Does **not** modify the
 /// global `PROVIDER` or `MEDIA_TRANSCRIBER`.
 ///
-/// Best-effort reachability probe since mahbot-1884: the persist path
+/// Best-effort reachability probe: the persist path
 /// ([`crate::config::persist_settled_string_field`]) warns on failure
 /// instead of rejecting the save, so a self-hosted endpoint can be
 /// configured before it is reachable.
@@ -265,7 +265,7 @@ pub(crate) async fn warmup_provider_from_config(
     config: &crate::config::ConfigData,
 ) -> anyhow::Result<()> {
     // Warm up against the effective endpoint — a persisted custom value is
-    // honored (mahbot-1884) — with the credential that endpoint would use.
+    // honored — with the credential that endpoint would use.
     let endpoint = crate::config::effective_chat_endpoint(config);
     let credential = crate::config::chat_credential(config);
     let provider = create_provider(credential.as_deref(), Some(&endpoint));
@@ -279,7 +279,7 @@ pub(crate) async fn warmup_provider_from_config(
 /// changes take effect without restart.
 ///
 /// The runtime MUST switch to the newly saved endpoint even when it is
-/// unreachable (mahbot-1884): the singletons are swapped in BEFORE the
+/// unreachable: the singletons are swapped in BEFORE the
 /// warmup, which then runs as a non-fatal background task (mirroring
 /// [`init_global`]) unless `background_warmup` is false. A failed warmup
 /// never leaves the old provider live — only structural validation and DB
@@ -301,7 +301,7 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData, background_
     let (provider, media_transcriber) = build_provider_and_transcriber(config);
 
     // Config-save path: swap the globals FIRST so the runtime switches to the
-    // new endpoint even when it is unreachable (mahbot-1884). The warmup is
+    // new endpoint even when it is unreachable. The warmup is
     // then a non-fatal background pool pre-warm, exactly like boot.
     *PROVIDER.write().unwrap_poison() = Some(provider.clone());
     *MEDIA_TRANSCRIBER.write().unwrap_poison() = media_transcriber;
@@ -417,7 +417,7 @@ pub(crate) fn restore_transcriber_for_test(previous: Option<MediaTranscriber>) {
 /// field (undocumented in the API reference but consumed by OpenRouter's
 /// own SDK) carries it.
 ///
-/// The display name is derived from the endpoint (mahbot-1884): "OpenRouter"
+/// The display name is derived from the endpoint: "OpenRouter"
 /// for the default endpoint, "Custom endpoint" otherwise — so custom-endpoint
 /// errors never falsely say "OpenRouter".
 ///
@@ -472,7 +472,7 @@ fn create_transcriber(
 #[must_use]
 fn build_media_transcriber(config: &crate::config::ConfigData) -> Option<MediaTranscriber> {
     // Media always targets the default OpenRouter endpoint regardless of a
-    // custom chat endpoint — mahbot-1884. The video-transcription slot never
+    // custom chat endpoint. The video-transcription slot never
     // consults provider routing — the request carries no routing block.
     let model = resolve_or(
         config.video_transcription_model.clone(),

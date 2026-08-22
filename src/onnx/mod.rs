@@ -1,7 +1,7 @@
 //! Minimal in-repo ONNX inference runtime.
 //!
-//! This module replaces the vendored `candle-onnx-mahbot` fork (removed in
-//! mahbot-1776).  It exists for exactly one consumer: the Supertonic 3 TTS
+//! This module replaces the vendored `candle-onnx-mahbot` fork (removed).
+//! It exists for exactly one consumer: the Supertonic 3 TTS
 //! pipeline ([`crate::audio::tts`]), which executes four pinned ONNX models
 //! (duration_predictor, text_encoder, vector_estimator, vocoder — all opset
 //! 19, a closed subset of 39 ops).  Nothing else in the codebase consumes

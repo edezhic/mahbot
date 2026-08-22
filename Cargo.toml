@@ -13,8 +13,8 @@ categories = ["development-tools"]
 rust-version = "1.96"
 resolver = "2"
 # `vendor/` holds canonical sources of pinned forks that cannot be published
-# with mahbot.  The last such fork (candle-onnx-mahbot) was removed in
-# mahbot-1776 (replaced by the in-repo runtime in src/onnx), so the directory
+# with mahbot.  The last such fork (candle-onnx-mahbot) was removed
+# (replaced by the in-repo runtime in src/onnx), so the directory
 # is currently unused; the exclude keeps any future vendored tree out of the
 # published .crate.
 exclude = [".DS_Store", "vendor/"]
@@ -81,7 +81,7 @@ iced_fonts = { version = "0.3", default-features = false, features = ["lucide", 
 # The same markdown parser iced_widget uses (resolved to the lock's 0.12.2 —
 # no new crates). The Sessions transcript pre-scans it to find HTML regions
 # (angle-bracket tag blocks) and escape only those, so they render as literal
-# text instead of being dropped at parse time (mahbot-1830).
+# text instead of being dropped at parse time.
 pulldown-cmark = "0.12"
 iced_anim = "0.3"
 iced_selection = { version = "0.5", features = ["markdown"] }

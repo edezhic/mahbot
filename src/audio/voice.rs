@@ -2213,7 +2213,7 @@ pub(crate) struct PipelineCtx {
     /// index on the next mic chunk so each hop reaches the stateful VAD
     /// exactly once.  Without it, an un-drained buffer re-processes (and
     /// re-counts) every prior frame on each chunk — the quadratic Phase-3
-    /// counter defect (mahbot-1782).
+    /// counter defect.
     phase3_processed: usize,
     /// Wall-clock start time of Phase 3 owner-negative collection.  Used for
     /// timeout — if [`PHASE3_TIMEOUT_SECS`] elapses, finalize with whatever
@@ -2230,7 +2230,7 @@ pub(crate) struct PipelineCtx {
     /// Adaptive threshold tracker for the rolling score window.
     adaptive_threshold: AdaptiveThresholdState,
     /// Adaptive threshold k multiplier (fixed default — the adaptive_k config
-    /// key is no longer read, mahbot-1825).
+    /// key is no longer read).
     adaptive_k: f32,
     /// Accumulated non-VAD audio during enrollment (pre-speech ambient noise
     /// and inter-utterance silence), saved as negative examples at speech
@@ -2305,7 +2305,7 @@ impl PipelineCtx {
             last_voice_notice_time: None,
             auto_model_retries_left: MAX_AUTO_MODEL_RETRY_CYCLES,
             adaptive_threshold: AdaptiveThresholdState::new(),
-            // Fixed code default (mahbot-1825): the stored adaptive_k config
+            // Fixed code default: the stored adaptive_k config
             // key is no longer read — it is an inert orphan.
             adaptive_k: ADAPTIVE_K_DEFAULT,
             segment_silence_hops: 0,
@@ -4386,7 +4386,7 @@ struct Phase3Progress {
 /// so tests can drive the segmentation deterministically instead of relying
 /// on the stateful earshot neural detector on synthetic audio.
 ///
-/// # 1:1 counting guarantee (mahbot-1782 regression)
+/// # 1:1 counting guarantee (regression)
 ///
 /// Frames are processed starting at the `processed` watermark (not at the
 /// buffer head), so each hop reaches the VAD — and the speech counter —
@@ -5898,7 +5898,7 @@ mod tests {
     }
 
     // ── Phase 3 owner-negative state machine tests ───────────────────────
-    // Regression tests for mahbot-1782: the Phase-3 speech counter grew
+    // Regression tests for the Phase-3 speech counter grew
     // quadratically (un-drained buffers re-counted every prior frame on each
     // mic chunk), tripping the (then-60 s, now 15 s) target after ~2–4 real
     // seconds.  The counting path is driven through the pure

@@ -10,7 +10,7 @@
 //! memory-mapped by the `qwen-asr` crate — zero-copy weight loading with
 //! minimal RSS overhead.
 //!
-//! # Boot strategy (mahbot-1709)
+//! # Boot strategy
 //!
 //! The boot path never waits for the model: [`spawn_background_init_if_enabled`]
 //! kicks the load-or-download chain off as a background task after the config
@@ -766,7 +766,7 @@ async fn load_from_cache(dir: PathBuf) -> Option<QwenLocalTranscriber> {
 /// ([`init_background`]). The caller is responsible for the STATE atomic
 /// guard.
 ///
-/// Decision 1 (mahbot-1709): no per-boot SHA256 re-verification — files are
+/// Decision 1: no per-boot SHA256 re-verification — files are
 /// verified once at download time (`download_verified` hashes the stream; the
 /// download loop re-verifies already-present files on recovery). A silently
 /// corrupted cache is caught at load time instead: a `None` from
@@ -870,7 +870,7 @@ pub async fn try_init_from_cache() -> bool {
 }
 
 /// Kick off the local ASR transcriber's load-or-download chain as a background
-/// task (boot path, mahbot-1709 decisions 2/3).
+/// task (boot path, decisions 2/3).
 ///
 /// The boot path never awaits this: the app and background services start
 /// regardless, and the ~4 s model load (or a full download when the cache is

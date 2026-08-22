@@ -292,7 +292,7 @@ pub enum SettingsMessage {
         generation: u64,
         result: Result<crate::config::PersistOutcome, String>,
     },
-    /// Toggle the custom chat-completions endpoint section (mahbot-1884).
+    /// Toggle the custom chat-completions endpoint section.
     /// ON only reveals the endpoint fields — nothing is staged, settled, or
     /// persisted (an endpoint becomes active when the user settles a
     /// genuinely non-default URL). OFF reverts to OpenRouter: closes the
@@ -419,7 +419,7 @@ const TEXT_INPUT_KEYS: &[&str] = &[
 
 /// Config keys rendered as discrete controls (toggles / pick lists) that
 /// persist immediately on change. `audio_transcription_use_local` is not a
-/// generic ConfigField key since mahbot-1825 — it is a dedicated
+/// generic ConfigField key — it is a dedicated
 /// [`SettingsMessage::TranscriptionToggle`] toggle with its own transactional
 /// persist path.
 const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER];
@@ -452,7 +452,7 @@ pub struct SettingsState {
     /// never persisted — the error is shown next to the offending control).
     field_errors: HashMap<String, String>,
     /// Inline warning from the last custom-endpoint save (non-fatal — e.g.
-    /// an unreachable endpoint saved anyway, mahbot-1884). Only the
+    /// an unreachable endpoint saved anyway). Only the
     /// endpoint persist arm can produce a warning, so a single slot
     /// suffices — a keyed map here would be single-key dead state.
     endpoint_warning: Option<String>,
@@ -580,7 +580,7 @@ impl SettingsState {
     /// persisted in the editable snapshot (normalized — trivial variants of
     /// the default OpenRouter URL never count). Single predicate for the
     /// OpenRouter-key highlight, the toggle state, and the Provider Routing
-    /// annotation (mahbot-1884), so UI state can never diverge from the
+    /// annotation, so UI state can never diverge from the
     /// normalized runtime endpoint.
     fn custom_endpoint_active_ui(&self) -> bool {
         crate::config::is_custom_endpoint(&crate::config::effective_chat_endpoint(&self.config))
@@ -1351,7 +1351,7 @@ impl SettingsState {
                         // (fail-open when it is unavailable) before the list is
                         // mutated; the input buffer is kept on rejection so the
                         // user can correct it. Image models always run on
-                        // OpenRouter (mahbot-1884), so validation always runs
+                        // OpenRouter, so validation always runs
                         // against the default endpoint — a custom chat endpoint
                         // must not gate media model additions.
                         ModelPickerTarget::ImageGen => {
@@ -2547,7 +2547,7 @@ impl SettingsState {
         // key is present. Computed per-render from the editable snapshot, so
         // the highlight clears on the first typed character and re-arms when
         // the field is cleared to empty/whitespace. With a genuinely custom
-        // endpoint active (mahbot-1884) the OpenRouter key is only needed for
+        // endpoint active the OpenRouter key is only needed for
         // media, so a keyless custom endpoint user's key field is not
         // highlighted.
         let custom_active = self.custom_endpoint_active_ui();
@@ -2734,7 +2734,7 @@ impl SettingsState {
         )
     }
 
-    // ── Audio section (mahbot-1825) ──────────────────────────
+    // ── Audio section ──────────────────────────
     //
     // One 'Audio' section with exactly three rows — Transcription, Wake Word
     // Detection, Text to Speech — each with the toggle and an inline status in
@@ -3347,7 +3347,7 @@ impl SettingsState {
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
         // With a custom chat endpoint staged, provider routing is a no-op —
-        // surface that so the section isn't misleading (mahbot-1884 req 8).
+        // surface that so the section isn't misleading (req 8).
         if self.custom_endpoint_active_ui() {
             rows.push(
                 text(
@@ -3381,7 +3381,7 @@ impl SettingsState {
                 field: order_field.clone(),
             };
             let order_error = self.field_errors.get(&order_field).map(String::as_str);
-            // Placeholder is a hint only (mahbot-1855): "DeepSeek" shows for
+            // Placeholder is a hint only: "DeepSeek" shows for
             // models whose ID starts with the lowercase `deepseek/` prefix
             // (OpenRouter model IDs use lowercase vendor prefixes), and no
             // placeholder for every other model. An empty field always means
@@ -4447,7 +4447,7 @@ mod tests {
         }
     }
 
-    /// Custom-endpoint toggle state machine (mahbot-1884): ON reveals the
+    /// Custom-endpoint toggle state machine: ON reveals the
     /// endpoint fields only — nothing is staged, persisted, or settle-armed;
     /// OFF closes the section and clears both endpoint fields from the
     /// editable snapshot (the async persist path then removes the persisted

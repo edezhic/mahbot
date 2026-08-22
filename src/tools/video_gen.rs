@@ -87,7 +87,7 @@ impl Tool for VideoGenTool {
         let seed = super::get_opt_i64(&args, "seed");
 
         // Build the API base URL (strip /chat/completions if present).
-        // Video generation always targets OpenRouter (mahbot-1884) — a custom
+        // Video generation always targets OpenRouter — a custom
         // chat endpoint never serves video models.
         let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
         let api_base = crate::providers::ensure_base_url(&endpoint);

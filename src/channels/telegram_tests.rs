@@ -649,7 +649,7 @@ fn wrapped_chunks_respect_telegram_limit() {
 
 #[test]
 fn tag_extension_clamped_to_telegram_limit() {
-    // Regression (mahbot-1845): extend_past_open_tag could push a chunk
+    // Regression: extend_past_open_tag could push a chunk
     // past the sendable limit when the split point landed inside a long
     // HTML tag whose '>' fell beyond the 4066-char window. The raw chunk
     // then exceeded 4096 chars and Telegram rejected the send (HTML and

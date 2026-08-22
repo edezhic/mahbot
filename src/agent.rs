@@ -1447,7 +1447,7 @@ impl Agent {
     ///
     /// All parameter sources are lazily resolved each call so that runtime
     /// hot-reload (model, routing) is reflected immediately. Reasoning effort
-    /// is baked into the role metadata since mahbot-1819 — it is not
+    /// is baked into the role metadata — it is not
     /// hot-reloadable.
     ///
     /// # KV-cache preservation
@@ -3429,7 +3429,7 @@ mod tests {
         agent.maybe_summarize().await;
     }
 
-    // ── Provider input-image rejection strip (ticket mahbot-1788) ────────
+    // ── Provider input-image rejection strip ────────
 
     /// The observed provider rejection body (OpenRouter HTTP 400
     /// `data_inspection_failed`, image variant).

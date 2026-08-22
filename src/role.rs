@@ -62,7 +62,7 @@ pub struct RoleInfo {
     pub badge_fg: (f32, f32, f32),
     /// Default reasoning effort for this role.
     ///
-    /// Authoritative since mahbot-1819: reasoning effort is no longer
+    /// Authoritative: reasoning effort is no longer
     /// user-tunable and stored `config_role.reasoning_effort` values are never
     /// consulted, so this baked default is what request time always uses.
     pub default_reasoning_effort: &'static str,
@@ -303,7 +303,7 @@ impl Role {
                 // or hit the web — for the periodic temp-dir cleaner a
                 // `search` over the whole temp folder would index junk and
                 // start filesystem watchers. Read + read-only shell cover
-                // inspection and temp-root mutation (mahbot-1779).
+                // inspection and temp-root mutation.
                 vec![
                     Box::new(ReadTool),
                     Box::new(ShellTool::new(ShellMode::ReadOnly)),
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
     fn sanitation_toolset_is_read_and_shell_only() {
-        // Acceptance pin (mahbot-1779): the Sanitation role advertises NO
+        // Acceptance pin: the Sanitation role advertises NO
         // search tools — even with web search configured — exactly read +
         // read-only shell.
         let snapshot = crate::config::CONFIG.snapshot();

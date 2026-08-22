@@ -77,8 +77,7 @@ async fn bootstrap_mahbot() -> Result<()> {
     // background task. Config is authoritative here (honors a user-set
     // audio_transcription_use_local=false) and this runs BEFORE the provider
     // init below, so the ~4s model load overlaps with the rest of boot. Never
-    // awaited — the app and background services start regardless (mahbot-1709
-    // decisions 2/3).
+    // awaited — the app and background services start regardless (decisions 2/3).
     mahbot::audio::local_transcriber::spawn_background_init_if_enabled();
     mahbot::providers::init_global()?;
 

@@ -3345,7 +3345,7 @@ async fn pickup_claim_claims_when_provider_configured() {
 #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
 async fn pickup_claim_claims_without_key_when_custom_endpoint_persisted() {
     init_management_test_stores().await;
-    // A keyless custom endpoint counts as provider configured (mahbot-1884) —
+    // A keyless custom endpoint counts as provider configured —
     // the runtime honors a persisted custom endpoint, so without an OpenRouter
     // key the pickup must still claim the workspace into discovery.
     let _cfg = ConfigGuard::new(None, Some("http://localhost:8080/v1"));

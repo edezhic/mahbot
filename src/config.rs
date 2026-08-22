@@ -41,7 +41,7 @@
 //! Fields **not** in this chain (e.g. `model_routings`) have their own
 //! dedicated table and reload path.
 //!
-//! ### Custom chat-completions endpoint (mahbot-1884)
+//! ### Custom chat-completions endpoint
 //!
 //! `provider_endpoint` is an `or(DEFAULT_PROVIDER_ENDPOINT)` field: a
 //! persisted value (a self-hosted OpenAI-compatible endpoint — Ollama,
@@ -105,10 +105,10 @@
 //! `media_transcription_model` / `media_transcription_provider` config_kv keys
 //! and the `adaptive_k` key are inert orphans: their schema and rows are left
 //! untouched, and no code path reads or writes them. (`adaptive_k`'s accessor
-//! is `fixed` since mahbot-1825 — the persisted row is never read — and the
+//! is `fixed` — the persisted row is never read — and the
 //! settings UI no longer renders a control for it, so nothing writes the row
 //! either.) The renamed `multimodal_model` config_kv key is likewise inert
-//! since mahbot-1891 — the slot is now `video_transcription_model`, so any
+//! — the slot is now `video_transcription_model`, so any
 //! legacy row under the old key is no longer read.
 //!
 //! # See also
@@ -145,20 +145,20 @@ const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
 
 /// Fresh-install seeded image-generation model list (newline-separated, in
 /// picker order; the first entry is the active model). Mirrors the curated
-/// set the live install ships (mahbot-1834).
+/// set the live install ships.
 const FRESH_INSTALL_IMAGE_GEN_MODELS: &str =
     "google/gemini-3.1-flash-image\nmicrosoft/mai-image-2.5\nqwen/qwen-image-3-pro";
 
 /// Fresh-install seeded video-generation model list (newline-separated, in
 /// picker order; the second entry is the active model). Mirrors the curated
-/// set the live install ships (mahbot-1834).
+/// set the live install ships.
 const FRESH_INSTALL_VIDEO_MODELS: &str = "bytedance/seedance-2.0-mini\nminimax/hailuo-3";
 
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
 
 /// Default adaptive k multiplier for wake word detection.
 ///
-/// Fixed runtime value since mahbot-1825: the `adaptive_k` config key is no
+/// Fixed runtime value: the `adaptive_k` config key is no
 /// longer read (the accessor is `fixed`, so a persisted row is an inert
 /// orphan), and this constant always applies.
 const DEFAULT_ADAPTIVE_K: &str = "2.5";
@@ -767,7 +767,7 @@ fn persist_lock() -> &'static tokio::sync::Mutex<()> {
     CONFIG_PERSIST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Fresh-install discriminator (mahbot-1825): set during [`load_or_init`] to
+/// Fresh-install discriminator: set during [`load_or_init`] to
 /// whether `config.db` did not exist on disk before the config store was
 /// opened this boot. [`reload_from_db`] seeds the fresh-install defaults
 /// into brand-new config databases only — existing databases receive zero
@@ -961,7 +961,7 @@ pub async fn load_or_init() -> Result<()> {
 
     // Fresh-install discriminator: capture whether the config store file exists
     // BEFORE any store open creates it, so reload_from_db() can seed
-    // fresh-install defaults into brand-new databases only (mahbot-1825). The
+    // fresh-install defaults into brand-new databases only. The
     // probe must check the exact path the store open uses (`<root>/db/config.db`
     // — see [`crate::turso::store_db_path`]); probing any other location would
     // classify every existing install as fresh and re-seed it on each boot,
@@ -988,7 +988,7 @@ fn first_legacy_value<'a>(kvs: &'a [(String, String)], legacy: &[&str]) -> Optio
     })
 }
 
-/// Fresh-install discriminator (mahbot-1825): `true` when the config store
+/// Fresh-install discriminator: `true` when the config store
 /// file does not yet exist at its real location (`<root>/db/config.db` — see
 /// [`crate::turso::store_db_path`]).
 ///
@@ -1002,7 +1002,6 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
 }
 
 /// Seed the fresh-install defaults into a brand-new config database
-/// (mahbot-1825, mahbot-1834, mahbot-1855).
 ///
 /// A fresh install must not load or download any audio model until the user
 /// enables a feature, so `audio_transcription_use_local` is seeded to
@@ -1037,7 +1036,7 @@ async fn seed_fresh_install_defaults(
     store
         .set_kv(CONFIG_KEY_VIDEO_MODELS, FRESH_INSTALL_VIDEO_MODELS)
         .await?;
-    // mahbot-1855: default model slots hosted by DeepSeek route through the
+    // default model slots hosted by DeepSeek route through the
     // DeepSeek provider on fresh installs. The rows are explicit and editable
     // (clearing the field in the Settings UI returns the model to auto).
     // Derived from the default-model constants filtered by the lowercase
@@ -1074,7 +1073,7 @@ async fn seed_fresh_install_defaults_from_flag(
     seed_fresh_install_defaults(fresh, store).await
 }
 
-/// One-time idempotent migration (mahbot-1898): rewrite persisted
+/// One-time idempotent migration: rewrite persisted
 /// `config_kv` rows that still hold the *previous* manager/worker default
 /// model to the new vision-capable default. Matching is exact on the full
 /// provider-prefixed string, so only rows the user never overrode are
@@ -1112,7 +1111,7 @@ pub async fn reload_from_db() -> Result<()> {
     let store = crate::config_db::store();
     let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
 
-    // Fresh-install seed (mahbot-1825, mahbot-1834): a brand-new config
+    // Fresh-install seed: a brand-new config
     // database gets the transcription-off default (so no audio model is
     // downloaded or loaded at boot) plus the image/video generation model
     // lists and active selections (so the Settings GUI pickers are populated).
@@ -1177,7 +1176,7 @@ pub async fn reload_from_db() -> Result<()> {
 
 /// Outcome of persisting a settled config field: the canonical persisted value
 /// plus an optional non-fatal warning (e.g. an unreachable custom endpoint that
-/// was saved anyway — mahbot-1884).
+/// was saved anyway).
 ///
 /// `pub` (not `pub(crate)`) because it flows through the public
 /// [`crate::gui::settings::SettingsMessage`] enum's persist-result variant.
@@ -1328,7 +1327,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         // validated too.
         //
         // Image models always run on OpenRouter — the catalog is
-        // endpoint-keyed on the default (mahbot-1884), so validation never
+        // endpoint-keyed on the default, so validation never
         // consults a custom chat endpoint.
         CONFIG_KEY_IMAGE_GEN_MODEL => {
             let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
@@ -1636,7 +1635,7 @@ mod tests {
         assert_eq!(trimmed_or_none(""), None);
     }
 
-    /// Endpoint normalization (mahbot-1884): trivial variants of the default
+    /// Endpoint normalization: trivial variants of the default
     /// OpenRouter URL — trailing slash, surrounding whitespace, uppercase
     /// scheme/host, a trailing `/chat/completions` suffix — must never count
     /// as a custom endpoint, while a genuinely different URL must.
@@ -1663,7 +1662,7 @@ mod tests {
         assert!(!is_custom_endpoint(DEFAULT_PROVIDER_ENDPOINT));
     }
 
-    /// Chat-credential key isolation (mahbot-1884): the OpenRouter key is
+    /// Chat-credential key isolation: the OpenRouter key is
     /// only ever used for the default endpoint. A custom endpoint uses its
     /// own key; when that key is empty NO Authorization header is sent
     /// (keyless servers) — the OpenRouter key must never reach a custom
@@ -1941,7 +1940,7 @@ mod tests {
         }
     }
 
-    /// Fresh-install seed (mahbot-1825, mahbot-1834): the fresh-install
+    /// Fresh-install seed: the fresh-install
     /// defaults land in brand-new config databases only — existing databases
     /// receive zero writes.
     ///

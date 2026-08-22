@@ -125,7 +125,7 @@ impl Tool for ImageGenTool {
         // fits the provider's ~2 MB body limit.
         super::fit_request_body_budget(&mut body, &mut references, super::MAX_REQUEST_BODY_BYTES)?;
 
-        // Image generation always targets OpenRouter (mahbot-1884) — a custom
+        // Image generation always targets OpenRouter — a custom
         // chat endpoint never serves image models.
         let api_base = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
         let images_url = format!("{api_base}/images");

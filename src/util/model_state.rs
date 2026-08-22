@@ -13,7 +13,7 @@
 //!   synchronization semantics (poisoning, init-once, contention).
 //! * All four consumers use [`ModelLoadGuard`] in their background download
 //!   loops. `local_transcriber` gained its guard when its init moved off the
-//!   awaited boot path (mahbot-1709): the boot-time background load/download
+//!   awaited boot path: the boot-time background load/download
 //!   must never leave its state stuck in `Loading` — a panic in the spawned
 //!   chain now flips it to `Failed` (the honest terminal state).
 //!

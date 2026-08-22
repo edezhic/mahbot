@@ -158,7 +158,7 @@ pub(crate) fn store_names() -> Vec<&'static str> {
 /// > required because `logs` (and any future store initialized outside this path)
 /// > lives only in the checkpoint iterator.
 ///
-/// # Real parallelism (mahbot-1709 decision 5)
+/// # Real parallelism (decision 5)
 ///
 /// Each store is spawned onto the runtime rather than joined via `try_join!`.
 /// turso's async query API performs the actual scan synchronously inside

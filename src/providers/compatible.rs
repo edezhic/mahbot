@@ -828,7 +828,7 @@ impl OpenAiCompatibleProvider {
 
         let mut extra = serde_json::Map::new();
 
-        // OpenRouter provider preferences — OpenRouter-only (mahbot-1884 req 7):
+        // OpenRouter provider preferences — OpenRouter-only (req 7):
         // the block has no meaning outside OpenRouter, so it is never sent to
         // custom endpoints. Per-request `data_collection: allow` overrides the
         // account-level strict privacy default so data-collecting paid endpoints
@@ -845,10 +845,10 @@ impl OpenAiCompatibleProvider {
             extra.insert("provider".to_string(), serde_json::Value::Object(provider));
         }
 
-        // Reasoning effort — model-family-aware for custom endpoints
-        // (mahbot-1888). The default OpenRouter endpoint stays byte-identical
-        // to pre-mahbot-1888: the effort passes through unchanged (OpenRouter
-        // normalizes the value per model). Custom endpoints get the family's
+        // Reasoning effort — model-family-aware for custom endpoints.
+        // The default OpenRouter endpoint stays byte-identical: the effort
+        // passes through unchanged (OpenRouter normalizes the value per
+        // model). Custom endpoints get the family's
         // native field/value vocabulary (e.g. Ollama 400s on `xhigh`), so
         // reasoning works by default on self-hosted servers too.
         match reasoning_fields_for_request(
@@ -892,10 +892,10 @@ impl OpenAiCompatibleProvider {
     }
 }
 
-// ── Model-family reasoning translation for custom endpoints (mahbot-1888) ──
+// ── Model-family reasoning translation for custom endpoints ──
 
 /// Reasoning-field outcome for a chat-completions request after
-/// model-family translation (mahbot-1888).
+/// model-family translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReasoningFields {
     /// Send `reasoning_effort: <value>`.
@@ -912,7 +912,7 @@ enum ReasoningFields {
 ///
 /// - No effort (`None`/empty) → no reasoning fields, regardless of endpoint.
 /// - Default OpenRouter endpoint → the effort passes through unchanged
-///   (byte-identical to pre-mahbot-1888 behavior; OpenRouter normalizes the
+///   (byte-identical behavior; OpenRouter normalizes the
 ///   value per model).
 /// - Custom endpoint → [`translate_for_custom_endpoint`] applies the
 ///   model family's native field/value vocabulary.
@@ -993,7 +993,7 @@ fn translate_for_custom_endpoint(model: &str, effort: &str) -> ReasoningFields {
     }
 }
 
-/// Reasoning-effort vocabulary families (mahbot-1888). Declaration order is
+/// Reasoning-effort vocabulary families. Declaration order is
 /// the family-detection order: a case-insensitive substring match on the
 /// model name, first-match-wins (deepseek, kimi, glm, hy3, muse-spark, grok,
 /// gemini, mimo, minimax), then the fallback.
@@ -1356,11 +1356,11 @@ mod tests {
         );
     }
 
-    /// Provider routing is OpenRouter-only (mahbot-1884 req 7): asserted on
+    /// Provider routing is OpenRouter-only (req 7): asserted on
     /// the serialized request body at the builder choke point — the block is
     /// sent for the default endpoint and suppressed for a custom endpoint,
     /// while `reasoning_effort` is sent unchanged to the default endpoint and
-    /// translated per model family on custom endpoints (mahbot-1888).
+    /// translated per model family on custom endpoints.
     #[test]
     fn provider_routing_block_suppressed_for_custom_endpoint() {
         let mut request = test_request(vec![ChatMessage::user("hello")], None);
@@ -1433,7 +1433,7 @@ mod tests {
         );
 
         // Custom endpoint → routing block suppressed; reasoning_effort is
-        // translated for the custom endpoint's model family (mahbot-1888).
+        // translated for the custom endpoint's model family.
         // The 'test' model matches no family → fallback → xhigh→max.
         let custom_provider =
             OpenAiCompatibleProvider::new("Custom endpoint", "http://localhost:8080/v1", None);
@@ -1453,7 +1453,7 @@ mod tests {
     }
 
     /// Full model-family × effort translation table for custom endpoints
-    /// (mahbot-1888): every family, the fallback, unmapped-effort passthrough,
+    /// every family, the fallback, unmapped-effort passthrough,
     /// field-shape dominance for MiMo/MiniMax, family over-capture of older
     /// siblings, case-insensitivity, and first-match-wins ordering. Also
     /// asserts requirement 2: the OpenRouter path stays byte-identical

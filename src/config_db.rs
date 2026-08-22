@@ -5,7 +5,7 @@
 //! - `config_model_routing` — per-model provider order.
 //!
 //! The `config_role` table (per-role model overrides) remains in the schema
-//! but is intentionally unreferenced since mahbot-1822: its rows are inert
+//! but is intentionally unreferenced: its rows are inert
 //! orphans (schema unchanged, rows untouched, no read or write path).
 
 use crate::config::{
@@ -138,7 +138,6 @@ impl ConfigStore {
     }
 
     /// Persist the transcription toggle and its wake-word cascade atomically
-    /// (mahbot-1825).
     ///
     /// Row semantics are unchanged: enabling deletes the `audio_transcription_use_local`
     /// row (absence = enabled), disabling writes `"false"`. When turning
@@ -561,7 +560,7 @@ mod tests {
         crate::config::CONFIG.swap(original);
     }
 
-    /// An unreachable custom chat endpoint is saved anyway (mahbot-1884): the
+    /// An unreachable custom chat endpoint is saved anyway: the
     /// persist path warns (non-fatal) instead of rejecting, so a self-hosted
     /// endpoint can be configured before its server is reachable. Port 1 →
     /// immediate connection refused — fast, no external network.

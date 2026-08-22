@@ -2817,7 +2817,7 @@ mod tests {
 // Regenerates the complete synthesis pipeline (duration predictor → text
 // encoder → 8 flow-matching vector-estimator steps → vocoder) and asserts the
 // PCM is bit-identical to the reference captured from the removed
-// candle-onnx-mahbot fork (mahbot-1776).  The SHA-256 below is the digest of
+// candle-onnx-mahbot fork. The SHA-256 below is the digest of
 // that reference PCM: 147456 f32 samples at 44.1 kHz for the fixed
 // text/style/seed.  Requires the model files on disk (skips otherwise).
 #[cfg(all(test, feature = "voice-tests"))]

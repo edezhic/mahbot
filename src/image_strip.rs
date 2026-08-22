@@ -14,7 +14,7 @@
 //! `src/prompt/`). The agent run then continues through its normal loop with
 //! the corrected message; there is **no dedicated retry step**.
 //!
-//! Scope contract (ticket mahbot-1788):
+//! Scope contract:
 //! - Only the most recent User-role message is touched; images in earlier
 //!   user messages are left alone.
 //! - The strip fires only on genuine input-image content rejections: the
