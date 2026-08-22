@@ -65,9 +65,9 @@
 //! > (including Artist) → worker slot. The video-transcription slot backs
 //! > only video transcription — no role uses it.
 //!
-//! Unset slots fall back to their `DEFAULT_*_MODEL` constant. The legacy
-//! `config_role` table (per-role overrides) is no longer read or written —
-//! its rows are inert orphans per the orphaned-key policy.
+//! Unset slots fall back to their `DEFAULT_*_MODEL` constant. Historical
+//! per-role overrides are no longer used — legacy rows are inert ghosts if
+//! present.
 //!
 //! ## Chain 3: Per-model provider routing
 //!
@@ -89,27 +89,13 @@
 //! | `config_kv` | [`crate::config_db::ConfigStore::get_all_kv`] | [`crate::config_db::ConfigStore::set_kv`] |
 //! | `config_model_routing` | [`crate::config_db::ConfigStore::get_all_model_routings`] | [`crate::config_db::ConfigStore::save_model_routing`] |
 //!
-//! The `config_role` table remains in the schema but is intentionally
-//! unreferenced (see the orphaned-key policy below).
-//!
 //! # Orphaned database keys
 //!
 //! Rows in `config_kv` without a corresponding [`ConfigData`] field are
-//! silently ignored and require no migration. Some legacy keys are still read
-//! as migration sources in [`reload_from_db`] when the target field is unset;
-//! those rows are kept intentionally (a downgrade would resurrect them) and
-//! must not be deleted. Orphaned rows are harmless and are naturally
-//! overwritten if a future config key reuses the name.
-//!
-//! The `config_role` table (per-role overrides) and the legacy
-//! `media_transcription_model` / `media_transcription_provider` config_kv keys
-//! and the `adaptive_k` key are inert orphans: their schema and rows are left
-//! untouched, and no code path reads or writes them. (`adaptive_k`'s accessor
-//! is `fixed` — the persisted row is never read — and the
-//! settings UI no longer renders a control for it, so nothing writes the row
-//! either.) The renamed `multimodal_model` config_kv key is likewise inert
-//! — the slot is now `video_transcription_model`, so any
-//! legacy row under the old key is no longer read.
+//! silently ignored (`tracing::debug!("Unknown config key, ignoring")` in
+//! [`reload_from_db`]) and left as harmless ghosts — no `DROP`/`DELETE`
+//! migration. They are naturally overwritten if a future config key reuses the
+//! name.
 //!
 //! # See also
 //!
@@ -155,13 +141,6 @@ const FRESH_INSTALL_IMAGE_GEN_MODELS: &str =
 const FRESH_INSTALL_VIDEO_MODELS: &str = "bytedance/seedance-2.0-mini\nminimax/hailuo-3";
 
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
-
-/// Default adaptive k multiplier for wake word detection.
-///
-/// Fixed runtime value: the `adaptive_k` config key is no
-/// longer read (the accessor is `fixed`, so a persisted row is an inert
-/// orphan), and this constant always applies.
-const DEFAULT_ADAPTIVE_K: &str = "2.5";
 
 // ── Named config structs ───────────────────────────────────────────
 
@@ -308,10 +287,6 @@ pub struct ConfigData {
     /// JSON-serialized wake word enrollment (v2 schema: prototype + calibration)
     /// for the voice assistant.  Owned exclusively by the voice pipeline.
     pub wake_word_templates: Option<String>,
-    /// Adaptive threshold k multiplier for wake word detection (default: `"2.5"`).
-    /// The adaptive threshold is computed as `mean + k × std` over a running
-    /// window of recent per-frame classifier scores.  Range: [1.0, 4.0].
-    pub adaptive_k: Option<String>,
     /// Per-model provider routing.
     pub model_routings: Vec<ModelRouting>,
 }
@@ -349,13 +324,10 @@ pub struct ConfigData {
 //
 // ══ Per-field accessor patterns ═════════════════════════════════════
 //
-// Each field is annotated with one of four patterns:
+// Each field is annotated with one of three patterns:
 //
 // * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
 // * `or(DEFAULT)` — returns `String`, falls back to the given default constant.
-// * `fixed(DEFAULT)` — returns `String`, ALWAYS the given constant (the
-//   persisted field value is not honored; used when a field stays in the
-//   schema for future use but only one value is currently supported).
 // * `list_or(fallback = <field>, default = <const>)` — returns `Vec<String>`,
 //   parses a newline-separated list, falls back to the named field then
 //   the default constant.
@@ -367,7 +339,7 @@ pub struct ConfigData {
 /// — all from a single annotated list of `Option<String>` field names.
 ///
 /// Each field is declared as `$field [$annotation]` where `$annotation` is one of
-/// `non_empty`, `or($default)`, `fixed($default)`, or `list_or(fallback = $fallback, default = $default)`.
+/// `non_empty`, `or($default)`, or `list_or(fallback = $fallback, default = $default)`.
 ///
 /// All generated items are guaranteed to stay synchronised because they expand
 /// from the same source.
@@ -503,24 +475,6 @@ macro_rules! string_config_fields {
         }
     };
 
-    // ── Accessor pattern: fixed(DEFAULT) ────────────────────────
-    //
-    // Returns String, ALWAYS the given constant — the persisted field
-    // value is not honored at runtime. Used when a config field stays in
-    // the schema (future use) but only one value is currently supported.
-    (@accessor $field:ident fixed($default:expr)) => {
-        #[doc = concat!(
-            "Returns the hardcoded `", stringify!($field),
-            "` value `", stringify!($default),
-            "` — any persisted value is not honored while only this ",
-            "value is supported."
-        )]
-        #[must_use]
-        pub fn $field(&self) -> String {
-            $default.to_string()
-        }
-    };
-
     // ── Accessor pattern: list_or(fallback = <field>, default = <const>) ──
     //
     // Returns Vec<String>. Tries parsing `$field` as a newline-separated list.
@@ -565,7 +519,6 @@ string_config_fields! {
     tts_enabled [non_empty],
     tts_language [or(DEFAULT_TTS_LANGUAGE)],
     wake_word_templates [non_empty],
-    adaptive_k [fixed(DEFAULT_ADAPTIVE_K)],
 }
 
 impl ConfigData {
@@ -979,15 +932,6 @@ pub async fn load_or_init() -> Result<()> {
     Ok(())
 }
 
-/// First value in `kvs` whose key matches any of `legacy` (in order).
-fn first_legacy_value<'a>(kvs: &'a [(String, String)], legacy: &[&str]) -> Option<&'a str> {
-    legacy.iter().find_map(|k| {
-        kvs.iter()
-            .find(|(kk, _)| kk.as_str() == *k)
-            .map(|(_, v)| v.as_str())
-    })
-}
-
 /// Fresh-install discriminator: `true` when the config store
 /// file does not yet exist at its real location (`<root>/db/config.db` — see
 /// [`crate::turso::store_db_path`]).
@@ -1128,15 +1072,6 @@ pub async fn reload_from_db() -> Result<()> {
         if !config.set_string_field(key, value) {
             tracing::debug!(key, "Unknown config key, ignoring");
         }
-    }
-
-    // Migrate the legacy split video config keys into the unified video_model
-    // field: the old video-edit value takes precedence over the old video-gen
-    // value. The legacy keys remain as orphaned config_kv rows (harmless; a
-    // downgrade would resurrect them — accepted).
-    if config.video_model.is_none() {
-        config.video_model =
-            first_legacy_value(&kvs, &["video_edit_model", "video_gen_model"]).map(String::from);
     }
 
     let routings = store.get_all_model_routings().await?;

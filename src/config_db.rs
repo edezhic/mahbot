@@ -3,10 +3,6 @@
 //! Two tables:
 //! - `config_kv` — generic key-value string pairs for runtime configuration.
 //! - `config_model_routing` — per-model provider order.
-//!
-//! The `config_role` table (per-role model overrides) remains in the schema
-//! but is intentionally unreferenced: its rows are inert
-//! orphans (schema unchanged, rows untouched, no read or write path).
 
 use crate::config::{
     CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_VOICE_ENABLED, ModelRouting,
@@ -26,12 +22,6 @@ const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS config_kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS config_role (
-    role             TEXT PRIMARY KEY,
-    model            TEXT,
-    reasoning_effort TEXT
 );
 
 CREATE TABLE IF NOT EXISTS config_model_routing (

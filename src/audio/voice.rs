@@ -2229,8 +2229,7 @@ pub(crate) struct PipelineCtx {
     segment_silence_hops: usize,
     /// Adaptive threshold tracker for the rolling score window.
     adaptive_threshold: AdaptiveThresholdState,
-    /// Adaptive threshold k multiplier (fixed default — the adaptive_k config
-    /// key is no longer read).
+    /// Adaptive threshold k multiplier (fixed at [`ADAPTIVE_K_DEFAULT`]).
     adaptive_k: f32,
     /// Accumulated non-VAD audio during enrollment (pre-speech ambient noise
     /// and inter-utterance silence), saved as negative examples at speech
@@ -2305,8 +2304,7 @@ impl PipelineCtx {
             last_voice_notice_time: None,
             auto_model_retries_left: MAX_AUTO_MODEL_RETRY_CYCLES,
             adaptive_threshold: AdaptiveThresholdState::new(),
-            // Fixed code default: the stored adaptive_k config
-            // key is no longer read — it is an inert orphan.
+            // Fixed default — no config key backs this field.
             adaptive_k: ADAPTIVE_K_DEFAULT,
             segment_silence_hops: 0,
             #[cfg(feature = "voice-tests")]

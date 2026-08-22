@@ -62,9 +62,8 @@ pub struct RoleInfo {
     pub badge_fg: (f32, f32, f32),
     /// Default reasoning effort for this role.
     ///
-    /// Authoritative: reasoning effort is no longer
-    /// user-tunable and stored `config_role.reasoning_effort` values are never
-    /// consulted, so this baked default is what request time always uses.
+    /// Authoritative: reasoning effort is baked into the binary and not
+    /// user-tunable, so this default is what request time always uses.
     pub default_reasoning_effort: &'static str,
     /// Human-readable display label (e.g. `"QA"` for [`Role::Qa`]).
     pub display_label: &'static str,
