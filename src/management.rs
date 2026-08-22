@@ -2793,10 +2793,12 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 
     // The removed "Auto-diagnostics" header would leave the first command's
     // separator as leading blank lines — strip them.
-    // Owner-deletes-at-end: the diagnostics runner is a NON-AGENT consumer of
-    // ShellTool, so its spill files are recorded under the non-agent owner key —
-    // clean them up here (equivalent to the agent-run-end hook).
-    crate::tools::shell::cleanup_agent_spills(crate::tools::shell::NON_AGENT_SPILL_OWNER);
+    // Owner-deletes-at-end: the diagnostics runner is a non-agent consumer of
+    // ShellTool, so its spill files are recorded under [`crate::role::DIAGNOSTICS_ROLE`]
+    // (`"diagnostics"`) — clean them up here (equivalent to the agent-run-end hook).
+    // Agent ids (`ticket_*`, `manager_*`, etc.) never equal bare `"diagnostics"` so
+    // no collision.
+    crate::tools::shell::cleanup_agent_spills(DIAGNOSTICS_ROLE);
     (comment.trim_start_matches('\n').to_string(), all_passed)
 }
 

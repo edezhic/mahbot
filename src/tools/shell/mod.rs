@@ -1239,11 +1239,6 @@ fn agent_temp_dir() -> Option<std::path::PathBuf> {
     Some(dir)
 }
 
-/// Registry key for spill files created OUTSIDE an agent run (the diagnostics
-/// runner, tests). An agent id is never empty, so this sentinel cannot collide
-/// with a real owner.
-pub(crate) const NON_AGENT_SPILL_OWNER: &str = "";
-
 /// Spill files created during agent runs, keyed by the owning agent id.
 /// Owner-deletes-at-end: [`cleanup_agent_spills`] removes them when the agent
 /// run ends. Entries for a dead agent id are removed on cleanup; a daemon
@@ -1255,13 +1250,22 @@ static SPILL_OWNERS: std::sync::LazyLock<
 
 /// Record a spill file under the current tool's owning agent id (set during
 /// agent tool execution). Outside an agent run (diagnostics runner, tests)
-/// the file is recorded under [`NON_AGENT_SPILL_OWNER`] so the diagnostics
-/// runner can clean up what it created.
+/// the file is recorded under [`crate::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`)
+/// so the diagnostics runner can clean up what it created. Agent ids are always
+/// prefixed (`ticket_*`, `manager_*`, etc.) and never equal bare `"diagnostics"`
+/// so no collision. Tests outside an agent also bucket there (acceptable).
 fn record_spill_owner(path: std::path::PathBuf) {
     let agent = crate::agent::CURRENT_TOOL_AGENT_ID
         .try_with(Clone::clone)
         .unwrap_or(None);
-    let key = agent.unwrap_or_else(|| NON_AGENT_SPILL_OWNER.to_string());
+    if let Some(ref agent_id) = agent {
+        debug_assert_ne!(
+            agent_id,
+            crate::role::DIAGNOSTICS_ROLE,
+            "agent id must not collide with diagnostics spill owner"
+        );
+    }
+    let key = agent.unwrap_or_else(|| crate::role::DIAGNOSTICS_ROLE.to_string());
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
     map.entry(key).or_default().push(path);
 }
@@ -1269,7 +1273,8 @@ fn record_spill_owner(path: std::path::PathBuf) {
 /// Delete the spill files recorded for `agent_id` (owner-deletes-at-end).
 /// Also clears the registry entry so a later run of the same agent id starts
 /// fresh. Callers: the agent run end hook (`run_agent`) and the diagnostics
-/// runner (which passes [`NON_AGENT_SPILL_OWNER`]).
+/// runner (which passes [`crate::role::DIAGNOSTICS_ROLE`]) — the diagnostics
+/// spill owner is [`crate::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`).
 pub(crate) fn cleanup_agent_spills(agent_id: &str) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
     let Some(paths) = map.remove(agent_id) else {
