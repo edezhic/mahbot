@@ -675,7 +675,7 @@ pub(crate) fn normalize_endpoint_url(url: &str) -> String {
         .trim_end_matches('/');
     // Lowercase scheme + host, preserve the path as-is.
     if let Some(scheme_end) = t.find("://") {
-        let scheme_and_dots = &t[..=scheme_end];
+        let scheme_and_dots = &t[..scheme_end + 3];
         let rest = &t[scheme_end + 3..];
         let authority_end = rest.find('/').unwrap_or(rest.len());
         let authority = &rest[..authority_end];
@@ -1440,9 +1440,7 @@ fn validate_config(config: &ConfigData) -> Result<()> {
             .strip_prefix("https://")
             .or_else(|| ep.strip_prefix("http://"))
             .unwrap();
-        let auth_end = rest
-            .find(['/', '?', '#'])
-            .unwrap_or(rest.len());
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = rest[..auth_end].trim();
         if authority.is_empty() || authority.starts_with(':') {
             anyhow::bail!(
