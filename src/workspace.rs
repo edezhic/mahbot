@@ -2915,107 +2915,75 @@ mod tests {
     // ── is_nightly_check_hour — time-window boundary tests ────────
 
     #[test]
-    fn nightly_check_hour_before_window() {
-        assert!(!is_nightly_check_hour(1), "1:00 AM is before the window");
-    }
-
-    #[test]
-    fn nightly_check_hour_start_inclusive() {
-        assert!(
-            is_nightly_check_hour(2),
-            "2:00 AM is the start of the window"
-        );
-    }
-
-    #[test]
-    fn nightly_check_hour_end_exclusive() {
-        assert!(
-            !is_nightly_check_hour(3),
-            "3:00 AM is excluded from the window"
-        );
-    }
-
-    #[test]
-    fn nightly_check_hour_after_window() {
-        assert!(!is_nightly_check_hour(4), "4:00 AM is after the window");
-    }
-
-    #[test]
-    fn nightly_check_hour_off_hours() {
-        assert!(!is_nightly_check_hour(0), "Midnight is outside the window");
-        assert!(!is_nightly_check_hour(12), "Noon is outside the window");
-        assert!(!is_nightly_check_hour(23), "11 PM is outside the window");
+    fn nightly_check_hour_window_boundaries() {
+        let cases: &[(u32, bool, &str)] = &[
+            (1, false, "1:00 AM is before the window"),
+            (2, true, "2:00 AM is the start of the window"),
+            (3, false, "3:00 AM is excluded from the window"),
+            (4, false, "4:00 AM is after the window"),
+            (0, false, "Midnight is outside the window"),
+            (12, false, "Noon is outside the window"),
+            (23, false, "11 PM is outside the window"),
+        ];
+        for (hour, expected, msg) in cases {
+            assert_eq!(is_nightly_check_hour(*hour), *expected, "{msg}");
+        }
     }
 
     // ── nightly_gate_allows — rolling 7-day frequency gate tests ──
 
     #[test]
-    fn nightly_gate_allows_first_pass() {
-        assert!(
-            nightly_gate_allows(None, Utc::now()),
-            "No recorded pass (first night ever) must be allowed",
-        );
-    }
-
-    #[test]
-    fn nightly_gate_allows_exactly_seven_days() {
-        // 'at least 7 days old' → elapsed >= 7 × 24 h, so the exact boundary
-        // is allowed.
+    fn nightly_gate_allows_table() {
+        // Hold `now` constant across all rows so elapsed-duration
+        // computations stay deterministic.
         let now = Utc::now();
-        let last = (now - chrono::Duration::days(7)).to_rfc3339();
-        assert!(
-            nightly_gate_allows(Some(&last), now),
-            "Exactly 7 days elapsed must be allowed (>= 7 days)",
-        );
-    }
-
-    #[test]
-    fn nightly_gate_blocks_before_seven_days() {
-        let now = Utc::now();
-        // 6 days 23 h 59 m 59 s elapsed — one second short of the boundary.
-        let last = (now - chrono::Duration::days(7) + chrono::Duration::seconds(1)).to_rfc3339();
-        assert!(
-            !nightly_gate_allows(Some(&last), now),
-            "6d23h59m59s elapsed must be blocked",
-        );
-        // Pass recorded just now — elapsed ~0.
+        let exact_7d = (now - chrono::Duration::days(7)).to_rfc3339();
+        let one_sec_short =
+            (now - chrono::Duration::days(7) + chrono::Duration::seconds(1)).to_rfc3339();
         let just_ran = now.to_rfc3339();
-        assert!(
-            !nightly_gate_allows(Some(&just_ran), now),
-            "A just-recorded pass must block",
-        );
-    }
+        let eight_days = (now - chrono::Duration::days(8)).to_rfc3339();
+        let future = (now + chrono::Duration::hours(1)).to_rfc3339();
 
-    #[test]
-    fn nightly_gate_allows_after_seven_days() {
-        let now = Utc::now();
-        let last = (now - chrono::Duration::days(8)).to_rfc3339();
-        assert!(
-            nightly_gate_allows(Some(&last), now),
-            "8 days elapsed must be allowed",
-        );
-    }
-
-    #[test]
-    fn nightly_gate_blocks_future_timestamp() {
-        // Clock skew / corrupted-but-well-formed value: negative elapsed
-        // duration stays blocked (fail-closed) until 7 days after it.
-        let now = Utc::now();
-        let last = (now + chrono::Duration::hours(1)).to_rfc3339();
-        assert!(
-            !nightly_gate_allows(Some(&last), now),
-            "A future timestamp must block the pass",
-        );
-    }
-
-    #[test]
-    fn nightly_gate_allows_unparseable_timestamp() {
-        // Fail-open on corrupt values (maintainer-debounce precedent): the
-        // pass runs and the pass-start write self-heals the stored value.
-        assert!(
-            nightly_gate_allows(Some("not-a-timestamp"), Utc::now()),
-            "An unparseable timestamp must let the pass through",
-        );
+        let cases: &[(Option<&str>, bool, &str)] = &[
+            (
+                None,
+                true,
+                "No recorded pass (first night ever) must be allowed",
+            ),
+            (
+                Some(exact_7d.as_str()),
+                true,
+                "Exactly 7 days elapsed must be allowed (>= 7 days)",
+            ),
+            (
+                Some(one_sec_short.as_str()),
+                false,
+                "6d23h59m59s elapsed must be blocked",
+            ),
+            (
+                Some(just_ran.as_str()),
+                false,
+                "A just-recorded pass must block",
+            ),
+            (
+                Some(eight_days.as_str()),
+                true,
+                "8 days elapsed must be allowed",
+            ),
+            (
+                Some(future.as_str()),
+                false,
+                "A future timestamp must block the pass",
+            ),
+            (
+                Some("not-a-timestamp"),
+                true,
+                "An unparseable timestamp must let the pass through",
+            ),
+        ];
+        for (last, expected, msg) in cases {
+            assert_eq!(nightly_gate_allows(*last, now), *expected, "{msg}");
+        }
     }
 
     // ── nightly_gate_should_run — end-to-end config_kv behaviour ──
