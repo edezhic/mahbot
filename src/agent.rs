@@ -451,7 +451,7 @@ impl Agent {
                     // outside a drain (e.g. an LLM call failing with no output
                     // produced). Keep the byte-identical historical message so
                     // external correlation keeps working.
-                    tracing::warn!(
+                    tracing::info!(
                         agent_id = %self.agent_id,
                         role = %self.role,
                         workspace = %self.workspace.name,
