@@ -459,6 +459,22 @@ async fn list_sessions_where(
     .await
 }
 
+/// A `session_metadata` column the read/write helpers may target; the closed
+/// enum makes the `format!` interpolation compile-time safe.
+enum MetadataColumn {
+    ActiveModels,
+    TokenLength,
+}
+
+impl MetadataColumn {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::ActiveModels => "active_models",
+            Self::TokenLength => "token_length",
+        }
+    }
+}
+
 // ── Methods — callable on the static ──────────────────────────
 
 impl SessionStore {
@@ -709,6 +725,47 @@ impl SessionStore {
         })
     }
 
+    /// Upsert one `session_metadata` column for `agent_id`; `last_activity` is
+    /// stamped only when the row is first created (the TTL key), never on conflict.
+    async fn set_metadata_value(
+        &self,
+        agent_id: &str,
+        column: MetadataColumn,
+        value: Value,
+    ) -> Result<()> {
+        let col = column.as_str();
+        let now = turso::now();
+        let sql = format!(
+            "INSERT INTO session_metadata (agent_id, last_activity, {col}) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(agent_id) DO UPDATE SET {col} = excluded.{col}"
+        );
+        self.conn
+            .execute(&sql, params![agent_id, now, value])
+            .await?;
+        Ok(())
+    }
+
+    /// Read one `session_metadata` column via `map`. `None` if the row is
+    /// missing, the column is NULL, or the read fails (logged via `warn_context`).
+    async fn get_metadata_value<X>(
+        &self,
+        agent_id: &str,
+        column: MetadataColumn,
+        warn_context: &str,
+        map: impl FnOnce(&Row) -> std::result::Result<Option<X>, ::turso::Error> + Send + 'static,
+    ) -> Option<X> {
+        let col = column.as_str();
+        let sql = format!("SELECT {col} FROM session_metadata WHERE agent_id = ?1");
+        match self.conn.query_optional(&sql, params![agent_id], map).await {
+            Ok(value) => value.flatten(),
+            Err(e) => {
+                tracing::warn!(agent_id = %agent_id, error = %e, "{warn_context}");
+                None
+            }
+        }
+    }
+
     /// Persist the `<active-models-opts>` snapshot (rendered model ids) for
     /// mid-session change detection; `None` clears the baseline (no block
     /// rendered — fail-open). Upserts so a missing metadata row (e.g. a
@@ -718,41 +775,21 @@ impl SessionStore {
         agent_id: &str,
         snapshot: Option<&str>,
     ) -> Result<()> {
-        let now = turso::now();
-        self.conn
-            .execute(
-                "INSERT INTO session_metadata (agent_id, last_activity, active_models) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(agent_id) DO UPDATE SET active_models = excluded.active_models",
-                params![agent_id, now, snapshot],
-            )
-            .await?;
-        Ok(())
+        self.set_metadata_value(agent_id, MetadataColumn::ActiveModels, snapshot.into())
+            .await
     }
 
     /// Read the last persisted `<active-models-opts>` snapshot, if any.
     /// Returns `None` when no baseline exists (no block rendered, or a
     /// session started before this feature).
     pub(crate) async fn get_active_models(&self, agent_id: &str) -> Option<String> {
-        match self
-            .conn
-            .query_optional(
-                "SELECT active_models FROM session_metadata WHERE agent_id = ?1",
-                params![agent_id],
-                |row| row.get::<Option<String>>(0),
-            )
-            .await
-        {
-            // A NULL column and a missing metadata row both mean "no baseline".
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => None,
-            // A read failure silently disables change detection — log it so
-            // the outage is visible rather than looking like a missing block.
-            Err(e) => {
-                tracing::warn!(agent_id = %agent_id, error = %e, "Failed to read active-models snapshot");
-                None
-            }
-        }
+        self.get_metadata_value(
+            agent_id,
+            MetadataColumn::ActiveModels,
+            "Failed to read active-models snapshot",
+            |row| row.get::<Option<String>>(0),
+        )
+        .await
     }
 
     /// Persist the real provider-reported session length (input + output
@@ -765,18 +802,10 @@ impl SessionStore {
         agent_id: &str,
         token_length: Option<u64>,
     ) -> Result<()> {
-        let now = turso::now();
         // turso binds integers as i64 — token counts are far below i64::MAX.
         let bound: Option<i64> = token_length.map(i64::try_from).transpose()?;
-        self.conn
-            .execute(
-                "INSERT INTO session_metadata (agent_id, last_activity, token_length) \
-                 VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(agent_id) DO UPDATE SET token_length = excluded.token_length",
-                params![agent_id, now, bound],
-            )
-            .await?;
-        Ok(())
+        self.set_metadata_value(agent_id, MetadataColumn::TokenLength, bound.into())
+            .await
     }
 
     /// Read the last persisted provider-reported session length, if any.
@@ -784,24 +813,16 @@ impl SessionStore {
     /// agent call (new sessions, pre-migration sessions — approved
     /// no-backfill semantics) or the value was explicitly cleared.
     pub(crate) async fn get_token_length(&self, agent_id: &str) -> Option<u64> {
-        match self
-            .conn
-            .query_optional(
-                "SELECT token_length FROM session_metadata WHERE agent_id = ?1",
-                params![agent_id],
-                |row| row.get::<Option<i64>>(0),
-            )
-            .await
-        {
-            Ok(Some(Some(tokens))) => u64::try_from(tokens).ok(),
-            Ok(_) => None,
-            // A read failure silently disables the metric — log it so the
-            // outage is visible rather than looking like a missing value.
-            Err(e) => {
-                tracing::warn!(agent_id = %agent_id, error = %e, "Failed to read session token length");
-                None
-            }
-        }
+        self.get_metadata_value(
+            agent_id,
+            MetadataColumn::TokenLength,
+            "Failed to read session token length",
+            |row| {
+                row.get::<Option<i64>>(0)
+                    .map(|opt| opt.and_then(|v| u64::try_from(v).ok()))
+            },
+        )
+        .await
     }
 }
 
