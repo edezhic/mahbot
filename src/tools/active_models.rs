@@ -134,7 +134,7 @@ async fn render_side(kind: ModelKind, model: Option<&str>) -> Option<(String, St
 /// block and the mid-session change-info). Returns `None` when the model is
 /// absent from the catalog, the catalog is unavailable, and the model has no
 /// static edit nuances — callers fall back to a change-only line. The catalog
-/// fetch is timeout-bounded internally (see [`crate::tools::media_catalog`]).
+/// fetch is timeout-bounded internally (see [`crate::util::catalog_cache`]).
 pub(crate) async fn render_section(kind: ModelKind, model: &str) -> Option<String> {
     match kind {
         ModelKind::Image => {
