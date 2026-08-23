@@ -884,37 +884,95 @@ mod tests {
     }
 
     #[test]
-    fn test_check_image_capability_rejects_unsupported_models() {
-        let catalog = fixture_catalog();
-        assert!(check_image_capability("qwen/qwen-image-3-pro", &catalog).is_ok());
-        let err = check_image_capability("unknown/model", &catalog).unwrap_err();
-        assert!(err.to_string().contains("cannot generate images"));
-        assert!(
-            err.to_string()
-                .contains("not in the OpenRouter image-models catalog")
-        );
-        let err = check_image_capability("text-only/model", &catalog).unwrap_err();
-        assert!(err.to_string().contains("cannot generate images"));
-        assert!(err.to_string().contains("does not list image output"));
-    }
-
-    #[test]
-    fn test_check_image_capability_fail_open_on_shape_drift() {
-        // Missing output_modalities (shape drift) is tolerated; explicitly
-        // text-only models are still rejected.
+    fn check_image_capability_cases() {
+        // One merged catalog covering the rejects cases (qwen capable, unknown
+        // absent, text-only) and the shape-drift case (drift/model missing
+        // output_modalities → fails open as capable). `ImageCatalog` is not
+        // Clone/Copy, so a single merged catalog is built here directly.
         let catalog = parse_catalog(&json!({
             "data": [
-                { "id": "drift/model", "supported_parameters": {} },
+                {
+                    "id": "qwen/qwen-image-3-pro",
+                    "architecture": { "output_modalities": ["image"] },
+                    "supported_parameters": {
+                        "resolution": { "type": "enum", "values": ["1K", "2K"] },
+                        "aspect_ratio": { "type": "enum", "values": ["1:1", "9:16"] },
+                        "input_references": { "type": "range", "min": 0, "max": 4 }
+                    }
+                },
                 {
                     "id": "text-only/model",
                     "architecture": { "output_modalities": ["text"] },
                     "supported_parameters": {}
+                },
+                {
+                    "id": "drift/model",
+                    "supported_parameters": {}
                 }
             ]
         }))
-        .expect("valid");
-        assert!(check_image_capability("drift/model", &catalog).is_ok());
-        assert!(check_image_capability("text-only/model", &catalog).is_err());
+        .expect("valid merged catalog");
+
+        struct Case {
+            name: &'static str,
+            model: &'static str,
+            // Empty → expect Ok; otherwise every fragment must appear in the
+            // error message (preserving the rejects test's substring checks).
+            expect_err_fragments: &'static [&'static str],
+        }
+
+        let cases = [
+            Case {
+                name: "capable_qwen",
+                model: "qwen/qwen-image-3-pro",
+                expect_err_fragments: &[],
+            },
+            Case {
+                name: "unknown_model_rejected",
+                model: "unknown/model",
+                expect_err_fragments: &[
+                    "cannot generate images",
+                    "not in the OpenRouter image-models catalog",
+                ],
+            },
+            Case {
+                name: "text_only_rejected",
+                model: "text-only/model",
+                expect_err_fragments: &["cannot generate images", "does not list image output"],
+            },
+            Case {
+                name: "shape_drift_fails_open",
+                model: "drift/model",
+                expect_err_fragments: &[],
+            },
+        ];
+
+        for case in &cases {
+            match check_image_capability(case.model, &catalog) {
+                Ok(_) if case.expect_err_fragments.is_empty() => {}
+                Ok(_) => panic!(
+                    "case: {name} — expected error containing {fragments:?}, got Ok for `{model}`",
+                    name = case.name,
+                    fragments = case.expect_err_fragments,
+                    model = case.model,
+                ),
+                Err(err) if case.expect_err_fragments.is_empty() => panic!(
+                    "case: {name} — expected Ok for `{model}`, got: {err}",
+                    name = case.name,
+                    model = case.model,
+                ),
+                Err(err) => {
+                    let msg = err.to_string();
+                    for &fragment in case.expect_err_fragments {
+                        assert!(
+                            msg.contains(fragment),
+                            "case: {name} — error should contain {fragment:?}, got: {msg}",
+                            name = case.name,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -976,36 +1034,87 @@ mod tests {
     // ── find_closest_aspect_ratio tests ──────────────────────────────
 
     #[test]
-    fn test_closest_ratio_exact_match() {
-        // Every canonical ratio should round-trip exactly.
-        for &(ratio_str, ratio_val) in CANONICAL_ASPECT_RATIOS {
-            let (w, h) = ratio_tuple_from_f64(ratio_val);
-            let result = find_closest_aspect_ratio(w, h);
+    fn find_closest_aspect_ratio_cases() {
+        struct Case {
+            name: &'static str,
+            width: u32,
+            height: u32,
+            expected: Option<&'static str>,
+        }
+
+        // Every canonical ratio should round-trip exactly — generated from
+        // CANONICAL_ASPECT_RATIOS so future ratios are auto-covered (and
+        // `ratio_tuple_from_f64` stays exercised).
+        let mut cases: Vec<Case> = CANONICAL_ASPECT_RATIOS
+            .iter()
+            .map(|&(ratio_str, ratio_val)| {
+                let (w, h) = ratio_tuple_from_f64(ratio_val);
+                Case {
+                    name: ratio_str,
+                    width: w,
+                    height: h,
+                    expected: Some(ratio_str),
+                }
+            })
+            .collect();
+
+        cases.extend([
+            // Between-candidates: closest canonical, not an exact match.
+            Case {
+                name: "between_3x2",
+                width: 1400,
+                height: 900,
+                expected: Some("3:2"),
+            },
+            Case {
+                name: "between_16x9",
+                width: 1700,
+                height: 900,
+                expected: Some("16:9"),
+            },
+            Case {
+                name: "exact_5x4",
+                width: 5,
+                height: 4,
+                expected: Some("5:4"),
+            },
+            Case {
+                name: "between_4x5",
+                width: 17,
+                height: 20,
+                expected: Some("4:5"),
+            },
+            // Zero dimensions → None (no meaningful ratio).
+            Case {
+                name: "zero_width",
+                width: 0,
+                height: 100,
+                expected: None,
+            },
+            Case {
+                name: "zero_height",
+                width: 100,
+                height: 0,
+                expected: None,
+            },
+            Case {
+                name: "zero_both",
+                width: 0,
+                height: 0,
+                expected: None,
+            },
+        ]);
+
+        for case in &cases {
             assert_eq!(
-                result,
-                Some(ratio_str),
-                "mismatch for {ratio_str} (w={w}, h={h})"
+                find_closest_aspect_ratio(case.width, case.height),
+                case.expected,
+                "case: {name} (w={width}, h={height})",
+                name = case.name,
+                width = case.width,
+                height = case.height,
             );
         }
-    }
-
-    #[test]
-    fn test_closest_ratio_between_candidates() {
-        // 1400×900 ≈ 1.556 — closer to 3:2 (1.5) than to 16:9 (1.778)
-        assert_eq!(find_closest_aspect_ratio(1400, 900), Some("3:2"));
-        // 1700×900 ≈ 1.889 — closer to 16:9 (1.778) than to 3:2 (1.5)
-        assert_eq!(find_closest_aspect_ratio(1700, 900), Some("16:9"));
-        // 5×4 = 1.25 → exactly 5:4
-        assert_eq!(find_closest_aspect_ratio(5, 4), Some("5:4"));
-        // 17×20 = 0.85 — closer to 4:5 (0.8) than to 1:1 (1.0)
-        assert_eq!(find_closest_aspect_ratio(17, 20), Some("4:5"));
-    }
-
-    #[test]
-    fn test_closest_ratio_zero_dimensions() {
-        assert_eq!(find_closest_aspect_ratio(0, 100), None);
-        assert_eq!(find_closest_aspect_ratio(100, 0), None);
-        assert_eq!(find_closest_aspect_ratio(0, 0), None);
     }
 
     /// Helper: convert a f64 ratio into integer width/height that produce
