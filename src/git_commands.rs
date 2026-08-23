@@ -1182,83 +1182,62 @@ AM staged_then_modified.js
 
     // ── parse_numstat_lines — numstat line parsing ──
 
-    /// Normal file modifications.
+    /// numstat line parsing: normal, binary, malformed-skip, and empty inputs.
     #[test]
-    fn parse_numstat_lines_normal() {
-        let output = "10\t3\tsrc/main.rs\n0\t1\tsrc/lib.rs\n42\t7\tCargo.toml\n";
-        let entries = parse_numstat_lines(output);
-        assert_eq!(entries.len(), 3);
-        assert_eq!(
-            entries[0],
-            NumstatEntry {
-                additions: Some(10),
-                deletions: Some(3),
-                path: "src/main.rs".to_string()
-            }
-        );
-        assert_eq!(
-            entries[1],
-            NumstatEntry {
-                additions: Some(0),
-                deletions: Some(1),
-                path: "src/lib.rs".to_string()
-            }
-        );
-        assert_eq!(
-            entries[2],
-            NumstatEntry {
-                additions: Some(42),
-                deletions: Some(7),
-                path: "Cargo.toml".to_string()
-            }
-        );
-    }
-
-    /// Binary files are represented as (None, None).
-    #[test]
-    fn parse_numstat_lines_binary() {
-        let output = "-\t-\timage.png\n42\t7\tsrc/main.rs\n";
-        let entries = parse_numstat_lines(output);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            entries[0],
-            NumstatEntry {
-                additions: None,
-                deletions: None,
-                path: "image.png".to_string()
-            }
-        );
-        assert_eq!(
-            entries[1],
-            NumstatEntry {
-                additions: Some(42),
-                deletions: Some(7),
-                path: "src/main.rs".to_string()
-            }
-        );
-    }
-
-    /// Empty lines and malformed lines are silently skipped.
-    #[test]
-    fn parse_numstat_lines_skips_malformed() {
-        let output = "\n\n10\t3\tsrc/main.rs\n\t\t\nnot-enough-fields\n";
-        let entries = parse_numstat_lines(output);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0],
-            NumstatEntry {
-                additions: Some(10),
-                deletions: Some(3),
-                path: "src/main.rs".to_string()
-            }
-        );
-    }
-
-    /// Empty output produces an empty vector.
-    #[test]
-    fn parse_numstat_lines_empty() {
-        assert!(parse_numstat_lines("").is_empty());
-        assert!(parse_numstat_lines("\n\n\n").is_empty());
+    fn parse_numstat_lines_cases() {
+        let cases: &[(&str, &str, Vec<NumstatEntry>)] = &[
+            (
+                "normal",
+                "10\t3\tsrc/main.rs\n0\t1\tsrc/lib.rs\n42\t7\tCargo.toml\n",
+                vec![
+                    NumstatEntry {
+                        additions: Some(10),
+                        deletions: Some(3),
+                        path: "src/main.rs".to_string(),
+                    },
+                    NumstatEntry {
+                        additions: Some(0),
+                        deletions: Some(1),
+                        path: "src/lib.rs".to_string(),
+                    },
+                    NumstatEntry {
+                        additions: Some(42),
+                        deletions: Some(7),
+                        path: "Cargo.toml".to_string(),
+                    },
+                ],
+            ),
+            (
+                "binary",
+                "-\t-\timage.png\n42\t7\tsrc/main.rs\n",
+                vec![
+                    NumstatEntry {
+                        additions: None,
+                        deletions: None,
+                        path: "image.png".to_string(),
+                    },
+                    NumstatEntry {
+                        additions: Some(42),
+                        deletions: Some(7),
+                        path: "src/main.rs".to_string(),
+                    },
+                ],
+            ),
+            (
+                "skips_malformed",
+                "\n\n10\t3\tsrc/main.rs\n\t\t\nnot-enough-fields\n",
+                vec![NumstatEntry {
+                    additions: Some(10),
+                    deletions: Some(3),
+                    path: "src/main.rs".to_string(),
+                }],
+            ),
+            ("empty_string", "", vec![]),
+            ("empty_lines", "\n\n\n", vec![]),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(parse_numstat_lines(input), *expected, "case: {name}");
+        }
     }
 
     // ── run_git_with_stdin — stdin-piping helper ──
@@ -1451,61 +1430,42 @@ AM staged_then_modified.js
 
     // ── has_unstaged_changes ─────────────────────────────────────────
 
-    /// Empty porcelain has no unstaged changes.
+    /// Empty, fully-staged, unstaged, dual-status, untracked, mixed, and
+    /// trailing-newline porcelain inputs.
     #[test]
-    fn has_unstaged_changes_empty() {
-        assert!(!has_unstaged_changes(""));
-        assert!(!has_unstaged_changes("\n\n"));
-    }
-
-    /// Fully-staged-only entries are not unstaged.
-    #[test]
-    fn has_unstaged_changes_fully_staged() {
-        assert!(!has_unstaged_changes("M  Cargo.toml\n"));
-        assert!(!has_unstaged_changes("A  src/lib.rs\n"));
-        assert!(!has_unstaged_changes(
-            "M  Cargo.toml\nA  src/lib.rs\nD  old.rs\n"
-        ));
-    }
-
-    /// Unstaged modifications (space in index column) are detected.
-    #[test]
-    fn has_unstaged_changes_unstaged_modifications() {
-        assert!(has_unstaged_changes(" M src/lib.rs\n"));
-        assert!(has_unstaged_changes(" D src/old.rs\n"));
-    }
-
-    /// Dual-status entries (staged + unstaged) are detected.
-    #[test]
-    fn has_unstaged_changes_dual_status() {
-        assert!(has_unstaged_changes("MM src/lib.rs\n"));
-        assert!(has_unstaged_changes("AM src/new.rs\n"));
-        assert!(has_unstaged_changes("MD src/old.rs\n"));
-    }
-
-    /// Untracked files (??) are detected.
-    #[test]
-    fn has_unstaged_changes_untracked() {
-        assert!(has_unstaged_changes("?? new_file.rs\n"));
-        assert!(has_unstaged_changes("?? dir/untracked.txt\n"));
-    }
-
-    /// Mixed porcelain output is parsed correctly.
-    #[test]
-    fn has_unstaged_changes_mixed() {
-        // Only staged — no unstaged.
-        assert!(!has_unstaged_changes("M  Cargo.toml\nA  src/main.rs\n"));
-
-        // Staged + unstaged — has unstaged.
-        assert!(has_unstaged_changes(
-            "M  Cargo.toml\n M src/main.rs\n?? new.rs\n"
-        ));
-    }
-
-    /// Whitespace trimming — trailing newline handled.
-    #[test]
-    fn has_unstaged_changes_trailing_newline() {
-        assert!(has_unstaged_changes(" M file.rs\n"));
-        assert!(!has_unstaged_changes("M  file.rs\n"));
+    fn has_unstaged_changes_cases() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("empty_string", "", false),
+            ("empty_lines", "\n\n", false),
+            ("fully_staged_modified", "M  Cargo.toml\n", false),
+            ("fully_staged_added", "A  src/lib.rs\n", false),
+            (
+                "fully_staged_mixed",
+                "M  Cargo.toml\nA  src/lib.rs\nD  old.rs\n",
+                false,
+            ),
+            ("unstaged_modified", " M src/lib.rs\n", true),
+            ("unstaged_deleted", " D src/old.rs\n", true),
+            ("dual_status_modified", "MM src/lib.rs\n", true),
+            ("dual_status_added", "AM src/new.rs\n", true),
+            ("dual_status_deleted", "MD src/old.rs\n", true),
+            ("untracked_file", "?? new_file.rs\n", true),
+            ("untracked_directory", "?? dir/untracked.txt\n", true),
+            (
+                "mixed_only_staged",
+                "M  Cargo.toml\nA  src/main.rs\n",
+                false,
+            ),
+            (
+                "mixed_staged_and_unstaged",
+                "M  Cargo.toml\n M src/main.rs\n?? new.rs\n",
+                true,
+            ),
+            ("trailing_newline_unstaged", " M file.rs\n", true),
+            ("trailing_newline_staged", "M  file.rs\n", false),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(has_unstaged_changes(input), *expected, "case: {name}");
+        }
     }
 }
