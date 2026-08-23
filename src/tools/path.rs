@@ -1395,193 +1395,344 @@ mod tests {
 
     // ── normalize_path tests ──────────────────────────────────────────────
 
+    /// Path normalization (`/`, `.`, `..` resolution) is exercised via a
+    /// data-driven table so the identity, dot-component removal, simple `..`,
+    /// root-limit no-op, excess-`..` preservation for relative paths, and
+    /// complex traversal rules are all covered in one place.
+    #[expect(clippy::too_many_lines)]
     #[test]
-    fn normalize_path_identity() {
-        // Paths without `.` or `..` should be unchanged.
-        assert_eq!(normalize_path(Path::new("/")), Path::new("/"));
-        assert_eq!(normalize_path(Path::new("/tmp")), Path::new("/tmp"));
-        assert_eq!(
-            normalize_path(Path::new("/tmp/file.txt")),
-            Path::new("/tmp/file.txt")
-        );
-        assert_eq!(
-            normalize_path(Path::new("relative/path")),
-            Path::new("relative/path")
-        );
-        assert_eq!(normalize_path(Path::new("single")), Path::new("single"));
+    fn normalize_path_all_cases() {
+        struct Case {
+            name: &'static str,
+            input: &'static str,
+            expected: &'static str,
+        }
+
+        let cases = [
+            // Paths without `.` or `..` should be unchanged.
+            Case {
+                name: "identity_root",
+                input: "/",
+                expected: "/",
+            },
+            Case {
+                name: "identity_tmp",
+                input: "/tmp",
+                expected: "/tmp",
+            },
+            Case {
+                name: "identity_tmp_file",
+                input: "/tmp/file.txt",
+                expected: "/tmp/file.txt",
+            },
+            Case {
+                name: "identity_relative",
+                input: "relative/path",
+                expected: "relative/path",
+            },
+            Case {
+                name: "identity_single",
+                input: "single",
+                expected: "single",
+            },
+            // Dot components are dropped.
+            Case {
+                name: "dot_tmp_file",
+                input: "/tmp/./file.txt",
+                expected: "/tmp/file.txt",
+            },
+            Case {
+                name: "dot_leading_tmp_file",
+                input: "/./tmp/./file.txt",
+                expected: "/tmp/file.txt",
+            },
+            Case {
+                name: "dot_relative",
+                input: "./relative/./path",
+                expected: "relative/path",
+            },
+            Case {
+                name: "dot_slash_root",
+                input: "/.",
+                expected: "/",
+            },
+            Case {
+                name: "dot_only",
+                input: ".",
+                expected: "",
+            },
+            // Simple `..` resolution.
+            Case {
+                name: "dotdot_tmp_etc",
+                input: "/tmp/../etc/passwd",
+                expected: "/etc/passwd",
+            },
+            Case {
+                name: "dotdot_deep_etc",
+                input: "/tmp/foo/../../etc",
+                expected: "/etc",
+            },
+            Case {
+                name: "dotdot_tmp_root",
+                input: "/tmp/..",
+                expected: "/",
+            },
+            // Can't go above root — excess `..` after root are dropped.
+            Case {
+                name: "dotdot_above_root_tmp",
+                input: "/../tmp",
+                expected: "/tmp",
+            },
+            Case {
+                name: "dotdot_root_file",
+                input: "/tmp/../../tmp/file.txt",
+                expected: "/tmp/file.txt",
+            },
+            Case {
+                name: "dotdot_above_root_only",
+                input: "/../../..",
+                expected: "/",
+            },
+            // For relative paths, excess `..` are preserved as meaningful prefix.
+            Case {
+                name: "rel_excess_dotdot_foo",
+                input: "../../foo",
+                expected: "../../foo",
+            },
+            Case {
+                name: "rel_excess_dotdot_only",
+                input: "../../..",
+                expected: "../../..",
+            },
+            Case {
+                name: "rel_excess_dotdot_bar",
+                input: "foo/../../bar",
+                expected: "../bar",
+            },
+            Case {
+                name: "rel_excess_dotdot_d",
+                input: "a/b/c/../../d",
+                expected: "a/d",
+            },
+            // Complex traversals, preserving the inline `->` transformation
+            // illustrations for the expected result.
+            // /a/b/c/../d/./e/../../f → /a/b/f
+            Case {
+                name: "complex_abs",
+                input: "/a/b/c/../d/./e/../../f",
+                expected: "/a/b/f",
+            },
+            // a/./b/./c/../d/../../e → a/e
+            Case {
+                name: "complex_rel",
+                input: "a/./b/./c/../d/../../e",
+                expected: "a/e",
+            },
+            // Relative path with excess `..`: a/b/../../../../c → ../../c
+            //   (pop past 'a' into excess `..` preserved for relative paths)
+            Case {
+                name: "complex_rel_excess",
+                input: "a/b/../../../../c",
+                expected: "../../c",
+            },
+            // Empty and dot-only paths.
+            Case {
+                name: "empty_string",
+                input: "",
+                expected: "",
+            },
+            Case {
+                name: "dot_only_empty",
+                input: ".",
+                expected: "",
+            },
+            Case {
+                name: "dot_slash_empty",
+                input: "/.",
+                expected: "/",
+            },
+        ];
+
+        for case in &cases {
+            assert_eq!(
+                normalize_path(Path::new(case.input)),
+                Path::new(case.expected),
+                "case: {}",
+                case.name
+            );
+        }
     }
 
+    // ── is_path_under_roots / allowed_temp_roots (traversal cluster) ──────
+
+    /// Allow/reject semantics for [`is_path_under_roots`] against
+    /// [`allowed_temp_roots`], covering path traversal, tilde expansion, clean
+    /// temp paths, absolute non-temp paths, harmless dot components, and the
+    /// root limit. The common-roots coverage test is kept separate.
+    #[expect(clippy::too_many_lines)]
     #[test]
-    fn normalize_path_removes_dot_components() {
-        assert_eq!(
-            normalize_path(Path::new("/tmp/./file.txt")),
-            Path::new("/tmp/file.txt")
-        );
-        assert_eq!(
-            normalize_path(Path::new("/./tmp/./file.txt")),
-            Path::new("/tmp/file.txt")
-        );
-        assert_eq!(
-            normalize_path(Path::new("./relative/./path")),
-            Path::new("relative/path")
-        );
-        assert_eq!(normalize_path(Path::new("/.")), Path::new("/"));
-        assert_eq!(normalize_path(Path::new(".")), Path::new(""));
-    }
+    fn is_path_under_allowed_temp_all_cases() {
+        struct Case {
+            name: &'static str,
+            path: &'static str,
+            allowed: bool,
+        }
 
-    #[test]
-    fn normalize_path_resolves_simple_dotdot() {
-        assert_eq!(
-            normalize_path(Path::new("/tmp/../etc/passwd")),
-            Path::new("/etc/passwd")
-        );
-        assert_eq!(
-            normalize_path(Path::new("/tmp/foo/../../etc")),
-            Path::new("/etc")
-        );
-        assert_eq!(normalize_path(Path::new("/tmp/..")), Path::new("/"));
-    }
+        let cases = [
+            // Core traversal: /tmp/../etc/passwd starts with /tmp but normalizes to /etc/passwd
+            Case {
+                name: "traversal_tmp_etc",
+                path: "/tmp/../etc/passwd",
+                allowed: false,
+            },
+            Case {
+                name: "traversal_deep_etc",
+                path: "/tmp/../../../../etc/passwd",
+                allowed: false,
+            },
+            // Deeper traversal: /tmp/foo/../../etc/passwd → /etc/passwd
+            Case {
+                name: "traversal_foo_etc",
+                path: "/tmp/foo/../../etc/passwd",
+                allowed: false,
+            },
+            Case {
+                name: "traversal_dot_etc_shadow",
+                path: "/tmp/./../etc/shadow",
+                allowed: false,
+            },
+            // Traversal that stays within temp should still be allowed.
+            // /tmp/../tmp/file.txt → /tmp/file.txt
+            Case {
+                name: "traversal_back_into_tmp",
+                path: "/tmp/../tmp/file.txt",
+                allowed: true,
+            },
+            // /tmp/foo/../../tmp/file.txt → /tmp/file.txt
+            Case {
+                name: "traversal_foo_back_tmp",
+                path: "/tmp/foo/../../tmp/file.txt",
+                allowed: true,
+            },
+            // /tmp/../../tmp/../tmp/bar → /tmp/bar
+            Case {
+                name: "traversal_deep_back_tmp",
+                path: "/tmp/../../tmp/../tmp/bar",
+                allowed: true,
+            },
+            // Tilde expansion + traversal: ~ expands to $HOME (e.g. /Users/username).
+            // ~/../tmp/file.txt → /Users/username/../tmp/file.txt → /Users/tmp/file.txt
+            //   NOT under /tmp → rejected
+            Case {
+                name: "tilde_traversal_tmp",
+                path: "~/../tmp/file.txt",
+                allowed: false,
+            },
+            // ~/../../tmp/file.txt → /Users/username/../../tmp/file.txt → /tmp/file.txt
+            //   IS under /tmp → allowed
+            Case {
+                name: "tilde_traversal_tmp_allowed",
+                path: "~/../../tmp/file.txt",
+                allowed: true,
+            },
+            // ~/../etc/passwd → /Users/username/../etc/passwd → /Users/etc/passwd
+            //   NOT under /tmp → rejected
+            Case {
+                name: "tilde_traversal_etc",
+                path: "~/../etc/passwd",
+                allowed: false,
+            },
+            // ~/../../etc/passwd → /Users/username/../../etc/passwd → /etc/passwd
+            //   NOT under /tmp → rejected
+            Case {
+                name: "tilde_traversal_etc_deep",
+                path: "~/../../etc/passwd",
+                allowed: false,
+            },
+            // Ensure normal temp paths still work (no regression).
+            Case {
+                name: "clean_tmp_out",
+                path: "/tmp/out.txt",
+                allowed: true,
+            },
+            Case {
+                name: "clean_private_tmp_out",
+                path: "/private/tmp/out.txt",
+                allowed: true,
+            },
+            Case {
+                name: "clean_var_tmp_out",
+                path: "/var/tmp/out.txt",
+                allowed: true,
+            },
+            // Relative paths still rejected (can't start_with absolute roots).
+            Case {
+                name: "clean_relative_rejected",
+                path: "relative.txt",
+                allowed: false,
+            },
+            Case {
+                name: "clean_dotdot_tmp_rejected",
+                path: "../tmp/out.txt",
+                allowed: false,
+            },
+            // Absolute paths outside temp are still rejected.
+            Case {
+                name: "non_temp_etc_passwd",
+                path: "/etc/passwd",
+                allowed: false,
+            },
+            Case {
+                name: "non_temp_usr_bin",
+                path: "/usr/bin/foo",
+                allowed: false,
+            },
+            Case {
+                name: "non_temp_var_log",
+                path: "/var/log/system.log",
+                allowed: false,
+            },
+            // Dot components in isolation should not affect the result.
+            Case {
+                name: "dot_harmless_tmp_file",
+                path: "/tmp/./file.txt",
+                allowed: true,
+            },
+            Case {
+                name: "dot_harmless_multi",
+                path: "/tmp/./././file.txt",
+                allowed: true,
+            },
+            Case {
+                name: "dot_harmless_foo",
+                path: "/tmp/foo/./../file.txt",
+                allowed: true,
+            },
+            Case {
+                name: "dot_harmless_etc_rejected",
+                path: "/tmp/./../etc/passwd",
+                allowed: false,
+            },
+            // Paths that would normalize to just "/" or above root should be rejected.
+            Case {
+                name: "root_limit_tmp",
+                path: "/tmp/../../../",
+                allowed: false,
+            },
+            Case {
+                name: "root_limit_absolute",
+                path: "/../../../../../",
+                allowed: false,
+            },
+        ];
 
-    #[test]
-    fn normalize_path_dotdot_at_root_is_noop() {
-        // Can't go above root — excess `..` after root are dropped.
-        assert_eq!(normalize_path(Path::new("/../tmp")), Path::new("/tmp"));
-        assert_eq!(
-            normalize_path(Path::new("/tmp/../../tmp/file.txt")),
-            Path::new("/tmp/file.txt")
-        );
-        assert_eq!(normalize_path(Path::new("/../../..")), Path::new("/"));
-    }
-
-    #[test]
-    fn normalize_path_preserves_excess_dotdot_for_relative_paths() {
-        // For relative paths, excess `..` are preserved as meaningful prefix.
-        assert_eq!(
-            normalize_path(Path::new("../../foo")),
-            Path::new("../../foo")
-        );
-        assert_eq!(normalize_path(Path::new("../../..")), Path::new("../../.."));
-        assert_eq!(
-            normalize_path(Path::new("foo/../../bar")),
-            Path::new("../bar")
-        );
-        assert_eq!(normalize_path(Path::new("a/b/c/../../d")), Path::new("a/d"));
-    }
-
-    #[test]
-    fn normalize_path_complex_traversal() {
-        // /a/b/c/../d/./e/../../f → /a/b/f
-        assert_eq!(
-            normalize_path(Path::new("/a/b/c/../d/./e/../../f")),
-            Path::new("/a/b/f")
-        );
-        // a/./b/./c/../d/../../e → a/e
-        assert_eq!(
-            normalize_path(Path::new("a/./b/./c/../d/../../e")),
-            Path::new("a/e")
-        );
-        // Relative path with excess `..`: a/b/../../../../c → ../../c
-        // (pop past 'a' into excess `..` preserved for relative paths)
-        assert_eq!(
-            normalize_path(Path::new("a/b/../../../../c")),
-            Path::new("../../c")
-        );
-    }
-
-    #[test]
-    fn normalize_path_empty_and_dot_only() {
-        assert_eq!(normalize_path(Path::new("")), Path::new(""));
-        assert_eq!(normalize_path(Path::new(".")), Path::new(""));
-        assert_eq!(normalize_path(Path::new("/.")), Path::new("/"));
-    }
-
-    /// Helper: assert that a path IS allowed under temp (after normalization),
-    /// typically because it resolves back inside the temp root.
-    fn assert_allowed_under_temp(path: &str) {
-        assert!(
-            is_path_under_roots(Path::new(path), &allowed_temp_roots()),
-            "Expected path to be allowed under temp: {path}"
-        );
-    }
-
-    /// Helper: assert that a path is NOT allowed under temp (rejected by
-    /// traversal protection).
-    fn assert_not_allowed_under_temp(path: &str) {
-        assert!(
-            !is_path_under_roots(Path::new(path), &allowed_temp_roots()),
-            "Expected path to be rejected under temp: {path}"
-        );
-    }
-
-    #[test]
-    fn is_path_under_allowed_temp_blocks_path_traversal() {
-        // Core traversal: /tmp/../etc/passwd starts with /tmp but normalizes to /etc/passwd
-        assert_not_allowed_under_temp("/tmp/../etc/passwd");
-        assert_not_allowed_under_temp("/tmp/../../../../etc/passwd");
-
-        // Deeper traversal: /tmp/foo/../../etc/passwd → /etc/passwd
-        assert_not_allowed_under_temp("/tmp/foo/../../etc/passwd");
-        assert_not_allowed_under_temp("/tmp/./../etc/shadow");
-
-        // Traversal that stays within temp should still be allowed.
-        // /tmp/../tmp/file.txt → /tmp/file.txt
-        assert_allowed_under_temp("/tmp/../tmp/file.txt");
-        // /tmp/foo/../../tmp/file.txt → /tmp/file.txt
-        assert_allowed_under_temp("/tmp/foo/../../tmp/file.txt");
-        // /tmp/../../tmp/../tmp/bar → /tmp/bar
-        assert_allowed_under_temp("/tmp/../../tmp/../tmp/bar");
-    }
-
-    #[test]
-    fn is_path_under_allowed_temp_blocks_tilde_traversal() {
-        // Tilde expansion + traversal: ~ expands to $HOME (e.g. /Users/username).
-        // ~/../tmp/file.txt → /Users/username/../tmp/file.txt → /Users/tmp/file.txt
-        //   NOT under /tmp → rejected
-        assert_not_allowed_under_temp("~/../tmp/file.txt");
-        // ~/../../tmp/file.txt → /Users/username/../../tmp/file.txt → /tmp/file.txt
-        //   IS under /tmp → allowed
-        assert_allowed_under_temp("~/../../tmp/file.txt");
-        // ~/../etc/passwd → /Users/username/../etc/passwd → /Users/etc/passwd
-        //   NOT under /tmp → rejected
-        assert_not_allowed_under_temp("~/../etc/passwd");
-        // ~/../../etc/passwd → /Users/username/../../etc/passwd → /etc/passwd
-        //   NOT under /tmp → rejected
-        assert_not_allowed_under_temp("~/../../etc/passwd");
-    }
-
-    #[test]
-    fn is_path_under_allowed_temp_allows_clean_paths() {
-        // Ensure normal temp paths still work (no regression).
-        assert_allowed_under_temp("/tmp/out.txt");
-        assert_allowed_under_temp("/private/tmp/out.txt");
-        assert_allowed_under_temp("/var/tmp/out.txt");
-
-        // Relative paths still rejected (can't start_with absolute roots).
-        assert_not_allowed_under_temp("relative.txt");
-        assert_not_allowed_under_temp("../tmp/out.txt");
-    }
-
-    #[test]
-    fn is_path_under_allowed_temp_blocks_absolute_non_temp() {
-        // Absolute paths outside temp are still rejected.
-        assert_not_allowed_under_temp("/etc/passwd");
-        assert_not_allowed_under_temp("/usr/bin/foo");
-        assert_not_allowed_under_temp("/var/log/system.log");
-    }
-
-    #[test]
-    fn is_path_under_allowed_temp_dot_components_are_harmless() {
-        // Dot components in isolation should not affect the result.
-        assert_allowed_under_temp("/tmp/./file.txt");
-        assert_allowed_under_temp("/tmp/./././file.txt");
-        assert_allowed_under_temp("/tmp/foo/./../file.txt");
-        assert_not_allowed_under_temp("/tmp/./../etc/passwd");
-    }
-
-    #[test]
-    fn is_path_under_allowed_temp_handles_root_limit() {
-        // Paths that would normalize to just "/" or above root should be rejected.
-        assert_not_allowed_under_temp("/tmp/../../../");
-        assert_not_allowed_under_temp("/../../../../../");
+        for case in &cases {
+            assert_eq!(
+                is_path_under_roots(Path::new(case.path), &allowed_temp_roots()),
+                case.allowed,
+                "case: {}",
+                case.name
+            );
+        }
     }
 }
