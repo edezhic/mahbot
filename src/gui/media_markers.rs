@@ -429,166 +429,108 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replace_image_marker() {
-        assert_eq!(
-            preprocess("Look [IMAGE:/tmp/photo.png] here"),
-            "Look ![Image](/tmp/photo.png) here"
-        );
-    }
-
-    #[test]
-    fn replace_image_marker_with_spaces_in_path() {
-        assert_eq!(
-            preprocess("img [IMAGE:/tmp/my file.png]"),
-            "img ![Image](/tmp/my file.png)"
-        );
-    }
-
-    #[test]
-    fn replace_audio_marker() {
-        assert_eq!(
-            preprocess("Listen [AUDIO:/tmp/recording.ogg]"),
-            "Listen 🎵 recording.ogg"
-        );
-    }
-
-    #[test]
-    fn replace_audio_marker_nested_path() {
-        assert_eq!(
-            preprocess("hear [AUDIO:/dir/subdir/rec.ogg]"),
-            "hear 🎵 rec.ogg"
-        );
-    }
-
-    #[test]
-    fn replace_video_marker() {
-        assert_eq!(
-            preprocess("Watch [VIDEO:/tmp/video.mp4]"),
-            "Watch 🎬 Video: video.mp4"
-        );
-    }
-
-    #[test]
-    fn replace_audio_transcription() {
-        assert_eq!(
-            preprocess("[Audio transcription of recording.ogg]: Hello world"),
-            "🔊 Hello world"
-        );
-    }
-
-    #[test]
-    fn replace_audio_transcription_multiline() {
-        assert_eq!(
-            preprocess("[Audio transcription of voice.ogg]: Line one\nLine two"),
-            "🔊 Line one\nLine two"
-        );
-    }
-
-    #[test]
-    fn replace_video_transcription_multiline() {
-        // The maximally-detailed transcription prompt produces multi-line
-        // descriptions — every line must render under the 🎬 prefix, and
-        // following message content must stay untouched.
-        assert_eq!(
-            preprocess("[Video transcription of clip.mp4]: Line one\nLine two\n\nEdit this"),
-            "🎬 Line one\nLine two\n\nEdit this"
-        );
-    }
-
-    #[test]
-    fn video_transcription_prevents_overlap_with_video_marker() {
-        // The video-transcription format contains "Video" — the preprocess
-        // must handle it before the [VIDEO:...] pattern.
-        let result =
-            preprocess("[Video transcription of clip.mp4]: hi there [VIDEO:/tmp/other.mp4]");
-        assert_eq!(result, "🎬 hi there 🎬 Video: other.mp4");
-    }
-
-    #[test]
-    fn audio_transcription_prevents_overlap_with_audio_marker() {
-        // The audio-transcription format contains "Audio" — the preprocess
-        // must handle it before the [AUDIO:...] pattern.
-        let result =
-            preprocess("[Audio transcription of msg.ogg]: hi there [AUDIO:/tmp/other.ogg]");
-        assert_eq!(result, "🔊 hi there 🎵 other.ogg");
-    }
-
-    #[test]
-    fn multiple_markers_mixed() {
-        let input = "![]() [IMAGE:/tmp/a.png] and [AUDIO:/tmp/b.ogg] end [VIDEO:/tmp/c.mp4]";
-        let expected = "![]() ![Image](/tmp/a.png) and 🎵 b.ogg end 🎬 Video: c.mp4";
-        assert_eq!(preprocess(input), expected);
-    }
-
-    #[test]
-    fn no_markers_unchanged() {
-        assert_eq!(preprocess("Hello world"), "Hello world");
-    }
-
-    #[test]
-    fn empty_string() {
-        assert_eq!(preprocess(""), "");
-    }
-
-    #[test]
-    fn strip_saved_image_annotation() {
-        // The upload annotation is display noise: the image renders separately
-        // from its data-URI marker, so `[Saved image: ...]` and the blank-line
-        // separator enrichment inserts before it are removed.
-        assert_eq!(
-            preprocess("[IMAGE:data:image/png;base64,AAAA]\n\n[Saved image: /uploads/img.png]"),
-            "![Image](data:image/png;base64,AAAA)"
-        );
-    }
-
-    #[test]
-    fn strip_saved_image_annotation_at_start() {
-        // An annotation with no preceding content/separator is still stripped.
-        assert_eq!(preprocess("[Saved image: /uploads/img.png]"), "");
-    }
-
-    #[test]
-    fn saved_video_annotation_becomes_placeholder() {
-        // Video enrichment replaces `[VIDEO:path]` in place with the
-        // `[Saved video: ...]` annotation; there is no separate video renderer,
-        // so the path must stay visible as a clip placeholder.
-        assert_eq!(
-            preprocess("Clip [Saved video: /uploads/clip.mp4] here"),
-            "Clip 🎬 Video: clip.mp4 here"
-        );
-    }
-
-    #[test]
-    fn saved_video_annotation_keeps_clip_visible_with_transcription() {
-        // Full video flow: transcription annotation + saved-video annotation.
-        // Both must render (the clip path must not be hidden).
-        assert_eq!(
-            preprocess(
-                "[Video transcription of clip.mp4]: Line one\n\n[Saved video: /uploads/clip.mp4]"
+    fn preprocess_table() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "replaces an image marker",
+                "Look [IMAGE:/tmp/photo.png] here",
+                "Look ![Image](/tmp/photo.png) here",
             ),
-            "🎬 Line one\n\n🎬 Video: clip.mp4"
-        );
+            (
+                "replaces an image marker with spaces in the path",
+                "img [IMAGE:/tmp/my file.png]",
+                "img ![Image](/tmp/my file.png)",
+            ),
+            (
+                "replaces an audio marker",
+                "Listen [AUDIO:/tmp/recording.ogg]",
+                "Listen 🎵 recording.ogg",
+            ),
+            (
+                "replaces an audio marker in a nested path",
+                "hear [AUDIO:/dir/subdir/rec.ogg]",
+                "hear 🎵 rec.ogg",
+            ),
+            (
+                "replaces a video marker",
+                "Watch [VIDEO:/tmp/video.mp4]",
+                "Watch 🎬 Video: video.mp4",
+            ),
+            (
+                "replaces an audio transcription block",
+                "[Audio transcription of recording.ogg]: Hello world",
+                "🔊 Hello world",
+            ),
+            (
+                "renders every line of a multiline audio transcription under 🔊",
+                "[Audio transcription of voice.ogg]: Line one\nLine two",
+                "🔊 Line one\nLine two",
+            ),
+            (
+                "renders every line of a multiline video transcription under 🎬 and leaves following message content untouched",
+                "[Video transcription of clip.mp4]: Line one\nLine two\n\nEdit this",
+                "🎬 Line one\nLine two\n\nEdit this",
+            ),
+            (
+                "video-transcription format contains Video and is handled before the [VIDEO:...] pattern",
+                "[Video transcription of clip.mp4]: hi there [VIDEO:/tmp/other.mp4]",
+                "🎬 hi there 🎬 Video: other.mp4",
+            ),
+            (
+                "audio-transcription format contains Audio and is handled before the [AUDIO:...] pattern",
+                "[Audio transcription of msg.ogg]: hi there [AUDIO:/tmp/other.ogg]",
+                "🔊 hi there 🎵 other.ogg",
+            ),
+            (
+                "replaces mixed image/audio/video markers",
+                "![]() [IMAGE:/tmp/a.png] and [AUDIO:/tmp/b.ogg] end [VIDEO:/tmp/c.mp4]",
+                "![]() ![Image](/tmp/a.png) and 🎵 b.ogg end 🎬 Video: c.mp4",
+            ),
+            (
+                "leaves content without markers unchanged",
+                "Hello world",
+                "Hello world",
+            ),
+            ("returns the empty string unchanged", "", ""),
+            (
+                "strips a saved image annotation and its blank-line separator",
+                "[IMAGE:data:image/png;base64,AAAA]\n\n[Saved image: /uploads/img.png]",
+                "![Image](data:image/png;base64,AAAA)",
+            ),
+            (
+                "strips a saved image annotation at the start with no preceding separator",
+                "[Saved image: /uploads/img.png]",
+                "",
+            ),
+            (
+                "turns a saved video annotation into a visible clip placeholder",
+                "Clip [Saved video: /uploads/clip.mp4] here",
+                "Clip 🎬 Video: clip.mp4 here",
+            ),
+            (
+                "keeps the saved video clip visible alongside its transcription",
+                "[Video transcription of clip.mp4]: Line one\n\n[Saved video: /uploads/clip.mp4]",
+                "🎬 Line one\n\n🎬 Video: clip.mp4",
+            ),
+        ];
+
+        for (i, (name, input, expected)) in cases.iter().enumerate() {
+            assert_eq!(preprocess(input), *expected, "case {i} ({name})");
+        }
     }
 
     #[test]
-    fn file_name_or_path_unix() {
-        assert_eq!(file_name_or_path("/foo/bar.txt"), "bar.txt");
-    }
-
-    #[test]
-    fn file_name_or_path_nested() {
-        assert_eq!(file_name_or_path("/foo/bar/doc.txt"), "doc.txt");
-    }
-
-    #[test]
-    fn file_name_or_path_no_dir() {
-        assert_eq!(file_name_or_path("bar.txt"), "bar.txt");
-    }
-
-    #[test]
-    fn file_name_or_path_trailing_slash() {
-        // On Unix `file_name()` normalizes the trailing slash.
-        assert_eq!(file_name_or_path("/foo/bar/"), "bar");
+    fn file_name_or_path_table() {
+        // On Unix `file_name()` additionally normalizes a trailing slash.
+        let cases: &[(&str, &str, &str)] = &[
+            ("unix path", "/foo/bar.txt", "bar.txt"),
+            ("nested path", "/foo/bar/doc.txt", "doc.txt"),
+            ("no directory component", "bar.txt", "bar.txt"),
+            ("trailing slash is normalized on Unix", "/foo/bar/", "bar"),
+        ];
+        for (i, (name, input, expected)) in cases.iter().enumerate() {
+            assert_eq!(file_name_or_path(input), *expected, "case {i} ({name})");
+        }
     }
 
     // ── Data-URI image helpers ────────────────────────────────────
@@ -607,76 +549,82 @@ mod tests {
     }
 
     #[test]
-    fn data_uri_base64_payload_extracts_payload() {
-        assert_eq!(
-            data_uri_base64_payload("data:image/png;base64,AAAA"),
-            Some("AAAA")
+    fn data_uri_base64_payload_table() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            (
+                "extracts the base64 payload",
+                "data:image/png;base64,AAAA",
+                Some("AAAA"),
+            ),
+            (
+                "handles mediatype parameters before the base64 marker",
+                "data:image/png;charset=utf-8;base64,BBBB",
+                Some("BBBB"),
+            ),
+            ("rejects a plain file path", "/tmp/photo.png", None),
+            ("rejects an http URL", "https://example.com/img.png", None),
+            (
+                "rejects a data URI without a base64 marker",
+                "data:image/png,raw-bytes",
+                None,
+            ),
+            (
+                "allows an empty payload",
+                "data:image/png;base64,",
+                Some(""),
+            ),
+        ];
+        for (i, (name, uri, expected)) in cases.iter().enumerate() {
+            assert_eq!(data_uri_base64_payload(uri), *expected, "case {i} ({name})");
+        }
+    }
+
+    #[test]
+    fn decode_data_uri_image_table() {
+        // URIs are built before the table: the success case needs a real
+        // encoded PNG, and the two over-cap cases need a payload/dimension
+        // past their cap.
+        let valid_uri = data_uri(&tiny_png(2, 1));
+        let invalid_base64 = "data:image/png;base64,%%%not-base64%%%".to_string();
+        let non_image = format!("data:text/plain;base64,{}", STANDARD.encode(b"hello world"));
+        let oversized_payload = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(MAX_DATA_URI_ENCODED_BYTES + 1)
         );
-    }
+        let oversized_dimensions = data_uri(&tiny_png(MAX_IMAGE_LONGEST_SIDE_PX + 1, 1));
+        let missing_marker = "data:image/png,AAAA".to_string();
 
-    #[test]
-    fn data_uri_base64_payload_handles_mediatype_params() {
-        assert_eq!(
-            data_uri_base64_payload("data:image/png;charset=utf-8;base64,BBBB"),
-            Some("BBBB")
-        );
-    }
-
-    #[test]
-    fn data_uri_base64_payload_rejects_non_data_uris() {
-        assert_eq!(data_uri_base64_payload("/tmp/photo.png"), None);
-        assert_eq!(data_uri_base64_payload("https://example.com/img.png"), None);
-        assert_eq!(data_uri_base64_payload("data:image/png,raw-bytes"), None);
-    }
-
-    #[test]
-    fn data_uri_base64_payload_allows_empty_payload() {
-        assert_eq!(data_uri_base64_payload("data:image/png;base64,"), Some(""));
-    }
-
-    #[test]
-    fn decode_data_uri_image_decodes_png() {
-        let uri = data_uri(&tiny_png(2, 1));
-        let (width, height, rgba) =
-            decode_data_uri_image(&uri).expect("valid PNG data URI decodes");
-        assert_eq!((width, height), (2, 1));
-        assert_eq!(rgba.len(), 8); // 2×1 RGBA
-        assert_eq!(&rgba[0..4], &[255, 0, 0, 255]);
-    }
-
-    #[test]
-    fn decode_data_uri_image_rejects_invalid_base64() {
-        assert_eq!(
-            decode_data_uri_image("data:image/png;base64,%%%not-base64%%%"),
-            None
-        );
-    }
-
-    #[test]
-    fn decode_data_uri_image_rejects_non_image_bytes() {
-        let uri = format!("data:text/plain;base64,{}", STANDARD.encode(b"hello world"));
-        assert_eq!(decode_data_uri_image(&uri), None);
-    }
-
-    #[test]
-    fn decode_data_uri_image_rejects_oversized_payload() {
-        // The cap check is a pure length test — no base64 work happens.
-        let huge = "A".repeat(MAX_DATA_URI_ENCODED_BYTES + 1);
-        let uri = format!("data:image/png;base64,{huge}");
-        assert_eq!(decode_data_uri_image(&uri), None);
-    }
-
-    #[test]
-    fn decode_data_uri_image_rejects_oversized_dimensions() {
-        // A valid PNG whose header declares a side over the cap is refused
-        // from the header alone, before any pixel decode.
-        let uri = data_uri(&tiny_png(MAX_IMAGE_LONGEST_SIDE_PX + 1, 1));
-        assert_eq!(decode_data_uri_image(&uri), None);
-    }
-
-    #[test]
-    fn decode_data_uri_image_rejects_missing_base64_marker() {
-        assert_eq!(decode_data_uri_image("data:image/png,AAAA"), None);
+        let cases: &[(&str, String, Option<(u32, u32, Vec<u8>)>)] = &[
+            (
+                "decodes a solid-red 2×1 PNG",
+                valid_uri,
+                Some((2, 1, vec![255, 0, 0, 255, 255, 0, 0, 255])),
+            ),
+            ("rejects invalid base64", invalid_base64, None),
+            ("rejects non-image bytes", non_image, None),
+            (
+                "rejects an oversized payload by a pure length check before any base64 work",
+                oversized_payload,
+                None,
+            ),
+            (
+                "rejects oversized dimensions from the header alone before any pixel decode",
+                oversized_dimensions,
+                None,
+            ),
+            (
+                "rejects a data URI missing the base64 marker",
+                missing_marker,
+                None,
+            ),
+        ];
+        for (i, (name, uri, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                decode_data_uri_image(uri).as_ref(),
+                expected.as_ref(),
+                "case {i} ({name})"
+            );
+        }
     }
 
     #[test]
