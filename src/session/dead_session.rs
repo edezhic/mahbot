@@ -188,14 +188,6 @@ pub async fn run_dead_session_recovery_loop() {
 
 // ── Core detection + recovery logic ─────────────────────────────────────────
 
-/// Agent-ID prefixes excluded from dead-session recovery: `manager_` plus all
-/// [`crate::session::TRANSIENT_AGENT_ID_PREFIXES`]. `manager_` stays out of the
-/// slice itself (Manager sessions must survive and keep their shared context) —
-/// this builds the union from it without duplicating the prefix list.
-fn excluded_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
-    crate::session::reserved_agent_id_prefixes()
-}
-
 /// Classify a session by its last persisted message role: is it a
 /// dead-session recovery candidate?
 ///
@@ -227,7 +219,9 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     // per-session `get_last_message_role` queries below are lightweight
     // (indexed `ORDER BY id DESC LIMIT 1`) and only run for eligible sessions.
     let sessions = crate::session::store()
-        .list_sessions_with_metadata_excluding(&excluded_agent_id_prefixes().collect::<Vec<&str>>())
+        .list_sessions_with_metadata_excluding(
+            &crate::session::reserved_agent_id_prefixes().collect::<Vec<&str>>(),
+        )
         .await;
 
     for session in &sessions {
@@ -328,7 +322,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 /// retained for test coverage and as documentation of the exclusion criteria.
 #[cfg(test)]
 fn is_excluded_agent_id(agent_id: &str) -> bool {
-    excluded_agent_id_prefixes().any(|p| {
+    crate::session::reserved_agent_id_prefixes().any(|p| {
         let bare = p.trim_end_matches('_');
         // Faithful to SQL `LIKE 'prefix_%'`: the `_` consumes exactly one char
         // after the bare reserved word, so a bare word alone is NOT excluded.
@@ -388,8 +382,8 @@ mod tests {
         // prefix must be excluded.  Enumerating these as literal table rows
         // would silently lose coverage when TRANSIENT_AGENT_ID_PREFIXES grows
         // (or `manager_` changes), so the union is enumerated at runtime via
-        // `excluded_agent_id_prefixes()` — the same source the poller uses.
-        for prefix in excluded_agent_id_prefixes() {
+        // `reserved_agent_id_prefixes()` — the same source the poller uses.
+        for prefix in crate::session::reserved_agent_id_prefixes() {
             let id = format!("{prefix}suffix");
             assert!(
                 is_excluded_agent_id(&id),

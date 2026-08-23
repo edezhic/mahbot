@@ -270,10 +270,6 @@ pub(crate) struct SessionContext {
     pub user_name: String,
     pub workspace_name: String,
     /// Agent role (e.g. `"engineer"`, `"analyst"`, `"reviewer"`).
-    ///
-    /// Contrast with `sessions.role` which stores the message role
-    /// (`"user"`, `"assistant"`, `"tool"`, `"system"`).  The two are
-    /// semantically unrelated despite sharing a column name.
     pub role: String,
 }
 
@@ -1104,6 +1100,27 @@ mod tests {
         format!("s{}", TEST_ID.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Build a freshly-initialized [`Session`] with the fixed test arguments
+    /// (Assistant role, no ticket, "gui"/"tester" channel/user, no round_ts).
+    /// Message may be empty (recovery-retry semantics) or a real user turn.
+    async fn session_with_init(agent_id: &str, msg: &str, ws: &crate::Workspace) -> Session {
+        let mut session = Session::default();
+        session
+            .init(
+                agent_id,
+                msg,
+                ws,
+                &crate::Role::Assistant,
+                None,
+                "gui",
+                "tester",
+                None,
+            )
+            .await
+            .unwrap();
+        session
+    }
+
     /// The user-message timestamp block lives at the END of the message
     /// (suffix format, `\n\n` separator), so the task text is byte-stable
     /// across rounds — a changed timestamp only invalidates the tail of the
@@ -1539,20 +1556,7 @@ mod tests {
 
         store().set_token_length(&k, Some(123_456)).await.unwrap();
         let ws = crate::workspace::test_ws_named("/_test_token_length", "token_length");
-        let mut session = Session::default();
-        session
-            .init(
-                &k,
-                "",
-                &ws,
-                &crate::Role::Assistant,
-                None,
-                "gui",
-                "tester",
-                None,
-            )
-            .await
-            .unwrap();
+        let session = session_with_init(&k, "", &ws).await;
         // The persisted real length is loaded so `maybe_summarize` and the
         // Running Agents card see it from the very start of the turn.
         assert_eq!(session.token_length(), Some(123_456));
@@ -1626,14 +1630,9 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let agent_id = unique_key();
         let ws = crate::workspace::test_ws_named("/_test_empty_session_init", "empty_test");
-        let role = crate::Role::Assistant;
 
         // First turn: init with a real message creates the session.
-        let mut session = Session::default();
-        session
-            .init(&agent_id, "hello", &ws, &role, None, "gui", "tester", None)
-            .await
-            .unwrap();
+        let session = session_with_init(&agent_id, "hello", &ws).await;
         let len_after_real = session.history().len();
         assert!(
             len_after_real >= 2,
@@ -1641,11 +1640,7 @@ mod tests {
         );
 
         // Second turn: init with empty message should NOT append.
-        let mut session = Session::default();
-        session
-            .init(&agent_id, "", &ws, &role, None, "gui", "tester", None)
-            .await
-            .unwrap();
+        let session = session_with_init(&agent_id, "", &ws).await;
         assert_eq!(
             session.history().len(),
             len_after_real,
@@ -1747,20 +1742,7 @@ mod tests {
             .await
             .unwrap();
         let ws = crate::workspace::test_ws_named("/_test_finalize_guard", "finalize_test");
-        let mut session = Session::default();
-        session
-            .init(
-                &k,
-                "",
-                &ws,
-                &crate::Role::Assistant,
-                None,
-                "gui",
-                "tester",
-                None,
-            )
-            .await
-            .unwrap();
+        let mut session = session_with_init(&k, "", &ws).await;
 
         // No new assistant output this turn → the persisted trailing answer
         // must not be re-appended; the empty-tail no-op is reported.
@@ -1800,20 +1782,7 @@ mod tests {
             .await
             .unwrap();
         let ws = crate::workspace::test_ws_named("/_test_gap_flush", "gap_flush");
-        let mut session = Session::default();
-        session
-            .init(
-                &k,
-                "",
-                &ws,
-                &crate::Role::Assistant,
-                None,
-                "gui",
-                "tester",
-                None,
-            )
-            .await
-            .unwrap();
+        let mut session = session_with_init(&k, "", &ws).await;
 
         // Failed drain: comment delivered to history only.
         session.push_messages_unpersisted(&[ChatMessage::user("C1")]);
@@ -1864,20 +1833,7 @@ mod tests {
             .await
             .unwrap();
         let ws = crate::workspace::test_ws_named("/_test_gap_abort", "gap_abort");
-        let mut session = Session::default();
-        session
-            .init(
-                &k,
-                "",
-                &ws,
-                &crate::Role::Assistant,
-                None,
-                "gui",
-                "tester",
-                None,
-            )
-            .await
-            .unwrap();
+        let mut session = session_with_init(&k, "", &ws).await;
 
         session.push_messages_unpersisted(&[ChatMessage::user("C1")]);
         session.finalize(&k).await.unwrap();
