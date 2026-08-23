@@ -462,10 +462,6 @@ pub(crate) fn calibrate_negatives(prototype: &[f32], negatives: &[Vec<f32>]) -> 
 mod tests {
     use super::*;
 
-    fn norm(v: &[f32]) -> Vec<f32> {
-        l2_normalize(v)
-    }
-
     /// Deterministic unit vector whose cosine against `reference` is `c`.
     ///
     /// The orthogonal component is derived from a seeded random direction, so
@@ -498,7 +494,7 @@ mod tests {
     #[test]
     fn calibration_floor_maps_negatives_to_zero() {
         #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
-        let proto = norm(
+        let proto = l2_normalize(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
                 .collect::<Vec<_>>(),
@@ -581,7 +577,7 @@ mod tests {
     #[test]
     fn anti_prototype_gate_rejects_windows_closer_to_a_negative() {
         #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
-        let proto = norm(
+        let proto = l2_normalize(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
                 .collect::<Vec<_>>(),
@@ -629,7 +625,7 @@ mod tests {
     #[test]
     fn distill_negative_prototypes_spreads_selection() {
         #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
-        let proto = norm(
+        let proto = l2_normalize(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
                 .collect::<Vec<_>>(),
@@ -703,7 +699,7 @@ mod tests {
 
     #[test]
     fn build_requires_min_utterances() {
-        let emb = norm(&vec![1.0; WAKE_WORD_EMBEDDING_DIM]);
+        let emb = l2_normalize(&vec![1.0; WAKE_WORD_EMBEDDING_DIM]);
         let enough: Vec<Vec<f32>> = vec![emb.clone(); MIN_ENROLLMENT_UTTERANCES];
         assert!(
             WakeWordEnrollment::build(
@@ -733,7 +729,7 @@ mod tests {
     #[test]
     fn prototype_is_unit_norm() {
         #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
-        let emb = norm(
+        let emb = l2_normalize(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
                 .collect::<Vec<_>>(),
@@ -756,7 +752,7 @@ mod tests {
     #[test]
     fn serde_roundtrip_v2() {
         #[expect(clippy::cast_precision_loss)] // embedding dim ≤ 1024 — exact in f32
-        let emb = norm(
+        let emb = l2_normalize(
             &(0..WAKE_WORD_EMBEDDING_DIM)
                 .map(|i| i as f32)
                 .collect::<Vec<_>>(),

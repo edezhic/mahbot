@@ -107,13 +107,13 @@ pub(crate) const HOP_LENGTH: usize = 256;
 const MAX_RECORD_SECS: usize = 600;
 
 /// Minimum silence duration before stopping command recording.
-pub(crate) const SILENCE_DURATION: Duration = Duration::from_millis(1500);
+pub(crate) const COMMAND_SILENCE_DURATION: Duration = Duration::from_millis(1500);
 
 /// Silence threshold in audio samples at 16 kHz.
-/// Derived from SILENCE_DURATION × SAMPLE_RATE to prevent silent drift
+/// Derived from COMMAND_SILENCE_DURATION × SAMPLE_RATE to prevent silent drift
 /// if either constant changes.
 pub(crate) const SILENCE_THRESHOLD_SAMPLES: usize =
-    (SILENCE_DURATION.as_millis() as usize * SAMPLE_RATE as usize) / 1000;
+    (COMMAND_SILENCE_DURATION.as_millis() as usize * SAMPLE_RATE as usize) / 1000;
 
 /// Enrollment/segmentation silence threshold (~304ms = 19 hops × 256 samples).
 /// Aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`] so that utterance
@@ -486,11 +486,7 @@ pub(crate) fn score_single_embedding(
 
     // Immediate-fire: no second-stage gate — a threshold
     // crossing fires detection on this frame (speaker-blind pipeline).
-    if detected {
-        (true, rolling_sum, total_score, effective_threshold)
-    } else {
-        (false, rolling_sum, total_score, effective_threshold)
-    }
+    (detected, rolling_sum, total_score, effective_threshold)
 }
 
 /// VAD threshold: scores >= this are considered speech.
@@ -1218,9 +1214,6 @@ pub(crate) fn compute_utterance_quality(
     // heuristic (estimate_snr_energy) which measures speech dynamic range
     // rather than true SNR.
     let snr_db = if let Some(noise_rms) = noise_rms {
-        // Shared RMS helper.  Empty-input NaN → 0.0 via
-        // compute_rms is branch-equivalent to the old inline formula (the
-        // `speech_rms > noise_rms` guard yields 0.0 in both cases).
         let speech_rms = crate::util::compute_rms(samples);
         if noise_rms > 1e-10 && speech_rms > noise_rms {
             20.0 * (speech_rms / noise_rms).log10()
@@ -1292,9 +1285,6 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
         if chunk.len() < FRAME_LENGTH / 2 {
             continue; // Skip partial trailing frames
         }
-        // Shared RMS helper.  `chunk.len().min(FRAME_LENGTH)`
-        // was always `chunk.len()` here (chunks ≤ FRAME_LENGTH and the
-        // half-frame skip above), so this is bit-identical.
         frame_rms.push(crate::util::compute_rms(chunk));
     }
 
@@ -5142,13 +5132,6 @@ mod tests {
     // soft score against the enrolled prototype.  These tests use synthetic
     // L2-normalized embeddings and a synthetic enrollment.
 
-    /// L2-normalize a test vector.
-    fn norm_embedding(v: &[f32]) -> Vec<f32> {
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(norm > 0.0, "test embedding must be non-zero");
-        v.iter().map(|x| x / norm).collect()
-    }
-
     /// Basis embedding: dim `d` = 1.0, everything else 0.0 (unit norm).
     fn basis_embedding(d: usize) -> Vec<f32> {
         let mut v = vec![0.0; WAKE_WORD_EMBEDDING_DIM];
@@ -5177,7 +5160,7 @@ mod tests {
         // Without an enrollment no detection is possible: total_score = 0.0
         // and the window is reset (0.0 < NO_MATCH_RESET_THRESHOLD).
         let mut window = vec![0.9, 0.8];
-        let emb = norm_embedding(&vec![1.0; WAKE_WORD_EMBEDDING_DIM]);
+        let emb = crate::audio::wake_word::l2_normalize(&vec![1.0; WAKE_WORD_EMBEDDING_DIM]);
         let (detected, rolling, total, _) =
             score_single_embedding(&emb, None, &mut window, None, ADAPTIVE_K_DEFAULT);
         assert!(!detected);

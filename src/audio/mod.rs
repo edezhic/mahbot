@@ -46,10 +46,10 @@ pub(crate) fn models_subdir(name: &str) -> Option<PathBuf> {
     crate::util::models_dir().map(|dir| dir.join(name))
 }
 
-/// Retry cap shared by the voice and TTS model download loops.
+/// Retry cap for the TTS model download loop.
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
 
-/// Shared download-retry skeleton for the voice and TTS model sets: owns the
+/// Shared download-retry skeleton for the TTS model set: owns the
 /// [`ModelLoadGuard`] and dir resolution, bounded loop (Ready pre-check, retry
 /// cap, download-only timeout, Failed re-check, 5s→2min backoff). `on_retry_cap`
 /// owns `state.store(Failed)` (module-specific tail ordering); dir-resolution
@@ -107,7 +107,7 @@ pub(crate) async fn run_download_retry_loop<D, L, F>(
     }
 }
 
-/// Verify-then-download helper shared by the TTS and voice model sets.
+/// Verify-then-download helper shared by the TTS model set.
 ///
 /// Checks `path` before downloading (SHA256 when `sha256` is non-empty,
 /// else `min_size`), re-downloading via

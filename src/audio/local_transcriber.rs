@@ -386,7 +386,7 @@ fn decode_opus_from_ogg(data: &[u8], path: &Path) -> Result<(Vec<f32>, i32)> {
 
     let cursor = Cursor::new(data);
     let mut reader = PacketReader::new(cursor);
-    let sample_rate: i32 = 16000; // We decode at 16 kHz
+    let sample_rate: i32 = qwen_asr::config::SAMPLE_RATE; // We decode at 16 kHz
     let mut decoder: Option<opus_decoder::OpusDecoder> = None;
     let mut channels: usize = 1; // Will be set from OpusHead
     let mut samples: Vec<f32> = Vec::new();

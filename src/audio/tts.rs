@@ -71,7 +71,7 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const DEFAULT_TOTAL_STEPS: usize = 8;
 const SPEED_FACTOR: f32 = 1.05;
 const MAX_CHUNK_LENGTH: usize = 300;
-const SILENCE_DURATION: f32 = 0.3;
+const TTS_CHUNK_SILENCE_SECS: f32 = 0.3;
 // Timeout per-chunk receive: guards against hung synthesis (ONNX deadlock).
 const SYNTHESIS_CHUNK_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -1546,7 +1546,7 @@ async fn speak_async(text: String, cancel_rx: Option<broadcast::Receiver<()>>) {
                 break;
             }
             // Natural pause between speech chunks
-            tokio::time::sleep(Duration::from_secs_f32(SILENCE_DURATION)).await;
+            tokio::time::sleep(Duration::from_secs_f32(TTS_CHUNK_SILENCE_SECS)).await;
         }
 
         // Render WAV bytes for this chunk (in-memory, no file I/O).
@@ -2517,7 +2517,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(tts)]
     async fn test_tts_e2e() {
-        const ASR_SAMPLE_RATE: u32 = 16_000;
+        const ASR_SAMPLE_RATE: u32 = qwen_asr::config::SAMPLE_RATE as u32;
 
         /// Strip ASCII punctuation (Unicode punctuation like em-dashes or
         /// curly quotes is not stripped, but these rarely appear in the
