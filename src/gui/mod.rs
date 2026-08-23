@@ -1919,15 +1919,14 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         .style(widgets::text_input_style)
         .size(13)
         .padding([4, 8]);
-    let clear_btn = tooltip(
-        button(text("×").size(14))
-            .on_press(Message::Board(board::BoardMessage::SearchCleared))
-            .style(theme::button_text)
-            .padding(4),
-        text("clear search").size(11),
+    let clear_btn = widgets::icon_tooltip_button(
+        text("×").size(14),
+        "clear search",
+        Some(Message::Board(board::BoardMessage::SearchCleared)),
+        4,
+        theme::button_text,
         tooltip::Position::Top,
-    )
-    .style(theme::tooltip_style);
+    );
     let search_row = row![search_input, clear_btn]
         .spacing(4)
         .align_y(Alignment::Center);
@@ -2437,24 +2436,18 @@ impl Dashboard {
         let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
             .size(24)
             .color(update_color);
-        let update_btn = button(update_icon)
-            .style(theme::button_text)
-            .padding(3)
-            .on_press_maybe(if clickable {
+        Some(widgets::icon_tooltip_button(
+            update_icon,
+            tooltip_text,
+            if clickable {
                 Some(Message::UpdateBot)
             } else {
                 None
-            });
-        let update_tooltip = tooltip_text;
-        Some(
-            tooltip(
-                update_btn,
-                text(update_tooltip).size(11),
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .into(),
-        )
+            },
+            3,
+            theme::button_text,
+            tooltip::Position::Top,
+        ))
     }
 
     /// Render the footer navigation icons (Sessions, Logs, Settings).
@@ -2468,15 +2461,14 @@ impl Dashboard {
                 theme::TEXT_MUTED
             };
             let icon: Element<'_, Message> = page_icon(*page, 24, color);
-            let btn = button(icon)
-                .style(theme::button_text)
-                .padding(3)
-                .on_press(Message::Navigation(*page));
-            icons.push(
-                tooltip(btn, text(page.label()).size(11), tooltip::Position::Top)
-                    .style(theme::tooltip_style)
-                    .into(),
-            );
+            icons.push(widgets::icon_tooltip_button(
+                icon,
+                page.label(),
+                Some(Message::Navigation(*page)),
+                3,
+                theme::button_text,
+                tooltip::Position::Top,
+            ));
         }
         Row::with_children(icons)
             .spacing(6)
@@ -2513,18 +2505,14 @@ impl Dashboard {
         ]
         .spacing(6)
         .align_y(Alignment::Center);
-        Some(
-            tooltip(
-                button(branch_content)
-                    .style(theme::button_text)
-                    .padding(3)
-                    .on_press(Message::Git(git::GitMessage::OpenModal)),
-                text("active branch").size(11),
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .into(),
-        )
+        Some(widgets::icon_tooltip_button(
+            branch_content,
+            "active branch",
+            Some(Message::Git(git::GitMessage::OpenModal)),
+            3,
+            theme::button_text,
+            tooltip::Position::Top,
+        ))
     }
 
     /// Render the git sync indicator (refresh icon + behind/ahead counts, clickable).
@@ -2589,22 +2577,18 @@ impl Dashboard {
         ]
         .spacing(6)
         .align_y(Alignment::Center);
-        Some(
-            tooltip(
-                button(sync_content)
-                    .style(theme::button_text)
-                    .padding(3)
-                    .on_press_maybe(if self.git_state.is_syncing() {
-                        None
-                    } else {
-                        Some(Message::Git(git::GitMessage::Sync))
-                    }),
-                text("sync commits pull and push").size(11),
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .into(),
-        )
+        Some(widgets::icon_tooltip_button(
+            sync_content,
+            "sync commits pull and push",
+            if self.git_state.is_syncing() {
+                None
+            } else {
+                Some(Message::Git(git::GitMessage::Sync))
+            },
+            3,
+            theme::button_text,
+            tooltip::Position::Top,
+        ))
     }
 
     /// Render the git diff stats button (+X/−Y, clickable -> diff modal).
@@ -2615,18 +2599,14 @@ impl Dashboard {
             return None;
         }
         let stats_row = widgets::diff_stats_row::<Message>(added, removed, 15.0);
-        Some(
-            tooltip(
-                button(stats_row)
-                    .style(theme::button_text)
-                    .padding(3)
-                    .on_press(Message::OpenDiffModal(None)),
-                text("uncommitted changes").size(11),
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .into(),
-        )
+        Some(widgets::icon_tooltip_button(
+            stats_row,
+            "uncommitted changes",
+            Some(Message::OpenDiffModal(None)),
+            3,
+            theme::button_text,
+            tooltip::Position::Top,
+        ))
     }
 
     /// Render the git block: divider, branch, sync, and diff stats.
@@ -2685,19 +2665,14 @@ impl Dashboard {
             } else {
                 container(icon).padding([0, 3]).into()
             };
-            let btn = button(content)
-                .style(theme::button_text)
-                .padding(0)
-                .on_press(Message::Navigation(Page::RunningAgents));
-            icons.push(
-                tooltip(
-                    btn,
-                    text(role.display_label()).size(11),
-                    tooltip::Position::Top,
-                )
-                .style(theme::tooltip_style)
-                .into(),
-            );
+            icons.push(widgets::icon_tooltip_button(
+                content,
+                role.display_label(),
+                Some(Message::Navigation(Page::RunningAgents)),
+                0,
+                theme::button_text,
+                tooltip::Position::Top,
+            ));
         }
         Some(
             Row::with_children(icons)
@@ -2740,15 +2715,14 @@ impl Dashboard {
         labels.sort_unstable();
         labels.dedup();
         let tooltip_text = labels.join(", ");
-        let btn = button(content)
-            .style(theme::button_text)
-            .padding(0)
-            .on_press(Message::Navigation(Page::RunningAgents));
-        Some(
-            tooltip(btn, text(tooltip_text).size(11), tooltip::Position::Top)
-                .style(theme::tooltip_style)
-                .into(),
-        )
+        Some(widgets::icon_tooltip_button(
+            content,
+            tooltip_text,
+            Some(Message::Navigation(Page::RunningAgents)),
+            0,
+            theme::button_text,
+            tooltip::Position::Top,
+        ))
     }
 
     /// Render the TTS download progress indicator in the centre of the footer bar.

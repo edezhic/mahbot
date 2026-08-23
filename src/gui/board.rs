@@ -521,29 +521,27 @@ impl BoardState {
             } else {
                 theme::button_text
             };
-            icon_row = icon_row.push(
-                tooltip(
-                    button(icon.size(16).color(icon_color))
-                        .style(style_fn)
-                        .on_press_maybe(if is_disabled {
-                            None
-                        } else if is_cancel {
-                            // Cancels go through the eligibility gate first
-                            // (`RequestCancel`): mid-pipeline cancels (agent
-                            // running) require explicit confirmation; other
-                            // cancels execute directly, exactly as before.
-                            Some(BoardMessage::RequestCancel(ticket_id.to_string()))
-                        } else {
-                            Some(BoardMessage::PerformAction(
-                                ticket_id.to_string(),
-                                phase.to_string(),
-                            ))
-                        }),
-                    text(tooltip_text).size(11),
-                    tooltip::Position::Top,
-                )
-                .style(theme::tooltip_style),
-            );
+            icon_row = icon_row.push(widgets::icon_tooltip_button(
+                icon.size(16).color(icon_color),
+                tooltip_text,
+                if is_disabled {
+                    None
+                } else if is_cancel {
+                    // Cancels go through the eligibility gate first
+                    // (`RequestCancel`): mid-pipeline cancels (agent
+                    // running) require explicit confirmation; other
+                    // cancels execute directly, exactly as before.
+                    Some(BoardMessage::RequestCancel(ticket_id.to_string()))
+                } else {
+                    Some(BoardMessage::PerformAction(
+                        ticket_id.to_string(),
+                        phase.to_string(),
+                    ))
+                },
+                button::DEFAULT_PADDING,
+                style_fn,
+                tooltip::Position::Top,
+            ));
         }
         icon_row
     }
@@ -1174,7 +1172,6 @@ impl BoardState {
     }
 
     /// Render a single ticket card: clickable title, ID, phase badge, and action icons.
-    #[expect(clippy::too_many_lines)]
     pub fn render_ticket_card<'a>(&'a self, ticket: &'a Ticket) -> Element<'a, BoardMessage> {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
@@ -1222,18 +1219,17 @@ impl BoardState {
             ]
             .spacing(0)
             .align_y(Alignment::Center);
-            let stats_button = tooltip(
-                button(stats_parts)
-                    .padding([2, 6])
-                    .style(theme::button_text)
-                    .on_press(BoardMessage::ViewCommitDiff {
-                        commit_hash: hash.clone(),
-                        workspace_name: ws_name.clone(),
-                    }),
-                text("ticket commit diff").size(11),
+            let stats_button = widgets::icon_tooltip_button(
+                stats_parts,
+                "ticket commit diff",
+                Some(BoardMessage::ViewCommitDiff {
+                    commit_hash: hash.clone(),
+                    workspace_name: ws_name.clone(),
+                }),
+                [2, 6],
+                theme::button_text,
                 tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style);
+            );
             badge_row = badge_row.push(stats_button);
         }
 
@@ -1243,22 +1239,20 @@ impl BoardState {
         // Per-ticket archive button for done/cancelled tickets
         if matches!(ticket.phase, TicketPhase::Done | TicketPhase::Cancelled) && !ticket.is_archived
         {
-            let archive_btn = tooltip(
-                button(
-                    lucide::archive::<iced::Theme, iced::Renderer>()
-                        .size(16)
-                        .color(theme::TEXT_MUTED),
-                )
-                .style(theme::button_text)
-                .on_press_maybe(if is_action_disabled {
+            let archive_btn = widgets::icon_tooltip_button(
+                lucide::archive::<iced::Theme, iced::Renderer>()
+                    .size(16)
+                    .color(theme::TEXT_MUTED),
+                "archive ticket",
+                if is_action_disabled {
                     None
                 } else {
                     Some(BoardMessage::ArchiveTicket(ticket.id.clone()))
-                }),
-                text("archive ticket").size(11),
+                },
+                button::DEFAULT_PADDING,
+                theme::button_text,
                 tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style);
+            );
             badge_row = badge_row.push(archive_btn);
         }
 
@@ -1554,18 +1548,16 @@ impl BoardState {
                     .color(theme::TEXT_PRIMARY)
                     .font(theme::FONT_BOLD),
                 Space::new().width(Length::Fill),
-                tooltip(
-                    button(
-                        lucide::x::<iced::Theme, iced::Renderer>()
-                            .size(16)
-                            .color(theme::TEXT_SECONDARY),
-                    )
-                    .style(theme::button_text)
-                    .on_press(BoardMessage::CloseModal),
-                    text("close").size(11),
+                widgets::icon_tooltip_button(
+                    lucide::x::<iced::Theme, iced::Renderer>()
+                        .size(16)
+                        .color(theme::TEXT_SECONDARY),
+                    "close",
+                    Some(BoardMessage::CloseModal),
+                    button::DEFAULT_PADDING,
+                    theme::button_text,
                     tooltip::Position::Top,
-                )
-                .style(theme::tooltip_style),
+                ),
             ]
             .align_y(Alignment::Center),
             text(&ticket.id).size(12).color(theme::TEXT_SECONDARY),

@@ -1635,26 +1635,23 @@ impl SettingsState {
                                     .align_y(Alignment::Center)
                             },
                             // Right column (FillPortion: 12) — Maintainer toggle only.
-                            container(
-                                tooltip(
-                                    button(widgets::maint_badge(maintainer_on))
-                                        .style(theme::button_text)
-                                        .on_press(SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::ToggleMaintainer(
-                                                ws_item.name.clone(),
-                                                !maintainer_on,
-                                            ),
-                                        ),),
-                                    text(if maintainer_on {
-                                        "stop maintenance"
-                                    } else {
-                                        "start maintenance"
-                                    })
-                                    .size(11),
-                                    tooltip::Position::Top,
-                                )
-                                .style(theme::tooltip_style),
-                            )
+                            container(widgets::icon_tooltip_button(
+                                widgets::maint_badge(maintainer_on),
+                                if maintainer_on {
+                                    "stop maintenance"
+                                } else {
+                                    "start maintenance"
+                                },
+                                Some(SettingsMessage::WorkspaceMsg(
+                                    workspaces::WorkspacesMessage::ToggleMaintainer(
+                                        ws_item.name.clone(),
+                                        !maintainer_on,
+                                    ),
+                                )),
+                                button::DEFAULT_PADDING,
+                                theme::button_text,
+                                tooltip::Position::Top,
+                            ),)
                             .width(Length::FillPortion(12))
                             .align_x(Alignment::End)
                             .align_y(Alignment::Center),
@@ -1917,23 +1914,18 @@ impl SettingsState {
                     .align_x(iced::alignment::Horizontal::Center)
                     .into()
                 } else {
-                    container(
-                        tooltip(
-                            button(
-                                lucide::log_in::<iced::Theme, iced::Renderer>()
-                                    .size(18)
-                                    .color(theme::TEXT_MUTED),
-                            )
-                            .style(theme::button_text)
-                            .padding(0)
-                            .on_press(SettingsMessage::UserMsg(users::UsersMessage::SwitchUser(
-                                user.name.clone(),
-                            ))),
-                            text("Switch active user").size(11),
-                            tooltip::Position::Top,
-                        )
-                        .style(theme::tooltip_style),
-                    )
+                    container(widgets::icon_tooltip_button(
+                        lucide::log_in::<iced::Theme, iced::Renderer>()
+                            .size(18)
+                            .color(theme::TEXT_MUTED),
+                        "Switch active user",
+                        Some(SettingsMessage::UserMsg(users::UsersMessage::SwitchUser(
+                            user.name.clone(),
+                        ))),
+                        0,
+                        theme::button_text,
+                        tooltip::Position::Top,
+                    ))
                     .width(Length::Fixed(28.0))
                     .align_x(iced::alignment::Horizontal::Center)
                     .into()
@@ -2046,26 +2038,20 @@ impl SettingsState {
                                     row![
                                         role_picker,
                                         Space::new().width(4),
-                                        tooltip(
-                                            button(
-                                                lucide::pencil_line::<iced::Theme, iced::Renderer>(
-                                                )
+                                        widgets::icon_tooltip_button(
+                                            lucide::pencil_line::<iced::Theme, iced::Renderer>()
                                                 .size(15)
                                                 .color(theme::TEXT_MUTED),
-                                            )
-                                            .style(theme::button_text)
-                                            .padding(2)
-                                            .on_press(
-                                                SettingsMessage::UserMsg(
-                                                    users::UsersMessage::OpenPoolEdit(
-                                                        user.name.clone()
-                                                    ),
-                                                )
-                                            ),
-                                            text("Edit role pool").size(11),
+                                            "Edit role pool",
+                                            Some(SettingsMessage::UserMsg(
+                                                users::UsersMessage::OpenPoolEdit(
+                                                    user.name.clone(),
+                                                ),
+                                            )),
+                                            2,
+                                            theme::button_text,
                                             tooltip::Position::Top,
-                                        )
-                                        .style(theme::tooltip_style),
+                                        ),
                                     ]
                                     .align_y(Alignment::Center),
                                 )
@@ -2155,26 +2141,21 @@ impl SettingsState {
                                             .into();
                                         e
                                     } else {
-                                        tooltip(
-                                            button(
-                                                lucide::x::<iced::Theme, iced::Renderer>()
-                                                    .size(11)
-                                                    .color(theme::TEXT_MUTED),
-                                            )
-                                            .style(theme::button_text)
-                                            .on_press(
-                                                SettingsMessage::UserMsg(
-                                                    users::UsersMessage::UnbindChannel(
-                                                        user.name.clone(),
-                                                        binding.identifier.clone(),
-                                                    ),
+                                        widgets::icon_tooltip_button(
+                                            lucide::x::<iced::Theme, iced::Renderer>()
+                                                .size(11)
+                                                .color(theme::TEXT_MUTED),
+                                            "Unlink Telegram",
+                                            Some(SettingsMessage::UserMsg(
+                                                users::UsersMessage::UnbindChannel(
+                                                    user.name.clone(),
+                                                    binding.identifier.clone(),
                                                 ),
-                                            ),
-                                            text("Unlink Telegram").size(11),
+                                            )),
+                                            button::DEFAULT_PADDING,
+                                            theme::button_text,
                                             tooltip::Position::Top,
                                         )
-                                        .style(theme::tooltip_style)
-                                        .into()
                                     },
                                 ]
                                 .align_y(Alignment::Center)

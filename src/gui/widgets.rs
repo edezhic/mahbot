@@ -1,6 +1,7 @@
 //! Shared dashboard widgets: styled pick_list, PickOption type, FileTree state struct
 //! and build_tree_panel for shared file-tree panel rendering.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
@@ -225,6 +226,37 @@ pub fn maint_badge<'a, Message: 'a>(enabled: bool) -> Column<'a, Message> {
     .align_x(Alignment::Center)
 }
 
+/// Shared icon/action button wrapped in a tooltip.
+///
+/// Replicates the `tooltip(button(icon).style(..).padding(..).on_press_maybe(..),
+/// text(..).size(11), pos)` idiom plus `theme::tooltip_style`. `padding` must
+/// mirror the original site exactly — pass [`iced::widget::button::DEFAULT_PADDING`]
+/// where there was no explicit `.padding()`. Full-width / container-wrapped
+/// variants keep their bespoke construction.
+#[must_use]
+pub fn icon_tooltip_button<'a, Message>(
+    icon: impl Into<Element<'a, Message>>,
+    tooltip_text: impl Into<Cow<'a, str>>,
+    on_press: Option<Message>,
+    padding: impl Into<Padding>,
+    style: impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style + 'a,
+    position: tooltip::Position,
+) -> Element<'a, Message>
+where
+    Message: Clone + 'a,
+{
+    tooltip(
+        button(icon)
+            .style(style)
+            .padding(padding)
+            .on_press_maybe(on_press),
+        text(tooltip_text.into()).size(11),
+        position,
+    )
+    .style(theme::tooltip_style)
+    .into()
+}
+
 /// Create a selectable text widget with the given color.
 ///
 /// Accepts both borrowed (`&str`) and owned (`String`) text content.
@@ -381,27 +413,24 @@ pub fn chat_composer<'a, M: Clone + 'a>(
     // never allocates content.text() per frame.
     let send_disabled = options.sending
         || (options.grey_on_empty && (content.is_empty() || content.text().trim().is_empty()));
-    let send_btn = tooltip(
-        button(
-            lucide::send::<iced::Theme, iced::Renderer>()
-                .size(14)
-                .color(if send_disabled {
-                    theme::TEXT_MUTED
-                } else {
-                    theme::ACCENT
-                }),
-        )
-        .style(theme::icon_button_style(send_disabled))
-        .on_press_maybe(if send_disabled {
+    let send_btn = icon_tooltip_button(
+        lucide::send::<iced::Theme, iced::Renderer>()
+            .size(14)
+            .color(if send_disabled {
+                theme::TEXT_MUTED
+            } else {
+                theme::ACCENT
+            }),
+        options.send_tooltip,
+        if send_disabled {
             None
         } else {
             Some(send_msg_btn)
-        })
-        .padding(4),
-        text(options.send_tooltip).size(11),
+        },
+        4,
+        theme::icon_button_style(send_disabled),
         tooltip::Position::Top,
-    )
-    .style(theme::tooltip_style);
+    );
 
     // Right-edge overlay: controls column (when present) above the send button.
     let mut col = Column::new().spacing(6).align_x(Alignment::End);
