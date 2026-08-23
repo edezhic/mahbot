@@ -2539,6 +2539,72 @@ impl SettingsState {
         .style(theme::dialog_container_style)
         .into()
     }
+    // ── Config-field builders ────────────────────────────────────
+    //
+    // Collapse the repeated ~20-line block (a `field_row`/`field_row_with_error`
+    // wrapping a `text_input`/`password_input` that emits `ConfigField` on input,
+    // `ConfigFieldSettleNow` on Enter, styled + fixed-width, with the `field_errors`
+    // lookup) into a single helper per input kind. Behavior-preserving: the field id
+    // is always `config:<key>` derived from the `CONFIG_KEY_*` const, which is
+    // `stringify!` of the snake_case field name — no per-call literal ids.
+
+    /// A single inline-editable text config field row (with error placement).
+    fn config_text_field<'a>(
+        &'a self,
+        label: &'static str,
+        placeholder: &'static str,
+        value: &'a str,
+        key: &'static str,
+        hint: Option<&'static str>,
+    ) -> Element<'a, SettingsMessage> {
+        let field = format!("config:{key}");
+        let error = self.field_errors.get(&field).map(String::as_str);
+        field_row_with_error(
+            label,
+            text_input(placeholder, value)
+                .on_input(move |v| SettingsMessage::ConfigField { key, value: v })
+                .on_submit(SettingsMessage::ConfigFieldSettleNow {
+                    field: field.clone(),
+                })
+                .style(super::widgets::text_input_style)
+                .width(Length::Fixed(375.0))
+                .into(),
+            hint,
+            error,
+        )
+    }
+
+    /// A single maskable password config field row (with password highlighting).
+    #[expect(clippy::too_many_arguments)]
+    fn config_password_field<'a>(
+        &'a self,
+        label: &'static str,
+        target: PasswordTarget,
+        placeholder: &'static str,
+        value: &'a str,
+        key: &'static str,
+        hint: Option<&'static str>,
+        highlight: bool,
+    ) -> Element<'a, SettingsMessage> {
+        let field = format!("config:{key}");
+        field_row(
+            label,
+            password_input(
+                placeholder,
+                value,
+                self.password_visible.contains(&target),
+                move |v| SettingsMessage::ConfigField { key, value: v },
+                SettingsMessage::TogglePasswordVisibility(target),
+                SettingsMessage::ConfigFieldSettleNow {
+                    field: field.clone(),
+                },
+                self.field_errors.get(&field).map(String::as_str),
+                highlight,
+            ),
+            hint,
+        )
+    }
+
     // ── Section helpers ──────────────────────────────────────────
 
     fn provider_section(&self) -> Element<'_, SettingsMessage> {
@@ -2564,26 +2630,14 @@ impl SettingsState {
         let custom_section_open = custom_active || self.custom_revealed;
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = vec![
-            field_row(
+            self.config_password_field(
                 "OpenRouter key",
-                password_input(
-                    "sk-or-v1-...",
-                    self.config.provider_key.as_deref().unwrap_or_default(),
-                    self.password_visible.contains(&PasswordTarget::ProviderKey),
-                    |v| SettingsMessage::ConfigField {
-                        key: CONFIG_KEY_PROVIDER_KEY,
-                        value: v,
-                    },
-                    SettingsMessage::TogglePasswordVisibility(PasswordTarget::ProviderKey),
-                    SettingsMessage::ConfigFieldSettleNow {
-                        field: "config:provider_key".to_string(),
-                    },
-                    self.field_errors
-                        .get("config:provider_key")
-                        .map(String::as_str),
-                    api_key_unset,
-                ),
+                PasswordTarget::ProviderKey,
+                "sk-or-v1-...",
+                self.config.provider_key.as_deref().unwrap_or_default(),
+                CONFIG_KEY_PROVIDER_KEY,
                 None,
+                api_key_unset,
             ),
             field_row(
                 "Custom endpoint",
@@ -2599,28 +2653,14 @@ impl SettingsState {
         if custom_section_open {
             // Endpoint URL — free text, settled on Enter / debounce. An
             // unreachable endpoint still saves (with an inline warning).
-            let endpoint_field = format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT}");
-            let endpoint_error = self.field_errors.get(&endpoint_field).map(String::as_str);
-            let mut endpoint_row = field_row_with_error(
+            let mut endpoint_row = self.config_text_field(
                 "Endpoint URL",
-                text_input(
-                    "https://openrouter.ai/api/v1",
-                    self.config.provider_endpoint.as_deref().unwrap_or_default(),
-                )
-                .on_input(|v| SettingsMessage::ConfigField {
-                    key: CONFIG_KEY_PROVIDER_ENDPOINT,
-                    value: v,
-                })
-                .on_submit(SettingsMessage::ConfigFieldSettleNow {
-                    field: endpoint_field.clone(),
-                })
-                .style(super::widgets::text_input_style)
-                .width(Length::Fixed(375.0))
-                .into(),
+                "https://openrouter.ai/api/v1",
+                self.config.provider_endpoint.as_deref().unwrap_or_default(),
+                CONFIG_KEY_PROVIDER_ENDPOINT,
                 Some(
                     "Reasoning effort is auto-translated per model family (e.g. Ollama max/high, MiMo thinking field, MiniMax none); unknown models fall back to max/high. An unreachable endpoint still saves (with a warning)",
                 ),
-                endpoint_error,
             );
             if let Some(w) = self.endpoint_warning.as_ref() {
                 endpoint_row = column![endpoint_row, inline_warning(w, 188.0)]
@@ -2630,100 +2670,49 @@ impl SettingsState {
             rows.push(endpoint_row);
 
             // Endpoint key (optional) — only ever sent to the custom endpoint.
-            let key_field = format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT_KEY}");
-            rows.push(field_row(
-                "Endpoint key (optional)",
-                password_input(
+            rows.push(
+                self.config_password_field(
+                    "Endpoint key (optional)",
+                    PasswordTarget::EndpointKey,
                     "Leave empty for keyless servers",
                     self.config
                         .provider_endpoint_key
                         .as_deref()
                         .unwrap_or_default(),
-                    self.password_visible.contains(&PasswordTarget::EndpointKey),
-                    |v| SettingsMessage::ConfigField {
-                        key: CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
-                        value: v,
-                    },
-                    SettingsMessage::TogglePasswordVisibility(PasswordTarget::EndpointKey),
-                    SettingsMessage::ConfigFieldSettleNow {
-                        field: key_field.clone(),
-                    },
-                    self.field_errors.get(&key_field).map(String::as_str),
+                    CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
+                    Some("Only sent to the custom endpoint — never to OpenRouter"),
                     false,
                 ),
-                Some("Only sent to the custom endpoint — never to OpenRouter"),
-            ));
+            );
         }
 
         section("Provider", Column::with_children(rows).spacing(4))
     }
 
     fn models_section(&self) -> Element<'_, SettingsMessage> {
-        let manager_row = field_row_with_error(
+        let manager_row = self.config_text_field(
             "Manager",
-            text_input(
-                crate::config::DEFAULT_MANAGER_MODEL,
-                self.config.manager_model.as_deref().unwrap_or_default(),
-            )
-            .on_input(|v| SettingsMessage::ConfigField {
-                key: CONFIG_KEY_MANAGER_MODEL,
-                value: v,
-            })
-            .on_submit(SettingsMessage::ConfigFieldSettleNow {
-                field: "config:manager_model".into(),
-            })
-            .style(super::widgets::text_input_style)
-            .width(Length::Fixed(375.0))
-            .into(),
+            crate::config::DEFAULT_MANAGER_MODEL,
+            self.config.manager_model.as_deref().unwrap_or_default(),
+            CONFIG_KEY_MANAGER_MODEL,
             Some("Manager, Assistant, Discovery, Engineer"),
-            self.field_errors
-                .get("config:manager_model")
-                .map(String::as_str),
         );
-        let worker_row = field_row_with_error(
+        let worker_row = self.config_text_field(
             "Worker",
-            text_input(
-                crate::config::DEFAULT_WORKER_MODEL,
-                self.config.worker_model.as_deref().unwrap_or_default(),
-            )
-            .on_input(|v| SettingsMessage::ConfigField {
-                key: CONFIG_KEY_WORKER_MODEL,
-                value: v,
-            })
-            .on_submit(SettingsMessage::ConfigFieldSettleNow {
-                field: "config:worker_model".into(),
-            })
-            .style(super::widgets::text_input_style)
-            .width(Length::Fixed(375.0))
-            .into(),
+            crate::config::DEFAULT_WORKER_MODEL,
+            self.config.worker_model.as_deref().unwrap_or_default(),
+            CONFIG_KEY_WORKER_MODEL,
             Some("Artist, Analyst, Coder, QA, Reviewer, Maintainer, Sanitation"),
-            self.field_errors
-                .get("config:worker_model")
-                .map(String::as_str),
         );
-        let video_transcription_row = field_row_with_error(
+        let video_transcription_row = self.config_text_field(
             "Video Transcription",
-            text_input(
-                crate::config::DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
-                self.config
-                    .video_transcription_model
-                    .as_deref()
-                    .unwrap_or_default(),
-            )
-            .on_input(|v| SettingsMessage::ConfigField {
-                key: CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
-                value: v,
-            })
-            .on_submit(SettingsMessage::ConfigFieldSettleNow {
-                field: "config:video_transcription_model".into(),
-            })
-            .style(super::widgets::text_input_style)
-            .width(Length::Fixed(375.0))
-            .into(),
+            crate::config::DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
+            self.config
+                .video_transcription_model
+                .as_deref()
+                .unwrap_or_default(),
+            CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
             Some("Video transcription only"),
-            self.field_errors
-                .get("config:video_transcription_model")
-                .map(String::as_str),
         );
         section(
             "Models",
@@ -3223,71 +3212,35 @@ impl SettingsState {
             "Integrations",
             column![
                 provider_row,
-                field_row(
+                self.config_password_field(
                     "Firecrawl API Key",
-                    password_input(
-                        "fc-...",
-                        self.config.firecrawl_key.as_deref().unwrap_or_default(),
-                        self.password_visible
-                            .contains(&PasswordTarget::FirecrawlKey),
-                        |v| SettingsMessage::ConfigField {
-                            key: CONFIG_KEY_FIRECRAWL_KEY,
-                            value: v
-                        },
-                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::FirecrawlKey),
-                        SettingsMessage::ConfigFieldSettleNow {
-                            field: "config:firecrawl_key".to_string()
-                        },
-                        self.field_errors
-                            .get("config:firecrawl_key")
-                            .map(String::as_str),
-                        false,
-                    ),
+                    PasswordTarget::FirecrawlKey,
+                    "fc-...",
+                    self.config.firecrawl_key.as_deref().unwrap_or_default(),
+                    CONFIG_KEY_FIRECRAWL_KEY,
                     None,
+                    false,
                 ),
-                field_row(
+                self.config_password_field(
                     "Exa API Key",
-                    password_input(
-                        "exa-...",
-                        self.config.exa_key.as_deref().unwrap_or_default(),
-                        self.password_visible.contains(&PasswordTarget::ExaKey),
-                        |v| SettingsMessage::ConfigField {
-                            key: CONFIG_KEY_EXA_KEY,
-                            value: v
-                        },
-                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::ExaKey),
-                        SettingsMessage::ConfigFieldSettleNow {
-                            field: "config:exa_key".to_string()
-                        },
-                        self.field_errors.get("config:exa_key").map(String::as_str),
-                        false,
-                    ),
+                    PasswordTarget::ExaKey,
+                    "exa-...",
+                    self.config.exa_key.as_deref().unwrap_or_default(),
+                    CONFIG_KEY_EXA_KEY,
                     None,
+                    false,
                 ),
-                field_row(
+                self.config_password_field(
                     "Telegram Bot Token",
-                    password_input(
-                        "123:abc",
-                        self.config
-                            .telegram_bot_token
-                            .as_deref()
-                            .unwrap_or_default(),
-                        self.password_visible
-                            .contains(&PasswordTarget::TelegramToken),
-                        |v| SettingsMessage::ConfigField {
-                            key: CONFIG_KEY_TELEGRAM_BOT_TOKEN,
-                            value: v
-                        },
-                        SettingsMessage::TogglePasswordVisibility(PasswordTarget::TelegramToken),
-                        SettingsMessage::ConfigFieldSettleNow {
-                            field: "config:telegram_bot_token".to_string()
-                        },
-                        self.field_errors
-                            .get("config:telegram_bot_token")
-                            .map(String::as_str),
-                        false,
-                    ),
+                    PasswordTarget::TelegramToken,
+                    "123:abc",
+                    self.config
+                        .telegram_bot_token
+                        .as_deref()
+                        .unwrap_or_default(),
+                    CONFIG_KEY_TELEGRAM_BOT_TOKEN,
                     Some("Applied automatically"),
+                    false,
                 ),
             ],
         )
