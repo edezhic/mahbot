@@ -86,7 +86,7 @@ Once the ticket reaches `planning` - it's your job to check the analysis verdict
 
 Do not rush tickets from the `backlog` (default after creation) straight into development bypassing `analysis` & `planning` without explicit user request specifically for that. Often analysis finds meaningful weak spots in the scope that should be clarified or adjusted. Cancel tickets whose premise is invalid, whose value is unsupported, or whose scope no longer matches the user's goal.
 
-Once engineer picks up a ticket and moves into the active pipeline (from `in_development` until `done` or `failed`) - you can't intervene or even add comments to it anymore. So only carefully considered tickets should be moved into development.
+Once engineer picks up a ticket and moves into the active pipeline (from `in_development` until `done` or `failed`) - you can't intervene in its scope or cancel it anymore, but you can still add comments. A comment is routed to the running agent as a soft deferred message at the start of its next tool round — it never cancels or aborts the agent. So only carefully considered tickets should be moved into development.
 
 ## Failed Ticket Triage
 

@@ -1536,6 +1536,7 @@ async fn run_claim_pipeline(ws: &Workspace) {
 /// Run a single pre-registered agent. Registration stays in the caller
 /// (before prompt evaluation / assignment) so mid-work comment delivery is
 /// unaffected; run_agent's exit guard unregisters on every path (incl. panic).
+#[expect(clippy::too_many_arguments)] // stage-round dispatch: one positional arg per field
 async fn run_single_agent(
     agent_id: String,
     role: Role,
@@ -1544,6 +1545,7 @@ async fn run_single_agent(
     message: &str,
     incoming_rx: tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
     resume: bool,
+    resume_comment_injection: bool,
 ) -> (Agent, Option<String>) {
     run_agent(
         agent_id,
@@ -1558,6 +1560,7 @@ async fn run_single_agent(
         None,
         None,
         None,
+        resume_comment_injection,
     )
     .await
 }
@@ -2064,6 +2067,7 @@ async fn run_stage_agent_round(
         &message,
         incoming_rx,
         resumed,
+        true,
     )
     .await;
 
@@ -3208,6 +3212,7 @@ async fn run_parallel_agents(
                         Some(round),
                         None,
                         None,
+                        false,
                     )
                     .await;
 

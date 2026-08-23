@@ -473,8 +473,11 @@ impl Tool for AddCommentTool {
 }
 
 /// Guard: refuse to proceed if the ticket is in a pipeline-occupied phase.
-/// All three user-facing ticket tools use this to prevent modifications
-/// to in-flight tickets during automated pipeline processing.
+/// The create-ticket tool (when superseding an existing ticket) and the
+/// update-ticket tool use this to prevent modifications to in-flight tickets
+/// during automated pipeline processing. `add_comment` deliberately bypasses
+/// it — comments are allowed mid-pipeline and are delivered to running agents
+/// as soft deferred messages.
 async fn guard_not_pipeline_occupied(
     store: &crate::board::BoardStore,
     ticket_id: &str,

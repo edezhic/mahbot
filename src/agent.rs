@@ -360,6 +360,7 @@ impl Agent {
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
+            resume_comment_injection: false,
         }
     }
 }
@@ -375,6 +376,14 @@ impl Drop for Agent {
         // SIGKILL to each live process group.
         self.background_sessions.terminate_all();
     }
+}
+
+/// Render a board ticket comment as a user-visible message for the agent's
+/// session. Shared by live delivery ([`Agent::drain_incoming_messages`]) and
+/// the empty-message resume catch-up ([`Agent::inject_outstanding_comments`])
+/// so both paths produce identical comment rendering.
+fn format_comment_message(user_name: &str, content: &str) -> String {
+    format!("[Comment from {user_name} on ticket]: {content}")
 }
 
 impl Agent {
@@ -523,6 +532,11 @@ impl Agent {
             anyhow::bail!("Agent round cut short by shutdown/drain — resumes at boot");
         }
 
+        // A resumed stage-agent round starting with an empty message would
+        // otherwise never surface board comments (the session-start ticket block
+        // is not re-rendered). Inject any it has not seen.
+        self.inject_outstanding_comments(resume, msg).await;
+
         // Mandatory: destructive over-threshold compaction is SKIPPED on resumed
         // turns — the pre-crash trail the resume was meant to preserve must
         // survive (the design's resume-flag rule; do NOT infer resume from an
@@ -576,7 +590,7 @@ impl Agent {
                 // Drain incoming messages (e.g., ticket comments from the Manager
                 // or comment tool). Messages are injected as user messages with a
                 // descriptive prefix so the agent understands the source.
-                self.drain_incoming_messages().await?;
+                self.drain_incoming_messages().await;
 
                 // Leader-stagger signal: fire after the FIRST LLM call
                 // completes, success or failure — the wait is fail-open;
@@ -1387,9 +1401,9 @@ impl Agent {
     ///
     /// This is a no-op when no receiver is configured (e.g., chat agents
     /// that use the consumer_loop instead).
-    async fn drain_incoming_messages(&mut self) -> anyhow::Result<()> {
+    async fn drain_incoming_messages(&mut self) {
         let Some(rx) = &mut self.incoming_rx else {
-            return Ok(());
+            return;
         };
 
         let mut messages = Vec::new();
@@ -1398,10 +1412,7 @@ impl Agent {
                 Ok(job) => {
                     let content = match job.kind {
                         crate::message_router::JobKind::TicketComment => {
-                            format!(
-                                "[Comment from {} on ticket]: {}",
-                                job.user_name, job.content
-                            )
+                            format_comment_message(&job.user_name, &job.content)
                         }
                         _ => job.content,
                     };
@@ -1418,28 +1429,108 @@ impl Agent {
         }
 
         if messages.is_empty() {
-            return Ok(());
+            return;
         }
 
-        // Persist to session DB — best-effort. The comment is already saved in
-        // the board DB, so losing the session copy is recoverable. Log and
+        // Persist to session DB — fail-open. The comment is already saved in
+        // the board DB, so losing the session copy is recoverable; log and
         // continue rather than aborting the tool round.
+        self.persist_messages_fail_open(&messages).await;
+    }
+
+    /// Persist messages to the session, fail-open: on a persist failure the
+    /// messages are still delivered to in-memory history (visible to the model
+    /// this turn) and left in the unpersisted tail, flushed by the next persist.
+    async fn persist_messages_fail_open(&mut self, messages: &[ChatMessage]) {
         if let Err(e) = self
             .session
-            .persist_messages(&self.agent_id, &messages)
+            .persist_messages(&self.agent_id, messages)
             .await
         {
             tracing::warn!(
                 agent_id = %self.agent_id,
                 error = %e,
-                "Failed to persist incoming messages to session DB — continuing without persistence",
+                "Failed to persist messages to session DB — continuing without persistence",
             );
-            // Still deliver to in-memory history so the model sees them this
-            // tool round; the unpersisted tail is flushed next persist.
-            self.session.push_messages_unpersisted(&messages);
+            self.session.push_messages_unpersisted(messages);
+        }
+    }
+
+    /// Inject board comments a resumed stage round has not seen.
+    ///
+    /// A resumed round starts with an empty message when the session already has
+    /// content, so it never re-renders the `<current-ticket>` block and would
+    /// otherwise miss comments added after the boot snapshot. Re-reads the board
+    /// and injects comments absent from the loaded history (content-based dedup,
+    /// whether a previously-delivered `[Comment from ...]` message or the
+    /// session-start ticket block). Gated to `resume` + empty `msg` and the
+    /// dispatcher-set [`Self::resume_comment_injection`] flag (the empty-message
+    /// resume); the bounce-feedback path reuses the session with a NON-empty
+    /// `msg` and is excluded. Runs once per turn, fail-open persist like live
+    /// delivery.
+    async fn inject_outstanding_comments(&mut self, resume: bool, msg: &str) {
+        if !resume || !msg.is_empty() {
+            return;
+        }
+        if !self.resume_comment_injection {
+            return;
         }
 
-        Ok(())
+        let Some(ticket_id) = self.ticket.as_ref().map(|t| t.id.clone()) else {
+            return;
+        };
+
+        // Fresh snapshot — the boot get_ticket is stale. Snapshot the board
+        // FIRST, then drain the channel: a comment routed after registration is
+        // already in the channel and deduped against the post-drain history. A
+        // comment routed after the drain can still be delivered twice; that is
+        // the accepted no-watermark limitation (content-based dedup only).
+        let comments = match crate::board::store().get_comments(&ticket_id).await {
+            Ok(comments) => comments,
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %self.agent_id,
+                    ticket = %ticket_id,
+                    error = %e,
+                    "Failed to read board comments for resume catch-up — skipping this round",
+                );
+                return;
+            }
+        };
+        if comments.is_empty() {
+            return;
+        }
+
+        self.drain_incoming_messages().await;
+
+        let new_messages: Vec<_> = {
+            let history = self.session.history();
+            comments
+                .iter()
+                .filter(|c| {
+                    !c.content.trim().is_empty()
+                        && !history.iter().any(|m| m.content.contains(&c.content))
+                })
+                .map(|c| {
+                    crate::session::user_msg_with_ts(
+                        &format_comment_message(&c.role, &c.content),
+                        None,
+                    )
+                })
+                .collect()
+        };
+        if new_messages.is_empty() {
+            return;
+        }
+
+        self.persist_messages_fail_open(&new_messages).await;
+        tracing::info!(
+            agent_id = %self.agent_id,
+            role = %self.role,
+            ticket = %ticket_id,
+            count = new_messages.len(),
+            "Injected outstanding board comments into resumed stage-agent session",
+        );
     }
 
     /// Build a [`ChatRequest`] from the given messages, using the agent's
@@ -1815,6 +1906,7 @@ pub(crate) async fn run_agent(
     round: Option<RoundOpts>,
     parent_key: Option<crate::registry::ParentKey>,
     parent_label: Option<String>,
+    resume_comment_injection: bool,
 ) -> (Agent, Option<String>) {
     // Unregister from the message router on EVERY exit path, including a
     // panic mid-work (Drop runs during unwind) — a leaked router entry would
@@ -1843,6 +1935,7 @@ pub(crate) async fn run_agent(
         parent_label,
     );
     agent.incoming_rx = incoming_rx;
+    agent.resume_comment_injection = resume_comment_injection;
     if let Some(round) = round {
         agent.round_ts = Some(round.round_ts);
         agent.first_call_notify = round.first_call_notify;
@@ -1943,6 +2036,7 @@ pub(crate) async fn run_default_agent(
         round,
         parent_key,
         parent_label,
+        false,
     )
     .await
 }
@@ -2067,6 +2161,7 @@ mod tests {
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
+            resume_comment_injection: false,
         }
     }
 
@@ -2535,10 +2630,7 @@ mod tests {
         };
         let _ = tx.send(job);
 
-        agent
-            .drain_incoming_messages()
-            .await
-            .expect("drain should succeed");
+        agent.drain_incoming_messages().await;
 
         let history = agent.session.history();
         assert!(!history.is_empty(), "should have at least one message");
@@ -2579,10 +2671,7 @@ mod tests {
         };
         let _ = tx.send(job);
 
-        agent
-            .drain_incoming_messages()
-            .await
-            .expect("drain should succeed");
+        agent.drain_incoming_messages().await;
 
         let history = agent.session.history();
         assert!(!history.is_empty(), "should have at least one message");
@@ -2595,7 +2684,7 @@ mod tests {
     }
 
     /// drain_incoming_messages handles a closed receiver gracefully
-    /// (sets incoming_rx to None, returns Ok without error).
+    /// (sets incoming_rx to None, no panic).
     #[tokio::test]
     async fn test_drain_incoming_messages_disconnected() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::message_router::AgentJob>();
@@ -2607,13 +2696,260 @@ mod tests {
         drop(tx);
 
         // Should not panic or error
-        agent
-            .drain_incoming_messages()
-            .await
-            .expect("drain should succeed on disconnected channel");
+        agent.drain_incoming_messages().await;
         assert!(
             agent.incoming_rx.is_none(),
             "incoming_rx should be set to None after disconnect",
+        );
+    }
+
+    // ── inject_outstanding_comments tests ──────────────────────────
+
+    /// Build an agent (with the given role) whose ticket is attached and whose
+    /// session is seeded with one `sessions` row (when `seed_content` is
+    /// `Some`) and then initialized with an empty message — mirroring the
+    /// empty-message resume dispatch for a deterministic stage round.
+    async fn make_inject_agent(
+        agent_id: &str,
+        role: crate::Role,
+        ws: &crate::Workspace,
+        ticket: crate::board::Ticket,
+        seed_content: Option<&str>,
+    ) -> Agent {
+        if let Some(content) = seed_content {
+            let now = crate::turso::now();
+            crate::session::store()
+                .conn
+                .execute(
+                    "INSERT INTO sessions (agent_id, role, content, created_at) \
+                     VALUES (?1, 'user', ?2, ?3)",
+                    crate::turso::params![agent_id, content, now],
+                )
+                .await
+                .unwrap();
+        }
+        let mut agent = make_agent_with_role(vec![], role);
+        agent.agent_id = agent_id.to_string();
+        // Mirror the management dispatcher: only engineer/sanitation stage rounds
+        // set the comment-injection flag (analyst/reviewer/QA are out of scope).
+        agent.resume_comment_injection =
+            matches!(role, crate::Role::Engineer | crate::Role::Sanitation);
+        agent
+            .session
+            .init(agent_id, "", ws, &role, Some(&ticket), "", "", None)
+            .await
+            .unwrap();
+        agent.ticket = Some(ticket);
+        agent
+    }
+
+    /// A comment added during a no-agent window is injected into the session for
+    /// an empty-message resume, across the in-scope stage roles (engineer,
+    /// sanitation).
+    #[tokio::test]
+    async fn test_inject_outstanding_comments_injects_for_stage_roles() {
+        crate::util::test::init_management_test_stores().await;
+        let cases: &[(&str, crate::Role, &str, &str, crate::board::TicketPhase)] = &[
+            (
+                "inject-new-agent",
+                crate::Role::Engineer,
+                "inject_new",
+                "please fix the formatting",
+                crate::board::TicketPhase::InDevelopment,
+            ),
+            (
+                "inject-sanitation-agent",
+                crate::Role::Sanitation,
+                "inject_sanitation",
+                "please verify the cleanup",
+                crate::board::TicketPhase::InSanitation,
+            ),
+        ];
+        for &(agent_id, role, ws_name, comment, phase) in cases {
+            let ws = crate::workspace::test_ws_named("/tmp/test", ws_name);
+            let ticket_id =
+                crate::util::test::make_ticket(crate::board::store(), &ws, "Inject Comment", phase)
+                    .await;
+            crate::board::store()
+                .add_comment(&ticket_id, "manager", comment)
+                .await
+                .unwrap();
+            let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+
+            let mut agent =
+                make_inject_agent(agent_id, role, &ws, ticket, Some("round 1 task")).await;
+            agent.inject_outstanding_comments(true, "").await;
+
+            let history = agent.session.history();
+            assert!(
+                history.iter().any(|m| {
+                    m.content.contains("[Comment from manager on ticket]")
+                        && m.content.contains(comment)
+                }),
+                "a new board comment should be injected into a resumed {role} session",
+            );
+        }
+    }
+
+    /// A comment whose content already appears in the loaded session history is
+    /// NOT re-injected (content-based dedup).
+    #[tokio::test]
+    async fn test_inject_outstanding_comments_dedups_existing_content() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::workspace::test_ws_named("/tmp/test", "inject_dedup");
+        let ticket_id = crate::util::test::make_ticket(
+            crate::board::store(),
+            &ws,
+            "Inject Dedup",
+            crate::board::TicketPhase::InDevelopment,
+        )
+        .await;
+        let content = "the comment content already seen";
+        crate::board::store()
+            .add_comment(&ticket_id, "manager", content)
+            .await
+            .unwrap();
+        let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+
+        // Seed a history row that already carries the comment content (as a
+        // previously delivered `[Comment from ...]` message) — the dedup must
+        // skip it.
+        let seed = format!("[Comment from manager on ticket]: {content}");
+        let mut agent = make_inject_agent(
+            "inject-dedup-agent",
+            crate::Role::Engineer,
+            &ws,
+            ticket,
+            Some(&seed),
+        )
+        .await;
+        agent.inject_outstanding_comments(true, "").await;
+
+        let history = agent.session.history();
+        assert_eq!(
+            history.len(),
+            1,
+            "an already-seen comment must not be re-injected",
+        );
+    }
+
+    /// Dedup is purely content-based (the ticket's rule): a comment authored by
+    /// the agent's own role is NOT special-cased — it is injected when its
+    /// content is absent from the loaded history (only content-in-history
+    /// dedup suppresses it).
+    #[tokio::test]
+    async fn test_inject_outstanding_comments_does_not_special_case_own_role() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::workspace::test_ws_named("/tmp/test", "inject_own_role");
+        let ticket_id = crate::util::test::make_ticket(
+            crate::board::store(),
+            &ws,
+            "Inject Own Role",
+            crate::board::TicketPhase::InDevelopment,
+        )
+        .await;
+        crate::board::store()
+            .add_comment(&ticket_id, "engineer", "note from the engineer")
+            .await
+            .unwrap();
+        let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+
+        let mut agent = make_inject_agent(
+            "inject-own-role-agent",
+            crate::Role::Engineer,
+            &ws,
+            ticket,
+            Some("round 1 task"),
+        )
+        .await;
+        agent.inject_outstanding_comments(true, "").await;
+
+        let history = agent.session.history();
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content.contains("[Comment from engineer on ticket]")),
+            "an own-role comment absent from history must still be injected",
+        );
+    }
+
+    /// The bounce-feedback path (non-empty `msg`) and a non-resumed round
+    /// (`resume=false`) are no-ops — no injection.
+    #[tokio::test]
+    async fn test_inject_outstanding_comments_noop_for_feedback_and_fresh() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::workspace::test_ws_named("/tmp/test", "inject_noop");
+        let ticket_id = crate::util::test::make_ticket(
+            crate::board::store(),
+            &ws,
+            "Inject Noop",
+            crate::board::TicketPhase::InDevelopment,
+        )
+        .await;
+        crate::board::store()
+            .add_comment(&ticket_id, "manager", "please fix the formatting")
+            .await
+            .unwrap();
+        let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+
+        let mut agent = make_inject_agent(
+            "inject-noop-agent",
+            crate::Role::Engineer,
+            &ws,
+            ticket,
+            Some("round 1 task"),
+        )
+        .await;
+        // Bounce-feedback path: non-empty msg.
+        agent
+            .inject_outstanding_comments(true, "round 2 feedback")
+            .await;
+        // Fresh (non-resumed) round.
+        agent.inject_outstanding_comments(false, "").await;
+
+        let history = agent.session.history();
+        assert!(
+            !history
+                .iter()
+                .any(|m| m.content.contains("[Comment from manager on ticket]")),
+            "feedback path and fresh round must not inject comments",
+        );
+    }
+
+    /// A non-engineer/sanitation role (e.g. Analyst) is out of scope — a no-op.
+    #[tokio::test]
+    async fn test_inject_outstanding_comments_noop_for_non_stage_role() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::workspace::test_ws_named("/tmp/test", "inject_analyst");
+        let ticket_id = crate::util::test::make_ticket(
+            crate::board::store(),
+            &ws,
+            "Inject Analyst",
+            crate::board::TicketPhase::InDevelopment,
+        )
+        .await;
+        crate::board::store()
+            .add_comment(&ticket_id, "manager", "please fix the formatting")
+            .await
+            .unwrap();
+        let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+
+        let mut agent = make_inject_agent(
+            "inject-analyst-agent",
+            crate::Role::Analyst,
+            &ws,
+            ticket,
+            Some("round 1 task"),
+        )
+        .await;
+        agent.inject_outstanding_comments(true, "").await;
+
+        let history = agent.session.history();
+        assert!(
+            !history
+                .iter()
+                .any(|m| m.content.contains("[Comment from manager on ticket]")),
+            "non-stage roles must not inject comments",
         );
     }
 
@@ -2785,6 +3121,7 @@ mod tests {
             }),
             None,
             None,
+            false,
         )
         .await;
         assert!(

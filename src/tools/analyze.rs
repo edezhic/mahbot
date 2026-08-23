@@ -475,6 +475,7 @@ async fn run_analyze_slots(
                     Some(round),
                     Some(crate::registry::ParentKey::AnalyzeRound(round_key)),
                     Some(question),
+                    false,
                 )
                 .await
             }

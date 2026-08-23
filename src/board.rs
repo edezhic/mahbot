@@ -532,9 +532,12 @@ impl TicketPhase {
     /// phases have an agent actively working on the ticket (development,
     /// diagnostics, review, QA), but four are transitory handoff phases
     /// (DiagnosticsDone, Reviewed, QaPassed, SanitationPassed) with no agent
-    /// running — the poller advances them within seconds. Automated tools
-    /// (create, update, add_comment) refuse to modify tickets in any of these
-    /// phases to prevent race conditions during phase transitions.
+    /// running — the poller advances them within seconds. The automated
+    /// create-ticket tool (when superseding an existing ticket) and the
+    /// update-ticket tool refuse to modify tickets in any of these phases to
+    /// prevent race conditions during phase transitions. `add_comment` is the
+    /// exception: it is allowed during any phase and delivers to a running
+    /// agent as a soft deferred message (or persists for the next agent).
     #[must_use]
     pub fn is_pipeline_occupied(&self) -> bool {
         PIPELINE_OCCUPIED_PHASES.contains(self)
@@ -1863,9 +1866,14 @@ impl BoardStore {
     /// Add a comment to a ticket (append-only).
     ///
     /// After persisting the comment, routes it to any running agents assigned
-    /// to this ticket via the message router. If no agent is registered
-    /// (the agent finished before the comment arrived), the comment stays in
-    /// the DB and will be picked up by the next dispatch.
+    /// to this ticket via the message router. A comment delivered to a running
+    /// agent is a SOFT DEFERRED message consumed at the start of the agent's
+    /// next tool round — it never cancels or aborts the agent. If no agent is
+    /// registered (the agent finished before the comment arrived), the comment
+    /// is surfaced by the next agent that works on the ticket: a fresh dispatch
+    /// on a new session re-renders the ticket comment block, and a resumed
+    /// deterministic stage session (engineer/sanitation) injects outstanding
+    /// comments at the empty-message resume point.
     pub async fn add_comment(&self, ticket_id: &str, role: &str, content: &str) -> Result<()> {
         crate::turso::with_tx(&self.conn, ticket_id, "add comment", async |tx| {
             Self::add_comment_tx(tx, ticket_id, role, content).await

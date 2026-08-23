@@ -777,6 +777,12 @@ pub struct Agent {
     /// per-call tool context via
     /// [`crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS`].
     background_sessions: std::sync::Arc<crate::tools::shell::BackgroundSessions>,
+    /// Whether a resumed empty-message stage round should surface board comments
+    /// it has not already seen. Set by the management dispatcher for the
+    /// engineer/sanitation stage rounds (the deterministic sessions that reuse
+    /// existing content on resume); the generic loop treats this as an opaque
+    /// per-agent behavior flag, so no stage-role policy lives in `agent.rs`.
+    pub(crate) resume_comment_injection: bool,
 }
 
 // ── Verdict type ─────────────────────────────────────────────────

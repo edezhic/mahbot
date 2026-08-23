@@ -566,6 +566,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             None,
             None,
             None,
+            false,
         )
         .await;
 
