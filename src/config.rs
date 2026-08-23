@@ -430,6 +430,40 @@ macro_rules! string_config_fields {
                 true
             }
 
+            /// Read a string field's raw value by its database key, returning
+            /// `None` for unknown keys.
+            ///
+            /// This is the allocation-free read counterpart to [`set_string_field`]:
+            /// it mirrors the setter's match arms so the two always agree on the
+            /// exact generated key set. The value is returned as stored (not
+            /// normalized) — call [`Self::normalize`] before using the config to
+            /// collapse empty/whitespace-only values to `None`.
+            ///
+            /// `model_routings` is **not** handled here — it lives in a separate
+            /// database table (`config_model_routing`).
+            #[must_use]
+            pub(crate) fn get_string_field(&self, key: &str) -> Option<&str> {
+                match key {
+                    $(stringify!($field) => self.$field.as_deref(),)*
+                    _ => None,
+                }
+            }
+
+            /// Whether `key` names a known string-field database key.
+            ///
+            /// Presence is checked against the generated field set, not against
+            /// the field's current value — this is why it is a separate method
+            /// rather than [`get_string_field(...).is_some()`]: on
+            /// [`STRUCT_FIELDS_DEFAULT`] every value is `None`, so a value-based
+            /// probe would always return `false`.
+            #[must_use]
+            pub(crate) fn has_string_field(&self, key: &str) -> bool {
+                match key {
+                    $(stringify!($field) => true,)*
+                    _ => false,
+                }
+            }
+
             /// Normalise all string fields in place: trim whitespace and collapse
             /// empty or whitespace-only values to `None`.
             ///
@@ -1349,11 +1383,7 @@ async fn write_kv_and_update_config(key: &str, trimmed: &str) -> Result<()> {
     // mirrors would create an orphaned DB entry. Defensive — the settings
     // page only renders known keys — but keeps a typo'd or future key from
     // silently diverging the DB and CONFIG.
-    if !ConfigData::STRUCT_FIELDS_DEFAULT
-        .string_fields()
-        .iter()
-        .any(|(known, _)| *known == key)
-    {
+    if !ConfigData::STRUCT_FIELDS_DEFAULT.has_string_field(key) {
         anyhow::bail!("unknown config field: {key}");
     }
     let store = crate::config_db::store();
@@ -1461,11 +1491,7 @@ mod tests {
             assert!(recognized, "key '{key}' should be recognized");
 
             // Find this key in string_fields and verify the value matches.
-            let found = config
-                .string_fields()
-                .iter()
-                .find(|(k, _)| *k == key)
-                .and_then(|(_, v)| *v);
+            let found = config.get_string_field(key);
             assert_eq!(
                 found,
                 Some(test_value.as_str()),
@@ -1476,11 +1502,7 @@ mod tests {
         // ── Normalization is handled by normalize(), not set_string_field ──
         // set_string_field stores the raw value as-is.
         let _ = config.set_string_field("provider_key", "");
-        let pk = config
-            .string_fields()
-            .iter()
-            .find(|(k, _)| *k == "provider_key")
-            .and_then(|(_, v)| *v);
+        let pk = config.get_string_field("provider_key");
         assert_eq!(
             pk,
             Some(""),
@@ -1488,11 +1510,7 @@ mod tests {
         );
 
         let _ = config.set_string_field("provider_key", "   ");
-        let pk = config
-            .string_fields()
-            .iter()
-            .find(|(k, _)| *k == "provider_key")
-            .and_then(|(_, v)| *v);
+        let pk = config.get_string_field("provider_key");
         assert_eq!(
             pk,
             Some("   "),
@@ -1501,11 +1519,7 @@ mod tests {
 
         // After normalize(), empty/whitespace values are collapsed to None.
         config.normalize();
-        let pk = config
-            .string_fields()
-            .iter()
-            .find(|(k, _)| *k == "provider_key")
-            .and_then(|(_, v)| *v);
+        let pk = config.get_string_field("provider_key");
         assert!(pk.is_none(), "normalize() collapses empty string to None");
 
         // Unknown key returns false.

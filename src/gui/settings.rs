@@ -686,12 +686,7 @@ impl SettingsState {
     /// with their value passed directly to [`Self::settle_now`] instead.
     fn staged_value(&self, field: &str) -> Option<String> {
         if let Some(key) = field.strip_prefix("config:") {
-            return self
-                .config
-                .string_fields()
-                .into_iter()
-                .find(|(k, _)| *k == key)
-                .and_then(|(_, v)| v.map(String::from));
+            return self.config.get_string_field(key).map(String::from);
         }
         if let Some(model) = field.strip_prefix("routing_order:") {
             return self
@@ -767,10 +762,8 @@ impl SettingsState {
             let value = value.map(str::to_owned).or_else(|| {
                 crate::config::CONFIG
                     .snapshot()
-                    .string_fields()
-                    .into_iter()
-                    .find(|(k, _)| *k == key)
-                    .and_then(|(_, v)| v.map(String::from))
+                    .get_string_field(key)
+                    .map(String::from)
             });
             let _ = self
                 .config
