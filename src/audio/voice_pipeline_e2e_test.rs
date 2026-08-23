@@ -78,9 +78,12 @@
 
 use super::*; // voice module items (handle_wake_word_detection, PipelineCtx, etc.)
 use crate::audio::tts;
+use crate::util::hex_string;
 use earshot::Detector;
 use rand::{RngExt, SeedableRng};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::path::Path;
 use std::time::Instant;
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -380,8 +383,7 @@ const TEST_CACHE_DIR: &str = "test_cache/voice_e2e";
 //
 // Returns a hex string (always succeeds since the hashes are compile-time).
 //
-// Delegates to [`super::tts_model_version_hash`] which is the canonical
-// implementation from `voice.rs`.
+// Delegates to [`tts_model_version_hash`], the canonical implementation.
 
 /// Get the cache directory path.
 fn cache_dir() -> std::path::PathBuf {
@@ -391,9 +393,141 @@ fn cache_dir() -> std::path::PathBuf {
     root.join(TEST_CACHE_DIR)
 }
 
+// ── Voice PCM disk cache helpers ─────────────────────────────
+//
+// Bench scaffolding that synthesises TTS PCM and caches it on disk.
+// Nothing in the production detection path synthesises TTS PCM, so these
+// helpers live here (voice-tests-only) rather than in `voice.rs`.
+
+/// Deterministic cache key for one TTS-synthesised PCM utterance.
+///
+/// Covers: text, TTS style, seed, sample rate, and the TTS model version
+/// hash.  A change to any TTS model file produces a different key and forces
+/// re-synthesis on first run.
+fn pcm_cache_key(text: &str, style: &str, seed: u64, sample_rate: u32, model_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(style.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(seed.to_le_bytes());
+    hasher.update([0u8]);
+    hasher.update(sample_rate.to_le_bytes());
+    hasher.update([0u8]);
+    hasher.update(model_hash.as_bytes());
+    hex_string(&hasher.finalize())
+}
+
+/// Hash of all TTS model SHA256 constants for cache invalidation.
+///
+/// Any change to any TTS model file produces a different hash, which
+/// changes the PCM cache key and triggers re-synthesis on first run.
+fn tts_model_version_hash() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(crate::audio::tts::DP_MODEL_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::TEXT_ENC_MODEL_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::VECTOR_EST_MODEL_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::VOCODER_MODEL_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::TTS_JSON_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::UNICODE_INDEXER_SHA256.as_bytes());
+    hasher.update(crate::audio::tts::VOICE_STYLE_SHA256.as_bytes());
+    hex_string(&hasher.finalize())
+}
+
+/// Write PCM f32 samples to the disk cache atomically (tmp + rename).
+fn write_pcm_cache(path: &Path, samples: &[f32]) {
+    let tmp_path = path.with_extension("tmp");
+    let mut data: Vec<u8> = Vec::with_capacity(samples.len() * 4);
+    for &s in samples {
+        data.extend_from_slice(&s.to_le_bytes());
+    }
+    if let Err(e) = std::fs::write(&tmp_path, &data) {
+        warn!(
+            "PCM cache: failed to write tmp file {}: {e}",
+            tmp_path.display()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        warn!(
+            "PCM cache: failed to rename {} -> {}: {e}",
+            tmp_path.display(),
+            path.display(),
+        );
+    }
+}
+
+/// Read PCM f32 samples from the disk cache.
+///
+/// Returns `None` if the cache file does not exist, has non-aligned size
+/// (not a multiple of 4 bytes), or fails to read.
+fn read_pcm_cache(path: &Path) -> Option<Vec<f32>> {
+    let data = std::fs::read(path).ok()?;
+    if data.is_empty() {
+        warn!("PCM cache: file {} is empty — deleting", path.display(),);
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    if data.len() % 4 != 0 {
+        warn!(
+            "PCM cache: file {} has non-aligned size {} — deleting",
+            path.display(),
+            data.len(),
+        );
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    let samples: Vec<f32> = data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    Some(samples)
+}
+
+/// Synthesise a phrase via TTS, caching PCM audio to disk.
+///
+/// Checks the voice PCM disk cache first (keyed by text + style + seed +
+/// sample rate + TTS model hash).  On cache hit, returns cached PCM
+/// directly without calling TTS.  On cache miss, calls
+/// [`crate::audio::tts::synthesize`], writes the result to the cache, and returns
+/// the PCM.
+///
+/// Returns `None` if TTS synthesis fails or the cache directory cannot
+/// be resolved.
+fn synthesize_with_pcm_cache(
+    text: &str,
+    style: &str,
+    seed: u64,
+    sample_rate: u32,
+    model_hash: &str,
+    cache_dir: &Path,
+) -> Option<Vec<f32>> {
+    let key = pcm_cache_key(text, style, seed, sample_rate, model_hash);
+    let cache_path = cache_dir.join(&key);
+
+    // Fast path: cache hit.
+    if let Some(pcm) = read_pcm_cache(&cache_path) {
+        debug!("PCM cache HIT for key {key} ({text}, style={style}, seed={seed})");
+        return Some(pcm);
+    }
+
+    debug!("PCM cache MISS for key {key} ({text}, style={style}, seed={seed}) — synthesising");
+
+    // Cache miss — synthesise via TTS
+    let Ok(pcm) = crate::audio::tts::synthesize(text, style, seed, sample_rate) else {
+        return None;
+    };
+
+    // Write to disk cache atomically
+    write_pcm_cache(&cache_path, &pcm);
+    Some(pcm)
+}
+
 /// Synthesize wake word variant audio with TTS caching support.
 ///
-/// Delegates to the production implementation.
+/// Delegates to the local [`synthesize_with_pcm_cache`] helper.
 fn synthesize_wake_word_variant_cached(
     text: &str,
     style: &str,
@@ -402,7 +536,7 @@ fn synthesize_wake_word_variant_cached(
     model_hash: &str,
     cache_dir: &std::path::Path,
 ) -> Option<Vec<f32>> {
-    super::synthesize_with_pcm_cache(text, style, seed, sample_rate, model_hash, cache_dir)
+    synthesize_with_pcm_cache(text, style, seed, sample_rate, model_hash, cache_dir)
 }
 
 // ── Audio generation helpers (with cache) ─────────────────────────────────
@@ -1172,7 +1306,7 @@ fn generate_owner_negative_sequences(
             // Fresh collision-free range (9000+) — the old 1000-1014 range
             // overlapped the confusable base (1000+).
             let seed_val = 9000 + i as u64 * 3 + seed as u64;
-            if let Some(pcm) = super::synthesize_with_pcm_cache(
+            if let Some(pcm) = synthesize_with_pcm_cache(
                 phrase,
                 enrolled_style,
                 seed_val,
@@ -1294,7 +1428,7 @@ fn generate_restricted_phrase_negatives(
             let seed = seed_base + i as u64 * seeds_per_phrase as u64 + seed_idx as u64;
 
             // PCM from cache or fresh TTS synthesis.
-            let Some(pcm) = super::synthesize_with_pcm_cache(
+            let Some(pcm) = synthesize_with_pcm_cache(
                 phrase,
                 style,
                 seed,
@@ -2330,7 +2464,7 @@ pub(crate) fn run_wake_word_benchmark() {
             cache_dir_path.display()
         );
     }
-    let model_version_hash = super::tts_model_version_hash();
+    let model_version_hash = tts_model_version_hash();
     info!("TTS model version hash: {}", &model_version_hash[..16]);
     crate::audio::tts::init_global()
         .unwrap_or_else(|e| warn!("tts::init_global() already called: {e}"));
@@ -2734,5 +2868,69 @@ mod tests {
         let a = allocate_voices(&styles);
         assert_eq!(a.enrolled, "F1.json");
         assert_eq!(a.negative_pool, styles[..6]);
+    }
+
+    // ── PCM cache key tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_pcm_cache_key_determinism() {
+        let h = |text, style, seed| pcm_cache_key(text, style, seed, 16000, "test_hash");
+        let a = h("hey mahbot", "default", 42);
+        let b = h("hey mahbot", "default", 42);
+        assert_eq!(a, b, "same inputs must produce same cache key");
+    }
+
+    #[test]
+    fn test_pcm_cache_key_sensitivity_to_text() {
+        let a = pcm_cache_key("hey mahbot", "default", 42, 16000, "hash");
+        let b = pcm_cache_key("hey jarvis", "default", 42, 16000, "hash");
+        assert_ne!(a, b, "different text must produce different cache keys");
+    }
+
+    #[test]
+    fn test_pcm_cache_key_sensitivity_to_seed() {
+        let a = pcm_cache_key("hey mahbot", "default", 41, 16000, "hash");
+        let b = pcm_cache_key("hey mahbot", "default", 42, 16000, "hash");
+        assert_ne!(a, b, "different seed must produce different cache keys");
+    }
+
+    #[test]
+    fn test_pcm_cache_key_sensitivity_to_model_hash() {
+        let a = pcm_cache_key("hey mahbot", "default", 42, 16000, "hash_a");
+        let b = pcm_cache_key("hey mahbot", "default", 42, 16000, "hash_b");
+        assert_ne!(
+            a, b,
+            "different model hash must produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn test_tts_model_version_hash_is_non_empty() {
+        let hash = tts_model_version_hash();
+        assert_eq!(hash.len(), 64, "SHA-256 hex is 64 chars");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be hex: {hash}"
+        );
+    }
+
+    // ── PCM cache read/write tests ─────────────────────────────────────────
+
+    /// Write synthetic PCM data (16 KB) to `path`.
+    fn seed_test_pcm(path: &Path) -> u64 {
+        let samples: Vec<f32> = vec![0.0; 4096]; // 16 KB
+        write_pcm_cache(path, &samples);
+        std::fs::metadata(path).map_or(0, |m| m.len())
+    }
+
+    #[test]
+    fn pcm_cache_read_normal_returns_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a".repeat(64));
+        seed_test_pcm(&path);
+        assert!(path.exists());
+
+        let result = read_pcm_cache(&path);
+        assert!(result.is_some(), "normal read should return cached PCM");
     }
 }
