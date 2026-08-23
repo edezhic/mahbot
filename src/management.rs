@@ -991,6 +991,15 @@ struct VerifierInfo {
     /// - Plural is acceptable when the label refers to a dispatched group:
     ///   `"Reviewers"` (3 parallel agents)
     log_label: &'static str,
+    /// The phase the ticket advances to when every verifier agent passes — the
+    /// verifier's *success* target (e.g. `TicketPhase::Reviewed` for reviewers,
+    /// `TicketPhase::QaPassed` for QA).
+    ///
+    /// INVARIANT: must never be `TicketPhase::Failed`. The all-passed round
+    /// transitions the ticket directly to `success_phase`, so a `Failed` value
+    /// would land an all-passed round on the terminal failure phase and invert
+    /// its meaning (all agents passed, yet the ticket fails). Today
+    /// `REVIEWER_VI`/`QA_VI` use `Reviewed`/`QaPassed`, never `Failed`.
     success_phase: TicketPhase,
     /// The phase the verifier is *actively working in* — the ticket phase
     /// the ticket occupies while the verifier's agents run (e.g.
@@ -4163,7 +4172,7 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
 /// Shared bounce-with-circuit-breaker finalizer.
 ///
 /// Computes the exhausted/target split from the ticket's shared bounce budget
-/// ([`bounce_exhausted`]) and the notify policy from `target` + `notify_on_bounce`
+/// ([`bounce_exhausted`]) and the notify policy from `trip` + `notify_on_bounce`
 /// (engineer notifies on EVERY bounce; verdict paths buffer a non-terminal
 /// bounce and notify on the trip). Writes the breaker-trip comment (SYSTEM_ROLE)
 /// followed by the failure comment (`failure_role`), increments the counter only
@@ -4191,18 +4200,20 @@ async fn finalize_bounce_with_breaker(
     trip_log: Option<&str>,
     bounce_log: &str,
 ) -> FinalizeOutcome {
-    let exhausted = bounce_exhausted(ticket.bounce_count);
-    let target = if exhausted {
+    // `trip` ⟺ `target == TicketPhase::Failed` ⟺ the bounce budget exhausted.
+    let trip = bounce_exhausted(ticket.bounce_count);
+    let target = if trip {
         TicketPhase::Failed
     } else {
         TicketPhase::ReadyForDevelopment
     };
-    let notify = if target == TicketPhase::Failed || notify_on_bounce {
+    // Verdict paths (`notify_on_bounce=false`): `Failed` ⟺ `Notify`.
+    let notify = if trip || notify_on_bounce {
         NotifyPolicy::Notify
     } else {
         NotifyPolicy::Buffer
     };
-    let trip_comment = exhausted.then(bounce_breaker_trip_comment);
+    let trip_comment = trip.then(bounce_breaker_trip_comment);
     // The verdict paths share one trip-log sentence; the engineer path passes
     // its own (it names the stage and the resumed prefix). The default is
     // built lazily so it isn't allocated when the caller supplies `Some`.
@@ -4222,7 +4233,7 @@ async fn finalize_bounce_with_breaker(
     // Failed but pauses, so it must render the paused-sentence, not the
     // drain sentence.
     let ctx = TransitionCtx::new(ticket, source, target, notify, log_label)
-        .with_breaker(target == TicketPhase::Failed && drains_siblings);
+        .with_breaker(trip && drains_siblings);
 
     let outcome = with_comment_and_transition(ctx, async |tx| {
         // [breaker, failure] failure-last so the last comment carries the
@@ -4233,7 +4244,7 @@ async fn finalize_bounce_with_breaker(
         }
         BoardStore::add_comment_tx(tx, &ticket.id, failure_role, failure_comment).await?;
         // The failing bounce is not counted (stays at the max).
-        if target == TicketPhase::ReadyForDevelopment {
+        if !trip {
             BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
         }
         Ok(())
@@ -4241,7 +4252,7 @@ async fn finalize_bounce_with_breaker(
     .await;
 
     if matches!(outcome, FinalizeOutcome::Applied) {
-        if target == TicketPhase::Failed {
+        if trip {
             if drains_siblings {
                 drain_ready_for_development_siblings(ticket).await;
             }
@@ -4279,6 +4290,10 @@ async fn finalize_bounce_with_breaker(
 ///    `success_phase` with [`NotifyPolicy::Buffer`]. No immediate notification fires —
 ///    it waits until the ticket reaches Done (after the QaPassed commit succeeds in
 ///    [`handle_qa_passed`]).
+///
+/// Across the three outcomes, [`TicketPhase::Failed`] is the only `Notify`
+/// target; every other target (bounce-back, `success_phase`) buffers. See the
+/// `VerifierInfo::success_phase` INVARIANT (must never be `Failed`).
 ///
 /// Returns `true` when the comment+transition completed, `false` on failure
 /// (the ticket stays in `verifier.active_phase`).
