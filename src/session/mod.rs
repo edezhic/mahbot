@@ -1015,6 +1015,24 @@ pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> String
     Session::delete(&resolve_agent_id(user_name, role, ws_name)).await
 }
 
+/// Build a transient agent ID shared by the suffixed builder family
+/// (`analyze_`, `research_`, `discovery_`, `maintainer_`).
+///
+/// Format: `{prefix}{ws_name}_{suffix}` when `label` is `None`, or
+/// `{prefix}{ws_name}_{suffix}_{label}` when `label` is `Some(_)`. The
+/// `prefix` must carry its trailing underscore (as stored in
+/// [`TRANSIENT_AGENT_ID_PREFIXES`]) so the result stays byte-identical to the
+/// historical literal builders — a bare prefix plus an inserted separator
+/// would emit a double underscore.
+#[must_use]
+fn transient_agent_id(prefix: &str, ws_name: &str, label: Option<&str>) -> String {
+    let suffix = crate::generate_suffix();
+    match label {
+        Some(label) => format!("{prefix}{ws_name}_{suffix}_{label}"),
+        None => format!("{prefix}{ws_name}_{suffix}"),
+    }
+}
+
 /// Construct an agent ID for Maintainer agents (workspace-scoped, unique per run).
 ///
 /// Format: `maintainer_{ws_name}_{suffix}`
@@ -1022,7 +1040,7 @@ pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> String
 /// accumulate conversation history across maintenance cycles.
 #[must_use]
 pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
-    format!("maintainer_{}_{}", ws_name, crate::generate_suffix())
+    transient_agent_id("maintainer_", ws_name, None)
 }
 
 /// Construct an agent ID for sub-agent analyze rounds (Engineer/Maintainer → sub-agent).
@@ -1031,7 +1049,7 @@ pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
 /// Role is the LAST segment — see [`direct_agent_id`] for rationale.
 #[must_use]
 pub(crate) fn analyze_agent_id(ws_name: &str, role: &str) -> String {
-    format!("analyze_{}_{}_{}", ws_name, crate::generate_suffix(), role)
+    transient_agent_id("analyze_", ws_name, Some(role))
 }
 
 /// Construct an agent ID for a deep-research sub-agent (decomposers,
@@ -1040,12 +1058,7 @@ pub(crate) fn analyze_agent_id(ws_name: &str, role: &str) -> String {
 /// Format: `research_{ws_name}_{suffix}_{label}`
 #[must_use]
 pub(crate) fn research_agent_id(ws_name: &str, label: &str) -> String {
-    format!(
-        "research_{}_{}_{}",
-        ws_name,
-        crate::generate_suffix(),
-        label
-    )
+    transient_agent_id("research_", ws_name, Some(label))
 }
 
 /// Construct an agent ID for workspace role discovery.
@@ -1054,12 +1067,7 @@ pub(crate) fn research_agent_id(ws_name: &str, label: &str) -> String {
 /// Role is the LAST segment — see [`direct_agent_id`] for rationale.
 #[must_use]
 pub(crate) fn discovery_agent_id(ws_name: &str, role: &str) -> String {
-    format!(
-        "discovery_{}_{}_{}",
-        ws_name,
-        crate::generate_suffix(),
-        role
-    )
+    transient_agent_id("discovery_", ws_name, Some(role))
 }
 
 // ── Existing tests ──────────────────────────────────────────────
