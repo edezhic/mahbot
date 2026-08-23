@@ -1652,41 +1652,41 @@ mod tests {
 
     #[test]
     fn test_has_ending_punctuation() {
-        // Sentence-ending punctuation detected
-        assert!(has_ending_punctuation("Yes."));
-        assert!(has_ending_punctuation("No!"));
-        assert!(has_ending_punctuation("Maybe?"));
-
-        // Commas, semicolons, colons are NOT terminal punctuation for TTS
-        // (they don't indicate the end of a sentence)
-        assert!(!has_ending_punctuation("comma,"));
-        assert!(!has_ending_punctuation("semicolon;"));
-        assert!(!has_ending_punctuation("colon:"));
-
-        // Closing brackets, quotes, guillemets, and CJK closing marks
-        // are NOT terminal punctuation for TTS (they don't end a sentence)
-        assert!(!has_ending_punctuation("paren)"));
-        assert!(!has_ending_punctuation("bracket]"));
-        assert!(!has_ending_punctuation("brace}"));
-        assert!(!has_ending_punctuation("guillemet»"));
-        assert!(!has_ending_punctuation("single»"));
-        assert!(!has_ending_punctuation("cjk」"));
-        assert!(!has_ending_punctuation("cjk』"));
-        assert!(!has_ending_punctuation("cjk】"));
-        assert!(!has_ending_punctuation("cjk〉"));
-        assert!(!has_ending_punctuation("cjk》"));
-
-        // Quotes are NOT terminal punctuation
-        assert!(!has_ending_punctuation("single'"));
-        assert!(!has_ending_punctuation("double\""));
-
-        // No punctuation
-        assert!(!has_ending_punctuation("Maybe"));
-
-        // Fullwidth variants should also be terminal
-        assert!(has_ending_punctuation("CJK\u{3002}"));
-        assert!(has_ending_punctuation("CJK\u{FF01}"));
-        assert!(has_ending_punctuation("CJK\u{FF1F}"));
+        let cases: &[(&str, &str, bool)] = &[
+            // Sentence-ending punctuation detected
+            ("period", "Yes.", true),
+            ("exclamation", "No!", true),
+            ("question", "Maybe?", true),
+            // Commas, semicolons, colons are NOT terminal punctuation for TTS
+            // (they don't indicate the end of a sentence)
+            ("comma", "comma,", false),
+            ("semicolon", "semicolon;", false),
+            ("colon", "colon:", false),
+            // Closing brackets, quotes, guillemets, and CJK closing marks
+            // are NOT terminal punctuation for TTS (they don't end a sentence)
+            ("paren", "paren)", false),
+            ("bracket", "bracket]", false),
+            ("brace", "brace}", false),
+            ("guillemet", "guillemet»", false),
+            ("single_guillemet", "single»", false),
+            ("cjk_right_corner_bracket", "cjk」", false),
+            ("cjk_right_white_corner_bracket", "cjk』", false),
+            ("cjk_right_black_square_bracket", "cjk】", false),
+            ("cjk_right_angle_bracket", "cjk〉", false),
+            ("cjk_right_double_angle", "cjk》", false),
+            // Quotes are NOT terminal punctuation
+            ("single_quote", "single'", false),
+            ("double_quote", "double\"", false),
+            // No punctuation
+            ("no_punctuation", "Maybe", false),
+            // Fullwidth variants should also be terminal
+            ("cjk_fullwidth_period", "CJK\u{3002}", true),
+            ("cjk_fullwidth_bang", "CJK\u{FF01}", true),
+            ("cjk_fullwidth_question", "CJK\u{FF1F}", true),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(has_ending_punctuation(input), expected, "case: {name}");
+        }
     }
 
     #[test]
@@ -1714,31 +1714,37 @@ mod tests {
 
     #[test]
     fn test_split_at_sentence_boundaries() {
-        let chunks = split_at_sentence_boundaries("A. B. C.", 3);
-        assert_eq!(
-            chunks.len(),
-            3,
-            "each single-char sentence should be its own chunk"
-        );
-        assert_eq!(chunks[0], "A.", "first chunk should be 'A.'");
-        assert_eq!(chunks[1], "B.", "second chunk should be 'B.'");
-        assert_eq!(chunks[2], "C.", "third chunk should be 'C.'");
-
-        // Single short sentence: no splitting
-        let single = split_at_sentence_boundaries("Hello world.", 100);
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0], "Hello world.");
+        let cases: &[(&str, &str, usize, &[&str])] = &[
+            ("single_char_sentences", "A. B. C.", 3, &["A.", "B.", "C."]),
+            // Single short sentence: no splitting
+            (
+                "single_short_sentence",
+                "Hello world.",
+                100,
+                &["Hello world."],
+            ),
+        ];
+        for &(name, input, max_len, expected) in cases {
+            let chunks = split_at_sentence_boundaries(input, max_len);
+            let got: Vec<&str> = chunks.iter().map(String::as_str).collect();
+            assert_eq!(got.as_slice(), expected, "case: {name}");
+        }
     }
 
     #[test]
     fn test_strip_markdown() {
-        // bold removal leaves space placeholder + original space = double space
-        assert_eq!(strip_markdown("**bold** text"), "  text");
-        assert_eq!(strip_markdown("`inline code` here"), "  here");
-        assert_eq!(strip_markdown("```\nblock\n```\nend"), " \nend");
-        assert_eq!(strip_markdown("[link](url) text"), "link text");
-        assert_eq!(strip_markdown("![img](url) cap"), "  cap");
-        assert_eq!(strip_markdown("~~strike~~"), " ");
+        let cases: &[(&str, &str, &str)] = &[
+            // bold removal leaves space placeholder + original space = double space
+            ("bold", "**bold** text", "  text"),
+            ("inline_code", "`inline code` here", "  here"),
+            ("code_block", "```\nblock\n```\nend", " \nend"),
+            ("link", "[link](url) text", "link text"),
+            ("image", "![img](url) cap", "  cap"),
+            ("strikethrough", "~~strike~~", " "),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(strip_markdown(input), expected, "case: {name}");
+        }
     }
 
     #[test]
@@ -1828,194 +1834,163 @@ mod tests {
 
     #[test]
     fn test_normalize_symbols() {
-        let r = normalize_symbols("Hello—world–test\u{2011}");
-        assert_eq!(r, "Hello-world-test-", "em/en dashes become hyphen");
-
-        let r2 = normalize_symbols(
-            "a\u{00AF}b[c]d|e/f#g\u{2192}h\u{2190}i\u{2665}j\u{2606}k\u{2661}l\u{00A9}m\\n",
-        );
-        assert_eq!(
-            r2, "a b c d e f g h i j k l m n",
-            "symbols like overline, brackets, pipe, slash, hash, arrows, hearts, copyright, backslash become space"
-        );
-
-        let r3 = normalize_symbols("\u{201C}hello\u{201D}");
-        assert_eq!(
-            r3, "\"hello\"",
-            "curly double quotes become straight double quote"
-        );
-
-        let r4 = normalize_symbols("\u{2018}hello\u{2019}\u{00B4}`");
-        assert_eq!(
-            r4, "'hello'''",
-            "curly single quotes, acute, backtick become straight single quote"
-        );
-
-        // Characters that should pass through unchanged
-        let r5 = normalize_symbols("abc123.!?");
-        assert_eq!(
-            r5, "abc123.!?",
-            "normal alphanumeric and basic punctuation pass through"
-        );
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "em/en dashes become hyphen",
+                "Hello—world–test\u{2011}",
+                "Hello-world-test-",
+            ),
+            (
+                "symbols like overline, brackets, pipe, slash, hash, arrows, hearts, copyright, backslash become space",
+                "a\u{00AF}b[c]d|e/f#g\u{2192}h\u{2190}i\u{2665}j\u{2606}k\u{2661}l\u{00A9}m\\n",
+                "a b c d e f g h i j k l m n",
+            ),
+            (
+                "curly double quotes become straight double quote",
+                "\u{201C}hello\u{201D}",
+                "\"hello\"",
+            ),
+            (
+                "curly single quotes, acute, backtick become straight single quote",
+                "\u{2018}hello\u{2019}\u{00B4}`",
+                "'hello'''",
+            ),
+            // Characters that should pass through unchanged
+            (
+                "normal alphanumeric and basic punctuation pass through",
+                "abc123.!?",
+                "abc123.!?",
+            ),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(normalize_symbols(input), expected, "case: {name}");
+        }
     }
 
     #[test]
     fn test_expand_abbreviations() {
-        assert_eq!(expand_abbreviations("@user"), " at user");
-        // Note: "e.g.," → "for example, " (trailing space) because the original
-        // text has a space after the comma — this is fine as clean_whitespace
-        // later normalises it.
-        assert_eq!(expand_abbreviations("e.g., hello"), "for example,  hello");
-        assert_eq!(expand_abbreviations("i.e., world"), "that is,  world");
-        assert_eq!(
-            expand_abbreviations("multiple e.g., and i.e., here"),
-            "multiple for example,  and that is,  here"
-        );
-        // Text without abbreviations passes through unchanged
-        assert_eq!(expand_abbreviations("hello world"), "hello world");
-        // Case-sensitive: only lowercase exact match
-        assert_eq!(expand_abbreviations("E.G.,"), "E.G.,");
+        let cases: &[(&str, &str, &str)] = &[
+            ("at_signed_user", "@user", " at user"),
+            // Note: "e.g.," → "for example, " (trailing space) because the original
+            // text has a space after the comma — this is fine as clean_whitespace
+            // later normalises it.
+            ("e.g., hello", "e.g., hello", "for example,  hello"),
+            ("i.e., world", "i.e., world", "that is,  world"),
+            (
+                "multiple e.g., and i.e., here",
+                "multiple e.g., and i.e., here",
+                "multiple for example,  and that is,  here",
+            ),
+            // Text without abbreviations passes through unchanged
+            ("text_without_abbreviations", "hello world", "hello world"),
+            // Case-sensitive: only lowercase exact match
+            ("case_sensitive", "E.G.,", "E.G.,"),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(expand_abbreviations(input), expected, "case: {name}");
+        }
     }
 
     #[test]
     fn test_fix_punctuation_spacing() {
-        assert_eq!(fix_punctuation_spacing("hello ,world"), "hello,world");
-        assert_eq!(fix_punctuation_spacing("hello .world"), "hello.world");
-        assert_eq!(fix_punctuation_spacing("hello !world"), "hello!world");
-        assert_eq!(fix_punctuation_spacing("hello ?world"), "hello?world");
-        assert_eq!(fix_punctuation_spacing("hello ;world"), "hello;world");
-        assert_eq!(fix_punctuation_spacing("hello :world"), "hello:world");
-        assert_eq!(fix_punctuation_spacing("hello 'world"), "hello'world");
-        assert_eq!(
-            fix_punctuation_spacing("hello , . ; : ! ? 'world"),
-            "hello,.;:!?'world"
-        );
-        // Text without spacing issues passes through unchanged
-        assert_eq!(fix_punctuation_spacing("Hello, world!"), "Hello, world!");
+        let cases: &[(&str, &str, &str)] = &[
+            ("comma", "hello ,world", "hello,world"),
+            ("period", "hello .world", "hello.world"),
+            ("bang", "hello !world", "hello!world"),
+            ("question", "hello ?world", "hello?world"),
+            ("semicolon", "hello ;world", "hello;world"),
+            ("colon", "hello :world", "hello:world"),
+            ("single_quote", "hello 'world", "hello'world"),
+            (
+                "all_punctuation",
+                "hello , . ; : ! ? 'world",
+                "hello,.;:!?'world",
+            ),
+            // Text without spacing issues passes through unchanged
+            ("no_spacing_issues", "Hello, world!", "Hello, world!"),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(fix_punctuation_spacing(input), expected, "case: {name}");
+        }
     }
 
     #[test]
     fn test_remove_duplicate_quotes() {
-        assert_eq!(
-            remove_duplicate_quotes(r#""hello""#),
-            r#""hello""#,
-            "single pair unchanged"
-        );
-        assert_eq!(
-            remove_duplicate_quotes(r#""""hello"""""#),
-            r#""hello""#,
-            "double quotes deduplicated"
-        );
-        assert_eq!(
-            remove_duplicate_quotes("''hello''"),
-            "'hello'",
-            "single quotes deduplicated"
-        );
-        assert_eq!(
-            remove_duplicate_quotes("``hello``"),
-            "`hello`",
-            "backticks deduplicated"
-        );
-        assert_eq!(
-            remove_duplicate_quotes(r#""'mixed"#),
-            r#""'mixed"#,
-            "different quote chars are not collapsed"
-        );
-        assert_eq!(
-            remove_duplicate_quotes("no quotes"),
-            "no quotes",
-            "text without quotes unchanged"
-        );
+        let cases: &[(&str, &str, &str)] = &[
+            ("single pair unchanged", r#""hello""#, r#""hello""#),
+            (
+                "double quotes deduplicated",
+                r#""""hello"""""#,
+                r#""hello""#,
+            ),
+            ("single quotes deduplicated", "''hello''", "'hello'"),
+            ("backticks deduplicated", "``hello``", "`hello`"),
+            (
+                "different quote chars are not collapsed",
+                r#""'mixed"#,
+                r#""'mixed"#,
+            ),
+            ("text without quotes unchanged", "no quotes", "no quotes"),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(remove_duplicate_quotes(input), expected, "case: {name}");
+        }
     }
 
     #[test]
     fn test_clean_whitespace() {
-        assert_eq!(
-            clean_whitespace("hello   world"),
-            "hello world",
-            "multiple spaces collapsed"
-        );
-        assert_eq!(
-            clean_whitespace("  hello  world  "),
-            "hello world",
-            "leading/trailing whitespace trimmed"
-        );
-        assert_eq!(
-            clean_whitespace("hello\tworld"),
-            "hello world",
-            "tabs become space"
-        );
-        assert_eq!(
-            clean_whitespace("hello\n\nworld"),
-            "hello world",
-            "newlines collapsed to space"
-        );
-        assert_eq!(clean_whitespace("  "), "", "whitespace-only becomes empty");
-        assert_eq!(
-            clean_whitespace("hello world"),
-            "hello world",
-            "normal text unchanged"
-        );
+        let cases: &[(&str, &str, &str)] = &[
+            ("multiple spaces collapsed", "hello   world", "hello world"),
+            (
+                "leading/trailing whitespace trimmed",
+                "  hello  world  ",
+                "hello world",
+            ),
+            ("tabs become space", "hello\tworld", "hello world"),
+            (
+                "newlines collapsed to space",
+                "hello\n\nworld",
+                "hello world",
+            ),
+            ("whitespace-only becomes empty", "  ", ""),
+            ("normal text unchanged", "hello world", "hello world"),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(clean_whitespace(input), expected, "case: {name}");
+        }
     }
 
     #[test]
     fn test_remove_emojis() {
-        // A selection of emojis from different ranges
-        let emoji_text = "Hello 😊😢🔥👍🏆🎉💯";
-        assert_eq!(
-            remove_emojis(emoji_text),
-            "Hello ",
-            "emoji characters removed"
-        );
-
-        // Emoticons range: U+1F600..=U+1F64F
-        assert_eq!(remove_emojis("😀😁😂🤣😃😄😅😆"), "", "emoticons removed");
-
-        // Symbols and pictographs range: U+1F300..=U+1F5FF
-        assert_eq!(remove_emojis("🌀🌂🌁"), "", "misc symbols removed");
-
-        // Transport range: U+1F680..=U+1F6FF
-        assert_eq!(remove_emojis("🚀🚁🚂"), "", "transport symbols removed");
-
-        // Various other emoji ranges
-        assert_eq!(
-            remove_emojis("🛀🛁🛂🛃🛄🛅"),
-            "",
-            "transport supplement removed"
-        );
-        assert_eq!(
-            remove_emojis("🤐🤑🤒🤓🤔🤕🤖"),
-            "",
-            "supplemental symbols removed"
-        );
-        assert_eq!(remove_emojis("🥰🥱🥴🥳🥺"), "", "extended symbols removed");
-        assert_eq!(remove_emojis("🦾🦿🧠🧡"), "", "symbols ext A removed");
-        // Note: ZWJ sequences like 🧑‍🦰 contain U+200D (zero-width joiner) which is
-        // not in the emoji ranges, so it passes through.
-        assert_eq!(
-            remove_emojis("🧑‍🦰"),
-            "\u{200d}",
-            "ZWJ character survives emoji removal"
-        );
-
-        // Misc symbols: U+2600..=U+26FF
-        // Note: ☀️ contains U+FE0F (variation selector-16) which is not in the
-        // emoji ranges, so it passes through. We test with bare U+2600 instead.
-        assert_eq!(
-            remove_emojis("\u{2600}\u{2601}\u{2602}\u{2603}"),
-            "",
-            "misc symbols removed"
-        );
-
-        // Dingbats: U+2700..=U+27BF
-        assert_eq!(remove_emojis("✀✁✂✃✄✅"), "", "dingbats removed");
-
-        // Non-emoji text passes through
-        assert_eq!(
-            remove_emojis("Hello, world!"),
-            "Hello, world!",
-            "plain text unchanged"
-        );
+        let cases: &[(&str, &str, &str)] = &[
+            // A selection of emojis from different ranges
+            ("emoji characters removed", "Hello 😊😢🔥👍🏆🎉💯", "Hello "),
+            // Emoticons range: U+1F600..=U+1F64F
+            ("emoticons removed", "😀😁😂🤣😃😄😅😆", ""),
+            // Symbols and pictographs range: U+1F300..=U+1F5FF
+            ("misc symbols removed", "🌀🌂🌁", ""),
+            // Transport range: U+1F680..=U+1F6FF
+            ("transport symbols removed", "🚀🚁🚂", ""),
+            // Various other emoji ranges
+            ("transport supplement removed", "🛀🛁🛂🛃🛄🛅", ""),
+            ("supplemental symbols removed", "🤐🤑🤒🤓🤔🤕🤖", ""),
+            ("extended symbols removed", "🥰🥱🥴🥳🥺", ""),
+            ("symbols ext A removed", "🦾🦿🧠🧡", ""),
+            // Note: ZWJ sequences like 🧑‍🦰 contain U+200D (zero-width joiner) which is
+            // not in the emoji ranges, so it passes through.
+            ("ZWJ character survives emoji removal", "🧑‍🦰", "\u{200d}"),
+            // Misc symbols: U+2600..=U+26FF
+            // Note: ☀️ contains U+FE0F (variation selector-16) which is not in the
+            // emoji ranges, so it passes through. We test with bare U+2600 instead.
+            ("misc symbols range", "\u{2600}\u{2601}\u{2602}\u{2603}", ""),
+            // Dingbats: U+2700..=U+27BF
+            ("dingbats removed", "✀✁✂✃✄✅", ""),
+            // Non-emoji text passes through
+            ("plain text unchanged", "Hello, world!", "Hello, world!"),
+        ];
+        for &(name, input, expected) in cases {
+            assert_eq!(remove_emojis(input), expected, "case: {name}");
+        }
     }
 
     /// Panic-safe guard that restores the TTS language config on drop.
