@@ -1952,103 +1952,114 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn parse_image_markers_extracts_multiple_markers() {
+    #[expect(clippy::type_complexity)]
+    fn parse_image_markers_cases() {
+        // Shared check for rows where markers must stay verbatim: the cleaned
+        // text equals the original input (which has no surrounding whitespace
+        // for `parse_image_markers`'s `trim()` to affect) and extracts no refs.
+        let assert_input = |cleaned: &str, refs: &[String], name: &str, input: &str| {
+            assert_eq!(cleaned, input, "case: {name}");
+            assert!(refs.is_empty(), "case: {name}");
+        };
+
         let uri = tiny_png_data_uri();
-        let input = format!("Check this [IMAGE:{uri}] and this [IMAGE:https://example.com/b.jpg]");
-        let (cleaned, refs) = parse_image_markers(&input);
 
-        assert_eq!(cleaned, "Check this  and this");
-        assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0], uri);
-        assert_eq!(refs[1], "https://example.com/b.jpg");
-    }
+        // Build a truncated-PNG marker (valid magic + IHDR, no IDAT) for the
+        // `rejects_truncated_raster` case.
+        let truncated_uri = {
+            let b64 = uri
+                .strip_prefix("data:image/png;base64,")
+                .expect("tiny png uri");
+            let bytes = STANDARD.decode(b64).expect("tiny png base64");
+            let truncated = &bytes[..bytes.len().min(33)];
+            format!("data:image/png;base64,{}", STANDARD.encode(truncated))
+        };
 
-    #[test]
-    fn parse_image_markers_keeps_invalid_empty_marker() {
-        let input = "hello [IMAGE:] world";
-        let (cleaned, refs) = parse_image_markers(input);
+        let cases: Vec<(&str, String, Box<dyn Fn(&str, &[String], &str, &str)>)> = vec![
+            (
+                "extracts_multiple_markers",
+                format!("Check this [IMAGE:{uri}] and this [IMAGE:https://example.com/b.jpg]"),
+                {
+                    let uri = uri.clone();
+                    Box::new(move |cleaned, refs, name, _input| {
+                        assert_eq!(cleaned, "Check this  and this", "case: {name}");
+                        assert_eq!(refs.len(), 2, "case: {name}");
+                        assert_eq!(refs[0], uri, "case: {name}");
+                        assert_eq!(refs[1], "https://example.com/b.jpg", "case: {name}");
+                    })
+                },
+            ),
+            (
+                "keeps_invalid_empty_marker",
+                "hello [IMAGE:] world".to_string(),
+                Box::new(|cleaned, refs, name, _input| {
+                    assert_eq!(cleaned, "hello [IMAGE:] world", "case: {name}");
+                    assert!(refs.is_empty(), "case: {name}");
+                }),
+            ),
+            // Stripping native `[IMAGE:]` payloads from history messages leaves
+            // only the text portion — those markers never reach the provider
+            // as text; the marker scan (and native image-part conversion)
+            // consumes them first.
+            (
+                "strips_markers_leaving_caption",
+                format!("[IMAGE:{uri}]\n\nDescribe this screenshot"),
+                {
+                    let uri = uri.clone();
+                    Box::new(move |cleaned, refs, name, _input| {
+                        assert_eq!(cleaned, "Describe this screenshot", "case: {name}");
+                        assert_eq!(refs.len(), 1, "case: {name}");
+                        assert_eq!(refs[0], uri, "case: {name}");
+                    })
+                },
+            ),
+            // An image-only message (no caption) should produce an empty string
+            // after marker stripping, so callers can drop it from history.
+            (
+                "image_only_message_becomes_empty",
+                format!("[IMAGE:{uri}]"),
+                Box::new(|cleaned, refs, name, _input| {
+                    assert!(cleaned.is_empty(), "case: {name}");
+                    assert_eq!(refs.len(), 1, "case: {name}");
+                }),
+            ),
+            // Non-IMAGE markers (AUDIO, VIDEO) and non-native IMAGE markers
+            // (file paths, prose placeholders) are preserved verbatim in the
+            // cleaned output. This test covers the mixed case to prevent
+            // regression of the preservation behaviour.
+            (
+                "preserves_audio_and_video_markers",
+                "[AUDIO:/tmp/sound.mp3] Listen to this [VIDEO:/tmp/clip.mp4] and [IMAGE:/tmp/img.png]".to_string(),
+                Box::new(assert_input),
+            ),
+            // Prose placeholders written as `[IMAGE:...]` / `[IMAGE:path]` /
+            // ellipsis data-URIs must stay in the text — they are not image
+            // payloads and must not become `image_url` parts (DeepSeek rejects
+            // them as unsupported).
+            (
+                "keeps_prose_placeholders",
+                concat!(
+                    "tool, command, [IMAGE:...] marker, or [IMAGE:path] syntax, ",
+                    "or [IMAGE:data:image/...;base64,...], ",
+                    "or [IMAGE:data:image/jpeg;base64,...], ",
+                    "or [IMAGE:data:image/png;base64,abcd]",
+                )
+                .to_string(),
+                Box::new(assert_input),
+            ),
+            // A truncated PNG (valid magic + IHDR, no IDAT) must stay in the
+            // text — DeepSeek rejects it as an unsupported/invalid image.
+            (
+                "rejects_truncated_raster",
+                format!("[IMAGE:{truncated_uri}]"),
+                Box::new(assert_input),
+            ),
+        ];
 
-        assert_eq!(cleaned, "hello [IMAGE:] world");
-        assert!(refs.is_empty());
-    }
-
-    /// Stripping native `[IMAGE:]` payloads from history messages leaves only
-    /// the text portion — those markers never reach the provider as text; the
-    /// marker scan (and native image-part conversion) consumes them first.
-    #[test]
-    fn parse_image_markers_strips_markers_leaving_caption() {
-        let uri = tiny_png_data_uri();
-        let input = format!("[IMAGE:{uri}]\n\nDescribe this screenshot");
-        let (cleaned, refs) = parse_image_markers(&input);
-        assert_eq!(cleaned, "Describe this screenshot");
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0], uri);
-    }
-
-    /// An image-only message (no caption) should produce an empty string after
-    /// marker stripping, so callers can drop it from history.
-    #[test]
-    fn parse_image_markers_image_only_message_becomes_empty() {
-        let uri = tiny_png_data_uri();
-        let input = format!("[IMAGE:{uri}]");
-        let (cleaned, refs) = parse_image_markers(&input);
-        assert!(
-            cleaned.is_empty(),
-            "expected empty string, got: {cleaned:?}"
-        );
-        assert_eq!(refs.len(), 1);
-    }
-
-    /// Non‑IMAGE markers (AUDIO, VIDEO) and non-native IMAGE markers (file
-    /// paths, prose placeholders) are preserved verbatim in the cleaned
-    /// output. This test covers the mixed case to prevent regression of the
-    /// preservation behaviour.
-    #[test]
-    fn parse_image_markers_preserves_audio_and_video_markers() {
-        let input =
-            "[AUDIO:/tmp/sound.mp3] Listen to this [VIDEO:/tmp/clip.mp4] and [IMAGE:/tmp/img.png]";
-        let (cleaned, refs) = parse_image_markers(input);
-
-        assert_eq!(
-            cleaned,
-            "[AUDIO:/tmp/sound.mp3] Listen to this [VIDEO:/tmp/clip.mp4] and [IMAGE:/tmp/img.png]"
-        );
-        assert!(refs.is_empty());
-    }
-
-    /// Prose placeholders written as `[IMAGE:...]` / `[IMAGE:path]` / ellipsis
-    /// data-URIs must stay in the text — they are not image payloads and must
-    /// not become `image_url` parts (DeepSeek rejects them as unsupported).
-    #[test]
-    fn parse_image_markers_keeps_prose_placeholders() {
-        let input = concat!(
-            "tool, command, [IMAGE:...] marker, or [IMAGE:path] syntax, ",
-            "or [IMAGE:data:image/...;base64,...], ",
-            "or [IMAGE:data:image/jpeg;base64,...], ",
-            "or [IMAGE:data:image/png;base64,abcd]"
-        );
-        let (cleaned, refs) = parse_image_markers(input);
-        assert_eq!(cleaned, input);
-        assert!(refs.is_empty());
-    }
-
-    /// A truncated PNG (valid magic + IHDR, no IDAT) must stay in the text —
-    /// DeepSeek rejects it as an unsupported/invalid image.
-    #[test]
-    fn parse_image_markers_rejects_truncated_raster() {
-        let uri = tiny_png_data_uri();
-        let b64 = uri
-            .strip_prefix("data:image/png;base64,")
-            .expect("tiny png uri");
-        let bytes = STANDARD.decode(b64).expect("tiny png base64");
-        let truncated = &bytes[..bytes.len().min(33)];
-        let input = format!(
-            "[IMAGE:data:image/png;base64,{}]",
-            STANDARD.encode(truncated)
-        );
-        let (cleaned, refs) = parse_image_markers(&input);
-        assert_eq!(cleaned, input);
-        assert!(refs.is_empty());
+        for (name, input, check) in cases {
+            let (cleaned, refs) = parse_image_markers(&input);
+            check(&cleaned, &refs, name, &input);
+        }
     }
 
     #[test]
@@ -2421,66 +2432,84 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_for_native_round_trips_reasoning_content() {
-        // Simulate stored assistant history JSON that includes reasoning_content
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
-                "id": "tc_1",
-                "name": "shell",
-                "arguments": "{\"cmd\":\"ls\"}"
-            }],
-            "reasoning_content": "Let me think about this..."
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
-        assert_eq!(native.len(), 1);
-        assert_eq!(native[0].role, "assistant");
-        assert_eq!(
-            native[0].reasoning_content.as_deref(),
-            Some("Let me think about this...")
-        );
-        assert!(native[0].tool_calls.is_some());
-    }
-
-    #[test]
-    fn convert_messages_for_native_no_reasoning_content_when_absent() {
-        // Normal model history without reasoning_content key
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
-                "id": "tc_1",
-                "name": "shell",
-                "arguments": "{\"cmd\":\"ls\"}"
-            }]
-        });
-
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
-        assert_eq!(native.len(), 1);
-        assert!(native[0].reasoning_content.is_none());
-    }
-
-    #[test]
-    fn convert_messages_for_native_synthesizes_reasoning_content_from_details_for_tool_calls() {
+    #[expect(clippy::type_complexity)]
+    fn convert_messages_for_native_reasoning_cases() {
         let details = serde_json::json!([
             {"type": "reasoning.text", "text": "from details", "format": "x", "index": 0}
         ]);
-        let history_json = serde_json::json!({
-            "content": "I will check",
-            "tool_calls": [{
-                "id": "tc_1",
-                "name": "shell",
-                "arguments": "{\"cmd\":\"ls\"}"
-            }],
-            "reasoning_details": details.clone(),
-        });
 
-        let messages = vec![ChatMessage::assistant(history_json.to_string())];
-        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
-        assert_eq!(native.len(), 1);
-        assert_eq!(native[0].reasoning_content.as_deref(), Some("from details"));
-        assert_eq!(native[0].reasoning_details.as_ref(), Some(&details));
+        let cases: Vec<(&str, serde_json::Value, Box<dyn Fn(&[NativeMessage], &str)>)> = vec![
+            (
+                "round_trips_reasoning_content",
+                serde_json::json!({
+                    "content": "I will check",
+                    "tool_calls": [{
+                        "id": "tc_1",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"ls\"}"
+                    }],
+                    "reasoning_content": "Let me think about this..."
+                }),
+                Box::new(|native, name| {
+                    assert_eq!(native.len(), 1, "case: {name}");
+                    assert_eq!(native[0].role, "assistant", "case: {name}");
+                    assert_eq!(
+                        native[0].reasoning_content.as_deref(),
+                        Some("Let me think about this..."),
+                        "case: {name}",
+                    );
+                    assert!(native[0].tool_calls.is_some(), "case: {name}");
+                }),
+            ),
+            (
+                "no_reasoning_content_when_absent",
+                serde_json::json!({
+                    "content": "I will check",
+                    "tool_calls": [{
+                        "id": "tc_1",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"ls\"}"
+                    }]
+                }),
+                Box::new(|native, name| {
+                    assert_eq!(native.len(), 1, "case: {name}");
+                    assert!(native[0].reasoning_content.is_none(), "case: {name}");
+                }),
+            ),
+            (
+                "synthesizes_reasoning_content_from_details_for_tool_calls",
+                serde_json::json!({
+                    "content": "I will check",
+                    "tool_calls": [{
+                        "id": "tc_1",
+                        "name": "shell",
+                        "arguments": "{\"cmd\":\"ls\"}"
+                    }],
+                    "reasoning_details": details.clone(),
+                }),
+                {
+                    let details = details.clone();
+                    Box::new(move |native, name| {
+                        assert_eq!(native.len(), 1, "case: {name}");
+                        assert_eq!(
+                            native[0].reasoning_content.as_deref(),
+                            Some("from details"),
+                            "case: {name}",
+                        );
+                        assert_eq!(
+                            native[0].reasoning_details.as_ref(),
+                            Some(&details),
+                            "case: {name}",
+                        );
+                    })
+                },
+            ),
+        ];
+
+        for (name, history_json, check) in cases {
+            let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+            check(&native, name);
+        }
     }
 }
