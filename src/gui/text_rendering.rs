@@ -404,6 +404,16 @@ pub(crate) fn push_or_merge<'a>(
 /// widget sorts its `span_data` before calling; the editor emits per-line
 /// spans in order). Shared by [`super::editor_widget`] and
 /// [`super::diff_widget`]; both previously inlined this loop.
+///
+/// # UTF-8 safety
+///
+/// Span offsets may land *inside* a multi-byte char (e.g. an em-dash) when the
+/// highlight source diverges from `text`; slicing there would panic and abort
+/// the GUI. Both endpoints are floor-aligned to a char boundary. Flooring both
+/// (never ceiling the end, which could let the next span overlap after the same
+/// alignment) keeps the list contiguous; a span collapsed to zero width by
+/// alignment is skipped, its character covered by the adjacent fill — only that
+/// character's colour attribution shifts (cosmetic).
 pub(crate) fn fill_rich_spans<'a>(
     text: &'a str,
     spans: impl IntoIterator<Item = (usize, usize, cosmic_text::Attrs<'a>)>,
@@ -411,7 +421,14 @@ pub(crate) fn fill_rich_spans<'a>(
 ) -> Vec<(&'a str, cosmic_text::Attrs<'a>)> {
     let mut result: Vec<(&str, cosmic_text::Attrs)> = Vec::new();
     let mut byte_pos = 0usize;
-    for (start, end, attrs) in spans {
+    for (raw_start, raw_end, attrs) in spans {
+        // `floor_char_boundary` already clamps an out-of-range index to `len`;
+        // `.max(byte_pos)` keeps the list monotonic and gap-free when a later
+        // span points back into bytes an earlier, longer one already covered.
+        let start = text.floor_char_boundary(raw_start).max(byte_pos);
+        let end = text.floor_char_boundary(raw_end);
+
+        // Fill any uncovered gap before this span with the base attributes.
         if start > byte_pos {
             push_or_merge(
                 text,
@@ -419,7 +436,10 @@ pub(crate) fn fill_rich_spans<'a>(
                 &text[byte_pos..start],
                 base_attrs.clone(),
             );
+            byte_pos = start;
         }
+        // Skip a span collapsed to zero width by alignment; the straddled
+        // character stays covered by the following base/span fill.
         if end > start {
             push_or_merge(text, &mut result, &text[start..end], attrs);
             byte_pos = end;
@@ -480,5 +500,112 @@ mod tests {
         push_or_merge(text, &mut result, &text[0..5], attrs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "hello");
+    }
+
+    // ── fill_rich_spans tests ──────────────────────────────────────────
+
+    /// Assert that `out` covers `text` contiguously with no gaps or overlaps
+    /// and that every emitted span starts/ends on a UTF-8 char boundary.
+    /// This is the exact contract [`cosmic_text::Buffer::set_rich_text`]
+    /// relies on: it rebuilds the buffer by concatenating the span slices.
+    fn assert_rich_spans_cover(text: &str, out: &[(&str, cosmic_text::Attrs)]) {
+        let mut byte_cursor = 0usize;
+        for (slice, _) in out {
+            let start = (slice.as_ptr() as usize) - (text.as_ptr() as usize);
+            let end = start + slice.len();
+            assert_eq!(
+                start, byte_cursor,
+                "gap or overlap before byte {byte_cursor}"
+            );
+            assert!(
+                text.is_char_boundary(start),
+                "start {start} is not a char boundary"
+            );
+            assert!(
+                text.is_char_boundary(end),
+                "end {end} is not a char boundary"
+            );
+            byte_cursor = end;
+        }
+        assert_eq!(byte_cursor, text.len(), "spans do not cover all bytes");
+    }
+
+    #[test]
+    fn fill_rich_spans_handles_spans_inside_multibyte_char() {
+        // "—" is 3 UTF-8 bytes; "é" is 2. Spans land inside both.
+        let text = "ab—cdé";
+        let base = cosmic_text::Attrs::new();
+        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
+        let spans = vec![
+            (3, 6, colored.clone()), // start inside em-dash (bytes 2..5)
+            (8, 9, colored.clone()), // start inside é (bytes 7..9)
+        ];
+        let out = fill_rich_spans(text, spans, &base);
+        assert_rich_spans_cover(text, &out);
+    }
+
+    #[test]
+    fn fill_rich_spans_collapsed_multibyte_span_keeps_coverage() {
+        // A span fully inside the em-dash collapses to zero width after
+        // alignment; coverage must still be complete with no gap.
+        let text = "ab—cd";
+        let base = cosmic_text::Attrs::new();
+        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
+        let spans = vec![(3, 4, colored)]; // bytes 3..4 are interior of em-dash 2..5
+        let out = fill_rich_spans(text, spans, &base);
+        assert_rich_spans_cover(text, &out);
+    }
+
+    #[test]
+    fn fill_rich_spans_clamps_out_of_range_spans() {
+        let text = "a—b";
+        let base = cosmic_text::Attrs::new();
+        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
+        let spans = vec![
+            (2, 100, colored.clone()),   // end clamped to text.len
+            (200, 300, colored.clone()), // entirely out of range
+        ];
+        let out = fill_rich_spans(text, spans, &base);
+        assert_rich_spans_cover(text, &out);
+    }
+
+    #[test]
+    fn fill_rich_spans_does_not_change_ascii_behaviour() {
+        let text = "hello world";
+        let base = cosmic_text::Attrs::new();
+        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
+        let spans = vec![(0, 5, colored.clone()), (6, 11, colored)];
+        let out = fill_rich_spans(text, spans, &base);
+        assert_rich_spans_cover(text, &out);
+        // The space at byte 5 is a base-attr gap; the rest is coloured.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, "hello");
+        assert_eq!(out[1].0, " ");
+        assert_eq!(out[2].0, "world");
+    }
+
+    #[test]
+    fn fill_rich_spans_end_inside_multibyte_char() {
+        // Mirrors the reported crash: "end byte index ... is not a char
+        // boundary; it is inside —". Here end=3 is inside the em-dash
+        // occupying bytes 1..4.
+        let text = "a—";
+        let base = cosmic_text::Attrs::new();
+        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
+        let spans = vec![(0, 3, colored)];
+        let out = fill_rich_spans(text, spans, &base);
+        assert_rich_spans_cover(text, &out);
+    }
+
+    #[test]
+    fn fill_rich_spans_fills_leading_and_trailing_multibyte_gaps() {
+        // Highlight starts mid-char and there is a multi-byte char at a span
+        // boundary; the emitted list must remain contiguous and complete.
+        let text = "—x—";
+        let base = cosmic_text::Attrs::new();
+        let colored = cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0));
+        let spans = vec![(1, 4, colored)]; // start inside first em-dash, end inside second
+        let out = fill_rich_spans(text, spans, &base);
+        assert_rich_spans_cover(text, &out);
     }
 }
