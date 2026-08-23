@@ -452,15 +452,54 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_validate_no_args() {
+    fn test_validate_execute_args() {
         let cache = WebSearchCache::new();
-        let args = json!({});
-        let result = cache.validate_execute_args(&args);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("either `query`"),
-            "Error should mention both args"
-        );
+        let cases: &[(&str, Value, Option<&str>, Option<&str>)] = &[
+            ("no_args", json!({}), Some("either `query`"), None),
+            (
+                "both_args",
+                json!({"query": "test", "expand": 1}),
+                Some("not both"),
+                None,
+            ),
+            (
+                "query_too_short",
+                json!({"query": "ab"}),
+                Some("at least 3"),
+                None,
+            ),
+            // Cache counter starts at 1, so any id >= 1 without a prior search fails
+            (
+                "expand_invalid_future_id",
+                json!({"expand": 999_999_999}),
+                Some("Invalid expand id"),
+                None,
+            ),
+            (
+                "good_query",
+                json!({"query": "rust programming"}),
+                None,
+                Some("rust programming"),
+            ),
+        ];
+        for (name, args, err_contains, ok_query) in cases {
+            let name = *name;
+            match (err_contains, ok_query) {
+                (Some(expected), _) => {
+                    let err = cache.validate_execute_args(args).unwrap_err().to_string();
+                    assert!(
+                        err.contains(*expected),
+                        "case: {name} — error should contain `{expected}`, got: {err}"
+                    );
+                }
+                (None, Some(expected_query)) => {
+                    let (query, expand_id) = cache.validate_execute_args(args).unwrap();
+                    assert_eq!(query, *expected_query, "case: {name}");
+                    assert!(expand_id.is_none(), "case: {name} — expected no expand_id");
+                }
+                (None, None) => unreachable!("case: {name}"),
+            }
+        }
     }
 
     #[test]
@@ -486,53 +525,6 @@ mod tests {
         // Non-JSON body yields no detail (caller falls back to status+body).
         assert_eq!(search_error_detail("plain text"), None);
         assert_eq!(search_error_detail(""), None);
-    }
-
-    #[test]
-    fn test_validate_both_args() {
-        let cache = WebSearchCache::new();
-        let args = json!({"query": "test", "expand": 1});
-        let result = cache.validate_execute_args(&args);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("not both"),
-            "Error should mention not both"
-        );
-    }
-
-    #[test]
-    fn test_validate_query_too_short() {
-        let cache = WebSearchCache::new();
-        let args = json!({"query": "ab"});
-        let result = cache.validate_execute_args(&args);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().to_string().contains("at least 3"),
-            "Error should mention min length"
-        );
-    }
-
-    #[test]
-    fn test_validate_expand_invalid_future_id() {
-        let cache = WebSearchCache::new();
-        // Cache counter starts at 1, so any id >= 1 without a prior search fails
-        let args = json!({"expand": 999_999_999});
-        let result = cache.validate_execute_args(&args);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Invalid expand id"),
-            "Error should contain 'Invalid expand id': {err}"
-        );
-    }
-
-    #[test]
-    fn test_validate_good_query() {
-        let cache = WebSearchCache::new();
-        let args = json!({"query": "rust programming"});
-        let (query, expand_id) = cache.validate_execute_args(&args).unwrap();
-        assert_eq!(query, "rust programming");
-        assert!(expand_id.is_none());
     }
 
     #[tokio::test]

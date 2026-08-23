@@ -485,61 +485,52 @@ mod tests {
     // ── Extension check tests ────────────────────────────────────────
 
     #[test]
-    fn ws_insensitive_included_extensions() {
-        for path in [
-            "main.rs",
-            "src/lib.rs",
-            "app.js",
-            "component.jsx",
-            "app.ts",
-            "component.tsx",
-            "main.c",
-            "main.h",
-            "main.cpp",
-            "main.hpp",
-            "main.cc",
-            "main.cxx",
-            "Main.java",
-            "Main.kt",
-            "Main.kts",
-            "main.go",
-            "main.swift",
-            "main.dart",
-            "Program.cs",
-            "main.zig",
-            "Main.scala",
-            "Main.rs",
-            "Main.RS",
-            "App.JS",
-            "Main.Rs",
-        ] {
-            assert!(
+    fn ws_insensitive_extensions() {
+        let cases: &[(&str, bool)] = &[
+            ("main.rs", true),
+            ("src/lib.rs", true),
+            ("app.js", true),
+            ("component.jsx", true),
+            ("app.ts", true),
+            ("component.tsx", true),
+            ("main.c", true),
+            ("main.h", true),
+            ("main.cpp", true),
+            ("main.hpp", true),
+            ("main.cc", true),
+            ("main.cxx", true),
+            ("Main.java", true),
+            ("Main.kt", true),
+            ("Main.kts", true),
+            ("main.go", true),
+            ("main.swift", true),
+            ("main.dart", true),
+            ("Program.cs", true),
+            ("main.zig", true),
+            ("Main.scala", true),
+            ("Main.rs", true),
+            ("Main.RS", true),
+            ("App.JS", true),
+            ("Main.Rs", true),
+            ("config.toml", false),
+            ("config.json", false),
+            ("config.yaml", false),
+            ("config.yml", false),
+            ("readme.md", false),
+            ("Dockerfile", false),
+            ("Makefile", false),
+            ("main.py", false),
+            ("main.rb", false),
+            ("main.php", false),
+            ("style.css", false),
+            ("script.sh", false),
+            ("docker-compose", false),
+        ];
+        for &(path, expected_match) in cases {
+            assert_eq!(
                 is_ws_insensitive_extension(path),
-                "Expected match for {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn ws_insensitive_excluded_extensions() {
-        for path in [
-            "config.toml",
-            "config.json",
-            "config.yaml",
-            "config.yml",
-            "readme.md",
-            "Dockerfile",
-            "Makefile",
-            "main.py",
-            "main.rb",
-            "main.php",
-            "style.css",
-            "script.sh",
-            "docker-compose",
-        ] {
-            assert!(
-                !is_ws_insensitive_extension(path),
-                "Expected no match for {path}"
+                expected_match,
+                "case: {path}"
             );
         }
     }
@@ -689,64 +680,89 @@ mod tests {
         }
     }
 
-    /// Cases where whitespace-insensitive matching is ambiguous
-    /// (the normalized old_string appears more than once).
+    /// Cases for whitespace-insensitive matching ambiguity decisions.
+    /// `expected_ambiguous = true` means the normalized old_string appears
+    /// more than once (produces an error); `false` means it does not (ok).
     #[test]
-    fn ws_match_is_ambiguous_true_cases() {
-        let ambiguous_cases: &[(&str, &str)] = &[
+    fn ws_match_is_ambiguous() {
+        let cases: &[(&str, &str, &str, bool)] = &[
             // Repeated pattern — "a b" appears 3x in normalized "a b a b a b"
-            ("a  b  a  b  a  b", "a b"),
+            ("repeated_pattern", "a  b  a  b  a  b", "a b", true),
             // Two lines that normalize to the same thing
-            ("let  x  =  1;\nlet  x  =  1;", "let x = 1;"),
+            (
+                "two_lines_normalize_same",
+                "let  x  =  1;\nlet  x  =  1;",
+                "let x = 1;",
+                true,
+            ),
             // Overlapping match in repeated tokens
-            ("a a a", "a a"),
+            ("overlapping_repeated_tokens", "a a a", "a a", true),
             // Multi-byte first character (2-byte Latin ñ)
-            ("ñ b ñ b", "ñ b"),
+            ("multibyte_2byte_latin", "ñ b ñ b", "ñ b", true),
             // Multi-byte first character (3-byte CJK)
-            ("字 符 字 符", "字 符"),
+            ("multibyte_3byte_cjk", "字 符 字 符", "字 符", true),
             // Multi-byte first character (4-byte emoji)
-            ("🚀 b 🚀 b", "🚀 b"),
-        ];
-        for (content, old) in ambiguous_cases {
-            let result = find_ws_insensitive(content, old);
-            assert!(
-                result.is_err(),
-                "Expected ambiguous error: content={content:?} old={old:?} got {result:?}"
-            );
-            let err = format!("{}", result.unwrap_err());
-            assert!(
-                err.contains("multiple times after whitespace normalization"),
-                "Error should mention ambiguity, got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn ws_match_is_ambiguous_false_cases() {
-        let unambiguous_cases: &[(&str, &str)] = &[
+            ("multibyte_4byte_emoji", "🚀 b 🚀 b", "🚀 b", true),
             // Single match
-            ("fn  foo()  {}", "fn foo() {}"),
+            ("single_match", "fn  foo()  {}", "fn foo() {}", false),
             // Two different functions — only one matches the pattern
-            ("fn  foo()  {}\nfn  bar()  {}", "fn bar() {}"),
+            (
+                "two_functions_one_matches",
+                "fn  foo()  {}\nfn  bar()  {}",
+                "fn bar() {}",
+                false,
+            ),
             // Old string appears only once after normalization
-            ("let  x  =  5;\nlet  y  =  10;\n    x  +  y", "let x = 5;"),
+            (
+                "appears_once_after_normalization",
+                "let  x  =  5;\nlet  y  =  10;\n    x  +  y",
+                "let x = 5;",
+                false,
+            ),
             // Empty old_string should not be ambiguous
-            ("anything", ""),
+            ("empty_old_string", "anything", "", false),
             // Not found at all
-            ("fn foo() {}", "fn bar() {}"),
+            ("not_found", "fn foo() {}", "fn bar() {}", false),
             // Multi-byte single match (2-byte Latin ñ)
-            ("fn  ñ  foo()  {}", "fn ñ foo()"),
+            (
+                "multibyte_2byte_latin_single",
+                "fn  ñ  foo()  {}",
+                "fn ñ foo()",
+                false,
+            ),
             // Multi-byte single match (3-byte CJK)
-            ("let  字  =  1;", "let 字 = 1;"),
+            (
+                "multibyte_3byte_cjk_single",
+                "let  字  =  1;",
+                "let 字 = 1;",
+                false,
+            ),
             // Multi-byte single match (4-byte emoji)
-            ("let  🚀  =  1;", "let 🚀 = 1;"),
+            (
+                "multibyte_4byte_emoji_single",
+                "let  🚀  =  1;",
+                "let 🚀 = 1;",
+                false,
+            ),
         ];
-        for (content, old) in unambiguous_cases {
+        for &(name, content, old, expected_ambiguous) in cases {
             let result = find_ws_insensitive(content, old);
-            assert!(
-                result.is_ok(),
-                "Expected no ambiguity error: content={content:?} old={old:?} got {result:?}"
-            );
+            if expected_ambiguous {
+                assert!(
+                    result.is_err(),
+                    "case: {name} — expected ambiguous error, content={content:?} old={old:?} got {result:?}"
+                );
+                let err = format!("{}", result.unwrap_err());
+                assert!(
+                    err.contains("multiple times after whitespace normalization"),
+                    "case: {name} — error should mention ambiguity, got: {err}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "case: {name} — expected no ambiguity error, content={content:?} old={old:?} got {result:?}"
+                );
+            }
         }
     }
 
