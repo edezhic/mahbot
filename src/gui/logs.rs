@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use iced_fonts::lucide;
 
 use super::common::PaginatedTabState;
-use super::context_menu::{ContextMenu, MenuItem};
+use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets;
 

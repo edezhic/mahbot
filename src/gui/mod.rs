@@ -11,7 +11,6 @@
 
 pub(crate) mod board;
 pub(crate) mod common;
-pub(crate) mod context_menu;
 pub(crate) mod diff;
 pub(crate) mod diff_widget;
 pub(crate) mod editor;
@@ -21,7 +20,7 @@ pub(crate) mod highlight;
 pub(crate) mod home;
 pub(crate) mod logs;
 pub(crate) mod media_markers;
-pub(crate) mod role_menu;
+pub(crate) mod menus;
 pub(crate) mod running;
 pub(crate) mod session_preview;
 pub(crate) mod sessions;
@@ -48,7 +47,7 @@ use crate::Role;
 use crate::audio::voice::VoiceStatus;
 use crate::self_update::UpdateMode;
 
-use self::context_menu::ContextMenu;
+use self::menus::ContextMenu;
 
 use iced_fonts::lucide;
 
@@ -1725,7 +1724,7 @@ impl Dashboard {
                 // menu is the fallback for empty-space right-clicks.
                 let home_view: Element<'_, Message> = ContextMenu::new(
                     home_view,
-                    vec![context_menu::MenuItem::new(
+                    vec![menus::MenuItem::new(
                         "Reset session".into(),
                         Message::Home(home::HomeMessage::ClearChat),
                     )],
@@ -1734,7 +1733,7 @@ impl Dashboard {
                 // Wrap sidebar in a right-click context menu with "Archive done & cancelled" option.
                 let sidebar: Element<'_, Message> = ContextMenu::new(
                     sidebar,
-                    vec![context_menu::MenuItem::new(
+                    vec![menus::MenuItem::new(
                         "Archive done & cancelled".into(),
                         Message::Board(board::BoardMessage::ArchiveAllCompleted),
                     )],

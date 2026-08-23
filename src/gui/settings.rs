@@ -31,7 +31,7 @@ use iced_fonts::lucide;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use super::context_menu::{ContextMenu, MenuItem};
+use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::users;
 use super::widgets;

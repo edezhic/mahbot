@@ -18,7 +18,7 @@ use iced::window;
 use iced_fonts::lucide;
 
 use super::ToastMessage;
-use super::context_menu::{ContextMenu, MenuItem};
+use super::menus::{ContextMenu, MenuItem};
 use super::session_preview::{
     MAX_PREVIEW_LINES, MessageMeasure, measure_message, re_measure, width_bucket,
 };

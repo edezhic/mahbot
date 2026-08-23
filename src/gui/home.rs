@@ -18,8 +18,7 @@ use std::collections::HashSet;
 
 use super::ToastMessage;
 use super::common::MAX_INPUT_CHARS;
-use super::context_menu::{ContextMenu, MenuItem};
-use super::role_menu::{RoleMenu, RoleMenuItem};
+use super::menus::{ContextMenu, MenuItem, RoleMenu, RoleMenuItem};
 use super::theme;
 use super::widgets::PickOption;
 

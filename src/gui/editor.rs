@@ -30,7 +30,7 @@ use iced_fonts::lucide;
 use fff_search::grep::{GrepMode, GrepSearchOptions};
 use fff_search::parse_grep_query;
 
-use super::context_menu::{ContextMenu, MenuItem};
+use super::menus::{ContextMenu, MenuItem};
 
 use crate::git_commands::{is_git_repo, run_git_check_ignore, run_git_output, run_git_status};
 use crate::util::unquote_c_style;

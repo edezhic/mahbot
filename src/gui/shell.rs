@@ -14,7 +14,7 @@ use iced::{Alignment, Element, Length, Size, Subscription, Task};
 use iced_fonts::lucide;
 use iced_term::{BackendCommand, TerminalView};
 
-use super::context_menu::{ContextMenu, MenuItem};
+use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets;
 
