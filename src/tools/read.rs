@@ -325,15 +325,12 @@ impl Tool for ReadTool {
         let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&res.path)
             .await
             .ok()?;
-        Some(crate::tools::ImagePayload {
-            path: res.path.display().to_string(),
-            data_uri: meta.data_uri,
-            width: meta.width,
-            height: meta.height,
-            format: meta.format,
-            recovery_note: res.recovery_note,
-            source: crate::tools::ImagePayloadSource::Read,
-        })
+        Some(crate::tools::ImagePayload::from_compressed_meta(
+            &res.path,
+            meta,
+            res.recovery_note,
+            crate::tools::ImagePayloadSource::Read,
+        ))
     }
 }
 

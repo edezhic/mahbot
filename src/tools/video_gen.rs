@@ -10,6 +10,14 @@ use std::path::Path;
 /// `[VIDEO:path]` in its reply.
 pub struct VideoGenTool;
 
+/// Insert an optional value into the request body under `key`, skipping
+/// parameters the caller did not supply.
+fn set_opt<T: Into<serde_json::Value>>(body: &mut serde_json::Value, key: &str, value: Option<T>) {
+    if let Some(v) = value {
+        body[key] = v.into();
+    }
+}
+
 #[async_trait]
 impl Tool for VideoGenTool {
     fn name(&self) -> &'static str {
@@ -98,29 +106,12 @@ impl Tool for VideoGenTool {
             "prompt": prompt,
         });
 
-        if let Some(d) = duration {
-            body["duration"] = json!(d);
-        }
-
-        if let Some(r) = resolution {
-            body["resolution"] = json!(r);
-        }
-
-        if let Some(a) = aspect_ratio {
-            body["aspect_ratio"] = json!(a);
-        }
-
-        if let Some(s) = size {
-            body["size"] = json!(s);
-        }
-
-        if let Some(g) = generate_audio {
-            body["generate_audio"] = json!(g);
-        }
-
-        if let Some(s) = seed {
-            body["seed"] = json!(s);
-        }
+        set_opt(&mut body, "duration", duration);
+        set_opt(&mut body, "resolution", resolution);
+        set_opt(&mut body, "aspect_ratio", aspect_ratio);
+        set_opt(&mut body, "size", size);
+        set_opt(&mut body, "generate_audio", generate_audio);
+        set_opt(&mut body, "seed", seed);
 
         // Optional: add reference image via input_references. Reference-load
         // failures are hard errors — never silently degrade to text-to-video.

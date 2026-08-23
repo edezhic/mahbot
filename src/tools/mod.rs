@@ -377,6 +377,32 @@ impl ImagePayload {
             None => base,
         }
     }
+
+    /// Build an [`ImagePayload`] from a post-decode [`crate::util::CompressedImageMeta`]
+    /// (the bounded data URI + post-EXIF dims + source-format label) and the
+    /// caller's resolved path, recovery note, and producing tool.
+    ///
+    /// This is the infallible construction tail: the caller performs the
+    /// fallible decode separately
+    /// (`crate::util::local_image_to_compressed_data_uri_with_meta(...).await.ok()?`)
+    /// and passes the decoded meta in to build the payload.
+    #[must_use]
+    pub(crate) fn from_compressed_meta(
+        path: &std::path::Path,
+        meta: crate::util::CompressedImageMeta,
+        recovery_note: Option<String>,
+        source: ImagePayloadSource,
+    ) -> Self {
+        Self {
+            path: path.display().to_string(),
+            data_uri: meta.data_uri,
+            width: meta.width,
+            height: meta.height,
+            format: meta.format,
+            recovery_note,
+            source,
+        }
+    }
 }
 
 /// Normalize a tool call name and arguments, repairing common agent mistakes.

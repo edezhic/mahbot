@@ -874,15 +874,12 @@ impl Tool for BrowserTool {
         let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&p)
             .await
             .ok()?;
-        Some(crate::tools::ImagePayload {
-            path,
-            data_uri: meta.data_uri,
-            width: meta.width,
-            height: meta.height,
-            format: meta.format,
-            recovery_note: None,
-            source: crate::tools::ImagePayloadSource::Browser,
-        })
+        Some(crate::tools::ImagePayload::from_compressed_meta(
+            &p,
+            meta,
+            None,
+            crate::tools::ImagePayloadSource::Browser,
+        ))
     }
 }
 

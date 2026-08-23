@@ -203,15 +203,12 @@ async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> 
             // over-cap input). The marker stays in the raw output for delivery.
             continue;
         };
-        return Some(ImagePayload {
-            path: p.display().to_string(),
-            data_uri: meta.data_uri,
-            width: meta.width,
-            height: meta.height,
-            format: meta.format,
-            recovery_note: None,
-            source: crate::tools::ImagePayloadSource::Generated,
-        });
+        return Some(ImagePayload::from_compressed_meta(
+            p,
+            meta,
+            None,
+            crate::tools::ImagePayloadSource::Generated,
+        ));
     }
     None
 }
