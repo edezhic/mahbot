@@ -2850,68 +2850,54 @@ async fn pickup_pending_workspace_waits_for_provider() {
 #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
 async fn pickup_claim_claims_when_provider_configured() {
     init_management_test_stores().await;
-    let _cfg = ConfigGuard::new(Some("sk-test"), None);
-    let ws = create_test_workspace("/tmp/test_pickup_claim", "ws_pickup_claim").await;
+    // Both provider_configured() disjuncts (key, keyless custom endpoint)
+    // must claim a Pending workspace. Rows carry their own attribution.
+    // (provider_key, custom_endpoint, ws_path, ws_name, claim_expect, status_msg)
+    let cases = [
+        (
+            Some("sk-test"),
+            None,
+            "/tmp/test_pickup_claim",
+            "ws_pickup_claim",
+            "claim should succeed",
+            "provider key configured → pending workspace claimed into discovery",
+        ),
+        // A keyless custom endpoint counts as provider configured — the
+        // runtime honors a persisted custom endpoint, so without an OpenRouter
+        // key the pickup must still claim the workspace into discovery.
+        (
+            None,
+            Some("http://localhost:8080/v1"),
+            "/tmp/test_pickup_endpoint",
+            "ws_pickup_endpoint",
+            "a persisted custom endpoint without a key must count as provider configured",
+            "keyless custom endpoint → pending workspace claimed into discovery",
+        ),
+    ];
+    for (provider_key, custom_endpoint, ws_path, ws_name, claim_expect, status_msg) in cases {
+        // Per-row ConfigGuard: each row must run against its own disjunct.
+        let _cfg = ConfigGuard::new(provider_key, custom_endpoint);
+        let ws = create_test_workspace(ws_path, ws_name).await;
 
-    // pickup_claim (the decision + atomic claim half of the pickup) must
-    // claim without spawning any discovery task — deterministic, no agents.
-    let claimed = pickup_claim(&ws).await;
-    let (generation, discover_diagnostics) = claimed.expect("claim should succeed");
-    assert_eq!(generation, 0, "fresh workspace has discovery_generation 0");
-    assert!(
-        discover_diagnostics,
-        "no diagnostics exist yet → first discovery must run diagnostics"
-    );
+        let claimed = pickup_claim(&ws).await;
+        let (generation, discover_diagnostics) = claimed.expect(claim_expect);
+        assert_eq!(generation, 0, "fresh workspace has discovery_generation 0");
+        assert!(
+            discover_diagnostics,
+            "no diagnostics exist yet → first discovery must run diagnostics"
+        );
 
-    let stored = crate::workspace::store()
-        .get_by_name("ws_pickup_claim")
-        .await
-        .expect("fetch")
-        .expect("exists");
-    assert_eq!(
-        stored.status,
-        WorkspaceStatus::Analyzing,
-        "provider key configured → pending workspace claimed into discovery"
-    );
-    assert!(
-        stored.paused,
-        "the claim must set the analysis pause (blocks pipeline claims while discovery runs)"
-    );
-}
-
-#[tokio::test]
-#[serial_test::serial(config_persist)] // swaps the process-global CONFIG
-async fn pickup_claim_claims_without_key_when_custom_endpoint_persisted() {
-    init_management_test_stores().await;
-    // A keyless custom endpoint counts as provider configured —
-    // the runtime honors a persisted custom endpoint, so without an OpenRouter
-    // key the pickup must still claim the workspace into discovery.
-    let _cfg = ConfigGuard::new(None, Some("http://localhost:8080/v1"));
-    let ws = create_test_workspace("/tmp/test_pickup_endpoint", "ws_pickup_endpoint").await;
-
-    let claimed = pickup_claim(&ws).await;
-    let (generation, discover_diagnostics) = claimed
-        .expect("a persisted custom endpoint without a key must count as provider configured");
-    assert_eq!(generation, 0, "fresh workspace has discovery_generation 0");
-    assert!(
-        discover_diagnostics,
-        "no diagnostics exist yet → first discovery must run diagnostics"
-    );
-
-    let stored = crate::workspace::store()
-        .get_by_name("ws_pickup_endpoint")
-        .await
-        .expect("fetch")
-        .expect("exists");
-    assert_eq!(
-        stored.status,
-        WorkspaceStatus::Analyzing,
-        "keyless custom endpoint → pending workspace claimed into discovery"
-    );
-    assert!(
-        stored.paused,
-        "the claim must set the analysis pause (blocks pipeline claims while discovery runs)"
-    );
+        let stored = crate::workspace::store()
+            .get_by_name(ws_name)
+            .await
+            .expect("fetch")
+            .expect("exists");
+        assert_eq!(stored.status, WorkspaceStatus::Analyzing, "{}", status_msg);
+        assert!(
+            stored.paused,
+            "the claim must set the analysis pause (blocks pipeline claims while discovery runs)"
+        );
+    }
 }
 
 #[tokio::test]
