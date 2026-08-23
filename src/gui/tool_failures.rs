@@ -12,6 +12,7 @@ use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
 
+use super::common::PaginatedTabState;
 use super::theme;
 use super::widgets;
 use super::widgets::selectable_text;
@@ -26,30 +27,14 @@ pub enum ToolFailuresMessage {
 }
 
 pub struct ToolFailuresState {
-    entries: Vec<ToolErrorEntry>,
-    load_state: super::common::AsyncLoadState,
-
-    // Pagination
-    pagination: super::common::PaginationState,
-
-    /// This tab's own search query (preserved across tab switches).
-    search: String,
-
-    /// Monotonic guard: refresh responses carry the generation they were
-    /// issued under; stale responses (issued before a newer refresh) are
-    /// dropped so an older query can never overwrite newer data.
-    refresh_generation: u64,
+    state: PaginatedTabState<ToolErrorEntry>,
 }
 
 impl ToolFailuresState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            load_state: super::common::AsyncLoadState::new(),
-            pagination: super::common::PaginationState::new(50),
-            search: String::new(),
-            refresh_generation: 0,
+            state: PaginatedTabState::new(50),
         }
     }
 
@@ -63,12 +48,10 @@ impl ToolFailuresState {
     ///
     /// Delegates to `AsyncLoadState::start_loading`.
     pub fn refresh(&mut self) -> Task<ToolFailuresMessage> {
-        self.load_state.start_loading();
-        self.refresh_generation = self.refresh_generation.wrapping_add(1);
-        let generation = self.refresh_generation;
-        let query = Self::build_query(&self.search);
-        let page = self.pagination.page;
-        let page_size = self.pagination.page_size;
+        let generation = self.state.begin_refresh();
+        let query = Self::build_query(&self.state.search);
+        let page = self.state.pagination.page;
+        let page_size = self.state.pagination.page_size;
         Task::perform(
             async move {
                 // Fail-open: no logs store → empty result, not a panic.
@@ -93,34 +76,16 @@ impl ToolFailuresState {
     pub fn update(&mut self, message: ToolFailuresMessage) -> Task<ToolFailuresMessage> {
         match message {
             ToolFailuresMessage::Refreshed(generation, entries, total) => {
-                if generation != self.refresh_generation {
-                    return Task::none();
+                if self.state.handle_refreshed(generation, entries, total) {
+                    self.refresh()
+                } else {
+                    Task::none()
                 }
-                // Page clamp against the fresh `total` from the response:
-                // if the total shrank between refreshes a previously valid
-                // page may now be past the end — clamp and re-query so the
-                // "Page X of Y" indicator stays valid.
-                if self.pagination.clamp_page(total) {
-                    // Adopt the fresh total immediately so the shared bottom
-                    // bar's "Page X of Y" indicator stays consistent with the
-                    // clamped page during the re-query window; the old
-                    // entries stay on screen.
-                    self.pagination.total = total;
-                    return self.refresh();
-                }
-                self.entries = entries;
-                self.pagination.total = total;
-                self.load_state.finish_loading();
-                Task::none()
             }
             ToolFailuresMessage::RefreshError(generation, e) => {
-                if generation != self.refresh_generation {
-                    return Task::none();
-                }
-                self.load_state.fail(e);
-                // ToolFailures shows "empty state" instead of "Loading…" after
-                // the first attempt, even if it failed, so mark has_loaded=true.
-                self.load_state.set_has_loaded();
+                // Fail-open tab: mark has_loaded even on error so the empty
+                // state ("No tool failures") renders instead of "Loading…".
+                self.state.handle_refresh_error(generation, e, true);
                 Task::none()
             }
         }
@@ -128,12 +93,12 @@ impl ToolFailuresState {
 
     /// Reset pagination to the first page.
     pub fn reset_pagination(&mut self) {
-        self.pagination.reset();
+        self.state.pagination.reset();
     }
 
     /// Go to the previous page and refresh.
     pub fn prev_page(&mut self) -> Task<ToolFailuresMessage> {
-        if self.pagination.prev_page() {
+        if self.state.pagination.prev_page() {
             self.refresh()
         } else {
             Task::none()
@@ -142,7 +107,7 @@ impl ToolFailuresState {
 
     /// Go to the next page and refresh.
     pub fn next_page(&mut self) -> Task<ToolFailuresMessage> {
-        if self.pagination.next_page() {
+        if self.state.pagination.next_page() {
             self.refresh()
         } else {
             Task::none()
@@ -151,44 +116,46 @@ impl ToolFailuresState {
 
     /// Current page index (rendered by the Logs page's shared bottom bar).
     pub(crate) fn page(&self) -> usize {
-        self.pagination.page
+        self.state.pagination.page
     }
 
     /// Total number of pages given the current total (rendered by the Logs
     /// page's shared bottom bar).
     pub(crate) fn total_pages(&self) -> usize {
-        self.pagination.total_pages()
+        self.state.pagination.total_pages()
     }
 
     /// This tab's search query (bound to the Logs page's shared search input).
     pub(crate) fn search(&self) -> &str {
-        &self.search
+        &self.state.search
     }
 
     /// Replace this tab's search query (from the Logs page's shared search input).
     pub(crate) fn set_search(&mut self, search: String) {
-        self.search = search;
+        self.state.search = search;
     }
 
     pub fn view(&self) -> Element<'_, ToolFailuresMessage> {
+        let state = &self.state;
         let mut content = Column::new();
 
         // Error display
-        content = widgets::push_error_banner(content, self.load_state.error());
+        content = widgets::push_error_banner(content, state.load_state.error());
 
         // Entries or empty state
-        if self.load_state.loading() && !self.load_state.has_loaded() {
+        if state.load_state.loading() && !state.load_state.has_loaded() {
             content = content.push(widgets::loading_text());
-        } else if self.entries.is_empty() && self.load_state.has_loaded() {
+        } else if state.entries.is_empty() && state.load_state.has_loaded() {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::bug::<iced::Theme, iced::Renderer>(),
                 "No tool failures",
             ));
-        } else if !self.entries.is_empty() {
+        } else if !state.entries.is_empty() {
             let entries_view = {
                 scrollable(
                     Column::with_children(
-                        self.entries
+                        state
+                            .entries
                             .iter()
                             .map(Self::render_error_row)
                             .collect::<Vec<_>>(),

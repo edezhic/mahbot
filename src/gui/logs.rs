@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use iced_fonts::lucide;
 
+use super::common::PaginatedTabState;
 use super::context_menu::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets;
@@ -99,33 +100,7 @@ pub enum LogMessage {
 /// Per-tab state shared by the All Logs and Issues tabs. Each tab keeps its
 /// own entries, load state, pagination and search query so switching tabs
 /// never reuses another tab's page index or query.
-struct LogsTabData {
-    entries: Vec<LogEntry>,
-    load_state: super::common::AsyncLoadState,
-
-    // Pagination
-    pagination: super::common::PaginationState,
-
-    /// This tab's own search query (preserved across tab switches).
-    search: String,
-
-    /// Monotonic guard: refresh responses carry the generation they were
-    /// issued under; stale responses (issued before a newer refresh of this
-    /// tab) are dropped so an older query can never overwrite newer data.
-    refresh_generation: u64,
-}
-
-impl LogsTabData {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            load_state: super::common::AsyncLoadState::new(),
-            pagination: super::common::PaginationState::new(50),
-            search: String::new(),
-            refresh_generation: 0,
-        }
-    }
-}
+type LogsTabData = PaginatedTabState<LogEntry>;
 
 pub struct LogsState {
     /// All Logs tab data (live-streamed).
@@ -156,8 +131,8 @@ impl LogsState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            all_logs: LogsTabData::new(),
-            issues: LogsTabData::new(),
+            all_logs: PaginatedTabState::new(50),
+            issues: PaginatedTabState::new(50),
             tool_failures_state: super::tool_failures::ToolFailuresState::new(),
             active_tab: LogsTab::AllLogs,
             paused: false,
@@ -231,9 +206,7 @@ impl LogsState {
                 .refresh()
                 .map(LogMessage::ToolFailures);
         };
-        data.load_state.start_loading();
-        data.refresh_generation = data.refresh_generation.wrapping_add(1);
-        let generation = data.refresh_generation;
+        let generation = data.begin_refresh();
         let query = LogQuery {
             // Issues shows ERROR/WARN entries only; All Logs is unfiltered.
             level: match tab {
@@ -283,37 +256,16 @@ impl LogsState {
                 let Some(data) = self.tab_data_mut(tab) else {
                     return Task::none();
                 };
-                // Drop stale responses: a newer refresh was issued for this
-                // tab since this query started.
-                if generation != data.refresh_generation {
-                    return Task::none();
-                }
-                // Page clamp against the fresh `total` from the response:
-                // totals can shrink (INFO retention purge) between refreshes,
-                // leaving a previously valid page past the end. Clamp and
-                // re-query — keeping the current entries on screen until the
-                // clamped page's data lands — so the "Page X of Y" indicator
-                // never shows an out-of-range page with empty data.
-                if data.pagination.clamp_page(total) {
-                    // Adopt the fresh total immediately so the "Page X of Y"
-                    // indicator stays consistent with the clamped page during
-                    // the re-query window; the old entries stay on screen.
-                    data.pagination.total = total;
+                if data.handle_refreshed(generation, entries, total) {
                     return self.refresh_tab(log_store, tab);
                 }
-                data.entries = entries;
-                data.pagination.total = total;
-                data.load_state.finish_loading();
                 Task::none()
             }
             LogMessage::RefreshError(tab, generation, e) => {
                 let Some(data) = self.tab_data_mut(tab) else {
                     return Task::none();
                 };
-                if generation != data.refresh_generation {
-                    return Task::none();
-                }
-                data.load_state.fail(e);
+                data.handle_refresh_error(generation, e, false);
                 Task::none()
             }
             LogMessage::LiveEntry(entry) => {

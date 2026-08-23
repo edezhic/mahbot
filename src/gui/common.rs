@@ -189,6 +189,88 @@ impl AsyncLoadState {
     }
 }
 
+/// Shared state for a paginated tab that fetches typed entries.
+///
+/// Groups the per-tab fields (`entries`, `load_state`, `pagination`, `search`,
+/// `refresh_generation`) and the common refresh bookkeeping. Each tab unit
+/// still owns its own `refresh()` (query type, store path and message enum
+/// differ), so callers use [`begin_refresh`](Self::begin_refresh) to prepare a
+/// refresh and [`handle_refreshed`](Self::handle_refreshed)/
+/// [`handle_refresh_error`](Self::handle_refresh_error) to process responses.
+/// `handle_refresh_error` takes `set_has_loaded_on_error` so the Tool Failures
+/// tab marks `has_loaded` on error while the Logs tabs leave it unset.
+pub(crate) struct PaginatedTabState<T> {
+    pub(crate) entries: Vec<T>,
+    pub(crate) load_state: AsyncLoadState,
+    pub(crate) pagination: PaginationState,
+    pub(crate) search: String,
+    pub(crate) refresh_generation: u64,
+}
+
+impl<T> PaginatedTabState<T> {
+    pub(crate) fn new(page_size: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            load_state: AsyncLoadState::new(),
+            pagination: PaginationState::new(page_size),
+            search: String::new(),
+            refresh_generation: 0,
+        }
+    }
+
+    /// Prepare the next refresh: mark loading and bump the generation counter.
+    /// Returns the new generation for tagging the async response.
+    pub(crate) fn begin_refresh(&mut self) -> u64 {
+        self.load_state.start_loading();
+        self.refresh_generation = self.refresh_generation.wrapping_add(1);
+        self.refresh_generation
+    }
+
+    /// Process a successful refresh response.
+    ///
+    /// Returns `true` when the fresh `total` shrank past the current page and
+    /// the caller should re-query (the total is already adopted, so the page
+    /// indicator stays consistent during the re-query window). Returns `false`
+    /// when the response was stale and dropped, or fresh and applied — in both
+    /// cases the caller does nothing further.
+    pub(crate) fn handle_refreshed(
+        &mut self,
+        generation: u64,
+        entries: Vec<T>,
+        total: usize,
+    ) -> bool {
+        if generation != self.refresh_generation {
+            return false;
+        }
+        if self.pagination.clamp_page(total) {
+            self.pagination.total = total;
+            return true;
+        }
+        self.entries = entries;
+        self.pagination.total = total;
+        self.load_state.finish_loading();
+        false
+    }
+
+    /// Process a failed refresh response. `set_has_loaded_on_error` preserves
+    /// the Tool-Failures-only behaviour of marking `has_loaded` on error; Logs
+    /// tabs pass `false`.
+    pub(crate) fn handle_refresh_error(
+        &mut self,
+        generation: u64,
+        e: String,
+        set_has_loaded_on_error: bool,
+    ) {
+        if generation != self.refresh_generation {
+            return;
+        }
+        self.load_state.fail(e);
+        if set_has_loaded_on_error {
+            self.load_state.set_has_loaded();
+        }
+    }
+}
+
 // ── Debounce state ──────────────────────────────────────────────────
 
 /// Debounce state for search/filter text inputs.
