@@ -98,8 +98,7 @@ pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
 /// its outside-folder scratch leaks to the OS temp sweep — the safe direction.
 /// The alternative (fail-open on error) would re-dispatch a cleanup LLM round
 /// for a run that ALREADY completed, per boot, until the envelope is delivered
-/// or the boot re-dispatch cap (`crate::jobs::MAX_BOOT_REDISPATCH`) fires and
-/// the row ages into the 8h purge (`crate::jobs::PURGE_CUTOFF_HOURS`) — a
+/// or the row ages into the 8h purge (`crate::jobs::PURGE_CUTOFF_HOURS`) — a
 /// bounded but avoidable cost for a transient read error that is far more
 /// likely than a genuine crash-window hit.
 async fn run_folder_exists(job_id: &str) -> bool {
@@ -114,9 +113,7 @@ async fn run_folder_exists(job_id: &str) -> bool {
 /// folder (the ephemeral search tracker lives inside it and dies with it).
 ///
 /// Called by the cleanup tail ([`run_cleanup_agent_and_finish`], folder
-/// before row terminalize) and by the boot cap branch in `recover_from_restart`
-/// (a capped cleanup is never resumed — the folder is released in-process at
-/// boot, before any agent spawns). The cleanup jobs row is NOT touched here:
+/// before row terminalize). The cleanup jobs row is NOT touched here:
 /// callers own row removal/aging.
 ///
 /// Removal failure is swallowed (the folder is "left for the OS") and the row
@@ -421,10 +418,7 @@ pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Resu
     // The row itself is the dedup marker: a surviving row means the cleanup is
     // already in flight (crash between dispatch and completion) — no second
     // agent is dispatched; the boot scan resumes the surviving row. The
-    // invariant: cleanup row exists ⟺ cleanup not finished — with one
-    // deliberate exception: the boot cap branch in `recover_from_restart`
-    // releases the folder in-process and leaves the row alive (~8h) for the
-    // purge to delete, so a row can outlive its folder on that path only.
+    // invariant: cleanup row exists ⟺ cleanup not finished.
     if research_cleanup_row_exists(conn, job_id).await? {
         tracing::info!(job = %job_id, "Research cleanup already dispatched — skipping");
         return Ok(None);
@@ -577,10 +571,7 @@ async fn run_cleanup_agent_and_finish(
     // search-engine state, then the whole folder, then the row. Folder first,
     // row last: a crash between folder removal and row terminalize leaves
     // row + no folder, which boot resume converges from with one extra round.
-    // Invariant: cleanup row exists ⟺ cleanup not finished — with one
-    // deliberate exception: the boot cap branch in `recover_from_restart`
-    // releases the folder in-process and leaves the row alive (~8h) for the
-    // purge to delete, so a row can outlive its folder on that path only.
+    // Invariant: cleanup row exists ⟺ cleanup not finished.
     release_run_folder(job_id).await;
     let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
 }

@@ -236,9 +236,8 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
 #[must_use]
 pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
-        Analysis, Backlog, Cancelled, DiagnosticsDone, Done, Failed, InDevelopment, InDiagnostics,
-        InQa, InReview, InSanitation, Planning, QaPassed, ReadyForDevelopment, Reviewed,
-        SanitationPassed,
+        Analysis, Backlog, Cancelled, Done, Failed, InDevelopment, InDiagnostics, InQa, InReview,
+        InSanitation, Planning, ReadyForDevelopment,
     };
     match phase {
         // Early phases — cool/muted, neutral
@@ -269,35 +268,19 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
             Color::from_rgb(0.310, 0.224, 0.102),
             Color::from_rgb(0.902, 0.863, 0.784),
         ),
-        DiagnosticsDone => (
-            Color::from_rgb(0.161, 0.235, 0.224),
-            Color::from_rgb(0.784, 0.902, 0.871),
-        ),
         // Sanitation phases — neutral gray
         InSanitation => (
             Color::from_rgb(0.310, 0.310, 0.310),
             Color::from_rgb(0.788, 0.788, 0.788),
-        ),
-        SanitationPassed => (
-            Color::from_rgb(0.247, 0.247, 0.247),
-            Color::from_rgb(0.863, 0.863, 0.863),
         ),
         // Review & QA
         InReview => (
             Color::from_rgb(0.184, 0.216, 0.380),
             Color::from_rgb(0.816, 0.816, 0.933),
         ),
-        Reviewed => (
-            Color::from_rgb(0.224, 0.208, 0.322),
-            Color::from_rgb(0.878, 0.816, 0.933),
-        ),
         InQa => (
             Color::from_rgb(0.216, 0.184, 0.380),
             Color::from_rgb(0.816, 0.816, 0.933),
-        ),
-        QaPassed => (
-            Color::from_rgb(0.176, 0.310, 0.208),
-            Color::from_rgb(0.784, 0.902, 0.816),
         ),
         // Unblocking phases — distinct
         Done => (

@@ -1035,7 +1035,12 @@ mod tests {
 
     #[test]
     fn register_carries_parent_key_and_run_lifetime() {
-        let kind: &'static str = "consolidate";
+        // Unique test-only kinds: `NON_AGENT_CALLS` is a process-global shared
+        // by parallel tests (analyze consolidation and research orchestration
+        // register the literal "consolidate"/"research_orchestrator" kinds),
+        // so a non-unique kind would make this test flakily observe another
+        // test's live registration and fail its post-drop emptiness assertion.
+        let kind: &'static str = "registry_test_consolidate_kind";
         let guard = NON_AGENT_CALLS.register(
             kind,
             "ws1",
@@ -1045,7 +1050,7 @@ mod tests {
         );
         // The run-lifetime flag is a distinct registration mode (whole-run
         // orchestrator guards); both must round-trip through the same path.
-        let orchestrator: &'static str = "research_orchestrator";
+        let orchestrator: &'static str = "registry_test_orchestrator_kind";
         let orchestrator_guard = NON_AGENT_CALLS.register(
             orchestrator,
             "ws1",

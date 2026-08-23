@@ -644,10 +644,6 @@ pub async fn expect_ticket_phase(store: &BoardStore, id: &str) -> TicketPhase {
 pub fn assert_superseded_ticket(ticket: &Ticket) {
     assert_eq!(ticket.phase, TicketPhase::Cancelled);
     assert!(
-        ticket.assigned_to.is_none(),
-        "superseded ticket should have no assignee"
-    );
-    assert!(
         ticket.is_archived,
         "superseded ticket should be archived immediately"
     );
@@ -787,11 +783,10 @@ impl<'a> TicketBuilder<'a> {
 ///
 /// Required schema columns live in the constructor (`id`, `kind`, `role`,
 /// `workspace_name`); the columns the historical fixtures varied between
-/// (user identity, channel, retry count) are opt-in setters, and `status` /
-/// `task` default to the schema defaults (`'launched'` / `''`). Timestamps
-/// are required via [`Self::timestamps`] and transcribed verbatim — the
-/// helper never generates timestamps internally (tests assert exact
-/// equality on them).
+/// (user identity, channel, retry count) are opt-in setters, and `task`
+/// defaults to `''`. Timestamps are required via [`Self::timestamps`] and
+/// transcribed verbatim — the helper never generates timestamps internally
+/// (tests assert exact equality on them).
 ///
 /// # Panics
 ///
@@ -802,7 +797,6 @@ pub(crate) struct JobRowBuilder<'a> {
     kind: String,
     role: String,
     workspace_name: String,
-    status: String,
     task: String,
     user_name: Option<String>,
     channel: Option<String>,
@@ -825,19 +819,12 @@ impl<'a> JobRowBuilder<'a> {
             kind: kind.into(),
             role: role.into(),
             workspace_name: workspace_name.into(),
-            status: "launched".into(),
             task: String::new(),
             user_name: None,
             channel: None,
             retry_count: None,
             timestamps: None,
         }
-    }
-
-    /// Set `status` (default: `'launched'`).
-    pub(crate) fn status(mut self, status: impl Into<String>) -> Self {
-        self.status = status.into();
-        self
     }
 
     /// Set `task` (default: `''`).
@@ -881,18 +868,16 @@ impl<'a> JobRowBuilder<'a> {
             kind,
             role,
             workspace_name,
-            status,
             task,
             user_name,
             channel,
             retry_count,
             timestamps,
         } = self;
-        let mut columns = vec!["id", "kind", "status", "task", "workspace_name", "role"];
+        let mut columns = vec!["id", "kind", "task", "workspace_name", "role"];
         let mut values: Vec<crate::turso::Value> = vec![
             crate::turso::Value::Text(id),
             crate::turso::Value::Text(kind),
-            crate::turso::Value::Text(status),
             crate::turso::Value::Text(task),
             crate::turso::Value::Text(workspace_name),
             crate::turso::Value::Text(role),

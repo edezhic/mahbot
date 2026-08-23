@@ -16,7 +16,7 @@
 
 use crate::agent::{run_agent, run_default_agent};
 use crate::config::CONFIG;
-use crate::message_router::{self, AgentJob, JobKind};
+use crate::message_router::{self, AgentJob, MessageKind};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::Tool;
 use crate::{Agent, ChatMessage, DEFAULT_MAX_TOKENS, Role, Workspace};
@@ -174,7 +174,7 @@ impl Tool for AnalyzeTool {
                             workspace_name: ws.name.clone(),
                             user_name,
                             channel,
-                            kind: JobKind::AnalyzeToolResult,
+                            kind: MessageKind::AnalyzeToolResult,
                             role: caller_role,
                             reply_target: None,
                             pending_job_id: None,
@@ -271,7 +271,7 @@ async fn dispatch_durable_analyze(
     let envelope = crate::jobs::complete_durable_job(
         &job_id,
         build_async_analyze_message(&result),
-        JobKind::AnalyzeToolResult,
+        MessageKind::AnalyzeToolResult,
         caller_role,
         &user_name,
         &channel,
@@ -475,7 +475,6 @@ async fn run_analyze_slots(
                     Some(round),
                     Some(crate::registry::ParentKey::AnalyzeRound(round_key)),
                     Some(question),
-                    false,
                 )
                 .await
             }
@@ -557,39 +556,7 @@ pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
     complete_durable_job_and_route(
         job_id,
         build_async_analyze_message(&result),
-        JobKind::AnalyzeToolResult,
-        caller_role,
-        &caller,
-        &ws.name,
-    )
-    .await;
-}
-
-/// Boot-scan over-cap handling for analyze jobs: the job exceeded
-/// MAX_BOOT_REDISPATCH — deliver an ERROR envelope to the original caller
-/// (the `<analyze-tool-result>` envelope is the async-analyze caller's ONLY result
-/// path; marking failed with no envelope would strand the caller forever —
-/// "failed = terminal … surface to user").
-pub(crate) async fn analyze_capped_envelope(job_id: &str, ws: &Workspace) {
-    let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
-        &crate::session::store().conn,
-        job_id,
-        "Analyze capped report",
-        "Analyze cap",
-    )
-    .await
-    else {
-        return;
-    };
-    let result: anyhow::Result<String> = Err(anyhow::anyhow!(format!(
-        "analyze round aborted after {} boot re-dispatch attempts — the last crash lost the round; \
-         please re-issue the analyze request",
-        crate::jobs::MAX_BOOT_REDISPATCH,
-    )));
-    complete_durable_job_and_route(
-        job_id,
-        build_async_analyze_message(&result),
-        JobKind::AnalyzeToolResult,
+        MessageKind::AnalyzeToolResult,
         caller_role,
         &caller,
         &ws.name,
@@ -619,7 +586,7 @@ pub(crate) fn build_async_result_envelope(result: &anyhow::Result<String>, tag: 
     }
 }
 
-/// Shared tail of the 4 resume/capped paths: terminalize a durable
+/// Shared tail of the resume paths: terminalize a durable
 /// analyze/research job and route its envelope to the stored caller. Takes
 /// pre-built content so the caller's named wrapper keeps kind and tag
 /// paired; the INSERT-failure best-effort route lives inside
@@ -627,7 +594,7 @@ pub(crate) fn build_async_result_envelope(result: &anyhow::Result<String>, tag: 
 pub(crate) async fn complete_durable_job_and_route(
     job_id: &str,
     content: String,
-    kind: JobKind,
+    kind: MessageKind,
     caller_role: Role,
     caller: &crate::jobs::JobCaller,
     workspace_name: &str,
@@ -2436,72 +2403,5 @@ mod tests {
             "resumed envelope routes to the original caller role, not Manager"
         );
         assert_eq!(envelope.user_name, "caller-user");
-    }
-
-    /// The boot-scan over-cap path must NOT strand the async-analyze caller: an
-    /// error envelope (with the original caller identity) is delivered instead
-    /// of a silent failed row.
-    ///
-    /// Serialized with the drain-flag writers: `analyze_capped_envelope` consults
-    /// the process-global drain flag and aborts early while it is set (project
-    /// convention: retry_tests_lock).
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-    async fn analyze_capped_envelope_delivers_error_to_caller() {
-        let _lock = crate::util::test::retry_tests_lock();
-        crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_analyze_capped");
-        let job_id = "analyze_job_capped_1";
-        let conn = &crate::session::store().conn;
-        crate::jobs::spawn_job(
-            conn,
-            job_id,
-            "question?",
-            &ws.name,
-            "caller-user",
-            "telegram",
-            crate::Role::Assistant,
-            &[crate::jobs::NewAgent {
-                agent_id: format!("analyze_{}_capped_0_analyst", ws.name),
-                kind: crate::jobs::AgentKind::Analyst,
-                idx: Some(0),
-                task: "question?".to_string(),
-            }],
-            &crate::jobs::SpawnChild::Analyze,
-        )
-        .await
-        .unwrap();
-
-        analyze_capped_envelope(job_id, &ws).await;
-
-        let job_rows = conn
-            .query(
-                "SELECT id FROM jobs WHERE id = ?1",
-                crate::turso::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(job_rows.len(), 0, "capped job must be terminalized");
-        let pending = conn
-            .query(
-                "SELECT envelope FROM pending_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1, "error envelope persisted with the job id");
-        let envelope_json: String = pending[0].get(0).unwrap();
-        let envelope: crate::message_router::AgentJob =
-            serde_json::from_str(&envelope_json).unwrap();
-        assert_eq!(
-            envelope.role,
-            crate::Role::Assistant,
-            "capped envelope routes to the original caller role, not Manager"
-        );
-        assert_eq!(envelope.user_name, "caller-user");
-        assert!(
-            envelope.content.contains("analyze round aborted"),
-            "the envelope must surface the cap failure to the caller"
-        );
     }
 }

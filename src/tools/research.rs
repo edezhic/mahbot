@@ -17,7 +17,7 @@
 //! existing global iteration backstop and retry machinery remain untouched.
 
 use crate::agent::{chat_request, role_tools_and_specs, run_default_agent};
-use crate::message_router::{self, AgentJob, JobKind};
+use crate::message_router::{self, AgentJob, MessageKind};
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::FailureClass;
 use crate::tools::Tool;
@@ -199,7 +199,7 @@ impl ResearchState {
     /// (both rows live in sessions.db — the documented single transaction
     /// domain), so a crash can't advance research_jobs.state without the
     /// matching jobs touch. retry_count is deliberately untouched: the boot
-    /// scan's MAX_BOOT_REDISPATCH bump is the only writer and must survive
+    /// scan's retry_count bump is the only writer and must survive
     /// checkpoints. A failed checkpoint logs a structured warning and the run
     /// continues.
     async fn save(&self, job_id: &str) {
@@ -471,7 +471,7 @@ impl Tool for ResearchTool {
                         workspace_name: ws.name.clone(),
                         user_name,
                         channel,
-                        kind: JobKind::ResearchResult,
+                        kind: MessageKind::ResearchResult,
                         role: caller_role,
                         reply_target: None,
                         pending_job_id: None,
@@ -588,7 +588,7 @@ async fn dispatch_durable_research(
     let envelope = crate::jobs::complete_durable_job(
         &job_id,
         build_async_research_message(&result),
-        JobKind::ResearchResult,
+        MessageKind::ResearchResult,
         caller_role,
         &user_name,
         &channel,
@@ -626,8 +626,8 @@ async fn dispatch_durable_research(
 }
 
 /// Real-terminalization artifacts (results.md + the command dump), written
-/// BEFORE the exactly-once terminalizing boundary at exactly three points:
-/// fresh dispatch, boot resume, boot-cap partial report. Shutdown/drain
+/// BEFORE the exactly-once terminalizing boundary at exactly two points:
+/// fresh dispatch and boot resume. Shutdown/drain
 /// aborts and panics write nothing (the run stays alive for the next boot —
 /// both the fresh-dispatch and resume paths now leave the job row 'launched'
 /// on abort, so boot-recovery re-enters and terminalizes for real). A dump
@@ -651,11 +651,7 @@ async fn write_terminalization_artifacts(
 /// BEFORE the exactly-once boundary, then durable completion, cleanup
 /// dispatch, and routing to the stored caller (in that order — matching the
 /// fresh-dispatch path: the envelope is never routed before the cleanup row
-/// exists). Callers pass their already-loaded state (the capped path loads it
-/// earlier for the partial report).
-///
-/// The boot-cap path never enters `run_deep_research`, so both artifacts are
-/// produced here.
+/// exists). Callers pass their already-loaded state.
 async fn terminalize_research(
     job_id: &str,
     ws: &Workspace,
@@ -683,7 +679,7 @@ async fn terminalize_research(
     let envelope = crate::jobs::complete_durable_job(
         job_id,
         delivered,
-        JobKind::ResearchResult,
+        MessageKind::ResearchResult,
         caller_role,
         &caller.user_name,
         &caller.channel,
@@ -711,7 +707,7 @@ async fn terminalize_research(
 }
 
 /// Boot resume of a research run: re-enter the orchestrator at the
-/// checkpointed stage (retry_count capped by the boot scan), then terminalize
+/// checkpointed stage (retry_count bumped by the boot scan), then terminalize
 /// into the durable envelope exactly like a fresh dispatch. Aborts quietly on
 /// shutdown/drain — no routing, no terminalization (the checkpointed state is
 /// reused by the next boot; routing a partial result here would race the
@@ -756,32 +752,6 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
         return;
     }
     let state = ResearchState::load(job_id).await;
-    terminalize_research(job_id, ws, &result, &state, caller_role, &caller).await;
-}
-
-/// Boot-scan over-cap handling: the job exceeded MAX_BOOT_REDISPATCH — deliver
-/// a PARTIAL REPORT from the checkpointed state (the research envelope is the
-/// Manager's only result path; marking failed with no envelope would strand
-/// the caller forever).
-pub(crate) async fn research_capped_partial_report(job_id: &str, ws: &Workspace) {
-    let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
-        &crate::session::store().conn,
-        job_id,
-        "Research capped report",
-        "Research cap",
-    )
-    .await
-    else {
-        return;
-    };
-    let state = ResearchState::load(job_id).await;
-    // Boot path: no recovered findings exist (they are never checkpointed).
-    let result: anyhow::Result<String> = Ok(partial_report(
-        &caller.task,
-        &state.acc,
-        "boot re-dispatch cap exceeded — partial report from last checkpoint",
-        &[],
-    ));
     terminalize_research(job_id, ws, &result, &state, caller_role, &caller).await;
 }
 
@@ -3597,81 +3567,6 @@ mod tests {
         assert!(
             envelope.ends_with("</research-result>"),
             "envelope must close: {envelope}"
-        );
-    }
-
-    /// The boot-scan over-cap path must deliver a PARTIAL REPORT to the
-    /// stored caller — the research envelope is the caller's only result
-    /// path, so a failed row with no envelope would strand the Manager
-    /// forever (the exact stranding class this path exists to prevent).
-    ///
-    /// Serialized with the drain-flag writers: `research_capped_partial_report`
-    /// consults the process-global drain flag and aborts early while it is
-    /// set (project convention: retry_tests_lock).
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-    async fn research_capped_delivers_partial_report_to_caller() {
-        let _lock = crate::util::test::retry_tests_lock();
-        crate::util::test::init_management_test_stores().await;
-        let ws = crate::workspace::test_ws("/tmp/test_ws_research_capped");
-        let job_id = "research_job_capped_1";
-        let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
-        crate::util::test::JobRowBuilder::new(conn, job_id, "research", "assistant", &ws.name)
-            .task("question?")
-            .user_name("caller-user")
-            .channel("telegram")
-            .retry_count(crate::jobs::MAX_BOOT_REDISPATCH)
-            .timestamps(now.clone())
-            .insert()
-            .await
-            .unwrap();
-        conn.execute(
-            "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-
-        research_capped_partial_report(job_id, &ws).await;
-
-        let job_rows = conn
-            .query(
-                "SELECT kind FROM jobs WHERE id = ?1",
-                crate::turso::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            job_rows.len(),
-            1,
-            "research job terminalized; the research_cleanup durability row remains"
-        );
-        assert_eq!(
-            job_rows[0].get::<String>(0).unwrap(),
-            "research_cleanup",
-            "the surviving row is the cleanup durability row, not the research job"
-        );
-        let pending = conn
-            .query(
-                "SELECT envelope FROM pending_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
-            )
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1, "partial-report envelope persisted");
-        let envelope_json: String = pending[0].get(0).unwrap();
-        let envelope: crate::message_router::AgentJob =
-            serde_json::from_str(&envelope_json).unwrap();
-        assert_eq!(
-            envelope.role,
-            crate::Role::Assistant,
-            "delivered to the original caller role, not Manager"
-        );
-        assert_eq!(envelope.user_name, "caller-user");
-        assert!(
-            envelope.content.contains("boot re-dispatch cap exceeded"),
-            "the partial report must surface the cap reason: {envelope_json}"
         );
     }
 

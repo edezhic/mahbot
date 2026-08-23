@@ -21,8 +21,8 @@ use super::widgets::{self, badge_pill, diff_stats_row, role_badge, selectable_te
 /// Phases where an agent is actively running on the ticket. Cancelling a
 /// ticket in one of these phases aborts an in-flight agent run — the
 /// technical-failure auto-pause trigger (see `agent_in_flight`). The phase
-/// alone is a coarse proxy: `assigned_to` must also be set, so queued
-/// tickets in an agent phase with no running agent are not treated as
+/// alone is a coarse proxy: the job's launched roster row must also be set, so
+/// queued tickets in an agent phase with no running agent are not treated as
 /// in-flight cancels.
 const AGENT_RUNNING_PHASES: &[TicketPhase] = &[
     TicketPhase::Analysis,
@@ -34,13 +34,30 @@ const AGENT_RUNNING_PHASES: &[TicketPhase] = &[
 ];
 
 /// Whether a cancel of this ticket aborts an in-flight agent run — an
-/// agent-running phase with an assigned agent. Shared by the
+/// agent-running phase with a currently-registered active agent. Shared by the
 /// `PerformAction` workspace-pause gate and the `RequestCancel`
 /// confirmation-eligibility check so the two sites can't drift (a drift
 /// would desync the pause behavior and make the modal's consequence
 /// text untrue).
-fn agent_in_flight(ticket: &Ticket) -> bool {
-    AGENT_RUNNING_PHASES.contains(&ticket.phase) && ticket.assigned_to.is_some()
+///
+/// The authoritative form is async ([`agent_in_flight`]) because the active
+/// agents live in sessions.db; the synchronous [`in_agent_phase`] proxy is
+/// used only for the UI's confirmation-eligibility heuristic, and the
+/// `PerformAction` gate re-checks authoritatively at execution.
+fn in_agent_phase(ticket: &Ticket) -> bool {
+    AGENT_RUNNING_PHASES.contains(&ticket.phase)
+}
+
+/// Whether the ticket currently has a registered active agent (async —
+/// reads the job's launched roster rows). Fails closed (returns `true`) on a
+/// DB error so an in-flight cancel is never skipped.
+async fn agent_in_flight(ticket: &Ticket) -> bool {
+    if !in_agent_phase(ticket) {
+        return false;
+    }
+    crate::jobs::ticket_has_active_agents(&crate::session::store().conn, &ticket.id)
+        .await
+        .unwrap_or(true)
 }
 
 /// Per-file stat from `git show --numstat`.
@@ -271,15 +288,15 @@ impl BoardState {
     fn ticket_in_flight(&self, ticket_id: &str) -> bool {
         if let Some(ref ticket) = self.selected_ticket {
             if ticket.id == ticket_id {
-                return agent_in_flight(ticket);
+                return in_agent_phase(ticket);
             }
         }
         if let Some(ticket) = self.search_results.iter().find(|t| t.id == ticket_id) {
-            return agent_in_flight(ticket);
+            return in_agent_phase(ticket);
         }
         self.tickets
             .iter()
-            .any(|t| t.id == ticket_id && agent_in_flight(t))
+            .any(|t| t.id == ticket_id && in_agent_phase(t))
     }
 
     /// Reset all modal-related state fields (close detail modal).
@@ -440,11 +457,6 @@ impl BoardState {
                 ("⏸ Pause", TicketPhase::Planning),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
-            TicketPhase::Reviewed => vec![
-                ("✅ Send to QA", TicketPhase::InQa),
-                ("🔄 Redo Dev", TicketPhase::ReadyForDevelopment),
-                ("🛑 Cancel", TicketPhase::Cancelled),
-            ],
             TicketPhase::Planning => vec![
                 ("✅ Ready for Dev", TicketPhase::ReadyForDevelopment),
                 ("↩ Back to Backlog", TicketPhase::Backlog),
@@ -463,11 +475,10 @@ impl BoardState {
 
     /// Map an action label to its lucide icon (16px) and tooltip text.
     ///
-    /// Keyed off the action label (not the target phase): "Redo Dev" and
-    /// "Ready for Dev" both transition to ReadyForDevelopment but need
-    /// different texts, so `Redo` must be matched before `Dev`. The single
-    /// keyword chain (Cancel → Redo → QA → Pause → Dev → Backlog) drives
-    /// both the icon and the tooltip, so the two can never drift apart.
+    /// Keyed off the action label. The keyword chain
+    /// (Cancel → QA → Pause → Dev → Backlog) drives both the icon and the
+    /// tooltip, so the two can never drift apart. Rework is automatic via
+    /// validation failures — there is no manual "Redo Dev" action anymore.
     /// The trailing `circle_check`/"move phase" pair is a defensive
     /// catch-all for labels outside [`Self::available_actions`].
     fn action_icon_and_tooltip<'a>(
@@ -478,8 +489,6 @@ impl BoardState {
     ) {
         if label.contains("Cancel") {
             (lucide::circle_x(), "cancel ticket")
-        } else if label.contains("Redo") {
-            (lucide::refresh_cw(), "redo dev")
         } else if label.contains("QA") {
             (lucide::shield_check(), "send to QA")
         } else if label.contains("Pause") {
@@ -722,7 +731,7 @@ impl BoardState {
                         // don't cascade. Supersede auto-cancels and Manager-tool
                         // cancels don't go through here; shutdown and
                         // already-paused are handled inside the helper.
-                        if phase == TicketPhase::Cancelled && agent_in_flight(&ticket) {
+                        if phase == TicketPhase::Cancelled && agent_in_flight(&ticket).await {
                             let notice = crate::management::pause_workspace_on_failure(
                                 &ticket,
                                 "user cancelled the ticket while an agent was running",
@@ -738,26 +747,14 @@ impl BoardState {
                                     .await;
                             }
                         }
-                        // Manual "Redo Dev" (Reviewed → ReadyForDevelopment)
-                        // is a bounce-back into development that consumes the
-                        // same breaker budget as pipeline bounce-backs. The
-                        // transition is phase-guarded (Reviewed only): a guard
-                        // miss means the ticket was already moved externally —
-                        // an expected no-op (no error, no bogus hop).
-                        let applied = if source == TicketPhase::Reviewed
-                            && phase == TicketPhase::ReadyForDevelopment
-                        {
-                            board
-                                .bounce_back_to_dev(&ticket_id)
-                                .await
-                                .map_err(|e| e.to_string())?
-                        } else {
-                            board
-                                .transition_to(&ticket_id, None, phase, None)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            true
-                        };
+                        // Re-dispatch into development is automatic via a
+                        // validation non-success (the unified bounce) — there
+                        // is no manual "Redo Dev" action anymore.
+                        board
+                            .transition_to(&ticket_id, None, phase)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let applied = true;
                         // Skip the hop when the ticket already reached the
                         // requested phase between render and click — the
                         // transition was a no-op and a self-transition entry
@@ -1825,7 +1822,6 @@ mod tests {
             title: "Test ticket".into(),
             description: String::new(),
             phase: TicketPhase::Backlog,
-            assigned_to: None,
             workspace_name: "test_ws".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
@@ -1838,7 +1834,6 @@ mod tests {
             lines_removed: None,
             reporter: "test".into(),
             is_archived: false,
-            pipeline_reservation: false,
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
@@ -2010,7 +2005,6 @@ mod tests {
             title: "New ticket".into(),
             description: String::new(),
             phase: TicketPhase::Backlog,
-            assigned_to: None,
             workspace_name: "test_ws".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
@@ -2023,7 +2017,6 @@ mod tests {
             lines_removed: None,
             reporter: "test".into(),
             is_archived: false,
-            pipeline_reservation: false,
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
@@ -2058,7 +2051,6 @@ mod tests {
             title: "Test ticket".into(),
             description: String::new(),
             phase,
-            assigned_to: None,
             workspace_name: "test_ws".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
@@ -2071,7 +2063,6 @@ mod tests {
             lines_removed: None,
             reporter: "test".into(),
             is_archived: false,
-            pipeline_reservation: false,
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
@@ -2301,7 +2292,6 @@ mod tests {
             title: "Test".into(),
             description: String::new(),
             phase: TicketPhase::Backlog,
-            assigned_to: None,
             workspace_name: "test_ws".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
@@ -2314,7 +2304,6 @@ mod tests {
             lines_removed: None,
             reporter: "test".into(),
             is_archived: false,
-            pipeline_reservation: false,
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
@@ -2343,9 +2332,8 @@ mod tests {
 
     // ── Mid-pipeline cancel confirmation ─────────────────────────
 
-    fn ticket_with(id: &str, phase: TicketPhase, assigned_to: Option<String>) -> Ticket {
+    fn ticket_with(id: &str, phase: TicketPhase) -> Ticket {
         Ticket {
-            assigned_to,
             ..make_ticket(id, phase)
         }
     }
@@ -2356,11 +2344,7 @@ mod tests {
         // agent) in the cached board list → the confirmation modal opens.
         // (No detail modal open, so the list is the eligibility source.)
         let mut state = BoardState::new();
-        state.tickets = vec![ticket_with(
-            "T-1",
-            TicketPhase::InDevelopment,
-            Some("engineer".into()),
-        )];
+        state.tickets = vec![ticket_with("T-1", TicketPhase::InDevelopment)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert_eq!(
             state.pending_cancel.as_deref(),
@@ -2373,7 +2357,7 @@ mod tests {
         assert!(state.pending_cancel.is_none());
 
         // A plain cancel (no in-flight agent) never opens the modal.
-        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog, None)];
+        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert!(
             state.pending_cancel.is_none(),
@@ -2382,11 +2366,7 @@ mod tests {
 
         // Confirming closes the modal (the PerformAction task carries the
         // actual transition).
-        state.tickets = vec![ticket_with(
-            "T-1",
-            TicketPhase::InDevelopment,
-            Some("engineer".into()),
-        )];
+        state.tickets = vec![ticket_with("T-1", TicketPhase::InDevelopment)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         let _task = state.update(BoardMessage::ConfirmCancel("T-1".into()));
         assert!(state.pending_cancel.is_none());
@@ -2395,11 +2375,7 @@ mod tests {
         // comment input is focused — with the detail modal open showing an
         // in-flight ticket.
         let mut state = make_board_state();
-        state.selected_ticket = Some(ticket_with(
-            "T-1",
-            TicketPhase::InDevelopment,
-            Some("engineer".into()),
-        ));
+        state.selected_ticket = Some(ticket_with("T-1", TicketPhase::InDevelopment));
         state.comment_focused = true;
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         let _task = state.update(BoardMessage::Escape);
@@ -2425,11 +2401,7 @@ mod tests {
         // a search is active), then the board list. A stale lower-priority
         // source must not decide the modal.
         let mut state = make_board_state(); // selected_ticket: T-1, Backlog, no assignee
-        state.tickets = vec![ticket_with(
-            "T-1",
-            TicketPhase::InDevelopment,
-            Some("engineer".into()),
-        )];
+        state.tickets = vec![ticket_with("T-1", TicketPhase::InDevelopment)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert!(
             state.pending_cancel.is_none(),
@@ -2438,12 +2410,8 @@ mod tests {
 
         // Detail says in-flight while the list is stale → modal opens.
         let mut state = make_board_state();
-        state.selected_ticket = Some(ticket_with(
-            "T-1",
-            TicketPhase::InDiagnostics,
-            Some("diagnostics".into()),
-        ));
-        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog, None)];
+        state.selected_ticket = Some(ticket_with("T-1", TicketPhase::InDiagnostics));
+        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert_eq!(
             state.pending_cancel.as_deref(),
@@ -2455,8 +2423,8 @@ mod tests {
         // list refresh is paused), so they are consulted before the list.
         let mut state = make_board_state();
         state.selected_ticket = None;
-        state.search_results = vec![ticket_with("T-1", TicketPhase::InQa, Some("qa".into()))];
-        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog, None)];
+        state.search_results = vec![ticket_with("T-1", TicketPhase::InQa)];
+        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert_eq!(
             state.pending_cancel.as_deref(),
@@ -2574,7 +2542,6 @@ mod tests {
             title: "Old result".into(),
             description: String::new(),
             phase: TicketPhase::Backlog,
-            assigned_to: None,
             workspace_name: "test_ws".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
@@ -2587,7 +2554,6 @@ mod tests {
             lines_removed: None,
             reporter: "test".into(),
             is_archived: false,
-            pipeline_reservation: false,
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,
@@ -2631,7 +2597,6 @@ mod tests {
                 title: "Stale".into(),
                 description: String::new(),
                 phase: TicketPhase::Backlog,
-                assigned_to: None,
                 workspace_name: "test_ws".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
@@ -2644,7 +2609,6 @@ mod tests {
                 lines_removed: None,
                 reporter: "test".into(),
                 is_archived: false,
-                pipeline_reservation: false,
                 priority: 0,
                 reviewed_head: None,
                 reviewed_tree: None,
@@ -2672,7 +2636,6 @@ mod tests {
                 title: "Fresh result".into(),
                 description: String::new(),
                 phase: TicketPhase::Backlog,
-                assigned_to: None,
                 workspace_name: "test_ws".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
@@ -2685,7 +2648,6 @@ mod tests {
                 lines_removed: None,
                 reporter: "test".into(),
                 is_archived: false,
-                pipeline_reservation: false,
                 priority: 0,
                 reviewed_head: None,
                 reviewed_tree: None,
@@ -2708,7 +2670,6 @@ mod tests {
             title: "Result".into(),
             description: String::new(),
             phase: TicketPhase::Backlog,
-            assigned_to: None,
             workspace_name: "test_ws".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
@@ -2721,7 +2682,6 @@ mod tests {
             lines_removed: None,
             reporter: "test".into(),
             is_archived: false,
-            pipeline_reservation: false,
             priority: 0,
             reviewed_head: None,
             reviewed_tree: None,

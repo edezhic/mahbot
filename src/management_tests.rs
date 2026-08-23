@@ -1,21 +1,11 @@
 use super::*;
 use crate::board::TicketComment;
-use crate::prompt::load_prompt;
 use crate::util::test::make_ticket;
 use crate::util::test::{
     JobRowBuilder, create_test_workspace, expect_ticket, expect_ticket_phase,
     init_management_test_stores,
 };
 use crate::workspace::test_ws_named;
-
-#[test]
-fn bounce_breaker_max_is_ten() {
-    assert_eq!(
-        crate::joint_verdict::MAX_BOUNCES,
-        10,
-        "MAX_BOUNCES must be 10"
-    );
-}
 
 // ── transition_ticket_to_done — conditional notification ─────────
 
@@ -53,51 +43,11 @@ async fn setup_ticket(
     (ws, ticket_id)
 }
 
-/// Assert `job_id` resolves to exactly one `jobs` row whose status equals
-/// `expected_status`. Preserves the duplicate-row guard (`len() == 1`) that a
-/// naive `query_optional()`-based helper would silently drop.
-async fn assert_job_status(conn: &crate::turso::Connection, job_id: &str, expected_status: &str) {
-    let jobs = conn
-        .query(
-            "SELECT status FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        jobs.len(),
-        1,
-        "expected exactly one jobs row for job {job_id}"
-    );
-    assert_eq!(
-        jobs[0].get::<String>(0).unwrap(),
-        expected_status,
-        "job {job_id} must be {expected_status}"
-    );
-}
-
-/// Assert the roster (`agents` rows keyed by `job_id`) cascaded to zero on
-/// completion.
-async fn assert_roster_cascaded(conn: &crate::turso::Connection, job_id: &str) {
-    let roster = conn
-        .query(
-            "SELECT COUNT(*) FROM agents WHERE job_id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        roster[0].get::<i64>(0).unwrap(),
-        0,
-        "roster cascaded on completion"
-    );
-}
-
-/// Verify the Buffer → Notify + drain sequence across two QaPassed tickets
+/// Verify the Buffer → Notify + drain sequence across two InQa tickets
 /// via `transition_ticket_to_done`: the first one buffers, the last one
 /// notifies and drains the buffer.
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board)
+/// Serialized with the reset_analysis_tickets tests (shared global board)
 /// and holds retry_tests_lock: the Notify path routes a Manager notification
 /// whose consumer loop runs a Manager agent that reads the process-global
 /// provider (project convention: retry_tests_lock).
@@ -108,16 +58,16 @@ async fn transition_ticket_to_done_buffer_and_notify() {
     let _lock = crate::util::test::retry_tests_lock();
     let ws = setup_db_workspace("drains_buffer").await;
 
-    // Two QaPassed tickets in the same workspace
-    let first_id = make_ticket(board(), &ws, "Ticket A", TicketPhase::QaPassed).await;
-    let second_id = make_ticket(board(), &ws, "Ticket B", TicketPhase::QaPassed).await;
+    // Two InQa tickets in the same workspace
+    let first_id = make_ticket(board(), &ws, "Ticket A", TicketPhase::InQa).await;
+    let second_id = make_ticket(board(), &ws, "Ticket B", TicketPhase::InQa).await;
 
     let ticket_a = expect_ticket(board(), &first_id).await;
 
-    // Transition ticket A — ticket B is still QaPassed (active), so Buffer
+    // Transition ticket A — ticket B is still InQa (active), so Buffer
     transition_ticket_to_done(
         &ticket_a,
-        TicketPhase::QaPassed,
+        TicketPhase::InQa,
         "Test — ticket A done, B still active",
     )
     .await;
@@ -131,7 +81,7 @@ async fn transition_ticket_to_done_buffer_and_notify() {
     let intermediate = crate::ticket_buffer::drain("ws_drains_buffer");
     assert!(
         !intermediate.is_empty(),
-        "After first QaPassed → Done with other active tickets: \
+        "After first InQa → Done with other active tickets: \
              should have buffered the notification (got empty buffer)",
     );
 
@@ -139,7 +89,7 @@ async fn transition_ticket_to_done_buffer_and_notify() {
     let ticket_b = expect_ticket(board(), &second_id).await;
     transition_ticket_to_done(
         &ticket_b,
-        TicketPhase::QaPassed,
+        TicketPhase::InQa,
         "Test — ticket B done, last ticket",
     )
     .await;
@@ -232,167 +182,25 @@ fn install_synthesis_test_seams(
 // ── process_verifier_verdicts — verdict processing ─────────────────────
 
 /// Verify all verdict-processing outcomes:
-/// - All failed → Failed (SYSTEM_ROLE failure comment only — no joint comment)
-/// - Any failed → bounce-back to ReadyForDevelopment with pipeline
-///   reservation, a single joint comment (role = stage name), and a bumped
+/// - Any failed (including an all-failed round) → unified bounce to
+///   InDevelopment, a single joint comment (role = stage name), and a bumped
 ///   bounce counter
-/// - The 11th bounce → Failed (bounce circuit breaker)
-/// - All passed (Reviewer) → Reviewed with a joint comment
-/// - All passed (QA) → QaPassed with a joint comment
+/// - The bounce circuit breaker → Failed on exhaustion
+/// - All passed (Reviewer) → InQa with a joint comment
+/// - All passed (QA) → InSanitation with a joint comment
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
-async fn process_verifier_verdicts_cases() {
-    struct Case {
-        name: &'static str,
-        ws_suffix: &'static str,
-        title: &'static str,
-        phase: TicketPhase,
-        results: Vec<ParallelVerdict>,
-        vi: VerifierInfo,
-        expected_phase: TicketPhase,
-        expected_pipeline_reservation: bool,
-        /// Expected bounce_count after processing (0 for non-bounce cases).
-        expected_bounce_count: i64,
-        /// Expected number of stage-role (joint) comments after the round.
-        expected_joint_comments: usize,
-    }
-
-    init_management_test_stores().await;
-    let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
-
-    let cases = vec![
-        Case {
-            name: "all failed -> Failed",
-            ws_suffix: "vp_all_fail",
-            title: "VP All Failed",
-            phase: TicketPhase::InReview,
-            results: vec![no_verdict(); 3],
-            vi: REVIEWER_VI,
-            expected_phase: TicketPhase::Failed,
-            expected_pipeline_reservation: false,
-            expected_bounce_count: 0,
-            expected_joint_comments: 0,
-        },
-        Case {
-            name: "any failed -> bounce-back with pipeline reservation",
-            ws_suffix: "vp_any_fail",
-            title: "VP Any Failed",
-            phase: TicketPhase::InReview,
-            results: vec![pass_result(), fail_result(), pass_result()],
-            vi: REVIEWER_VI,
-            expected_phase: TicketPhase::ReadyForDevelopment,
-            expected_pipeline_reservation: true,
-            expected_bounce_count: 1,
-            expected_joint_comments: 1,
-        },
-        Case {
-            name: "all passed -> Reviewed",
-            ws_suffix: "vp_all_pass",
-            title: "VP All Pass",
-            phase: TicketPhase::InReview,
-            results: vec![pass_result(), pass_result(), pass_result()],
-            vi: REVIEWER_VI,
-            expected_phase: TicketPhase::Reviewed,
-            expected_pipeline_reservation: false,
-            expected_bounce_count: 0,
-            expected_joint_comments: 1,
-        },
-        Case {
-            name: "all passed (QA) -> QaPassed",
-            ws_suffix: "vp_qa_pass",
-            title: "VP QA Pass",
-            phase: TicketPhase::InQa,
-            results: vec![pass_result(), pass_result(), pass_result()],
-            vi: QA_VI,
-            expected_phase: TicketPhase::QaPassed,
-            expected_pipeline_reservation: false,
-            expected_bounce_count: 0,
-            expected_joint_comments: 1,
-        },
-    ];
-
-    for case in &cases {
-        let ws = test_ws_named("/tmp/test", case.ws_suffix);
-        let ticket_id = make_ticket(board(), &ws, case.title, case.phase).await;
-
-        let ticket = expect_ticket(board(), &ticket_id).await;
-
-        process_verifier_verdicts(&ws, &ticket, &case.results, case.vi).await;
-
-        let ticket = expect_ticket(board(), &ticket_id).await;
-        assert_eq!(
-            ticket.phase, case.expected_phase,
-            "case {}: expected phase {:?}, got {:?}",
-            case.name, case.expected_phase, ticket.phase,
-        );
-        assert_eq!(
-            ticket.pipeline_reservation, case.expected_pipeline_reservation,
-            "case {}: expected pipeline_reservation={}, got {}",
-            case.name, case.expected_pipeline_reservation, ticket.pipeline_reservation,
-        );
-        assert_eq!(
-            ticket.bounce_count, case.expected_bounce_count,
-            "case {}: expected bounce_count={}, got {}",
-            case.name, case.expected_bounce_count, ticket.bounce_count,
-        );
-
-        // Every non-all-failed round writes exactly ONE joint comment (role =
-        // stage name), replacing the three per-agent comments; all-failed
-        // rounds keep only the SYSTEM_ROLE failure comment.
-        let comments = board()
-            .get_comments(&ticket_id)
-            .await
-            .expect("get comments");
-        let verdict_comments: Vec<&TicketComment> = comments
-            .iter()
-            .filter(|c| c.role == stage_name(case.vi.role))
-            .collect();
-        if case.expected_joint_comments == 1 {
-            assert_eq!(
-                verdict_comments.len(),
-                1,
-                "case {}: one joint comment expected, got {}",
-                case.name,
-                verdict_comments.len(),
-            );
-            let joint = &verdict_comments[0];
-            assert!(
-                !joint.content.contains("valid verdicts")
-                    && !joint.content.contains("threshold 9/10"),
-                "case {}: verifier comments carry no round headline or threshold line: {}",
-                case.name,
-                joint.content,
-            );
-            assert!(
-                joint.content.contains("### Summary"),
-                "case {}: joint comment keeps the Summary section: {}",
-                case.name,
-                joint.content,
-            );
-        } else {
-            assert!(
-                verdict_comments.is_empty(),
-                "case {}: no per-stage comments expected for all-failed rounds",
-                case.name,
-            );
-        }
-    }
-}
 
 /// The stage-finalization choke point treats a phase-guard miss (ticket moved
 /// externally while the stage was finishing) as a first-class, expected
 /// outcome: the whole round is rolled back silently — nothing is written, no
-/// bounce is counted — and `assigned_to` is NOT cleared by the finalizer (the
-/// external mover already handled the ticket; a finalizer clear would clobber
-/// a fresh claim by the new phase).
+/// bounce is counted — and the job's launched roster rows are NOT cleared by
+/// the finalizer (the external mover already handled the ticket; a finalizer clear
+/// would clobber a fresh claim by the new phase).
 ///
 /// The round uses a mixed verdict (pass/fail/pass → any_failed), so the
-/// target is ReadyForDevelopment and the closure increments the bounce
+/// target is InDevelopment and the closure increments the bounce
 /// counter: the `bounce_count == 0` assertion genuinely exercises the
 /// rollback of an in-transaction write that WOULD have committed had the
 /// guard applied.
@@ -400,7 +208,7 @@ async fn process_verifier_verdicts_cases() {
 /// Regression guard for the structural fix: the guard miss is a silent skip
 /// (the silent-rollback path never reaches the warn arms), not an error —
 /// this test asserts the observable side effects (phase untouched, bounce
-/// unchanged, assignment preserved, no comment written).
+/// unchanged, active-agent registration preserved, no comment written).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
 #[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
@@ -413,25 +221,22 @@ async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
     let ticket_id = make_ticket(board(), &ws, "VP Moved", TicketPhase::InReview).await;
 
     // The Manager triages the ticket to Planning while the verifier round
-    // finishes. The mover's claim on the ticket must survive the finalizer.
+    // finishes. The mover's transition must survive the finalizer.
     board()
-        .transition_to(&ticket_id, None, TicketPhase::Planning, None)
+        .transition_to(&ticket_id, None, TicketPhase::Planning)
         .await
         .expect("external move to Planning");
-    board()
-        .set_assigned_to_no_cancel(&ticket_id, Some("external-mover"))
-        .await
-        .expect("external mover claims the ticket");
 
     let ticket = expect_ticket(board(), &ticket_id).await;
     let transitioned = process_verifier_verdicts(
         &ws,
         &ticket,
-        // Mixed verdict → any_failed → target ReadyForDevelopment: the
+        // Mixed verdict → any_failed → bounce to development: the
         // closure writes a joint comment AND increments the bounce counter,
         // so the guard miss must roll both back.
         &[pass_result(), fail_result(), pass_result()],
         REVIEWER_VI,
+        "test_job",
     )
     .await;
     assert!(!transitioned, "guard miss must not report a transition");
@@ -446,11 +251,6 @@ async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
         ticket.bounce_count, 0,
         "guard miss must not bump the bounce counter"
     );
-    assert_eq!(
-        ticket.assigned_to.as_deref(),
-        Some("external-mover"),
-        "guard miss must not clear the external mover's assignment"
-    );
 
     // Nothing was written: a skipped round leaves no joint comment behind.
     let comments = board()
@@ -463,79 +263,6 @@ async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
             .any(|c| c.role == stage_name(REVIEWER_VI.role)),
         "a skipped round must not write a joint comment"
     );
-}
-
-/// Resume a review round from stored roster outcomes: done slots replay their
-/// checkpointed verdicts (no re-invocation, no LLM for the agents) and the
-/// verdicts are re-processed through the existing process_verifier_verdicts —
-/// the ticket transitions to Reviewed exactly like a fresh round, with no
-/// double bounce. High-signal replay test: the round-1 analyze-resume bugs lived
-/// in this path (job-id conflicts, caller misrouting).
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the InReview fixture).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
-async fn resume_verifier_round_replays_stored_outcomes() {
-    init_management_test_stores().await;
-    let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
-
-    let ws = test_ws_named("/tmp/test", "vp_resume");
-    let ticket_id = make_ticket(board(), &ws, "VP Resume", TicketPhase::InReview).await;
-    let job_id = "vp_resume_job";
-    let now = crate::turso::now();
-    let conn = &crate::session::store().conn;
-
-    // Job row + ticket_stage_jobs row exactly as a crashed dispatch leaves
-    // them (stage=review, phase=in_review, round=1).
-    JobRowBuilder::new(conn, job_id, "ticket_stage", "reviewer", &ws.name)
-        .timestamps(now.clone())
-        .insert()
-        .await
-        .unwrap();
-    conn.execute(
-        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
-         VALUES (?1, ?2, 'review', 'in_review', 1)",
-        crate::turso::params![job_id, ticket_id.clone()],
-    )
-    .await
-    .unwrap();
-
-    // Three done roster rows carrying stored passing verdicts (the replay
-    // reconstructs these WITHOUT calling the provider — the FakeProvider is
-    // only needed for the joint-comment synthesis).
-    for i in 0..3 {
-        let agent_id = format!("ticket_{ticket_id}_resume_{i}_reviewer");
-        conn.execute(
-            "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
-             VALUES (?1, ?2, 'verifier', ?3, 'done', ?4, '')",
-            crate::turso::params![
-                job_id,
-                agent_id,
-                i64::from(i),
-                serialize_verdict_outcome(&pass_result()),
-            ],
-        )
-        .await
-        .unwrap();
-    }
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    resume_ticket_stage_round("review".to_string(), job_id.to_string(), ticket, ws).await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        ticket.phase,
-        TicketPhase::Reviewed,
-        "replayed all-pass stored outcomes must transition to Reviewed"
-    );
-    // No double bounce on replay (bounce_count only increments on failures).
-    assert_eq!(ticket.bounce_count, 0, "no bounce on an all-pass replay");
-    // Job completed (status=done, roster cascaded).
-    assert_job_status(conn, job_id, "done").await;
-    assert_roster_cascaded(conn, job_id).await;
 }
 
 /// The phase-gate bail path returns before run_agent runs, so its exit
@@ -557,11 +284,11 @@ async fn parallel_round_phase_gate_bail_unregisters_router() {
     let ticket = Arc::new(expect_ticket(board(), &ticket_id).await);
     assert_eq!(ticket.phase, TicketPhase::Analysis);
     board()
-        .transition_to(&ticket_id, None, TicketPhase::Planning, None)
+        .transition_to(&ticket_id, None, TicketPhase::Planning)
         .await
         .unwrap();
-    let slots: Vec<TicketStageSlot> = (0..2)
-        .map(|i| TicketStageSlot {
+    let slots: Vec<AgentSlot> = (0..2)
+        .map(|i| AgentSlot {
             idx: i,
             agent_id: format!("pg_bail_{i}"),
             task: "task".to_string(),
@@ -612,219 +339,6 @@ async fn panicked_round_member_maps_to_contained_no_response() {
     );
 }
 
-/// Resume an engineer round at boot (S5): the NULL-seat anchor session is
-/// CONTINUED — the resume dispatches with an empty message (session content
-/// exists → no duplicate task-prompt append), the engineer completes, the
-/// ticket transitions to InDiagnostics, the job completes, the roster
-/// cascades, and the anchor row itself survives (permanent seat).
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the InDevelopment fixture).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
-async fn resume_engineer_round_continues_anchor_session() {
-    init_management_test_stores().await;
-    // Main LLM response + engineer-summary extraction (2 calls).
-    let fake = crate::util::test::FakeProvider::new()
-        .ok("implemented the resume path")
-        .ok(r#"{"items": ["resumed the engineer session"]}"#);
-    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake);
-
-    let ws = test_ws_named("/tmp/test", "eng_resume");
-    let ticket_id = make_ticket(board(), &ws, "Eng Resume", TicketPhase::InDevelopment).await;
-    let job_id = "eng_resume_job";
-    let now = crate::turso::now();
-    let conn = &crate::session::store().conn;
-    let anchor_id = crate::jobs::engineer_anchor_id(&ticket_id);
-    let task = "round 2 feedback: fix the tests";
-
-    // Job + ticket_stage_jobs rows exactly as a crashed round-2 dispatch
-    // leaves them (stage=engineer, phase=in_development, round=2).
-    JobRowBuilder::new(conn, job_id, "ticket_stage", "engineer", &ws.name)
-        .task(task)
-        .timestamps(now.clone())
-        .insert()
-        .await
-        .unwrap();
-    conn.execute(
-        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
-         VALUES (?1, ?2, 'engineer', 'in_development', 2)",
-        crate::turso::params![job_id, ticket_id.clone()],
-    )
-    .await
-    .unwrap();
-    // NULL-seat anchor + this round's roster row (same agent_id, coexisting
-    // under the composite PK).
-    conn.execute(
-        "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
-         VALUES (NULL, ?1, 'engineer', NULL, 'done', ?2)",
-        crate::turso::params![anchor_id.clone(), task],
-    )
-    .await
-    .unwrap();
-    conn.execute(
-        "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
-         VALUES (?1, ?2, 'engineer', 0, 'launched', ?3)",
-        crate::turso::params![job_id, anchor_id.clone(), task],
-    )
-    .await
-    .unwrap();
-    // Round-1 session content exists → empty-message dispatch (no duplicate
-    // task-prompt append).
-    conn.execute(
-        "INSERT INTO sessions (agent_id, role, content, created_at) \
-         VALUES (?1, 'user', ?2, ?3)",
-        crate::turso::params![
-            anchor_id.clone(),
-            format!("<ts>{now}</ts>\n\nround 1 task"),
-            now.clone()
-        ],
-    )
-    .await
-    .unwrap();
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    resume_ticket_stage_round("engineer".to_string(), job_id.to_string(), ticket, ws).await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        ticket.phase,
-        TicketPhase::InDiagnostics,
-        "resumed engineer must transition to InDiagnostics"
-    );
-    // Job completed + roster cascaded; the anchor survives.
-    assert_job_status(conn, job_id, "done").await;
-    assert_roster_cascaded(conn, job_id).await;
-    let anchors = conn
-        .query(
-            "SELECT COUNT(*) FROM agents WHERE agent_id = ?1 AND job_id IS NULL",
-            crate::turso::params![anchor_id.clone()],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        anchors[0].get::<i64>(0).unwrap(),
-        1,
-        "NULL-seat anchor survives round completion"
-    );
-    // Session continuity: exactly the round-1 user row + the round-2
-    // assistant response — the task was NOT re-appended.
-    let msgs = conn
-        .query(
-            "SELECT role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
-            crate::turso::params![anchor_id.clone()],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        msgs.len(),
-        2,
-        "round-1 user row + round-2 assistant response only"
-    );
-    assert_eq!(msgs[0].get::<String>(0).unwrap(), "user");
-    assert_eq!(msgs[1].get::<String>(0).unwrap(), "assistant");
-    assert!(
-        !msgs[1]
-            .get::<String>(1)
-            .unwrap()
-            .contains("round 2 feedback"),
-        "task must not be re-appended on a resumed session"
-    );
-}
-
-/// Resume a sanitation round at boot: the job-derived session
-/// `ticket_{job_id}_sanitation` CONTINUES (empty message — no duplicate
-/// task-prompt append), the verdict is extracted from the resumed response and
-/// processed, the ticket transitions to SanitationPassed, the job completes,
-/// and the roster cascades.
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the InSanitation fixture).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
-async fn resume_sanitation_round_continues_session_and_passes() {
-    init_management_test_stores().await;
-    // Main LLM response + SanitationVerdict extraction (2 calls).
-    let fake = crate::util::test::FakeProvider::new()
-        .ok("inspected the workspace — no garbage files found")
-        .ok(r#"{"pass": true, "garbage_files": [], "rationale": "workspace is clean"}"#);
-    let (_lock, _policy_guard, _provider_guard) = install_synthesis_test_seams(fake);
-
-    let ws = test_ws_named("/tmp/test", "san_resume");
-    let ticket_id = make_ticket(board(), &ws, "San Resume", TicketPhase::InSanitation).await;
-    let job_id = "san_resume_job";
-    let now = crate::turso::now();
-    let conn = &crate::session::store().conn;
-    let agent_id = format!("ticket_{job_id}_sanitation");
-    let task = "sanitation task";
-
-    // Job + ticket_stage_jobs rows exactly as a crashed dispatch leaves them
-    // (stage=sanitation, phase=in_sanitation, round=1).
-    JobRowBuilder::new(conn, job_id, "ticket_stage", "sanitation", &ws.name)
-        .task(task)
-        .timestamps(now.clone())
-        .insert()
-        .await
-        .unwrap();
-    conn.execute(
-        "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
-         VALUES (?1, ?2, 'sanitation', 'in_sanitation', 1)",
-        crate::turso::params![job_id, ticket_id.clone()],
-    )
-    .await
-    .unwrap();
-    // Roster row + session content → empty-message dispatch (no re-append).
-    conn.execute(
-        "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
-         VALUES (?1, ?2, 'sanitation', 0, 'launched', ?3)",
-        crate::turso::params![job_id, agent_id.clone(), task],
-    )
-    .await
-    .unwrap();
-    conn.execute(
-        "INSERT INTO sessions (agent_id, role, content, created_at) \
-         VALUES (?1, 'user', ?2, ?3)",
-        crate::turso::params![
-            agent_id.clone(),
-            format!("<ts>{now}</ts>\n\n{task}"),
-            now.clone()
-        ],
-    )
-    .await
-    .unwrap();
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    resume_ticket_stage_round("sanitation".to_string(), job_id.to_string(), ticket, ws).await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        ticket.phase,
-        TicketPhase::SanitationPassed,
-        "resumed sanitation pass must transition to SanitationPassed"
-    );
-    // Job completed + roster cascaded.
-    assert_job_status(conn, job_id, "done").await;
-    assert_roster_cascaded(conn, job_id).await;
-    // Session continuity: exactly the seeded user row + the resumed assistant
-    // response — the task was NOT re-appended.
-    let msgs = conn
-        .query(
-            "SELECT role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
-            crate::turso::params![agent_id.clone()],
-        )
-        .await
-        .unwrap();
-    assert_eq!(msgs.len(), 2, "seeded user row + assistant response only");
-    assert_eq!(msgs[0].get::<String>(0).unwrap(), "user");
-    assert_eq!(msgs[1].get::<String>(0).unwrap(), "assistant");
-    assert!(
-        !msgs[1].get::<String>(1).unwrap().contains(task),
-        "task must not be re-appended on a resumed session"
-    );
-}
-
 /// Provider that panics on the first scoped call. `drain_first` starts the
 /// process-global graceful drain right before panicking — simulating a drain
 /// that begins while the agent is mid-LLM-call (the dispatch task's panic
@@ -854,7 +368,7 @@ impl crate::Provider for PanicProvider {
 /// boot resume. The control case (no drain) proves the same panic path DOES
 /// transition to Failed when the guard is inactive.
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board + the
+/// Serialized with the reset_analysis_tickets tests (shared global board + the
 /// process-global drain flag).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
@@ -944,7 +458,7 @@ async fn dispatch_panic_during_drain_skips_failed_transition() {
 /// The bounce circuit breaker: a ticket already at [`MAX_BOUNCES`] bounces
 /// fails on the next failed round instead of bouncing again.
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
@@ -974,6 +488,7 @@ async fn eleventh_bounce_fails_ticket() {
         &ticket,
         &[pass_result(), fail_result(), pass_result()],
         REVIEWER_VI,
+        "test_job",
     )
     .await;
     assert!(
@@ -1004,67 +519,16 @@ async fn eleventh_bounce_fails_ticket() {
     );
 }
 
-/// Regression guard for the auto-pause trigger boundaries:
-///
-/// A technical failure (all verifier agents failing) pauses the workspace.
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the fixture phases). Also serialized
-/// with the drain-flag writers: `process_verifier_verdicts` and
-/// `pause_workspace_on_failure` consult the process-global drain flag, which
-/// would suppress the pause and the transition (project convention:
-/// retry_tests_lock).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-async fn technical_failure_pauses_workspace() {
-    let _lock = crate::util::test::retry_tests_lock();
-    init_management_test_stores().await;
-
-    let ws_verifier = create_test_workspace("/tmp/pause_verifier_ws", "ws_pause_verifier").await;
-    let verifier_id = make_ticket(
-        board(),
-        &ws_verifier,
-        "Verifier All Failed",
-        TicketPhase::InReview,
-    )
-    .await;
-    let ticket = expect_ticket(board(), &verifier_id).await;
-    let transitioned =
-        process_verifier_verdicts(&ws_verifier, &ticket, &vec![no_verdict(); 3], REVIEWER_VI).await;
-    assert!(
-        transitioned,
-        "all-failed round should transition the ticket"
-    );
-    let ws = crate::workspace::store()
-        .get_by_name("ws_pause_verifier")
-        .await
-        .expect("get workspace")
-        .expect("workspace exists");
-    assert!(ws.paused, "verifier all-failed must pause the workspace");
-
-    // The failure comment must carry the pause notice + a per-agent reason.
-    let comments = board()
-        .get_comments(&verifier_id)
-        .await
-        .expect("get comments");
-    let last = comments
-        .last()
-        .expect("failure comment written")
-        .content
-        .clone();
-    assert!(last.contains("Workspace paused"), "{last}");
-    assert!(last.contains("agent produced no response"), "{last}");
-}
-
 // ── Claim gate: automatic claims blocked while paused or not Ready ──
 
-/// The claim gate ([`blocks_claim`]) must block exactly the automatic pickup
-/// of *new* work: BacklogAnalysis (backlog → analysis) and
-/// EngineerDevelopment (ready_for_development → in_development). Two gates:
+/// The claim gate ([`blocks_claim`]) must block the automatic pickup of
+/// *new* work (BacklogAnalysis, EngineerDevelopment) when the workspace is
+/// paused **or** not Ready, and freeze the entire occupied implementation when the
+/// workspace is paused. Two gates:
 ///
-/// * **Pause gate** — later-phase claims (review, QA) proceed while paused,
-///   and nothing is blocked when a Ready workspace is unpaused.
+/// * **Pause gate** — a paused Ready workspace blocks ALL claims (the implementation
+///   is frozen; unpause re-arms the poll) — pause is a real freeze, not just
+///   a new-work gate.
 /// * **Status gate** — a non-Ready workspace (Pending/Analyzing/Failed)
 ///   blocks new-work claims even when unpaused: its contexts are missing or
 ///   stale, so a manual unpause must not re-enable development work.
@@ -1080,16 +544,15 @@ fn blocks_claim_gate_matrix() {
             phase,
             PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
         );
-        // Pause gate: a paused Ready workspace blocks new work only.
+        // Pause gate: a paused Ready workspace freezes every claim.
         let paused = Workspace {
             status: WorkspaceStatus::Ready,
             paused: true,
             ..Default::default()
         };
-        assert_eq!(
+        assert!(
             blocks_claim(&paused, phase),
-            new_work,
-            "pause gate mismatch for {} ({} → {})",
+            "pause gate mismatch for {} ({} → {}) — a paused workspace must freeze the implementation",
             phase.info().log_label,
             source.as_ref(),
             phase.info().expected_phase.as_ref(),
@@ -1145,7 +608,7 @@ fn blocks_claim_gate_matrix() {
 /// - The spawned dispatch tasks read the process-global provider, so the
 ///   test holds `retry_tests_lock()` per the suite's provider-seam
 ///   convention.
-/// - The spawned dispatches may persist `ticket_stage_jobs`/`agents` rows
+/// - The spawned dispatches may persist `ticket_jobs`/`agents` rows
 ///   for this test's ticket IDs into the shared test jobs DB before the
 ///   runtime drops them; later `recover_from_restart` tests in this serial
 ///   group tolerate extra rows (they assert on their own fixture IDs).
@@ -1232,7 +695,7 @@ async fn paused_workspace_holds_backlog_and_rfd_until_unpause() {
 /// - Partial fail → Planning with one joint comment (role "Analysis")
 /// - No verdicts → Planning with a joint comment carrying the failure dumps
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
@@ -1331,7 +794,7 @@ async fn process_analyst_verdicts_cases() {
 /// unavailable (provider scripted to fail) still advances the ticket with a
 /// deterministic fallback comment — never a fabricated one.
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
@@ -1379,296 +842,27 @@ async fn analyst_round_fails_open_with_fallback_comment() {
     );
 }
 
-// ── handle_qa_passed — QA → Done path ───────────────────────────────
-
-/// handle_qa_passed first checks whether git is available and whether the
-/// workspace path is a git repo. In test environments git may exist, but
-/// the workspace path is deliberately not a git repo, so the function
-/// transitions directly to Done without committing.
-/// This test validates the graceful non-git fallback path.
-#[tokio::test]
-async fn handle_qa_passed_no_git_to_done() {
-    // Use a temporary directory without git init — guarantees no git repo
-    // exists regardless of the test runner's filesystem state. The `dir`
-    // binding must stay alive (function scope) for the workspace path to
-    // remain valid.
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let ws_path = dir.path().to_str().expect("temp path is valid UTF-8");
-    let (ws, ticket_id) =
-        setup_ticket(ws_path, "qa_no_git", "QA No Git", TicketPhase::QaPassed).await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-
-    handle_qa_passed(ticket, ws).await;
-
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::Done,
-        "QA passed should eventually transition to Done"
-    );
-
-    // Verify a SYSTEM_ROLE comment was written capturing the reason.
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    assert!(
-        comments
-            .iter()
-            .any(|c| c.role == SYSTEM_ROLE && c.content.contains("without commit")),
-        "Expected a SYSTEM_ROLE comment explaining why no commit was made"
-    );
-}
-
-/// handle_qa_passed with untracked files present should claim the ticket
-/// to InSanitation and dispatch a sanitation agent. Creates a real git repo
-/// with an untracked file to exercise the full claim path.
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the fixture phases).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-async fn handle_qa_passed_untracked_files_to_insanitation() {
-    // Skip if git is not installed — the test cannot create a repo.
-    if !crate::git_commands::git_is_installed().await {
-        eprintln!("git not installed — skipping git-dependent test");
-        return;
-    }
-
-    // Create a temp directory and init a git repo
-    let (_dir, repo_path) = crate::util::test::init_temp_repo();
-
-    // Create an untracked file
-    std::fs::write(repo_path.join("untracked.txt"), b"garbage").expect("write untracked file");
-
-    let (ws, ticket_id) = setup_ticket(
-        repo_path.to_str().unwrap(),
-        "qa_untracked",
-        "QA Untracked",
-        TicketPhase::QaPassed,
-    )
-    .await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-
-    handle_qa_passed(ticket, ws).await;
-
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::InSanitation,
-        "QA passed with untracked files should transition to InSanitation"
-    );
-
-    // Verify assigned_to is set to a sanitation agent ID for this ticket.
-    //
-    // `handle_qa_passed` claims with the unsuffixed base ID
-    // (`ticket_{id}_sanitation`); the spawned dispatch task may then overwrite
-    // it with the suffixed registered ID (`ticket_{id}_sanitation_{suffix}`)
-    // before this assertion runs. Both are valid sanitation assignments, so
-    // match the prefix rather than the exact claim-time value — asserting the
-    // exact unsuffixed ID would be racy with the background dispatch.
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    let base_key = crate::session::ticket_agent_id(&ticket_id, crate::Role::Sanitation.as_str());
-    assert!(
-        ticket
-            .assigned_to
-            .as_deref()
-            .is_some_and(|a| a.starts_with(&base_key)),
-        "assigned_to should be a sanitation agent ID for this ticket, got {:?}",
-        ticket.assigned_to,
-    );
-}
-
-// ── Sanitation agent registration / comment routing wiring ──
-
-/// Sanitation dispatch must persist the SAME suffixed agent ID it registers
-/// with the message router — the routing contract.
-///
-/// The board routes mid-work comments to the exact ID stored in
-/// `assigned_to` (`route_comment_to_agents` → `try_route`).
-/// [`BoardStore::claim_sanitation`] stores the unsuffixed base ID as a
-/// placeholder; [`register_agent_and_assign`] (called by `run_stage_agent_round`)
-/// must overwrite it with the suffixed ID the run actually registers,
-/// otherwise comments are silently dropped for the whole phase.
-///
-/// This test exercises the register+assign scaffolding directly (no LLM
-/// involved — `dispatch_sanitation` itself would invoke a real provider) and
-/// verifies end-to-end delivery through `add_comment` → message router.
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the fixture phases).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-async fn sanitation_register_persists_registered_id() {
-    init_management_test_stores().await;
-    let ws = test_ws_named("/tmp/test_san_register", "ws_san_register");
-    let ticket_id = make_ticket(board(), &ws, "San Register", TicketPhase::InSanitation).await;
-
-    // Mirror the run_stage_agent_round scaffolding: job-derived agent ID first,
-    // then register + persist the same ID in assigned_to.
-    let agent_id = "ticket_test-job_sanitation".to_string();
-    let mut rx = register_agent_and_assign(
-        &ticket_id,
-        &agent_id,
-        "Failed to persist assigned_to for sanitation agent — mid-run comments may not route",
-    )
-    .await;
-
-    // The stored ID must be exactly the ID registered in the router — the
-    // mismatch that broke comment routing.
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        ticket.assigned_to.as_deref(),
-        Some(agent_id.as_str()),
-        "assigned_to must store the exact suffixed agent ID registered in the router"
-    );
-
-    // The ID must be run-unique via the job id (fresh session per run —
-    // agent id `ticket_{job_id}_sanitation`).
-    assert_eq!(
-        agent_id,
-        "ticket_test-job_sanitation".to_string(),
-        "sanitation agent ID must be job-derived for run isolation, got {agent_id}"
-    );
-
-    // Wiring proof: a comment routed to the assigned sanitation agent is
-    // delivered via the message router — no silent drop.
-    board()
-        .add_comment(&ticket_id, "manager", "mid-run ping")
-        .await
-        .expect("add_comment should succeed");
-    let job = rx
-        .try_recv()
-        .expect("comment routed to the assigned sanitation agent should be delivered");
-    assert_eq!(job.content, "mid-run ping");
-    assert_eq!(job.kind, crate::message_router::JobKind::TicketComment);
-
-    message_router::unregister_agent(&agent_id);
-}
-
-/// Pin the mismatch shape: an unsuffixed `assigned_to` (the
-/// `claim_sanitation` placeholder) does NOT match the suffixed agent ID a
-/// sanitation run registers — comments are silently dropped.
-///
-/// This is the regression the fix eliminates: [`register_agent_and_assign`]
-/// overwrites the placeholder with the registered suffixed ID so routing
-/// matches. The negative assertion guards against someone "simplifying" the
-/// fix by dropping the suffix instead (which would regress per-run session
-/// isolation).
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the fixture phases).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-async fn sanitation_unsuffixed_assignment_is_not_routed() {
-    init_management_test_stores().await;
-    let ws = test_ws_named("/tmp/test_san_mismatch", "ws_san_mismatch");
-    let ticket_id = make_ticket(board(), &ws, "San Mismatch", TicketPhase::InSanitation).await;
-
-    // Simulate the pre-fix state: assigned_to holds the unsuffixed base ID
-    // (what claim_sanitation stores) while the run registers the suffixed ID.
-    let base = crate::session::ticket_agent_id(&ticket_id, crate::Role::Sanitation.as_str());
-    board()
-        .set_assigned_to_no_cancel(&ticket_id, Some(&base))
-        .await
-        .expect("set assigned_to");
-    let suffixed = format!("{base}_{}", crate::generate_suffix());
-    let mut rx = message_router::register_agent(&suffixed);
-
-    board()
-        .add_comment(&ticket_id, "manager", "should be dropped")
-        .await
-        .expect("add_comment should succeed");
-
-    // The comment is routed to the unsuffixed ID (not registered) — dropped.
-    assert!(
-        rx.try_recv().is_err(),
-        "comment routed to an unsuffixed assigned_to must NOT reach the suffixed \
-         registered agent (mismatch shape pinned by mahbot-1035)"
-    );
-
-    message_router::unregister_agent(&suffixed);
-}
-
-/// handle_qa_passed with a clean working tree (no untracked files, no
-/// modifications) should transition to Done directly without creating a
-/// commit — exercising the clean-tree path through [`finalize_ticket_with_git_status`].
-///
-/// Creates a real git repo with a clean working tree to exercise the
-/// QaPassed→Done transition through the clean-tree path.
-#[tokio::test]
-async fn handle_qa_passed_clean_tree_to_done() {
-    // Skip if git is not installed — the test cannot create a repo.
-    if !crate::git_commands::git_is_installed().await {
-        eprintln!("git not installed — skipping git-dependent test");
-        return;
-    }
-
-    let (_dir, repo_path) = crate::util::test::init_temp_repo();
-
-    let (ws, ticket_id) = setup_ticket(
-        repo_path.to_str().unwrap(),
-        "qa_clean",
-        "QA Clean Tree",
-        TicketPhase::QaPassed,
-    )
-    .await;
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-
-    handle_qa_passed(ticket, ws).await;
-
-    let phase = expect_ticket_phase(board(), &ticket_id).await;
-    assert_eq!(
-        phase,
-        TicketPhase::Done,
-        "QA passed with clean tree should transition to Done"
-    );
-
-    // Verify a SYSTEM_ROLE comment was written explaining the clean-tree skip.
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get_comments");
-    assert!(
-        comments
-            .iter()
-            .any(|c| c.role == SYSTEM_ROLE && c.content.contains("Clean working tree")),
-        "Expected a SYSTEM_ROLE comment explaining the clean-tree skip"
-    );
-}
-
 // ── process_sanitation_verdict — verdict processing ──────────────────
 
 /// Verify [`process_sanitation_verdict`] across all scenarios:
-/// - pass=true, clean → SanitationPassed, no marker comment
-/// - pass=false, garbage → ReadyForDevelopment with pipeline reservation and marker comment
-/// - pass=true, reviewed files → SanitationPassed with "(files reviewed)" suffix, no marker comment
+/// - pass=true, clean → Done, no marker comment
+/// - pass=false, garbage → InDevelopment (unified bounce), no marker comment
+/// - pass=true, reviewed files → Done with "(files reviewed)" suffix, no marker comment
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
 async fn process_sanitation_verdict_cases() {
-    /// All scenarios of [`process_sanitation_verdict`]. The two comment-marker
-    /// fields use different types: [`Case::sanit_markers`] is `&[&str]`
-    /// because a Sanitation role comment is *always* created; [`Case::sys_markers`]
-    /// is `Option<Vec<&'static str>>` because a [`SANITATION_ROLE`] failure-marker
-    /// comment is *conditional* (only appears on `pass=false`) and its marker value
-    /// is loaded from a prompt file at runtime.
+    /// All scenarios of [`process_sanitation_verdict`]. [`Case::sanit_markers`]
+    /// is `&[&str]` because a Sanitation role comment is *always* created.
     struct Case {
         name: &'static str,
         ws_suffix: &'static str,
         verdict: crate::SanitationVerdict,
         expected_phase: TicketPhase,
-        expected_pipeline_reservation: bool,
         /// Substrings required in a Sanitation role comment (empty = just exists).
         sanit_markers: &'static [&'static str],
-        /// Substrings required in a [`SANITATION_ROLE`] comment (the marker
-        /// comment written when sanitation fails). `None` = no marker comment.
-        sys_markers: Option<&'static [&'static str]>,
     }
 
     init_management_test_stores().await;
@@ -1691,57 +885,60 @@ async fn process_sanitation_verdict_cases() {
 
     let cases = [
         Case {
-            name: "pass=true → SanitationPassed",
+            name: "pass=true → Done",
             ws_suffix: "sp",
             verdict: clean,
-            expected_phase: TicketPhase::SanitationPassed,
-            expected_pipeline_reservation: false,
+            expected_phase: TicketPhase::Done,
             sanit_markers: &[],
-            sys_markers: None,
         },
         Case {
-            name: "pass=false → ReadyForDevelopment",
+            name: "pass=false → InDevelopment (unified bounce)",
             ws_suffix: "sf",
             verdict: garbage,
-            expected_phase: TicketPhase::ReadyForDevelopment,
-            expected_pipeline_reservation: true,
+            expected_phase: TicketPhase::InDevelopment,
             sanit_markers: &["node_modules/"],
-            sys_markers: None,
         },
         Case {
-            name: "pass=true with reviewed files → SanitationPassed (files reviewed)",
+            name: "pass=true with reviewed files → Done (files reviewed)",
             ws_suffix: "sp_r",
             verdict: reviewed,
-            expected_phase: TicketPhase::SanitationPassed,
-            expected_pipeline_reservation: false,
+            expected_phase: TicketPhase::Done,
             sanit_markers: &["(files reviewed)"],
-            sys_markers: None,
         },
     ];
 
     for case in &cases {
         let ws = test_ws_named("/tmp/test", case.ws_suffix);
         let id = make_ticket(board(), &ws, case.name, TicketPhase::InSanitation).await;
+        // The sanitation round runs on the implementation job (stage='sanitation');
+        // create a real job row so the id handed to the verdict processor corresponds
+        // to a real job rather than a phantom that only produces no-op synced writes.
+        let job_id = format!("job_san_{}", case.ws_suffix);
+        crate::jobs::spawn_job(
+            &crate::session::store().conn,
+            &job_id,
+            "task",
+            &ws.name,
+            "",
+            "",
+            Role::Engineer,
+            &[],
+            &crate::jobs::SpawnChild::TicketJob {
+                ticket_id: id.clone(),
+                stage: IMPLEMENTATION_STAGE_SANITATION.to_string(),
+                is_implementation: true,
+            },
+        )
+        .await
+        .expect("create implementation job");
         let ticket = expect_ticket(board(), &id).await;
-        process_sanitation_verdict(&ticket, case.verdict.clone()).await;
+        process_sanitation_verdict(&ticket, &job_id, case.verdict.clone(), &ws).await;
 
         let phase = expect_ticket_phase(board(), &id).await;
         assert_eq!(
             phase, case.expected_phase,
             "case {}: expected phase {:?}, got {:?}",
             case.name, case.expected_phase, phase,
-        );
-
-        let ticket = expect_ticket(board(), &id).await;
-        assert_eq!(
-            ticket.pipeline_reservation, case.expected_pipeline_reservation,
-            "case {}: pipeline_reservation mismatch",
-            case.name,
-        );
-        assert!(
-            ticket.assigned_to.is_none(),
-            "case {}: assigned_to should be cleared",
-            case.name,
         );
 
         let comments = board().get_comments(&id).await.expect("get_comments");
@@ -1755,202 +952,11 @@ async fn process_sanitation_verdict_cases() {
             case.sanit_markers,
         );
 
-        // Marker role comment check (written with SANITATION_ROLE on pass=false)
-        match &case.sys_markers {
-            Some(markers) => {
-                assert!(
-                    comments.iter().any(|c| c.role == SANITATION_ROLE
-                        && markers.iter().all(|&m| c.content.contains(m))),
-                    "case {}: expected SANITATION_ROLE comment matching {:?}",
-                    case.name,
-                    markers,
-                );
-            }
-            None => assert!(
-                !comments.iter().any(|c| c.role == SANITATION_ROLE),
-                "case {}: expected no SANITATION_ROLE comment",
-                case.name,
-            ),
-        }
-    }
-}
-
-/// Verify [`dispatch_diagnostics`] behaviour across all scenarios:
-///
-/// | Scenario | Commands | Expected Phase | Pipeline Reservation | Comment Contains |
-/// |---|---|---|---|---|
-/// | No diagnostics commands | None (unset) | DiagnosticsDone | false | "No diagnostics commands are configured" |
-/// | Diagnostics failure | `false` | ReadyForDevelopment | true | `diagnostics_failed.md` marker |
-/// | Diagnostics pass | `true`, ... | DiagnosticsDone | false | `diagnostics_passed.md` marker |
-/// | DB error (corrupt JSON) | N/A (corrupt) | DiagnosticsDone | false | "database error" |
-///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
-/// concurrent boot reset would clobber the fixture phases).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-async fn dispatch_diagnostics_cases() {
-    struct Case {
-        name: &'static str,
-        ws_suffix: &'static str,
-        title: &'static str,
-        /// Diagnostics commands to persist (None = leave unset).
-        commands: Option<DiagnosticsCommands>,
-        /// If true, overwrite the diagnostics column with invalid JSON.
-        corrupt_diagnostics: bool,
-        /// If true, create a real temp directory for command execution.
-        needs_tempdir: bool,
-        expected_phase: TicketPhase,
-        expected_pipeline_reservation: bool,
-        /// Substrings that must all be present in a DIAGNOSTICS_ROLE comment.
-        expected_comment_contains: &'static [&'static str],
-    }
-
-    const NO_DIAG_CMDS: &[&str] = &["No diagnostics commands are configured"];
-    const DB_ERR: &[&str] = &["database error"];
-
-    init_management_test_stores().await;
-
-    let diagnostics_failed_marker: &'static str =
-        load_prompt("pipeline/diagnostics_failed.md").leak();
-    let diagnostics_passed_marker: &'static str =
-        load_prompt("pipeline/diagnostics_passed.md").leak();
-
-    let fail_comment_contains: &'static [&'static str] =
-        Box::leak(vec![diagnostics_failed_marker].into_boxed_slice());
-    let pass_comment_contains: &'static [&'static str] =
-        Box::leak(vec![diagnostics_passed_marker, "PASSED in"].into_boxed_slice());
-
-    let fail_cmds = DiagnosticsCommands {
-        format: Some("false".to_string()),
-        ..Default::default()
-    };
-    let pass_cmds = DiagnosticsCommands {
-        format: Some("true".to_string()),
-        type_check: Some("true".to_string()),
-        ..Default::default()
-    };
-
-    let cases = [
-        Case {
-            name: "no diagnostics commands",
-            ws_suffix: "dc_no_cmds",
-            title: "No Diagnostics Commands",
-            commands: None,
-            corrupt_diagnostics: false,
-            needs_tempdir: false,
-            expected_phase: TicketPhase::DiagnosticsDone,
-            expected_pipeline_reservation: false,
-            expected_comment_contains: NO_DIAG_CMDS,
-        },
-        Case {
-            name: "diagnostics failure",
-            ws_suffix: "dc_fail",
-            title: "Diagnostics Failure Test",
-            commands: Some(fail_cmds),
-            corrupt_diagnostics: false,
-            needs_tempdir: true,
-            expected_phase: TicketPhase::ReadyForDevelopment,
-            expected_pipeline_reservation: true,
-            expected_comment_contains: fail_comment_contains,
-        },
-        Case {
-            name: "diagnostics all pass",
-            ws_suffix: "dc_pass",
-            title: "Diagnostics All Pass Test",
-            commands: Some(pass_cmds),
-            corrupt_diagnostics: false,
-            needs_tempdir: true,
-            expected_phase: TicketPhase::DiagnosticsDone,
-            expected_pipeline_reservation: false,
-            expected_comment_contains: pass_comment_contains,
-        },
-        Case {
-            name: "diagnostics DB error",
-            ws_suffix: "dc_db_err",
-            title: "Diagnostics DB Error Test",
-            commands: None,
-            corrupt_diagnostics: true,
-            needs_tempdir: false,
-            expected_phase: TicketPhase::DiagnosticsDone,
-            expected_pipeline_reservation: false,
-            expected_comment_contains: DB_ERR,
-        },
-    ];
-
-    for case in &cases {
-        let (_dir, ws_path): (Option<tempfile::TempDir>, String) = if case.needs_tempdir {
-            let dir = tempfile::tempdir().expect("create temp dir");
-            let path = dir.path().to_string_lossy().to_string();
-            (Some(dir), path)
-        } else {
-            (None, format!("/tmp/{}", case.ws_suffix))
-        };
-
-        let ws = create_test_workspace(&ws_path, case.ws_suffix).await;
-
-        if let Some(cmds) = &case.commands {
-            crate::workspace::store()
-                .set_diagnostics(case.ws_suffix, cmds)
-                .await
-                .expect("set diagnostics");
-        }
-        if case.corrupt_diagnostics {
-            crate::workspace::store()
-                .conn
-                .execute(
-                    "UPDATE workspaces SET diagnostics = ?1 WHERE name = ?2",
-                    turso::params!["not valid json", case.ws_suffix],
-                )
-                .await
-                .expect("set diagnostics to invalid JSON");
-        }
-
-        let ticket_id = make_ticket(board(), &ws, case.title, TicketPhase::InDiagnostics).await;
-
-        // NOTE: Do NOT claim the ticket beforehand — dispatch_diagnostics
-        // calls claim_diagnostics internally as its first step.
-        let ticket = expect_ticket(board(), &ticket_id).await;
-        dispatch_diagnostics(Arc::new(ticket), ws).await;
-
-        let phase = expect_ticket_phase(board(), &ticket_id).await;
-        assert_eq!(
-            phase, case.expected_phase,
-            "case {}: expected phase {:?}, got {:?}",
-            case.name, case.expected_phase, phase,
-        );
-
-        let ticket = expect_ticket(board(), &ticket_id).await;
-        assert_eq!(
-            ticket.pipeline_reservation, case.expected_pipeline_reservation,
-            "case {}: pipeline_reservation mismatch",
-            case.name,
-        );
+        // Marker role comment check: no SANITATION_ROLE comment is written.
         assert!(
-            ticket.assigned_to.is_none(),
-            "case {}: assigned_to should be cleared after diagnostics dispatch",
+            !comments.iter().any(|c| c.role == SANITATION_ROLE),
+            "case {}: expected no SANITATION_ROLE comment",
             case.name,
-        );
-
-        let comments = board()
-            .get_comments(&ticket_id)
-            .await
-            .expect("get_comments");
-        assert!(
-            !comments.is_empty(),
-            "case {}: should have written at least one comment",
-            case.name,
-        );
-        let has_expected = comments.iter().any(|c| {
-            c.role == DIAGNOSTICS_ROLE
-                && case
-                    .expected_comment_contains
-                    .iter()
-                    .all(|&marker| c.content.contains(marker))
-        });
-        assert!(
-            has_expected,
-            "case {}: should have a DIAGNOSTICS_ROLE comment containing: {:?}",
-            case.name, case.expected_comment_contains,
         );
     }
 }
@@ -1961,7 +967,7 @@ async fn dispatch_diagnostics_cases() {
 /// base (same HEAD, same index tree, clean porcelain), the reviewer pass may
 /// legitimately be skipped — this is the comment-only-round case.
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
@@ -1997,13 +1003,13 @@ async fn dispatch_verifiers_skip_review_when_content_matches_base() {
 
     let ticket = Arc::new(expect_ticket(board(), &ticket_id).await);
 
-    dispatch_verifiers(ticket, ws, REVIEWER_VI).await;
+    dispatch_verifiers(ticket, ws, REVIEWER_VI, false).await;
 
     let phase = expect_ticket_phase(board(), &ticket_id).await;
     assert_eq!(
         phase,
-        TicketPhase::Reviewed,
-        "Content identical to the reviewed base should skip review and go directly to Reviewed"
+        TicketPhase::InQa,
+        "Content identical to the reviewed base should skip review and go directly to InQa"
     );
 
     // Verify a SYSTEM_ROLE comment was written explaining the skip.
@@ -2129,17 +1135,6 @@ fn joint_comment_includes_failed_agent_dumps() {
         comment.contains("Agent 2"),
         "agent indices are 1-based: {comment}"
     );
-}
-
-#[test]
-fn raw_response_dump_section_covers_sanitation_shape() {
-    // The sanitation failure comment path reuses raw_response_dump_section;
-    // verify the same truncation/marker contract holds there.
-    let raw = "Sanitation agent output with details";
-    let failure = retry_exhausted_with_raw(Some(raw.to_string()));
-    let section = raw_response_dump_section(&failure);
-    assert!(section.contains("Raw agent response"), "{section}");
-    assert!(section.contains(raw), "{section}");
 }
 
 #[test]
@@ -2280,7 +1275,7 @@ async fn engineer_comment_text_fail_open_and_renders() {
     );
 }
 
-// ── Engineer hard-failure bounce ────────────────────────────────────────
+// ── Engineer failure paths (cancel, hard-failure, drain) ────────────────
 
 /// Build a test Engineer agent for the finalizer tests (registered with the
 /// ticket so cancellation-by-ticket works).
@@ -2297,168 +1292,10 @@ fn engineer_finalize_test_agent(ws: &Workspace, ticket: &Ticket, suffix: &str) -
     )
 }
 
-/// A genuine hard "Agent failed" outcome must NOT fail the ticket: it bounces
-/// back to ReadyForDevelopment (sharing the review/QA bounce budget, with the
-/// pipeline reservation for rework priority), pauses the workspace, and
-/// records the concrete error as an Engineer-role comment (the unified
-/// failure-comment role) so the Manager notification surfaces it.
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
-async fn engineer_hard_failure_bounces_to_ready_for_development() {
-    init_management_test_stores().await;
-    let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
-
-    let ws = create_test_workspace("/tmp/eng_bounce_ws", "ws_eng_bounce").await;
-    let ticket_id = make_ticket(board(), &ws, "Eng Hard Failure", TicketPhase::InDevelopment).await;
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    let mut agent = engineer_finalize_test_agent(&ws, &ticket, "hard");
-    agent.failure = Some("OpenRouter 500: service is too busy".to_string());
-
-    finalize_engineer_round(&ticket, &agent, None, "job_eng_bounce", false).await;
-
-    let t = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        t.phase,
-        TicketPhase::ReadyForDevelopment,
-        "a hard engineer failure must bounce the ticket, not fail it"
-    );
-    assert_eq!(
-        t.bounce_count, 1,
-        "the hard-failure bounce must consume the shared review/QA bounce budget"
-    );
-    assert!(
-        t.pipeline_reservation,
-        "the bounce must set rework priority over fresh ReadyForDevelopment tickets"
-    );
-
-    let ws_after = crate::workspace::store()
-        .get_by_name("ws_eng_bounce")
-        .await
-        .expect("query workspace")
-        .expect("workspace exists");
-    assert!(
-        ws_after.paused,
-        "a hard engineer failure must pause the workspace"
-    );
-
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get comments");
-    let last = comments.last().expect("failure comment written");
-    assert_eq!(
-        last.role,
-        Role::Engineer.as_str(),
-        "the failure comment must use the unified failure-comment role (the failing stage's role)"
-    );
-    assert!(
-        last.content.contains("OpenRouter 500: service is too busy"),
-        "the concrete error must be recorded on the ticket: {}",
-        last.content
-    );
-    assert!(
-        last.content.contains("Workspace paused"),
-        "the pause notice must be attached to the failure comment: {}",
-        last.content
-    );
-}
-
-/// The engineer hard-failure bounce trip: when the shared bounce budget is
-/// exhausted, the ticket moves to Failed (not RFD) — the workspace is STILL
-/// paused, ReadyForDevelopment siblings are NOT drained to Planning (unlike
-/// the verifier trip), the counter stays at the max, and both the trip
-/// comment and the concrete-error comment are written (trip first, so
-/// notify_ticket's last-comment lookup surfaces the error).
-#[tokio::test]
-#[serial_test::serial(reset_inflight)]
-#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
-async fn engineer_hard_failure_budget_exhaustion_fails_ticket() {
-    init_management_test_stores().await;
-    let (_lock, _policy_guard, _provider_guard) =
-        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
-
-    let ws = create_test_workspace("/tmp/eng_trip_ws", "ws_eng_trip").await;
-    let ticket_id = make_ticket(board(), &ws, "Eng Trip", TicketPhase::InDevelopment).await;
-    // A sibling RFD ticket that must NOT be drained to Planning by the trip.
-    let sibling_id = make_ticket(
-        board(),
-        &ws,
-        "Eng Trip Sibling",
-        TicketPhase::ReadyForDevelopment,
-    )
-    .await;
-    board()
-        .conn
-        .execute(
-            "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
-            turso::params![
-                i64::try_from(crate::joint_verdict::MAX_BOUNCES).unwrap(),
-                ticket_id.as_str()
-            ],
-        )
-        .await
-        .expect("set bounce_count to max");
-
-    let ticket = expect_ticket(board(), &ticket_id).await;
-    let mut agent = engineer_finalize_test_agent(&ws, &ticket, "trip");
-    agent.failure = Some("provider exploded".to_string());
-
-    finalize_engineer_round(&ticket, &agent, None, "job_eng_trip", false).await;
-
-    let t = expect_ticket(board(), &ticket_id).await;
-    assert_eq!(
-        t.phase,
-        TicketPhase::Failed,
-        "an engineer hard failure at the bounce budget max must fail the ticket"
-    );
-    assert_eq!(
-        t.bounce_count,
-        i64::try_from(crate::joint_verdict::MAX_BOUNCES).unwrap(),
-        "the failing bounce is not counted — the counter stays at the max"
-    );
-
-    let ws_after = crate::workspace::store()
-        .get_by_name("ws_eng_trip")
-        .await
-        .expect("query workspace")
-        .expect("workspace exists");
-    assert!(
-        ws_after.paused,
-        "the budget-exhausting hard failure must pause the workspace too"
-    );
-
-    let sibling = expect_ticket(board(), &sibling_id).await;
-    assert_eq!(
-        sibling.phase,
-        TicketPhase::ReadyForDevelopment,
-        "the engineer trip must NOT drain ReadyForDevelopment siblings to Planning"
-    );
-
-    let comments = board()
-        .get_comments(&ticket_id)
-        .await
-        .expect("get comments");
-    let trip_idx = comments
-        .iter()
-        .position(|c| c.content.contains("circuit breaker"))
-        .expect("trip comment written");
-    let failure_idx = comments
-        .iter()
-        .rposition(|c| c.content.contains("provider exploded"))
-        .expect("failure comment written");
-    assert!(
-        trip_idx < failure_idx,
-        "the trip comment must be written BEFORE the failure comment so the \
-         notification's last-comment lookup surfaces the concrete error"
-    );
-    assert_eq!(
-        comments[failure_idx].role,
-        Role::Engineer.as_str(),
-        "the failure comment must use the unified failure-comment role (the failing stage's role)"
-    );
-}
+/// A genuine hard "Agent failed" outcome must NOT fail the ticket: it pauses
+/// the workspace and freezes the implementation in place (the ticket stays in
+/// InDevelopment), and records the concrete error as a SYSTEM-role comment so
+/// the Manager notification and the resumed engineer's feedback surface it.
 
 /// A user-initiated cancellation of the engineer keeps today's semantics:
 /// ticket Failed + workspace paused, never auto-re-queued (no bounce).
@@ -2476,7 +1313,7 @@ async fn engineer_cancel_fails_ticket_without_bounce() {
     let agent = engineer_finalize_test_agent(&ws, &ticket, "cancel");
     crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
 
-    finalize_engineer_round(&ticket, &agent, None, "job_eng_cancel", false).await;
+    finalize_engineer_stage(&ticket, &agent, None, "job_eng_cancel", &ws, false).await;
 
     let t = expect_ticket(board(), &ticket_id).await;
     assert_eq!(
@@ -2511,6 +1348,306 @@ async fn engineer_cancel_fails_ticket_without_bounce() {
     );
 }
 
+/// A genuine engineer hard failure (non-cancelled) pauses the workspace and
+/// freezes the implementation in place: the ticket stays in InDevelopment (no bounce,
+/// no bounce-budget consumption), the workspace is paused and `jobs.status`
+/// stays 'launched', the implementation's launched roster rows are cleared, and a
+/// SYSTEM-role comment carrying the failure reason is written (so the Manager
+/// notification and the resumed engineer's feedback surface it).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn engineer_hard_failure_pauses_workspace_and_freezes_implementation() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
+
+    let ws = create_test_workspace("/tmp/eng_hard_ws", "ws_eng_hard").await;
+    let ticket_id = make_ticket(board(), &ws, "Eng Hard", TicketPhase::InDevelopment).await;
+    let job_id = "job_eng_hard";
+    let conn = &crate::session::store().conn;
+    crate::jobs::spawn_job(
+        conn,
+        job_id,
+        "task",
+        &ws.name,
+        "",
+        "",
+        Role::Engineer,
+        &[],
+        &crate::jobs::SpawnChild::TicketJob {
+            ticket_id: ticket_id.clone(),
+            stage: IMPLEMENTATION_STAGE_DEVELOPMENT.to_string(),
+            is_implementation: true,
+        },
+    )
+    .await
+    .expect("create implementation job");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let mut agent = engineer_finalize_test_agent(&ws, &ticket, "hard");
+    agent.failure = Some("boom".to_string());
+
+    finalize_engineer_stage(&ticket, &agent, None, job_id, &ws, false).await;
+
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::InDevelopment,
+        "an engineer hard failure must freeze the implementation in place, NOT fail the ticket"
+    );
+    assert_eq!(
+        t.bounce_count, 0,
+        "an engineer hard failure must not consume the bounce budget"
+    );
+
+    let ws_after = crate::workspace::store()
+        .get_by_name("ws_eng_hard")
+        .await
+        .expect("query workspace")
+        .expect("workspace exists");
+    assert!(
+        ws_after.paused,
+        "an engineer hard failure must pause the workspace"
+    );
+
+    let status: Option<String> = conn
+        .query_optional(
+            "SELECT status FROM jobs WHERE id = ?1",
+            crate::turso::params![job_id],
+            |row| row.get::<String>(0),
+        )
+        .await
+        .expect("query job status");
+    assert_eq!(
+        status.as_deref(),
+        Some("launched"),
+        "the implementation job must stay 'launched' (frozen, not done) after the hard failure"
+    );
+
+    let active: i64 = conn
+        .query_optional(
+            "SELECT COUNT(*) FROM agents WHERE job_id = ?1 AND status = 'launched'",
+            crate::turso::params![job_id],
+            |row| row.get(0),
+        )
+        .await
+        .expect("query active agents")
+        .expect("active-agent count row exists");
+    assert_eq!(
+        active, 0,
+        "the engineer's running roster row must be cleared"
+    );
+
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    let last = comments.last().expect("failure comment written");
+    assert_eq!(
+        last.role, SYSTEM_ROLE,
+        "the hard-failure comment is SYSTEM-role"
+    );
+    assert!(
+        last.content.contains("boom"),
+        "the failure reason must be recorded: {}",
+        last.content
+    );
+}
+
+/// The InDevelopment re-dispatch lane must feed outstanding feedback to the
+/// re-dispatched engineer. The poll loads the ticket with its comments
+/// (via `get_ticket`, `LoadComments::Yes`), so [`engineer_work_message`] sees the
+/// post-Engineer validation/rejecter comments and selects the bounce-feedback
+/// prompt when one exists, or the plain implement prompt otherwise.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+async fn in_development_redispatch_lane_feeds_feedback() {
+    init_management_test_stores().await;
+    let _lock = crate::util::test::retry_tests_lock();
+
+    let ws = create_test_workspace("/tmp/eng_redispatch_ws", "ws_eng_redispatch").await;
+    let ticket_id = make_ticket(board(), &ws, "Eng Redispatch", TicketPhase::InDevelopment).await;
+    let job_id = "job_eng_redispatch";
+    let conn = &crate::session::store().conn;
+    crate::jobs::spawn_job(
+        conn,
+        job_id,
+        "task",
+        &ws.name,
+        "",
+        "",
+        Role::Engineer,
+        &[],
+        &crate::jobs::SpawnChild::TicketJob {
+            ticket_id: ticket_id.clone(),
+            stage: IMPLEMENTATION_STAGE_DEVELOPMENT.to_string(),
+            is_implementation: true,
+        },
+    )
+    .await
+    .expect("create implementation job");
+
+    // An Engineer comment, then a post-Engineer validation failure comment.
+    board()
+        .add_comment(
+            &ticket_id,
+            Role::Engineer.as_str(),
+            "round 1 implementation",
+        )
+        .await
+        .expect("add engineer comment");
+    board()
+        .add_comment(
+            &ticket_id,
+            Role::Reviewer.as_str(),
+            "please fix the type error",
+        )
+        .await
+        .expect("add reviewer comment");
+
+    // The lane's re-fetch uses get_ticket (LoadComments::Yes), so comments are
+    // present and the message carries the post-Engineer feedback.
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let message = engineer_work_message(&ticket);
+    let expected = substitute(
+        &load_prompt("pipeline/bounce_feedback.md"),
+        &[("{{feedback}}", "please fix the type error")],
+    );
+    assert_eq!(
+        message, expected,
+        "the re-dispatched engineer must receive the post-Engineer feedback"
+    );
+    assert!(
+        message.contains("please fix the type error"),
+        "the feedback comment text must be embedded in the prompt"
+    );
+
+    // With only a pre-Engineer comment, the feedback set is empty → implement.
+    let second_id = make_ticket(board(), &ws, "Eng No Feedback", TicketPhase::InDevelopment).await;
+    board()
+        .add_comment(&second_id, Role::Analyst.as_str(), "pre-engineer note")
+        .await
+        .expect("add analyst comment");
+    board()
+        .add_comment(
+            &second_id,
+            Role::Engineer.as_str(),
+            "round 1 implementation",
+        )
+        .await
+        .expect("add engineer comment");
+    let ticket = expect_ticket(board(), &second_id).await;
+    let message = engineer_work_message(&ticket);
+    assert_eq!(
+        message,
+        load_prompt("implement.md"),
+        "no post-Engineer feedback → implement.md"
+    );
+}
+
+/// The direct-bounce auto-rework path must re-fetch the ticket fresh AFTER the
+/// validation failure comment is written, so the re-dispatched engineer receives
+/// the failure feedback (bounce_feedback) rather than the bare implement prompt.
+/// A stale in-memory clone would drop the just-written comment and regress the
+/// "a resumed engineer gets the outstanding feedback" invariant.
+///
+/// This drives the REAL `bounce_to_development` → spawned `dispatch_engineer`
+/// path and observes the first LLM request the re-dispatched engineer actually
+/// sends to the provider (captured by the `FakeProvider`). That request's user
+/// message IS `engineer_work_message(&ticket)` — the exact prompt handed to the
+/// engineer. If the re-fetch were reverted (a stale clone handed to
+/// `dispatch_engineer`), the prompt would be the bare `implement.md` and this
+/// assertion fails; it does NOT independently re-fetch the ticket.
+///
+/// The first provider request is asserted because a successful engineer round
+/// cascades into diagnostics/review, whose agents make further requests and
+/// overwrite `jobs.task` — but `request_messages[0]` is the immutable original
+/// re-dispatch prompt.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+async fn bounce_to_development_feeds_feedback_to_redispatch() {
+    use crate::util::test::{FakeProvider, install_fake_provider, install_test_retry_policy};
+
+    init_management_test_stores().await;
+    let _lock = crate::util::test::retry_tests_lock();
+    // The bounce spawns a real `dispatch_engineer` which drives a provider round;
+    // a fake provider records the prompt (and keeps the detached task from
+    // touching a real endpoint at teardown).
+    let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+    let fake = std::sync::Arc::new(FakeProvider::new().ok("implemented"));
+    let _provider = install_fake_provider(fake.clone());
+
+    let ws = create_test_workspace("/tmp/eng_bounce_feedback_ws", "ws_eng_bounce_feedback").await;
+    let ticket_id = make_ticket(
+        board(),
+        &ws,
+        "Eng Bounce Feedback",
+        TicketPhase::InDiagnostics,
+    )
+    .await;
+    let job_id = "job_eng_bounce_feedback";
+    let conn = &crate::session::store().conn;
+    crate::jobs::spawn_job(
+        conn,
+        job_id,
+        "task",
+        &ws.name,
+        "",
+        "",
+        Role::Engineer,
+        &[],
+        &crate::jobs::SpawnChild::TicketJob {
+            ticket_id: ticket_id.clone(),
+            stage: IMPLEMENTATION_STAGE_DEVELOPMENT.to_string(),
+            is_implementation: true,
+        },
+    )
+    .await
+    .expect("create implementation job");
+
+    // The bounce writes the validation failure comment and re-dispatches.
+    let stale = expect_ticket(board(), &ticket_id).await;
+    let outcome = bounce_to_development(
+        &stale,
+        TicketPhase::InDiagnostics,
+        "Diagnostics",
+        /* drains_siblings */ true,
+        DIAGNOSTICS_ROLE,
+        "failed: type error",
+        job_id,
+        &ws,
+    )
+    .await;
+    assert!(matches!(outcome, FinalizeOutcome::Applied));
+
+    // Wait for the spawned dispatch_engineer to make its first LLM request.
+    let mut messages = Vec::new();
+    for _ in 0..50 {
+        messages = fake.request_messages.lock().unwrap().clone();
+        if !messages.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        !messages.is_empty(),
+        "the re-dispatched engineer never reached the provider"
+    );
+
+    let first = &messages[0];
+    assert!(
+        first.contains("failed: type error"),
+        "re-dispatched engineer's first prompt must carry the just-written failure feedback; got: {first}"
+    );
+    assert!(
+        !first.contains(&load_prompt("implement.md")),
+        "a bounce re-dispatch must select the feedback prompt, not the bare implement"
+    );
+}
+
 /// A drain-cut engineer round (response None + graceful drain active) must
 /// leave the job 'launched' for boot resume — no bounce, no Failed
 /// transition, no failure comment, no pause (requirement 4). Uses a REAL
@@ -2530,7 +1667,7 @@ async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
     JobRowBuilder::new(
         &crate::session::store().conn,
         job_id,
-        "ticket_stage",
+        "ticket_implementation",
         "engineer",
         &ws.name,
     )
@@ -2543,7 +1680,7 @@ async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
     agent.failure = Some("drained boom".to_string());
 
     crate::shutdown::drain_begin();
-    finalize_engineer_round(&ticket, &agent, None, job_id, false).await;
+    finalize_engineer_stage(&ticket, &agent, None, job_id, &ws, false).await;
     // Clear the process-global drain flag BEFORE the assertions so a failing
     // assert cannot poison the serialized group.
     crate::shutdown::drain_clear();
@@ -2593,7 +1730,7 @@ async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
 
 /// The post-pause drain guard inside [`handle_engineer_failure`] — the second
 /// aborting check, after the workspace-pause await (the first real gap after
-/// the caller's initial [`stage_round_drain_cut`]) — must bail without any
+/// the caller's initial [`stage_drain_cut`]) — must bail without any
 /// side effects and return `false`, so the caller leaves the job
 /// status='launched' for boot resume: no bounce, no Failed transition, no
 /// comment, no pause. The test drives the drain pre-active so the guard's
@@ -2619,7 +1756,7 @@ async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
     JobRowBuilder::new(
         &crate::session::store().conn,
         job_id,
-        "ticket_stage",
+        "ticket_implementation",
         "engineer",
         &ws.name,
     )
@@ -2633,7 +1770,7 @@ async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
     agent.failure = Some("drained boom".to_string());
 
     crate::shutdown::drain_begin();
-    let bailed = handle_engineer_failure(&ticket, &agent, false).await;
+    let bailed = handle_engineer_failure(&ticket, &agent, "job_midtail", &ws, false).await;
     // Clear the process-global drain flag BEFORE the assertions so a failing
     // assert cannot poison the serialized group.
     crate::shutdown::drain_clear();
@@ -2685,105 +1822,47 @@ async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
     );
 }
 
-// ── ticket_stage roster helpers ──────────────────────────────────────────
+// ── ticket_analysis roster helpers ──────────────────────────────────────────
 // These pin the agent-id / angle-cycling contract shared by
-// `spawn_ticket_stage_round` (fresh dispatch) and `append_ticket_stage_slots`
-// (analysis escalation). The fresh-dispatch paths funnel their job+child-row
-// spawn tail through `spawn_ticket_stage_job`. The helpers are the single
+// `spawn_ticket_analysis_round` (fresh dispatch) and `append_ticket_analysis_slots`
+// (analysis escalation). The fresh-dispatch path funnels its job+child-row
+// spawn tail through `spawn_job`. The helpers are the single
 // home for both rules — if the shape ever changes, these tests are the first
 // to notice.
 
 /// The agent-id helper must produce the exact documented shape
 /// `ticket_{ticket_id}_{idx}_{suffix}_{role}` for both dispatch paths.
 #[test]
-fn ticket_stage_agent_id_format() {
+fn agent_id_format() {
     assert_eq!(
-        ticket_stage_agent_id("t-42", 0, "abc123", Role::Analyst),
+        agent_id("t-42", 0, "abc123", Role::Analyst),
         "ticket_t-42_0_abc123_analyst",
         "base-round slot 0"
     );
     assert_eq!(
-        ticket_stage_agent_id("t-42", 2, "abc123", Role::Analyst),
+        agent_id("t-42", 2, "abc123", Role::Analyst),
         "ticket_t-42_2_abc123_analyst",
         "base-round slot 2"
     );
     // Escalation continues at the roster length (3, 4) with a FRESH suffix.
     assert_eq!(
-        ticket_stage_agent_id("t-42", 3, "def456", Role::Analyst),
+        agent_id("t-42", 3, "def456", Role::Analyst),
         "ticket_t-42_3_def456_analyst",
         "escalation slot 3"
     );
     assert_eq!(
-        ticket_stage_agent_id("t-42", 4, "def456", Role::Analyst),
+        agent_id("t-42", 4, "def456", Role::Analyst),
         "ticket_t-42_4_def456_analyst",
         "escalation slot 4"
     );
     // Role string is the canonical lowercase `as_str()` (role LAST).
     assert_eq!(
-        ticket_stage_agent_id("t-7", 0, "xyz789", Role::Reviewer),
+        agent_id("t-7", 0, "xyz789", Role::Reviewer),
         "ticket_t-7_0_xyz789_reviewer"
     );
     assert_eq!(
-        ticket_stage_agent_id("t-7", 0, "xyz789", Role::Qa),
+        agent_id("t-7", 0, "xyz789", Role::Qa),
         "ticket_t-7_0_xyz789_qa"
-    );
-}
-
-/// The angle-cycling rule must cover all three branches: bare prompt (no
-/// angles), join-all for single-slot rounds, and per-index cycling with wrap.
-#[test]
-fn ticket_stage_slot_task_angle_branches() {
-    let prompt = "Review the change";
-    let angles = vec!["angle one".to_string(), "angle two".to_string()];
-
-    // No angles → bare prompt untouched (Analyst-style roles).
-    assert_eq!(
-        ticket_stage_slot_task(prompt, &[], 3, 1),
-        prompt,
-        "no angles: shared prompt used verbatim"
-    );
-
-    // Single-slot round (QA's lone tester) → ALL angle sections joined.
-    assert_eq!(
-        ticket_stage_slot_task(prompt, &angles, 1, 0),
-        format!("{prompt}\n\nangle one\n\nangle two"),
-        "slot_count == 1 concatenates every angle section"
-    );
-
-    // Multi-slot round → cycling by GLOBAL slot index, wrapping past len.
-    assert_eq!(
-        ticket_stage_slot_task(prompt, &angles, 2, 0),
-        format!("{prompt}\n\nangle one"),
-        "global idx 0 → first angle"
-    );
-    assert_eq!(
-        ticket_stage_slot_task(prompt, &angles, 2, 1),
-        format!("{prompt}\n\nangle two"),
-        "global idx 1 → second angle"
-    );
-    assert_eq!(
-        ticket_stage_slot_task(prompt, &angles, 2, 2),
-        format!("{prompt}\n\nangle one"),
-        "global idx 2 wraps to first angle"
-    );
-    assert_eq!(
-        ticket_stage_slot_task(prompt, &angles, 2, 3),
-        format!("{prompt}\n\nangle two"),
-        "global idx 3 wraps to second angle"
-    );
-
-    // Escalation view: the job is the whole — a base roster of 3 + 2
-    // escalation slots must keep angle selection continuous (idx 3, 4).
-    let angles3 = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-    assert_eq!(
-        ticket_stage_slot_task(prompt, &angles3, 5, 3),
-        format!("{prompt}\n\na"),
-        "escalation global idx 3 → angles[3 % 3]"
-    );
-    assert_eq!(
-        ticket_stage_slot_task(prompt, &angles3, 5, 4),
-        format!("{prompt}\n\nb"),
-        "escalation global idx 4 → angles[4 % 3]"
     );
 }
 

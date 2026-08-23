@@ -2,7 +2,6 @@ use super::*;
 use crate::Role;
 use crate::Tool;
 use crate::Workspace;
-use crate::role::DIAGNOSTICS_ROLE;
 use crate::util::test::TicketBuilder;
 use crate::util::test::assert_superseded_ticket;
 use crate::util::test::expect_ticket;
@@ -10,7 +9,6 @@ use crate::util::test::init_test_stores;
 use crate::util::test::make_ticket;
 use crate::workspace::test_ws;
 use crate::workspace::test_ws_named;
-use strum::IntoEnumIterator;
 use tempfile::TempDir;
 
 /// Scenarios for testing invalid prerequisite/supersede inputs.
@@ -71,7 +69,7 @@ async fn test_get_ticket_phase() {
 
     // After transition, reflects new phase.
     store
-        .transition_to(&id, None, TicketPhase::ReadyForDevelopment, None)
+        .transition_to(&id, None, TicketPhase::ReadyForDevelopment)
         .await
         .expect("set");
     let phase = crate::util::test::expect_ticket_phase(&store, &id).await;
@@ -110,104 +108,13 @@ async fn test_get_tickets_by_ids() {
     }
 }
 
-#[test]
-fn test_ticket_phase_parse_and_roundtrip() {
-    // Roundtrip: as_ref() -> parse() for every variant
-    for v in TicketPhase::iter() {
-        let parsed: TicketPhase = v.as_ref().parse().unwrap();
-        assert_eq!(&parsed, &v, "roundtrip failed for {v}");
-    }
-
-    // Error case — verify error message includes helpful details.
-    let err = "unknown_phase".parse::<TicketPhase>().unwrap_err();
-    let msg = format!("{err}");
-
-    assert!(
-        msg.contains("Invalid phase"),
-        "error should mention 'Invalid phase', got: {msg}"
-    );
-    assert!(
-        msg.contains("unknown_phase"),
-        "error should contain the invalid input value, got: {msg}"
-    );
-    assert!(
-        TicketPhase::iter().any(|p| msg.contains(p.as_ref())),
-        "error should list at least one valid phase, got: {msg}"
-    );
-}
-
-#[test]
-fn test_display_name_no_underscores() {
-    // Every variant's display_name() must be underscore-free
-    // and non-empty.
-    for variant in TicketPhase::iter() {
-        let name = variant.display_name();
-        assert!(!name.is_empty(), "empty display_name for {variant}");
-        assert!(
-            !name.contains('_'),
-            "display_name for {variant} still has underscore: {name}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn test_unconditional_transition_clears_assignment() {
-    let (store, _tmp, id) = setup().await;
-
-    // Claim the ticket (sets assigned_to to NULL by default)
-    let claimed = store
-        .claim_ticket_in_workspace(
-            TicketPhase::Backlog,
-            TicketPhase::InDevelopment,
-            "ws",
-            PipelineCheck::Skip,
-            None,
-        )
-        .await
-        .expect("claim")
-        .expect("ticket exists");
-
-    // Set assigned_to explicitly (matching production dispatch_engineer behavior)
-    store
-        .set_assigned_to_no_cancel(&claimed.id, Some(Role::Engineer.as_str()))
-        .await
-        .expect("set_assigned_to");
-    let ticket = store
-        .get_ticket(&id)
-        .await
-        .expect("get")
-        .expect("should exist");
-    assert!(
-        ticket.assigned_to.is_some(),
-        "assigned_to should be set after set_assigned_to"
-    );
-
-    // Update phase — this should clear assigned_to
-    store
-        .transition_to(&id, None, TicketPhase::DiagnosticsDone, None)
-        .await
-        .expect("update");
-
-    let ticket = crate::util::test::expect_ticket(&store, &id).await;
-    assert_eq!(ticket.phase, TicketPhase::DiagnosticsDone);
-    assert!(
-        ticket.assigned_to.is_none(),
-        "assigned_to should be cleared after unconditional transition"
-    );
-}
-
 #[tokio::test]
 async fn test_guarded_transition() {
     let (store, _tmp, id) = setup().await;
 
     // Wrong expected phase — should fail, ticket unchanged.
     let result = store
-        .transition_to(
-            &id,
-            Some(TicketPhase::Done),
-            TicketPhase::InDevelopment,
-            None,
-        )
+        .transition_to(&id, Some(TicketPhase::Done), TicketPhase::InDevelopment)
         .await;
     assert!(
         result.is_err(),
@@ -218,12 +125,7 @@ async fn test_guarded_transition() {
 
     // Correct expected phase — should succeed.
     store
-        .transition_to(
-            &id,
-            Some(TicketPhase::Backlog),
-            TicketPhase::InDevelopment,
-            None,
-        )
+        .transition_to(&id, Some(TicketPhase::Backlog), TicketPhase::InDevelopment)
         .await
         .expect("guarded transition with correct phase should succeed");
     let ticket = crate::util::test::expect_ticket(&store, &id).await;
@@ -274,7 +176,7 @@ async fn test_list_tickets() {
     assert_eq!(tickets.len(), 0);
 }
 
-/// Verify that `reset_inflight_tickets` correctly transitions each in-flight
+/// Verify that `reset_analysis_tickets` correctly transitions each in-flight
 /// ticket phase back to its ready state, and that non-inflight phases (e.g.
 /// Backlog) are left untouched.
 ///
@@ -287,7 +189,7 @@ async fn test_list_tickets() {
 /// the attribute is load-bearing for the group, not for this test's own data.
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
-async fn test_reset_inflight_tickets() {
+async fn test_reset_analysis_tickets() {
     /// A single reset transition case.
     struct Case {
         name: &'static str,
@@ -297,8 +199,6 @@ async fn test_reset_inflight_tickets() {
         start: TicketPhase,
         /// The expected phase after reset.
         expected: TicketPhase,
-        /// Expected pipeline_reservation after reset.
-        reservation: bool,
     }
 
     let cases = [
@@ -307,49 +207,44 @@ async fn test_reset_inflight_tickets() {
             suffix: "a",
             start: TicketPhase::Backlog,
             expected: TicketPhase::Backlog,
-            reservation: false,
         },
         Case {
-            name: "Analysis → Backlog (no reservation)",
+            name: "Analysis → Backlog",
             suffix: "b",
             start: TicketPhase::Analysis,
             expected: TicketPhase::Backlog,
-            reservation: false,
         },
+        // Implementation-protected occupied phases are NOT reset: a resumed implementation
+        // keeps them in phase. Only Analysis → Backlog is reset.
         Case {
-            name: "InDevelopment → ReadyForDevelopment (reservation=1)",
+            name: "InDevelopment stays (implementation-protected)",
             suffix: "c",
             start: TicketPhase::InDevelopment,
-            expected: TicketPhase::ReadyForDevelopment,
-            reservation: true,
+            expected: TicketPhase::InDevelopment,
         },
         Case {
-            name: "InDiagnostics → ReadyForDevelopment (reservation=1)",
+            name: "InDiagnostics stays (implementation-protected)",
             suffix: "d",
             start: TicketPhase::InDiagnostics,
-            expected: TicketPhase::ReadyForDevelopment,
-            reservation: true,
+            expected: TicketPhase::InDiagnostics,
         },
         Case {
-            name: "InSanitation → QaPassed (reservation=1)",
+            name: "InSanitation stays (implementation-protected)",
             suffix: "e",
             start: TicketPhase::InSanitation,
-            expected: TicketPhase::QaPassed,
-            reservation: true,
+            expected: TicketPhase::InSanitation,
         },
         Case {
-            name: "InQa → Reviewed (no reservation)",
+            name: "InQa stays (implementation-protected)",
             suffix: "f",
             start: TicketPhase::InQa,
-            expected: TicketPhase::Reviewed,
-            reservation: false,
+            expected: TicketPhase::InQa,
         },
         Case {
-            name: "InReview → DiagnosticsDone (no reservation)",
+            name: "InReview stays (implementation-protected)",
             suffix: "g",
             start: TicketPhase::InReview,
-            expected: TicketPhase::DiagnosticsDone,
-            reservation: false,
+            expected: TicketPhase::InReview,
         },
     ];
 
@@ -360,7 +255,7 @@ async fn test_reset_inflight_tickets() {
 
         let id = make_ticket(&store, &ws, case.name, case.start).await;
 
-        store.reset_inflight_tickets(&[]).await.expect("reset");
+        store.reset_analysis_tickets(&[]).await.expect("reset");
 
         let t = expect_ticket(&store, &id).await;
         assert_eq!(
@@ -368,282 +263,7 @@ async fn test_reset_inflight_tickets() {
             "Case '{}': unexpected phase after reset",
             case.name,
         );
-        assert_eq!(
-            t.pipeline_reservation, case.reservation,
-            "Case '{}': unexpected pipeline_reservation after reset",
-            case.name,
-        );
-        assert!(
-            t.assigned_to.is_none(),
-            "Case '{}': assigned_to should be NULL after reset",
-            case.name,
-        );
     }
-}
-
-#[tokio::test]
-async fn test_claim_prefers_reserved_ticket() {
-    let (store, _tmp) = open_test_store().await;
-    let ws = test_ws_named("/ws", "ws");
-
-    // Create two ReadyForDevelopment tickets
-    let fresh_id = make_ticket(&store, &ws, "Fresh", TicketPhase::ReadyForDevelopment).await;
-    let reserved_id = make_ticket(&store, &ws, "Reserved", TicketPhase::ReadyForDevelopment).await;
-
-    // Set reservation on the second ticket
-    store
-        .transition_to(
-            &reserved_id,
-            Some(TicketPhase::ReadyForDevelopment),
-            TicketPhase::ReadyForDevelopment,
-            Some(true),
-        )
-        .await
-        .expect("set reservation");
-
-    // When claiming with PipelineCheck::Enforce, the reserved ticket should be picked first
-    let claimed = store
-        .claim_ticket_in_workspace(
-            TicketPhase::ReadyForDevelopment,
-            TicketPhase::InDevelopment,
-            "ws",
-            PipelineCheck::Enforce,
-            None,
-        )
-        .await
-        .expect("claim")
-        .expect("should claim a ticket");
-    assert_eq!(
-        claimed.id, reserved_id,
-        "Reserved ticket should be claimed before fresh one"
-    );
-    assert!(
-        !claimed.pipeline_reservation,
-        "Claim should clear pipeline_reservation"
-    );
-
-    // Verify the cleared reservation is persisted in the DB
-    // (the returned Ticket struct already reflects the DB state, but
-    // a separate re-read explicitly tests persistence).
-    let reserved_db = expect_ticket(&store, &reserved_id).await;
-    assert!(
-        !reserved_db.pipeline_reservation,
-        "Reservation should be 0 in DB after claim"
-    );
-
-    // After the reserved ticket is claimed (now InDevelopment, pipeline-occupied),
-    // the fresh ticket is still at ReadyForDevelopment but cannot be claimed
-    // because the pipeline is occupied. Verify the fresh ticket remains untouched.
-    let fresh = expect_ticket(&store, &fresh_id).await;
-    assert_eq!(
-        fresh.phase,
-        TicketPhase::ReadyForDevelopment,
-        "Fresh ticket should still be at ReadyForDevelopment"
-    );
-    assert!(
-        !fresh.pipeline_reservation,
-        "Fresh ticket should have no reservation"
-    );
-}
-
-#[tokio::test]
-async fn test_terminal_transition_clears_reservation() {
-    let (store, _tmp) = open_test_store().await;
-    let ws = test_ws_named("/ws", "ws");
-
-    // Reserve a ticket the way a bounce-back does.
-    let id = make_ticket(&store, &ws, "Bounced", TicketPhase::Backlog).await;
-    store
-        .transition_to(
-            &id,
-            Some(TicketPhase::Backlog),
-            TicketPhase::ReadyForDevelopment,
-            Some(true),
-        )
-        .await
-        .expect("reserve");
-    assert!(
-        expect_ticket(&store, &id).await.pipeline_reservation,
-        "bounce-back should set reservation"
-    );
-
-    // Terminal transition (done) clears the flag even with reservation = None.
-    store
-        .transition_to(&id, None, TicketPhase::Done, None)
-        .await
-        .expect("done");
-    let t = expect_ticket(&store, &id).await;
-    assert_eq!(t.phase, TicketPhase::Done);
-    assert!(
-        !t.pipeline_reservation,
-        "terminal transition must clear pipeline_reservation"
-    );
-
-    // Non-terminal control: a planning transition preserves the flag.
-    let ctl = make_ticket(&store, &ws, "Control", TicketPhase::Backlog).await;
-    store
-        .transition_to(
-            &ctl,
-            Some(TicketPhase::Backlog),
-            TicketPhase::ReadyForDevelopment,
-            Some(true),
-        )
-        .await
-        .expect("reserve control");
-    store
-        .transition_to(&ctl, None, TicketPhase::Planning, None)
-        .await
-        .expect("planning");
-    let ctl = expect_ticket(&store, &ctl).await;
-    assert_eq!(ctl.phase, TicketPhase::Planning);
-    assert!(
-        ctl.pipeline_reservation,
-        "non-terminal transition must preserve pipeline_reservation"
-    );
-}
-
-#[tokio::test]
-async fn test_supersede_clears_reservation() {
-    init_test_stores().await;
-    let store = crate::board::BOARD.get().unwrap();
-    let ws = test_ws_named("/ws", "ws");
-    let old_id = make_ticket(store, &ws, "Test", TicketPhase::Backlog).await;
-    store
-        .transition_to(
-            &old_id,
-            Some(TicketPhase::Backlog),
-            TicketPhase::ReadyForDevelopment,
-            Some(true),
-        )
-        .await
-        .expect("reserve");
-
-    TicketBuilder::new(store, &ws)
-        .title("New title")
-        .desc("New desc")
-        .supersede(&old_id)
-        .await
-        .expect("supersede");
-
-    let old = expect_ticket(store, &old_id).await;
-    assert_superseded_ticket(&old);
-    assert!(
-        !old.pipeline_reservation,
-        "supersede cancellation must clear pipeline_reservation"
-    );
-}
-
-#[tokio::test]
-async fn test_clear_terminal_reservations_sweep() {
-    let (store, _tmp) = open_test_store().await;
-    let ws = test_ws_named("/ws", "ws");
-
-    // Stale pre-fix rows: terminal-phase tickets carrying a reservation,
-    // including the archived shape (is_archived = 1, like the live stale row).
-    let done_id = make_ticket(&store, &ws, "Done", TicketPhase::Done).await;
-    let cancelled_id = make_ticket(&store, &ws, "Cancelled", TicketPhase::Cancelled).await;
-    let failed_id = make_ticket(&store, &ws, "Failed", TicketPhase::Failed).await;
-    let archived_id = make_ticket(&store, &ws, "Archived", TicketPhase::Done).await;
-    store.set_archived(&archived_id).await.expect("archive");
-    for id in [&done_id, &cancelled_id, &failed_id, &archived_id] {
-        store
-            .conn
-            .execute(
-                "UPDATE tickets SET pipeline_reservation = 1 WHERE id = ?1",
-                crate::turso::params![id.clone()],
-            )
-            .await
-            .expect("stale reservation");
-    }
-    let archived_before = expect_ticket(&store, &archived_id).await;
-
-    // Reserved non-terminal ticket must survive the sweep.
-    let reserved_id = make_ticket(&store, &ws, "Reserved", TicketPhase::ReadyForDevelopment).await;
-    store
-        .transition_to(
-            &reserved_id,
-            Some(TicketPhase::ReadyForDevelopment),
-            TicketPhase::ReadyForDevelopment,
-            Some(true),
-        )
-        .await
-        .expect("reserve");
-
-    assert_eq!(
-        store.clear_terminal_reservations().await.expect("sweep"),
-        4,
-        "sweep should clear all four stale terminal rows"
-    );
-
-    for id in [&done_id, &cancelled_id, &failed_id, &archived_id] {
-        assert!(
-            !expect_ticket(&store, id).await.pipeline_reservation,
-            "sweep must clear reservation on {id}"
-        );
-    }
-    let archived_after = expect_ticket(&store, &archived_id).await;
-    assert_eq!(
-        archived_after.updated_at, archived_before.updated_at,
-        "sweep must not bump updated_at"
-    );
-    assert!(
-        expect_ticket(&store, &reserved_id)
-            .await
-            .pipeline_reservation,
-        "sweep must not touch non-terminal reserved tickets"
-    );
-}
-
-#[tokio::test]
-async fn test_has_pipeline_occupant_reserved() {
-    let (store, _tmp) = open_test_store().await;
-    let ws = test_ws_named("/ws", "ws");
-
-    // A fresh ReadyForDevelopment ticket should NOT be a pipeline occupant
-    let id = make_ticket(&store, &ws, "Fresh", TicketPhase::ReadyForDevelopment).await;
-    assert!(
-        !store
-            .has_pipeline_occupant_for_workspace("ws")
-            .await
-            .expect("check"),
-        "Fresh ReadyForDevelopment ticket should not be a pipeline occupant"
-    );
-
-    // After setting reservation, it should be a pipeline occupant
-    store
-        .transition_to(
-            &id,
-            Some(TicketPhase::ReadyForDevelopment),
-            TicketPhase::ReadyForDevelopment,
-            Some(true),
-        )
-        .await
-        .expect("set reservation");
-    assert!(
-        store
-            .has_pipeline_occupant_for_workspace("ws")
-            .await
-            .expect("check"),
-        "Reserved ReadyForDevelopment ticket should be a pipeline occupant"
-    );
-
-    // After removing reservation, it should not be a pipeline occupant
-    store
-        .transition_to(
-            &id,
-            Some(TicketPhase::ReadyForDevelopment),
-            TicketPhase::ReadyForDevelopment,
-            Some(false),
-        )
-        .await
-        .expect("clear reservation");
-    assert!(
-        !store
-            .has_pipeline_occupant_for_workspace("ws")
-            .await
-            .expect("check"),
-        "Non-reserved ReadyForDevelopment ticket should not be a pipeline occupant again"
-    );
 }
 
 /// Assert that [`BoardStore::has_active_tickets_excluding`] returns the
@@ -686,11 +306,9 @@ async fn create_non_active_tickets(store: &BoardStore) -> Vec<String> {
 /// active tickets (PIPELINE_OCCUPIED_PHASES + ReadyForDevelopment) per workspace,
 /// excluding a specified ticket ID.
 ///
-/// Active tickets include all ReadyForDevelopment tickets regardless of
-/// `pipeline_reservation`, unlike [`has_pipeline_occupant_for_workspace`] which
-/// requires `pipeline_reservation = 1`. This is intentional — unstarted backlog
-/// tickets are considered active to suppress Done notifications until the pipeline
-/// is fully drained.
+/// Active tickets include all ReadyForDevelopment tickets. This is intentional —
+/// unstarted backlog tickets are considered active to suppress Done notifications
+/// until the pipeline is fully drained.
 #[tokio::test]
 async fn test_has_active_tickets_excluding() {
     let (store, _tmp) = open_test_store().await;
@@ -742,8 +360,7 @@ async fn test_has_active_tickets_excluding() {
         .await;
     }
 
-    // ReadyForDevelopment without reservation counts as active
-    // (rfd_id already has no reservation — it was created with default)
+    // ReadyForDevelopment counts as active regardless of its pipeline state
     assert_active_excluding(
         &store,
         "ws",
@@ -786,56 +403,6 @@ async fn test_has_active_tickets_excluding() {
     .await;
 }
 
-/// Verify that every non-transitory pipeline-occupied phase has a reset transition.
-///
-/// [`PIPELINE_OCCUPIED_PHASES`] defines 9 phases; 5 of them (InDevelopment,
-/// InDiagnostics, InSanitation, InReview, InQa) have entries in
-/// [`RESET_TRANSITIONS`]. The remaining 4 phases
-/// ([`TRANSITORY_HANDOFF_PHASES`]) are transitory handoff states that the
-/// poller picks up within seconds — no agent is mid-execution in those states,
-/// so they don't need reset entries.
-///
-/// This test does NOT assert the reverse direction (reset → pipeline occupant),
-/// because [`RESET_TRANSITIONS`] also includes `Analysis → Backlog`, and `Analysis`
-/// is intentionally not a pipeline occupant (it's a pre-flight phase).
-///
-/// It also mechanically verifies that [`TRANSITORY_HANDOFF_PHASES`] is a subset of
-/// [`PIPELINE_OCCUPIED_PHASES`], ensuring the two sets stay in sync.
-#[test]
-fn test_pipeline_occupancy_coverage() {
-    // Verify that every transitory handoff phase is a pipeline occupant.
-    for phase in TRANSITORY_HANDOFF_PHASES {
-        assert!(
-            PIPELINE_OCCUPIED_PHASES.contains(phase),
-            "\
-TRANSITORY_HANDOFF_PHASES contains `{phase}` which is not in \
-PIPELINE_OCCUPIED_PHASES. Every transitory handoff phase must also \
-be a pipeline occupant.\
-                ",
-        );
-    }
-
-    // Collect all `from` phases from BoardStore::RESET_TRANSITIONS for easy lookup.
-    let reset_from: Vec<TicketPhase> = BoardStore::RESET_TRANSITIONS
-        .iter()
-        .map(|t| t.from)
-        .collect();
-
-    for phase in PIPELINE_OCCUPIED_PHASES {
-        let has_reset = reset_from.contains(phase);
-        assert!(
-            has_reset || phase.is_transitory_handoff(),
-            "\
-PIPELINE_OCCUPIED_PHASES contains `{phase}` which has no corresponding \
-entry in RESET_TRANSITIONS and is not a transitory handoff phase \
-(see `TicketPhase::is_transitory_handoff`). Either add a reset transition to \
-RESET_TRANSITIONS, or mark the phase as transitory handoff in that method \
-with a comment explaining why no agent is mid-execution in that state.\
-                ",
-        );
-    }
-}
-
 #[tokio::test]
 async fn test_claim_ticket_in_workspace() {
     let (store, _tmp) = open_test_store().await;
@@ -863,7 +430,6 @@ async fn test_claim_ticket_in_workspace() {
     assert_eq!(claimed_a.id, id_a);
     assert_eq!(claimed_a.workspace_name, "workspace_a");
     assert_eq!(claimed_a.phase, TicketPhase::InDevelopment);
-    assert!(claimed_a.assigned_to.is_none());
 
     // Claim from workspace A again — should return None (no more backlog tickets)
     assert!(
@@ -1296,7 +862,7 @@ async fn test_transitive_prerequisites_block() {
 
     // Move A to done
     store
-        .transition_to(&a, None, TicketPhase::Done, None)
+        .transition_to(&a, None, TicketPhase::Done)
         .await
         .expect("done a");
 
@@ -1316,7 +882,7 @@ async fn test_transitive_prerequisites_block() {
 
     // Move B to done
     store
-        .transition_to(&b, None, TicketPhase::Done, None)
+        .transition_to(&b, None, TicketPhase::Done)
         .await
         .expect("done b");
 
@@ -1713,7 +1279,7 @@ async fn test_transactional_triple_write() {
         // transaction → commit → all visible (or error rollback → none persist).
         let (store, _tmp) = open_test_store().await;
         let ws = test_ws_named("/ws", "ws");
-        let id = make_ticket(&store, &ws, "Test", TicketPhase::QaPassed).await;
+        let id = make_ticket(&store, &ws, "Test", TicketPhase::InQa).await;
 
         let label = if should_succeed { "commit" } else { "rollback" };
         let result: anyhow::Result<()> =
@@ -1733,14 +1299,8 @@ async fn test_transactional_triple_write() {
                     "triple write comment",
                 )
                 .await?;
-                BoardStore::transition_to_tx(
-                    tx,
-                    &id,
-                    Some(TicketPhase::QaPassed),
-                    TicketPhase::Done,
-                    None,
-                )
-                .await?;
+                BoardStore::transition_to_tx(tx, &id, Some(TicketPhase::InQa), TicketPhase::Done)
+                    .await?;
                 if should_succeed {
                     Ok(())
                 } else {
@@ -1786,7 +1346,7 @@ async fn test_transactional_triple_write() {
             );
             assert_eq!(
                 ticket.phase,
-                TicketPhase::QaPassed,
+                TicketPhase::InQa,
                 "({label}) phase after rollback",
             );
             assert_eq!(comments.len(), 0, "({label}) comments.len after rollback");
@@ -1915,10 +1475,8 @@ async fn corrupt_prerequisites_causes_query_errors() {
 #[tokio::test]
 async fn test_claim_diagnostics() {
     enum Scenario {
-        /// Ticket is unassigned and in InDiagnostics — claim should succeed.
+        /// Ticket is in InDiagnostics — claim should succeed.
         Success,
-        /// Ticket is already assigned — claim should fail.
-        AlreadyAssigned,
         /// Ticket is in a different phase — claim should fail.
         WrongPhase,
     }
@@ -1930,12 +1488,8 @@ async fn test_claim_diagnostics() {
 
     let cases = [
         Case {
-            name: "unassigned in diagnostics succeeds",
+            name: "in diagnostics succeeds",
             scenario: Scenario::Success,
-        },
-        Case {
-            name: "already assigned fails",
-            scenario: Scenario::AlreadyAssigned,
         },
         Case {
             name: "wrong phase fails",
@@ -1955,220 +1509,33 @@ async fn test_claim_diagnostics() {
         };
         let id = make_ticket(&store, &ws, &title, phase).await;
 
-        if matches!(case.scenario, Scenario::AlreadyAssigned) {
-            store
-                .set_assigned_to_no_cancel(&id, Some(DIAGNOSTICS_ROLE))
-                .await
-                .expect("set_assigned_to");
-        }
-
         let claimed = store
-            .claim_diagnostics(&id, DIAGNOSTICS_ROLE)
+            .claim_diagnostics(&id)
             .await
             .expect("claim_diagnostics");
 
         match case.scenario {
             Scenario::Success => {
                 assert!(claimed, "Case '{}': expected claim to succeed", case.name);
-
-                // Verify post-claim state.
+                // Claim is a phase-CAS: the ticket stays in InDiagnostics.
                 let ticket = crate::util::test::expect_ticket(&store, &id).await;
-                assert_eq!(
-                    ticket.assigned_to.as_deref(),
-                    Some(DIAGNOSTICS_ROLE),
-                    "Case '{}': assignee should be set",
-                    case.name
-                );
                 assert_eq!(
                     ticket.phase,
                     TicketPhase::InDiagnostics,
                     "Case '{}': phase should remain InDiagnostics",
                     case.name
                 );
-
-                // Verify idempotency (second claim returns false).
-                let second = store
-                    .claim_diagnostics(&id, DIAGNOSTICS_ROLE)
-                    .await
-                    .expect("second claim");
-                assert!(
-                    !second,
-                    "Case '{}': second claim should return false (idempotent)",
-                    case.name
-                );
             }
-            Scenario::AlreadyAssigned | Scenario::WrongPhase => {
+            Scenario::WrongPhase => {
                 assert!(!claimed, "Case '{}': expected claim to fail", case.name);
             }
         }
     }
 }
 
-// ── claim_sanitation tests ──
-
-/// Table-driven tests for `claim_sanitation` covering success (QaPassed),
-/// wrong-phase rejection, and assigned_to verification on successful claim.
-#[tokio::test]
-async fn test_claim_sanitation() {
-    struct Case {
-        name: &'static str,
-        phase: TicketPhase,
-        expected_claim: bool,
-    }
-
-    let cases = [
-        Case {
-            name: "qa_passed succeeds",
-            phase: TicketPhase::QaPassed,
-            expected_claim: true,
-        },
-        Case {
-            name: "backlog (wrong phase) fails",
-            phase: TicketPhase::Backlog,
-            expected_claim: false,
-        },
-        Case {
-            name: "in_development (wrong phase) fails",
-            phase: TicketPhase::InDevelopment,
-            expected_claim: false,
-        },
-    ];
-
-    let (store, _tmp) = open_test_store().await;
-    let ws = test_ws_named("/ws", "ws");
-
-    for (i, case) in cases.iter().enumerate() {
-        let title = format!("san-claim-{i}");
-        let id = make_ticket(&store, &ws, &title, case.phase).await;
-
-        // Compute before the call (needed as parameter even for non-claim cases).
-        let expected_key = crate::session::ticket_agent_id(&id, crate::Role::Sanitation.as_str());
-
-        let claimed = store
-            .claim_sanitation(&id, &expected_key)
-            .await
-            .expect("claim_sanitation");
-        assert_eq!(
-            claimed, case.expected_claim,
-            "Case '{}': unexpected claim result",
-            case.name
-        );
-
-        if case.expected_claim {
-            let ticket = crate::util::test::expect_ticket(&store, &id).await;
-            assert_eq!(ticket.phase, TicketPhase::InSanitation);
-            assert_eq!(
-                ticket.assigned_to.as_deref(),
-                Some(expected_key.as_str()),
-                "Case '{}': assigned_to should be set to sanitation agent ID",
-                case.name
-            );
-        }
-    }
-}
-
-/// Sanitation claims serialize per workspace: a second claim in the same
-/// workspace is blocked until the first clears the pipeline; other
-/// workspaces proceed independently.
-#[tokio::test]
-async fn test_claim_sanitation_serialization() {
-    for same_workspace in [true, false] {
-        // Fresh store per iteration so the same-workspace Done transition
-        // doesn't leak into the cross-workspace InSanitation assertions.
-        let (store, _tmp) = open_test_store().await;
-        let ws_a = test_ws_named("/ws_a", "ws_a");
-        let ws_b = test_ws_named("/ws_b", "ws_b");
-        let second_ws = if same_workspace { &ws_a } else { &ws_b };
-
-        let first_id = make_ticket(&store, &ws_a, "First", TicketPhase::QaPassed).await;
-        let second_id = make_ticket(&store, second_ws, "Second", TicketPhase::QaPassed).await;
-
-        let first_key =
-            crate::session::ticket_agent_id(&first_id, crate::Role::Sanitation.as_str());
-        let second_key =
-            crate::session::ticket_agent_id(&second_id, crate::Role::Sanitation.as_str());
-
-        assert!(
-            store
-                .claim_sanitation(&first_id, &first_key)
-                .await
-                .expect("first claim"),
-            "first claim should succeed"
-        );
-
-        let second_claimed = store
-            .claim_sanitation(&second_id, &second_key)
-            .await
-            .expect("second claim");
-        if same_workspace {
-            assert!(
-                !second_claimed,
-                "second claim should be blocked while first ticket is in the sanitation pipeline"
-            );
-            // Direct to Done — SanitationPassed is also in the blocked set,
-            // so moving there alone wouldn't clear it.
-            store
-                .transition_to(&first_id, None, TicketPhase::Done, None)
-                .await
-                .expect("transition first to Done");
-            assert!(
-                store
-                    .claim_sanitation(&second_id, &second_key)
-                    .await
-                    .expect("second claim retry"),
-                "second claim should succeed after pipeline clears"
-            );
-        } else {
-            assert!(
-                second_claimed,
-                "claim in another workspace should succeed independently"
-            );
-            let a = expect_ticket(&store, &first_id).await;
-            let b = expect_ticket(&store, &second_id).await;
-            assert_eq!(a.phase, TicketPhase::InSanitation);
-            assert_eq!(b.phase, TicketPhase::InSanitation);
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_set_assigned_to_none() {
-    // Successfully clear an assigned assignee
-    let (store, _tmp, id) = setup().await;
-
-    store
-        .set_assigned_to_no_cancel(&id, Some(DIAGNOSTICS_ROLE))
-        .await
-        .expect("set_assigned_to");
-    let ticket = crate::util::test::expect_ticket(&store, &id).await;
-    assert_eq!(ticket.assigned_to.as_deref(), Some(DIAGNOSTICS_ROLE));
-
-    store
-        .set_assigned_to_no_cancel(&id, None)
-        .await
-        .expect("set_assigned_to(None) should clear assignee");
-    let ticket = crate::util::test::expect_ticket(&store, &id).await;
-    assert!(ticket.assigned_to.is_none(), "assigned_to should be NULL");
-
-    // Idempotent: clearing an already-None assignee succeeds
-    store
-        .set_assigned_to_no_cancel(&id, None)
-        .await
-        .expect("second set_assigned_to(None) should also succeed");
-
-    // Non-existent ticket fails
-    let (store2, _tmp2) = open_test_store().await;
-    let result = store2.set_assigned_to_no_cancel("nonexistent", None).await;
-    assert!(
-        result.is_err(),
-        "set_assigned_to(None) on nonexistent ticket should fail"
-    );
-}
-
 /// Round-trip test that exercises ALL column-index constants in
 /// [`ticket_from_row`] by creating a ticket, setting every mutable field
-/// via public API, then verifying every [`Ticket`] field (including
-/// `pipeline_reservation` via its SQL `DEFAULT 0`) survives the
+/// via public API, then verifying every [`Ticket`] field survives the
 /// SELECT → `ticket_from_row` deserialization path.
 ///
 /// Serves as a regression test for ticket deserialization — the
@@ -2199,7 +1566,7 @@ async fn test_ticket_roundtrip_all_fields() {
         .await
         .expect("create_ticket");
 
-    // ── Fresh ticket (defaults: no assigned_to, no comments, no commit info) ─
+    // ── Fresh ticket (defaults: no active agents, no comments, no commit info) ─
     let fresh = store
         .get_ticket(&id)
         .await
@@ -2224,7 +1591,6 @@ async fn test_ticket_roundtrip_all_fields() {
             title: "Roundtrip Title".into(),
             description: "Roundtrip description".into(),
             phase: TicketPhase::Backlog,
-            assigned_to: None,
             workspace_name: "test_workspace".into(),
             created_at: fresh.created_at.clone(),
             updated_at: fresh.updated_at.clone(),
@@ -2237,7 +1603,6 @@ async fn test_ticket_roundtrip_all_fields() {
             lines_removed: None,
             reporter: "test_reporter".into(),
             is_archived: false,
-            pipeline_reservation: false,
             priority: 1,
             reviewed_head: None,
             reviewed_tree: None,
@@ -2246,12 +1611,7 @@ async fn test_ticket_roundtrip_all_fields() {
         },
     );
 
-    // ── Mutated ticket (assigned_to + commit info) ──────────────────────
-    store
-        .set_assigned_to_no_cancel(&id, Some("test_assignee"))
-        .await
-        .expect("set_assigned_to");
-
+    // ── Mutated ticket (commit info) ────────────────────────────────────
     let tx = store.conn.begin_tx().await.unwrap();
     BoardStore::set_commit_info_tx(&tx, &id, "abcdef0123456789abcdef0123456789abcd0123", 42, 7)
         .await
@@ -2287,7 +1647,6 @@ async fn test_ticket_roundtrip_all_fields() {
             title: "Roundtrip Title".into(),
             description: "Roundtrip description".into(),
             phase: TicketPhase::Backlog,
-            assigned_to: Some("test_assignee".into()),
             workspace_name: "test_workspace".into(),
             created_at: ticket.created_at.clone(),
             updated_at: ticket.updated_at.clone(),
@@ -2300,7 +1659,6 @@ async fn test_ticket_roundtrip_all_fields() {
             lines_removed: Some(7),
             reporter: "test_reporter".into(),
             is_archived: false,
-            pipeline_reservation: false,
             priority: 1,
             reviewed_head: Some("reviewed-head-hash".into()),
             reviewed_tree: Some("reviewed-tree-hash".into()),
@@ -2336,7 +1694,6 @@ async fn test_ticket_roundtrip_all_fields() {
             title: "Roundtrip Title".into(),
             description: "Roundtrip description".into(),
             phase: TicketPhase::Backlog,
-            assigned_to: None,
             workspace_name: "test_workspace".into(),
             created_at: archived.created_at.clone(),
             updated_at: archived.updated_at.clone(),
@@ -2349,7 +1706,6 @@ async fn test_ticket_roundtrip_all_fields() {
             lines_removed: Some(7),
             reporter: "test_reporter".into(),
             is_archived: true,
-            pipeline_reservation: false,
             priority: 1,
             reviewed_head: Some("reviewed-head-hash".into()),
             reviewed_tree: Some("reviewed-tree-hash".into()),
@@ -2374,7 +1730,7 @@ async fn test_done_at_transition_semantics() {
         .expect("create_ticket");
 
     store
-        .transition_to(&id, None, TicketPhase::Done, None)
+        .transition_to(&id, None, TicketPhase::Done)
         .await
         .expect("transition to done");
     let done = store.get_ticket(&id).await.expect("get").expect("ticket");
@@ -2398,14 +1754,14 @@ async fn test_done_at_transition_semantics() {
 
     // Leaving Done clears the stamp; re-completion re-stamps it.
     store
-        .transition_to(&id, Some(TicketPhase::Done), TicketPhase::Backlog, None)
+        .transition_to(&id, Some(TicketPhase::Done), TicketPhase::Backlog)
         .await
         .expect("reopen");
     let reopened = store.get_ticket(&id).await.expect("get").expect("ticket");
     assert_eq!(reopened.done_at, None, "done_at cleared when leaving Done");
 
     store
-        .transition_to(&id, Some(TicketPhase::Backlog), TicketPhase::Done, None)
+        .transition_to(&id, Some(TicketPhase::Backlog), TicketPhase::Done)
         .await
         .expect("re-complete");
     let redone = store.get_ticket(&id).await.expect("get").expect("ticket");
@@ -2604,7 +1960,6 @@ async fn test_detailed_display_basic() {
             ("Supersedes:", "no supersedes when not set"),
             ("Superseded by:", "no superseded_by when not set"),
             ("Archived:", "no archived line when false"),
-            ("assigned_to:", "assigned_to should not be displayed"),
             ("commit_hash:", "commit_hash should not be displayed"),
             ("lines_added:", "lines_added should not be displayed"),
             ("lines_removed:", "lines_removed should not be displayed"),
@@ -2759,7 +2114,7 @@ async fn test_route_comment_to_agents_no_assignment() {
     let store = crate::board::store();
     let ws = crate::workspace::test_ws("/tmp/test_route_comment_no_assign");
 
-    // Create a ticket WITHOUT assigned_to
+    // Create a ticket with no active agents / no assignment
     let ticket_id = crate::util::test::make_ticket(
         store,
         &ws,
@@ -2779,7 +2134,7 @@ async fn test_route_comment_to_agents_no_assignment() {
 /// the commenter's role in the AgentJob. The engineer row guards the
 /// Role::parse → Manager fallback — the manager row alone would pass silently.
 ///
-/// Serialized with the reset_inflight_tickets tests (shared global board — a
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
@@ -2803,11 +2158,35 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
         )
         .await;
 
+        let job_id = format!("test-route-job-{i}");
+        crate::jobs::spawn_job(
+            &crate::session::store().conn,
+            &job_id,
+            "task",
+            &ws.name,
+            "",
+            "",
+            crate::Role::Engineer,
+            &[],
+            &crate::jobs::SpawnChild::TicketJob {
+                ticket_id: ticket_id.clone(),
+                stage: "development".to_string(),
+                is_implementation: true,
+            },
+        )
+        .await
+        .expect("create implementation");
         let agent_id = format!("_test_route_comment_agent_{i}");
-        store
-            .set_assigned_to_no_cancel(&ticket_id, Some(&agent_id))
-            .await
-            .expect("set assigned_to");
+        crate::jobs::upsert_job_agent(
+            &crate::session::store().conn,
+            &job_id,
+            &agent_id,
+            crate::jobs::AgentKind::Verifier,
+            crate::jobs::RowStatus::Launched,
+            "",
+        )
+        .await
+        .expect("set active agent");
         let mut rx = crate::message_router::register_agent(&agent_id);
 
         store
@@ -2817,7 +2196,10 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
 
         let received = rx.try_recv().expect("should receive the routed comment");
         assert_eq!(received.content, content);
-        assert_eq!(received.kind, crate::message_router::JobKind::TicketComment);
+        assert_eq!(
+            received.kind,
+            crate::message_router::MessageKind::TicketComment
+        );
         assert_eq!(received.user_name, commenter);
         assert_eq!(
             received.role, expected_role,
@@ -2830,68 +2212,4 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
 
         crate::message_router::unregister_agent(&agent_id);
     }
-}
-
-/// Manual "Redo Dev" bounce-back transitions Reviewed → ReadyForDevelopment
-/// and increments the bounce counter atomically (so manual bounces consume
-/// the same breaker budget as pipeline bounces).
-#[tokio::test]
-async fn test_bounce_back_to_dev_transitions_and_increments_counter() {
-    let (store, _tmp) = open_test_store().await;
-    let ws = crate::workspace::test_ws("/tmp/test_bounce_back_to_dev");
-    let id = make_ticket(&store, &ws, "Redo Dev", TicketPhase::Reviewed).await;
-
-    assert!(
-        store
-            .bounce_back_to_dev(&id)
-            .await
-            .expect("bounce-back succeeds"),
-        "bounce-back from Reviewed must apply"
-    );
-
-    let ticket = expect_ticket(&store, &id).await;
-    assert_eq!(ticket.phase, TicketPhase::ReadyForDevelopment);
-    assert_eq!(ticket.bounce_count, 1, "manual bounce must count");
-
-    // A second Redo Dev from Reviewed (e.g. after a fresh review pass)
-    // increments again; bouncing from a non-Reviewed phase is rejected.
-    store
-        .transition_to(&id, None, TicketPhase::Reviewed, None)
-        .await
-        .expect("move back to Reviewed for a second round");
-    assert!(
-        store
-            .bounce_back_to_dev(&id)
-            .await
-            .expect("second bounce-back succeeds"),
-        "second bounce-back from Reviewed must apply"
-    );
-    let ticket = expect_ticket(&store, &id).await;
-    assert_eq!(ticket.bounce_count, 2);
-
-    store
-        .transition_to(&id, None, TicketPhase::InQa, None)
-        .await
-        .expect("move to InQa");
-    // Bouncing from a non-Reviewed phase is a phase-guard miss: the ticket
-    // moved externally, which is an expected, silent no-op — not an error
-    // (the claim convention: guard miss = `Ok(false)`).
-    let outcome = store
-        .bounce_back_to_dev(&id)
-        .await
-        .expect("guard-missed bounce-back must not error");
-    assert!(
-        !outcome,
-        "bounce-back from a non-Reviewed phase must report the guard miss"
-    );
-    let ticket = expect_ticket(&store, &id).await;
-    assert_eq!(
-        ticket.phase,
-        TicketPhase::InQa,
-        "guard-missed bounce-back must leave the ticket untouched"
-    );
-    assert_eq!(
-        ticket.bounce_count, 2,
-        "guard-missed bounce-back must not bump the bounce counter"
-    );
 }

@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::message_router::{AgentJob, JobKind};
+use crate::message_router::{AgentJob, MessageKind};
 use crate::registry::AGENT_REGISTRY;
 use crate::session::SessionContext;
 use crate::{ChatRole, Role};
@@ -348,7 +348,7 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
         workspace_name: ctx.workspace_name.clone(),
         user_name: ctx.user_name.clone(),
         channel: ctx.channel.clone(),
-        kind: JobKind::RecoveryRetry,
+        kind: MessageKind::RecoveryRetry,
         role,
         // reply_target is not available from session metadata — the recovery
         // response will be persisted to chat_history and broadcast via the

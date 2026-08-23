@@ -11,7 +11,7 @@
 //! wipe-and-recreate path records it as applied instead of failing with a
 //! duplicate-column error.
 
-use crate::turso::Migration;
+use crate::turso::{Migration, MigrationGuard};
 
 /// Migrations for the sessions store (sessions.db).
 ///
@@ -41,44 +41,192 @@ use crate::turso::Migration;
 /// with message inserts). The fresh-DB SCHEMA already declares the column, so
 /// the existence guard makes both paths converge (wipe-and-recreate needs no
 /// backfill — fresh databases start empty).
+///
+/// **003 — drop `ticket_stage_jobs.round`.** The analysis rework is one-round
+/// per job, so the `round` column is dead. The fresh-DB SCHEMA no longer
+/// declares it; the drop guard makes both paths converge (fresh DB: column
+/// already absent, SQL skipped, recorded as applied; upgraded DB: the DROP
+/// fires).
+///
+/// **004 — reset pre-rework ticket-jobs data.** A deliberate one-time data
+/// reset for the clean upgrade: deletes the pre-rework `ticket_stage` job rows
+/// (the only ticket-job kind that could exist at migration time — the reworked
+/// `ticket_analysis`/`ticket_implementation` kinds are created only by the
+/// rework, and `ticket_journey` never existed). Cascades to `ticket_stage_jobs`
+/// child rows and agent rosters (FK ON DELETE CASCADE); non-ticket jobs
+/// (research/analyze/cleanup) are left intact. No backward compat — this is a
+/// deliberate one-time data reset for the clean upgrade.
+///
+/// **005 — drop `ticket_stage_jobs.phase`.** The phase column shipped in a
+/// prior schema but is now redundant — it is derivable from (kind, stage) via
+/// [`crate::jobs::derive_ticket_phase`]. The fresh-DB SCHEMA no longer declares
+/// it; the drop guard makes both paths converge (fresh DB: column already
+/// absent, SQL skipped, recorded as applied; upgraded DB: the DROP fires).
+///
+/// **006 — rename `ticket_stage_jobs` → `ticket_jobs`.** The child table ships
+/// under the new name. On a fresh DB the SCHEMA creates `ticket_jobs`
+/// directly, so the rename is skipped and recorded as applied. On an
+/// upgraded-in-place DB the old `ticket_stage_jobs` table holds the data; the
+/// migration first drops the empty `ticket_jobs` that the fresh-DB SCHEMA batch
+/// created on this same open (it is brand new and empty — no data loss), then
+/// renames the old table under the new name so the new code reads the
+/// pre-existing rows. Both paths converge to a single `ticket_jobs` table.
 pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
     Migration {
         id: "001_session_token_length",
         sql: "ALTER TABLE session_metadata ADD COLUMN token_length INTEGER",
-        guard: Some(("session_metadata", "token_length")),
+        guard: Some(MigrationGuard::ColumnExists {
+            table: "session_metadata",
+            column: "token_length",
+        }),
     },
     Migration {
         id: "002_session_message_count",
         sql: "ALTER TABLE session_metadata ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0; \
               UPDATE session_metadata SET message_count = (SELECT COUNT(*) FROM sessions \
               WHERE sessions.agent_id = session_metadata.agent_id)",
-        guard: Some(("session_metadata", "message_count")),
+        guard: Some(MigrationGuard::ColumnExists {
+            table: "session_metadata",
+            column: "message_count",
+        }),
+    },
+    Migration {
+        id: "003_drop_ticket_stage_jobs_round",
+        sql: "ALTER TABLE ticket_stage_jobs DROP COLUMN round",
+        guard: Some(MigrationGuard::ColumnDropped {
+            table: "ticket_stage_jobs",
+            column: "round",
+        }),
+    },
+    Migration {
+        id: "004_reset_implementation_jobs",
+        sql: "DELETE FROM jobs WHERE kind = 'ticket_stage'",
+        guard: None,
+    },
+    Migration {
+        id: "005_drop_ticket_stage_jobs_phase",
+        sql: "ALTER TABLE ticket_stage_jobs DROP COLUMN phase",
+        guard: Some(MigrationGuard::ColumnDropped {
+            table: "ticket_stage_jobs",
+            column: "phase",
+        }),
+    },
+    Migration {
+        id: "006_rename_ticket_stage_jobs_to_ticket_jobs",
+        sql: "DROP TABLE IF EXISTS ticket_jobs; \
+              ALTER TABLE ticket_stage_jobs RENAME TO ticket_jobs",
+        guard: Some(MigrationGuard::TableExists {
+            table: "ticket_stage_jobs",
+        }),
+    },
+];
+
+/// Migrations for the board store (board.db).
+///
+/// **001 — drop `tickets.pipeline_reservation`.** The job-centric pipeline
+/// rework removes the ticket-level pipeline reservation in favor of the
+/// implementation job (see `src/jobs.rs`). The fresh-DB SCHEMA
+/// (`src/board.rs`) no longer declares the column, so the ALTER only fires on
+/// pre-existing databases; the drop guard makes both paths converge (fresh-DB
+/// path: column already absent, SQL skipped, migration recorded as applied).
+///
+/// **002 — drop `tickets.assigned_to`.** Replaced by the `agents` roster in
+/// sessions.db (`status='launched'` rows bound to the implementation/analysis jobs),
+/// which drives comment routing and the mid-execution re-dispatch guard.
+///
+/// **003 — reset non-terminal tickets.** A deliberate one-time data reset for
+/// the reworked pipeline phase semantics: every non-terminal, non-archived
+/// ticket is returned to `Backlog`. Only non-terminal, non-archived rows are
+/// reset (Done/Cancelled/Failed and archived tickets are untouched). Phase is
+/// stored lowercase snake_case; `TicketPhase::Backlog.as_ref() == "backlog"`.
+/// No backward compat — this is a deliberate reset.
+///
+/// **004 — drop `tickets.review_base_count`.** A dead column that exists only
+/// as drift in the live board DB — it is not declared by the current SCHEMA
+/// and is referenced by no production code. The fresh-DB SCHEMA never declares
+/// it, so the drop guard makes both paths converge (fresh DB: column already
+/// absent, SQL skipped, recorded as applied; upgraded DB: the DROP fires).
+pub(crate) const BOARD_MIGRATIONS: &[Migration] = &[
+    Migration {
+        id: "001_drop_ticket_pipeline_reservation",
+        sql: "ALTER TABLE tickets DROP COLUMN pipeline_reservation",
+        guard: Some(MigrationGuard::ColumnDropped {
+            table: "tickets",
+            column: "pipeline_reservation",
+        }),
+    },
+    Migration {
+        id: "002_drop_ticket_assigned_to",
+        sql: "ALTER TABLE tickets DROP COLUMN assigned_to",
+        guard: Some(MigrationGuard::ColumnDropped {
+            table: "tickets",
+            column: "assigned_to",
+        }),
+    },
+    Migration {
+        id: "003_reset_nonterminal_tickets",
+        sql: "UPDATE tickets SET phase = 'backlog' WHERE phase NOT IN ('done','cancelled','failed') AND is_archived = 0",
+        guard: None,
+    },
+    Migration {
+        id: "004_drop_tickets_review_base_count",
+        sql: "ALTER TABLE tickets DROP COLUMN review_base_count",
+        guard: Some(MigrationGuard::ColumnDropped {
+            table: "tickets",
+            column: "review_base_count",
+        }),
     },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turso::{column_exists, run_pending_migrations};
+    use crate::turso::{column_exists, run_pending_migrations, table_exists};
 
     /// Old-DB schema: `session_metadata` WITHOUT the token-length or
     /// message-count columns — simulates the live pre-migration database
     /// (upgrade-in-place path). Includes the `sessions` table so the
-    /// message-count backfill is exercised against real rows.
+    /// message-count backfill is exercised against real rows. Includes a
+    /// `jobs` table (migration 004 is a kind-scoped DELETE) and a
+    /// `ticket_stage_jobs` table WITH both the `round` column (migration 003
+    /// drops it) and the `phase` column (migration 005 drops it) — no `paused`
+    /// column, which was removed as dead bookkeeping. The `round`/`phase`
+    /// presence exercises the DROP DDL on the upgrade path.
     const OLD_SCHEMA: &str = "CREATE TABLE sessions (\
          id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
          role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);\
-         CREATE TABLE session_metadata (agent_id TEXT PRIMARY KEY, last_activity TEXT NOT NULL);";
+         CREATE TABLE session_metadata (agent_id TEXT PRIMARY KEY, last_activity TEXT NOT NULL);\
+         CREATE TABLE jobs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
+         status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
+         workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
+         channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
+         retry_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, \
+         updated_at TEXT NOT NULL);\
+         CREATE TABLE ticket_stage_jobs (\
+         id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL, stage TEXT NOT NULL, \
+         phase TEXT NOT NULL, round INTEGER NOT NULL);";
 
     /// Fresh-DB schema: `session_metadata` already declares both migrated
     /// columns — simulates the wipe-and-recreate path where the SCHEMA
-    /// produced the migrated shape.
+    /// produced the migrated shape. Includes a `jobs` table and a
+    /// `ticket_jobs` table matching the current SCHEMA shape (id, ticket_id,
+    /// stage — no `round`, no `phase`). The table carries the NEW name because
+    /// the fresh SCHEMA creates `ticket_jobs` directly; the RENAME migration is
+    /// thus a skipped-and-recorded no-op.
     const FRESH_SCHEMA: &str = "CREATE TABLE sessions (\
          id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
          role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);\
          CREATE TABLE session_metadata (\
          agent_id TEXT PRIMARY KEY, last_activity TEXT NOT NULL, \
-         token_length INTEGER, message_count INTEGER NOT NULL DEFAULT 0);";
+         token_length INTEGER, message_count INTEGER NOT NULL DEFAULT 0);\
+         CREATE TABLE jobs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
+         status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
+         workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
+         channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
+         retry_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, \
+         updated_at TEXT NOT NULL);\
+         CREATE TABLE ticket_jobs (\
+         id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL, stage TEXT NOT NULL);";
 
     async fn applied_ids(conn: &crate::turso::Connection) -> Vec<String> {
         conn.query("SELECT id FROM schema_migrations ORDER BY id", ())
@@ -162,15 +310,40 @@ mod tests {
         assert_eq!(message_count(&conn, "sess_c").await, 0);
         assert_eq!(
             applied_ids(&conn).await,
-            vec!["001_session_token_length", "002_session_message_count"],
-            "both migrations recorded in order"
+            vec![
+                "001_session_token_length",
+                "002_session_message_count",
+                "003_drop_ticket_stage_jobs_round",
+                "004_reset_implementation_jobs",
+                "005_drop_ticket_stage_jobs_phase",
+                "006_rename_ticket_stage_jobs_to_ticket_jobs",
+            ],
+            "migrations recorded in order"
+        );
+        // The upgrade path exercised the full DDL chain: round dropped, phase
+        // dropped, and the table RENAMEd to `ticket_jobs` (old name gone).
+        assert!(
+            table_exists(&conn, "ticket_jobs").await.unwrap(),
+            "rename must leave the table under its new name"
+        );
+        assert!(
+            !table_exists(&conn, "ticket_stage_jobs").await.unwrap(),
+            "rename must remove the old table name"
+        );
+        assert!(
+            !column_exists(&conn, "ticket_jobs", "phase").await.unwrap(),
+            "phase column must be dropped by migration 005"
+        );
+        assert!(
+            !column_exists(&conn, "ticket_jobs", "round").await.unwrap(),
+            "round column must be dropped by migration 003"
         );
 
         // Re-running (e.g. a later boot) is a strict no-op — never twice.
         run_pending_migrations(&conn, "sessions", SESSION_MIGRATIONS)
             .await
             .expect("second run is a no-op");
-        assert_eq!(applied_ids(&conn).await.len(), 2, "never re-run");
+        assert_eq!(applied_ids(&conn).await.len(), 6, "never re-run");
     }
 
     #[tokio::test]
@@ -212,8 +385,174 @@ mod tests {
         );
         assert_eq!(
             applied_ids(&conn).await,
-            vec!["001_session_token_length", "002_session_message_count"],
-            "both migrations recorded as applied even though the SQL was skipped"
+            vec![
+                "001_session_token_length",
+                "002_session_message_count",
+                "003_drop_ticket_stage_jobs_round",
+                "004_reset_implementation_jobs",
+                "005_drop_ticket_stage_jobs_phase",
+                "006_rename_ticket_stage_jobs_to_ticket_jobs",
+            ],
+            "migrations recorded as applied even though the SQL was skipped"
+        );
+        // Fresh-DB path: the RENAME must NOT fire (the SCHEMA created
+        // `ticket_jobs` directly); the table survives its new name.
+        assert!(
+            table_exists(&conn, "ticket_jobs").await.unwrap(),
+            "fresh SCHEMA-created ticket_jobs must survive the skipped rename"
+        );
+        assert!(
+            !table_exists(&conn, "ticket_stage_jobs").await.unwrap(),
+            "fresh DB must never create the old table name"
+        );
+    }
+
+    // ── Board DROP COLUMN migrations (the inverse guard direction) ──────
+
+    /// Old board schema: `tickets` WITH the columns that the job-centric
+    /// rework drops (`pipeline_reservation`, `assigned_to`) plus the dead
+    /// drift column `review_base_count` (migration 004 drops it) — simulates
+    /// the pre-migration live board.db (upgrade-in-place path). Includes
+    /// `phase` and `is_archived` so migration 003's reset UPDATE can run.
+    const OLD_BOARD_SCHEMA: &str = "CREATE TABLE tickets (\
+         id TEXT PRIMARY KEY, title TEXT NOT NULL, pipeline_reservation INTEGER, \
+         assigned_to TEXT, review_base_count INTEGER, \
+         phase TEXT NOT NULL DEFAULT 'backlog', \
+         is_archived INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);";
+
+    /// Fresh board schema: `tickets` WITHOUT any dropped column (the current
+    /// SCHEMA no longer declares them) — simulates the wipe-and-recreate path.
+    /// Includes `phase` and `is_archived` so migration 003's reset UPDATE runs.
+    const FRESH_BOARD_SCHEMA: &str = "CREATE TABLE tickets (\
+         id TEXT PRIMARY KEY, title TEXT NOT NULL, \
+         phase TEXT NOT NULL DEFAULT 'backlog', \
+         is_archived INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);";
+
+    #[tokio::test]
+    async fn board_drop_column_migrations_run_on_old_db() {
+        // The DROP direction is the inverse of the tested ADD path; exercises
+        // the ACTUAL `ALTER TABLE ... DROP COLUMN` DDL against turso on an
+        // upgraded-in-place database.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::turso::open_with_schema(&tmp.path().join("board.db"), OLD_BOARD_SCHEMA)
+            .await
+            .expect("open old board test store");
+        assert!(
+            column_exists(&conn, "tickets", "pipeline_reservation")
+                .await
+                .unwrap(),
+            "old board DB has pipeline_reservation before migration"
+        );
+        assert!(
+            column_exists(&conn, "tickets", "assigned_to")
+                .await
+                .unwrap(),
+            "old board DB has assigned_to before migration"
+        );
+        assert!(
+            column_exists(&conn, "tickets", "review_base_count")
+                .await
+                .unwrap(),
+            "old board DB has the dead review_base_count drift column before migration"
+        );
+
+        run_pending_migrations(&conn, "board", BOARD_MIGRATIONS)
+            .await
+            .expect("apply board DROP COLUMN migrations");
+        assert!(
+            !column_exists(&conn, "tickets", "pipeline_reservation")
+                .await
+                .unwrap(),
+            "ALTER must drop pipeline_reservation"
+        );
+        assert!(
+            !column_exists(&conn, "tickets", "assigned_to")
+                .await
+                .unwrap(),
+            "ALTER must drop assigned_to"
+        );
+        assert!(
+            !column_exists(&conn, "tickets", "review_base_count")
+                .await
+                .unwrap(),
+            "ALTER must drop the dead review_base_count column"
+        );
+        assert_eq!(
+            applied_ids(&conn).await,
+            vec![
+                "001_drop_ticket_pipeline_reservation",
+                "002_drop_ticket_assigned_to",
+                "003_reset_nonterminal_tickets",
+                "004_drop_tickets_review_base_count",
+            ],
+            "all DROP migrations + the reset recorded in order"
+        );
+
+        // Re-running (e.g. a later boot) is a strict no-op — never twice.
+        run_pending_migrations(&conn, "board", BOARD_MIGRATIONS)
+            .await
+            .expect("second run is a no-op");
+        assert_eq!(applied_ids(&conn).await.len(), 4, "never re-run");
+    }
+
+    #[tokio::test]
+    async fn board_drop_column_migrations_skip_on_fresh_db_and_record_applied() {
+        // Wipe-and-recreate: the SCHEMA no longer declares the columns, so the
+        // DROPs must NOT fire (the DROP would fail on a missing column); the
+        // guard turns them into recorded no-ops.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::turso::open_with_schema(&tmp.path().join("board.db"), FRESH_BOARD_SCHEMA)
+            .await
+            .expect("open fresh board test store");
+        assert!(
+            !column_exists(&conn, "tickets", "pipeline_reservation")
+                .await
+                .unwrap(),
+            "fresh board DB has no pipeline_reservation"
+        );
+        assert!(
+            !column_exists(&conn, "tickets", "assigned_to")
+                .await
+                .unwrap(),
+            "fresh board DB has no assigned_to"
+        );
+        assert!(
+            !column_exists(&conn, "tickets", "review_base_count")
+                .await
+                .unwrap(),
+            "fresh board DB has no dead review_base_count column"
+        );
+
+        run_pending_migrations(&conn, "board", BOARD_MIGRATIONS)
+            .await
+            .expect("guard turns pending drops into recorded no-ops");
+        assert!(
+            !column_exists(&conn, "tickets", "pipeline_reservation")
+                .await
+                .unwrap(),
+            "column still absent (never created)"
+        );
+        assert!(
+            !column_exists(&conn, "tickets", "assigned_to")
+                .await
+                .unwrap(),
+            "column still absent (never created)"
+        );
+        assert!(
+            !column_exists(&conn, "tickets", "review_base_count")
+                .await
+                .unwrap(),
+            "review_base_count still absent (never created)"
+        );
+        assert_eq!(
+            applied_ids(&conn).await,
+            vec![
+                "001_drop_ticket_pipeline_reservation",
+                "002_drop_ticket_assigned_to",
+                "003_reset_nonterminal_tickets",
+                "004_drop_tickets_review_base_count",
+            ],
+            "all recorded as applied even though the DDL was skipped"
         );
     }
 }

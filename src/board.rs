@@ -18,8 +18,7 @@ crate::define_store! {
     expect = "BOARD not initialized — call init_global() first",
 }
 
-/// Background task: auto-archive cancelled tickets older than 1 hour and
-/// sweep stale terminal-phase pipeline reservations.
+/// Background task: auto-archive cancelled tickets older than 1 hour.
 ///
 /// Runs every 5 minutes, respects the global shutdown token via
 /// [`crate::shutdown::sleep_or_shutdown_or_drain`] (same pattern as
@@ -37,7 +36,7 @@ pub async fn run_archive_cancelled_loop() {
         // seats for tickets in a terminal phase — the TTL guard stops
         // protecting the accumulated engineer session once the anchor is gone
         // (idempotent, ≤5-min delay against the 8h TTL).
-        crate::jobs::purge_terminal_engineer_anchors().await;
+        crate::jobs::purge_terminal_engineer_session_pins().await;
 
         let Some(board) = BOARD.get() else {
             warn!("Archive cancelled loop: board not initialized");
@@ -49,12 +48,6 @@ pub async fn run_archive_cancelled_loop() {
             Ok(_) => debug!("Archive cancelled loop: no stale tickets"),
             Err(e) => warn!(error = %e, "Archive cancelled loop failed"),
         }
-
-        match board.clear_terminal_reservations().await {
-            Ok(n) if n > 0 => info!(count = n, "Cleared stale terminal pipeline reservations"),
-            Ok(_) => debug!("Reservation sweep: no stale terminal reservations"),
-            Err(e) => warn!(error = %e, "Reservation sweep failed"),
-        }
     }
 }
 
@@ -64,7 +57,6 @@ CREATE TABLE IF NOT EXISTS tickets (
     title           TEXT NOT NULL,
     description     TEXT NOT NULL,
     phase          TEXT NOT NULL DEFAULT 'backlog',
-    assigned_to     TEXT,
     workspace_name  TEXT NOT NULL,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
@@ -77,7 +69,6 @@ CREATE TABLE IF NOT EXISTS tickets (
     reporter        TEXT NOT NULL DEFAULT '',
     is_archived     INTEGER NOT NULL DEFAULT 0,
     embedding       BLOB,
-    pipeline_reservation INTEGER NOT NULL DEFAULT 0,
     priority        INTEGER NOT NULL DEFAULT 1,
     reviewed_head   TEXT,
     reviewed_tree   TEXT,
@@ -115,7 +106,6 @@ crate::columns! {
         TITLE                  => "title",
         DESCRIPTION            => "description",
         PHASE                  => "phase",
-        ASSIGNED_TO            => "assigned_to",
         WORKSPACE_NAME         => "workspace_name",
         CREATED_AT             => "created_at",
         UPDATED_AT             => "updated_at",
@@ -127,7 +117,6 @@ crate::columns! {
         LINES_REMOVED          => "lines_removed",
         REPORTER               => "reporter",
         IS_ARCHIVED            => "is_archived",
-        PIPELINE_RESERVATION   => "pipeline_reservation",
         PRIORITY               => "priority",
         REVIEWED_HEAD          => "reviewed_head",
         REVIEWED_TREE          => "reviewed_tree",
@@ -157,48 +146,23 @@ crate::columns! {
 /// pre-development threshold (Analysis + Planning + ReadyForDevelopment) and is no longer
 /// directly suppressed by this constant.
 ///
-/// Note: the set includes four transitory handoff phases (DiagnosticsDone, Reviewed,
-/// QaPassed, SanitationPassed) in which no agent is running — the poller advances them
-/// within seconds. They still count as pipeline-occupied because they block new Engineer
-/// claims for the workspace until advanced; they are not states where agents are actively
-/// working for an extended period.
+/// Occupancy is owned by the implementation job (jobs kind='ticket_implementation') — a
+/// ticket in any of these phases always has a live implementation job, and the
+/// implementation is the single authority that advances the ticket through the
+/// pipeline. `tickets.phase` is the displayed state of the implementation job
+/// as it advances, and is also an input gate for the claim step (Backlog →
+/// Analysis, ReadyForDevelopment → InDevelopment) — not a pure mirror.
 ///
-/// [`BoardStore::reset_inflight_tickets`] (via [`BoardStore::RESET_TRANSITIONS`]) only resets a subset
-/// of these (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) plus Analysis — see its
-/// docs for rationale. The remaining four transitory handoff phases are intentionally excluded
-/// from reset. The `tests::test_pipeline_occupancy_coverage`
-/// test enforces that every non-transitory pipeline occupant has a corresponding reset transition.
+/// [`BoardStore::reset_analysis_tickets`] (via [`BoardStore::RESET_ANALYSIS_TRANSITIONS`])
+/// only resets Analysis → Backlog — the implementation-protected occupied phases
+/// (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) are NOT reset
+/// (a resumed implementation job keeps them in phase).
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
-    TicketPhase::DiagnosticsDone,
     TicketPhase::InReview,
-    TicketPhase::Reviewed,
     TicketPhase::InQa,
-    TicketPhase::QaPassed,
     TicketPhase::InSanitation,
-    TicketPhase::SanitationPassed,
-];
-
-/// The sanitation pipeline — only one ticket per workspace may be in these
-/// phases at a time (serialization enforced by [`BoardStore::claim_sanitation`]).
-///
-/// Subset of [`PIPELINE_OCCUPIED_PHASES`].
-const SANITATION_PIPELINE_PHASES: &[TicketPhase] =
-    &[TicketPhase::InSanitation, TicketPhase::SanitationPassed];
-
-/// Pipeline-occupied phases that are transitory handoff states — no agent is
-/// mid-execution in these phases, so they don't need a reset transition. The
-/// poller picks them up within seconds.
-///
-/// This is a subset of [`PIPELINE_OCCUPIED_PHASES`]. The relationship is
-/// mechanically verified by `tests::test_pipeline_occupancy_coverage`.
-#[cfg(test)]
-const TRANSITORY_HANDOFF_PHASES: &[TicketPhase] = &[
-    TicketPhase::DiagnosticsDone,
-    TicketPhase::SanitationPassed,
-    TicketPhase::Reviewed,
-    TicketPhase::QaPassed,
 ];
 
 /// Phases that unblock dependent tickets.
@@ -219,9 +183,7 @@ pub const UNBLOCKING_PHASES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase::
 
 /// Terminal phases — a ticket in one of these can no longer be claimed.
 ///
-/// [`TicketPhase::is_terminal`] delegates to this constant. Used to clear
-/// [`pipeline_reservation`](Ticket::pipeline_reservation) on terminal
-/// transitions and by the periodic reservation sweep.
+/// [`TicketPhase::is_terminal`] delegates to this constant.
 ///
 /// Note: `Failed` is deliberately included here even though it is excluded
 /// from [`UNBLOCKING_PHASES`] (a failed ticket permanently blocks dependents).
@@ -286,7 +248,6 @@ pub struct Ticket {
     pub title: String,
     pub description: String,
     pub phase: TicketPhase,
-    pub assigned_to: Option<String>,
     pub workspace_name: String,
     pub created_at: String,
     pub updated_at: String,
@@ -313,11 +274,6 @@ pub struct Ticket {
     pub reporter: String,
     /// Whether this ticket has been archived (hidden from normal listings).
     pub is_archived: bool,
-    /// Whether this ticket holds a pipeline reservation (bounced back for
-    /// rework — review/QA bounce-back, diagnostics/sanitation failure, or
-    /// engineer hard failure — and awaiting rework). When set, the ticket
-    /// gets priority over other ReadyForDevelopment tickets during claim.
-    pub pipeline_reservation: bool,
     pub priority: i64,
     /// HEAD commit hash at the last completed reviewer round on this ticket.
     /// `None` until the first reviewer pass finishes — used by the reviewer
@@ -331,9 +287,11 @@ pub struct Ticket {
     /// Exact completion timestamp: set on transition to Done, cleared when the
     /// ticket leaves Done. `None` for never-done or not-currently-done tickets.
     pub done_at: Option<String>,
-    /// Number of times this ticket bounced back into development (review/QA
-    /// bounce-backs and engineer hard failures). Drives the bounce-based
-    /// circuit breaker (max 10).
+    /// Number of times this ticket bounced back into development from a
+    /// validation-phase non-success (diagnostics/review/QA/sanitation). Drives
+    /// the bounce-based circuit breaker (max 10). Engineer hard failures are
+    /// pause-only (workspace pause, implementation frozen) and do not consume this
+    /// budget.
     pub bounce_count: i64,
 }
 
@@ -382,7 +340,6 @@ impl Ticket {
     /// The following [`Ticket`] fields are deliberately omitted — they are
     /// available in the board UI but not meaningful for agent context:
     ///
-    /// - `assigned_to`
     /// - `commit_hash`
     /// - `lines_added` / `lines_removed`
     ///
@@ -478,30 +435,15 @@ pub enum TicketPhase {
     ReadyForDevelopment,
     InDevelopment,
     InDiagnostics,
-    DiagnosticsDone,
     InSanitation,
-    SanitationPassed,
     InReview,
-    Reviewed,
     InQa,
-    QaPassed,
     Done,
     Cancelled,
     Failed,
 }
 
 impl TicketPhase {
-    /// Returns `true` for transitory handoff phases — pipeline-occupied
-    /// phases where no agent is mid-execution.
-    ///
-    /// Delegates to `TRANSITORY_HANDOFF_PHASES` so the transitory handoff set can never
-    /// accidentally diverge from the definition used in coverage tests.
-    #[cfg(test)]
-    #[must_use]
-    fn is_transitory_handoff(self) -> bool {
-        TRANSITORY_HANDOFF_PHASES.contains(&self)
-    }
-
     /// Returns `true` for phases that unblock dependent tickets.
     ///
     /// Delegates to [`UNBLOCKING_PHASES`] so the unblocking set can never
@@ -515,11 +457,11 @@ impl TicketPhase {
     }
 
     /// Returns `true` for terminal phases (`Done`, `Cancelled`, `Failed`) — a
-    /// ticket in one of these can no longer be claimed, so the rework-priority
-    /// reservation must be cleared.
+    /// ticket in one of these can no longer be claimed, so the implementation job is
+    /// finished.
     ///
     /// Delegates to [`TERMINAL_PHASES`] so the terminal set is authoritative
-    /// for both the transition-clearing clause and the reservation sweep.
+    /// for both the transition-clearing clause and the implementation completion.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         TERMINAL_PHASES.contains(self)
@@ -528,11 +470,10 @@ impl TicketPhase {
     /// Returns `true` if the ticket is in a pipeline-occupied phase.
     ///
     /// Tickets in these phases occupy the dev/review/QA pipeline — only one
-    /// ticket per workspace may be in the pipeline at a time. Most of these
-    /// phases have an agent actively working on the ticket (development,
-    /// diagnostics, review, QA), but four are transitory handoff phases
-    /// (DiagnosticsDone, Reviewed, QaPassed, SanitationPassed) with no agent
-    /// running — the poller advances them within seconds. The automated
+    /// ticket per workspace may be in the pipeline at a time. These phases
+    /// have an agent actively working on the ticket (development,
+    /// diagnostics, review, QA, sanitation) and are owned by the implementation job.
+    /// The automated
     /// create-ticket tool (when superseding an existing ticket) and the
     /// update-ticket tool refuse to modify tickets in any of these phases to
     /// prevent race conditions during phase transitions. `add_comment` is the
@@ -633,8 +574,6 @@ impl PreparedUpdate {
     /// - **`BoardStore::claim_diagnostics`** — returns `Result<bool>`, only cancels on success.
     /// - **`BoardStore::supersede_and_create`** — runs inside a transaction, cancels
     ///   before commit via a different pattern.
-    /// - **`BoardStore::claim_sanitation`** — returns `Result<bool>`, does NOT cancel
-    ///   (QaPassed has no running agent).
     async fn execute_and_cancel(self, conn: &turso::Connection) -> Result<()> {
         let rows = conn.execute(&self.sql, self.params).await?;
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
@@ -655,21 +594,11 @@ impl PreparedUpdate {
 }
 
 /// A single reset transition: when a ticket in `from` phase is found on startup,
-/// it is rolled back to `to` phase. If `pipeline_reservation` is true, the ticket
-/// gets `pipeline_reservation = 1` so it is claimed before any fresh ticket in the
-/// same phase (preserving rework priority across restarts).
+/// it is rolled back to `to` phase.
 #[derive(Debug, Clone, Copy)]
 struct ResetTransition {
     from: TicketPhase,
     to: TicketPhase,
-    /// Whether to set `pipeline_reservation = 1` on the reset ticket.
-    ///
-    /// When `true`: the reset ticket gets priority re-dispatch — it will be
-    /// claimed before any fresh ticket in the same phase.
-    /// When `false`: normal queue order.
-    ///
-    /// See [`BoardStore::RESET_TRANSITIONS`] for the rationale behind each entry.
-    pipeline_reservation: bool,
 }
 
 /// Controls whether the pipeline-occupancy check is enforced when claiming tickets.
@@ -706,6 +635,12 @@ impl BoardStore {
             TICKETS_FTS_INDEX_NAME,
             "ngram",
             TICKETS_FTS_INDEX_DDL,
+        )
+        .await?;
+        crate::turso::run_pending_migrations(
+            &self.conn,
+            "board",
+            crate::migrations::BOARD_MIGRATIONS,
         )
         .await?;
         Ok(())
@@ -912,8 +847,8 @@ impl BoardStore {
         let now = turso::now();
         let cancelled_rows = tx
             .execute(
-                "UPDATE tickets SET phase = ?1, updated_at = ?2, assigned_to = NULL, \
-                 superseded_by = ?4, is_archived = 1, done_at = NULL, pipeline_reservation = 0 \
+                "UPDATE tickets SET phase = ?1, updated_at = ?2, \
+                 superseded_by = ?4, is_archived = 1, done_at = NULL \
                  WHERE id = ?3",
                 turso::params![
                     TicketPhase::Cancelled.as_ref(),
@@ -969,7 +904,6 @@ impl BoardStore {
             phase: row
                 .get::<String>(COL_TICKET_PHASE)?
                 .parse::<TicketPhase>()?,
-            assigned_to: row.get(COL_TICKET_ASSIGNED_TO)?,
             workspace_name: row.get(COL_TICKET_WORKSPACE_NAME)?,
             created_at: row.get(COL_TICKET_CREATED_AT)?,
             updated_at: row.get(COL_TICKET_UPDATED_AT)?,
@@ -982,7 +916,6 @@ impl BoardStore {
             lines_removed: row.get(COL_TICKET_LINES_REMOVED)?,
             reporter: row.get::<String>(COL_TICKET_REPORTER)?,
             is_archived: row.get::<bool>(COL_TICKET_IS_ARCHIVED)?,
-            pipeline_reservation: row.get::<bool>(COL_TICKET_PIPELINE_RESERVATION)?,
             priority: row.get::<i64>(COL_TICKET_PRIORITY)?,
             reviewed_head: row.get(COL_TICKET_REVIEWED_HEAD)?,
             reviewed_tree: row.get(COL_TICKET_REVIEWED_TREE)?,
@@ -1020,32 +953,21 @@ impl BoardStore {
     /// separate SELECT + UPDATE window). Pipeline-occupied phases are defined
     /// in [`PIPELINE_OCCUPIED_PHASES`].
     ///
-    /// Note that a reserved ReadyForDevelopment ticket (one with
-    /// `pipeline_reservation = 1`) is **not** treated as a pipeline occupant for
-    /// the purpose of this claim — [`has_pipeline_occupant_for_workspace`] (a
-    /// test-only query) considers such tickets occupants, but the claim subquery
-    /// orders by `pipeline_reservation DESC` and clears reservation on claim,
-    /// so a reserved ticket at ReadyForDevelopment will be claimed before any
-    /// other ticket at the same phase — no pipeline occupancy check needed.
-    ///
     /// When `pipeline_check` is [`PipelineCheck::Skip`], the claim uses a
     /// simple LIMIT 1 subquery with no pipeline gating. This is used for phases
     /// that should not be blocked by in-flight pipeline tickets (e.g., analysis,
     /// review, and QA).
     ///
-    /// The subquery orders by `pipeline_reservation DESC, priority ASC, created_at ASC` so that
-    /// tickets bounced back for rework (reservation = 1) are claimed
-    /// before fresh tickets at the same phase. Among tickets with equal reservation,
-    /// tickets with lower priority (higher urgency) are claimed first, then the oldest ticket
-    /// (earliest created_at) is claimed first.
+    /// The subquery orders by `priority ASC, created_at ASC` so that tickets
+    /// with lower priority (higher urgency) are claimed first, then the oldest
+    /// ticket (earliest created_at) is claimed first.
     ///
-    /// Note: the UPDATE sets `assigned_to = NULL` and `pipeline_reservation = 0` —
-    /// this intentionally drops the previous claimant and clears any pipeline
-    /// reservation so the cleared slot is available for other tickets.
-    /// Callers that require agent-level assignment
-    /// (single-owner dispatches like the Engineer) should call
-    /// [`set_assigned_to_no_cancel`](Self::set_assigned_to_no_cancel) after claiming. Parallel-agent
-    /// dispatches (analysts, verifiers) intentionally leave `assigned_to` NULL.
+    /// Note: the mid-execution re-dispatch guard (the historical `assigned_to
+    /// IS NULL` clause) is enforced by the caller via
+    /// [`crate::jobs::ticket_has_active_agents`] — the agents roster
+    /// lives in sessions.db, which board.db cannot reference in a single
+    /// statement. The claim source phases (Backlog, ReadyForDevelopment)
+    /// have no running agent.
     pub(crate) async fn claim_ticket_in_workspace(
         &self,
         current_phase: TicketPhase,
@@ -1087,13 +1009,12 @@ impl BoardStore {
         };
 
         let sql = format!(
-            "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
-             pipeline_reservation = 0 \
+            "UPDATE tickets SET phase = ?1, updated_at = ?2 \
              WHERE id = (SELECT t1.id FROM tickets t1 \
-             WHERE t1.phase = ?3 AND t1.assigned_to IS NULL AND t1.workspace_name = ?4 \
+             WHERE t1.phase = ?3 AND t1.workspace_name = ?4 \
              AND t1.is_archived = 0 \
              {grace_clause}{pipeline_occupied_clause}{prereq_filter} \
-             ORDER BY t1.pipeline_reservation DESC, t1.priority ASC, t1.created_at ASC LIMIT 1) \
+             ORDER BY t1.priority ASC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}"
         );
 
@@ -1217,12 +1138,12 @@ impl BoardStore {
     ///
     /// ```ignore
     /// let prep = Self::build_ticket_update_with_updated_at(
-    ///     "assigned_to = ?",
-    ///     vec![Value::from("user-123")],
+    ///     "priority = ?",
+    ///     vec![Value::from(2)],
     ///     "ticket-456",
     /// );
-    /// // SQL:  "UPDATE tickets SET assigned_to = ?, updated_at = ? WHERE id = ?"
-    /// // params: [user-123, now, ticket-456]
+    /// // SQL:  "UPDATE tickets SET priority = ?, updated_at = ? WHERE id = ?"
+    /// // params: [2, now, ticket-456]
     /// ```
     fn build_ticket_update_with_updated_at(
         set_clause: &str,
@@ -1246,9 +1167,7 @@ impl BoardStore {
     /// [`transition_to_tx`](Self::transition_to_tx).
     ///
     /// Note: this does **not** use [`Self::build_ticket_update_with_updated_at`]
-    /// because it has extra SET columns (`assigned_to = NULL`,
-    /// `pipeline_reservation = COALESCE(?5, pipeline_reservation)`,
-    /// `done_at = CASE ...`) and an
+    /// because it has an extra SET column (`done_at = CASE ...`) and an
     /// additional WHERE condition (`AND (?4 IS NULL OR phase = ?4)`) that
     /// don't fit the helper's fixed pattern.
     ///
@@ -1256,25 +1175,14 @@ impl BoardStore {
     /// on re-completion — and cleared when the ticket leaves `done`, so the
     /// column holds a timestamp iff the ticket is currently in the Done phase.
     /// Later non-transition activity (comments, archive) never touches it.
-    ///
-    /// Terminal targets ([`TicketPhase::is_terminal`]) always clear
-    /// `pipeline_reservation` regardless of `reservation`: a ticket that can
-    /// no longer be claimed must not keep a stale rework-priority flag.
     fn build_transition_sql(
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
-        reservation: Option<bool>,
     ) -> PreparedUpdate {
         let now = turso::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
-        let reservation = if target_phase.is_terminal() {
-            Some(false)
-        } else {
-            reservation
-        };
-        let sql = "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2, \
-                    pipeline_reservation = COALESCE(?5, pipeline_reservation), \
+        let sql = "UPDATE tickets SET phase = ?1, updated_at = ?2, \
                     done_at = CASE WHEN ?1 = 'done' THEN ?2 \
                                    WHEN phase = 'done' THEN NULL \
                                    ELSE done_at END \
@@ -1284,7 +1192,6 @@ impl BoardStore {
             Value::from(now),
             Value::from(ticket_id),
             Value::from(guard),
-            Value::from(reservation),
         ];
         PreparedUpdate {
             sql: sql.to_string(),
@@ -1294,17 +1201,7 @@ impl BoardStore {
     }
 
     /// Update ticket phase, optionally guarded by an expected phase for CAS-style
-    /// atomicity. Always clears `assigned_to` and cancels running agents.
-    ///
-    /// # Note on [`pipeline_reservation`](Ticket::pipeline_reservation)
-    ///
-    /// When `reservation` is `None`, the column is left untouched so bounce-back
-    /// transitions can set it atomically, and manual transitions leave stale
-    /// reservations inert (claim/blocker queries filter by phase). When
-    /// `Some(value)`, it's set in the same UPDATE to avoid a race on crash/restart
-    /// recovery or rework priority. Terminal targets
-    /// ([`TicketPhase::is_terminal`]) always clear the flag — see
-    /// [`build_transition_sql`](Self::build_transition_sql).
+    /// atomicity. Always cancels running agents.
     ///
     /// # Errors
     ///
@@ -1314,11 +1211,23 @@ impl BoardStore {
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
-        reservation: Option<bool>,
     ) -> Result<()> {
-        let prepared =
-            Self::build_transition_sql(ticket_id, expected_phase, target_phase, reservation);
-        prepared.execute_and_cancel(&self.conn).await
+        let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase);
+        prepared.execute_and_cancel(&self.conn).await?;
+        // A terminal transition (Done/Cancelled/Failed) completes the ticket's
+        // implementation (idempotent; no-op when the ticket has no implementation row) so a
+        // manual Done/Cancelled does not leave a lingering 'launched' implementation
+        // row. The pipeline path completes the implementation at its own Done
+        // handoff functions, so this only fires for external/manual callers.
+        // Guard on the session store being initialized: this is the MANUAL
+        // path, and some board-only contexts (tests) never open the session DB.
+        if target_phase.is_terminal()
+            && let Some(session) = crate::session::SESSIONS.get()
+        {
+            let _ =
+                crate::jobs::complete_implementation_job_for_ticket(&session.conn, ticket_id).await;
+        }
+        Ok(())
     }
 
     /// Transactional variant of [`transition_to`](Self::transition_to) —
@@ -1341,10 +1250,8 @@ impl BoardStore {
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
-        reservation: Option<bool>,
     ) -> Result<bool> {
-        let prepared =
-            Self::build_transition_sql(ticket_id, expected_phase, target_phase, reservation);
+        let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase);
         prepared.execute_tx_matched(tx).await
     }
 
@@ -1355,80 +1262,32 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Set or clear the assignee for a ticket **without** cancelling any running
-    /// agent.
+    /// Atomically guard the CAS for diagnostics execution.
     ///
-    /// When `assigned_to` is `Some(value)`, sets the `assigned_to` column to that
-    /// value. When `None`, clears the assignee (sets `assigned_to = NULL`).
+    /// Despite the `claim_*` name, this does NOT persist a claim marker on the
+    /// ticket — it only bumps `updated_at` and cancels any stale agents
+    /// registered on the ticket (safety-in-depth against a stale dispatch).
+    /// The single-occupant in-flight marker is enforced by the CALLER via the
+    /// implementation job's `agents` roster (status='launched').
     ///
-    /// This is the safe choice for parallel agent phases (analysis, review, QA)
-    /// where multiple agents are registered and should NOT be cancelled by the
-    /// assignment update, and for all post-agent cleanup (no agent is running,
-    /// so the cancellation side-effect would be misleading).
-    pub async fn set_assigned_to_no_cancel(
-        &self,
-        ticket_id: &str,
-        assigned_to: Option<&str>,
-    ) -> Result<()> {
-        let prepared = Self::build_ticket_update_with_updated_at(
-            "assigned_to = ?",
-            vec![Value::from(assigned_to)],
-            ticket_id,
-        );
-        prepared.execute_no_cancel(&self.conn).await
-    }
-
-    /// Transactional variant of `set_assigned_to_no_cancel` —
-    /// uses an existing transaction instead of opening its own.
-    /// Does NOT cancel registered agents — the caller is responsible
-    /// for cancelling stale agents **before** beginning the transaction
-    /// when a cancel is needed (e.g., via `AGENT_REGISTRY.cancel_by_ticket_id`).
-    /// This is safe for post-agent operations (e.g., clearing assignment
-    /// after an agent has already finished) where no cancel is needed.
-    pub(crate) async fn set_assigned_to_tx(
-        tx: &TxGuard<'_>,
-        ticket_id: &str,
-        assigned_to: Option<&str>,
-    ) -> Result<()> {
-        let prepared = Self::build_ticket_update_with_updated_at(
-            "assigned_to = ?",
-            vec![Value::from(assigned_to)],
-            ticket_id,
-        );
-        prepared.execute_tx(tx).await
-    }
-
-    /// Atomically claim a ticket for diagnostics execution.
-    ///
-    /// Sets `assigned_to` to the caller-provided value, only when the ticket
-    /// is unassigned AND still in [`TicketPhase::InDiagnostics`] — a single
-    /// atomic SQL guard that prevents the TOCTOU race between the poll
-    /// listing pre-filter and the subsequent claim. The assignee set and phase
-    /// check are fused into one UPDATE; callers do not need a separate
-    /// assignment after claiming.
+    /// Guards the TOCTOU race between the poll listing pre-filter and the
+    /// subsequent claim: only when the ticket is still in
+    /// [`TicketPhase::InDiagnostics`] is the row updated.
     ///
     /// Returns `Ok(true)` if a row was updated (claim succeeded), `Ok(false)`
     /// if no row matched (already claimed by another dispatch or ticket moved
-    /// out of [`TicketPhase::InDiagnostics`]). On a successful claim, cancels
-    /// any agent registered on this ticket as a safety-in-depth measure against
-    /// stale dispatches.
-    pub async fn claim_diagnostics(&self, ticket_id: &str, assigned_to: &str) -> Result<bool> {
+    /// out of [`TicketPhase::InDiagnostics`]).
+    pub async fn claim_diagnostics(&self, ticket_id: &str) -> Result<bool> {
         let now = turso::now();
         let rows = self
             .conn
             .execute(
                 "UPDATE tickets \
-                 SET assigned_to = ?1, updated_at = ?2 \
-                 WHERE id = ?3 \
-                 AND assigned_to IS NULL \
-                 AND phase = ?4 \
+                 SET updated_at = ?1 \
+                 WHERE id = ?2 \
+                 AND phase = ?3 \
                  AND is_archived = 0",
-                turso::params![
-                    assigned_to,
-                    now,
-                    ticket_id,
-                    TicketPhase::InDiagnostics.as_ref()
-                ],
+                turso::params![now, ticket_id, TicketPhase::InDiagnostics.as_ref()],
             )
             .await?;
 
@@ -1436,48 +1295,6 @@ impl BoardStore {
             crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
         }
 
-        Ok(rows > 0)
-    }
-
-    /// Claim a QaPassed ticket for sanitation processing.
-    ///
-    /// Atomically transitions the ticket from [`TicketPhase::QaPassed`] to
-    /// [`TicketPhase::InSanitation`], sets `assigned_to` to the caller-provided
-    /// value, and enforces the per-workspace serialization invariant: only one
-    /// ticket at a time may be in `SANITATION_PIPELINE_PHASES`.
-    ///
-    /// Returns `Ok(true)` if the claim succeeded, `Ok(false)` if:
-    /// - The ticket is no longer in QaPassed (already claimed by another handler), or
-    /// - Another ticket is already in the sanitation pipeline for this workspace.
-    ///
-    /// Unlike [`transition_to`](Self::transition_to), this method does NOT
-    /// cancel registered agents — QaPassed is a transitory handoff phase
-    /// with no running agent, so cancellation is unnecessary.
-    pub async fn claim_sanitation(&self, ticket_id: &str, assigned_to: &str) -> Result<bool> {
-        let now = turso::now();
-        let occupied_sql = phase_list_sql_fragment(SANITATION_PIPELINE_PHASES);
-        let sql = format!(
-            "UPDATE tickets SET phase = ?1, assigned_to = ?2, updated_at = ?3 \
-             WHERE id = ?4 AND phase = ?5 AND is_archived = 0 \
-             AND NOT EXISTS (SELECT 1 FROM tickets t2 \
-               WHERE t2.workspace_name = \
-                 (SELECT workspace_name FROM tickets WHERE id = ?4) \
-               AND t2.id != ?4 \
-               AND t2.phase IN ({occupied_sql}))"
-        );
-        let rows = self
-            .conn
-            .execute(
-                &sql,
-                turso::params![
-                    TicketPhase::InSanitation.as_ref(),
-                    assigned_to,
-                    now,
-                    ticket_id,
-                    TicketPhase::QaPassed.as_ref(),
-                ],
-            )
-            .await?;
         Ok(rows > 0)
     }
 
@@ -1555,160 +1372,51 @@ impl BoardStore {
         }
     }
 
-    /// Manual "Redo Dev" bounce-back: transition a Reviewed ticket back to
-    /// ReadyForDevelopment and increment its bounce counter atomically, so
-    /// manual bounce-backs consume the same breaker budget as pipeline
-    /// bounce-backs. Sets `pipeline_reservation` for
-    /// rework priority (matching pipeline bounce-backs). Cancels any
-    /// registered agent only after the transition succeeds — a CAS
-    /// guard miss (ticket moved externally) must not cancel a just-claimed
-    /// agent.
-    ///
-    /// # Return value
-    ///
-    /// Returns `Ok(true)` when the bounce-back committed and `Ok(false)`
-    /// when the guard missed (the ticket is no longer in
-    /// [`TicketPhase::Reviewed`]) — the expected, silent no-op for a ticket
-    /// that was moved externally while the user was clicking. Follows the
-    /// board layer's claim convention (guard miss = `Ok(false)`).
-    pub(crate) async fn bounce_back_to_dev(&self, ticket_id: &str) -> Result<bool> {
-        let applied = crate::turso::with_tx_outcome(
-            &self.conn,
-            ticket_id,
-            "bounce back to dev",
-            async |tx| {
-                if Self::transition_to_tx(
-                    tx,
-                    ticket_id,
-                    Some(TicketPhase::Reviewed),
-                    TicketPhase::ReadyForDevelopment,
-                    Some(true),
-                )
-                .await?
-                {
-                    Self::increment_bounce_count_tx(tx, ticket_id).await?;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            },
-        )
-        .await?;
-        if applied {
-            crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
-        }
-        Ok(applied)
-    }
-
-    /// Transition pairs for crash/restart recovery (extracted so tests can verify
-    /// coverage against [`PIPELINE_OCCUPIED_PHASES`] without duplicating the pairs).
-    ///
-    /// Each entry maps a phase where an agent may have crashed mid-work back to the
-    /// phase the ticket should resume in. Must be kept in sync with
-    /// [`PIPELINE_OCCUPIED_PHASES`] — see `tests::test_pipeline_occupancy_coverage`.
-    ///
-    /// Asymmetry: `Analysis → Backlog` is included (backlog analysts may crash mid-analysis),
-    /// but `Analysis` is intentionally NOT in [`PIPELINE_OCCUPIED_PHASES`] (it's a pre-flight
-    /// phase, not a pipeline occupant).
-    ///
-    /// Transitory handoff phases (DiagnosticsDone, SanitationPassed, Reviewed, QaPassed) are pipeline
-    /// occupied but don't need a reset entry — the poller picks them up within seconds
-    /// of restart, so no agent session is mid-execution in those states.
-    ///
-    /// `pipeline_reservation` choice per entry:
-    /// - `true`: expensive production-side phases (development, diagnostics, sanitation)
-    ///   — losing queue position wastes significant work, so reset tickets get priority.
-    /// - `false`: lighter inspection phases (analysis, review, QA) — re-queuing is cheap,
-    ///   so normal queue order is fine.
-    const RESET_TRANSITIONS: &[ResetTransition] = &[
-        ResetTransition {
-            from: TicketPhase::InDevelopment,
-            to: TicketPhase::ReadyForDevelopment,
-            pipeline_reservation: true,
-        },
-        ResetTransition {
-            from: TicketPhase::InDiagnostics,
-            to: TicketPhase::ReadyForDevelopment,
-            pipeline_reservation: true,
-        },
-        ResetTransition {
-            from: TicketPhase::InSanitation,
-            to: TicketPhase::QaPassed,
-            pipeline_reservation: true,
-            // Note: pipeline_reservation = true on InSanitation → QaPassed is inert —
-            // QaPassed uses list-based dispatch (spawn_for_each_ticket_in_phase), not the
-            // claim loop where pipeline_reservation provides ordering. Set `true` to match
-            // the production-side convention (sanitation is substantive work, like
-            // development and diagnostics); the flag is harmless for list-based dispatch.
-        },
-        ResetTransition {
-            from: TicketPhase::InQa,
-            to: TicketPhase::Reviewed,
-            pipeline_reservation: false,
-        },
-        ResetTransition {
-            from: TicketPhase::InReview,
-            to: TicketPhase::DiagnosticsDone,
-            pipeline_reservation: false,
-        },
-        ResetTransition {
-            from: TicketPhase::Analysis,
-            to: TicketPhase::Backlog,
-            pipeline_reservation: false,
-        },
-    ];
+    /// Crash/restart reset transition. Boot recovery excludes implementation-owned
+    /// tickets (those with a `ticket_jobs` child row) from the reset so they resume
+    /// in place; of the remaining phases only `Analysis → Backlog` (backlog analysts
+    /// may crash mid-analysis). Analysis is intentionally NOT in
+    /// [`PIPELINE_OCCUPIED_PHASES`] — it is a pre-flight phase, not a pipeline occupant.
+    const RESET_ANALYSIS_TRANSITIONS: &[ResetTransition] = &[ResetTransition {
+        from: TicketPhase::Analysis,
+        to: TicketPhase::Backlog,
+    }];
     /// Lookup a reset transition by `from` phase. Shared by the boot reset and
     /// the stale-purge rollback in jobs.rs so both paths use one table.
-    pub(crate) fn reset_transition(from: TicketPhase) -> Option<(TicketPhase, bool)> {
-        Self::RESET_TRANSITIONS
+    pub(crate) fn reset_analysis_transition(from: TicketPhase) -> Option<TicketPhase> {
+        Self::RESET_ANALYSIS_TRANSITIONS
             .iter()
             .find(|t| t.from == from)
-            .map(|t| (t.to, t.pipeline_reservation))
+            .map(|t| t.to)
     }
-    /// SET clause shared by the boot reset ([`Self::reset_inflight_tickets`])
-    /// and the stale-purge rollback in jobs.rs: phase + assignee clear +
-    /// updated_at + pipeline reservation.
+    /// SET clause shared by the boot reset ([`Self::reset_analysis_tickets`])
+    /// and the stale-purge rollback in jobs.rs: phase + updated_at.
     ///
-    /// Parameter slots: `?1` = target phase, `?2` = now, `?4` =
-    /// pipeline_reservation (`?3`/`?5` are WHERE-bound at the call sites —
-    /// board.rs binds `?3` = source phase; jobs.rs binds `?3` = ticket id and
-    /// `?5` = source phase).
+    /// Exactly two placeholders: `?1` = target phase, `?2` = now. Call sites
+    /// append their own WHERE-bound placeholders after this clause (board.rs
+    /// binds `?3` = source phase in `WHERE phase = ?3`; jobs.rs binds `?3` =
+    /// ticket id and `?4` = source phase in `WHERE id = ?3 AND phase = ?4`).
     ///
     /// Interpolated via `format!` at both call sites — must never contain a
     /// literal `{` or `}`.
-    pub(crate) const RESET_TICKET_SET_CLAUSE: &str =
-        "phase = ?1, assigned_to = NULL, updated_at = ?2, pipeline_reservation = ?4";
-    /// Reset all in-flight tickets to their ready state (for crash/restart recovery).
-    ///
-    /// Resets:
-    /// - 5 of the 9 `PIPELINE_OCCUPIED_PHASES` where agents may have been mid-work
-    ///   (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) — roll back to
-    ///   their pre-pipeline state
-    /// - `Analysis` (not a pipeline occupant, but backlog analysts may crash mid-work)
-    ///
-    /// Tickets that are bounced to `ReadyForDevelopment` (InDevelopment and InDiagnostics)
-    /// get `pipeline_reservation = 1` so they are claimed before any fresh
-    /// `ReadyForDevelopment` ticket — this preserves the rework priority across restarts.
-    ///
-    /// Excludes DiagnosticsDone, SanitationPassed, Reviewed, and QaPassed — these are transitory handoff states
-    /// that the poller picks up within the next poll cycle.
-    ///
-    /// Uses `Self::RESET_TRANSITIONS` (extracted as an associated const so tests
-    /// can verify coverage against `PIPELINE_OCCUPIED_PHASES`).
+    pub(crate) const RESET_TICKET_SET_CLAUSE: &str = "phase = ?1, updated_at = ?2";
+    /// Reset Analysis in-flight tickets at boot (crash/restart recovery). Only
+    /// `Analysis → Backlog` is reset (backlog analysts may crash mid-work); the
+    /// implementation-protected occupied phases (InDevelopment, InDiagnostics,
+    /// InReview, InQa, InSanitation) are NOT reset — a resumed implementation job
+    /// keeps them in phase instead of re-claiming.
     ///
     /// `exclude_ticket_ids`: tickets with a RESUMED active job at boot must be
-    /// skipped — resetting them to a claimable phase would re-claim via the 1s
-    /// poll loop while the resumed agent runs (duplicate work/double LLM
-    /// cost/conflicting verdicts). An empty exclusion omits the clause.
-    pub async fn reset_inflight_tickets(&self, exclude_ticket_ids: &[String]) -> Result<()> {
+    /// skipped — resetting them would re-claim via the poll loop while the resumed
+    /// agent runs (duplicate work/conflicting verdicts). Empty excludes nothing.
+    pub async fn reset_analysis_tickets(&self, exclude_ticket_ids: &[String]) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         let now = turso::now();
-        for transition in Self::RESET_TRANSITIONS {
+        for transition in Self::RESET_ANALYSIS_TRANSITIONS {
             let mut values: Vec<turso::Value> = vec![
                 turso::Value::Text(transition.to.as_ref().to_string()),
                 turso::Value::Text(now.clone()),
                 turso::Value::Text(transition.from.as_ref().to_string()),
-                turso::Value::Integer(i64::from(transition.pipeline_reservation)),
             ];
             let clause = if exclude_ticket_ids.is_empty() {
                 String::new()
@@ -1741,9 +1449,7 @@ impl BoardStore {
     /// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) ticket,
     /// optionally excluding a specific ticket ID.
     ///
-    /// [`has_active_tickets_excluding`] delegates to this helper. The test-only
-    /// [`has_pipeline_occupant_for_workspace`] delegates too, with
-    /// `require_rfd_reservation = true`.
+    /// [`has_active_tickets_excluding`] delegates to this helper.
     ///
     /// # Parameters
     ///
@@ -1751,11 +1457,6 @@ impl BoardStore {
     /// * `exclude_ticket_id` — When `Some(id)`, that ticket is excluded from
     ///   the check. When `None`, no exclusion is applied (the SQL clause
     ///   `(?2 IS NULL OR id != ?2)` short-circuits to `TRUE`).
-    /// * `require_rfd_reservation` — When `true`, only ReadyForDevelopment
-    ///   tickets with `pipeline_reservation = 1` are counted as active (used
-    ///   by the pipeline-occupant check). When `false`, all ReadyForDevelopment
-    ///   tickets are active regardless of reservation (notification-suppression
-    ///   policy for [`has_active_tickets_excluding`]).
     ///
     /// Excludes archived tickets — the only phases that ever get archived are
     /// `Done` and `Cancelled`, neither of which appears in
@@ -1767,24 +1468,15 @@ impl BoardStore {
     /// - `?1`: `workspace_name`
     /// - `?2`: `exclude_ticket_id` (may be `None`)
     /// - `?3`: ReadyForDevelopment phase value
-    ///
-    /// When `require_rfd_reservation = true` the RFD branch adds
-    /// `AND pipeline_reservation = 1` to the same `?3` position.
     async fn has_active_tickets_internal(
         &self,
         workspace_name: &str,
         exclude_ticket_id: Option<&str>,
-        require_rfd_reservation: bool,
     ) -> Result<bool> {
         let occupied_sql = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES);
-        let rfd_condition = if require_rfd_reservation {
-            "(phase = ?3 AND pipeline_reservation = 1)".to_string()
-        } else {
-            "phase = ?3".to_string()
-        };
         let sql = format!(
             "SELECT 1 FROM tickets WHERE \
-             (phase IN ({occupied_sql}) OR {rfd_condition}) \
+             (phase IN ({occupied_sql}) OR phase = ?3) \
              AND workspace_name = ?1 AND is_archived = 0 \
              AND (?2 IS NULL OR id != ?2) LIMIT 1",
         );
@@ -1796,70 +1488,33 @@ impl BoardStore {
         Ok(!rows.is_empty())
     }
 
-    /// Returns `true` if the given workspace has any ticket with a
-    /// pipeline-occupied phase (dev/review/QA), OR any reserved
-    /// ReadyForDevelopment ticket that was bounced back and is awaiting rework.
-    ///
-    /// **Test-only query** — retained to provide coverage of the pipeline-occupant
-    /// SQL variant. Production code uses [`has_active_tickets_excluding`] or
-    /// [`count_by_phase`].
-    ///
-    /// Delegates to [`has_active_tickets_internal`] with
-    /// `exclude_ticket_id = None` and `require_rfd_reservation = true`.
-    ///
-    /// Note this includes `AND pipeline_reservation = 1` for ReadyForDevelopment
-    /// tickets, unlike [`has_active_tickets_excluding`] (the production entry
-    /// point) which treats all ReadyForDevelopment tickets as active regardless
-    /// of reservation.
-    ///
-    /// # Maintenance warning
-    ///
-    /// If a future feature needs this in production, remove the `#[cfg(test)]`
-    /// gate and add a real caller. The doc comment and tests will validate the
-    /// query is correct before any production use.
-    ///
-    /// Excludes archived tickets — the only phases that ever get archived are
-    /// `Done` and `Cancelled`, neither of which appears in
-    /// `PIPELINE_OCCUPIED_PHASES`, so this is a defensive consistency measure.
-    #[cfg(test)]
-    pub(crate) async fn has_pipeline_occupant_for_workspace(
-        &self,
-        workspace_name: &str,
-    ) -> Result<bool> {
-        self.has_active_tickets_internal(workspace_name, None, true)
-            .await
-    }
-
     /// Check if the workspace has any active tickets other than the excluded one.
     ///
     /// "Active" means a ticket whose phase is either a pipeline-occupied phase
     /// (`PIPELINE_OCCUPIED_PHASES`) or [`TicketPhase::ReadyForDevelopment`]
-    /// (regardless of `pipeline_reservation` — unstarted backlog tickets are
-    /// considered active to suppress Done notifications until the pipeline is
-    /// fully drained).
+    /// (unstarted backlog tickets are considered active to suppress Done
+    /// notifications until the pipeline is fully drained).
     ///
-    /// Delegates to `has_active_tickets_internal`. The test-only
-    /// `has_pipeline_occupant_for_workspace` additionally requires
-    /// `pipeline_reservation = 1` for ReadyForDevelopment tickets.
+    /// Delegates to `has_active_tickets_internal`.
     ///
     /// Non-active phases (not matched by the query): `Done`, `Cancelled`,
     /// `Failed`, `Backlog`, `Analysis`, `Planning`.
     ///
     /// # Race condition note
     ///
-    /// When multiple QaPassed tickets in the same workspace are finalized
+    /// When multiple occupied tickets in the same workspace are finalized
     /// concurrently (each via [`tokio::spawn`] in the poller), both may see
     /// each other as active and both buffer their Done transitions. In this
     /// scenario all tickets are already in Done in the database — the only
     /// consequence is that Done notifications are delayed until the next
-    /// [`crate::message_router::JobKind::UserMessage`] drains the buffer. This is an accepted trade-off:
+    /// [`crate::message_router::MessageKind::UserMessage`] drains the buffer. This is an accepted trade-off:
     /// the race window is small and the buffer always drains eventually.
     pub async fn has_active_tickets_excluding(
         &self,
         workspace_name: &str,
         exclude_ticket_id: &str,
     ) -> Result<bool> {
-        self.has_active_tickets_internal(workspace_name, Some(exclude_ticket_id), false)
+        self.has_active_tickets_internal(workspace_name, Some(exclude_ticket_id))
             .await
     }
 
@@ -1888,11 +1543,18 @@ impl BoardStore {
 
     /// Route a newly-persisted comment to any running agents assigned to the ticket.
     ///
-    /// Looks up the ticket's `assigned_to` field. If agents are assigned and
-    /// registered in the message router, the comment is delivered to each one.
-    /// This is best-effort — failures are logged but not propagated.
+    /// Looks up the ticket's currently-running agents (`launched` roster rows
+    /// across the ticket's implementation and analysis jobs — the replacement for the
+    /// historical `tickets.assigned_to`). If agents are registered in the
+    /// message router, the comment is delivered to each one. This is
+    /// best-effort — failures are logged but not propagated.
     async fn route_comment_to_agents(&self, ticket_id: &str, role: &str, content: &str) {
-        // Fetch the ticket's assigned_to and workspace_name
+        // Best-effort: if the sessions store isn't initialized (e.g. a
+        // board-only test), there are no active agents to route to.
+        let Some(sessions) = crate::session::SESSIONS.get() else {
+            return;
+        };
+        // Fetch the ticket's workspace_name.
         let ticket = match self.get_ticket(ticket_id).await {
             Ok(Some(t)) => t,
             Ok(None) => {
@@ -1905,12 +1567,21 @@ impl BoardStore {
             }
         };
 
-        let Some(assigned_to) = ticket.assigned_to.as_ref() else {
-            return; // No agents assigned
-        };
+        let active =
+            match crate::jobs::list_running_agents_for_ticket(&sessions.conn, ticket_id).await {
+                Ok(agents) if !agents.is_empty() => agents,
+                Ok(_) => return, // No running agents
+                Err(e) => {
+                    warn!(
+                        ticket = %ticket_id,
+                        error = %e,
+                        "Comment routing: failed to read running agents",
+                    );
+                    return;
+                }
+            };
 
-        for agent_id in assigned_to.split(',') {
-            let agent_id = agent_id.trim();
+        for agent_id in active {
             if agent_id.is_empty() {
                 continue;
             }
@@ -1928,13 +1599,13 @@ impl BoardStore {
                 workspace_name: ticket.workspace_name.clone(),
                 user_name: role.to_string(),
                 channel: String::new(),
-                kind: crate::message_router::JobKind::TicketComment,
+                kind: crate::message_router::MessageKind::TicketComment,
                 role: commenter_role,
                 reply_target: None,
                 pending_job_id: None,
             };
 
-            if crate::message_router::try_route(agent_id, job) {
+            if crate::message_router::try_route(&agent_id, job) {
                 debug!(
                     ticket = %ticket_id,
                     agent = %agent_id,
@@ -2092,29 +1763,21 @@ impl BoardStore {
 
     /// Archive a single ticket by ID.
     ///
-    /// Sets `is_archived = 1` and clears `assigned_to` (archived tickets should
-    /// not remain assigned). Returns an error if the ticket does not exist.
+    /// Sets `is_archived = 1`. Returns an error if the ticket does not exist.
     ///
     /// **Ordering constraint:** The caller must transition the ticket to a
     /// terminal state (`done` or `cancelled`) *before* calling this method.
-    /// There is no `assigned_to IS NULL` guard — [`transition_to`](Self::transition_to)
-    /// already clears the assignee, and a single-ticket archive on an assigned
-    /// ticket is intentionally allowed to resolve stale assignments.
     pub async fn set_archived(&self, ticket_id: &str) -> Result<()> {
-        let prepared = Self::build_ticket_update_with_updated_at(
-            "is_archived = 1, assigned_to = NULL",
-            vec![],
-            ticket_id,
-        );
+        let prepared =
+            Self::build_ticket_update_with_updated_at("is_archived = 1", vec![], ticket_id);
         prepared.execute_and_cancel(&self.conn).await
     }
 
     /// Move all non-archived ReadyForDevelopment tickets in the given workspace
-    /// to Planning, clearing their assignments.
+    /// to Planning.
     ///
     /// Used by the circuit breaker to drain sibling ReadyForDevelopment tickets
-    /// when a ticket in the same workspace fails, ensuring pipeline reservation
-    /// ordering is preserved (bounced tickets get priority over fresh ones).
+    /// when a ticket in the same workspace fails.
     ///
     /// Uses a single atomic UPDATE so there is no TOCTOU window between reading
     /// current ReadyForDevelopment tickets and updating them. Per-sibling
@@ -2130,7 +1793,7 @@ impl BoardStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE tickets SET phase = ?1, assigned_to = NULL, updated_at = ?2 \
+                "UPDATE tickets SET phase = ?1, updated_at = ?2 \
                  WHERE phase = ?3 AND workspace_name = ?4 AND is_archived = 0",
                 turso::params![
                     TicketPhase::Planning.as_ref(),
@@ -2150,36 +1813,12 @@ impl BoardStore {
             .conn
             .execute(
                 "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
-                 WHERE phase = ?2 AND updated_at < ?3 AND assigned_to IS NULL \
+                 WHERE phase = ?2 AND updated_at < ?3 \
                  AND is_archived = 0",
                 turso::params![now, TicketPhase::Cancelled.as_ref(), cutoff],
             )
             .await
             .context("Failed to archive stale cancelled tickets")?;
-        Ok(updated)
-    }
-
-    /// Idempotently clear stale `pipeline_reservation` flags on
-    /// terminal-phase tickets ([`TERMINAL_PHASES`]).
-    ///
-    /// Terminal phases cannot be claimed, so a reservation left over from a
-    /// pre-terminal bounce is inert garbage. The sweep is a pure flag purge:
-    /// it does **not** bump `updated_at`/`done_at` (bumping `updated_at` would
-    /// delay stale-cancelled archival, which filters by `updated_at` cutoff)
-    /// and does **not** filter `is_archived` (archived terminal rows can still
-    /// carry the flag). Non-terminal reserved rows (e.g. ReadyForDevelopment
-    /// waiting for the pipeline) are deliberately left untouched.
-    pub(crate) async fn clear_terminal_reservations(&self) -> Result<u64> {
-        let sql = format!(
-            "UPDATE tickets SET pipeline_reservation = 0 \
-             WHERE phase IN ({}) AND pipeline_reservation = 1",
-            phase_list_sql_fragment(TERMINAL_PHASES),
-        );
-        let updated = self
-            .conn
-            .execute(&sql, turso::params![])
-            .await
-            .context("Failed to clear stale terminal pipeline reservations")?;
         Ok(updated)
     }
 
@@ -2190,7 +1829,7 @@ impl BoardStore {
         let now = turso::now();
         let sql = format!(
             "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
-             WHERE phase IN ({}) AND assigned_to IS NULL AND is_archived = 0 \
+             WHERE phase IN ({}) AND is_archived = 0 \
              AND (?2 IS NULL OR workspace_name = ?2)",
             phase_list_sql_fragment(UNBLOCKING_PHASES),
         );

@@ -357,7 +357,6 @@ impl Agent {
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
-            resume_comment_injection: false,
         }
     }
 }
@@ -1408,7 +1407,7 @@ impl Agent {
             match rx.try_recv() {
                 Ok(job) => {
                     let content = match job.kind {
-                        crate::message_router::JobKind::TicketComment => {
+                        crate::message_router::MessageKind::TicketComment => {
                             format_comment_message(&job.user_name, &job.content)
                         }
                         _ => job.content,
@@ -1460,16 +1459,12 @@ impl Agent {
     /// otherwise miss comments added after the boot snapshot. Re-reads the board
     /// and injects comments absent from the loaded history (content-based dedup,
     /// whether a previously-delivered `[Comment from ...]` message or the
-    /// session-start ticket block). Gated to `resume` + empty `msg` and the
-    /// dispatcher-set [`Self::resume_comment_injection`] flag (the empty-message
-    /// resume); the bounce-feedback path reuses the session with a NON-empty
-    /// `msg` and is excluded. Runs once per turn, fail-open persist like live
-    /// delivery.
+    /// session-start ticket block). Gated to `resume` + empty `msg`: the
+    /// bounce-feedback path runs with `resume=false` (non-empty `msg`), so the
+    /// `!resume` check excludes it. Runs once per turn, fail-open persist like
+    /// live delivery.
     async fn inject_outstanding_comments(&mut self, resume: bool, msg: &str) {
         if !resume || !msg.is_empty() {
-            return;
-        }
-        if !self.resume_comment_injection {
             return;
         }
 
@@ -1903,7 +1898,6 @@ pub(crate) async fn run_agent(
     round: Option<RoundOpts>,
     parent_key: Option<crate::registry::ParentKey>,
     parent_label: Option<String>,
-    resume_comment_injection: bool,
 ) -> (Agent, Option<String>) {
     // Unregister from the message router on EVERY exit path, including a
     // panic mid-work (Drop runs during unwind) — a leaked router entry would
@@ -1932,7 +1926,6 @@ pub(crate) async fn run_agent(
         parent_label,
     );
     agent.incoming_rx = incoming_rx;
-    agent.resume_comment_injection = resume_comment_injection;
     if let Some(round) = round {
         agent.round_ts = Some(round.round_ts);
         agent.first_call_notify = round.first_call_notify;
@@ -2033,7 +2026,6 @@ pub(crate) async fn run_default_agent(
         round,
         parent_key,
         parent_label,
-        false,
     )
     .await
 }
@@ -2158,7 +2150,6 @@ mod tests {
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
-            resume_comment_injection: false,
         }
     }
 
@@ -2620,7 +2611,7 @@ mod tests {
             workspace_name: "test_ws".to_string(),
             user_name: "manager".to_string(),
             channel: String::new(),
-            kind: crate::message_router::JobKind::TicketComment,
+            kind: crate::message_router::MessageKind::TicketComment,
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
@@ -2661,7 +2652,7 @@ mod tests {
             workspace_name: "test_ws".to_string(),
             user_name: "user".to_string(),
             channel: String::new(),
-            kind: crate::message_router::JobKind::UserMessage,
+            kind: crate::message_router::MessageKind::UserMessage,
             role: crate::Role::Assistant,
             reply_target: None,
             pending_job_id: None,
@@ -2727,10 +2718,6 @@ mod tests {
         }
         let mut agent = make_agent_with_role(vec![], role);
         agent.agent_id = agent_id.to_string();
-        // Mirror the management dispatcher: only engineer/sanitation stage rounds
-        // set the comment-injection flag (analyst/reviewer/QA are out of scope).
-        agent.resume_comment_injection =
-            matches!(role, crate::Role::Engineer | crate::Role::Sanitation);
         agent
             .session
             .init(agent_id, "", ws, &role, Some(&ticket), "", "", None)
@@ -2913,9 +2900,11 @@ mod tests {
         );
     }
 
-    /// A non-engineer/sanitation role (e.g. Analyst) is out of scope — a no-op.
+    /// Comment injection is not role-gated: the role flag was removed as dead
+    /// weight (only stage rounds resume with an empty message in production),
+    /// so a non-stage role reaching the resume path injects too.
     #[tokio::test]
-    async fn test_inject_outstanding_comments_noop_for_non_stage_role() {
+    async fn test_inject_outstanding_comments_injects_for_non_stage_role() {
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws_named("/tmp/test", "inject_analyst");
         let ticket_id = crate::util::test::make_ticket(
@@ -2943,10 +2932,10 @@ mod tests {
 
         let history = agent.session.history();
         assert!(
-            !history
+            history
                 .iter()
                 .any(|m| m.content.contains("[Comment from manager on ticket]")),
-            "non-stage roles must not inject comments",
+            "injection is no longer role-gated — non-stage roles reaching the resume path inject",
         );
     }
 
@@ -3118,7 +3107,6 @@ mod tests {
             }),
             None,
             None,
-            false,
         )
         .await;
         assert!(

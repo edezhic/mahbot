@@ -160,12 +160,10 @@ CREATE TABLE IF NOT EXISTS pending_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target_agent_id, created_at);
 
-CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
+CREATE TABLE IF NOT EXISTS ticket_jobs (
     id          TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     ticket_id   TEXT NOT NULL,
-    stage       TEXT NOT NULL,
-    phase       TEXT NOT NULL,
-    round       INTEGER NOT NULL
+    stage       TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS research_jobs (

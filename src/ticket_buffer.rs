@@ -109,7 +109,7 @@ pub(crate) fn push(
 /// <ticket-updates>
 /// • mahbot-1 (pipeline flow):
 ///     in_development → in_diagnostics (2026-08-07T11:00:00+00:00)
-///     in_diagnostics → diagnostics_done (2026-08-07T11:05:00+00:00)
+///     in_diagnostics → in_review (2026-08-07T11:05:00+00:00)
 /// • mahbot-2 (user action):
 ///     analysis → planning (2026-08-07T11:10:00+00:00)
 /// </ticket-updates>
@@ -241,15 +241,15 @@ mod tests {
             "ws-a",
             "mahbot-1736",
             TicketPhase::InDiagnostics,
-            TicketPhase::DiagnosticsDone,
+            TicketPhase::InReview,
             TransitionOrigin::Pipeline,
             "2026-08-17T08:21:19.225709+00:00",
         );
         push_raw(
             "ws-a",
             "mahbot-1736",
-            TicketPhase::DiagnosticsDone,
-            TicketPhase::InSanitation,
+            TicketPhase::InReview,
+            TicketPhase::InQa,
             TransitionOrigin::Pipeline,
             "2026-08-17T08:32:01.225709+00:00",
         );
@@ -263,20 +263,12 @@ mod tests {
                 .contains("    in_development → in_diagnostics (2026-08-17T08:11:34.225709+00:00)")
         );
         assert!(
-            result.contains(
-                "    in_diagnostics → diagnostics_done (2026-08-17T08:21:19.225709+00:00)"
-            )
+            result.contains("    in_diagnostics → in_review (2026-08-17T08:21:19.225709+00:00)")
         );
-        assert!(
-            result.contains(
-                "    diagnostics_done → in_sanitation (2026-08-17T08:32:01.225709+00:00)"
-            )
-        );
+        assert!(result.contains("    in_review → in_qa (2026-08-17T08:32:01.225709+00:00)"));
         let hop1 = result.find("    in_development").unwrap();
-        let hop2 = result
-            .find("    in_diagnostics → diagnostics_done")
-            .unwrap();
-        let hop3 = result.find("    diagnostics_done → in_sanitation").unwrap();
+        let hop2 = result.find("    in_diagnostics → in_review").unwrap();
+        let hop3 = result.find("    in_review → in_qa").unwrap();
         assert!(hop1 < hop2 && hop2 < hop3);
     }
 
@@ -296,7 +288,7 @@ mod tests {
             "ws-a",
             "mahbot-1736",
             TicketPhase::InDiagnostics,
-            TicketPhase::DiagnosticsDone,
+            TicketPhase::InReview,
             TransitionOrigin::Pipeline,
             "2026-08-17T08:21:19.225709+00:00",
         );

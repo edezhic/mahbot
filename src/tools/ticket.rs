@@ -260,7 +260,7 @@ impl Tool for UpdateTicketTool {
                 },
                 "phase": {
                     "type": "string",
-                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), planning (paused state awaiting further decision whether to proceed with the ticket or cancel it), ready_for_development (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete), qa_passed (advance failed ticket past failed — only valid from 'failed' phase for Manager triage of minor issues). Do NOT manually set other pipeline-managed phases (analysis, in_development, in_diagnostics, diagnostics_done, in_review, reviewed, in_qa) — the board poller handles these automatically and manual transitions will interfere with running agents."
+                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), planning (paused state awaiting further decision whether to proceed with the ticket or cancel it), ready_for_development (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete). Do NOT manually set other pipeline-managed phases (analysis, in_development, in_diagnostics, in_review, in_qa, in_sanitation) — the board poller handles these automatically and manual transitions will interfere with running agents."
                 }
             }),
             &["ticket_id", "phase"],
@@ -278,9 +278,7 @@ impl Tool for UpdateTicketTool {
         // Guard: refuse to update a ticket that is in a pipeline-occupied phase.
         guard_not_pipeline_occupied(store, &ticket_id).await?;
 
-        store
-            .transition_to(&ticket_id, None, parsed_phase, None)
-            .await?;
+        store.transition_to(&ticket_id, None, parsed_phase).await?;
 
         Ok(format!("Ticket {ticket_id} phase updated to '{new_phase}'"))
     }
@@ -573,16 +571,11 @@ mod tests {
         let id_c = make_ticket(store, &ws, "C", crate::board::TicketPhase::Backlog).await;
         // Transition C to 'done' and B to 'cancelled'
         store
-            .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done, None)
+            .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done)
             .await
             .expect("transition to done");
         store
-            .transition_to(
-                &id_b,
-                Some(TicketPhase::Backlog),
-                TicketPhase::Cancelled,
-                None,
-            )
+            .transition_to(&id_b, Some(TicketPhase::Backlog), TicketPhase::Cancelled)
             .await
             .expect("transition to cancelled");
 

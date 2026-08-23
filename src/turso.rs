@@ -1118,6 +1118,32 @@ pub(crate) async fn ensure_fts_index(
 // transaction-atomic with DDL). Each migration is a ready-made SQL
 // statement/script applied exactly once, in order, at store initialization.
 
+/// Existence-guard direction for a migration: whether the SQL runs when the
+/// column EXISTS or when it is ABSENT. This is what makes the wipe-and-recreate
+/// vs upgrade-in-place paths converge to the same final state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MigrationGuard {
+    /// Add-column migration: skip the SQL when the column already exists
+    /// (a fresh-DB SCHEMA already declared it); run it when the column is
+    /// missing (an older database being upgraded in place).
+    ColumnExists {
+        table: &'static str,
+        column: &'static str,
+    },
+    /// Drop-column migration: run the SQL when the column still exists
+    /// (an older database being upgraded in place); skip it when the column
+    /// is already absent (a fresh-DB SCHEMA never declared it).
+    ColumnDropped {
+        table: &'static str,
+        column: &'static str,
+    },
+    /// Table-rename migration: run the SQL when the table still exists under
+    /// its old name (an older database being upgraded in place); skip it when
+    /// the table is already absent (a fresh-DB SCHEMA created the new name
+    /// directly). Both paths record the migration as applied.
+    TableExists { table: &'static str },
+}
+
 /// One ordered, ready-made schema migration.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Migration {
@@ -1126,21 +1152,21 @@ pub(crate) struct Migration {
     pub(crate) id: &'static str,
     /// The SQL statement/script applied when the migration is pending.
     pub(crate) sql: &'static str,
-    /// Optional existence guard `(table, column)`: when the column already
-    /// exists, the SQL is skipped but the migration is still recorded as
-    /// applied. This is what makes the wipe-and-recreate operational
-    /// sequence safe — a fresh-DB SCHEMA already contains the migrated shape
-    /// (the column exists), so a duplicate-column ALTER must never fire; the
-    /// guard turns it into a no-op recorded as applied. The upgrade-in-place
-    /// path (column missing) runs the SQL and records it. Both paths
-    /// converge to the same final state.
-    pub(crate) guard: Option<(&'static str, &'static str)>,
+    /// Optional existence guard. When the guard's condition holds, the SQL is
+    /// skipped but the migration is still recorded as applied. This is what
+    /// makes the wipe-and-recreate operational sequence safe — a fresh-DB
+    /// SCHEMA already contains the migrated shape, so a duplicate-column
+    /// ALTER (or a no-op DROP) must never fire; the guard turns it into a
+    /// no-op recorded as applied. The upgrade-in-place path runs the SQL and
+    /// records it. Both paths converge to the same final state.
+    pub(crate) guard: Option<MigrationGuard>,
 }
 
 /// Check whether `table` has a column named `column`.
 ///
 /// `PRAGMA table_info` reports one row per column with the column name at
-/// position 1.
+/// position 1. A missing table reports zero rows (column absent), which is the
+/// fresh-DB shape for a column that was never declared.
 pub(crate) async fn column_exists(
     conn: &Connection,
     table: &str,
@@ -1153,6 +1179,23 @@ pub(crate) async fn column_exists(
     Ok(rows
         .iter()
         .any(|row| row.get::<String>(1).ok().as_deref() == Some(column)))
+}
+
+/// Check whether a table currently exists under `name`.
+///
+/// Backs the [`MigrationGuard::TableExists`] guard: a table that shipped under
+/// an old name (to be RENAMEd by the migration) reports `true` on an
+/// upgraded-in-place database and `false` on a fresh-DB SCHEMA that created
+/// the new name directly.
+pub(crate) async fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    let rows = conn
+        .query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+        )
+        .await
+        .context("Failed to read table schema (sqlite_master)")?;
+    Ok(!rows.is_empty())
 }
 
 /// Apply pending migrations for a store, in order, exactly once each.
@@ -1201,8 +1244,27 @@ pub(crate) async fn run_pending_migrations(
         if applied.contains(migration.id) {
             continue;
         }
-        let guard_holds = match migration.guard {
-            Some((table, column)) => {
+        // Decide whether the migration's SQL must actually run, based on the
+        // guard's direction:
+        //   - None                 → always run.
+        //   - ColumnExists         → run only if the column is ABSENT
+        //                             (already-present = fresh-DB shape = skip).
+        //   - ColumnDropped        → run only if the column is PRESENT
+        //                             (already-absent = fresh-DB shape = skip).
+        //   - TableExists          → run only if the table is PRESENT under its
+        //                             old name (already-absent = fresh-DB SCHEMA
+        //                             created the new name = skip).
+        let run_sql = match migration.guard {
+            None => true,
+            Some(MigrationGuard::ColumnExists { table, column }) => {
+                !column_exists(conn, table, column).await.with_context(|| {
+                    format!(
+                        "Migration '{}' guard check failed on {table}.{column}",
+                        migration.id
+                    )
+                })?
+            }
+            Some(MigrationGuard::ColumnDropped { table, column }) => {
                 column_exists(conn, table, column).await.with_context(|| {
                     format!(
                         "Migration '{}' guard check failed on {table}.{column}",
@@ -1210,38 +1272,50 @@ pub(crate) async fn run_pending_migrations(
                     )
                 })?
             }
-            None => false,
+            Some(MigrationGuard::TableExists { table }) => {
+                table_exists(conn, table).await.with_context(|| {
+                    format!(
+                        "Migration '{}' guard check failed on table {table}",
+                        migration.id
+                    )
+                })?
+            }
         };
-        if guard_holds {
-            // Fresh-DB path: the SCHEMA already produced the migrated shape —
-            // record the migration as applied without running its SQL.
-            conn.execute(
+        // The tracking-row INSERT is identical whether the migration SQL ran
+        // (in-tx, atomic with the schema change) or was skipped (fresh-DB
+        // shape); factor the statement + params so the two arms cannot drift.
+        let record_migration = |id: &str| {
+            (
                 "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
-                params![migration.id, now()],
+                params![id, now()],
             )
-            .await
-            .with_context(|| format!("Failed to record migration '{}' as applied", migration.id))?;
-        } else {
+        };
+        if run_sql {
             let tx = conn.begin_tx().await.with_context(|| {
                 format!("Migration '{}': failed to begin transaction", migration.id)
             })?;
             tx.execute_batch(migration.sql)
                 .await
                 .with_context(|| format!("Migration '{}' failed", migration.id))?;
-            tx.execute(
-                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
-                params![migration.id, now()],
-            )
-            .await
-            .with_context(|| format!("Failed to record migration '{}' as applied", migration.id))?;
+            let (sql, params) = record_migration(migration.id);
+            tx.execute(sql, params).await.with_context(|| {
+                format!("Failed to record migration '{}' as applied", migration.id)
+            })?;
             tx.commit()
                 .await
                 .with_context(|| format!("Migration '{}': failed to commit", migration.id))?;
+        } else {
+            // Fresh-DB path: the SCHEMA already produced the migrated shape —
+            // record the migration as applied without running its SQL.
+            let (sql, params) = record_migration(migration.id);
+            conn.execute(sql, params).await.with_context(|| {
+                format!("Failed to record migration '{}' as applied", migration.id)
+            })?;
         }
         tracing::info!(
             store = store_name,
             migration = migration.id,
-            skipped_sql = guard_holds,
+            skipped_sql = !run_sql,
             "Applied database migration",
         );
     }

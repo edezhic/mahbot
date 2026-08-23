@@ -393,7 +393,7 @@ mod tests {
         let envelope = crate::jobs::complete_durable_job(
             job_id,
             "report".to_string(),
-            crate::message_router::JobKind::ResearchResult,
+            crate::message_router::MessageKind::ResearchResult,
             crate::Role::Assistant,
             "caller-user",
             "telegram",

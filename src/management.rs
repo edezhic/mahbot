@@ -1,23 +1,29 @@
 //! Board poller — picks up tickets from the board and dispatches agents.
 //!
-//! Poll phases — dispatches agents based on ticket phase:
-//! - Backlog → spawn Analyst agents (3 parallel; escalates to 5 on unanimous blockers)
-//! - ReadyForDevelopment → spawn Engineer agent
-//! - InDiagnostics → dispatch diagnostics runner (shell commands)
-//! - DiagnosticsDone → spawn Reviewer agents (calibrated dynamic count)
-//! - Reviewed → spawn QA agent (single tester)
-//! - QaPassed → check for untracked files; if found, claim to InSanitation and
-//!   dispatch Sanitation agent, otherwise commit and transition to Done
-//! - InSanitation → dispatch Sanitation agent (via `assigned_to` re-dispatch guard)
-//! - SanitationPassed → auto-commit and transition to Done
+//! The implementation job is the single authority for an occupied ticket's
+//! pipeline. `tickets.phase` is the displayed (post-factum) state of the
+//! implementation job as it advances — PLUS an input gate for the claim step
+//! (Backlog → Analysis, ReadyForDevelopment → InDevelopment). It is not a pure
+//! mirror: it also gates entry into the pipeline. The poll loop iterates the
+//! implementation jobs (sessions.db) and dispatches the matching stage agent; the
+//! implementation job dispatches the next stage immediately in the same
+//! dispatch-finalizer (no separate poll tick).
 //!
-//! Reviewer and QA phases share a single `PollPhase::VerifierCheck` variant
-//! with per-phase configuration carried in `VerifierInfo` constants
+//! Poll phases — claims + implementation dispatch:
+//! - Backlog → spawn Analyst agents (3 parallel; escalates to 5 on unanimous blockers)
+//! - ReadyForDevelopment → spawn Engineer agent (creates the implementation)
+//! - Implementation iteration: an occupied implementation job whose stage agent is
+//!   not running re-dispatches its stage (development/diagnostics/review/qa/sanitation).
+//!
+//! The staged pipeline is `InDiagnostics → InReview → InQa → InSanitation →
+//! Done`. Reviewer and QA phases share a single `PollPhase::VerifierCheck`
+//! variant with per-phase configuration carried in `VerifierInfo` constants
 //! (`REVIEWER_VI`, `QA_VI`).
 //!
 //! The Sanitation phase (sanitation.md agent prompt, Role::Sanitation) inspects
-//! new/untracked files before the auto-commit step. Garbage artifacts cause a
-//! bounce back to ReadyForDevelopment; clean files proceed to Done via commit.
+//! new/untracked files before the commit-to-Done step. Garbage artifacts cause a
+//! direct re-dispatch back to development on the owning implementation job; clean
+//! files proceed to Done via commit.
 
 use std::fmt::Write;
 
@@ -28,19 +34,19 @@ use tracing::{debug, error, info, warn};
 
 use chrono::Duration as ChronoDuration;
 use futures_util::FutureExt;
-use futures_util::future::join_all;
+use futures_util::future::{BoxFuture, join_all};
 
 use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
 use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketPhase};
 use crate::git_commands::{
-    has_unstaged_changes, list_new_or_untracked_files, parse_new_files_from_porcelain,
-    run_git_add_all, run_git_diff_stats, run_git_head, run_git_status, run_git_write_tree,
+    has_unstaged_changes, list_new_or_untracked_files, run_git_add_all, run_git_diff_stats,
+    run_git_head, run_git_status, run_git_write_tree,
 };
-use crate::jobs::ResumableStage;
+use crate::jobs::ResumableJob;
 use crate::message_router;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
-use crate::session::{manager_agent_id, ticket_agent_id};
+use crate::session::manager_agent_id;
 use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
 use crate::turso::TxGuard;
@@ -66,35 +72,19 @@ const REVIEW_QA_THRESHOLD: u8 = 9;
 /// Neutral reason for a phase-gate bail (transients are not misattributed).
 const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 
+/// Implementation stage identifiers (the `ticket_jobs.stage` column). One
+/// implementation job owns a ticket's entire occupied pipeline; each stage is
+/// a dispatch unit on the SAME implementation job.
+const IMPLEMENTATION_STAGE_DEVELOPMENT: &str = "development";
+const IMPLEMENTATION_STAGE_DIAGNOSTICS: &str = "diagnostics";
+const IMPLEMENTATION_STAGE_REVIEW: &str = "review";
+const IMPLEMENTATION_STAGE_QA: &str = "qa";
+const IMPLEMENTATION_STAGE_SANITATION: &str = "sanitation";
+
 /// Returns the global [`BoardStore`] singleton.
 #[inline]
 fn board() -> &'static BoardStore {
     crate::board::store()
-}
-
-/// Best-effort clearing of `assigned_to` on early-return / error paths.
-///
-/// Prevents stuck tickets when a dispatch function must return without
-/// transitioning the ticket. Errors are logged but not propagated —
-/// callers are already on an error path and should not fail again here.
-///
-/// Uses [`BoardStore::set_assigned_to_no_cancel`] with `None` — the
-/// non-cancelling assignment variant. All call sites are post-agent so there
-/// is no agent to cancel.
-///
-/// ## TOCTOU race
-///
-/// A concurrent claim may set a new assignee between a phase check and this
-/// clear. That's very low probability and the same race is accepted in
-/// [`record_sanitation_failure`].
-async fn clear_assigned_to_no_cancel(ticket_id: &str, context: &str) {
-    if let Err(e) = board().set_assigned_to_no_cancel(ticket_id, None).await {
-        warn!(
-            ticket = %ticket_id,
-            error = %e,
-            "Failed to clear assigned_to: {context}",
-        );
-    }
 }
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
@@ -128,41 +118,35 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
-/// Bails when not in expected phase: completes stage job via [`complete_ticket_stage_job`],
-/// does NOT touch `assigned_to` (parallel rounds keep `assigned_to=NULL` owned by
-/// [`run_parallel_agents`]). See [`is_ticket_in_phase`] for the fail-closed contract
-/// (moved externally / missing row / DB error → bail). Sibling [`phase_changed_and_clear_assignment`]
-/// clears `assigned_to` instead for single-slot re-dispatch rounds.
-///
-/// Three guard-site categories (each grouping its callers): the analysis round
-/// ([`maybe_escalate_analysis`], [`finalize_analysis_round`]), the verifier
-/// round ([`dispatch_verifiers`]), and the resume path ([`resume_analysis_round`],
-/// [`resume_verifier_round`], [`resume_stage_round`]).
+/// Bails when not in expected phase ([`is_ticket_in_phase`]'s fail-closed
+/// contract: moved externally / missing row / DB error → bail). With
+/// `clear_roster_only=true` it clears the job's running-agent roster rows
+/// ([`crate::jobs::clear_launched_agents_for_job`]) to unblock re-dispatch for
+/// single-agent rounds; with `false` it completes the job via
+/// [`crate::jobs::complete_ticket_job`] (status='done', which also clears the
+/// roster rows). The single-agent stage finalizers compose this with the
+/// drain-cut predicate ([`stage_drain_cut`]) in [`guard_stage`].
 #[must_use]
-async fn complete_job_and_bail_if_phase_moved(
+async fn guard_job_phase(
     ticket_id: &str,
     expected: TicketPhase,
     job_id: &str,
+    clear_roster_only: bool,
 ) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
-        complete_ticket_stage_job(job_id).await;
-        return true;
-    }
-    false
-}
-
-/// Bails when not in expected phase: clears `assigned_to` via [`clear_assigned_to_no_cancel`]
-/// to unblock re-dispatch for single-agent rounds. See [`is_ticket_in_phase`] for the
-/// fail-closed contract (moved externally / missing row / DB error → bail). Sibling
-/// [`complete_job_and_bail_if_phase_moved`] terminalizes the stage job instead and does
-/// not touch `assigned_to`.
-///
-/// Call sites ([`finalize_engineer_round`], [`finalize_sanitation_round`], [`dispatch_diagnostics`]) have previously set `assigned_to` via [`claim_ticket_in_workspace`] or [`claim_diagnostics`], so clearing it here prevents a stale assignment from blocking re-dispatch.
-#[must_use]
-async fn phase_changed_and_clear_assignment(ticket_id: &str, expected: TicketPhase) -> bool {
-    if !is_ticket_in_phase(ticket_id, expected).await {
-        let label = format!("ticket left {expected:?}");
-        clear_assigned_to_no_cancel(ticket_id, &label).await;
+        if clear_roster_only {
+            let label = format!("ticket left {expected:?}");
+            if let Err(e) =
+                crate::jobs::clear_launched_agents_for_job(&crate::session::store().conn, job_id)
+                    .await
+            {
+                warn!(ticket = %ticket_id, error = %e, "Failed to clear active agents: {label}");
+            }
+        } else if let Err(e) =
+            crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await
+        {
+            warn!(job = %job_id, error = %e, "Failed to complete job after phase-moved");
+        }
         return true;
     }
     false
@@ -199,7 +183,7 @@ struct TransitionCtx<'t, 'l> {
     /// failure notification then describes the drain instead of the
     /// auto-pause. Read only on Failed transitions; the readers are the
     /// bounce breaker trip (`true`) and the technical-failure sites —
-    /// dispatch panic, engineer failure, verifier all-failed (`false`).
+    /// dispatch panic and the engineer-cancel path (`false`).
     /// Every Failed site must set it explicitly so the notification renders
     /// the sentence matching the mechanism that ran.
     breaker_trip: bool,
@@ -268,11 +252,6 @@ enum FinalizeOutcome {
 /// phase transition, then dispatches a notification. The closure is
 /// responsible for writing all per-agent/system comments to the database.
 ///
-/// `pipeline_reservation` is automatically derived from the target phase:
-/// `Some(true)` when transitioning to [`TicketPhase::ReadyForDevelopment`]
-/// (bounce-back transitions get priority re-dispatch over fresh tickets),
-/// `None` for all other transitions.
-///
 /// # Correctness
 ///
 /// Uses [`BoardStore::transition_to_tx`] which does **not** cancel registered
@@ -290,8 +269,6 @@ async fn with_comment_and_transition<F>(
 where
     F: AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
 {
-    let pipeline_reservation = (ctx.target == TicketPhase::ReadyForDevelopment).then_some(true);
-
     let outcome = match crate::turso::with_tx_outcome(
         &board().conn,
         &ctx.ticket.id,
@@ -300,14 +277,7 @@ where
             write_comments(tx).await?;
             // The transition's `Ok(false)` (guard miss) is the closure's
             // `Ok(false)`: the whole transaction is rolled back silently.
-            BoardStore::transition_to_tx(
-                tx,
-                &ctx.ticket.id,
-                Some(ctx.source),
-                ctx.target,
-                pipeline_reservation,
-            )
-            .await
+            BoardStore::transition_to_tx(tx, &ctx.ticket.id, Some(ctx.source), ctx.target).await
         },
     )
     .await
@@ -329,11 +299,6 @@ where
                 "{}: transition to {} failed — ticket stuck in {}",
                 ctx.log_label, ctx.target, ctx.source,
             );
-            // Clear assigned_to so the ticket can be re-dispatched on the next poll
-            // cycle. All call sites set assigned_to before reaching this function, so
-            // the field is always populated when this runs. Only on genuine write
-            // failures — a guard-missed ticket was already handled by the mover.
-            clear_assigned_to_no_cancel(&ctx.ticket.id, ctx.log_label).await;
             FinalizeOutcome::Failed
         }
     };
@@ -442,8 +407,9 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
 
 /// Wording shared by the failure-comment pause note and the Manager
 /// notification: the pause gate blocks automatic Backlog→Analysis and
-/// ReadyForDevelopment→InDevelopment claims (see [`run_claim_pipeline`]),
-/// while later-phase work (review, QA, in-flight runs) continues.
+/// ReadyForDevelopment→InDevelopment claims (see [`run_claim_pipeline`]);
+/// poll stages 2-6 (InDevelopment/InDiagnostics/InReview/InQA/InSanitation)
+/// early-return on `ws.paused` and wait for the unpause.
 /// Single-sourced so the two sites cannot drift.
 fn paused_workspace_sentence() -> &'static str {
     "new analysis and development claims are blocked until the workspace is resumed"
@@ -466,32 +432,26 @@ fn paused_workspace_sentence() -> &'static str {
 /// # Circuit-breaker exclusion
 ///
 /// Bounce breaker trips keep their drain-to-Planning handling and must not
-/// pause. The engineer hard-failure bounce trip is the one exception: it
-/// pauses at the engineer failure site, before the Failed transition, because
-/// the budget-exhausting failure is a technical failure like any other engineer
-/// failure. Verdict-based sanitation/diagnostics bounces now share the same
-/// breaker and drain on exhaustion (without pausing); the infinite-retry paths
-/// (`record_sanitation_failure` and diagnostics skip) never trip and never pause. Callers are the
-/// technical-failure sites: dispatch panic, engineer agent failure (including
-/// its bounce-budget trip), all verifier agents failing, and the GUI cancel
-/// of an in-flight agent run.
+/// pause. Validation-phase non-success (diagnostics/review/QA/sanitation
+/// verdict failures) routes through the unified [`bounce_to_development`]
+/// path, which increments the shared bounce budget, drains ReadyForDevelopment
+/// siblings on exhaustion, and never pauses. The engineer hard-failure path is
+/// pause-only — it freezes the implementation in place (no bounce, no Failed, no
+/// bounce-budget consumption) and pauses the workspace so the Manager can
+/// triage. Callers of this helper are the pause sites: dispatch panic,
+/// engineer agent hard failure, and GUI/user cancel of an in-flight agent run.
 ///
 /// # Scope
 ///
-/// Sanitation/diagnostics *verdict* failures share the bounce budget and trip
-/// via the breaker (drain, no pause); the `record_sanitation_failure` and
-/// diagnostics-skip paths record a failure marker and clear
-/// `assigned_to` for indefinite retry without consuming budget. Analyst failures
-/// never fail the ticket (analysts always advance to Planning), and mixed
-/// verifier rounds (some failures + a sub-threshold verdict) bounce to
-/// ReadyForDevelopment without pausing. Analyze-tool sub-agent failures (parallel
-/// analysts under [`AnalyzeTool`](crate::tools::AnalyzeTool)) likewise never
-/// reach this helper — they are tool calls inside a caller's run, not
-/// ticket-level failures. The pause gate blocks automatic Backlog→Analysis
-/// and ReadyForDevelopment→InDevelopment claims, so a pause stops further
-/// pickup of queued Backlog/RFD tickets on the poll cycles that follow (a
-/// claim already in flight within the current cycle may still land);
-/// tickets already past analysis continue through their later phases.
+/// The pause gate blocks automatic Backlog→Analysis and
+/// ReadyForDevelopment→InDevelopment claims; poll stages 2-6
+/// (InDevelopment/InDiagnostics/InReview/InQA/InSanitation) early-return on
+/// `ws.paused` and wait for the unpause. Analyst failures never fail the
+/// ticket (analysts always advance to Planning); mixed verifier rounds (some
+/// failures + a sub-threshold verdict) bounce to development without pausing.
+/// Analyze-tool sub-agent failures (parallel analysts under
+/// [`AnalyzeTool`](crate::tools::AnalyzeTool)) likewise never reach this helper
+/// — they are tool calls inside a caller's run, not ticket-level failures.
 pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) -> String {
     if crate::shutdown::aborting() {
         // Shutdown AND the graceful drain are excluded: a drain-cut round is
@@ -553,8 +513,9 @@ async fn last_comment_as_failure_details(ticket_id: &str) -> String {
 /// below), then routes the result through the message router.
 ///
 /// This function does NOT pause the workspace — technical-failure pause
-/// happens at the trigger sites (dispatch panic, engineer failure, verifier
-/// all-failed, GUI cancel) before the transition that fires this notification.
+/// happens at the trigger sites (dispatch panic, engineer hard failure, GUI
+/// cancel) before the transition that fires this notification. Validation
+/// non-success routes through [`bounce_to_development`] (drains, no pause).
 /// The Manager handles failed tickets via the triage prompt.
 ///
 /// # Side effects
@@ -568,13 +529,13 @@ async fn last_comment_as_failure_details(ticket_id: &str) -> String {
 /// # Invariant: failure comment written before the notification
 ///
 /// When `target_phase` is `Failed`, or the transition is the engineer
-/// hard-failure bounce (source `InDevelopment` → `ReadyForDevelopment` — the
-/// only Notify transition to RFD, enforced structurally at the gate below),
-/// the failure details are read from the database (last comment, any role)
-/// instead of being passed as a parameter. The caller MUST ensure the failure
-/// comment has already been written to the DB before calling this function
-/// (the transition closure runs first in [`with_comment_and_transition`], so
-/// this invariant holds for all call paths).
+/// hard-failure pause (the ticket stays in `InDevelopment`, but the
+/// notification reflects the paused workspace), the failure details are read
+/// from the database (last comment, any role) instead of being passed as a
+/// parameter. The caller MUST ensure the failure comment has already been
+/// written to the DB before calling this function (the transition closure runs
+/// first in [`with_comment_and_transition`], so this invariant holds for all
+/// call paths).
 /// The agent ID (`manager_{ws_name}`) is intentionally shared between
 /// user-facing Manager chat (main.rs) and notification agents — the same Manager
 /// must see both notification context and user conversation history in a unified
@@ -629,14 +590,11 @@ async fn notify_ticket(
         ],
     );
 
-    // The engineer hard-failure bounce is the ONLY Notify transition
-    // InDevelopment → ReadyForDevelopment (verifier/sanitation bounces buffer,
-    // manual moves are user actions), so gating on the source phase
-    // structurally excludes any future RFD+Notify transition from silently
-    // rendering the engineer-bounce template.
-    let engineer_bounce =
-        source == TicketPhase::InDevelopment && target_phase == TicketPhase::ReadyForDevelopment;
-    if target_phase == TicketPhase::Failed || engineer_bounce {
+    // The engineer hard-failure pause is notified via the dedicated
+    // [`notify_engineer_pause`] path (the ticket does NOT transition, so it
+    // never reaches this function). Only terminal Failed transitions render
+    // the generic failure template here.
+    if target_phase == TicketPhase::Failed {
         // The transition closure wrote the failure comment LAST (after any
         // bounce-breaker trip comment), so the last comment carries the
         // concrete error.
@@ -658,16 +616,8 @@ async fn notify_ticket(
                 .to_string()
         };
 
-        // The engineer hard-failure bounce gets a dedicated template: the
-        // ticket was NOT failed, so the generic failed-ticket triage wording
-        // (supersede/revert guidance) would misdirect the Manager.
-        let template = if engineer_bounce {
-            "pipeline/engineer_bounce_notification.md"
-        } else {
-            "pipeline/failure_notification.md"
-        };
         let warning = substitute(
-            &load_prompt(template),
+            &load_prompt("pipeline/failure_notification.md"),
             &[
                 ("{{failure_details}}", &failure_details),
                 ("{{workspace_status}}", &workspace_status),
@@ -687,7 +637,7 @@ async fn notify_ticket(
             workspace_name: ws.name,
             user_name: String::new(),
             channel: String::new(),
-            kind: message_router::JobKind::TicketNotify,
+            kind: message_router::MessageKind::TicketNotify,
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
@@ -697,26 +647,22 @@ async fn notify_ticket(
 
 #[expect(clippy::too_many_lines)]
 pub async fn run_management() {
-    // Boot recovery scan: first statement of run_management,
-    // BEFORE reset_inflight_tickets. Replays pending envelopes, materializes
-    // the resumed-ticket exclusion set, resets everything else, and returns
-    // the ticket_stage jobs selected for resume.
+    // Boot recovery scan: first statement, BEFORE reset_analysis_tickets.
+    // Replays pending envelopes, builds the resumed-ticket exclusion set,
+    // resets the rest, and returns the ticket_analysis jobs selected for resume.
     let resumable = match crate::jobs::recover_from_restart().await {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "Boot recovery scan failed — proceeding with plain reset");
             if let Some(board) = BOARD.get() {
-                let _ = board.reset_inflight_tickets(&[]).await;
+                let _ = board.reset_analysis_tickets(&[]).await;
             }
             Vec::new()
         }
     };
 
-    // Boot recovery for workspaces: discovery leaves no job rows, so a
-    // workspace still in 'analyzing' at startup means a crashed/panicked
-    // mid-discovery run. Reclassify to 'pending' so the pickup step retries
-    // it (or waits for the provider) — fixes the historical "stranded in
-    // analyzing forever" behavior. Must precede the first poll cycle.
+    // A workspace still 'analyzing' at startup is a crashed mid-discovery run —
+    // reclassify to 'pending' so the pickup retries it. Must precede the poll.
     if let Err(e) = crate::workspace::store()
         .reclassify_analyzing_to_pending()
         .await
@@ -724,27 +670,26 @@ pub async fn run_management() {
         warn!(error = %e, "Boot recovery: failed to reclassify stranded analyzing workspaces");
     }
 
-    // Resume the selected rounds (silent background resume — no Manager
-    // notifications; results deliver via normal paths).
+    // Resume selected rounds (silent background resume).
     for stage in resumable {
         // Or-pattern: every variant carries job_id + workspace_name.
         let (job_id, workspace_name) = match &stage {
-            ResumableStage::TicketStage {
+            ResumableJob::TicketJob {
                 job_id,
                 workspace_name,
                 ..
             }
-            | ResumableStage::Research {
+            | ResumableJob::Research {
                 job_id,
                 workspace_name,
                 ..
             }
-            | ResumableStage::Analyze {
+            | ResumableJob::Analyze {
                 job_id,
                 workspace_name,
                 ..
             }
-            | ResumableStage::ResearchCleanup {
+            | ResumableJob::ResearchCleanup {
                 job_id,
                 workspace_name,
             } => (job_id, workspace_name),
@@ -758,14 +703,14 @@ pub async fn run_management() {
             );
             // Design: "Unresolvable workspace → delete job row" — a done row
             // would linger without a workspace to drive it (envelope kinds
-            // have no ticket to reset; ticket_stage kinds are re-covered by
+            // have no ticket to reset; ticket_analysis kinds are re-covered by
             // the next boot's reset once no job row protects them).
             // Any path that removes a research_cleanup row must release the
             // run folder in the same operation (the row is the folder-hold;
             // no sweep is a backstop anymore). A cleanup can never run
             // without its workspace, so the folder would be orphaned — release
             // it before terminalizing the row.
-            if matches!(&stage, ResumableStage::ResearchCleanup { .. }) {
+            if matches!(&stage, ResumableJob::ResearchCleanup { .. }) {
                 crate::research_cleanup::release_run_folder(job_id).await;
             }
             let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
@@ -773,76 +718,76 @@ pub async fn run_management() {
         };
         match stage {
             // research/analyze jobs carry no ticket — re-dispatch the orchestrator.
-            ResumableStage::Research { job_id, capped, .. } => {
+            ResumableJob::Research { job_id, .. } => {
                 let ws = workspace;
-                if capped {
-                    // Over-cap research: deliver the partial report from the last
-                    // checkpoint (the envelope is the caller's only result path).
-                    info!(
-                        job = %job_id,
-                        "Delivering research partial report (boot re-dispatch cap exceeded)",
-                    );
-                    tokio::spawn(async move {
-                        crate::tools::research::research_capped_partial_report(&job_id, &ws).await;
-                    });
-                } else {
-                    info!(job = %job_id, "Resuming research run at boot");
-                    tokio::spawn(async move {
-                        crate::tools::research::resume_research_run(&job_id, &ws).await;
-                    });
-                }
+                info!(job = %job_id, "Resuming research run at boot");
+                tokio::spawn(async move {
+                    crate::tools::research::resume_research_run(&job_id, &ws).await;
+                });
             }
-            ResumableStage::Analyze { job_id, capped, .. } => {
+            ResumableJob::Analyze { job_id, .. } => {
                 let ws = workspace;
-                if capped {
-                    // Over-cap analyze: deliver the failure envelope to the original
-                    // caller (the <analyze-tool-result> envelope is the async-analyze caller's
-                    // only result path — "failed = terminal … surface to user").
-                    info!(
-                        job = %job_id,
-                        "Delivering analyze failure envelope (boot re-dispatch cap exceeded)",
-                    );
-                    tokio::spawn(async move {
-                        crate::tools::analyze::analyze_capped_envelope(&job_id, &ws).await;
-                    });
-                } else {
-                    info!(job = %job_id, "Resuming analyze round at boot");
-                    tokio::spawn(async move {
-                        crate::tools::analyze::resume_analyze_round(&job_id, &ws).await;
-                    });
-                }
+                info!(job = %job_id, "Resuming analyze round at boot");
+                tokio::spawn(async move {
+                    crate::tools::analyze::resume_analyze_round(&job_id, &ws).await;
+                });
             }
-            ResumableStage::ResearchCleanup { job_id, .. } => {
+            ResumableJob::ResearchCleanup { job_id, .. } => {
                 info!(job = %job_id, "Resuming research cleanup agent at boot");
                 tokio::spawn(async move {
                     crate::research_cleanup::resume_research_cleanup(&job_id, &workspace).await;
                 });
             }
-            ResumableStage::TicketStage {
+            ResumableJob::TicketJob {
                 job_id,
                 ticket_id,
                 stage,
+                is_implementation,
                 ..
             } => {
-                if let Ok(Some(ticket)) = crate::board::store().get_ticket(&ticket_id).await {
+                // A paused workspace keeps its implementation frozen at boot (do not
+                // dispatch); an unpaused workspace re-dispatches its stage on
+                // the same job. `workspaces.paused` is the freeze authority.
+                // Analysis is not implementation-driven and is not paused-frozen.
+                if is_implementation && workspace.paused {
                     info!(
                         job = %job_id,
                         ticket = %ticket_id,
                         stage = %stage,
-                        "Resuming ticket stage round at boot",
+                        "Implementation is frozen at boot (workspace paused) — leaving frozen",
                     );
-                    tokio::spawn(resume_ticket_stage_round(stage, job_id, ticket, workspace));
-                } else {
-                    warn!(
-                        job = %job_id,
-                        ticket = %ticket_id,
-                        "Resume ticket not found — deleting job row",
-                    );
-                    let _ = crate::jobs::complete_ticket_stage_job(
-                        &crate::session::store().conn,
-                        &job_id,
-                    )
-                    .await;
+                    continue;
+                }
+                match crate::board::store().get_ticket(&ticket_id).await {
+                    Ok(Some(ticket)) => {
+                        info!(
+                            job = %job_id,
+                            ticket = %ticket_id,
+                            stage = %stage,
+                            "Resuming ticket-job stage at boot",
+                        );
+                        tokio::spawn(resume_ticket_job(stage, job_id, ticket, workspace));
+                    }
+                    Ok(None) => {
+                        warn!(
+                            job = %job_id,
+                            ticket = %ticket_id,
+                            "Resume ticket not found — completing job",
+                        );
+                        let _ = crate::jobs::complete_ticket_job(
+                            &crate::session::store().conn,
+                            &job_id,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            job = %job_id,
+                            ticket = %ticket_id,
+                            error = %e,
+                            "Failed to read resume ticket — leaving job in place",
+                        );
+                    }
                 }
             }
         }
@@ -862,14 +807,11 @@ pub async fn run_management() {
 /// Shared dispatch helper: log the ticket+workspace, then spawn the phase
 /// dispatcher in a background task.
 ///
-/// This is a plain `fn` (not `async`) because both `info!()` and
-/// `tokio::spawn()` are synchronous operations — no `.await` needed.
-///
 /// When the bounce breaker trips (enforced in
-/// [`process_verifier_verdicts`]/[`bounce_engineer_hard_failure`]) siblings are
-/// drained: all other [`TicketPhase::ReadyForDevelopment`] tickets in the same
-/// workspace are moved to [`TicketPhase::Planning`] so the Manager can triage
-/// the failure without new tickets auto-starting.
+/// [`process_verifier_verdicts`]) siblings are drained: all other
+/// [`TicketPhase::ReadyForDevelopment`] tickets in the same workspace are moved
+/// to [`TicketPhase::Planning`] so the Manager can triage the failure without
+/// new tickets auto-starting.
 ///
 /// # Panic safety
 ///
@@ -904,10 +846,12 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         // Adding a new PollPhase variant requires adding a row in
         // PollPhase::info() which carries the log_label field (enforced by the
         // single match in info()). The bounce breaker is enforced at the bounce
-        // sites (review/QA in process_verifier_verdicts and engineer hard
-        // failures in bounce_engineer_hard_failure), not pre-flight.
+        // sites (review/QA in process_verifier_verdicts, sanitation/verifier
+        // non-success in bounce_to_development), not pre-flight. The engineer
+        // hard-failure path is pause-only (workspace pause + implementation freeze),
+        // never a bounce.
         //
-        // The post-agent phase_changed_and_clear_assignment check in each dispatch function is
+        // The post-agent `guard_job_phase` check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
         if !is_ticket_in_phase(&ticket.id, expected_phase).await {
             return;
@@ -924,10 +868,10 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         let result = std::panic::AssertUnwindSafe(async move {
             match phase {
                 PollPhase::BacklogAnalysis => dispatch_backlog_analysts(ticket, ws).await,
-                PollPhase::EngineerDevelopment => dispatch_engineer(ticket, ws).await,
-                PollPhase::SanitationCheck => dispatch_sanitation(ticket, ws).await,
+                PollPhase::EngineerDevelopment => dispatch_engineer(ticket, ws, false).await,
+                PollPhase::SanitationCheck => dispatch_sanitation(ticket, ws, false).await,
                 PollPhase::DiagnosticsCheck => dispatch_diagnostics(ticket, ws).await,
-                PollPhase::VerifierCheck(vi) => dispatch_verifiers(ticket, ws, vi).await,
+                PollPhase::VerifierCheck(vi) => dispatch_verifiers(ticket, ws, vi, false).await,
             }
         })
         .catch_unwind()
@@ -970,6 +914,13 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
                 &panic_comment,
             )
             .await;
+            // Terminal Failed: complete the implementation so a lingering 'launched' row
+            // does not survive. Idempotent (no-op if the ticket has no implementation row).
+            let _ = crate::jobs::complete_implementation_job_for_ticket(
+                &crate::session::store().conn,
+                &ticket_for_failure.id,
+            )
+            .await;
         }
     });
 }
@@ -992,21 +943,21 @@ struct VerifierInfo {
     ///   `"Reviewers"` (3 parallel agents)
     log_label: &'static str,
     /// The phase the ticket advances to when every verifier agent passes — the
-    /// verifier's *success* target (e.g. `TicketPhase::Reviewed` for reviewers,
-    /// `TicketPhase::QaPassed` for QA).
+    /// verifier's *success* target (e.g. `TicketPhase::InQa` for reviewers,
+    /// `TicketPhase::InSanitation` for QA).
     ///
     /// INVARIANT: must never be `TicketPhase::Failed`. The all-passed round
     /// transitions the ticket directly to `success_phase`, so a `Failed` value
     /// would land an all-passed round on the terminal failure phase and invert
     /// its meaning (all agents passed, yet the ticket fails). Today
-    /// `REVIEWER_VI`/`QA_VI` use `Reviewed`/`QaPassed`, never `Failed`.
+    /// `REVIEWER_VI`/`QA_VI` use `InQa`/`InSanitation`, never `Failed`.
     success_phase: TicketPhase,
     /// The phase the verifier is *actively working in* — the ticket phase
     /// the ticket occupies while the verifier's agents run (e.g.
     /// [`TicketPhase::InReview`] for reviewers, [`TicketPhase::InQa`] for QA).
     /// This is the phase that transitions *from* when the verifier finishes
-    /// (to [`success_phase`] on success, or to Failed/ReadyForDevelopment
-    /// on failure).
+    /// (to [`success_phase`] on success, or to the unified bounce target —
+    /// InDevelopment on a non-exhausting bounce, Failed on budget exhaustion).
     ///
     /// Contrast with [`PollPhaseInfo::expected_phase`] which serves as the
     /// *target* phase for claim transitions in the poll loop.
@@ -1018,7 +969,7 @@ struct VerifierInfo {
 const REVIEWER_VI: VerifierInfo = VerifierInfo {
     role: Role::Reviewer,
     log_label: "Reviewers",
-    success_phase: TicketPhase::Reviewed,
+    success_phase: TicketPhase::InQa,
     active_phase: TicketPhase::InReview,
     prompt_template: "review.md",
     extraction_prompt_path: "extraction/reviewer.md",
@@ -1027,7 +978,7 @@ const REVIEWER_VI: VerifierInfo = VerifierInfo {
 const QA_VI: VerifierInfo = VerifierInfo {
     role: Role::Qa,
     log_label: "QA",
-    success_phase: TicketPhase::QaPassed,
+    success_phase: TicketPhase::InSanitation,
     active_phase: TicketPhase::InQa,
     prompt_template: "qa.md",
     extraction_prompt_path: "extraction/qa.md",
@@ -1099,8 +1050,8 @@ impl PollPhase {
             },
             Self::SanitationCheck => PollPhaseInfo {
                 // SanitationCheck is excluded from CLAIM_PHASES since the
-                // actual QaPassed→InSanitation transition happens via
-                // claim_sanitation in handle_qa_passed.
+                // InQa→InSanitation handoff happens inside the QA verifier
+                // finalizer (immediate next-stage dispatch), not a claim.
                 ..PollPhaseInfo::new(TicketPhase::InSanitation, "Sanitation")
             },
             Self::DiagnosticsCheck => PollPhaseInfo::new(TicketPhase::InDiagnostics, "Diagnostics"),
@@ -1119,10 +1070,10 @@ impl PollPhase {
 ///
 /// DiagnosticsCheck and SanitationCheck are intentionally excluded — they
 /// keep the ticket in InDiagnostics/InSanitation while running and guard
-/// re-dispatch via `assigned_to` and pre-condition checks respectively.
-/// QaPassed→Done uses a separate list-based dispatch because the commit
-/// must succeed before transitioning to Done, so there is no atomic claim
-/// to perform.
+/// re-dispatch via the implementation's in-flight roster marker and pre-condition
+/// checks respectively. Intermediate stage handoffs (diagnostics→review,
+/// review→qa, qa→sanitation) happen inside the implementation dispatch finalizers,
+/// not via separate claims.
 ///
 /// [`TicketPhase::Planning`] is intentionally absent from this list.
 /// Planning tickets require Manager judgment and are never picked up
@@ -1134,44 +1085,7 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
         TicketPhase::ReadyForDevelopment,
         PollPhase::EngineerDevelopment,
     ),
-    (
-        TicketPhase::DiagnosticsDone,
-        PollPhase::VerifierCheck(REVIEWER_VI),
-    ),
-    (TicketPhase::Reviewed, PollPhase::VerifierCheck(QA_VI)),
 ];
-
-/// Spawn a background task per ticket in `phase` for the workspace.
-///
-/// Lists tickets via [`BoardStore::list_all_tickets`] with both filters set;
-/// does NOT load comments — lightweight enough for poll loops. On DB errors,
-/// logs and returns; tickets stay in phase and are re-picked next poll cycle.
-///
-/// Raw `tokio::spawn` is used instead of `spawn_dispatch` because there is no
-/// claim transition — the ticket stays in its phase until the operation
-/// succeeds, so transient failures (and panics, which `spawn_dispatch` would
-/// move to `Failed`) are harmless: the ticket is re-dispatched on the next
-/// poll cycle. `Ticket` is moved by value, so no `Arc` wrapping is needed.
-async fn spawn_for_each_ticket_in_phase<F, Fut>(phase: TicketPhase, ws: &Workspace, f: F)
-where
-    F: Fn(Ticket, Workspace) -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    match board().list_all_tickets(Some(&ws.name), Some(phase)).await {
-        Ok(tickets) => {
-            for ticket in tickets {
-                let f = f.clone();
-                let ws = ws.clone();
-                tokio::spawn(async move {
-                    f(ticket, ws).await;
-                });
-            }
-        }
-        Err(e) => {
-            error!(workspace = %ws.name, phase = %phase, error = %e, "Phase listing failed");
-        }
-    }
-}
 
 /// Run one poll round: claim actionable tickets and dispatch agents.
 ///
@@ -1187,17 +1101,8 @@ where
 ///    ([`pickup_pending_workspace`]).
 /// 1. **Pipeline claims** — atomic source→target phase transitions
 ///    (`run_claim_pipeline`).
-///
-///    Steps 2-5 run concurrently via `tokio::join!` in
-///    [`process_single_workspace`] (see there for DB serialization and
-///    snapshot-timing notes):
-/// 2. **DiagnosticsCheck** — dispatch unassigned `InDiagnostics` tickets
-///    so diagnostics commands (fmt, lint, build, test) continue running.
-/// 3. **SanitationPassed → Done** — auto-commit tickets that have passed
-///    sanitation.
-/// 4. **QaPassed** — check the working tree for untracked files; claim to
-///    `InSanitation` if dirty, otherwise commit directly to `Done`.
-/// 5. **SanitationCheck** — dispatch unassigned `InSanitation` tickets.
+/// 2. **Implementation dispatch** — iterate the workspace's implementation jobs and
+///    dispatch each stage agent whose agent is not running.
 ///
 /// # Architecture history
 ///
@@ -1250,11 +1155,12 @@ async fn poll_round() {
 
 /// Process the poll steps for a single workspace.
 ///
-/// Steps 0-1 are issued in order because claims must be ordered and the git tree
-/// is shared; steps 2-5 are concurrent via `tokio::join!` (see inline comments
-/// below for serialization and snapshot notes). Per-ticket work runs concurrently
-/// in detached tasks. Across workspaces this function is called concurrently by
-/// [`poll_round`].
+/// Step 0 (pending pickup) and step 1 (pipeline claims) are issued in order
+/// because claims must be ordered and the git tree is shared; step 2
+/// (implementation-iteration dispatch) lists the workspace's implementation jobs and
+/// dispatches each stage whose agent is not running. Per-ticket work runs
+/// concurrently in detached tasks. Across workspaces this function is called
+/// concurrently by [`poll_round`].
 async fn process_single_workspace(ws: Workspace) {
     // 0. Pending-workspace pickup — a pending workspace (added without a
     // provider key, or returned to pending after provider-class discovery
@@ -1272,78 +1178,86 @@ async fn process_single_workspace(ws: Workspace) {
     // 1. Pipeline claims — atomic source→target transitions
     run_claim_pipeline(&ws).await;
 
-    // 2-5. Concurrent poll listings via `tokio::join!` — the four phase listings
-    // are independent and each already handles its own errors per phase
-    // (see `spawn_for_each_ticket_in_phase`). DB listings serialize on
-    // `Arc<Mutex<turso::Connection>>`, so the benefit is async scheduling tail
-    // latency removal on the 1s poll loop, not DB parallelism.
-    //
-    // Snapshot timing: `handle_qa_passed` claims run in detached `tokio::spawn`
-    // tasks, so a concurrent `InSanitation` listing may snapshot before
-    // just-claimed tickets appear and will pick them up next poll cycle (~1s) —
-    // already tolerated by existing design (tickets re-dispatched next cycle).
-    // This is true even sequentially; concurrent join only changes listing
-    // snapshot interleaving, not claim completion.
-    tokio::join!(
-        // 2. DiagnosticsCheck — diagnostics keeps the ticket
-        // in InDiagnostics while running, so the claim loop isn't applicable.
-        // Tickets that already have assigned_to set are mid-execution and must not
-        // be re-dispatched; transient DB listing errors are safe — tickets stay
-        // in phase and are re-dispatched on the next poll cycle (~1s).
-        spawn_for_each_ticket_in_phase(TicketPhase::InDiagnostics, &ws, |ticket, ws| async move {
-            if ticket.assigned_to.is_some() {
+    // 2. Implementation-iteration dispatch — the implementation job is the single authority
+    // for an occupied ticket's pipeline. Iterate the workspace's implementations
+    // (sessions.db) and dispatch the matching stage agent when its stage agent
+    // is not running. A paused workspace keeps its implementations frozen (no new
+    // stage dispatch); a terminal ticket completes its implementation.
+    let conn = &crate::session::store().conn;
+    let implementations =
+        match crate::jobs::list_workspace_implementation_jobs(conn, &ws.name).await {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(workspace = %ws.name, error = %e, "Failed to list implementation jobs");
                 return;
             }
-            spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws);
-        }),
-        // 3. SanitationPassed → Done (auto-commit),
-        // following the same pattern as the QaPassed→Done commit flow.
-        spawn_for_each_ticket_in_phase(
-            TicketPhase::SanitationPassed,
-            &ws,
-            |ticket, ws| async move {
-                let Some(porcelain) = ensure_git_or_done_and_get_status(
-                    &ticket,
-                    &ws,
-                    TicketPhase::SanitationPassed,
-                    "finalize",
-                )
-                .await
-                else {
-                    return;
-                };
-                finalize_ticket_with_git_status(
-                    ticket,
-                    ws,
-                    TicketPhase::SanitationPassed,
-                    &porcelain,
-                )
-                .await;
-            },
-        ),
-        // 4. Handle QaPassed tickets.
-        //
-        // For each QaPassed ticket, check whether the working tree has new/untracked
-        // files. If it does, claim the ticket to InSanitation and dispatch a sanitation
-        // agent. Otherwise, commit directly and transition to Done (existing behavior).
-        //
-        // Spawned via tokio::spawn (inside spawn_for_each_ticket_in_phase) to prevent
-        // git operations from blocking the poll loop. The ticket stays in QaPassed
-        // until either the claim or the commit succeeds, so re-dispatch is harmless.
-        spawn_for_each_ticket_in_phase(TicketPhase::QaPassed, &ws, handle_qa_passed),
-        // 5. SanitationCheck — handle_qa_passed (step 4) runs
-        // in spawned tasks concurrent with this step. It may: (a) claim
-        // QaPassed→InSanitation with assigned_to set, or (b) commit the ticket
-        // directly to Done. Tickets that already have assigned_to set are
-        // mid-execution and are skipped — neither path races with this step
-        // because the ticket is either in a different phase or already assigned.
-        spawn_for_each_ticket_in_phase(TicketPhase::InSanitation, &ws, |ticket, ws| async move {
-            if ticket.assigned_to.is_some() {
-                return;
+        };
+    for implementation in implementations {
+        // A paused workspace freezes the implementation — no new stage dispatch.
+        if ws.paused {
+            break;
+        }
+        // Terminal ticket → the implementation is finished; complete it.
+        let ticket = match board().get_ticket(&implementation.ticket_id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                warn!(
+                    ticket = %implementation.ticket_id,
+                    job = %implementation.id,
+                    "Implementation ticket missing — completing implementation",
+                );
+                let _ = crate::jobs::complete_ticket_job(conn, &implementation.id).await;
+                continue;
             }
-            spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
-        }),
-    );
+            Err(e) => {
+                warn!(
+                    ticket = %implementation.ticket_id,
+                    job = %implementation.id,
+                    error = %e,
+                    "Failed to read implementation ticket — leaving implementation in place",
+                );
+                continue;
+            }
+        };
+        if ticket.phase.is_terminal() {
+            let _ = crate::jobs::complete_ticket_job(conn, &implementation.id).await;
+            continue;
+        }
+        // Mid-execution guard: an implementation with a launched roster agent must not
+        // be re-dispatched.
+        if crate::jobs::job_has_launched_agents(conn, &implementation.id)
+            .await
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        match implementation.stage.as_str() {
+            IMPLEMENTATION_STAGE_DEVELOPMENT => {
+                spawn_dispatch(PollPhase::EngineerDevelopment, ticket, ws.clone());
+            }
+            IMPLEMENTATION_STAGE_DIAGNOSTICS => {
+                spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws.clone());
+            }
+            IMPLEMENTATION_STAGE_REVIEW => {
+                spawn_dispatch(PollPhase::VerifierCheck(REVIEWER_VI), ticket, ws.clone());
+            }
+            IMPLEMENTATION_STAGE_QA => {
+                spawn_dispatch(PollPhase::VerifierCheck(QA_VI), ticket, ws.clone());
+            }
+            IMPLEMENTATION_STAGE_SANITATION => {
+                spawn_dispatch(PollPhase::SanitationCheck, ticket, ws.clone());
+            }
+            other => {
+                warn!(
+                    ticket = %implementation.ticket_id,
+                    job = %implementation.id,
+                    stage = %other,
+                    "Unknown implementation stage — completing implementation",
+                );
+                let _ = crate::jobs::complete_ticket_job(conn, &implementation.id).await;
+            }
+        }
+    }
 }
 
 /// Pickup step: claim a `Pending` workspace into its first discovery when the
@@ -1470,31 +1384,38 @@ async fn pickup_claim(ws: &Workspace) -> Option<(i64, bool)> {
 ///   contexts; a manual unpause on them (or the same-round stale copy after
 ///   a pending-pickup claim) must not re-enable new-work claims.
 ///
-/// Later-phase claims (DiagnosticsDone→Review, Reviewed→QA) proceed so
-/// tickets already past analysis finish without getting stuck — pausing and
-/// incomplete discovery gate new analysis/development, not in-progress work.
+/// Later-phase stage advances (diagnostics→review→qa→sanitation) happen
+/// inside the implementation dispatch finalizers, not via separate claims — pausing
+/// and incomplete discovery gate new analysis/development, not in-progress
+/// work.
 fn blocks_claim(ws: &Workspace, phase: PollPhase) -> bool {
+    // A paused workspace freezes the entire occupied implementation: no claim
+    // advances while paused (resume re-arms the poll on unpause). The
+    // discovery-readiness gate still applies only to new-work claims.
+    if ws.paused {
+        return true;
+    }
     if !matches!(
         phase,
         PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
     ) {
         return false;
     }
-    ws.paused || ws.status != WorkspaceStatus::Ready
+    ws.status != WorkspaceStatus::Ready
 }
 
 /// Claim for each pipeline phase in a workspace.
 ///
 /// [`blocks_claim`] skips the automatic pickup of new work (backlog →
 /// analysis and ready_for_development → in_development) when the workspace is
-/// paused **or** has not completed discovery (`Ready`). Later-phase claims
-/// (DiagnosticsDone→Review, Reviewed→QA) proceed normally so that tickets
-/// already past analysis finish without getting stuck — pausing gates new
-/// analysis/development, not in-progress work.
+/// paused **or** has not completed discovery (`Ready`). A paused workspace
+/// additionally freezes the entire occupied implementation: no stage advances until
+/// the workspace is unpaused — pause is a real freeze, not just a new-work
+/// gate.
 ///
 /// On claim error we `break` out of the phase loop — this skips all
-/// remaining CLAIM_PHASES for this workspace and falls through to
-/// Diagnostics/QaPassed (which handle their own errors independently).
+/// remaining CLAIM_PHASES for this workspace and falls through to implementation
+/// dispatch (which handles its own errors independently).
 /// A DB-down workspace won't block other workspaces; a transient claim
 /// failure won't generate log noise for every remaining phase.
 async fn run_claim_pipeline(ws: &Workspace) {
@@ -1545,7 +1466,6 @@ async fn run_claim_pipeline(ws: &Workspace) {
 /// Run a single pre-registered agent. Registration stays in the caller
 /// (before prompt evaluation / assignment) so mid-work comment delivery is
 /// unaffected; run_agent's exit guard unregisters on every path (incl. panic).
-#[expect(clippy::too_many_arguments)] // stage-round dispatch: one positional arg per field
 async fn run_single_agent(
     agent_id: String,
     role: Role,
@@ -1554,7 +1474,6 @@ async fn run_single_agent(
     message: &str,
     incoming_rx: tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
     resume: bool,
-    resume_comment_injection: bool,
 ) -> (Agent, Option<String>) {
     run_agent(
         agent_id,
@@ -1569,7 +1488,6 @@ async fn run_single_agent(
         None,
         None,
         None,
-        resume_comment_injection,
     )
     .await
 }
@@ -1626,7 +1544,7 @@ fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>
 /// pipeline behind the verdict-gate schedule. The fallback paths scrub without
 /// truncating (fail-open content is preserved; only the success path applies
 /// the 24 KB sandwich cap). The extraction widens the post-agent window
-/// (assigned_to still set, agent unregistered) to at most ~90 s: comments
+/// (active-agent row still set, agent unregistered) to at most ~90 s: comments
 /// arriving then are persisted and picked up on the next engineer round,
 /// never lost.
 async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
@@ -1676,19 +1594,14 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
 }
 
 /// Drain-cut guard for the single-agent stage-round finalizers
-/// ([`finalize_engineer_round`], [`finalize_sanitation_round`]): when the
+/// ([`finalize_engineer_stage`], [`finalize_sanitation_stage`]): when the
 /// round produced no response and the app is aborting (drain), the job must
 /// stay status='launched' for boot resume — no failure record, no
 /// AGENT_FAILURE_EMOJI. Silent on resume (the fresh dispatch already logged
 /// the drain). Returns `true` when the caller must abort the finalize tail
 /// early, leaving the job 'launched'; `false` to continue processing. `label`
 /// parameterizes the log line ("Engineer"/"Sanitation").
-fn stage_round_drain_cut(
-    ticket_id: &str,
-    label: &str,
-    response: Option<&str>,
-    resumed: bool,
-) -> bool {
+fn stage_drain_cut(ticket_id: &str, label: &str, response: Option<&str>, resumed: bool) -> bool {
     let drain_cut = response.is_none() && crate::shutdown::aborting();
     if drain_cut && !resumed {
         info!(
@@ -1700,12 +1613,11 @@ fn stage_round_drain_cut(
 }
 
 /// Shared post-run guard prologue for the single-agent stage-round finalizers
-/// ([`finalize_engineer_round`], [`finalize_sanitation_round`]): if the ticket
-/// phase moved on (analysis escalation, a fresh round, user cancel), complete
-/// the stage job and bail; else if the round was drain-cut (see
-/// [`stage_round_drain_cut`]), bail leaving the job 'launched' for boot resume.
-/// Returns `true` when the caller must return early; `false` to continue.
-async fn guard_stage_round(
+/// ([`finalize_engineer_stage`], [`finalize_sanitation_stage`]): complete the
+/// job and bail if the ticket phase moved (analysis escalation, fresh round,
+/// user cancel); else bail on a drain-cut (see [`stage_drain_cut`]),
+/// leaving the job 'launched' for boot resume. Returns `true` to bail early.
+async fn guard_stage(
     ticket_id: &str,
     phase: TicketPhase,
     label: &str,
@@ -1713,11 +1625,12 @@ async fn guard_stage_round(
     resumed: bool,
     job_id: &str,
 ) -> bool {
-    if phase_changed_and_clear_assignment(ticket_id, phase).await {
-        complete_ticket_stage_job(job_id).await;
+    // Phase moved: complete the job directly (it clears the active-agent rows
+    // too, so no separate clear is needed) and bail.
+    if guard_job_phase(ticket_id, phase, job_id, false).await {
         return true;
     }
-    if stage_round_drain_cut(ticket_id, label, response, resumed) {
+    if stage_drain_cut(ticket_id, label, response, resumed) {
         return true;
     }
     false
@@ -1725,22 +1638,19 @@ async fn guard_stage_round(
 
 /// Shared engineer post-run tail: phase/drain guards, failure handling, pause,
 /// transition, and job terminalization. Diagnostics are dispatched by the poll
-/// loop as a separate `PollPhase::DiagnosticsCheck` (see `poll_round`) — the
-/// success path only transitions to InDiagnostics. The guards live in
-/// [`guard_stage_round`]: phase-moved → complete job and bail; drain-cut →
-/// leave the job 'launched' for boot resume (fresh dispatches log, resumes
-/// stay silent); response `None` past the guards is a real failure or user
-/// cancel, delegated to [`handle_engineer_failure`].
-///
-/// `resumed` selects the observability log strings.
-async fn finalize_engineer_round(
+/// loop as a separate `PollPhase::DiagnosticsCheck` — the success path only
+/// transitions to InDiagnostics. The guards live in [`guard_stage`];
+/// response `None` past the guards is a real failure or user cancel, delegated
+/// to [`handle_engineer_failure`]. `resumed` selects the log strings.
+async fn finalize_engineer_stage(
     ticket: &Ticket,
     agent: &Agent,
     response: Option<&str>,
     job_id: &str,
+    ws: &Workspace,
     resumed: bool,
 ) {
-    if guard_stage_round(
+    if guard_stage(
         &ticket.id,
         TicketPhase::InDevelopment,
         "Engineer",
@@ -1753,8 +1663,9 @@ async fn finalize_engineer_round(
         return;
     }
 
-    // Success path: engineer produced output — transition to InDiagnostics
-    // (unchanged).
+    // Success path: engineer produced output — transition to InDiagnostics,
+    // advance the implementation to the diagnostics stage, and immediately dispatch
+    // the diagnostics runner on the same implementation.
     if let Some(text) = response {
         let comment_text = engineer_comment_text(agent, text).await;
         comment_and_transition_or_bail(
@@ -1773,56 +1684,63 @@ async fn finalize_engineer_round(
             },
         )
         .await;
-        complete_ticket_stage_job(job_id).await;
+        let conn = &crate::session::store().conn;
+        // The implementation dispatches the next stage in the same finalizer: the
+        // diagnostics runner. `claim_diagnostics` (CAS) inside the dispatch
+        // prevents a concurrent poll re-dispatch.
+        advance_to_next_stage(
+            ticket,
+            ws,
+            job_id,
+            conn,
+            Some(IMPLEMENTATION_STAGE_DIAGNOSTICS),
+            |_| {},
+            |ticket_arc, ws| dispatch_diagnostics(ticket_arc, ws).boxed(),
+        )
+        .await;
         return;
     }
 
     // Past the guards above, response None here is a real failure or a user
-    // cancel — classify, pause, and either fail or bounce. The helper returns
-    // false when a shutdown/drain landed mid-tail: the job must then stay
-    // status='launched' for boot resume (mirrors finalize_verifier_round's
-    // early return before job completion).
-    if !handle_engineer_failure(ticket, agent, resumed).await {
-        return;
-    }
-    complete_ticket_stage_job(job_id).await;
+    // cancel — classify, pause, and freeze/fail. The helper returns false when
+    // a shutdown/drain landed mid-tail: the job then stays status='launched'
+    // for boot resume (the caller no longer completes the implementation).
+    let _ = handle_engineer_failure(ticket, agent, job_id, ws, resumed).await;
 }
 
 /// Handle the engineer failure tail (response `None` past the guards).
 ///
 /// - **User cancel** → ticket Failed + workspace pause (unchanged, never
-///   auto-re-queued).
-/// - **Hard failure** ("Agent failed") → the workspace pauses and the ticket
-///   bounces back to ReadyForDevelopment for an automatic retry, consuming
-///   the same bounce budget as review/QA bounces. When the budget is
-///   exhausted the ticket moves to Failed via the bounce breaker — still
-///   with the workspace paused and WITHOUT draining ReadyForDevelopment
-///   siblings. The concrete error is recorded as an `Engineer` role
-///   comment (the unified failure-comment role) so the Manager notification
-///   surfaces it (notify_ticket renders the last comment as the failure
-///   details).
+///   auto-re-queued). The implementation job is completed.
+/// - **Hard failure** ("Agent failed") → the workspace pauses and the implementation
+///   is FROZEN in place: the ticket stays in **InDevelopment** (no bounce to
+///   ReadyForDevelopment, no Failed trip, no bounce-budget consumption). The
+///   implementation's active-agent row is cleared so an unpause re-dispatches the
+///   engineer on the same job/session (session continuity comes from the
+///   NULL-seat engineer anchor). The Manager is notified via the new
+///   engineer-pause notification template.
 /// - **Shutdown/drain race** (token/drain landing after the first drain-cut
-///   check and before the transition commit — re-checked after the
-///   workspace-pause await) → no bounce, no Failed transition; the job stays
-///   'launched' for boot resume. A pause may already be committed if the
-///   drain flipped mid-await (recoverable via the normal unpause).
+///   check and before the transition commit) → no bounce, no Failed transition;
+///   the job stays 'launched' for boot resume.
 ///
-/// Returns `false` when a shutdown/drain cut the failure handling short — the
-/// caller must then leave the job status='launched' for boot resume. Returns
-/// `true` otherwise (failure handling ran to the transition attempt); the
-/// caller terminalizes the stage job.
-async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) -> bool {
+/// Returns `false` when a shutdown/drain cut the failure handling short (the
+/// caller leaves the job 'launched'); `true` otherwise.
+async fn handle_engineer_failure(
+    ticket: &Ticket,
+    agent: &Agent,
+    job_id: &str,
+    ws: &Workspace,
+    resumed: bool,
+) -> bool {
     let cancelled = agent.is_cancelled();
 
-    // No drain re-check here: the caller's stage_round_drain_cut just ran
+    // No drain re-check here: the caller's stage_drain_cut just ran
     // aborting() and no await separates that read from this point, so a
     // second read would be provably identical. The first real gap is the
     // pause await below, which is where the post-pause guard lives.
 
     // Pause before the transition so the failure notification reflects the
-    // paused workspace. Shutdown is excluded inside the helper; a hard
-    // failure pauses on every occurrence, including the budget-exhausting
-    // bounce-trip one.
+    // paused workspace. Both user-cancel and hard-failure paths pause.
     let pause_reason = if cancelled {
         "user cancelled the agent run"
     } else {
@@ -1831,11 +1749,10 @@ async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) 
     let pause_note = pause_workspace_on_failure(ticket, pause_reason).await;
 
     // Second drain-cut: the pause await is the first real gap after the
-    // caller's stage_round_drain_cut — a drain landing there must not commit
+    // caller's stage_drain_cut — a drain landing there must not commit
     // a bounce or a Failed transition (the job stays 'launched' for boot
     // resume). The pause may already be committed if the drain flipped
-    // mid-await; recoverable via the normal unpause and strictly better than
-    // committing the transition during the drain.
+    // mid-await; recoverable via the normal unpause.
     if crate::shutdown::aborting() {
         info!(
             ticket = %ticket.id,
@@ -1844,11 +1761,6 @@ async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) 
         return false;
     }
 
-    // The guards above ensure the global token is not cancelled when this
-    // read normally runs, but it CAN fire in the window between the last
-    // guard and this read — passing the live value keeps such a shutdown
-    // classified as shutdown instead of being misread as a user cancel or a
-    // hard failure.
     let failure_comment = engineer_failure_comment(
         crate::shutdown::shutdown_token().is_cancelled(),
         cancelled,
@@ -1875,56 +1787,155 @@ async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, resumed: bool) 
             },
         )
         .await;
+        // The implementation is terminal once the ticket fails.
+        let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
     } else {
-        bounce_engineer_hard_failure(ticket, &comment_text, resumed).await;
+        // Hard failure: pause is already committed. Freeze the implementation in
+        // place — the ticket stays in InDevelopment, no bounce, no Failed, no
+        // bounce-budget consumption. Session continuity for a later unpause
+        // comes from the NULL-seat engineer anchor session (the existing
+        // `ticket_{ticket_id}_engineer` session), NOT a separate resume
+        // pointer. The failure comment is recorded under SYSTEM_ROLE (not an
+        // Engineer-role comment) so the restarting engineer's feedback
+        // (comments after the last Engineer comment) carries the failure
+        // reason up to the paused round.
+        if let Err(e) = board()
+            .add_comment(&ticket.id, SYSTEM_ROLE, &comment_text)
+            .await
+        {
+            warn!(ticket = %ticket.id, error = %e, "Failed to comment engineer hard failure");
+        }
+        // The workspace pause freezes the implementation (the workspace `paused` flag
+        // is the freeze authority), so no explicit implementation freeze is needed.
+        let conn = &crate::session::store().conn;
+        // Clear the engineer's running roster row so the implementation-iteration
+        // re-dispatch gate does not block on a stale mid-execution marker:
+        // after unpause the implementation is re-dispatched on the same job/session.
+        // (The agent loop's exit guard already unregistered from the router;
+        // the roster row must be cleared.)
+        if let Err(e) = crate::jobs::clear_launched_agents_for_job(conn, job_id).await {
+            warn!(ticket = %ticket.id, error = %e, "Failed to clear running agents after engineer hard failure");
+        }
+        // Notify the Manager that the workspace was paused due to the engineer
+        // hard failure (the hard-failure notification). The pre-pause
+        // `ws.paused` snapshot is always false on a hard failure, so derive the
+        // post-pause state from the pause note instead.
+        let workspace_paused = ws.paused || !pause_note.is_empty();
+        notify_engineer_pause(ws, &comment_text, workspace_paused);
+        info!(
+            ticket = %ticket.id,
+            "Engineer hard failure — workspace paused, implementation frozen at InDevelopment"
+        );
     }
     true
 }
 
-/// Bounce a hard-failed engineer ticket back to ReadyForDevelopment for an
-/// automatic retry, sharing the review/QA bounce budget. The counter is
-/// bumped atomically with the transition (drift-free invariant). When the
-/// budget is exhausted the ticket fails via the bounce breaker — workspace
-/// still paused, ReadyForDevelopment siblings NOT drained (unlike the
-/// verifier trip). The concrete-error comment is written LAST so the Manager
-/// notification surfaces it (`notify_ticket` renders the last comment as the
-/// failure details). `resumed` selects the observability log prefix.
-async fn bounce_engineer_hard_failure(ticket: &Ticket, comment_text: &str, resumed: bool) {
-    let resumed_prefix = if resumed { "Resumed " } else { "" };
-    finalize_bounce_with_breaker(
-        ticket,
-        TicketPhase::InDevelopment,
-        "Engineer",
-        // The engineer notifies the Manager on EVERY bounce — if the engineer
-        // cannot work, escalate immediately (not just on the terminal trip).
-        /* notify_on_bounce */ true,
-        // The engineer trip pauses (in the caller) and does NOT drain siblings.
-        /* drains_siblings */ false,
-        // Unified failure-comment role: the failing stage's role, not SYSTEM_ROLE.
-        Role::Engineer.as_str(),
-        comment_text,
-        Some(&format!(
-            "{resumed_prefix}Engineer hard failure exhausted the bounce budget — ticket failed"
-        )),
-        &format!(
-            "{resumed_prefix}Engineer hard failure — ticket bounced to ReadyForDevelopment for retry"
-        ),
-    )
-    .await;
+/// Notify the Manager that a workspace was paused because of an engineer hard
+/// failure. The ticket stays in development and resumes automatically after
+/// unpause — no action needed.
+fn notify_engineer_pause(ws: &Workspace, failure_details: &str, paused: bool) {
+    let workspace_status = if paused {
+        format!("The workspace is paused — {}.", paused_workspace_sentence())
+    } else {
+        "The workspace was not paused — remaining queued tickets may still be claimed.".to_string()
+    };
+    let warning = substitute(
+        &load_prompt("pipeline/engineer_pause_notification.md"),
+        &[
+            ("{{failure_details}}", failure_details),
+            ("{{workspace_status}}", &workspace_status),
+        ],
+    );
+    let agent_id = manager_agent_id(&ws.name);
+    message_router::route(
+        &agent_id,
+        crate::message_router::AgentJob {
+            content: warning,
+            workspace_name: ws.name.clone(),
+            user_name: "system".to_string(),
+            channel: String::new(),
+            kind: crate::message_router::MessageKind::UserMessage,
+            role: crate::Role::Manager,
+            reply_target: None,
+            pending_job_id: None,
+        },
+    );
 }
 
-/// Run an Engineer agent to implement the ticket.
-///
-/// Gathers feedback comments from all roles since the last engineer run and
-/// includes them in the agent prompt. After the agent finishes, performs a
-/// post-run phase check to catch race conditions, then transitions:
-/// - InDiagnostics (buffer) on successful completion
-/// - ReadyForDevelopment (notify) on a hard "Agent failed" outcome — the
-///   ticket retries automatically, sharing the review/QA bounce budget
-/// - Failed (notify) on user cancel, or when the bounce budget is exhausted
-async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
-    let agent_id = ticket_agent_id(&ticket.id, Role::Engineer.as_str());
+/// Find the implementation job for a ticket (must already exist — it is created at
+/// the engineer claim). Returns the implementation job id, or `None` (after logging)
+/// when the implementation is missing or a DB error occurred.
+async fn find_implementation_or_bail(ticket: &Ticket) -> Option<String> {
+    match crate::jobs::find_implementation_job(&crate::session::store().conn, &ticket.id).await {
+        Ok(Some(j)) => Some(j.id),
+        Ok(None) => {
+            error!(
+                ticket = %ticket.id,
+                "Implementation not found — aborting stage dispatch (implementation should exist after engineer claim)",
+            );
+            None
+        }
+        Err(e) => {
+            error!(ticket = %ticket.id, error = %e, "Failed to find implementation — aborting dispatch");
+            None
+        }
+    }
+}
 
+/// Find or create the implementation job for a ticket. At the first
+/// ReadyForDevelopment → InDevelopment claim no implementation exists — create it
+/// (jobs.kind='ticket_implementation' + ticket_jobs child row). Subsequent
+/// stages reuse it. Returns the implementation job id, or `None` on failure.
+async fn ensure_implementation(ticket: &Ticket, ws: &Workspace, task: &str) -> Option<String> {
+    let conn = &crate::session::store().conn;
+    match crate::jobs::find_implementation_job(conn, &ticket.id).await {
+        Ok(Some(j)) => Some(j.id),
+        Ok(None) => {
+            let job_id = crate::generate_id();
+            if let Err(e) = crate::jobs::spawn_job(
+                conn,
+                &job_id,
+                task,
+                &ws.name,
+                "",
+                "",
+                Role::Engineer,
+                &[],
+                &crate::jobs::SpawnChild::TicketJob {
+                    ticket_id: ticket.id.clone(),
+                    stage: IMPLEMENTATION_STAGE_DEVELOPMENT.to_string(),
+                    is_implementation: true,
+                },
+            )
+            .await
+            {
+                error!(
+                    ticket = %ticket.id,
+                    error = %e,
+                    "Failed to create implementation job — aborting dispatch",
+                );
+                None
+            } else {
+                Some(job_id)
+            }
+        }
+        Err(e) => {
+            error!(ticket = %ticket.id, error = %e, "Failed to find implementation — aborting dispatch");
+            None
+        }
+    }
+}
+
+/// Build the engineer's work prompt: the outstanding feedback comments from
+/// all roles since the last Engineer comment, or the plain implement prompt
+/// when there is none.
+///
+/// A re-dispatched engineer (auto-rework after a validation failure, or a
+/// hard-failure unpause) must receive the reviewer/QA/diagnostics/sanitation
+/// or hard-failure reason that followed its last run — those comments land
+/// after the last Engineer-role comment, so they are gathered here and routed
+/// through the bounce-feedback template rather than the bare implement prompt.
+fn engineer_work_message(ticket: &Ticket) -> String {
     let last_eng_pos = ticket
         .comments
         .iter()
@@ -1936,52 +1947,71 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace) {
         .map(|c| c.content.as_str())
         .collect();
 
-    let message = if feedback.is_empty() {
+    if feedback.is_empty() {
         load_prompt("implement.md")
     } else {
         substitute(
             &load_prompt("pipeline/bounce_feedback.md"),
             &[("{{feedback}}", &feedback.join("\n---\n"))],
         )
-    };
+    }
+}
 
-    // Spawn the durable engineer round (single-slot roster) BEFORE the round
-    // tail — the job is the resume handle across crashes AND graceful drains.
-    let job_id = crate::generate_id();
-    let Ok(_slot) = spawn_single_slot_round(
-        &job_id,
-        &ticket,
-        &ws,
-        "engineer",
-        TicketPhase::InDevelopment,
-        Role::Engineer,
-        &message,
-        &agent_id,
-    )
-    .await
-    else {
-        error!(
-            ticket = %ticket.id,
-            "Failed to spawn engineer job — aborting dispatch",
-        );
-        return;
-    };
-    run_stage_agent_round(
-        &ticket,
-        &ws,
-        &job_id,
-        &message,
-        false,
-        StageRoundKind::Engineer,
-    )
-    .await;
+/// Run an Engineer agent to implement the ticket.
+///
+/// Gathers feedback comments from all roles since the last engineer run and
+/// includes them in the agent prompt. Runs the engineer on the implementation job:
+/// the implementation is created at the first ReadyForDevelopment → InDevelopment
+/// claim and reused for ALL subsequent stages. After the agent finishes,
+/// performs a post-run phase check to catch race conditions, then transitions:
+/// - InDiagnostics (buffer) on successful completion
+/// - InDevelopment (in place, implementation re-dispatched) on a validation
+///   non-success — the ticket retries automatically on the SAME implementation job
+///   (no ReadyForDevelopment, no re-claim)
+/// - Failed (notify) on user cancel, or when the bounce budget is exhausted
+/// - Frozen at InDevelopment (workspace paused) on an engineer hard failure
+fn dispatch_engineer(
+    ticket: Arc<Ticket>,
+    ws: Workspace,
+    resumed: bool,
+) -> futures_util::future::BoxFuture<'static, ()> {
+    Box::pin(async move {
+        let message = engineer_work_message(&ticket);
+
+        // The implementation job is the single owner of the workspace's running slot
+        // for this ticket — find it (or create it at the first claim) and run
+        // the engineer on it. The implementation survives across all stages.
+        let Some(job_id) = ensure_implementation(&ticket, &ws, &message).await else {
+            return;
+        };
+        let conn = &crate::session::store().conn;
+        // Sync the implementation's authoritative stage + task for boot resume.
+        sync_implementation(
+            conn,
+            &job_id,
+            &ticket.id,
+            IMPLEMENTATION_STAGE_DEVELOPMENT,
+            Some(&message),
+        )
+        .await;
+
+        run_stage_agent(
+            &ticket,
+            &ws,
+            &job_id,
+            &message,
+            resumed,
+            StageRunKind::Engineer,
+        )
+        .await;
+    })
 }
 
 /// The single-agent stage rounds sharing one run tail: engineer (NULL-seat
-/// anchor, [`finalize_engineer_round`]) and sanitation (job-derived agent ID,
-/// [`finalize_sanitation_round`]).
+/// anchor, [`finalize_engineer_stage`]) and sanitation (job-derived agent ID,
+/// [`finalize_sanitation_stage`]).
 #[derive(Clone, Copy)]
-enum StageRoundKind {
+enum StageRunKind {
     Engineer,
     Sanitation,
 }
@@ -1991,19 +2021,19 @@ enum StageRoundKind {
 /// The NULL-seat anchor (permanently-NULL `job_id`) is upserted FIRST so the
 /// accumulated session `ticket_{id}_engineer` survives round-job deletion and
 /// the 8h purge. The upsert is idempotent (partial unique index — single row
-/// per agent_id, job_id NULL): a crash between `spawn_single_slot_round` and
+/// per agent_id, job_id NULL): a crash between the round's spawn and
 /// the fresh-dispatch upsert (two adjacent awaits) would otherwise leave this
 /// round WITHOUT an anchor — after CASCADE the session loses TTL protection
 /// and the next bounce round loses S5 context. (Engineer stage only.)
 ///
 /// The sanitation agent ID is job-derived (`ticket_{job_id}_sanitation`):
 /// derived FIRST as a pure function of job_id, then registered (router +
-/// `assigned_to`), then the session-non-emptiness discriminator is read — the
-/// session-store read and router registration are independent (benign
-/// ordering). The register overwrites the claim-time placeholder
+/// job roster row), then the session-non-emptiness discriminator is
+/// read — the session-store read and router registration are independent
+/// (benign ordering). The register overwrites the claim-time placeholder
 /// (`ticket_{ticket_id}_sanitation`) with the job-derived run ID so mid-run
 /// comments route to the actual agent (and covers the re-dispatch path after
-/// [`record_sanitation_failure`] clears `assigned_to`). (Sanitation stage only.)
+/// [`record_sanitation_failure`] clears active agents). (Sanitation stage only.)
 ///
 /// Resume dispatch rule — session-non-emptiness discriminator: the check is
 /// "any session content", not "current round's task present" — existing
@@ -2013,16 +2043,16 @@ enum StageRoundKind {
 /// session.init leaves the round's feedback undelivered (a non-empty prior
 /// round then dispatches an empty message). Narrow window, quality-only —
 /// accepted. Fresh dispatch always uses the rendered prompt.
-async fn run_stage_agent_round(
+async fn run_stage_agent(
     ticket: &Ticket,
     ws: &Workspace,
     job_id: &str,
     task: &str,
     resumed: bool,
-    kind: StageRoundKind,
+    kind: StageRunKind,
 ) {
-    if let StageRoundKind::Engineer = kind
-        && let Err(e) = crate::jobs::upsert_engineer_anchor(
+    if let StageRunKind::Engineer = kind
+        && let Err(e) = crate::jobs::upsert_engineer_session_pin(
             &crate::session::store().conn,
             &ticket.id,
             task,
@@ -2039,21 +2069,26 @@ async fn run_stage_agent_round(
     }
 
     let agent_id = match kind {
-        StageRoundKind::Engineer => crate::jobs::engineer_anchor_id(&ticket.id),
-        StageRoundKind::Sanitation => format!("ticket_{job_id}_sanitation"),
+        StageRunKind::Engineer => crate::jobs::engineer_session_pin_id(&ticket.id),
+        StageRunKind::Sanitation => format!("ticket_{job_id}_sanitation"),
     };
-    let incoming_rx = register_agent_and_assign(
-        &ticket.id,
+    let agent_kind = match kind {
+        StageRunKind::Engineer => crate::jobs::AgentKind::Engineer,
+        StageRunKind::Sanitation => crate::jobs::AgentKind::Sanitation,
+    };
+    let incoming_rx = register_running_agent(
+        job_id,
         &agent_id,
+        agent_kind,
         match kind {
-            StageRoundKind::Engineer if resumed => {
-                "Failed to persist assigned_to for resumed engineer — comments may not route"
+            StageRunKind::Engineer if resumed => {
+                "Failed to register running engineer — comments may not route"
             }
-            StageRoundKind::Engineer => {
-                "Failed to persist assigned_to — stale agent already cancelled at dispatch, proceeding without DB assignment"
+            StageRunKind::Engineer => {
+                "Failed to register running engineer — stale agent already cancelled at dispatch, proceeding without roster registration"
             }
-            StageRoundKind::Sanitation => {
-                "Failed to persist assigned_to for sanitation agent — mid-run comments may not route"
+            StageRunKind::Sanitation => {
+                "Failed to register running sanitation agent — mid-run comments may not route"
             }
         },
     )
@@ -2068,24 +2103,24 @@ async fn run_stage_agent_round(
     let (agent, response) = run_single_agent(
         agent_id,
         match kind {
-            StageRoundKind::Engineer => Role::Engineer,
-            StageRoundKind::Sanitation => Role::Sanitation,
+            StageRunKind::Engineer => Role::Engineer,
+            StageRunKind::Sanitation => Role::Sanitation,
         },
         ws,
         ticket,
         &message,
         incoming_rx,
         resumed,
-        true,
     )
     .await;
 
     match kind {
-        StageRoundKind::Engineer => {
-            finalize_engineer_round(ticket, &agent, response.as_deref(), job_id, resumed).await;
+        StageRunKind::Engineer => {
+            finalize_engineer_stage(ticket, &agent, response.as_deref(), job_id, ws, resumed).await;
         }
-        StageRoundKind::Sanitation => {
-            finalize_sanitation_round(ticket, &agent, response.as_deref(), job_id, resumed).await;
+        StageRunKind::Sanitation => {
+            finalize_sanitation_stage(ticket, &agent, response.as_deref(), job_id, resumed, ws)
+                .await;
         }
     }
 }
@@ -2098,7 +2133,7 @@ async fn run_stage_agent_round(
 ///
 /// # Race condition
 ///
-/// Multiple QaPassed tickets in the same workspace are finalized concurrently
+/// Multiple occupied tickets in the same workspace are finalized concurrently
 /// (`tokio::spawn` in `poll_round`). Both may see each other as active and
 /// both buffer. In this scenario all tickets are already Done in the database
 /// — the only consequence is delayed notifications until the next
@@ -2144,6 +2179,13 @@ async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment
         FinalizeOutcome::Applied
     ) {
         info!(ticket = %ticket.id, "{comment}");
+        // The implementation reaches Done — terminalize it so its jobs row is not
+        // left status='launched' until the 8h purge (or the next boot).
+        let _ = crate::jobs::complete_implementation_job_for_ticket(
+            &crate::session::store().conn,
+            &ticket.id,
+        )
+        .await;
     }
 }
 
@@ -2250,8 +2292,8 @@ async fn finalize_ticket_with_git_status(
 /// ticket to Done atomically within a single DB transaction via
 /// [`with_comment_and_transition`].
 ///
-/// Parameterized by source phase so both the QaPassed→Done and
-/// SanitationPassed→Done flows share the same implementation.
+/// Parameterized by source phase so the sanitation→Done and
+/// git-unavailable done paths share the same implementation.
 async fn finalize_commit_and_transition(
     ticket: &Ticket,
     commit_info: crate::git_commands::CommitInfo,
@@ -2300,6 +2342,13 @@ async fn finalize_commit_and_transition(
         FinalizeOutcome::Applied
     ) {
         info!(ticket = %ticket.id, "Committed {}, moving to Done", commit_info.short_hash());
+        // The implementation reaches Done — terminalize it so its jobs row is not
+        // left status='launched' until the 8h purge (or the next boot).
+        let _ = crate::jobs::complete_implementation_job_for_ticket(
+            &crate::session::store().conn,
+            &ticket.id,
+        )
+        .await;
     }
 }
 
@@ -2316,79 +2365,15 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
     }
 }
 
-// ── QaPassed → InSanitation → Done ────────────────────────────────────
-
-/// Handle a QaPassed ticket: check for untracked/new files and either
-/// transition to InSanitation for sanitation agent dispatch or commit
-/// directly to Done.
-///
-/// Checks the working tree for untracked files (`git status --porcelain`
-/// showing `??` or `A `). If untracked files exist, atomically transitions
-/// the ticket to InSanitation with `assigned_to` set (no TOCTOU window
-/// between transition and assignment), and dispatches the sanitation agent.
-/// Otherwise, commits and transitions to Done (existing behavior).
-async fn handle_qa_passed(ticket: Ticket, ws: Workspace) {
-    let Some(porcelain) = ensure_git_or_done_and_get_status(
-        &ticket,
-        &ws,
-        TicketPhase::QaPassed,
-        "untracked files check",
-    )
-    .await
-    else {
-        return;
-    };
-
-    let untracked = parse_new_files_from_porcelain(&porcelain);
-
-    if untracked.is_empty() {
-        // Git status and availability already checked above — delegate directly
-        // to the helper that commits dirty changes or transitions to Done.
-        finalize_ticket_with_git_status(ticket, ws, TicketPhase::QaPassed, &porcelain).await;
-    } else {
-        // Untracked files exist — claim this specific ticket to InSanitation
-        // via the dedicated claim_sanitation method (see BoardStore docs).
-        let agent_id = ticket_agent_id(&ticket.id, Role::Sanitation.as_str());
-        let claimed = match board().claim_sanitation(&ticket.id, &agent_id).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Failed to transition QaPassed ticket to InSanitation"
-                );
-                return;
-            }
-        };
-
-        if !claimed {
-            debug!(
-                ticket = %ticket.id,
-                "QaPassed ticket moved externally — skipping sanitation dispatch",
-            );
-            return;
-        }
-
-        ticket_buffer::push(
-            &ticket.workspace_name,
-            &ticket.id,
-            TicketPhase::QaPassed,
-            TicketPhase::InSanitation,
-            ticket_buffer::TransitionOrigin::Pipeline,
-        );
-
-        spawn_dispatch(PollPhase::SanitationCheck, ticket, ws);
-    }
-}
-
 /// Record a sanitation failure: add a [`SANITATION_ROLE`] comment as a failure
-/// marker and clear assigned_to so the ticket can be re-dispatched.
+/// marker and clear the ticket's running roster rows so it can be re-dispatched.
 ///
 /// `raw_dump`: when the failure is a verdict
 /// extraction failure, the last-attempt raw response is dumped into the
 /// comment the same way the parallel verdict path does.
 async fn record_sanitation_failure(
     ticket_id: &str,
+    job_id: &str,
     reason: impl std::fmt::Display,
     raw_dump: Option<&crate::retry::RetryExhausted>,
 ) {
@@ -2409,7 +2394,6 @@ async fn record_sanitation_failure(
         "record sanitation failure",
         async |tx| {
             BoardStore::add_comment_tx(tx, ticket_id, SANITATION_ROLE, &reason_str).await?;
-            BoardStore::set_assigned_to_tx(tx, ticket_id, None).await?;
             Ok(())
         },
     )
@@ -2418,46 +2402,61 @@ async fn record_sanitation_failure(
         warn!(
             ticket = %ticket_id,
             error = %e,
-            "Failed to record sanitation failure (failure marker comment + assigned_to clear)",
+            "Failed to record sanitation failure (failure marker comment)",
+        );
+    }
+    // Best-effort clear of the job's running roster rows (sessions.db).
+    if let Err(e) =
+        crate::jobs::clear_launched_agents_for_job(&crate::session::store().conn, job_id).await
+    {
+        warn!(
+            ticket = %ticket_id,
+            error = %e,
+            "Failed to clear running agents after sanitation failure",
         );
     }
 }
 
-/// Register an agent in the message router and persist the SAME ID in the
-/// ticket's `assigned_to` so mid-run comments route to it.
+/// Register an agent in the message router and write a job-bound launched
+/// roster row so mid-run comments route to it and the re-dispatch guard
+/// blocks.
 ///
 /// Returns the agent's inbox receiver, ready for [`run_agent`].
 ///
-/// # Ordering invariant (register-before-set)
+/// # Ordering invariant (register-before-record)
 ///
-/// The router registration MUST happen before `assigned_to` is updated —
-/// routing looks the stored ID up in the router, so persisting an ID that is
-/// not yet registered would create a drop window.
+/// The router registration MUST happen before the roster row is written —
+/// routing looks the stored ID up in the router, so persisting an ID
+/// that is not yet registered would create a drop window.
 ///
-/// Uses [`BoardStore::set_assigned_to_no_cancel`] (the non-cancelling
-/// variant): the cancel-variant side-effect `AGENT_REGISTRY.cancel_by_ticket_id`
-/// would kill a concurrently running agent for this ticket. That cancel is a
-/// no-op at this point anyway —
-/// no agent for this ticket is in `AGENT_REGISTRY` yet (agents enter it only
-/// inside [`run_agent`], after assignment) and stale agents were already
-/// cancelled pre-flight by [`spawn_dispatch`].
+/// Uses [`crate::jobs::upsert_job_agent`] (best-effort sessions.db
+/// ops; failures warn, never propagate — comment routing is already
+/// best-effort).
 ///
 /// The warn message is a parameter because call sites describe the failure
 /// differently.
-async fn register_agent_and_assign(
-    ticket_id: &str,
+async fn register_running_agent(
+    job_id: &str,
     agent_id: &str,
+    kind: crate::jobs::AgentKind,
     warn_message: &str,
 ) -> tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob> {
     // Register in the message router so comments can be delivered mid-work.
     let incoming_rx = message_router::register_agent(agent_id);
 
-    if let Err(e) = board()
-        .set_assigned_to_no_cancel(ticket_id, Some(agent_id))
-        .await
+    if let Err(e) = crate::jobs::upsert_job_agent(
+        &crate::session::store().conn,
+        job_id,
+        agent_id,
+        kind,
+        crate::jobs::RowStatus::Launched,
+        "",
+    )
+    .await
     {
         warn!(
-            ticket = ticket_id,
+            agent = agent_id,
+            job = job_id,
             error = %e,
             "{warn_message}",
         );
@@ -2466,20 +2465,52 @@ async fn register_agent_and_assign(
     incoming_rx
 }
 
+/// Shared sanitation-failure tail: record the failure marker (reason +
+/// optional raw dump) and route the non-success through the unified
+/// bounce-to-development path (increments budget, direct re-dispatch). Used by
+/// the response-None and verdict-extraction-error branches of
+/// [`finalize_sanitation_stage`]. [`bounce_to_development`] drains
+/// ReadyForDevelopment siblings on breaker exhaustion and never pauses.
+async fn finalize_sanitation_failure(
+    ticket: &Ticket,
+    job_id: &str,
+    reason: String,
+    raw_dump: Option<&crate::retry::RetryExhausted>,
+    ws: &Workspace,
+) {
+    record_sanitation_failure(&ticket.id, job_id, reason, raw_dump).await;
+    // `record_sanitation_failure` already recorded the detailed
+    // "Sanitation failed — <reason>" marker; bounce_to_development adds no
+    // duplicate stage comment (the unified bounce still increments the budget
+    // exactly once).
+    bounce_to_development(
+        ticket,
+        TicketPhase::InSanitation,
+        "Sanitation",
+        /* drains_siblings */ true,
+        SANITATION_ROLE,
+        "",
+        job_id,
+        ws,
+    )
+    .await;
+}
+
 /// Absorb the post-run tail shared by dispatch and resume: the phase/drain
 /// guards, the response-None failure block, verdict extraction with error
-/// handling, and the job terminalization. Guards (see [`guard_stage_round`]):
+/// handling, and the job terminalization. Guards (see [`guard_stage`]):
 /// phase-moved → complete job and bail; drain-cut → leave the job 'launched'
 /// for boot resume (fresh dispatches log, resumes stay silent); response-None
 /// past the guards is a real failure.
-async fn finalize_sanitation_round(
+async fn finalize_sanitation_stage(
     ticket: &Ticket,
     agent: &Agent,
     response: Option<&str>,
     job_id: &str,
     resumed: bool,
+    ws: &Workspace,
 ) {
-    if guard_stage_round(
+    if guard_stage(
         &ticket.id,
         TicketPhase::InSanitation,
         "Sanitation",
@@ -2493,22 +2524,21 @@ async fn finalize_sanitation_round(
     }
     let resumed_suffix = if resumed { " (resumed)" } else { "" };
     if response.is_none() {
-        // Agent failed or was cancelled — record failure and clear assigned_to
-        // for re-dispatch retry. The marker comment records the failure for
-        // triage; this no-output path stays infinite-retry without consuming
-        // the bounce budget (only verdict-based garbage bounces share the
-        // breaker). (Past the guard above, response None here is a real failure.)
+        // Agent failed or was cancelled — record the failure marker and route
+        // the non-success through the unified bounce-to-development path. The
+        // marker comment records the failure for triage.
         warn!(
             ticket = %ticket.id,
-            "Sanitation agent returned no output{resumed_suffix} — clearing assigned_to for retry"
+            "Sanitation agent returned no output{resumed_suffix} — bouncing to development"
         );
-        record_sanitation_failure(
-            &ticket.id,
+        finalize_sanitation_failure(
+            ticket,
+            job_id,
             format!("agent returned no output{resumed_suffix}"),
             None,
+            ws,
         )
         .await;
-        complete_ticket_stage_job(job_id).await;
         return;
     }
 
@@ -2517,23 +2547,25 @@ async fn finalize_sanitation_round(
         .extract_verdict::<crate::SanitationVerdict>(&extraction_prompt, None, None)
         .await
     {
-        Ok(verdict) => process_sanitation_verdict(ticket, verdict).await,
+        Ok(verdict) => {
+            process_sanitation_verdict(ticket, job_id, verdict, ws).await;
+        }
         Err(failure) => {
             warn!(
                 ticket = %ticket.id,
                 error = %failure,
-                "Failed to extract sanitation verdict{resumed_suffix} — clearing assigned_to for retry"
+                "Failed to extract sanitation verdict{resumed_suffix} — bouncing to development"
             );
-            record_sanitation_failure(
-                &ticket.id,
+            finalize_sanitation_failure(
+                ticket,
+                job_id,
                 format!("verdict extraction error{resumed_suffix}: {failure}"),
                 Some(&failure),
+                ws,
             )
             .await;
         }
     }
-
-    complete_ticket_stage_job(job_id).await;
 }
 
 /// Run the sanitation agent to inspect new/untracked files in the workspace.
@@ -2544,26 +2576,52 @@ async fn finalize_sanitation_round(
 ///
 /// After the agent completes, extracts a structured [`SanitationVerdict`] and
 /// delegates to [`process_sanitation_verdict`] for pass/fail processing.
-async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
-    //
-    // Unlike handle_qa_passed (which fails closed on git errors — returning early
-    // to stay in QaPassed for retry), dispatch_sanitation takes a fail-open approach:
-    // if we can't list untracked files, we pass an empty list rather than failing the
-    // ticket. The sanitation agent will see "(could not list untracked files)" and
-    // proceed. This is intentional: by the time dispatch_sanitation runs, the ticket
-    // has already been claimed to InSanitation with assigned_to set. Failing-closed
-    // (returning early) would leave the ticket stuck in InSanitation with no agent
-    // running, requiring the next poll cycle's re-dispatch guard to recover. Passing
-    // an empty list is at-worst a no-op (the agent passes, ticket proceeds to commit);
-    // at-best the agent may still detect garbage from known patterns.
-    //
-    // Note: this re-runs `git status --porcelain` even though `handle_qa_passed`
-    // already collected the untracked file list. The re-run is unavoidable because
-    // `dispatch_sanitation` runs in a separate async task (spawned via `spawn_dispatch`)
-    // and the data from `handle_qa_passed` cannot be shared across that boundary.
-    // The shell overhead of one `git status` call per sanitation cycle is negligible
-    // relative to the LLM agent cost that follows.
+async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, resumed: bool) {
+    // Fail-open listing: a listing error is passed to the agent (we cannot
+    // prove there are no files); an empty list skips the agent and commits to
+    // Done.
     let untracked_files = match list_new_or_untracked_files(ws.as_path()).await {
+        Ok(files) if files.is_empty() => {
+            // No new/untracked files — skip the sanitation agent entirely and
+            // commit straight to Done (no bounce budget consumed).
+            let Some(job_id) = find_implementation_or_bail(&ticket).await else {
+                return;
+            };
+            let comment =
+                "🧹 No new or untracked files — skipping sanitation agent, committing to Done.";
+            if let Err(e) = board()
+                .add_comment(&ticket.id, Role::Sanitation.as_str(), comment)
+                .await
+            {
+                warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation skip comment");
+            }
+            sync_implementation(
+                &crate::session::store().conn,
+                &job_id,
+                &ticket.id,
+                IMPLEMENTATION_STAGE_SANITATION,
+                None,
+            )
+            .await;
+            let Some(porcelain) = ensure_git_or_done_and_get_status(
+                &ticket,
+                &ws,
+                TicketPhase::InSanitation,
+                "finalize",
+            )
+            .await
+            else {
+                return;
+            };
+            finalize_ticket_with_git_status(
+                ticket.as_ref().clone(),
+                ws.clone(),
+                TicketPhase::InSanitation,
+                &porcelain,
+            )
+            .await;
+            return;
+        }
         Ok(files) => files.join("\n"),
         Err(e) => {
             warn!(
@@ -2584,37 +2642,27 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
         ],
     );
 
-    // Spawn the durable sanitation round BEFORE the session write — the job
-    // is the resume handle. The agent ID is derived per-run from the job id
-    // (`ticket_{job_id}_sanitation`); the roster row carries the
-    // ACTUAL run id so the purge live-session protection and resume paths
-    // match the real session.
-    let job_id = crate::generate_id();
-    let Ok(_slot) = spawn_single_slot_round(
-        &job_id,
-        &ticket,
-        &ws,
-        "sanitation",
-        TicketPhase::InSanitation,
-        Role::Sanitation,
-        &prompt,
-        &format!("ticket_{job_id}_sanitation"),
-    )
-    .await
-    else {
-        error!(
-            ticket = %ticket.id,
-            "Failed to spawn sanitation job — aborting dispatch",
-        );
+    // Sanitation runs on the SAME implementation job (created at the engineer claim).
+    let Some(job_id) = find_implementation_or_bail(&ticket).await else {
         return;
     };
-    run_stage_agent_round(
+    let conn = &crate::session::store().conn;
+    sync_implementation(
+        conn,
+        &job_id,
+        &ticket.id,
+        IMPLEMENTATION_STAGE_SANITATION,
+        Some(&prompt),
+    )
+    .await;
+
+    run_stage_agent(
         &ticket,
         &ws,
         &job_id,
         &prompt,
-        false,
-        StageRoundKind::Sanitation,
+        resumed,
+        StageRunKind::Sanitation,
     )
     .await;
 }
@@ -2624,15 +2672,17 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace) {
 /// Called by [`dispatch_sanitation`] after the agent completes and the
 /// [`SanitationVerdict`] has been extracted.
 ///
-/// - If **clean** (pass = true): transitions to [`TicketPhase::SanitationPassed`]
-///   (transitory handoff before auto-commit).
-/// - If **garbage detected** (pass = false): bounces to
-///   [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation and
-///   increments the shared bounce counter; on exhaustion (bounce_count >=
-///   MAX_BOUNCES) fails to [`TicketPhase::Failed`] via the bounce breaker
-///   (drain, SYSTEM_ROLE trip comment + concrete failure last). Shares the
-///   review/QA/engineer bounce budget.
-async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationVerdict) {
+/// - If **clean** (pass = true): records the verdict comment and commits the
+///   working tree to Done.
+/// - If **garbage detected** (pass = false): routes through the unified
+///   bounce-to-development path (increments the shared bounce budget; direct
+///   engineer re-dispatch on the same implementation; trips Failed on exhaustion).
+async fn process_sanitation_verdict(
+    ticket: &Ticket,
+    job_id: &str,
+    verdict: crate::SanitationVerdict,
+    ws: &Workspace,
+) {
     if verdict.pass {
         let passed_suffix = if verdict.garbage_files.is_empty() {
             ""
@@ -2643,16 +2693,34 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
             "🧹 Sanitation passed{passed_suffix}: {rationale}",
             rationale = verdict.rationale
         );
-        comment_and_transition_or_bail(
-            TransitionCtx::buffered(
-                ticket,
-                TicketPhase::InSanitation,
-                TicketPhase::SanitationPassed,
-                "Sanitation",
-            ),
-            Role::Sanitation.as_str(),
-            &comment,
-            "Sanitation passed — transitioned to SanitationPassed",
+        if let Err(e) = board()
+            .add_comment(&ticket.id, Role::Sanitation.as_str(), &comment)
+            .await
+        {
+            warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation pass comment");
+        }
+        let conn = &crate::session::store().conn;
+        sync_implementation(
+            conn,
+            job_id,
+            &ticket.id,
+            IMPLEMENTATION_STAGE_SANITATION,
+            None,
+        )
+        .await;
+        // Commit the changes and transition to Done (the implementation is
+        // terminalized by the commit path).
+        let Some(porcelain) =
+            ensure_git_or_done_and_get_status(ticket, ws, TicketPhase::InSanitation, "finalize")
+                .await
+        else {
+            return;
+        };
+        finalize_ticket_with_git_status(
+            ticket.clone(),
+            ws.clone(),
+            TicketPhase::InSanitation,
+            &porcelain,
         )
         .await;
     } else {
@@ -2664,22 +2732,18 @@ async fn process_sanitation_verdict(ticket: &Ticket, verdict: crate::SanitationV
                 ("{{rationale}}", &verdict.rationale),
             ],
         );
-        // Verdict bounce shares the review/QA/engineer bounce budget and trips
-        // the breaker on exhaustion (drain siblings, no pause).
-        finalize_bounce_with_breaker(
+        // Unified bounce-to-development: increments the shared bounce budget,
+        // direct engineer re-dispatch on the same implementation; trips Failed on
+        // exhaustion (drain siblings, no pause).
+        bounce_to_development(
             ticket,
             TicketPhase::InSanitation,
             "Sanitation",
-            // Verdict paths buffer on a non-terminal bounce, notify on the trip.
-            /* notify_on_bounce */
-            false,
-            // Verdict breaker-trips drain ReadyForDevelopment siblings.
-            /* drains_siblings */
-            true,
+            /* drains_siblings */ true,
             Role::Sanitation.as_str(),
             &comment,
-            None,
-            "Sanitation failed — bounced back to ReadyForDevelopment with pipeline reservation",
+            job_id,
+            ws,
         )
         .await;
     }
@@ -2773,24 +2837,147 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
     (comment.trim_start_matches('\n').to_string(), all_passed)
 }
 
+/// Sync the implementation's authoritative stage at a stage handoff (phase is
+/// derived from (kind, stage) — see [`crate::jobs::derive_ticket_phase`], so it
+/// is NOT written here), plus one stage-specific effect: `Some(task)` writes
+/// the stored dispatch task (at dispatch time, before the stage agent runs);
+/// `None` clears the prior stage's running-agent roster rows (at
+/// stage-completion handoff). Keeps the implementation's authoritative state in
+/// sync with the ticket's phase mirror. Failures log and continue — the
+/// implementation sync is best-effort; the next dispatch re-syncs.
+async fn sync_implementation(
+    conn: &crate::turso::Connection,
+    job_id: &str,
+    ticket_id: &str,
+    stage: &str,
+    task: Option<&str>,
+) {
+    if let Err(e) = crate::jobs::update_implementation_job(conn, job_id, stage).await {
+        warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to sync implementation state to {stage}");
+    }
+    match task {
+        Some(task) => {
+            if let Err(e) = crate::jobs::update_implementation_job_task(conn, job_id, task).await {
+                warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to sync implementation task");
+            }
+        }
+        None => {
+            if let Err(e) = crate::jobs::clear_launched_agents_for_job(conn, job_id).await {
+                warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to clear running agents on stage handoff to {stage}");
+            }
+        }
+    }
+}
+
+/// Unified "advance the implementation to the next stage and immediately
+/// dispatch the next stage's agent(s) in the same finalizer" epilogue. The
+/// single-owner pipeline invariant holds: each stage handoff dispatches the next
+/// stage directly, so the implementation never waits on a separate poll tick.
+///
+/// `sync` is `Some(stage)` when the implementation's authoritative
+/// `ticket_jobs.stage` must be written to the upcoming stage before dispatch;
+/// `None` on the validation-failure bounce path, where the re-dispatched
+/// engineer re-syncs the stage itself (a duplicate write would follow). Phase
+/// is derived from (kind, stage), so `sync` carries only the stage. The
+/// per-site `log` runs after the sync and before the spawn so the message stays
+/// byte-identical per caller; callers that do not log pass a no-op.
+/// `dispatch_next` builds the correct next-dispatch future:
+/// `dispatch_diagnostics`, `dispatch_verifiers(.., QA_VI, ..)`,
+/// `dispatch_sanitation`, or `dispatch_engineer`.
+async fn advance_to_next_stage(
+    ticket: &Ticket,
+    ws: &Workspace,
+    job_id: &str,
+    conn: &crate::turso::Connection,
+    sync: Option<&str>,
+    log: impl FnOnce(&Ticket),
+    dispatch_next: impl FnOnce(Arc<Ticket>, Workspace) -> BoxFuture<'static, ()> + Send + 'static,
+) {
+    if let Some(stage) = sync {
+        sync_implementation(conn, job_id, &ticket.id, stage, None).await;
+    }
+    log(ticket);
+    let ticket_arc = Arc::new(ticket.clone());
+    let ws = ws.clone();
+    tokio::spawn(Box::pin(async move {
+        dispatch_next(ticket_arc, ws).await;
+    }));
+}
+
+/// Conclude a successful diagnostics run (all-passed or no-commands skip):
+/// transition to `InReview` and advance the implementation to the review stage.
+/// `log_label` preserves the per-arm distinction between the pass and
+/// skip messages.
+async fn conclude_diagnostics_success(
+    ticket: &Ticket,
+    job_id: &str,
+    comment: &str,
+    log_label: &str,
+    conn: &crate::turso::Connection,
+    ws: &Workspace,
+) {
+    comment_and_transition_or_bail(
+        TransitionCtx::buffered(
+            ticket,
+            TicketPhase::InDiagnostics,
+            TicketPhase::InReview,
+            "Diagnostics",
+        ),
+        DIAGNOSTICS_ROLE,
+        comment,
+        log_label,
+    )
+    .await;
+    // The implementation dispatches the next stage in the same finalizer: the
+    // reviewers.
+    advance_to_next_stage(
+        ticket,
+        ws,
+        job_id,
+        conn,
+        Some(IMPLEMENTATION_STAGE_REVIEW),
+        |_| {},
+        |ticket_arc, ws| dispatch_verifiers(ticket_arc, ws, REVIEWER_VI, false),
+    )
+    .await;
+}
+
+/// Conclude a failed diagnostics run: unified bounce back to development on the
+/// same implementation, consuming the shared bounce budget.
+async fn conclude_diagnostics_failure(
+    ticket: &Ticket,
+    job_id: &str,
+    comment: &str,
+    ws: &Workspace,
+) {
+    bounce_to_development(
+        ticket,
+        TicketPhase::InDiagnostics,
+        "Diagnostics",
+        /* drains_siblings */ true,
+        DIAGNOSTICS_ROLE,
+        comment,
+        job_id,
+        ws,
+    )
+    .await;
+}
+
 /// Run diagnostics commands after the engineer completes development.
 ///
 /// Called by [`PollPhase::DiagnosticsCheck`] via [`spawn_dispatch`].
-/// Uses [`BoardStore::claim_diagnostics`] to set
-/// `assigned_to` and prevent
+/// Uses [`BoardStore::claim_diagnostics`] plus a job-bound roster in-flight
+/// marker to prevent
 /// double-dispatch. Unlike the pipeline-phase dispatchers (which are dispatched
 /// from the atomic claim loop and already own the ticket by the time their
 /// dispatch runs), diagnostics keeps the ticket in `InDiagnostics` while
 /// executing, so a separate atomic claim is needed to close the TOCTOU window.
 /// Loads discovered diagnostics commands for the workspace and runs them
 /// sequentially via [`run_diagnostics_commands`]. Stops at the first failure.
-/// After execution, transitions the ticket to either `DiagnosticsDone` (all
-/// passed) or `ReadyForDevelopment` (any failure).
+/// After execution, transitions the ticket to either `InReview` (all passed)
+/// or `InDevelopment` (unified bounce on any failure).
 async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
-    match board()
-        .claim_diagnostics(&ticket.id, DIAGNOSTICS_ROLE)
-        .await
-    {
+    match board().claim_diagnostics(&ticket.id).await {
         Err(e) => {
             error!(
                 ticket = %ticket.id,
@@ -2809,10 +2996,40 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
         Ok(true) => {}
     }
 
+    // Diagnostics runs on the SAME implementation job (created at the engineer claim).
+    let Some(job_id) = find_implementation_or_bail(&ticket).await else {
+        return;
+    };
+    let conn = &crate::session::store().conn;
+
+    // Register a synthetic in-flight roster marker so the implementation-iteration
+    // re-dispatch guard (`job_has_launched_agents`) blocks while diagnostics
+    // execute. Diagnostics is shell-command-driven (no LLM agent), so the
+    // marker id is synthetic; it is cleared on the success / phase-changed
+    // handoffs. On the diagnostics-failure bounce it is left in place — the
+    // re-dispatched engineer's own roster row becomes the live guard, and the
+    // stale marker is cleared at the next stage handoff.
+    let diag_agent_id = format!("ticket_{}_diagnostics", ticket.id);
+    if let Err(e) = crate::jobs::upsert_job_agent(
+        conn,
+        &job_id,
+        &diag_agent_id,
+        crate::jobs::AgentKind::Diagnostics,
+        crate::jobs::RowStatus::Launched,
+        "",
+    )
+    .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            error = %e,
+            "Failed to register diagnostics in-flight marker — diagnostics may re-dispatch",
+        );
+    }
+
     // Separate the decision (target phase + comment body + outcome log) from
     // the action (single transition call), matching the dispatch_engineer
-    // precedent. C2 (diagnostics failure) shares the verifier/engineer bounce
-    // budget and circuit breaker; C1/B/Err skip without consuming budget.
+    // precedent. Diagnostics failure shares the unified bounce budget.
     match crate::workspace::store().get_diagnostics(&ws.name).await {
         Ok(Some(cmds)) if !cmds.is_empty() => {
             // Run commands sequentially in the prescribed order.
@@ -2820,77 +3037,55 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
             // Post-run check: verify ticket hasn't been moved externally while
             // diagnostics commands ran.
-            if phase_changed_and_clear_assignment(&ticket.id, TicketPhase::InDiagnostics).await {
+            if guard_job_phase(&ticket.id, TicketPhase::InDiagnostics, &job_id, true).await {
                 return;
             }
 
             if all_passed {
-                // Path C1: All diagnostics passed — transition to DiagnosticsDone.
-                comment_and_transition_or_bail(
-                    TransitionCtx::buffered(
-                        &ticket,
-                        TicketPhase::InDiagnostics,
-                        TicketPhase::DiagnosticsDone,
-                        "Diagnostics",
-                    ),
-                    DIAGNOSTICS_ROLE,
+                // Path C1: All diagnostics passed — transition to InReview
+                // and advance the implementation to the review stage.
+                conclude_diagnostics_success(
+                    &ticket,
+                    &job_id,
                     &comment,
                     "Diagnostics finished — transitioned ticket",
+                    conn,
+                    &ws,
                 )
                 .await;
             } else {
-                // Path C2: Diagnostics failed — bounce with shared budget.
-                finalize_bounce_with_breaker(
-                    &ticket,
-                    TicketPhase::InDiagnostics,
-                    "Diagnostics",
-                    // Verdict paths buffer on a non-terminal bounce, notify on the trip.
-                    /* notify_on_bounce */
-                    false,
-                    // Verdict breaker-trips drain ReadyForDevelopment siblings.
-                    /* drains_siblings */
-                    true,
-                    DIAGNOSTICS_ROLE,
-                    comment.as_str(),
-                    None,
-                    "Diagnostics failed — transitioned ticket",
-                )
-                .await;
+                // Path C2: Diagnostics failed — unified bounce to development.
+                conclude_diagnostics_failure(&ticket, &job_id, comment.as_str(), &ws).await;
             }
         }
         Ok(_) => {
             // Path B: No diagnostics commands configured (or empty list) — skip.
-            comment_and_transition_or_bail(
-                TransitionCtx::buffered(
-                    &ticket,
-                    TicketPhase::InDiagnostics,
-                    TicketPhase::DiagnosticsDone,
-                    "Diagnostics",
-                ),
-                DIAGNOSTICS_ROLE,
+            conclude_diagnostics_success(
+                &ticket,
+                &job_id,
                 "No diagnostics commands are configured for this workspace \
                  — diagnostics skipped.",
                 "Diagnostics skipped — transitioned ticket",
+                conn,
+                &ws,
             )
             .await;
         }
         Err(e) => {
-            // Path A: DB error loading diagnostics — log and skip.
+            // Path A: DB error loading diagnostics — a phase failure. Per the
+            // unified bounce budget, this increments the budget and re-dispatches
+            // the engineer directly on the same implementation (NOT a silent skip; it
+            // would let a transient DB error masquerade as clean diagnostics).
             warn!(
                 ticket = %ticket.id,
                 error = %e,
-                "Failed to load diagnostics for workspace — transitioning to DiagnosticsDone",
+                "Failed to load diagnostics for workspace — bouncing to development",
             );
-            comment_and_transition_or_bail(
-                TransitionCtx::buffered(
-                    &ticket,
-                    TicketPhase::InDiagnostics,
-                    TicketPhase::DiagnosticsDone,
-                    "Diagnostics",
-                ),
-                DIAGNOSTICS_ROLE,
+            conclude_diagnostics_failure(
+                &ticket,
+                &job_id,
                 &format!("Could not load diagnostics commands due to a database error: {e}"),
-                "Diagnostics failed — transitioned ticket",
+                &ws,
             )
             .await;
         }
@@ -2909,9 +3104,9 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 //     `verdict_passes` against `REVIEW_QA_THRESHOLD`.
 //   * Transition policy — analysts always advance to `Planning` regardless
 //     of outcome (fail-open; the joint comment gives the Manager depth).
-//     Reviewers/QA have a 3-way outcome: all-failed -> Failed,
-//     any-failed -> bounce back to development (bounce counter bumped,
-//     11th bounce fails), all-pass -> success phase.
+//     Reviewers/QA use a unified non-success bounce: any-failed (including an
+//     all-failed round) bounces back to development (bounce counter bumped;
+//     trips Failed on exhaustion), all-pass -> success phase.
 //   * Signature — analysts need only `&Ticket` and `&[ParallelVerdict]`;
 //     reviewers/QA need the `VerifierInfo` struct to drive the 3-way
 //     transition (success phase, active phase, role label). This structural
@@ -3050,17 +3245,9 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
     }
 }
 
-fn format_parallel_assigned_to(launched: &[&TicketStageSlot]) -> String {
-    launched
-        .iter()
-        .map(|s| s.agent_id.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 async fn checkpoint_parallel_outcomes(
     job_id: &str,
-    launched: &[&TicketStageSlot],
+    launched: &[&AgentSlot],
     run_results: &[ParallelVerdict],
 ) -> std::collections::HashMap<String, ParallelVerdict> {
     let conn = &crate::session::store().conn;
@@ -3089,7 +3276,7 @@ async fn checkpoint_parallel_outcomes(
 }
 
 fn assemble_parallel_results(
-    slots: &[TicketStageSlot],
+    slots: &[AgentSlot],
     by_agent: &std::collections::HashMap<String, ParallelVerdict>,
 ) -> Vec<ParallelVerdict> {
     let mut results = Vec::with_capacity(slots.len());
@@ -3110,10 +3297,10 @@ fn assemble_parallel_results(
 /// Run `count` agents of the same role in parallel, then extract structured verdicts
 /// from their responses.
 ///
-/// Roster slots are pre-built by the caller ([`spawn_ticket_stage_round`] for
-/// fresh dispatch, [`append_ticket_stage_slots`] for analysis escalation). The
+/// Roster slots are pre-built by the caller ([`spawn_ticket_analysis_round`] for
+/// fresh dispatch, [`append_ticket_analysis_slots`] for analysis escalation). The
 /// agent-id format and the angle-cycling rule are canonicalized in
-/// [`ticket_stage_agent_id`] and [`ticket_stage_slot_task`] respectively —
+/// [`agent_id`] and [`agent_slot_task`] respectively —
 /// both call sites must go through them so the two rules cannot drift. Each
 /// agent creates its own CancellationToken and auto-registers. KV-cache
 /// discipline: the variation is limited to the user message — model,
@@ -3131,14 +3318,14 @@ async fn run_parallel_agents(
     role: Role,
     extraction_prompt: &str,
     job_id: &str,
-    slots: &[TicketStageSlot],
+    slots: &[AgentSlot],
     resume: bool,
 ) -> Vec<ParallelVerdict> {
     // ── Register the not-yet-done agents in the message router BEFORE
     // spawning ── This allows the board's comment-routing to deliver
     // mid-work comments to any of these agents. Done slots (resumed rounds)
     // are never re-invoked — their outcomes are read from the roster.
-    let launched: Vec<&TicketStageSlot> = slots
+    let launched: Vec<&AgentSlot> = slots
         .iter()
         .filter(|s| s.status != crate::jobs::RowStatus::Done)
         .collect();
@@ -3147,25 +3334,12 @@ async fn run_parallel_agents(
         .map(|s| message_router::register_agent(&s.agent_id))
         .collect();
 
-    let assigned_to_str = format_parallel_assigned_to(&launched);
-    if !assigned_to_str.is_empty()
-        && let Err(e) = board()
-            .set_assigned_to_no_cancel(&ticket.id, Some(&assigned_to_str))
-            .await
-    {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to set assigned_to for parallel agents",
-        );
-    }
-
     // ── Spawn and run all launched agents (leader-staggered) ───────────
     // Members are spawned (not joined inline): a panicked/cancelled member
     // resolves to ParallelVerdict::NoResponse below — the round continues
     // fail-open and the member checkpoints Failed, matching the analyze/research
     // round semantics.
-    let results = {
+    {
         let members: Vec<_> = launched
             .iter()
             .zip(receivers)
@@ -3221,7 +3395,6 @@ async fn run_parallel_agents(
                         Some(round),
                         None,
                         None,
-                        false,
                     )
                     .await;
 
@@ -3277,18 +3450,7 @@ async fn run_parallel_agents(
 
         let by_agent = checkpoint_parallel_outcomes(job_id, &launched, &run_results).await;
         assemble_parallel_results(slots, &by_agent)
-    };
-
-    // ── Cleanup: clear assigned_to (no cancel, agents already done) ────
-    if let Err(e) = board().set_assigned_to_no_cancel(&ticket.id, None).await {
-        warn!(
-            ticket = %ticket.id,
-            error = %e,
-            "Failed to clear assigned_to after parallel agents",
-        );
     }
-
-    results
 }
 
 /// Map a panicked round member's [`tokio::task::JoinError`] to a contained
@@ -3341,13 +3503,13 @@ fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     }
 }
 
-// ── Ticket-stage job roster (durable round record) ─────────────────────
+// ── Ticket-analysis job roster (durable round record) ─────────────────
 
-/// One roster slot of a ticket_stage round. Roster rows ARE the round record:
+/// One roster slot of a ticket_analysis round. Roster rows ARE the round record:
 /// dispatched_count = roster size; escalation appends slots 3,4 (re-evaluated
 /// only when roster size == 3); replay re-runs missing agents FIRST, then
 /// re-processes when all outcomes present.
-struct TicketStageSlot {
+struct AgentSlot {
     /// Dispatch slot index (0-based; escalation continues at 3, 4).
     idx: i64,
     agent_id: String,
@@ -3395,32 +3557,7 @@ fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
     }
 }
 
-/// Map a verdict role to the agents.kind vocabulary.
-const fn agent_kind_for_role(role: Role) -> crate::jobs::AgentKind {
-    match role {
-        Role::Reviewer | Role::Qa => crate::jobs::AgentKind::Verifier,
-        Role::Engineer => crate::jobs::AgentKind::Engineer,
-        Role::Sanitation => crate::jobs::AgentKind::Sanitation,
-        _ => crate::jobs::AgentKind::Analyst,
-    }
-}
-
-/// Next round number for a (ticket_id, stage) pair — MAX(round) + 1.
-async fn next_ticket_stage_round(
-    conn: &crate::turso::Connection,
-    ticket_id: &str,
-    stage: &str,
-) -> i64 {
-    conn.query_row(
-        "SELECT COALESCE(MAX(round), 0) + 1 FROM ticket_stage_jobs WHERE ticket_id = ?1 AND stage = ?2",
-        crate::turso::params![ticket_id, stage],
-        |row| row.get::<i64>(0),
-    )
-    .await
-    .unwrap_or(1)
-}
-
-/// Canonical agent-id format for ticket_stage roster slots
+/// Canonical agent-id format for ticket_analysis roster slots
 /// (`ticket_{ticket_id}_{idx}_{suffix}_{role}`).
 ///
 /// `idx` is the slot's GLOBAL index within the job (base round: the 0-based
@@ -3430,19 +3567,19 @@ async fn next_ticket_stage_round(
 /// never collide with base-round ids, even across crash/resume cycles.
 ///
 /// This is the single home for the id contract shared by
-/// [`spawn_ticket_stage_round`] (fresh dispatch) and
-/// [`append_ticket_stage_slots`] (analysis escalation) — the two must never
+/// [`spawn_ticket_analysis_round`] (fresh dispatch) and
+/// [`append_ticket_analysis_slots`] (analysis escalation) — the two must never
 /// drift. Resume paths read the stored agent ids straight from the roster and
 /// only match the `ticket_` prefix, so the exact shape is convention, not a
 /// parse contract.
 #[must_use]
-fn ticket_stage_agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
+fn agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
     format!("ticket_{}_{}_{}_{}", ticket_id, idx, suffix, role.as_str())
 }
 
-/// Render the FINAL per-agent task for a ticket_stage roster slot — the
-/// canonical angle-cycling rule shared by [`spawn_ticket_stage_round`] and
-/// [`append_ticket_stage_slots`].
+/// Render the FINAL per-agent task for a ticket_analysis roster slot — the
+/// canonical angle-cycling rule shared by [`spawn_ticket_analysis_round`] and
+/// [`append_ticket_analysis_slots`].
 ///
 /// `angles` are the per-agent angle supplements from [`load_verifier_angles`]
 /// (empty for non-verifier roles → the shared prompt is used untouched).
@@ -3458,7 +3595,7 @@ fn ticket_stage_agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) ->
 /// KV-cache discipline: the variation is limited to the user message — model,
 /// reasoning effort, and tools stay identical across agents.
 #[must_use]
-fn ticket_stage_slot_task(
+fn agent_slot_task(
     prompt: &str,
     angles: &[String],
     slot_count: usize,
@@ -3473,77 +3610,33 @@ fn ticket_stage_slot_task(
     }
 }
 
-/// Spawn the shared ticket_stage `spawn_job` tail: compute the next round and
-/// insert the job + agents + `ticket_stage_jobs` child row in ONE transaction
-/// (before any agent session write).
+/// Build a batch of [`AgentSlot`]s using the canonical agent-id format
+/// ([`agent_id`]) and angle-cycling rule ([`agent_slot_task`]).
 ///
-/// This is the single home for the [`crate::jobs::SpawnChild::TicketStage`]
-/// row-shape — the same shape resume paths read. The child row is inserted in
-/// the SAME tx as the job (all kinds use the shared in-tx child pattern — a
-/// missing child row is impossible for a committed job), so the round is
-/// computed BEFORE the spawn tx on the same `conn`.
-///
-/// Deliberately PARTIAL abstraction: only the spawn tail is shared. The two
-/// call sites keep their distinct agent-id contract —
-/// [`spawn_ticket_stage_round`] builds a generated roster,
-/// [`spawn_single_slot_round`] pins an exact single slot — and hand their
-/// `agents` slice here. Do not expect the whole spawn operation to be unified;
-/// each caller still owns its roster construction.
-#[expect(clippy::too_many_arguments)]
-async fn spawn_ticket_stage_job(
-    job_id: &str,
-    ticket: &Ticket,
-    ws: &Workspace,
-    stage: &str,
-    phase: TicketPhase,
+/// `start_idx` is the slot's global starting index within the job — 0 for a
+/// fresh round, `roster_len` for an escalation batch. `slot_count` is the
+/// TOTAL number of slots in the job (used by the angle rule so escalation is
+/// continuous with the base-round slots); `count` is the size of this batch.
+/// Shared by [`spawn_ticket_analysis_round`], [`append_ticket_analysis_slots`],
+/// and the verifier dispatch so the id/task rules cannot drift.
+#[must_use]
+fn build_agent_slots(
+    ticket_id: &str,
     role: Role,
     prompt: &str,
-    agents: &[crate::jobs::NewAgent],
-) -> anyhow::Result<()> {
-    let conn = &crate::session::store().conn;
-    let round = next_ticket_stage_round(conn, &ticket.id, stage).await;
-    crate::jobs::spawn_job(
-        conn,
-        job_id,
-        prompt,
-        &ws.name,
-        "",
-        "",
-        role,
-        agents,
-        &crate::jobs::SpawnChild::TicketStage {
-            ticket_id: ticket.id.clone(),
-            stage: stage.to_string(),
-            phase: phase.as_ref().to_string(),
-            round,
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Spawn a ticket_stage job + roster via [`spawn_ticket_stage_job`] in ONE
-/// transaction (before any agent session write). The job row carries the
-/// rendered prompt template; each roster row carries the FINAL per-agent
-/// prompt. Returns the job id + slots.
-async fn spawn_ticket_stage_round(
-    ticket: &Ticket,
-    ws: &Workspace,
-    stage: &'static str,
-    phase: TicketPhase,
-    role: Role,
-    prompt: &str,
+    slot_count: usize,
+    start_idx: i64,
     count: usize,
-) -> anyhow::Result<(String, Vec<TicketStageSlot>)> {
-    let job_id = crate::generate_id();
+) -> Vec<AgentSlot> {
     let suffix = crate::generate_suffix();
     let angles = load_verifier_angles(role);
     let mut slots = Vec::with_capacity(count);
-    for i in 0..count {
-        let idx = i64::try_from(i).unwrap_or(i64::MAX);
-        let agent_id = ticket_stage_agent_id(&ticket.id, idx, &suffix, role);
-        let task = ticket_stage_slot_task(prompt, &angles, count, i);
-        slots.push(TicketStageSlot {
+    let global_start = usize::try_from(start_idx).unwrap_or(usize::MAX);
+    for k in 0..count {
+        let idx = start_idx + i64::try_from(k).unwrap_or(i64::MAX);
+        let agent_id = agent_id(ticket_id, idx, &suffix, role);
+        let task = agent_slot_task(prompt, &angles, slot_count, global_start + k);
+        slots.push(AgentSlot {
             idx,
             agent_id,
             task,
@@ -3551,128 +3644,92 @@ async fn spawn_ticket_stage_round(
             outcome: None,
         });
     }
+    slots
+}
+
+/// Spawn a ticket_analysis job + roster via [`crate::jobs::spawn_job`] in ONE
+/// transaction (before any agent session write). The job row carries the
+/// rendered prompt template; each roster row carries the FINAL per-agent
+/// prompt. Returns the job id + slots.
+async fn spawn_ticket_analysis_round(
+    ticket: &Ticket,
+    ws: &Workspace,
+    stage: &'static str,
+    role: Role,
+    prompt: &str,
+    count: usize,
+) -> anyhow::Result<(String, Vec<AgentSlot>)> {
+    let job_id = crate::generate_id();
+    let slots = build_agent_slots(&ticket.id, role, prompt, count, 0, count);
     let agents: Vec<crate::jobs::NewAgent> = slots
         .iter()
         .map(|s| crate::jobs::NewAgent {
             agent_id: s.agent_id.clone(),
-            kind: agent_kind_for_role(role),
+            kind: crate::jobs::AgentKind::Analyst,
             idx: Some(s.idx),
             task: s.task.clone(),
         })
         .collect();
-    spawn_ticket_stage_job(&job_id, ticket, ws, stage, phase, role, prompt, &agents).await?;
+    let conn = &crate::session::store().conn;
+    crate::jobs::spawn_job(
+        conn,
+        &job_id,
+        prompt,
+        &ws.name,
+        "",
+        "",
+        role,
+        &agents,
+        &crate::jobs::SpawnChild::TicketJob {
+            ticket_id: ticket.id.clone(),
+            stage: stage.to_string(),
+            is_implementation: false,
+        },
+    )
+    .await?;
     Ok((job_id, slots))
 }
 
-/// Spawn a single-slot ticket_stage job whose roster row carries the EXACT
-/// run agent_id (engineer: the NULL-seat anchor id; sanitation: the
-/// job-derived `ticket_{job_id}_sanitation`). Roster rows must reference the
-/// ACTUAL session — phantom generated ids would never be checkpointed, would
-/// be ignored by resume paths, and would let the purge's live-session
-/// protection clause miss an active round. The anchor's NULL-seat row and this
-/// round's roster row coexist under the composite PK (job_id, agent_id).
-///
-/// The spawn tail is shared with [`spawn_ticket_stage_round`] via
-/// [`spawn_ticket_stage_job`].
-#[expect(clippy::too_many_arguments)]
-async fn spawn_single_slot_round(
-    job_id: &str,
-    ticket: &Ticket,
-    ws: &Workspace,
-    stage: &'static str,
-    phase: TicketPhase,
-    role: Role,
-    prompt: &str,
-    agent_id: &str,
-) -> anyhow::Result<TicketStageSlot> {
-    let slot = TicketStageSlot {
-        idx: 0,
-        agent_id: agent_id.to_string(),
-        task: prompt.to_string(),
-        status: crate::jobs::RowStatus::Launched,
-        outcome: None,
-    };
-    spawn_ticket_stage_job(
-        job_id,
-        ticket,
-        ws,
-        stage,
-        phase,
-        role,
-        prompt,
-        &[crate::jobs::NewAgent {
-            agent_id: agent_id.to_string(),
-            kind: agent_kind_for_role(role),
-            idx: Some(0),
-            task: prompt.to_string(),
-        }],
-    )
-    .await?;
-    Ok(slot)
-}
-
-/// Append escalation slots (3, 4) to an existing ticket_stage job.
-async fn append_ticket_stage_slots(
+/// Append escalation slots (3, 4) to an existing ticket_analysis job.
+async fn append_ticket_analysis_slots(
     ticket: &Ticket,
     job_id: &str,
     role: Role,
     prompt: &str,
     count: usize,
-) -> anyhow::Result<Vec<TicketStageSlot>> {
+) -> anyhow::Result<Vec<AgentSlot>> {
     let roster = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
     let roster_len = roster.len();
     let next_idx = i64::try_from(roster_len).unwrap_or(i64::MAX);
-    let suffix = crate::generate_suffix();
-    let angles = load_verifier_angles(role);
     // The angle rule sees the job as a whole: slot_count is the TOTAL roster
     // size (base + escalation) and the global index (roster_len + k) keeps
     // angle selection continuous with the base-round slots.
     let slot_count = roster_len + count;
-    let mut slots = Vec::with_capacity(count);
-    for (k, i) in (next_idx..next_idx + i64::try_from(count).unwrap_or(i64::MAX)).enumerate() {
-        let agent_id = ticket_stage_agent_id(&ticket.id, i, &suffix, role);
-        let task = ticket_stage_slot_task(prompt, &angles, slot_count, roster_len + k);
+    let slots = build_agent_slots(&ticket.id, role, prompt, slot_count, next_idx, count);
+    for slot in &slots {
         crate::session::store()
             .conn
             .execute(
                 crate::jobs::AGENT_INSERT_SQL,
                 crate::jobs::agent_params(
                     job_id,
-                    &agent_id,
-                    agent_kind_for_role(role),
-                    Some(i),
-                    &task,
+                    &slot.agent_id,
+                    crate::jobs::AgentKind::Analyst,
+                    Some(slot.idx),
+                    &slot.task,
                 ),
             )
             .await?;
-        slots.push(TicketStageSlot {
-            idx: i,
-            agent_id,
-            task,
-            status: crate::jobs::RowStatus::Launched,
-            outcome: None,
-        });
     }
     Ok(slots)
 }
 
-/// Terminalize a ticket_stage job AFTER the board transition+comment ran
-/// (ordering contract: jobs-first would strand tickets — job done + ticket
-/// still in a blocking phase → excluded from boot reset, never rolled back).
-async fn complete_ticket_stage_job(job_id: &str) {
-    if let Err(e) =
-        crate::jobs::complete_ticket_stage_job(&crate::session::store().conn, job_id).await
-    {
-        warn!(job = %job_id, error = %e, "Failed to terminalize ticket_stage job");
-    }
-}
-
-/// Load the roster of a ticket_stage job from the agents table (boot resume).
-async fn load_ticket_stage_slots(job_id: &str) -> anyhow::Result<Vec<TicketStageSlot>> {
+/// Load the roster of a ticket_analysis job from the agents table (boot resume).
+async fn load_ticket_analysis_slots(job_id: &str) -> anyhow::Result<Vec<AgentSlot>> {
     let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
     Ok(rows
         .into_iter()
-        .map(|r| TicketStageSlot {
+        .map(|r| AgentSlot {
             idx: r.idx.unwrap_or(0),
             agent_id: r.agent_id,
             task: r.task,
@@ -3692,7 +3749,7 @@ async fn load_ticket_stage_slots(job_id: &str) -> anyhow::Result<Vec<TicketStage
 /// verdict per slot by construction of [`run_parallel_agents`], so
 /// `results.len() == slots.len()`; the base roster is
 /// `DEFAULT_PARALLEL_AGENT_COUNT` by construction of
-/// [`spawn_ticket_stage_round`]. On resume this guards against re-escalation
+/// [`spawn_ticket_analysis_round`]. On resume this guards against re-escalation
 /// after a crash between the base round and the escalation batch. Skipped
 /// during the graceful drain — no new jobs are spawned while draining.
 #[must_use]
@@ -3711,7 +3768,7 @@ async fn maybe_escalate_analysis(
     {
         // Re-check the phase before spending the second batch — the ticket
         // may have been moved externally while the first batch ran.
-        if complete_job_and_bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
+        if guard_job_phase(&ticket.id, TicketPhase::Analysis, job_id, false).await {
             return false;
         }
         if resume {
@@ -3719,7 +3776,7 @@ async fn maybe_escalate_analysis(
         } else {
             info!(ticket = %ticket.id, "All analysts flagged blockers — escalating with 2 additional analysts");
         }
-        let extra_slots = match append_ticket_stage_slots(ticket, job_id, Role::Analyst, task, 2)
+        let extra_slots = match append_ticket_analysis_slots(ticket, job_id, Role::Analyst, task, 2)
             .await
         {
             Ok(s) => s,
@@ -3762,25 +3819,25 @@ async fn maybe_escalate_analysis(
 /// No pre-flight circuit breaker is checked in [`spawn_dispatch`] for this
 /// phase — bounce logic is verifier-only; analysis always advances to Planning.
 ///
-/// ## Note: no `clear_assigned_to_no_cancel` on post-run phase check
+/// ## Note: no active-agent clear on post-run phase check
 ///
 /// Unlike [`dispatch_engineer`], [`dispatch_diagnostics`], and [`dispatch_sanitation`],
-/// this function does **not** call [`clear_assigned_to_no_cancel`] when the post-run phase check
-/// fails (the ticket moved externally during analysis). This is intentional:
+/// this function does **not** call [`crate::jobs::clear_launched_agents_for_job`]
+/// when the post-run phase check fails (the ticket moved externally during
+/// analysis). This is intentional:
 ///
-/// * **`assigned_to` is already managed** — [`run_parallel_agents`] sets `assigned_to`
-///   to the comma-separated agent IDs for mid-work comment routing, and clears it
-///   after all agents finish. If the phase check fails (ticket moved externally),
-///   the parallel agents are already done and unregistered — `assigned_to` was already
-///   cleared or is about to be overwritten by the external transition.
+/// * **Active agents are already managed** — [`run_parallel_agents`] writes the
+///   agent IDs to the job roster for mid-work comment routing, and checkpoints
+///   them after all agents finish. If the phase check fails (ticket moved
+///   externally), the parallel agents are already done and unregistered.
 /// * **Ephemeral agent IDs** — [`run_parallel_agents`] generates unique agent
-///   IDs (`{base}_{i}_{suffix}`) that are written to the ticket's `assigned_to`
-///   field for comment routing and then cleared after the agents finish.
-///   The agent registry entries are already cleaned up.
-/// * **TOCTOU race** — calling [`clear_assigned_to_no_cancel`] would unnecessarily risk
-///   overwriting an assignee that a concurrent claim set between the phase check and
-///   the clear. Since [`run_parallel_agents`] already clears `assigned_to` internally,
-///   there is nothing to gain.
+///   IDs (`{base}_{i}_{suffix}`) that are written to the roster for comment
+///   routing and then checkpointed after the agents finish. The agent
+///   registry entries are already cleaned up.
+/// * **TOCTOU race** — calling a job roster clear here would unnecessarily
+///   risk overwriting a marker a concurrent claim set between the phase check
+///   and the clear. Since [`run_parallel_agents`] already checkpoints the
+///   roster internally, there is nothing to gain.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     let prompt_key = if ticket.reporter == Role::Maintainer.as_str() {
         "analyze/maintainer_ticket.md"
@@ -3791,11 +3848,10 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 
     // Spawn the durable analysis round (jobs + roster, one tx) BEFORE the
     // agents' first session writes — the roster is the round record.
-    let Ok((job_id, slots)) = spawn_ticket_stage_round(
+    let Ok((job_id, slots)) = spawn_ticket_analysis_round(
         &ticket,
         &ws,
         "analysis",
-        TicketPhase::Analysis,
         Role::Analyst,
         &message,
         DEFAULT_PARALLEL_AGENT_COUNT,
@@ -3817,7 +3873,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 ///
 /// `task` is the message the agents were dispatched with — on fresh dispatch
 /// the in-memory prompt, on resume re-read from `jobs.task`. Equal by
-/// construction of [`spawn_ticket_stage_job`] (it stores the message as
+/// construction of [`crate::jobs::spawn_job`] (it stores the message as
 /// `jobs.task`); if that ever changes, the resume path silently diverges.
 ///
 /// Analysis stays fail-open — the ticket always advances to Planning, the
@@ -3832,7 +3888,7 @@ async fn run_analysis_round(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
     job_id: &str,
-    slots: &[TicketStageSlot],
+    slots: &[AgentSlot],
     task: &str,
     resumed: bool,
 ) {
@@ -3993,7 +4049,7 @@ async fn finalize_analysis_round(
     results: &[ParallelVerdict],
     job_id: &str,
 ) {
-    if complete_job_and_bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
+    if guard_job_phase(&ticket.id, TicketPhase::Analysis, job_id, false).await {
         return;
     }
     if crate::shutdown::aborting() {
@@ -4003,7 +4059,9 @@ async fn finalize_analysis_round(
     if crate::shutdown::aborting() {
         return;
     }
-    complete_ticket_stage_job(job_id).await;
+    if let Err(e) = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await {
+        warn!(job = %job_id, error = %e, "Failed to terminalize ticket_analysis job");
+    }
 }
 
 /// Format a natural-language summary of analyst verdict categories.
@@ -4055,11 +4113,11 @@ fn format_analyst_summary(
 ///
 /// This function is called after a bounce breaker trip (review/QA,
 /// sanitation verdict failure, or diagnostics failure). Only the bounce
-/// breaker triggers the drain; non-tripping bounces and the infinite-retry
-/// paths (`record_sanitation_failure`, diagnostics skip) do not drain.
+/// breaker triggers the drain; non-tripping bounces (which re-dispatch the
+/// engineer on the same implementation) and the diagnostics-skip path do not drain.
 ///
-/// The engineer hard-failure bounce trip is the deliberate exception: it does
-/// NOT call this function — it pauses the workspace instead, which blocks new
+/// The engineer hard failure is the deliberate exception: it does NOT call
+/// this function — it pauses the workspace instead, which blocks new
 /// ReadyForDevelopment claims while the pause is active (see
 /// [`pause_workspace_on_failure`] and [`blocks_claim`]).
 ///
@@ -4078,7 +4136,7 @@ fn format_analyst_summary(
 ///
 /// # Precondition
 /// The bounce breaker must have tripped for `ticket` (i.e.,
-/// `process_verifier_verdicts` or `bounce_engineer_hard_failure` tripped and
+/// `process_verifier_verdicts` tripped and
 /// the transition to `Failed` has been attempted). The drain operates on the
 /// workspace identified by `ticket.workspace_name` and is safe to call even if
 /// the transition failed — the important invariant is that a breaker tripped,
@@ -4123,34 +4181,11 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// aggregate, so in multi-agent all-ParseFailed rounds the middle dumps may
 /// still be trimmed. Only called from the all-failed branch, where every
 /// result is `NoResponse` or `ParseFailed`.
-fn verifier_failure_reasons(results: &[ParallelVerdict]) -> String {
-    let per_agent_cap = crate::util::FAILURE_DETAIL_CAP / results.len().max(1);
-    let reasons: Vec<String> = results
-        .iter()
-        .enumerate()
-        .filter_map(|(i, r)| match r {
-            ParallelVerdict::NoResponse(reason) => Some(format!("{}. {reason}", i + 1)),
-            ParallelVerdict::ParseFailed(f) => Some(format!(
-                "{}. verdict extraction failed: {}",
-                i + 1,
-                crate::util::truncate_sandwich(
-                    &raw_response_dump_section(f),
-                    per_agent_cap,
-                    "agent failure",
-                )
-            )),
-            // Unreachable at the only call site (all_failed) — required for
-            // match exhaustiveness.
-            ParallelVerdict::Verdict(_) => None,
-        })
-        .collect();
-    format!("\n\nPer-agent failures:\n{}", reasons.join("\n"))
-}
-
-/// The bounce circuit-breaker trip comment: the ticket was bounced (review/QA
-/// bounce or engineer hard failure) too many times. Shared by the verifier
-/// bounce trip and the engineer hard-failure trip so the wording cannot drift
-/// (engineer hard failures share the review/QA bounce budget).
+/// The bounce circuit-breaker trip comment: a validation-phase non-success
+/// (diagnostics/review/QA/sanitation) exceeded the unified bounce budget.
+/// Shared by all the validation-failure bounce paths so the wording cannot
+/// drift. Engineer hard failures are pause-only and do not consume this
+/// budget.
 /// Must retain the "circuit breaker" substring (asserted by
 /// `eleventh_bounce_fails_ticket`).
 #[must_use]
@@ -4169,69 +4204,47 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
     usize::try_from(bounce_count).unwrap_or(usize::MAX) >= crate::joint_verdict::MAX_BOUNCES
 }
 
-/// Shared bounce-with-circuit-breaker finalizer.
+/// Unified validation-failure bounce.
 ///
-/// Computes the exhausted/target split from the ticket's shared bounce budget
-/// ([`bounce_exhausted`]) and the notify policy from `trip` + `notify_on_bounce`
-/// (engineer notifies on EVERY bounce; verdict paths buffer a non-terminal
-/// bounce and notify on the trip). Writes the breaker-trip comment (SYSTEM_ROLE)
-/// followed by the failure comment (`failure_role`), increments the counter only
-/// when the ticket bounces to ReadyForDevelopment, and on a trip either drains
-/// ReadyForDevelopment siblings (`drains_siblings`) or relies on the workspace
-/// already being paused (the engineer path pauses in its caller).
+/// Increments the shared bounce budget for EVERY validation-phase non-success
+/// outcome (diagnostics/review/QA/sanitation). On exhaustion
+/// (`bounce_count >= MAX_BOUNCES`) the ticket trips to **Failed** (terminal);
+/// when `drains_siblings` the ReadyForDevelopment siblings are drained to
+/// Planning, and the implementation job is completed. When NOT exhausted the ticket is
+/// kept in the pipeline: it does NOT go to ReadyForDevelopment and is NOT
+/// re-claimed — the engineer is re-dispatched directly back to
+/// `development`/InDevelopment on the same implementation job (it re-syncs the
+/// stage on dispatch). No reservation; no re-claim path.
 ///
 /// Comment order is normalized to `[breaker, failure]` failure-last so
-/// `notify_ticket`'s last-comment lookup surfaces the concrete error. The
-/// notification's drain-vs-pause sentence is driven by `drains_siblings`, NOT
-/// by `target == Failed` alone — the engineer trip also lands on Failed but
-/// pauses.
+/// `notify_ticket`'s last-comment lookup surfaces the concrete error.
 ///
-/// Returns the [`FinalizeOutcome`] so the verifier can map `Applied` to its
-/// bool; the other callers ignore it.
-#[expect(clippy::too_many_arguments)] // the genuinely-varying axes of the four callers
-async fn finalize_bounce_with_breaker(
+/// Returns the [`FinalizeOutcome`] so the verifier can map `Applied` to its bool.
+#[expect(clippy::too_many_arguments)]
+async fn bounce_to_development(
     ticket: &Ticket,
     source: TicketPhase,
     log_label: &str,
-    notify_on_bounce: bool,
     drains_siblings: bool,
     failure_role: &str,
     failure_comment: &str,
-    trip_log: Option<&str>,
-    bounce_log: &str,
+    implementation_job_id: &str,
+    ws: &Workspace,
 ) -> FinalizeOutcome {
     // `trip` ⟺ `target == TicketPhase::Failed` ⟺ the bounce budget exhausted.
     let trip = bounce_exhausted(ticket.bounce_count);
     let target = if trip {
         TicketPhase::Failed
     } else {
-        TicketPhase::ReadyForDevelopment
+        TicketPhase::InDevelopment
     };
-    // Verdict paths (`notify_on_bounce=false`): `Failed` ⟺ `Notify`.
-    let notify = if trip || notify_on_bounce {
+    // Verdict paths buffer a non-terminal bounce and notify on the trip.
+    let notify = if trip {
         NotifyPolicy::Notify
     } else {
         NotifyPolicy::Buffer
     };
     let trip_comment = trip.then(bounce_breaker_trip_comment);
-    // The verdict paths share one trip-log sentence; the engineer path passes
-    // its own (it names the stage and the resumed prefix). The default is
-    // built lazily so it isn't allocated when the caller supplies `Some`.
-    let default_trip_log;
-    let trip_log = if let Some(log) = trip_log {
-        log
-    } else {
-        default_trip_log = format!(
-            "Bounce circuit breaker tripped ({} bounces) — ticket failed",
-            crate::joint_verdict::MAX_BOUNCES,
-        );
-        &default_trip_log
-    };
-
-    // `breaker_trip` (and thus the notification's drain sentence) follows the
-    // drain mechanism, not `target == Failed`: the engineer trip lands on
-    // Failed but pauses, so it must render the paused-sentence, not the
-    // drain sentence.
     let ctx = TransitionCtx::new(ticket, source, target, notify, log_label)
         .with_breaker(trip && drains_siblings);
 
@@ -4242,7 +4255,9 @@ async fn finalize_bounce_with_breaker(
         if let Some(comment) = &trip_comment {
             BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, comment).await?;
         }
-        BoardStore::add_comment_tx(tx, &ticket.id, failure_role, failure_comment).await?;
+        if !failure_comment.is_empty() {
+            BoardStore::add_comment_tx(tx, &ticket.id, failure_role, failure_comment).await?;
+        }
         // The failing bounce is not counted (stays at the max).
         if !trip {
             BoardStore::increment_bounce_count_tx(tx, &ticket.id).await?;
@@ -4252,13 +4267,45 @@ async fn finalize_bounce_with_breaker(
     .await;
 
     if matches!(outcome, FinalizeOutcome::Applied) {
+        let conn = &crate::session::store().conn;
         if trip {
             if drains_siblings {
                 drain_ready_for_development_siblings(ticket).await;
             }
-            info!(ticket = %ticket.id, "{}", trip_log);
+            let _ = crate::jobs::complete_ticket_job(conn, implementation_job_id).await;
+            info!(
+                ticket = %ticket.id,
+                "Bounce circuit breaker tripped ({} bounces) — ticket failed",
+                crate::joint_verdict::MAX_BOUNCES,
+            );
         } else {
-            info!(ticket = %ticket.id, target = %target, "{}", bounce_log);
+            // Re-fetch the ticket fresh (with comments) so the re-dispatched
+            // engineer sees the just-written failure/joint comment — a stale clone
+            // would render implement.md instead of the bounce_feedback prompt.
+            // dispatch_engineer's sync_implementation re-syncs the stage/phase,
+            // so no sync is needed here (a duplicate write would follow).
+            let fresh = crate::board::store()
+                .get_ticket(&ticket.id)
+                .await
+                .ok()
+                .flatten()
+                .map_or_else(|| Arc::new(ticket.clone()), Arc::new);
+            advance_to_next_stage(
+                &fresh,
+                ws,
+                implementation_job_id,
+                conn,
+                None,
+                |t| {
+                    info!(
+                        ticket = %t.id,
+                        target = %target,
+                        "{log_label} failed — engineer re-dispatched on implementation",
+                    );
+                },
+                |ticket_arc, ws| dispatch_engineer(ticket_arc, ws, false),
+            )
+            .await;
         }
     }
     outcome
@@ -4266,50 +4313,35 @@ async fn finalize_bounce_with_breaker(
 
 // ── Verifier rounds & resume ──────────────────────────────────────────
 
-/// Process parallel verifier results: add failing comments, determine pass/fail,
+/// Process parallel verifier results: add the joint comment, determine pass/fail,
 /// and update ticket phase accordingly.
 ///
-/// Handles three outcomes in priority order:
+/// Handles two outcomes:
 ///
-/// 1. **All agents failed to produce a verdict** (every result has `verdict: None`
-///    — crashed, timed out, or unparseable output) → transition to [`TicketPhase::Failed`]
-///    with [`NotifyPolicy::Notify`]. This is a terminal failure; retrying would waste
-///    credits on a fundamentally broken dispatch. Kept outside the shared
-///    bounce-with-breaker helper: it is not a bounce (no breaker, no joint
-///    comment, no increment, and it pauses the workspace).
+/// 1. **All passed** (all at or above threshold) → advance to the verifier's
+///    `success_phase` with [`NotifyPolicy::Buffer`] and advance the implementation to the
+///    next stage, immediately dispatching it in the same finalizer.
 ///
-/// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`]) → bounce back to
-///    [`TicketPhase::ReadyForDevelopment`] with a pipeline reservation (or fail on
-///    breaker exhaustion), delegating to [`finalize_bounce_with_breaker`]. No
-///    pre-flight breaker exists in [`spawn_dispatch`] for verifiers; the helper
-///    checks the shared bounce budget, drains ReadyForDevelopment siblings on a
-///    trip, and writes the joint comment LAST (after the breaker trip comment)
-///    so `notify_ticket` surfaces the concrete findings.
+/// 2. **Any verifier failed** (score below [`REVIEW_QA_THRESHOLD`], including an
+///    all-failed round where every agent produced no verdict) → delegate to the
+///    unified [`bounce_to_development`]: it increments the shared bounce budget and
+///    re-dispatches the engineer directly on the same implementation job (no ready queue,
+///    no re-claim), and trips the ticket to [`TicketPhase::Failed`] on budget
+///    exhaustion (draining ReadyForDevelopment siblings). There is **no**
+///    all-failed → immediate Failed special case and no per-phase reservation.
 ///
-/// 3. **All passed** (all at or above threshold) → transition to the verifier's
-///    `success_phase` with [`NotifyPolicy::Buffer`]. No immediate notification fires —
-///    it waits until the ticket reaches Done (after the QaPassed commit succeeds in
-///    [`handle_qa_passed`]).
-///
-/// Across the three outcomes, [`TicketPhase::Failed`] is the only `Notify`
-/// target; every other target (bounce-back, `success_phase`) buffers. See the
-/// `VerifierInfo::success_phase` INVARIANT (must never be `Failed`).
+/// [`TicketPhase::Failed`] is the only `Notify` target; the success phase buffers.
+/// See the `VerifierInfo::success_phase` INVARIANT (must never be `Failed`).
 ///
 /// Returns `true` when the comment+transition completed, `false` on failure
 /// (the ticket stays in `verifier.active_phase`).
-///
-/// See the "Parallel agent helpers (shared)" section for why this is separate
-/// from [`process_analyst_verdicts`].
-#[expect(clippy::too_many_lines)]
 async fn process_verifier_verdicts(
     ws: &Workspace,
     ticket: &Ticket,
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
+    job_id: &str,
 ) -> bool {
-    let all_failed = results
-        .iter()
-        .all(|r| !matches!(r, ParallelVerdict::Verdict(_)));
     // Gate against the actually-dispatched count (N_gate): a no-response or
     // parse failure counts as a failed agent, so a partial round bounces.
     let any_failed = results.iter().any(|r| match r {
@@ -4320,11 +4352,7 @@ async fn process_verifier_verdicts(
     // No exit-time ticket rollback: during the graceful drain a
     // failed round must NOT drive the ticket to Failed, bounce it, or pause
     // the workspace — the job stays status='launched' for boot resume, which
-    // re-processes the stored outcomes. Suppresses ALL transitions (consistent
-    // with process_analyst_verdicts): a partial round whose drain-cut members
-    // produced NoResponse would otherwise hit the any_failed bounce path and
-    // bounce the ticket with a joint comment during the drain, discarding the
-    // checkpointed outcomes.
+    // re-processes the stored outcomes.
     if crate::shutdown::aborting() {
         info!(
             ticket = %ticket.id,
@@ -4334,87 +4362,25 @@ async fn process_verifier_verdicts(
         return false;
     }
 
-    // One joint comment replaces the per-agent failing comments — written
-    // after every round EXCEPT all-failed rounds (those keep their dedicated
-    // failure comment; a joint comment would duplicate it). Synthesis runs
+    // One joint comment replaces the per-agent failing comments. Synthesis runs
     // BEFORE any transition (never holding the board write lock); the
     // comment+transition transaction stays short.
-    let joint_comment = if all_failed {
-        None
-    } else {
-        Some(
-            build_round_joint_comment(
-                stage_name(verifier.role),
-                results,
-                REVIEW_QA_THRESHOLD,
-                verifier.role,
-                "",
-                ws,
-                &ticket.id,
-                &ticket.title,
-            )
-            .await,
-        )
-    };
+    let joint_comment = build_round_joint_comment(
+        stage_name(verifier.role),
+        results,
+        REVIEW_QA_THRESHOLD,
+        verifier.role,
+        "",
+        ws,
+        &ticket.id,
+        &ticket.title,
+    )
+    .await;
 
-    // All-failed: terminal Failed (NOT a bounce — kept outside the helper so
-    // the pass path and the terminal-failure path are not hidden). Pause the
-    // workspace, write the per-agent reasons failure comment, no breaker or
-    // joint comment, and never consume the bounce budget. Checked before
-    // `!any_failed` so a degenerate empty result slice (vacuously all-failed)
-    // still fails the ticket instead of hitting the all-passed joint-comment
-    // expectation.
-    if all_failed {
-        let pause_note =
-            pause_workspace_on_failure(ticket, "all verifier agents failed to produce verdicts")
-                .await;
-        let reasons = verifier_failure_reasons(results);
-        let header = substitute(
-            &load_prompt("pipeline/verifiers_all_failed.md"),
-            &[("{{agent_type}}", verifier.log_label)],
-        );
-        let body = format!("{reasons}{pause_note}");
-        let failure_comment = crate::util::truncate_sandwich(
-            &crate::util::scrub_credentials(&format!("{header}\n{body}")),
-            crate::util::FAILURE_DETAIL_CAP,
-            "verifier failure",
-        );
-        if !matches!(
-            comment_and_transition(
-                TransitionCtx::new(
-                    ticket,
-                    verifier.active_phase,
-                    TicketPhase::Failed,
-                    NotifyPolicy::Notify,
-                    verifier.log_label
-                ),
-                SYSTEM_ROLE,
-                &failure_comment,
-            )
-            .await,
-            FinalizeOutcome::Applied
-        ) {
-            return false;
-        }
-        info!(
-            ticket = %ticket.id,
-            reasons = %crate::util::truncate_sandwich(
-                &crate::util::scrub_credentials(&reasons),
-                crate::util::FAILURE_DETAIL_CAP,
-                "verifier failure",
-            ),
-            "{log_label}: all verifier agents failed to produce verdicts — ticket moved to Failed",
-            log_label = verifier.log_label,
-        );
-        return true;
-    }
-
-    // All-passed: advance to the verifier's success_phase (buffered). Kept
-    // outside the helper so the pass path is not hidden.
+    // All-passed: advance to the verifier's success_phase (buffered) and
+    // advance the implementation to the next stage.
     if !any_failed {
-        let joint = joint_comment
-            .as_deref()
-            .expect("joint comment built for a non-all-failed round");
+        let joint = joint_comment.as_str();
         if !matches!(
             comment_and_transition(
                 TransitionCtx::buffered(
@@ -4431,44 +4397,61 @@ async fn process_verifier_verdicts(
         ) {
             return false;
         }
-        info!(
-            ticket = %ticket.id,
-            "{log_label}: all passed (≥ {REVIEW_QA_THRESHOLD}/10)",
-            log_label = verifier.log_label,
-            REVIEW_QA_THRESHOLD = REVIEW_QA_THRESHOLD,
-        );
+        let conn = &crate::session::store().conn;
+        let next_stage = verifier_success_stage(verifier.role);
+        // The implementation dispatches the next stage in the same finalizer: QA
+        // after review, sanitation after QA.
+        advance_to_next_stage(
+            ticket,
+            ws,
+            job_id,
+            conn,
+            Some(next_stage),
+            |t| {
+                info!(
+                    ticket = %t.id,
+                    "{log_label}: all passed (≥ {REVIEW_QA_THRESHOLD}/10)",
+                    log_label = verifier.log_label,
+                    REVIEW_QA_THRESHOLD = REVIEW_QA_THRESHOLD,
+                );
+            },
+            move |ticket_arc, ws| {
+                if verifier.role == Role::Reviewer {
+                    dispatch_verifiers(ticket_arc, ws, QA_VI, false)
+                } else {
+                    dispatch_sanitation(ticket_arc, ws, false).boxed()
+                }
+            },
+        )
+        .await;
         return true;
     }
 
-    // Bounce (some failed + a sub-threshold verdict, not all-failed): delegate
-    // to the shared helper. The joint comment carries the concrete review/QA
-    // findings and is written LAST (after the breaker trip comment) so
-    // notify_ticket's last-comment lookup surfaces them, not the generic trip
-    // text. The helper computes exhausted/target and the notify policy, drains
-    // RFD siblings on the trip, and returns the outcome for the bool mapping.
-    let joint = joint_comment
-        .as_deref()
-        .expect("joint comment built for a non-all-failed round");
-    let outcome = finalize_bounce_with_breaker(
+    // Non-success (some failed + a sub-threshold verdict, OR all-failed):
+    // delegate to the unified bounce-to-development path — it increments the
+    // shared bounce budget, re-dispatches the engineer directly on the same
+    // implementation job (no ready queue), and trips Failed on exhaustion. There is
+    // NO all-failed → immediate Failed special case anymore.
+    let outcome = bounce_to_development(
         ticket,
         verifier.active_phase,
         verifier.log_label,
-        // Verdict paths buffer on a non-terminal bounce, notify on the trip.
-        /* notify_on_bounce */
-        false,
-        // Verdict breaker-trips drain ReadyForDevelopment siblings.
-        /* drains_siblings */
-        true,
+        /* drains_siblings */ true,
         stage_name(verifier.role),
-        joint,
-        None,
-        &format!(
-            "{log_label} failed — pipeline reservation set for rework priority",
-            log_label = verifier.log_label,
-        ),
+        &joint_comment,
+        job_id,
+        ws,
     )
     .await;
     matches!(outcome, FinalizeOutcome::Applied)
+}
+
+/// Map a verifier role to the implementation stage that follows a successful pass.
+fn verifier_success_stage(role: Role) -> &'static str {
+    match role {
+        Role::Reviewer => IMPLEMENTATION_STAGE_QA,
+        _ => IMPLEMENTATION_STAGE_SANITATION,
+    }
 }
 
 /// Decide whether the reviewer pass may be skipped for a ticket.
@@ -4567,20 +4550,24 @@ async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
     }
 }
 
-/// Resume a ticket_stage round at boot: re-run missing roster
-/// slots FIRST, then re-process verdicts from stored outcomes when all are
-/// present. Silent background resume — no Manager notifications; results
-/// deliver via normal paths (board comment/transition).
-async fn resume_ticket_stage_round(stage: String, job_id: String, ticket: Ticket, ws: Workspace) {
+/// Resume a ticket job at boot: re-dispatch the stage on the SAME job. The
+/// analysis round re-runs missing roster slots FIRST (recovering stored
+/// outcomes); the implementation stages re-dispatch the stage agent fresh (a crash
+/// mid-stage re-runs the stage). Silent background resume — no Manager
+/// notifications; results deliver via normal paths.
+async fn resume_ticket_job(stage: String, job_id: String, ticket: Ticket, ws: Workspace) {
     match stage.as_str() {
         "analysis" => resume_analysis_round(&job_id, ticket, ws).await,
-        "review" => resume_verifier_round(&job_id, ticket, ws, REVIEWER_VI).await,
-        "qa" => resume_verifier_round(&job_id, ticket, ws, QA_VI).await,
-        "engineer" => resume_stage_round(&job_id, ticket, ws, StageRoundKind::Engineer).await,
-        "sanitation" => resume_stage_round(&job_id, ticket, ws, StageRoundKind::Sanitation).await,
+        IMPLEMENTATION_STAGE_DEVELOPMENT => dispatch_engineer(Arc::new(ticket), ws, true).await,
+        IMPLEMENTATION_STAGE_DIAGNOSTICS => dispatch_diagnostics(Arc::new(ticket), ws).await,
+        IMPLEMENTATION_STAGE_REVIEW => {
+            dispatch_verifiers(Arc::new(ticket), ws, REVIEWER_VI, true).await;
+        }
+        IMPLEMENTATION_STAGE_QA => dispatch_verifiers(Arc::new(ticket), ws, QA_VI, true).await,
+        IMPLEMENTATION_STAGE_SANITATION => dispatch_sanitation(Arc::new(ticket), ws, true).await,
         other => {
-            warn!(stage = %other, job = %job_id, "Unknown ticket_stage on resume — completing job");
-            complete_ticket_stage_job(&job_id).await;
+            warn!(stage = %other, job = %job_id, "Unknown ticket-job stage on resume — completing job");
+            let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
         }
     }
 }
@@ -4589,11 +4576,15 @@ async fn resume_ticket_stage_round(stage: String, job_id: String, ticket: Ticket
 /// escalation only when roster size == 3 (matches analysis_escalation_needed),
 /// then re-process verdicts through the existing process_analyst_verdicts.
 async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
-    if complete_job_and_bail_if_phase_moved(&ticket.id, TicketPhase::Analysis, job_id).await {
+    if guard_job_phase(&ticket.id, TicketPhase::Analysis, job_id, false).await {
         return;
     }
-    let Ok(slots) = load_ticket_stage_slots(job_id).await else {
-        complete_ticket_stage_job(job_id).await;
+    let Ok(slots) = load_ticket_analysis_slots(job_id).await else {
+        if let Err(e) =
+            crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await
+        {
+            warn!(job = %job_id, error = %e, "Failed to terminalize ticket_analysis job");
+        }
         return;
     };
     let ticket_arc = Arc::new(ticket);
@@ -4652,60 +4643,6 @@ async fn record_reviewed_base_after_review(
     }
 }
 
-/// Resume a verifier round (review/QA): re-run missing slots, then re-process
-/// verdicts. REPLAY INCLUDES THE DISPATCH TAIL — the
-/// record_reviewed_base_after_review helper — so the skip-review gate
-/// (tickets.reviewed_head/reviewed_tree) still fires on later rounds. The
-/// reviewer count is never frozen: it is recomputed from the live working-tree
-/// diff at every dispatch, so a resumed round re-derives it like any other.
-async fn resume_verifier_round(job_id: &str, ticket: Ticket, ws: Workspace, vi: VerifierInfo) {
-    if complete_job_and_bail_if_phase_moved(&ticket.id, vi.active_phase, job_id).await {
-        return;
-    }
-    let Ok(slots) = load_ticket_stage_slots(job_id).await else {
-        complete_ticket_stage_job(job_id).await;
-        return;
-    };
-    let extraction_prompt = load_prompt(vi.extraction_prompt_path);
-    let ticket_arc = Arc::new(ticket);
-    let results = run_parallel_agents(
-        &ticket_arc,
-        &ws,
-        vi.role,
-        &extraction_prompt,
-        job_id,
-        &slots,
-        true,
-    )
-    .await;
-    if complete_job_and_bail_if_phase_moved(&ticket_arc.id, vi.active_phase, job_id).await {
-        return;
-    }
-    if crate::shutdown::aborting() {
-        // Drain-cut: outcomes checkpointed, job stays launched for boot resume.
-        return;
-    }
-
-    let (_is_reviewer, _repo_path, git_available) = verifier_git_state(&ws, vi).await;
-
-    finalize_verifier_round(&ws, &ticket_arc, vi, &results, job_id, true, git_available).await;
-}
-
-/// Resume a single-agent stage round (engineer/sanitation) at boot: phase-
-/// guard, then re-run the shared stage-agent tail (see
-/// [`run_stage_agent_round`] for the resume dispatch rule).
-async fn resume_stage_round(job_id: &str, ticket: Ticket, ws: Workspace, kind: StageRoundKind) {
-    let phase = match kind {
-        StageRoundKind::Engineer => TicketPhase::InDevelopment,
-        StageRoundKind::Sanitation => TicketPhase::InSanitation,
-    };
-    if complete_job_and_bail_if_phase_moved(&ticket.id, phase, job_id).await {
-        return;
-    }
-    let task = job_task(job_id).await;
-    run_stage_agent_round(&ticket, &ws, job_id, &task, true, kind).await;
-}
-
 /// Read a job's stored task (the FINAL rendered prompt template).
 async fn job_task(job_id: &str) -> String {
     crate::session::store()
@@ -4738,7 +4675,7 @@ async fn finalize_verifier_round(
     resumed: bool,
     git_available: bool,
 ) {
-    let transitioned = process_verifier_verdicts(ws, ticket, results, vi).await;
+    let transitioned = process_verifier_verdicts(ws, ticket, results, vi, job_id).await;
     if !transitioned && crate::shutdown::aborting() {
         let cut_short = if resumed {
             "Resumed verifier round cut short by drain — job stays launched for boot resume"
@@ -4758,7 +4695,6 @@ async fn finalize_verifier_round(
         if resumed { "Resume: " } else { "" },
     )
     .await;
-    complete_ticket_stage_job(job_id).await;
 }
 
 /// Git availability + reviewer identity shared by the verifier pair:
@@ -4776,12 +4712,26 @@ async fn verifier_git_state(ws: &Workspace, vi: VerifierInfo) -> (bool, &Path, b
 /// Fetches the engineer's last comment, builds a prompt from the template,
 /// runs verifiers of the given role (reviewers use the calibrated dynamic
 /// count; QA runs a single agent), and processes the verdicts.
-async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo) {
-    // ── Skip-review check for Reviewers ──────────────────────────────
-    // Skip ONLY when the current content is identical to the reviewed base
-    // recorded on this ticket by a prior completed review round (same HEAD,
-    // same index tree, clean porcelain). A ticket with no recorded base —
-    // first review round, brand-new commit — must always run the full pass.
+fn dispatch_verifiers(
+    ticket: Arc<Ticket>,
+    ws: Workspace,
+    vi: VerifierInfo,
+    resumed: bool,
+) -> futures_util::future::BoxFuture<'static, ()> {
+    Box::pin(async move {
+        dispatch_verifiers_impl(ticket, ws, vi, resumed).await;
+    })
+}
+
+/// Body of [`dispatch_verifiers`] — split from the boxed wrapper so the
+/// implementation→stage re-dispatch cycle is broken at the boxed boundary.
+#[expect(clippy::too_many_lines)]
+async fn dispatch_verifiers_impl(
+    ticket: Arc<Ticket>,
+    ws: Workspace,
+    vi: VerifierInfo,
+    resumed: bool,
+) {
     let (is_reviewer, repo_path, git_available) = verifier_git_state(&ws, vi).await;
 
     if git_available {
@@ -4795,7 +4745,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
                     TransitionCtx::buffered(
                         &ticket,
                         vi.active_phase,
-                        TicketPhase::Reviewed,
+                        TicketPhase::InQa,
                         vi.log_label,
                     ),
                     SYSTEM_ROLE,
@@ -4804,6 +4754,20 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
                      Skipping reviewer dispatch.",
                 )
                 .await;
+                // Advance the implementation to QA and dispatch the QA agent.
+                let conn = &crate::session::store().conn;
+                if let Some(job_id) = find_implementation_or_bail(&ticket).await {
+                    advance_to_next_stage(
+                        &ticket,
+                        &ws,
+                        &job_id,
+                        conn,
+                        Some(IMPLEMENTATION_STAGE_QA),
+                        |_| {},
+                        |ticket_arc, ws| dispatch_verifiers(ticket_arc, ws, QA_VI, false),
+                    )
+                    .await;
+                }
                 return;
             }
             Ok(false) => {}
@@ -4847,26 +4811,41 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         "Dispatching {count} parallel {verifier_label}",
     );
 
-    // Spawn the durable verifier round (jobs + roster, one tx) BEFORE the
-    // agents' first session writes — the roster is the round record.
-    let stage = if is_reviewer { "review" } else { "qa" };
-    let Ok((job_id, slots)) = spawn_ticket_stage_round(
-        &ticket,
-        &ws,
-        stage,
-        vi.active_phase,
-        vi.role,
-        &prompt,
-        count,
-    )
-    .await
-    else {
-        error!(
-            ticket = %ticket.id,
-            "Failed to spawn verifier job — aborting dispatch",
-        );
+    // Verifiers run on the SAME implementation job (created at the engineer claim).
+    let Some(job_id) = find_implementation_or_bail(&ticket).await else {
         return;
     };
+    let conn = &crate::session::store().conn;
+    let stage = if is_reviewer {
+        IMPLEMENTATION_STAGE_REVIEW
+    } else {
+        IMPLEMENTATION_STAGE_QA
+    };
+    sync_implementation(conn, &job_id, &ticket.id, stage, Some(&prompt)).await;
+
+    let slots = build_agent_slots(&ticket.id, vi.role, &prompt, count, 0, count);
+    // Write the launched roster rows so the re-dispatch guard blocks and
+    // mid-run comments route to the verifier agents. The `agents.kind` labels
+    // the round; analysis's own roster rows are written at spawn time.
+    for slot in &slots {
+        if let Err(e) = crate::jobs::upsert_job_agent(
+            conn,
+            &job_id,
+            &slot.agent_id,
+            crate::jobs::AgentKind::Verifier,
+            crate::jobs::RowStatus::Launched,
+            &slot.task,
+        )
+        .await
+        {
+            warn!(
+                ticket = %ticket.id,
+                agent = %slot.agent_id,
+                error = %e,
+                "Failed to write verifier roster row",
+            );
+        }
+    }
     let results = run_parallel_agents(
         &ticket,
         &ws,
@@ -4874,14 +4853,14 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         &extraction_prompt,
         &job_id,
         &slots,
-        false,
+        resumed,
     )
     .await;
-    if complete_job_and_bail_if_phase_moved(&ticket.id, vi.active_phase, &job_id).await {
+    if guard_job_phase(&ticket.id, vi.active_phase, &job_id, false).await {
         return;
     }
 
-    finalize_verifier_round(&ws, &ticket, vi, &results, &job_id, false, git_available).await;
+    finalize_verifier_round(&ws, &ticket, vi, &results, &job_id, resumed, git_available).await;
 }
 
 #[cfg(test)]

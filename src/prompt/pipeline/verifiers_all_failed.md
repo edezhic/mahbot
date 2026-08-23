@@ -1,1 +1,0 @@
-❌ All {{agent_type}} agents failed to produce verdicts — ticket marked as Failed.

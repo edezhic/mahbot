@@ -306,7 +306,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     });
 
     // Drain-watch: while the drain flag is set, poll the agent registry AND
-    // the non-agent call registry. Drain-cut ticket_stage/analyze rounds
+    // the non-agent call registry. Drain-cut ticket_analysis/analyze rounds
     // intentionally leave their jobs status='launched' for boot resume,
     // so a jobs-table count cannot reach zero in the common
     // drain — and even research jobs, which DO terminalize mid-drain via the
@@ -774,7 +774,7 @@ async fn deliver_clear_reply(
             workspace_name: ws.name.clone(),
             user_name: msg.user_name.clone(),
             channel: msg.channel.clone(),
-            kind: message_router::JobKind::UserMessage,
+            kind: message_router::MessageKind::UserMessage,
             role: effective_role,
             reply_target: Some(msg.reply_target.clone()),
             pending_job_id: None,

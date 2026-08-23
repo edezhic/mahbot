@@ -97,7 +97,7 @@ fn telegram_delivery_content<'a>(
 
 /// Semantic category of a queue job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JobKind {
+pub enum MessageKind {
     /// User-typed message (chat or inline-button callback).
     /// For Manager: the ticket transition buffer drains before the agent runs.
     /// For other roles: no ticket buffer drain.
@@ -133,7 +133,7 @@ pub struct AgentJob {
     /// Channel origin (gui, telegram, voice).
     pub channel: String,
     /// The semantic job kind.
-    pub kind: JobKind,
+    pub kind: MessageKind,
     /// The agent's [`Role`] — embedded directly so the router never needs
     /// to parse agent ID strings.
     pub role: Role,
@@ -254,7 +254,7 @@ pub fn route(agent_id: &str, job: AgentJob) {
 /// Computes the agent ID via [`crate::session::resolve_agent_id`] (Manager
 /// role → `manager_{ws_name}`, others → channel-agnostic direct ID per
 /// user+workspace+role) and enqueues
-/// a [`JobKind::UserMessage`] job. Surrounding per-site pipelines (broadcast,
+/// a [`MessageKind::UserMessage`] job. Surrounding per-site pipelines (broadcast,
 /// persistence, enrichment) remain at the call sites.
 ///
 /// # Durability (at-least-once)
@@ -286,7 +286,7 @@ pub async fn route_user_message(
         workspace_name,
         user_name,
         channel,
-        kind: JobKind::UserMessage,
+        kind: MessageKind::UserMessage,
         role,
         reply_target,
         pending_job_id: None,
@@ -534,7 +534,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // llm_loop. If one arrives here, someone used route() instead of
         // try_route(), or the agent's receiver was dropped.
         let message = match (role, job.kind) {
-            (Role::Manager, JobKind::UserMessage) => {
+            (Role::Manager, MessageKind::UserMessage) => {
                 let drained = crate::ticket_buffer::drain(&job.workspace_name);
                 if drained.is_empty() {
                     job.content.clone()
@@ -542,7 +542,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                     format!("{drained}\n{content}", content = job.content)
                 }
             }
-            (_, JobKind::TicketComment) => {
+            (_, MessageKind::TicketComment) => {
                 warn!(
                     agent_id = %agent_id,
                     "Consumer loop received TicketComment — was try_route() used instead of route()? Discarding",
@@ -566,7 +566,6 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             None,
             None,
             None,
-            false,
         )
         .await;
 
@@ -590,7 +589,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             // Drained agents must NOT emit the failure emoji: their round was
             // cut short by the graceful-drain window (or shutdown), not a
             // failure.
-            if job.kind == JobKind::UserMessage
+            if job.kind == MessageKind::UserMessage
                 && !agent.is_cancelled()
                 && !crate::shutdown::aborting()
             {
@@ -959,7 +958,7 @@ mod tests {
             workspace_name: workspace.to_string(),
             user_name: user.to_string(),
             channel: channel.to_string(),
-            kind: JobKind::UserMessage,
+            kind: MessageKind::UserMessage,
             role,
             reply_target: None,
             pending_job_id: None,
@@ -1299,7 +1298,7 @@ mod tests {
             workspace_name: "default".to_string(),
             user_name: "unregistered_alice".to_string(),
             channel: "gui".to_string(),
-            kind: JobKind::UserMessage,
+            kind: MessageKind::UserMessage,
             role: Role::Assistant,
             reply_target: Some("chat_123".to_string()),
             pending_job_id: None,
@@ -1334,7 +1333,7 @@ mod tests {
             workspace_name: "default".to_string(),
             user_name: "admin".to_string(),
             channel: "gui".to_string(),
-            kind: JobKind::UserMessage,
+            kind: MessageKind::UserMessage,
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
@@ -1360,7 +1359,7 @@ mod tests {
             workspace_name: "default".to_string(),
             user_name: "admin".to_string(),
             channel: "gui".to_string(),
-            kind: JobKind::UserMessage,
+            kind: MessageKind::UserMessage,
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
@@ -1409,7 +1408,7 @@ mod tests {
             workspace_name: "default".to_string(),
             user_name: "admin".to_string(),
             channel: "gui".to_string(),
-            kind: JobKind::UserMessage,
+            kind: MessageKind::UserMessage,
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
@@ -1444,7 +1443,7 @@ mod tests {
             workspace_name: "default".to_string(),
             user_name: "admin".to_string(),
             channel: "gui".to_string(),
-            kind: JobKind::TicketNotify,
+            kind: MessageKind::TicketNotify,
             role: Role::Manager,
             reply_target: None,
             pending_job_id: None,
@@ -1630,7 +1629,7 @@ mod tests {
     }
 
     /// `RecoveryRetry` is intentionally NOT `UserMessage`.  The emoji gate in
-    /// `consumer_loop` uses `job.kind == JobKind::UserMessage` to decide whether
+    /// `consumer_loop` uses `job.kind == MessageKind::UserMessage` to decide whether
     /// to send the failure emoji — `RecoveryRetry` is automatically excluded
     /// because the equality check is specific to `UserMessage`.
     ///
@@ -1646,10 +1645,10 @@ mod tests {
     #[test]
     fn test_recovery_retry_kind_invariant() {
         assert_ne!(
-            JobKind::RecoveryRetry,
-            JobKind::UserMessage,
+            MessageKind::RecoveryRetry,
+            MessageKind::UserMessage,
             "RecoveryRetry must be a distinct variant from UserMessage — \
-             the emoji gate's `== JobKind::UserMessage` check naturally excludes it",
+             the emoji gate's `== MessageKind::UserMessage` check naturally excludes it",
         );
     }
 }
