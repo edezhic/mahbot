@@ -1348,6 +1348,21 @@ async fn assert_archive_empty_db(store: &BoardStore) {
     assert_eq!(count, 0, "Empty DB all archive should return 0");
 }
 
+/// Assert the archived-excluded count of tickets in `phase` equals `expected`.
+///
+/// `expect_msg` labels the DB query failure and `assert_msg` the count
+/// mismatch, preserving each call-site's distinct diagnostics.
+async fn assert_phase_count(
+    store: &BoardStore,
+    phase: TicketPhase,
+    expected: i64,
+    expect_msg: &str,
+    assert_msg: &str,
+) {
+    let count = store.count_by_phase(phase, None).await.expect(expect_msg);
+    assert_eq!(count, expected, "{assert_msg}");
+}
+
 #[tokio::test]
 async fn test_archive_stale_cancelled() {
     let (store, _tmp) = open_test_store().await;
@@ -1426,30 +1441,30 @@ async fn test_archive_all_done_and_cancelled() {
     let backlog_id = make_ticket(&store, &ws, "backlog", TicketPhase::Backlog).await;
 
     // Before archiving, count_by_phase includes active tickets.
-    let count_done_before = store
-        .count_by_phase(TicketPhase::Done, None)
-        .await
-        .expect("count Done before");
-    assert_eq!(
-        count_done_before, 1,
-        "Should count Done ticket before archive"
-    );
-    let count_cancelled_before = store
-        .count_by_phase(TicketPhase::Cancelled, None)
-        .await
-        .expect("count Cancelled before");
-    assert_eq!(
-        count_cancelled_before, 1,
-        "Should count Cancelled ticket before archive"
-    );
-    let count_backlog_before = store
-        .count_by_phase(TicketPhase::Backlog, None)
-        .await
-        .expect("count Backlog before");
-    assert_eq!(
-        count_backlog_before, 1,
-        "Should count Backlog ticket before archive"
-    );
+    assert_phase_count(
+        &store,
+        TicketPhase::Done,
+        1,
+        "count Done before",
+        "Should count Done ticket before archive",
+    )
+    .await;
+    assert_phase_count(
+        &store,
+        TicketPhase::Cancelled,
+        1,
+        "count Cancelled before",
+        "Should count Cancelled ticket before archive",
+    )
+    .await;
+    assert_phase_count(
+        &store,
+        TicketPhase::Backlog,
+        1,
+        "count Backlog before",
+        "Should count Backlog ticket before archive",
+    )
+    .await;
 
     // Act
     let count = store
@@ -1478,30 +1493,30 @@ async fn test_archive_all_done_and_cancelled() {
     assert_eq!(backlog_ticket.phase, TicketPhase::Backlog);
 
     // After archiving, count_by_phase excludes archived tickets.
-    let count_done_after = store
-        .count_by_phase(TicketPhase::Done, None)
-        .await
-        .expect("count Done after");
-    assert_eq!(
-        count_done_after, 0,
-        "Should not count archived Done tickets"
-    );
-    let count_cancelled_after = store
-        .count_by_phase(TicketPhase::Cancelled, None)
-        .await
-        .expect("count Cancelled after");
-    assert_eq!(
-        count_cancelled_after, 0,
-        "Should not count archived Cancelled tickets"
-    );
-    let count_backlog_after = store
-        .count_by_phase(TicketPhase::Backlog, None)
-        .await
-        .expect("count Backlog after");
-    assert_eq!(
-        count_backlog_after, 1,
-        "Should still count non-archived Backlog tickets"
-    );
+    assert_phase_count(
+        &store,
+        TicketPhase::Done,
+        0,
+        "count Done after",
+        "Should not count archived Done tickets",
+    )
+    .await;
+    assert_phase_count(
+        &store,
+        TicketPhase::Cancelled,
+        0,
+        "count Cancelled after",
+        "Should not count archived Cancelled tickets",
+    )
+    .await;
+    assert_phase_count(
+        &store,
+        TicketPhase::Backlog,
+        1,
+        "count Backlog after",
+        "Should still count non-archived Backlog tickets",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2520,6 +2535,23 @@ async fn test_search_by_fts_scoped_to_workspace() {
     );
 }
 
+/// Assert that `display` contains every `(needle, msg)` pair.
+///
+/// `format!`-based needles must be materialised into owned `String`s before
+/// building the slice (a `&` to a temporary would not live long enough).
+fn assert_display_contains(display: &str, needles: &[(&str, &str)]) {
+    for (needle, msg) in needles {
+        assert!(display.contains(needle), "{msg}");
+    }
+}
+
+/// Assert that `display` does NOT contain every `(needle, msg)` pair.
+fn assert_display_not_contains(display: &str, needles: &[(&str, &str)]) {
+    for (needle, msg) in needles {
+        assert!(!display.contains(needle), "{msg}");
+    }
+}
+
 /// Basic field layout of `detailed_display`: fields present, negative
 /// assertions for absent fields, and "(no comments)" when empty.
 #[tokio::test]
@@ -2542,80 +2574,41 @@ async fn test_detailed_display_basic() {
     let ticket = expect_ticket(&store, &id).await;
     let display = ticket.detailed_display();
 
-    assert!(
-        display.contains(&format!("Ticket: {id}")),
-        "should contain ticket id"
-    );
-    assert!(
-        display.contains("Title: Display Test Ticket"),
-        "should contain title"
-    );
-    assert!(
-        display.contains("Description: A description for testing"),
-        "should contain description"
-    );
-    assert!(
-        display.contains("Phase: in_development"),
-        "should use snake_case phase"
-    );
-    assert!(
-        display.contains("Reporter: manager"),
-        "should contain reporter"
-    );
-    assert!(
-        display.contains("Workspace: test-ws"),
-        "should contain workspace"
-    );
-    assert!(
-        display.contains("Created:"),
-        "should contain created timestamp"
-    );
-    assert!(
-        display.contains("Updated:"),
-        "should contain updated timestamp"
-    );
-    assert!(
-        display.contains(&format!("Prerequisites: {prereq_id}")),
-        "should show prerequisites"
-    );
-    assert!(
-        display.contains("Comments:"),
-        "should have comments section"
-    );
-    assert!(display.contains("(no comments)"), "should show no comments");
-    assert!(
-        display.contains("Priority: P1"),
-        "should contain priority label (default 1)"
+    let ticket_id_needle = format!("Ticket: {id}");
+    let prereq_needle = format!("Prerequisites: {prereq_id}");
+    assert_display_contains(
+        &display,
+        &[
+            (&ticket_id_needle, "should contain ticket id"),
+            ("Title: Display Test Ticket", "should contain title"),
+            (
+                "Description: A description for testing",
+                "should contain description",
+            ),
+            ("Phase: in_development", "should use snake_case phase"),
+            ("Reporter: manager", "should contain reporter"),
+            ("Workspace: test-ws", "should contain workspace"),
+            ("Created:", "should contain created timestamp"),
+            ("Updated:", "should contain updated timestamp"),
+            (&prereq_needle, "should show prerequisites"),
+            ("Comments:", "should have comments section"),
+            ("(no comments)", "should show no comments"),
+            ("Priority: P1", "should contain priority label (default 1)"),
+        ],
     );
 
     // Fields that should NOT appear when unset
-    assert!(
-        !display.contains("Supersedes:"),
-        "no supersedes when not set"
-    );
-    assert!(
-        !display.contains("Superseded by:"),
-        "no superseded_by when not set"
-    );
-    assert!(
-        !display.contains("Archived:"),
-        "no archived line when false"
-    );
-    assert!(
-        !display.contains("assigned_to:"),
-        "assigned_to should not be displayed"
-    );
-    assert!(
-        !display.contains("commit_hash:"),
-        "commit_hash should not be displayed"
-    );
-    assert!(
-        !display.contains("lines_added:"),
-        "lines_added should not be displayed"
-    );
-    assert!(
-        !display.contains("lines_removed:"),
-        "lines_removed should not be displayed"
+    assert_display_not_contains(
+        &display,
+        &[
+            ("Supersedes:", "no supersedes when not set"),
+            ("Superseded by:", "no superseded_by when not set"),
+            ("Archived:", "no archived line when false"),
+            ("assigned_to:", "assigned_to should not be displayed"),
+            ("commit_hash:", "commit_hash should not be displayed"),
+            ("lines_added:", "lines_added should not be displayed"),
+            ("lines_removed:", "lines_removed should not be displayed"),
+        ],
     );
 }
 
@@ -2642,19 +2635,15 @@ async fn test_detailed_display_with_content() {
     let ticket = expect_ticket(&store, &id).await;
     let display = ticket.detailed_display();
 
-    assert!(
-        display.contains("Comments:"),
-        "should have comments section"
-    );
-    assert!(display.contains("[analyst]"), "should show analyst role");
-    assert!(display.contains("[reviewer]"), "should show reviewer role");
-    assert!(
-        display.contains("First comment"),
-        "should show first comment"
-    );
-    assert!(
-        display.contains("Second comment"),
-        "should show second comment"
+    assert_display_contains(
+        &display,
+        &[
+            ("Comments:", "should have comments section"),
+            ("[analyst]", "should show analyst role"),
+            ("[reviewer]", "should show reviewer role"),
+            ("First comment", "should show first comment"),
+            ("Second comment", "should show second comment"),
+        ],
     );
     assert!(
         !display.contains("(no comments)"),
