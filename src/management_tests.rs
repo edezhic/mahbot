@@ -53,6 +53,46 @@ async fn setup_ticket(
     (ws, ticket_id)
 }
 
+/// Assert `job_id` resolves to exactly one `jobs` row whose status equals
+/// `expected_status`. Preserves the duplicate-row guard (`len() == 1`) that a
+/// naive `query_optional()`-based helper would silently drop.
+async fn assert_job_status(conn: &crate::turso::Connection, job_id: &str, expected_status: &str) {
+    let jobs = conn
+        .query(
+            "SELECT status FROM jobs WHERE id = ?1",
+            crate::turso::params![job_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.len(),
+        1,
+        "expected exactly one jobs row for job {job_id}"
+    );
+    assert_eq!(
+        jobs[0].get::<String>(0).unwrap(),
+        expected_status,
+        "job {job_id} must be {expected_status}"
+    );
+}
+
+/// Assert the roster (`agents` rows keyed by `job_id`) cascaded to zero on
+/// completion.
+async fn assert_roster_cascaded(conn: &crate::turso::Connection, job_id: &str) {
+    let roster = conn
+        .query(
+            "SELECT COUNT(*) FROM agents WHERE job_id = ?1",
+            crate::turso::params![job_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        roster[0].get::<i64>(0).unwrap(),
+        0,
+        "roster cascaded on completion"
+    );
+}
+
 /// Verify the Buffer → Notify + drain sequence across two QaPassed tickets
 /// via `transition_ticket_to_done`: the first one buffers, the last one
 /// notifies and drains the buffer.
@@ -494,27 +534,8 @@ async fn resume_verifier_round_replays_stored_outcomes() {
     // No double bounce on replay (bounce_count only increments on failures).
     assert_eq!(ticket.bounce_count, 0, "no bounce on an all-pass replay");
     // Job completed (status=done, roster cascaded).
-    let jobs = conn
-        .query(
-            "SELECT status FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].get::<String>(0).unwrap(), "done");
-    let agents = conn
-        .query(
-            "SELECT COUNT(*) FROM agents WHERE job_id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        agents[0].get::<i64>(0).unwrap(),
-        0,
-        "roster rows cascaded on completion"
-    );
+    assert_job_status(conn, job_id, "done").await;
+    assert_roster_cascaded(conn, job_id).await;
 }
 
 /// The phase-gate bail path returns before run_agent runs, so its exit
@@ -673,27 +694,8 @@ async fn resume_engineer_round_continues_anchor_session() {
         "resumed engineer must transition to InDiagnostics"
     );
     // Job completed + roster cascaded; the anchor survives.
-    let jobs = conn
-        .query(
-            "SELECT status FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].get::<String>(0).unwrap(), "done");
-    let roster = conn
-        .query(
-            "SELECT COUNT(*) FROM agents WHERE job_id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        roster[0].get::<i64>(0).unwrap(),
-        0,
-        "roster cascaded on completion"
-    );
+    assert_job_status(conn, job_id, "done").await;
+    assert_roster_cascaded(conn, job_id).await;
     let anchors = conn
         .query(
             "SELECT COUNT(*) FROM agents WHERE agent_id = ?1 AND job_id IS NULL",
@@ -803,27 +805,8 @@ async fn resume_sanitation_round_continues_session_and_passes() {
         "resumed sanitation pass must transition to SanitationPassed"
     );
     // Job completed + roster cascaded.
-    let jobs = conn
-        .query(
-            "SELECT status FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].get::<String>(0).unwrap(), "done");
-    let roster = conn
-        .query(
-            "SELECT COUNT(*) FROM agents WHERE job_id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        roster[0].get::<i64>(0).unwrap(),
-        0,
-        "roster cascaded on completion"
-    );
+    assert_job_status(conn, job_id, "done").await;
+    assert_roster_cascaded(conn, job_id).await;
     // Session continuity: exactly the seeded user row + the resumed assistant
     // response — the task was NOT re-appended.
     let msgs = conn
