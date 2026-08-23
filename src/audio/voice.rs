@@ -4562,65 +4562,79 @@ mod tests {
     }
 
     #[test]
-    fn segment_no_speech_returns_empty() {
-        // No VAD-positive frames at all → no utterances.
-        let n_frames = 10;
-        let audio = audio_for_frames(n_frames);
-        let vad = vec![false; n_frames];
-        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
-        assert!(utterances.is_empty(), "no speech → no utterances");
-    }
-
-    #[test]
-    fn segment_single_utterance_detected() {
-        // 4 speech frames (≥1 consecutive → sustained immediately) + 10 silence frames (≥10 → threshold).
-        let audio = audio_for_frames(14);
-        let mut vad = vec![true; 4];
-        vad.extend(vec![false; 10]);
-        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
-        assert_eq!(
-            utterances.len(),
-            1,
-            "sustained speech + silence → 1 utterance"
-        );
-        assert!(
-            !utterances[0].is_empty(),
-            "utterance should contain audio samples"
-        );
-    }
-
-    #[test]
-    fn segment_multiple_utterances_separated_by_silence() {
-        // 4 speech, 10 silence, 3 speech, 10 silence → 2 utterances.
-        let n_frames = 4 + 10 + 3 + 10;
-        let audio = audio_for_frames(n_frames);
-        let mut vad = vec![true; 4];
-        vad.extend(vec![false; 10]);
-        vad.extend(vec![true; 3]);
-        vad.extend(vec![false; 10]);
-        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
-        assert_eq!(utterances.len(), 2, "two speech segments → two utterances");
-        for (i, utt) in utterances.iter().enumerate() {
-            assert!(
-                !utt.is_empty(),
-                "utterance {i} should contain audio samples"
-            );
+    fn segment_utterances_by_vad_table() {
+        // Table-driven coverage of [`segment_utterances_by_vad`].  Each case
+        // describes the per-frame VAD decision sequence as (n_frames, is_speech)
+        // runs; the total frame count derives the audio buffer length.
+        struct Case {
+            name: &'static str,
+            /// `(n_frames, is_speech)` runs describing the per-frame VAD
+            /// decision sequence.  The total is the number of frames.
+            vad_runs: &'static [(usize, bool)],
+            /// Expected number of emitted utterances.
+            expected_utterances: usize,
+            /// When true, additionally assert each emitted utterance has
+            /// non-empty audio samples.
+            expect_non_empty: bool,
         }
-    }
 
-    #[test]
-    fn segment_utterance_at_end_without_silence_not_emitted() {
-        // 8 silence frames, then 4 speech frames at end — no trailing silence
-        // to cross the threshold, so no utterance is emitted.
-        let n_frames = 12;
-        let audio = audio_for_frames(n_frames);
-        let mut vad = vec![false; 8];
-        vad.extend(vec![true; 4]);
-        let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
-        assert!(
-            utterances.is_empty(),
-            "speech at end without trailing silence → no utterance",
-        );
+        let cases = [
+            Case {
+                // No VAD-positive frames at all → no utterances.
+                name: "no_speech_returns_empty",
+                vad_runs: &[(10, false)],
+                expected_utterances: 0,
+                expect_non_empty: false,
+            },
+            Case {
+                // 4 speech frames (≥1 consecutive → sustained immediately) +
+                // 10 silence frames (≥10 → threshold).
+                name: "single_utterance_detected",
+                vad_runs: &[(4, true), (10, false)],
+                expected_utterances: 1,
+                expect_non_empty: true,
+            },
+            Case {
+                // 4 speech, 10 silence, 3 speech, 10 silence → 2 utterances.
+                name: "multiple_utterances_separated_by_silence",
+                vad_runs: &[(4, true), (10, false), (3, true), (10, false)],
+                expected_utterances: 2,
+                expect_non_empty: true,
+            },
+            Case {
+                // 8 silence frames, then 4 speech frames at end — no trailing
+                // silence to cross the threshold, so no utterance is emitted.
+                name: "utterance_at_end_without_silence_not_emitted",
+                vad_runs: &[(8, false), (4, true)],
+                expected_utterances: 0,
+                expect_non_empty: false,
+            },
+        ];
+
+        for case in &cases {
+            let n_frames: usize = case.vad_runs.iter().map(|(count, _)| *count).sum();
+            let audio = audio_for_frames(n_frames);
+            let mut vad = Vec::with_capacity(n_frames);
+            for &(count, is_speech) in case.vad_runs {
+                vad.extend(std::iter::repeat_n(is_speech, count));
+            }
+            let utterances = segment_utterances_by_vad(&audio, &vad, &TEST_VAD_CONFIG);
+            assert_eq!(
+                utterances.len(),
+                case.expected_utterances,
+                "case: {name}",
+                name = case.name,
+            );
+            if case.expect_non_empty {
+                for (i, utt) in utterances.iter().enumerate() {
+                    assert!(
+                        !utt.is_empty(),
+                        "case: {name} — utterance {i} should contain audio samples",
+                        name = case.name,
+                    );
+                }
+            }
+        }
     }
 
     /// The default segmentation config must use the standard pipeline
@@ -5413,47 +5427,82 @@ mod tests {
     // cluster; utterances on other bases are outliers.
 
     #[test]
-    fn consistency_gate_fails_when_too_few_utterances() {
-        let embs: Vec<Vec<f32>> = vec![basis_embedding(0); 4]; // < 5 utterances
-        let err = enrollment_consistency_check(&embs).unwrap_err();
-        assert!(
-            err.contains("4 enrollment utterances"),
-            "error should mention the utterance count: {err}"
-        );
-    }
+    fn consistency_gate_table() {
+        // Centroid gate is pure: basis-0 embeddings form a consistent cluster,
+        // basis-1 embeddings are outliers.  `bad_dim_at` corrupts one slot.
+        struct Case {
+            name: &'static str,
+            /// Count of consistent basis-0 utterances.
+            basis0: usize,
+            /// Count of outlier basis-1 utterances.
+            basis1: usize,
+            /// 0-based embedding slot to replace with a wrong-dimension vector.
+            bad_dim_at: Option<usize>,
+            /// Expected substring of the user-facing error; `None` means the
+            /// gate must succeed.
+            expected_error_fragment: Option<&'static str>,
+        }
 
-    #[test]
-    fn consistency_gate_fails_when_too_few_pass_threshold() {
-        // 6 on basis 0 + 4 on basis 1: 6/10 pass → need ceil(10 × 0.7) = 7 → fail.
-        let mut embs: Vec<Vec<f32>> = vec![basis_embedding(0); 6];
-        embs.extend(vec![basis_embedding(1); 4]);
-        let err = enrollment_consistency_check(&embs).unwrap_err();
-        assert!(
-            err.contains("6/10"),
-            "error should report 6/10 passed: {err}"
-        );
-    }
+        let cases = [
+            Case {
+                name: "fails_when_too_few_utterances",
+                basis0: 4,
+                basis1: 0,
+                bad_dim_at: None,
+                expected_error_fragment: Some("4 enrollment utterances"),
+            },
+            Case {
+                // 6 on basis 0 + 4 on basis 1: 6/10 pass → need ceil(10 × 0.7) = 7 → fail.
+                name: "fails_when_too_few_pass_threshold",
+                basis0: 6,
+                basis1: 4,
+                bad_dim_at: None,
+                expected_error_fragment: Some("6/10"),
+            },
+            Case {
+                // 8 on basis 0 + 2 on basis 1: 8/10 pass → need ceil(10 × 0.7) = 7 → pass.
+                name: "succeeds_with_high_quality_utterances",
+                basis0: 8,
+                basis1: 2,
+                bad_dim_at: None,
+                expected_error_fragment: None,
+            },
+            Case {
+                name: "rejects_wrong_dimension",
+                basis0: MIN_ENROLLMENT_UTTERANCES,
+                basis1: 0,
+                bad_dim_at: Some(0),
+                expected_error_fragment: Some("expected 1024"),
+            },
+        ];
 
-    #[test]
-    fn consistency_gate_succeeds_with_high_quality_utterances() {
-        // 8 on basis 0 + 2 on basis 1: 8/10 pass → need ceil(10 × 0.7) = 7 → pass.
-        let mut embs: Vec<Vec<f32>> = vec![basis_embedding(0); 8];
-        embs.extend(vec![basis_embedding(1); 2]);
-        assert!(
-            enrollment_consistency_check(&embs).is_ok(),
-            "8/10 consistent utterances must pass the gate"
-        );
-    }
-
-    #[test]
-    fn consistency_gate_rejects_wrong_dimension() {
-        let mut embs: Vec<Vec<f32>> = vec![basis_embedding(0); MIN_ENROLLMENT_UTTERANCES];
-        embs[0] = vec![0.5; 64]; // wrong dim
-        let err = enrollment_consistency_check(&embs).unwrap_err();
-        assert!(
-            err.contains("expected 1024"),
-            "error should mention the dimension mismatch: {err}"
-        );
+        for case in &cases {
+            let mut embs: Vec<Vec<f32>> = Vec::with_capacity(case.basis0 + case.basis1);
+            embs.extend(std::iter::repeat_n(basis_embedding(0), case.basis0));
+            embs.extend(std::iter::repeat_n(basis_embedding(1), case.basis1));
+            if let Some(idx) = case.bad_dim_at {
+                embs[idx] = vec![0.5; 64];
+            }
+            match (
+                enrollment_consistency_check(&embs),
+                case.expected_error_fragment,
+            ) {
+                (Ok(_), None) => {}
+                (Err(err), Some(fragment)) => assert!(
+                    err.contains(fragment),
+                    "case: {name} — error should mention {fragment:?}: {err}",
+                    name = case.name,
+                ),
+                (Ok(_), Some(fragment)) => panic!(
+                    "case: {name} — expected error containing {fragment:?}, got Ok",
+                    name = case.name,
+                ),
+                (Err(err), None) => panic!(
+                    "case: {name} — expected success, got error: {err}",
+                    name = case.name,
+                ),
+            }
+        }
     }
 
     // ── PCM cache key tests ─────────────────────────────────────────────────
