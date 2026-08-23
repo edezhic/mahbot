@@ -383,59 +383,95 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_excluded_agent_id_transient_prefixes() {
-        // Must match the union of TRANSIENT_AGENT_ID_PREFIXES + manager_.
+    fn test_is_excluded_agent_id_cases() {
+        // Dynamic prefix drift-detection invariant: every registered reserved
+        // prefix must be excluded.  Enumerating these as literal table rows
+        // would silently lose coverage when TRANSIENT_AGENT_ID_PREFIXES grows
+        // (or `manager_` changes), so the union is enumerated at runtime via
+        // `excluded_agent_id_prefixes()` — the same source the poller uses.
         for prefix in excluded_agent_id_prefixes() {
             let id = format!("{prefix}suffix");
             assert!(
                 is_excluded_agent_id(&id),
-                "expected '{id}' (prefix '{prefix}') to be excluded"
+                "case: transient prefix '{prefix}' — expected '{id}' to be excluded",
             );
         }
-    }
 
-    #[test]
-    fn test_is_excluded_agent_id_direct_session() {
-        // Direct user-agent sessions should NOT be excluded by the union of
-        // `TRANSIENT_AGENT_ID_PREFIXES` and `"manager_"`.
-        assert!(!is_excluded_agent_id("alice_main_workspace_engineer"));
-        assert!(!is_excluded_agent_id("bob_my_project_analyst"));
-        assert!(!is_excluded_agent_id("charlie_personal_work_assistant"));
-    }
+        struct Case {
+            name: &'static str,
+            id: String,
+            excluded: bool,
+        }
 
-    #[test]
-    fn test_direct_session_underscore_in_names_not_mistaken_for_exclusion() {
-        // Even if user/workspace names contain underscores,
-        // the start of the agent_id is the user name ("some_user"),
-        // which doesn't match any excluded prefix.
-        assert!(!is_excluded_agent_id(
-            "some_user_my_cool_workspace_reviewer"
-        ));
-    }
+        let cases = vec![
+            // Direct user-agent sessions should NOT be excluded by the union of
+            // `TRANSIENT_AGENT_ID_PREFIXES` and `"manager_"`.
+            Case {
+                name: "direct_session",
+                id: "alice_main_workspace_engineer".into(),
+                excluded: false,
+            },
+            Case {
+                name: "direct_session_ws_2",
+                id: "bob_my_project_analyst".into(),
+                excluded: false,
+            },
+            Case {
+                name: "direct_session_ws_3",
+                id: "charlie_personal_work_assistant".into(),
+                excluded: false,
+            },
+            // Even if user/workspace names contain underscores, the start of the
+            // agent_id is the user name ("some_user"), which doesn't match any
+            // excluded prefix.
+            Case {
+                name: "underscore_in_names",
+                id: "some_user_my_cool_workspace_reviewer".into(),
+                excluded: false,
+            },
+            // A real user whose name collides with a reserved prefix is escaped by
+            // `direct_agent_id` (a `user_` prefix), so their session is never
+            // mistaken for a transient/background session and is never skipped by
+            // the poller.  These are runtime-built (cannot be `&'static str`
+            // rows) so the live link to the `user_`-escape coupling stays honest.
+            Case {
+                name: "colliding_user_manager",
+                id: crate::session::direct_agent_id("manager", "engineer", "ws"),
+                excluded: false,
+            },
+            Case {
+                name: "colliding_user_ticket",
+                id: crate::session::direct_agent_id("ticket_bob", "analyst", "ws"),
+                excluded: false,
+            },
+            // The production SQL exclusion is `LIKE 'prefix_%'` (case-insensitive
+            // for ASCII), so a case-variant reserved word is also excluded here.
+            Case {
+                name: "case_variant_ticket_upper",
+                id: "Ticket_suffix".into(),
+                excluded: true,
+            },
+            Case {
+                name: "case_variant_ticket_mixed",
+                id: "tIcKeT_suffix".into(),
+                excluded: true,
+            },
+            Case {
+                name: "case_variant_manager",
+                id: "Manager_bob".into(),
+                excluded: true,
+            },
+        ];
 
-    #[test]
-    fn test_direct_session_colliding_user_name_not_mistaken_for_exclusion() {
-        // A real user whose name collides with a reserved prefix is escaped by
-        // `direct_agent_id` (a `user_` prefix), so their session is never
-        // mistaken for a transient/background session and is never skipped by
-        // the poller.
-        assert!(!is_excluded_agent_id(&crate::session::direct_agent_id(
-            "manager", "engineer", "ws",
-        )));
-        assert!(!is_excluded_agent_id(&crate::session::direct_agent_id(
-            "ticket_bob",
-            "analyst",
-            "ws",
-        )));
-    }
-
-    #[test]
-    fn test_is_excluded_agent_id_case_variant_reserved_word() {
-        // The production SQL exclusion is `LIKE 'prefix_%'` (case-insensitive
-        // for ASCII), so a case-variant reserved word is also excluded here.
-        assert!(is_excluded_agent_id("Ticket_suffix"));
-        assert!(is_excluded_agent_id("tIcKeT_suffix"));
-        assert!(is_excluded_agent_id("Manager_bob"));
+        for case in &cases {
+            assert_eq!(
+                is_excluded_agent_id(&case.id),
+                case.excluded,
+                "case: {name} — id='{id}'",
+                name = case.name,
+                id = case.id,
+            );
+        }
     }
 
     #[test]

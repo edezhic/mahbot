@@ -1544,9 +1544,7 @@ mod tests {
         // Direct session plus one session per excluded prefix — the union of
         // `manager_` and [`TRANSIENT_AGENT_ID_PREFIXES`].
         let direct_id = unique_key();
-        let excluded_prefixes: Vec<&str> = std::iter::once("manager_")
-            .chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
-            .collect();
+        let excluded_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
         let prefixed_ids: Vec<String> = excluded_prefixes
             .iter()
             .map(|p| format!("{p}{}", unique_key()))
@@ -1904,9 +1902,7 @@ mod transient_prefix_tests {
         // name collides with a reserved prefix is escaped with a `user_`
         // prefix by `safe_user_segment`, so their conversation is never
         // mistaken for a transient/background agent.
-        let reserved_prefixes = std::iter::once("manager_")
-            .chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
-            .collect::<Vec<_>>();
+        let reserved_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
 
         for prefix in &reserved_prefixes {
             let bare_word = prefix.trim_end_matches('_');
