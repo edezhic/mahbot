@@ -16,6 +16,10 @@
 //!   and vanishes (deliberate override of the strict absence-is-honest rule
 //!   for tools; the last-tool block is a historical marker, always labeled by
 //!   its tool name, so it cannot be mistaken for live activity).
+//! - An agent that is alive and working but has neither a current tool nor a
+//!   completed tool (the pre-first-tool LLM reasoning window, or a run that
+//!   never invokes a tool) shows a static "thinking…" indicator instead of a
+//!   blank activity slot — the card never appears empty while the agent lives.
 //! - Parallel tool execution is represented honestly: every tool that
 //!   actually started executing appears as its own tool block; tools that never
 //!   execute (unknown tool, pre-flight cancellation) never show.
@@ -594,11 +598,12 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, RunningMessage> {
     let elapsed = format_elapsed(h.started_at);
 
     // Fill slot between the icon and the right-aligned metrics: running tools
-    // if any, else the live activity phase, else the LAST COMPLETED tool — a
-    // fast tool no longer flashes and vanishes. Each tool renders as its own
-    // block (bold white name + truncated key-value pairs) wrapped in a hover
-    // tooltip showing the full untruncated args; the activity label is plain
-    // accent text with no tooltip.
+    // if any, else the live activity phase, else the LAST COMPLETED tool —
+    // a fast tool no longer flashes and vanishes — else a static "thinking…"
+    // placeholder for the tool-less pre-first-tool window. Each tool renders
+    // as its own block (bold white name + truncated key-value pairs) wrapped
+    // in a hover tooltip showing the full untruncated args; the activity label
+    // is plain accent text with no tooltip.
     let mut fill = Column::new().spacing(4).align_x(Alignment::Start);
     for tool in &h.current_tools {
         fill = fill.push(render_tool_block(tool));
@@ -613,6 +618,11 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, RunningMessage> {
             fill = fill.push(text(activity.clone()).size(11).color(theme::ACCENT));
         } else if let Some(last) = &h.last_tool {
             fill = fill.push(render_tool_block(last));
+        } else {
+            // Pre-first-tool / tool-less window: the agent is alive and
+            // working but has not yet completed a tool — show a small static
+            // "thinking…" indicator instead of leaving the slot blank.
+            fill = fill.push(render_thinking_indicator());
         }
     }
 
@@ -636,6 +646,22 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, RunningMessage> {
         .padding(8)
         .style(theme::surface_card_style)
         .into()
+}
+
+/// Render the "thinking…" placeholder shown when an agent is alive and
+/// working but has neither a currently-executing tool nor a completed tool
+/// (the pre-first-tool LLM reasoning window). Static icon + text, styled to
+/// match the surrounding activity label (small accent).
+fn render_thinking_indicator() -> Element<'static, RunningMessage> {
+    row![
+        lucide::loader_circle::<iced::Theme, iced::Renderer>()
+            .size(12)
+            .color(theme::ACCENT),
+        text("thinking…").size(11).color(theme::ACCENT),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// Render one tool block: bold white tool name on top, the comma-separated
