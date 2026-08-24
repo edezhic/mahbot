@@ -59,8 +59,9 @@ use crate::turso::{Migration, MigrationGuard};
 /// deliberate one-time data reset for the clean upgrade.
 ///
 /// **005 — drop `ticket_stage_jobs.phase`.** The phase column shipped in a
-/// prior schema but is now redundant — it is derivable from (kind, stage) via
-/// [`crate::jobs::derive_ticket_phase`]. The fresh-DB SCHEMA no longer declares
+/// prior schema but is now redundant — the ticket phase is the only stored
+/// representation, so it is not derivable from a job-side mirror. The fresh-DB
+/// SCHEMA no longer declares
 /// it; the drop guard makes both paths converge (fresh DB: column already
 /// absent, SQL skipped, recorded as applied; upgraded DB: the DROP fires).
 ///
@@ -72,6 +73,16 @@ use crate::turso::{Migration, MigrationGuard};
 /// created on this same open (it is brand new and empty — no data loss), then
 /// renames the old table under the new name so the new code reads the
 /// pre-existing rows. Both paths converge to a single `ticket_jobs` table.
+///
+/// **consolidate_002 — drop `ticket_jobs.stage`.** The phase column no longer
+/// mirrors `tickets.phase`; per the single-DB consolidation the ticket phase is
+/// the only stored representation, so the job-side stage mirror is dropped. On
+/// an upgrade-in-place DB the 006 rename has already moved the legacy
+/// `ticket_stage_jobs` (still carrying `stage`) to `ticket_jobs`;
+/// consolidate_002 then drops the column. The fresh-DB SCHEMA no longer
+/// declares it, so the drop guard makes both paths converge. It uses the
+/// `consolidate_` post-consolidation prefix (per the documented convention)
+/// and runs after 006 and before the one-time consolidation import.
 pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
     Migration {
         id: "001_session_token_length",
@@ -118,6 +129,14 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
               ALTER TABLE ticket_stage_jobs RENAME TO ticket_jobs",
         guard: Some(MigrationGuard::TableExists {
             table: "ticket_stage_jobs",
+        }),
+    },
+    Migration {
+        id: "consolidate_002_drop_ticket_jobs_stage",
+        sql: "ALTER TABLE ticket_jobs DROP COLUMN stage",
+        guard: Some(MigrationGuard::ColumnDropped {
+            table: "ticket_jobs",
+            column: "stage",
         }),
     },
 ];
@@ -249,8 +268,8 @@ mod tests {
     /// Fresh-DB schema: `session_metadata` already declares both migrated
     /// columns — simulates the wipe-and-recreate path where the SCHEMA
     /// produced the migrated shape. Includes a `jobs` table and a
-    /// `ticket_jobs` table matching the current SCHEMA shape (id, ticket_id,
-    /// stage — no `round`, no `phase`). The table carries the NEW name because
+    /// `ticket_jobs` table matching the current SCHEMA shape (id, ticket_id —
+    /// no `stage`, no `round`, no `phase`). The table carries the NEW name because
     /// the fresh SCHEMA creates `ticket_jobs` directly; the RENAME migration is
     /// thus a skipped-and-recorded no-op.
     const FRESH_SCHEMA: &str = "CREATE TABLE sessions (\
@@ -266,7 +285,7 @@ mod tests {
          retry_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, \
          updated_at TEXT NOT NULL);\
          CREATE TABLE ticket_jobs (\
-         id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL, stage TEXT NOT NULL);";
+         id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL);";
 
     async fn applied_ids(conn: &crate::turso::Connection) -> Vec<String> {
         conn.query("SELECT id FROM schema_migrations ORDER BY id", ())
@@ -357,6 +376,7 @@ mod tests {
                 "004_reset_implementation_jobs",
                 "005_drop_ticket_stage_jobs_phase",
                 "006_rename_ticket_stage_jobs_to_ticket_jobs",
+                "consolidate_002_drop_ticket_jobs_stage",
             ],
             "migrations recorded in order"
         );
@@ -378,12 +398,16 @@ mod tests {
             !column_exists(&conn, "ticket_jobs", "round").await.unwrap(),
             "round column must be dropped by migration 003"
         );
+        assert!(
+            !column_exists(&conn, "ticket_jobs", "stage").await.unwrap(),
+            "stage column must be dropped by consolidate_002 migration"
+        );
 
         // Re-running (e.g. a later boot) is a strict no-op — never twice.
         run_pending_migrations(&conn, "sessions", SESSION_MIGRATIONS)
             .await
             .expect("second run is a no-op");
-        assert_eq!(applied_ids(&conn).await.len(), 6, "never re-run");
+        assert_eq!(applied_ids(&conn).await.len(), 7, "never re-run");
     }
 
     #[tokio::test]
@@ -432,6 +456,7 @@ mod tests {
                 "004_reset_implementation_jobs",
                 "005_drop_ticket_stage_jobs_phase",
                 "006_rename_ticket_stage_jobs_to_ticket_jobs",
+                "consolidate_002_drop_ticket_jobs_stage",
             ],
             "migrations recorded as applied even though the SQL was skipped"
         );

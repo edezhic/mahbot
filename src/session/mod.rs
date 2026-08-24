@@ -159,8 +159,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target
 
 CREATE TABLE IF NOT EXISTS ticket_jobs (
     id          TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    ticket_id   TEXT NOT NULL REFERENCES tickets(id),
-    stage       TEXT NOT NULL
+    ticket_id   TEXT NOT NULL REFERENCES tickets(id)
 );
 
 CREATE TABLE IF NOT EXISTS research_jobs (

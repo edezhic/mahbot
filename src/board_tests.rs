@@ -2170,7 +2170,6 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
             &[],
             &crate::jobs::SpawnChild::TicketJob {
                 ticket_id: ticket_id.clone(),
-                stage: "development".to_string(),
                 is_implementation: true,
             },
         )

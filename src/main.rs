@@ -154,7 +154,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
             "Session cleanup",
             mahbot::jobs::PURGE_CUTOFF_HOURS,
             |cutoff| async move {
-                // Stale-job purge FIRST (cross-DB orchestrator: board rollback +
+                // Stale-job purge FIRST (single-connection orchestrator: board rollback +
                 // sessions DELETE) — protected sessions only become eligible for
                 // the TTL guard after the purge cascade removes their job rows.
                 let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;

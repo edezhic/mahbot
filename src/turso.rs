@@ -4353,21 +4353,29 @@ mod tests {
             .expect("ticket must be imported");
         assert_eq!(ticket_phase, "analysis", "ticket phase preserved");
 
-        // Job + renamed child row (old phase/round columns dropped).
+        // Job + renamed child row (old phase/round/stage columns dropped).
         let job_kind: String = conn
             .query_optional("SELECT kind FROM jobs WHERE id = 'j1'", (), |r| r.get(0))
             .await
             .unwrap()
             .expect("job must be imported");
         assert_eq!(job_kind, "ticket_analysis");
-        let tj_stage: String = conn
-            .query_optional("SELECT stage FROM ticket_jobs WHERE id = 'j1'", (), |r| {
-                r.get(0)
-            })
+        let tj_ticket_id: String = conn
+            .query_optional(
+                "SELECT ticket_id FROM ticket_jobs WHERE id = 'j1'",
+                (),
+                |r| r.get(0),
+            )
             .await
             .unwrap()
             .expect("ticket_stage_jobs must be renamed to ticket_jobs on import");
-        assert_eq!(tj_stage, "analysis");
+        assert_eq!(tj_ticket_id, "t1");
+        assert!(
+            !crate::turso::column_exists(&conn, "ticket_jobs", "stage")
+                .await
+                .unwrap(),
+            "stage column must be dropped by consolidate_002 migration"
+        );
 
         // Migration-ordering contract: the unguarded sessions migration 004
         // (`DELETE FROM jobs WHERE kind='ticket_stage'`) ran on the EMPTY
@@ -4477,13 +4485,21 @@ mod tests {
 
         let conn = open_consolidated_store(root).await.unwrap();
 
-        let tj_stage: String = conn
-            .query_optional("SELECT stage FROM ticket_jobs WHERE id = 'j1'", (), |r| {
-                r.get(0)
-            })
+        let tj_ticket_id: String = conn
+            .query_optional(
+                "SELECT ticket_id FROM ticket_jobs WHERE id = 'j1'",
+                (),
+                |r| r.get(0),
+            )
             .await
             .unwrap()
             .expect("an already-migrated ticket_jobs table must be copied, not dropped");
-        assert_eq!(tj_stage, "analysis");
+        assert_eq!(tj_ticket_id, "t1");
+        assert!(
+            !crate::turso::column_exists(&conn, "ticket_jobs", "stage")
+                .await
+                .unwrap(),
+            "stage column must be dropped by consolidate_002 migration"
+        );
     }
 }

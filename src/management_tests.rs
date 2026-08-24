@@ -925,7 +925,6 @@ async fn process_sanitation_verdict_cases() {
             &[],
             &crate::jobs::SpawnChild::TicketJob {
                 ticket_id: id.clone(),
-                stage: IMPLEMENTATION_STAGE_SANITATION.to_string(),
                 is_implementation: true,
             },
         )
@@ -1378,7 +1377,6 @@ async fn engineer_hard_failure_pauses_workspace_and_freezes_implementation() {
         &[],
         &crate::jobs::SpawnChild::TicketJob {
             ticket_id: ticket_id.clone(),
-            stage: IMPLEMENTATION_STAGE_DEVELOPMENT.to_string(),
             is_implementation: true,
         },
     )
@@ -1483,7 +1481,6 @@ async fn in_development_redispatch_lane_feeds_feedback() {
         &[],
         &crate::jobs::SpawnChild::TicketJob {
             ticket_id: ticket_id.clone(),
-            stage: IMPLEMENTATION_STAGE_DEVELOPMENT.to_string(),
             is_implementation: true,
         },
     )
@@ -1602,7 +1599,6 @@ async fn bounce_to_development_feeds_feedback_to_redispatch() {
         &[],
         &crate::jobs::SpawnChild::TicketJob {
             ticket_id: ticket_id.clone(),
-            stage: IMPLEMENTATION_STAGE_DEVELOPMENT.to_string(),
             is_implementation: true,
         },
     )

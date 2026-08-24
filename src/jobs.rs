@@ -228,16 +228,15 @@ pub(crate) enum SpawnChild {
     /// cleanup prompt. Leftover rows are terminalized at boot (never
     /// resumed) — the cleaner's ephemeral workspace is never registered.
     TempCleanup,
-    /// ticket_jobs (id, ticket_id, stage) — shared by the
+    /// ticket_jobs (id, ticket_id) — shared by the
     /// `ticket_analysis` and `ticket_implementation` kinds. `is_implementation`
     /// distinguishes them so `kind_str()` yields the matching `jobs.kind`
     /// (mirrors [`ResumableJob::TicketJob`]). The implementation variant is the
     /// single-owner pipeline job created with an empty roster (the engineer
-    /// registers later); analysis spawns its roster at spawn time. Phase is
-    /// derived, not stored — see [`derive_ticket_phase`].
+    /// registers later); analysis spawns its roster at spawn time. Phase lives
+    /// only on the ticket.
     TicketJob {
         ticket_id: String,
-        stage: String,
         is_implementation: bool,
     },
 }
@@ -322,13 +321,11 @@ pub(crate) async fn spawn_job(
             .await
             .with_context(|| format!("failed to insert research_jobs row for job {id}"))?;
         }
-        SpawnChild::TicketJob {
-            ticket_id, stage, ..
-        } => {
+        SpawnChild::TicketJob { ticket_id, .. } => {
             tx.execute(
-                "INSERT INTO ticket_jobs (id, ticket_id, stage) \
-                 VALUES (?1, ?2, ?3)",
-                params![id, ticket_id.clone(), stage.clone()],
+                "INSERT INTO ticket_jobs (id, ticket_id) \
+                 VALUES (?1, ?2)",
+                params![id, ticket_id.clone()],
             )
             .await
             .with_context(|| format!("failed to insert ticket_jobs row for job {id}"))?;
@@ -501,27 +498,25 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
 // The `ticket_jobs` child table is the single substrate for the two
 // ticket-job kinds: `jobs.kind='ticket_analysis'` (per-run analysis job) and
 // `jobs.kind='ticket_implementation'` (single-owner pipeline implementation job). Both
-// read their stage state from this one table and both are handled by one
-// boot-scan/lifecycle. Phase is derived from (kind, stage) via
-// [`derive_ticket_phase`], never stored. The active agent(s) for a running job
+// read their phase from `tickets.phase` and both are handled by one
+// boot-scan/lifecycle. The ticket phase is the only stored representation —
+// the job side carries no phase mirror. The active agent(s) for a running job
 // are held in the `agents` roster (status='launched'), which drives comment
 // routing and the mid-execution re-dispatch guard.
 
-/// A row of the `ticket_jobs` child table (id, ticket_id, stage) — the shared
+/// A row of the `ticket_jobs` child table (id, ticket_id) — the shared
 /// row model for both the per-run `ticket_analysis` analysis job and the
 /// single-owner `ticket_implementation` pipeline job.
 #[derive(Debug, Clone)]
 pub(crate) struct TicketJobRow {
     pub id: String,
     pub ticket_id: String,
-    pub stage: String,
 }
 
 fn ticket_job_row_from(row: &Row) -> anyhow::Result<TicketJobRow> {
     Ok(TicketJobRow {
         id: row.get(0)?,
         ticket_id: row.get(1)?,
-        stage: row.get(2)?,
     })
 }
 
@@ -531,7 +526,7 @@ pub(crate) async fn find_implementation_job(
     ticket_id: &str,
 ) -> Result<Option<TicketJobRow>> {
     conn.query_optional(
-        "SELECT sj.id, sj.ticket_id, sj.stage \
+        "SELECT sj.id, sj.ticket_id \
          FROM ticket_jobs sj \
          JOIN jobs j ON j.id = sj.id \
          WHERE sj.ticket_id = ?1 AND j.kind = 'ticket_implementation'",
@@ -549,7 +544,7 @@ pub(crate) async fn list_workspace_implementation_jobs(
 ) -> Result<Vec<TicketJobRow>> {
     let rows = conn
         .query(
-            "SELECT sj.id, sj.ticket_id, sj.stage \
+            "SELECT sj.id, sj.ticket_id \
              FROM ticket_jobs sj \
              JOIN jobs j ON j.id = sj.id \
              WHERE j.kind = 'ticket_implementation' AND j.workspace_name = ?1",
@@ -558,54 +553,6 @@ pub(crate) async fn list_workspace_implementation_jobs(
         .await
         .context("list workspace implementations")?;
     rows.iter().map(ticket_job_row_from).collect()
-}
-
-/// Derive the effective pipeline phase for a ticket job from its (kind, stage).
-///
-/// `ticket_analysis` always maps to `analysis` (the single one-round analysis
-/// stage). `ticket_implementation` maps its stage literal to the mirroring
-/// ticket phase. An unknown stage (or a kind that is neither of the two
-/// ticket-job kinds) maps to `""` — the empty sentinel fails every board
-/// phase comparison, so an unrecognized row is never mistaken for in-phase and
-/// never rolls back a ticket (safe default).
-///
-/// The phase is a pure derivation — it is never persisted, so the board phase
-/// and the job row can never diverge over a crash window.
-#[must_use]
-pub fn derive_ticket_phase(kind: &str, stage: &str) -> &'static str {
-    if kind == "ticket_analysis" {
-        return "analysis";
-    }
-    match stage {
-        "development" => "in_development",
-        "diagnostics" => "in_diagnostics",
-        "review" => "in_review",
-        "qa" => "in_qa",
-        "sanitation" => "in_sanitation",
-        _ => "",
-    }
-}
-
-/// Advance/re-sync the implementation job's authoritative stage on the
-/// `ticket_jobs` child row as the ticket moves through the pipeline. The job
-/// row itself (jobs kind='ticket_implementation') is created once at the first
-/// ReadyForDevelopment → InDevelopment claim; this function only moves its
-/// stage. Freeze/purge-immunity comes from the cross-DB workspace `paused`
-/// flag, not a column on this row, so a stage advance never touches it. Phase
-/// is derived from (kind, stage) — see [`derive_ticket_phase`] — so it is
-/// not written here.
-pub(crate) async fn update_implementation_job(
-    conn: &Connection,
-    job_id: &str,
-    stage: &str,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE ticket_jobs SET stage = ?2 WHERE id = ?1",
-        params![job_id, stage],
-    )
-    .await
-    .context("update ticket implementation")?;
-    Ok(())
 }
 
 /// Update the implementation job's stored `task` so boot resume re-dispatches the
@@ -954,19 +901,20 @@ pub(crate) async fn delete_pending_job(conn: &Connection, id: &str) -> Result<()
 ///
 /// The ticket-job kinds — `jobs.kind='ticket_analysis'` (per-run analysis) and
 /// `jobs.kind='ticket_implementation'` (single-owner pipeline implementation) — share
-/// one resume variant; the boot-scan loop and the runtime dispatch branch on
-/// `stage` to tell analysis from implementation.
+/// one resume variant that carries only the ticket identity; the boot-scan loop
+/// and the runtime dispatch branch on `tickets.phase` to tell analysis from
+/// implementation.
 pub(crate) enum ResumableJob {
     /// A per-run `ticket_analysis` analysis job or a `ticket_implementation`
     /// pipeline job interrupted by a crash. Resumed in place: the ticket is
     /// still in the job's expected phase. `is_implementation` is set from the
-    /// persisted `jobs.kind` at the scan site (NOT derived from the `stage`
-    /// literal) so a future third ticket-job stage cannot be silently
-    /// misclassified.
+    /// persisted `jobs.kind` at the scan site so a future third ticket-job
+    /// stage cannot be silently misclassified. Resume dispatch derives the
+    /// branch from `tickets.phase` — implementation resumes iff the phase is
+    /// pipeline-occupied, analysis iff it is `Analysis`.
     TicketJob {
         job_id: String,
         ticket_id: String,
-        stage: String,
         is_implementation: bool,
         workspace_name: String,
     },
@@ -1148,7 +1096,7 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
 /// tx (board/sessions now share one file).
 ///
 /// Crash-safe ordering:
-/// 1. SELECT the purge set (ticket_id, stage → derived phase) BEFORE deleting —
+/// 1. SELECT the purge set (ticket_id → literal 'analysis' phase) BEFORE deleting —
 ///    CASCADE destroys ticket_jobs rows at delete time.
 /// 2. ONE transaction (the shared consolidated connection) that rolls back each
 ///    stale analysis ticket's phase with a per-ticket CAS (phase CAS as the
@@ -1179,7 +1127,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     // `ticket_jobs` child row and are handled by their own lifecycle.
     let rows = conn
         .query(
-            "SELECT j.id, j.kind, j.workspace_name, ts.ticket_id, ts.stage \
+            "SELECT j.id, j.kind, j.workspace_name, ts.ticket_id \
              FROM jobs j \
              LEFT JOIN ticket_jobs ts ON ts.id = j.id \
              WHERE j.updated_at < ?1 \
@@ -1215,8 +1163,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     // no round guard — every stale analysis row rolls its ticket back
     // unconditionally (the board rollback reads the stored jobs rows from
     // here rather than opening a board-side view of ticket_jobs, and the
-    // phase is re-derived from (kind, stage) — it is no longer stored on
-    // the row).
+    // phase is the literal 'analysis' — the ticket is reset to Backlog).
     let mut rollbacks: Vec<(String, String)> = Vec::new();
     for row in &rows {
         let id: String = row.get(0)?;
@@ -1230,12 +1177,8 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
         if kind == "ticket_analysis" {
             ticket_analysis_ids.insert(id);
             let ticket_id: Option<String> = row.get(3).ok();
-            let stage: Option<String> = row.get(4).ok();
-            if let (Some(t), Some(s)) = (ticket_id, stage) {
-                let phase = derive_ticket_phase(&kind, &s);
-                if !phase.is_empty() {
-                    rollbacks.push((t, phase.to_string()));
-                }
+            if let Some(t) = ticket_id {
+                rollbacks.push((t, "analysis".to_string()));
             }
         }
     }
@@ -1385,11 +1328,12 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                 let is_implementation = job.kind == "ticket_implementation";
                 // Phase-check against the ticket: in expected phase → resume
                 // (add to exclusion); moved/cancelled/done → stale → mark done
-                // at boot. The expected phase is derived from (kind, stage) —
-                // phase is no longer stored on the row.
+                // at boot. The expected phase derives from `tickets.phase` —
+                // implementation resumes iff the phase is pipeline-occupied,
+                // analysis iff it is `Analysis`.
                 let rows = conn
                     .query_map_strict(
-                        "SELECT id, ticket_id, stage \
+                        "SELECT id, ticket_id \
                          FROM ticket_jobs WHERE id = ?1",
                         params![job.id.clone()],
                         ticket_job_row_from,
@@ -1406,12 +1350,16 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                 // feeds escalation). Bump updated_at (the boot bump) AND
                 // increment retry_count (every bump here is one boot resume).
                 let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
-                let expected_phase = derive_ticket_phase(&job.kind, &row.stage);
-                let in_phase = !expected_phase.is_empty()
-                    && crate::board::store()
-                        .get_ticket_phase(&row.ticket_id)
-                        .await
-                        .is_ok_and(|p| p.is_some_and(|ph| ph.as_ref() == expected_phase));
+                let phase = crate::board::store()
+                    .get_ticket_phase(&row.ticket_id)
+                    .await
+                    .ok()
+                    .flatten();
+                let in_phase = if is_implementation {
+                    phase.is_some_and(|p| p.is_pipeline_occupied())
+                } else {
+                    phase == Some(crate::board::TicketPhase::Analysis)
+                };
                 if in_phase {
                     if is_implementation {
                         // A implementation interrupted by a crash: any 'launched' roster
@@ -1432,7 +1380,6 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                     resumable.push(ResumableJob::TicketJob {
                         job_id: job.id.clone(),
                         ticket_id: row.ticket_id,
-                        stage: row.stage,
                         is_implementation,
                         workspace_name: job.workspace_name.clone(),
                     });
@@ -1577,7 +1524,7 @@ pub fn engineer_session_pin_ticket_id(agent_id: &str) -> Option<String> {
 /// boot sweep) because the terminal paths are scattered (engineer failure,
 /// verifier all-failed, sanitation failure, dispatch panic, supersede, user
 /// cancel). Idempotent: parse ticket_id from the pin agent_id,
-/// phase-check on the board side (cross-DB — no join possible), delete.
+/// phase-check on the board side (shared consolidated connection), delete.
 pub(crate) async fn purge_terminal_engineer_session_pins() -> usize {
     let conn = &crate::session::store().conn;
     let Ok(rows) = conn
@@ -2149,8 +2096,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO ticket_jobs (id, ticket_id, stage) \
-             VALUES (?1, ?2, 'analysis')",
+            "INSERT INTO ticket_jobs (id, ticket_id) \
+             VALUES (?1, ?2)",
             params!["jr1", ticket_id.clone()],
         )
         .await
@@ -2203,7 +2150,6 @@ mod tests {
             &[],
             &SpawnChild::TicketJob {
                 ticket_id: ticket_id.clone(),
-                stage: "development".to_string(),
                 is_implementation: true,
             },
         )
@@ -2293,8 +2239,8 @@ mod tests {
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO ticket_jobs (id, ticket_id, stage) \
-             VALUES (?1, ?2, 'analysis')",
+            "INSERT INTO ticket_jobs (id, ticket_id) \
+             VALUES (?1, ?2)",
             params!["jfail_ts", ticket_id.clone()],
         )
         .await
@@ -2744,5 +2690,176 @@ mod tests {
         conn.execute("DELETE FROM pending_jobs WHERE id = 'rcln3'", ())
             .await
             .unwrap();
+    }
+
+    /// The kind-aware boot-resume predicate: a `ticket_implementation` job
+    /// resumes iff the ticket is in a pipeline-occupied phase, a
+    /// `ticket_analysis` job resumes iff the ticket is in `Analysis`, and any
+    /// other phase completes the job as stale. This locks in the behavior
+    /// change that replaced the old strict (kind, stage)-derived phase-equality
+    /// guard — which could complete a live job whose stale stage mirror drifted
+    /// from the ticket phase, stranding the ticket in an occupied phase.
+    #[tokio::test]
+    #[serial_test::serial(reset_inflight)] // recover_from_restart resets the shared global board
+    async fn recover_boot_predicate_is_kind_aware_on_ticket_phase() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let ws = crate::util::test::create_test_workspace(
+            "/tmp/test_ws_boot_predicate",
+            "boot_predicate_ws",
+        )
+        .await;
+        let board = crate::board::store();
+        async fn job_status(conn: &crate::turso::Connection, id: &str) -> String {
+            conn.query_row("SELECT status FROM jobs WHERE id = ?1", params![id], |r| {
+                r.get::<String>(0)
+            })
+            .await
+            .unwrap()
+        }
+
+        // (a) ticket_analysis + ticket in Analysis → resume.
+        let analysis_ticket = crate::util::test::make_ticket(
+            board,
+            &ws,
+            "Analysis resume",
+            crate::board::TicketPhase::Analysis,
+        )
+        .await;
+        spawn_job(
+            conn,
+            "jb_analysis",
+            "task",
+            &ws.name,
+            "",
+            "",
+            crate::Role::Analyst,
+            &[],
+            &SpawnChild::TicketJob {
+                ticket_id: analysis_ticket.clone(),
+                is_implementation: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // (b) ticket_analysis + ticket moved out of Analysis (stale) → complete.
+        let stale_analysis_ticket = crate::util::test::make_ticket(
+            board,
+            &ws,
+            "Stale analysis",
+            crate::board::TicketPhase::Backlog,
+        )
+        .await;
+        spawn_job(
+            conn,
+            "jb_analysis_stale",
+            "task",
+            &ws.name,
+            "",
+            "",
+            crate::Role::Analyst,
+            &[],
+            &SpawnChild::TicketJob {
+                ticket_id: stale_analysis_ticket.clone(),
+                is_implementation: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        // (c) ticket_implementation + ticket in a pipeline-occupied phase → resume.
+        let impl_ticket = crate::util::test::make_ticket(
+            board,
+            &ws,
+            "Implementation resume",
+            crate::board::TicketPhase::InDevelopment,
+        )
+        .await;
+        spawn_job(
+            conn,
+            "jb_impl",
+            "task",
+            &ws.name,
+            "",
+            "",
+            crate::Role::Engineer,
+            &[],
+            &SpawnChild::TicketJob {
+                ticket_id: impl_ticket.clone(),
+                is_implementation: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // (d) ticket_implementation + ticket moved out of the pipeline (stale) → complete.
+        let stale_impl_ticket = crate::util::test::make_ticket(
+            board,
+            &ws,
+            "Stale implementation",
+            crate::board::TicketPhase::Backlog,
+        )
+        .await;
+        spawn_job(
+            conn,
+            "jb_impl_stale",
+            "task",
+            &ws.name,
+            "",
+            "",
+            crate::Role::Engineer,
+            &[],
+            &SpawnChild::TicketJob {
+                ticket_id: stale_impl_ticket.clone(),
+                is_implementation: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resumable = recover_from_restart().await.unwrap();
+
+        // Analysis + Analysis phase → resumed.
+        assert!(
+            resumable.iter().any(|r| matches!(
+                r,
+                ResumableJob::TicketJob { job_id, is_implementation, .. }
+                    if job_id.as_str() == "jb_analysis" && !*is_implementation
+            )),
+            "a ticket_analysis job with the ticket in Analysis must resume",
+        );
+        assert_eq!(job_status(conn, "jb_analysis").await, "launched");
+
+        // Analysis + stale phase → completed (not resumed).
+        assert!(
+            !resumable.iter().any(|r| matches!(
+                r,
+                ResumableJob::TicketJob { job_id, .. } if job_id.as_str() == "jb_analysis_stale"
+            )),
+            "a ticket_analysis job with a moved ticket must complete, not resume",
+        );
+        assert_eq!(job_status(conn, "jb_analysis_stale").await, "done");
+
+        // Implementation + occupied phase → resumed.
+        assert!(
+            resumable.iter().any(|r| matches!(
+                r,
+                ResumableJob::TicketJob { job_id, is_implementation, .. }
+                    if job_id.as_str() == "jb_impl" && *is_implementation
+            )),
+            "a ticket_implementation job with the ticket in a pipeline-occupied phase must resume",
+        );
+        assert_eq!(job_status(conn, "jb_impl").await, "launched");
+
+        // Implementation + stale phase → completed (not resumed).
+        assert!(
+            !resumable.iter().any(|r| matches!(
+                r,
+                ResumableJob::TicketJob { job_id, .. } if job_id.as_str() == "jb_impl_stale"
+            )),
+            "a ticket_implementation job with a moved ticket must complete, not resume",
+        );
+        assert_eq!(job_status(conn, "jb_impl_stale").await, "done");
     }
 }

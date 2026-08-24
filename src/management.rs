@@ -72,9 +72,11 @@ const REVIEW_QA_THRESHOLD: u8 = 9;
 /// Neutral reason for a phase-gate bail (transients are not misattributed).
 const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 
-/// Implementation stage identifiers (the `ticket_jobs.stage` column). One
+/// Implementation stage identifiers: human-readable stage-label strings used
+/// by the advance/sync handoff and [`verifier_success_stage`]. One
 /// implementation job owns a ticket's entire occupied pipeline; each stage is
-/// a dispatch unit on the SAME implementation job.
+/// a dispatch unit on the SAME implementation job. The stage is no longer
+/// stored on `ticket_jobs`.
 const IMPLEMENTATION_STAGE_DEVELOPMENT: &str = "development";
 const IMPLEMENTATION_STAGE_DIAGNOSTICS: &str = "diagnostics";
 const IMPLEMENTATION_STAGE_REVIEW: &str = "review";
@@ -741,7 +743,6 @@ pub async fn run_management() {
             ResumableJob::TicketJob {
                 job_id,
                 ticket_id,
-                stage,
                 is_implementation,
                 ..
             } => {
@@ -753,7 +754,6 @@ pub async fn run_management() {
                     info!(
                         job = %job_id,
                         ticket = %ticket_id,
-                        stage = %stage,
                         "Implementation is frozen at boot (workspace paused) — leaving frozen",
                     );
                     continue;
@@ -763,10 +763,9 @@ pub async fn run_management() {
                         info!(
                             job = %job_id,
                             ticket = %ticket_id,
-                            stage = %stage,
                             "Resuming ticket-job stage at boot",
                         );
-                        tokio::spawn(resume_ticket_job(stage, job_id, ticket, workspace));
+                        tokio::spawn(resume_ticket_job(job_id, ticket, workspace));
                     }
                     Ok(None) => {
                         warn!(
@@ -1232,28 +1231,28 @@ async fn process_single_workspace(ws: Workspace) {
         {
             continue;
         }
-        match implementation.stage.as_str() {
-            IMPLEMENTATION_STAGE_DEVELOPMENT => {
+        match ticket.phase {
+            TicketPhase::InDevelopment => {
                 spawn_dispatch(PollPhase::EngineerDevelopment, ticket, ws.clone());
             }
-            IMPLEMENTATION_STAGE_DIAGNOSTICS => {
+            TicketPhase::InDiagnostics => {
                 spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws.clone());
             }
-            IMPLEMENTATION_STAGE_REVIEW => {
+            TicketPhase::InReview => {
                 spawn_dispatch(PollPhase::VerifierCheck(REVIEWER_VI), ticket, ws.clone());
             }
-            IMPLEMENTATION_STAGE_QA => {
+            TicketPhase::InQa => {
                 spawn_dispatch(PollPhase::VerifierCheck(QA_VI), ticket, ws.clone());
             }
-            IMPLEMENTATION_STAGE_SANITATION => {
+            TicketPhase::InSanitation => {
                 spawn_dispatch(PollPhase::SanitationCheck, ticket, ws.clone());
             }
             other => {
                 warn!(
                     ticket = %implementation.ticket_id,
                     job = %implementation.id,
-                    stage = %other,
-                    "Unknown implementation stage — completing implementation",
+                    phase = %other,
+                    "Unknown implementation phase — completing implementation",
                 );
                 let _ = crate::jobs::complete_ticket_job(conn, &implementation.id).await;
             }
@@ -1904,7 +1903,6 @@ async fn ensure_implementation(ticket: &Ticket, ws: &Workspace, task: &str) -> O
                 &[],
                 &crate::jobs::SpawnChild::TicketJob {
                     ticket_id: ticket.id.clone(),
-                    stage: IMPLEMENTATION_STAGE_DEVELOPMENT.to_string(),
                     is_implementation: true,
                 },
             )
@@ -2838,14 +2836,12 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
     (comment.trim_start_matches('\n').to_string(), all_passed)
 }
 
-/// Sync the implementation's authoritative stage at a stage handoff (phase is
-/// derived from (kind, stage) — see [`crate::jobs::derive_ticket_phase`], so it
-/// is NOT written here), plus one stage-specific effect: `Some(task)` writes
-/// the stored dispatch task (at dispatch time, before the stage agent runs);
-/// `None` clears the prior stage's running-agent roster rows (at
-/// stage-completion handoff). Keeps the implementation's authoritative state in
-/// sync with the ticket's phase mirror. Failures log and continue — the
-/// implementation sync is best-effort; the next dispatch re-syncs.
+/// Sync the implementation's per-stage effects at a stage handoff: `Some(task)`
+/// writes the stored dispatch task (at dispatch time, before the stage agent
+/// runs); `None` clears the prior stage's running-agent roster rows (at
+/// stage-completion handoff). No stage is written as a stored mirror — the
+/// ticket phase is the only stored representation. Failures log and continue —
+/// the implementation sync is best-effort; the next dispatch re-syncs.
 async fn sync_implementation(
     conn: &crate::turso::Connection,
     job_id: &str,
@@ -2853,9 +2849,6 @@ async fn sync_implementation(
     stage: &str,
     task: Option<&str>,
 ) {
-    if let Err(e) = crate::jobs::update_implementation_job(conn, job_id, stage).await {
-        warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to sync implementation state to {stage}");
-    }
     match task {
         Some(task) => {
             if let Err(e) = crate::jobs::update_implementation_job_task(conn, job_id, task).await {
@@ -2875,11 +2868,11 @@ async fn sync_implementation(
 /// single-owner pipeline invariant holds: each stage handoff dispatches the next
 /// stage directly, so the implementation never waits on a separate poll tick.
 ///
-/// `sync` is `Some(stage)` when the implementation's authoritative
-/// `ticket_jobs.stage` must be written to the upcoming stage before dispatch;
-/// `None` on the validation-failure bounce path, where the re-dispatched
-/// engineer re-syncs the stage itself (a duplicate write would follow). Phase
-/// is derived from (kind, stage), so `sync` carries only the stage. The
+/// `sync` is `Some(stage)` when the stage handoff sync must run before dispatch
+/// (roster-clear on task=None, task write on task=Some); `None` on the
+/// validation-failure bounce path, where the re-dispatched engineer re-syncs the
+/// stage itself. No stage is written as a stored mirror — `sync` carries only
+/// the stage label for the handoff. The
 /// per-site `log` runs after the sync and before the spawn so the message stays
 /// byte-identical per caller; callers that do not log pass a no-op.
 /// `dispatch_next` builds the correct next-dispatch future:
@@ -3655,7 +3648,6 @@ fn build_agent_slots(
 async fn spawn_ticket_analysis_round(
     ticket: &Ticket,
     ws: &Workspace,
-    stage: &'static str,
     role: Role,
     prompt: &str,
     count: usize,
@@ -3683,7 +3675,6 @@ async fn spawn_ticket_analysis_round(
         &agents,
         &crate::jobs::SpawnChild::TicketJob {
             ticket_id: ticket.id.clone(),
-            stage: stage.to_string(),
             is_implementation: false,
         },
     )
@@ -3852,7 +3843,6 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
     let Ok((job_id, slots)) = spawn_ticket_analysis_round(
         &ticket,
         &ws,
-        "analysis",
         Role::Analyst,
         &message,
         DEFAULT_PARALLEL_AGENT_COUNT,
@@ -4551,23 +4541,24 @@ async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
     }
 }
 
-/// Resume a ticket job at boot: re-dispatch the stage on the SAME job. The
+/// Resume a ticket job at boot: re-dispatch the phase on the SAME job. The
 /// analysis round re-runs missing roster slots FIRST (recovering stored
 /// outcomes); the implementation stages re-dispatch the stage agent fresh (a crash
-/// mid-stage re-runs the stage). Silent background resume — no Manager
+/// mid-stage re-runs the stage). The branch derives from the ticket's phase —
+/// phase is the only stored representation. Silent background resume — no Manager
 /// notifications; results deliver via normal paths.
-async fn resume_ticket_job(stage: String, job_id: String, ticket: Ticket, ws: Workspace) {
-    match stage.as_str() {
-        "analysis" => resume_analysis_round(&job_id, ticket, ws).await,
-        IMPLEMENTATION_STAGE_DEVELOPMENT => dispatch_engineer(Arc::new(ticket), ws, true).await,
-        IMPLEMENTATION_STAGE_DIAGNOSTICS => dispatch_diagnostics(Arc::new(ticket), ws).await,
-        IMPLEMENTATION_STAGE_REVIEW => {
+async fn resume_ticket_job(job_id: String, ticket: Ticket, ws: Workspace) {
+    match ticket.phase {
+        TicketPhase::Analysis => resume_analysis_round(&job_id, ticket, ws).await,
+        TicketPhase::InDevelopment => dispatch_engineer(Arc::new(ticket), ws, true).await,
+        TicketPhase::InDiagnostics => dispatch_diagnostics(Arc::new(ticket), ws).await,
+        TicketPhase::InReview => {
             dispatch_verifiers(Arc::new(ticket), ws, REVIEWER_VI, true).await;
         }
-        IMPLEMENTATION_STAGE_QA => dispatch_verifiers(Arc::new(ticket), ws, QA_VI, true).await,
-        IMPLEMENTATION_STAGE_SANITATION => dispatch_sanitation(Arc::new(ticket), ws, true).await,
+        TicketPhase::InQa => dispatch_verifiers(Arc::new(ticket), ws, QA_VI, true).await,
+        TicketPhase::InSanitation => dispatch_sanitation(Arc::new(ticket), ws, true).await,
         other => {
-            warn!(stage = %other, job = %job_id, "Unknown ticket-job stage on resume — completing job");
+            warn!(phase = %other, job = %job_id, "Unknown ticket-job phase on resume — completing job");
             let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
         }
     }
