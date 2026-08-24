@@ -2051,6 +2051,11 @@ fn row_to_value(v: &turso::core::Value) -> Value {
 /// Copy the `sqlite_sequence` AUTOINCREMENT watermark (only for tables present
 /// in both source and target) so `sessions.id` / `chat_history.id` keep
 /// incrementing correctly after consolidation.
+///
+/// `sqlite_sequence` is created as `CREATE TABLE sqlite_sequence(name,seq)` —
+/// no PRIMARY KEY or UNIQUE on `name`, and Turso rejects indexes on it — so
+/// `ON CONFLICT(name)` is invalid SQL. Delete-then-insert is the portable
+/// upsert (the engine's AUTOINCREMENT path maintains one row per name).
 async fn copy_sqlite_sequence(
     conn: &Connection,
     io: &std::sync::Arc<dyn turso::core::IO>,
@@ -2078,8 +2083,13 @@ async fn copy_sqlite_sequence(
             continue;
         }
         conn.execute(
-            "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2) \
-             ON CONFLICT(name) DO UPDATE SET seq = excluded.seq",
+            "DELETE FROM sqlite_sequence WHERE name = ?1",
+            params![name.clone()],
+        )
+        .await
+        .with_context(|| format!("failed to clear AUTOINCREMENT watermark for '{name}'"))?;
+        conn.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
             params![name.clone(), seq],
         )
         .await
@@ -4513,6 +4523,82 @@ mod tests {
                 .await
                 .unwrap(),
             "stage column must be dropped by consolidate_002 migration"
+        );
+    }
+
+    /// A legacy sessions.db with AUTOINCREMENT `sessions` rows (and a
+    /// watermark above the surviving max id) must import without hitting the
+    /// invalid `ON CONFLICT(name)` upsert on `sqlite_sequence`, and the next
+    /// auto-id must not re-issue a deleted high id.
+    #[tokio::test]
+    async fn consolidation_import_preserves_sessions_autoincrement_watermark() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let legacy_schema = "CREATE TABLE sessions (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
+             role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);";
+        let session_conn = open_with_schema(&legacy_store_db_path(root, "sessions"), legacy_schema)
+            .await
+            .unwrap();
+        for i in 1..=3 {
+            session_conn
+                .execute(
+                    "INSERT INTO sessions (agent_id, role, content, created_at) \
+                     VALUES ('a1', 'user', ?1, '2026-01-01T00:00:00Z')",
+                    (turso::Value::Text(format!("m{i}")),),
+                )
+                .await
+                .unwrap();
+        }
+        session_conn
+            .execute(
+                "INSERT INTO sessions (id, agent_id, role, content, created_at) \
+                 VALUES (100, 'a1', 'user', 'high', '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        session_conn
+            .execute("DELETE FROM sessions WHERE id = 100", ())
+            .await
+            .unwrap();
+        let source_seq: i64 = session_conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'sessions'",
+                (),
+                |r| r.get(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            source_seq, 100,
+            "source watermark must survive the deleted high id"
+        );
+        drop(session_conn);
+
+        let conn = open_consolidated_store(root)
+            .await
+            .expect("import must succeed with AUTOINCREMENT sessions rows");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", (), |r| r.get(0))
+            .await
+            .unwrap();
+        assert_eq!(count, 3, "surviving session rows must be imported");
+        conn.execute(
+            "INSERT INTO sessions (agent_id, role, content, created_at) \
+             VALUES ('a1', 'user', 'next', '2026-01-01T00:00:00Z')",
+            (),
+        )
+        .await
+        .unwrap();
+        let next_id: i64 = conn
+            .query_row("SELECT MAX(id) FROM sessions", (), |r| r.get(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            next_id, 101,
+            "next auto-id must advance past the imported watermark, not re-issue 4 or 100"
         );
     }
 }

@@ -37,7 +37,7 @@ const LOG_RETENTION_HOURS: i64 = 8;
 async fn bootstrap_mahbot_safe() -> Result<(), String> {
     match AssertUnwindSafe(bootstrap_mahbot()).catch_unwind().await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Err(e)) => Err(format!("{e:#}")),
         Err(payload) => Err(format_startup_panic(&*payload)),
     }
 }
