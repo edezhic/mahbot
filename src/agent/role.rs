@@ -102,6 +102,7 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
         },
         Role::Engineer => &RoleInfo {
             badge_fg: (0.855, 0.439, 0.173),
+            default_reasoning_effort: "xhigh",
             display_label: "Engineer",
             ..BASE_ROLE_INFO
         },
