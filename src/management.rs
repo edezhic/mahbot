@@ -60,6 +60,12 @@ use crate::{Agent, DiagnosticsCommands, Role, Workspace, WorkspaceStatus};
 /// QA runs a single tester (see [`QA_PARALLEL_AGENT_COUNT`]).
 const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
 
+/// Base analysis roster size (the initial analyst batch). Escalation appends
+/// 2 slots, for `ANALYSIS_BASE_ROSTER_SIZE + 2` total. Kept as a named const
+/// so round-ness is never reconstructed from roster length at the escalation
+/// gate.
+const ANALYSIS_BASE_ROSTER_SIZE: usize = DEFAULT_PARALLEL_AGENT_COUNT;
+
 /// QA runs exactly one tester per round — reviewers already verify the change
 /// in depth. May be revisited if a single tester proves insufficient.
 const QA_PARALLEL_AGENT_COUNT: usize = 1;
@@ -676,7 +682,12 @@ pub async fn run_management() {
     for stage in resumable {
         // Or-pattern: every variant carries job_id + workspace_name.
         let (job_id, workspace_name) = match &stage {
-            ResumableJob::TicketJob {
+            ResumableJob::TicketAnalysis {
+                job_id,
+                workspace_name,
+                ..
+            }
+            | ResumableJob::TicketImplementation {
                 job_id,
                 workspace_name,
                 ..
@@ -740,17 +751,48 @@ pub async fn run_management() {
                     crate::research_cleanup::resume_research_cleanup(&job_id, &workspace).await;
                 });
             }
-            ResumableJob::TicketJob {
-                job_id,
-                ticket_id,
-                is_implementation,
-                ..
+            ResumableJob::TicketAnalysis {
+                job_id, ticket_id, ..
+            } => {
+                // Analysis is not implementation-driven and is not paused-frozen.
+                match crate::board::store().get_ticket(&ticket_id).await {
+                    Ok(Some(ticket)) => {
+                        info!(
+                            job = %job_id,
+                            ticket = %ticket_id,
+                            "Resuming ticket analysis job at boot",
+                        );
+                        tokio::spawn(resume_analysis_job(job_id, ticket, workspace));
+                    }
+                    Ok(None) => {
+                        warn!(
+                            job = %job_id,
+                            ticket = %ticket_id,
+                            "Resume ticket not found — completing job",
+                        );
+                        let _ = crate::jobs::complete_ticket_job(
+                            &crate::session::store().conn,
+                            &job_id,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            job = %job_id,
+                            ticket = %ticket_id,
+                            error = %e,
+                            "Failed to read resume ticket — leaving job in place",
+                        );
+                    }
+                }
+            }
+            ResumableJob::TicketImplementation {
+                job_id, ticket_id, ..
             } => {
                 // A paused workspace keeps its implementation frozen at boot (do not
                 // dispatch); an unpaused workspace re-dispatches its stage on
                 // the same job. `workspaces.paused` is the freeze authority.
-                // Analysis is not implementation-driven and is not paused-frozen.
-                if is_implementation && workspace.paused {
+                if workspace.paused {
                     info!(
                         job = %job_id,
                         ticket = %ticket_id,
@@ -763,9 +805,9 @@ pub async fn run_management() {
                         info!(
                             job = %job_id,
                             ticket = %ticket_id,
-                            "Resuming ticket-job stage at boot",
+                            "Resuming ticket implementation stage at boot",
                         );
-                        tokio::spawn(resume_ticket_job(job_id, ticket, workspace));
+                        tokio::spawn(resume_implementation_job(job_id, ticket, workspace));
                     }
                     Ok(None) => {
                         warn!(
@@ -1901,9 +1943,8 @@ async fn ensure_implementation(ticket: &Ticket, ws: &Workspace, task: &str) -> O
                 "",
                 Role::Engineer,
                 &[],
-                &crate::jobs::SpawnChild::TicketJob {
+                &crate::jobs::SpawnChild::TicketImplementation {
                     ticket_id: ticket.id.clone(),
-                    is_implementation: true,
                 },
             )
             .await
@@ -3673,9 +3714,8 @@ async fn spawn_ticket_analysis_round(
         "",
         role,
         &agents,
-        &crate::jobs::SpawnChild::TicketJob {
+        &crate::jobs::SpawnChild::TicketAnalysis {
             ticket_id: ticket.id.clone(),
-            is_implementation: false,
         },
     )
     .await?;
@@ -3733,18 +3773,28 @@ async fn load_ticket_analysis_slots(job_id: &str) -> anyhow::Result<Vec<AgentSlo
 
 // ── Backlog Analysis ──────────────────────────────────────────────────
 
+/// Round-ness of a per-run analysis job. `Base` is the initial
+/// [`ANALYSIS_BASE_ROSTER_SIZE`]-slot dispatch; `Escalation` is the +2 batch
+/// appended when every base analyst flags blockers. Round-ness is computed
+/// ONCE at the dispatch/resume boundary and threaded into the escalation gate —
+/// never reconstructed from roster length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalysisRoundKind {
+    Base,
+    Escalation,
+}
+
 /// Escalate a unanimous-blocker analysis round with 2 extra analysts on the
 /// SAME job, extending `results`. Returns false when the ticket left the
 /// Analysis phase — the job was already completed; the caller must return.
 ///
-/// Roster gate: escalation is re-evaluated only at base roster size. One
-/// verdict per slot by construction of [`run_parallel_agents`], so
-/// `results.len() == slots.len()`; the base roster is
-/// `DEFAULT_PARALLEL_AGENT_COUNT` by construction of
-/// [`spawn_ticket_analysis_round`]. On resume this guards against re-escalation
-/// after a crash between the base round and the escalation batch. Skipped
-/// during the graceful drain — no new jobs are spawned while draining.
+/// Roster gate: escalation is re-evaluated only for a `Base` round — an
+/// `Escalation` round never re-escalates. On resume this guards against
+/// re-escalation after a crash between the base round and the escalation
+/// batch. Skipped during the graceful drain — no new jobs are spawned while
+/// draining.
 #[must_use]
+#[expect(clippy::too_many_arguments)]
 async fn maybe_escalate_analysis(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
@@ -3752,10 +3802,11 @@ async fn maybe_escalate_analysis(
     extraction_prompt: &str,
     task: &str,
     resume: bool,
+    round_kind: AnalysisRoundKind,
     results: &mut Vec<ParallelVerdict>,
 ) -> bool {
-    if results.len() == DEFAULT_PARALLEL_AGENT_COUNT
-        && crate::joint_verdict::analysis_escalation_needed(results, DEFAULT_PARALLEL_AGENT_COUNT)
+    if round_kind == AnalysisRoundKind::Base
+        && crate::joint_verdict::analysis_escalation_needed(results, ANALYSIS_BASE_ROSTER_SIZE)
         && !crate::shutdown::aborting()
     {
         // Re-check the phase before spending the second batch — the ticket
@@ -3855,7 +3906,16 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         );
         return;
     };
-    run_analysis_round(&ticket, &ws, &job_id, &slots, &message, false).await;
+    run_analysis_round(
+        &ticket,
+        &ws,
+        &job_id,
+        &slots,
+        &message,
+        false,
+        AnalysisRoundKind::Base,
+    )
+    .await;
 }
 
 /// Run an analysis round: parallel analysts, unanimous-blocker escalation,
@@ -3868,7 +3928,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
 /// `jobs.task`); if that ever changes, the resume path silently diverges.
 ///
 /// Analysis stays fail-open — the ticket always advances to Planning, the
-/// Manager decides. Escalation is re-evaluated ONLY at base roster size (see
+/// Manager decides. Escalation is re-evaluated ONLY for a `Base` round (see
 /// [`maybe_escalate_analysis`]): on resume this guards against re-escalation
 /// after a crash between the base round and the escalation batch. The drain
 /// guard mirrors the fresh dispatch path.
@@ -3882,6 +3942,7 @@ async fn run_analysis_round(
     slots: &[AgentSlot],
     task: &str,
     resumed: bool,
+    round_kind: AnalysisRoundKind,
 ) {
     let extraction_prompt = load_prompt("extraction/analyst.md");
     let mut results = run_parallel_agents(
@@ -3901,6 +3962,7 @@ async fn run_analysis_round(
         &extraction_prompt,
         task,
         resumed,
+        round_kind,
         &mut results,
     )
     .await
@@ -4541,15 +4603,24 @@ async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
     }
 }
 
-/// Resume a ticket job at boot: re-dispatch the phase on the SAME job. The
-/// analysis round re-runs missing roster slots FIRST (recovering stored
-/// outcomes); the implementation stages re-dispatch the stage agent fresh (a crash
-/// mid-stage re-runs the stage). The branch derives from the ticket's phase —
-/// phase is the only stored representation. Silent background resume — no Manager
-/// notifications; results deliver via normal paths.
-async fn resume_ticket_job(job_id: String, ticket: Ticket, ws: Workspace) {
+/// Resume an analysis job at boot: re-run missing roster slots first. The
+/// branch derives from the [`ResumableJob::TicketAnalysis`] variant (kind), never
+/// from the phase — analysis owns exactly the `Analysis` phase.
+async fn resume_analysis_job(job_id: String, ticket: Ticket, ws: Workspace) {
+    if ticket.phase != TicketPhase::Analysis {
+        warn!(phase = %ticket.phase, job = %job_id, "ticket_analysis job resumed outside Analysis phase — completing job");
+        let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
+        return;
+    }
+    resume_analysis_round(&job_id, ticket, ws).await;
+}
+
+/// Resume an implementation job at boot: re-dispatch the stage on the SAME job
+/// (a crash mid-stage re-runs the stage). The branch derives from the
+/// [`ResumableJob::TicketImplementation`] variant (kind), never from the phase —
+/// implementation owns exactly the five pipeline-occupied stages.
+async fn resume_implementation_job(job_id: String, ticket: Ticket, ws: Workspace) {
     match ticket.phase {
-        TicketPhase::Analysis => resume_analysis_round(&job_id, ticket, ws).await,
         TicketPhase::InDevelopment => dispatch_engineer(Arc::new(ticket), ws, true).await,
         TicketPhase::InDiagnostics => dispatch_diagnostics(Arc::new(ticket), ws).await,
         TicketPhase::InReview => {
@@ -4558,15 +4629,17 @@ async fn resume_ticket_job(job_id: String, ticket: Ticket, ws: Workspace) {
         TicketPhase::InQa => dispatch_verifiers(Arc::new(ticket), ws, QA_VI, true).await,
         TicketPhase::InSanitation => dispatch_sanitation(Arc::new(ticket), ws, true).await,
         other => {
-            warn!(phase = %other, job = %job_id, "Unknown ticket-job phase on resume — completing job");
+            warn!(phase = %other, job = %job_id, "Unknown implementation phase on resume — completing job");
             let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
         }
     }
 }
 
 /// Resume an analysis round: re-run not-done roster slots, re-evaluate
-/// escalation only when roster size == 3 (matches analysis_escalation_needed),
-/// then re-process verdicts through the existing process_analyst_verdicts.
+/// escalation only for a `Base` round (round-kind inferred from the loaded
+/// roster: any slot idx >= ANALYSIS_BASE_ROSTER_SIZE means the round already
+/// escalated), then re-process verdicts through the existing
+/// process_analyst_verdicts.
 async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     if guard_job_phase(&ticket.id, TicketPhase::Analysis, job_id, false).await {
         return;
@@ -4581,7 +4654,15 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     };
     let ticket_arc = Arc::new(ticket);
     let task = job_task(job_id).await;
-    run_analysis_round(&ticket_arc, &ws, job_id, &slots, &task, true).await;
+    let round_kind = if slots
+        .iter()
+        .any(|s| s.idx >= i64::try_from(ANALYSIS_BASE_ROSTER_SIZE).unwrap_or(i64::MAX))
+    {
+        AnalysisRoundKind::Escalation
+    } else {
+        AnalysisRoundKind::Base
+    };
+    run_analysis_round(&ticket_arc, &ws, job_id, &slots, &task, true, round_kind).await;
 }
 
 /// Stage all changes and record the ticket's reviewed base (HEAD + index tree)

@@ -923,9 +923,8 @@ async fn process_sanitation_verdict_cases() {
             "",
             Role::Engineer,
             &[],
-            &crate::jobs::SpawnChild::TicketJob {
+            &crate::jobs::SpawnChild::TicketImplementation {
                 ticket_id: id.clone(),
-                is_implementation: true,
             },
         )
         .await
@@ -1375,9 +1374,8 @@ async fn engineer_hard_failure_pauses_workspace_and_freezes_implementation() {
         "",
         Role::Engineer,
         &[],
-        &crate::jobs::SpawnChild::TicketJob {
+        &crate::jobs::SpawnChild::TicketImplementation {
             ticket_id: ticket_id.clone(),
-            is_implementation: true,
         },
     )
     .await
@@ -1479,9 +1477,8 @@ async fn in_development_redispatch_lane_feeds_feedback() {
         "",
         Role::Engineer,
         &[],
-        &crate::jobs::SpawnChild::TicketJob {
+        &crate::jobs::SpawnChild::TicketImplementation {
             ticket_id: ticket_id.clone(),
-            is_implementation: true,
         },
     )
     .await
@@ -1597,9 +1594,8 @@ async fn bounce_to_development_feeds_feedback_to_redispatch() {
         "",
         Role::Engineer,
         &[],
-        &crate::jobs::SpawnChild::TicketJob {
+        &crate::jobs::SpawnChild::TicketImplementation {
             ticket_id: ticket_id.clone(),
-            is_implementation: true,
         },
     )
     .await

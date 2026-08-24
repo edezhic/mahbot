@@ -2168,9 +2168,8 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
             "",
             crate::Role::Engineer,
             &[],
-            &crate::jobs::SpawnChild::TicketJob {
+            &crate::jobs::SpawnChild::TicketImplementation {
                 ticket_id: ticket_id.clone(),
-                is_implementation: true,
             },
         )
         .await

@@ -228,17 +228,16 @@ pub(crate) enum SpawnChild {
     /// cleanup prompt. Leftover rows are terminalized at boot (never
     /// resumed) — the cleaner's ephemeral workspace is never registered.
     TempCleanup,
-    /// ticket_jobs (id, ticket_id) — shared by the
-    /// `ticket_analysis` and `ticket_implementation` kinds. `is_implementation`
-    /// distinguishes them so `kind_str()` yields the matching `jobs.kind`
-    /// (mirrors [`ResumableJob::TicketJob`]). The implementation variant is the
-    /// single-owner pipeline job created with an empty roster (the engineer
-    /// registers later); analysis spawns its roster at spawn time. Phase lives
-    /// only on the ticket.
-    TicketJob {
-        ticket_id: String,
-        is_implementation: bool,
-    },
+    /// ticket_jobs (id, ticket_id) — a per-run `ticket_analysis` analysis batch
+    /// over the shared substrate. Analysis spawns its full Analyst roster at
+    /// creation; round-ness (base vs escalation) is derived at the
+    /// dispatch/resume boundary, never stored on the job. Phase lives only on
+    /// the ticket.
+    TicketAnalysis { ticket_id: String },
+    /// ticket_jobs (id, ticket_id) — a single-owner `ticket_implementation`
+    /// pipeline job over the shared substrate. Created with an empty roster;
+    /// each stage's agent registers a launched row during dispatch.
+    TicketImplementation { ticket_id: String },
 }
 
 impl SpawnChild {
@@ -252,15 +251,8 @@ impl SpawnChild {
             Self::Research => "research",
             Self::ResearchCleanup => "research_cleanup",
             Self::TempCleanup => "temp_cleanup",
-            Self::TicketJob {
-                is_implementation, ..
-            } => {
-                if *is_implementation {
-                    "ticket_implementation"
-                } else {
-                    "ticket_analysis"
-                }
-            }
+            Self::TicketAnalysis { .. } => "ticket_analysis",
+            Self::TicketImplementation { .. } => "ticket_implementation",
         }
     }
 }
@@ -321,7 +313,8 @@ pub(crate) async fn spawn_job(
             .await
             .with_context(|| format!("failed to insert research_jobs row for job {id}"))?;
         }
-        SpawnChild::TicketJob { ticket_id, .. } => {
+        SpawnChild::TicketAnalysis { ticket_id }
+        | SpawnChild::TicketImplementation { ticket_id } => {
             tx.execute(
                 "INSERT INTO ticket_jobs (id, ticket_id) \
                  VALUES (?1, ?2)",
@@ -495,14 +488,13 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
 
 // ── Ticket-job substrate (ticket_jobs) ─────────────────────────────────
 //
-// The `ticket_jobs` child table is the single substrate for the two
-// ticket-job kinds: `jobs.kind='ticket_analysis'` (per-run analysis job) and
-// `jobs.kind='ticket_implementation'` (single-owner pipeline implementation job). Both
-// read their phase from `tickets.phase` and both are handled by one
-// boot-scan/lifecycle. The ticket phase is the only stored representation —
-// the job side carries no phase mirror. The active agent(s) for a running job
-// are held in the `agents` roster (status='launched'), which drives comment
-// routing and the mid-execution re-dispatch guard.
+// The `ticket_jobs` child table is the single shared substrate for the two
+// ticket-job kinds: `jobs.kind='ticket_analysis'` (per-run analysis batch) and
+// `jobs.kind='ticket_implementation'` (single-owner pipeline job). Both read
+// their phase from `tickets.phase`; the job side carries no phase mirror. The
+// active agent(s) for a running job are held in the `agents` roster
+// (status='launched'), which drives comment routing and the mid-execution
+// re-dispatch guard.
 
 /// A row of the `ticket_jobs` child table (id, ticket_id) — the shared
 /// row model for both the per-run `ticket_analysis` analysis job and the
@@ -900,22 +892,24 @@ pub(crate) async fn delete_pending_job(conn: &Connection, id: &str) -> Result<()
 /// Outcome of a boot recovery scan: jobs selected for resume.
 ///
 /// The ticket-job kinds — `jobs.kind='ticket_analysis'` (per-run analysis) and
-/// `jobs.kind='ticket_implementation'` (single-owner pipeline implementation) — share
-/// one resume variant that carries only the ticket identity; the boot-scan loop
-/// and the runtime dispatch branch on `tickets.phase` to tell analysis from
-/// implementation.
+/// `jobs.kind='ticket_implementation'` (single-owner pipeline implementation) —
+/// are modeled as distinct resume variants. The boot-scan loop selects the
+/// variant from `jobs.kind`, and runtime dispatch derives the stage from the
+/// ticket's phase.
 pub(crate) enum ResumableJob {
-    /// A per-run `ticket_analysis` analysis job or a `ticket_implementation`
-    /// pipeline job interrupted by a crash. Resumed in place: the ticket is
-    /// still in the job's expected phase. `is_implementation` is set from the
-    /// persisted `jobs.kind` at the scan site so a future third ticket-job
-    /// stage cannot be silently misclassified. Resume dispatch derives the
-    /// branch from `tickets.phase` — implementation resumes iff the phase is
-    /// pipeline-occupied, analysis iff it is `Analysis`.
-    TicketJob {
+    /// A per-run `ticket_analysis` analysis job interrupted by a crash.
+    /// Resumed in place: the ticket is still in `Analysis`.
+    TicketAnalysis {
         job_id: String,
         ticket_id: String,
-        is_implementation: bool,
+        workspace_name: String,
+    },
+    /// A single-owner `ticket_implementation` pipeline job interrupted by a
+    /// crash. Resumed in place: the ticket is still in a pipeline-occupied
+    /// phase.
+    TicketImplementation {
+        job_id: String,
+        ticket_id: String,
         workspace_name: String,
     },
     Research {
@@ -1377,12 +1371,19 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                         }
                     }
                     exclusion.push(row.ticket_id.clone());
-                    resumable.push(ResumableJob::TicketJob {
-                        job_id: job.id.clone(),
-                        ticket_id: row.ticket_id,
-                        is_implementation,
-                        workspace_name: job.workspace_name.clone(),
-                    });
+                    if is_implementation {
+                        resumable.push(ResumableJob::TicketImplementation {
+                            job_id: job.id.clone(),
+                            ticket_id: row.ticket_id,
+                            workspace_name: job.workspace_name.clone(),
+                        });
+                    } else {
+                        resumable.push(ResumableJob::TicketAnalysis {
+                            job_id: job.id.clone(),
+                            ticket_id: row.ticket_id,
+                            workspace_name: job.workspace_name.clone(),
+                        });
+                    }
                 } else {
                     to_complete.push(job.id.clone());
                 }
@@ -2148,9 +2149,8 @@ mod tests {
             "",
             crate::Role::Engineer,
             &[],
-            &SpawnChild::TicketJob {
+            &SpawnChild::TicketImplementation {
                 ticket_id: ticket_id.clone(),
-                is_implementation: true,
             },
         )
         .await
@@ -2735,9 +2735,8 @@ mod tests {
             "",
             crate::Role::Analyst,
             &[],
-            &SpawnChild::TicketJob {
+            &SpawnChild::TicketAnalysis {
                 ticket_id: analysis_ticket.clone(),
-                is_implementation: false,
             },
         )
         .await
@@ -2760,9 +2759,8 @@ mod tests {
             "",
             crate::Role::Analyst,
             &[],
-            &SpawnChild::TicketJob {
+            &SpawnChild::TicketAnalysis {
                 ticket_id: stale_analysis_ticket.clone(),
-                is_implementation: false,
             },
         )
         .await
@@ -2785,9 +2783,8 @@ mod tests {
             "",
             crate::Role::Engineer,
             &[],
-            &SpawnChild::TicketJob {
+            &SpawnChild::TicketImplementation {
                 ticket_id: impl_ticket.clone(),
-                is_implementation: true,
             },
         )
         .await
@@ -2810,9 +2807,8 @@ mod tests {
             "",
             crate::Role::Engineer,
             &[],
-            &SpawnChild::TicketJob {
+            &SpawnChild::TicketImplementation {
                 ticket_id: stale_impl_ticket.clone(),
-                is_implementation: true,
             },
         )
         .await
@@ -2824,8 +2820,8 @@ mod tests {
         assert!(
             resumable.iter().any(|r| matches!(
                 r,
-                ResumableJob::TicketJob { job_id, is_implementation, .. }
-                    if job_id.as_str() == "jb_analysis" && !*is_implementation
+                ResumableJob::TicketAnalysis { job_id, .. }
+                    if job_id.as_str() == "jb_analysis"
             )),
             "a ticket_analysis job with the ticket in Analysis must resume",
         );
@@ -2835,7 +2831,7 @@ mod tests {
         assert!(
             !resumable.iter().any(|r| matches!(
                 r,
-                ResumableJob::TicketJob { job_id, .. } if job_id.as_str() == "jb_analysis_stale"
+                ResumableJob::TicketAnalysis { job_id, .. } if job_id.as_str() == "jb_analysis_stale"
             )),
             "a ticket_analysis job with a moved ticket must complete, not resume",
         );
@@ -2845,8 +2841,8 @@ mod tests {
         assert!(
             resumable.iter().any(|r| matches!(
                 r,
-                ResumableJob::TicketJob { job_id, is_implementation, .. }
-                    if job_id.as_str() == "jb_impl" && *is_implementation
+                ResumableJob::TicketImplementation { job_id, .. }
+                    if job_id.as_str() == "jb_impl"
             )),
             "a ticket_implementation job with the ticket in a pipeline-occupied phase must resume",
         );
@@ -2856,7 +2852,7 @@ mod tests {
         assert!(
             !resumable.iter().any(|r| matches!(
                 r,
-                ResumableJob::TicketJob { job_id, .. } if job_id.as_str() == "jb_impl_stale"
+                ResumableJob::TicketImplementation { job_id, .. } if job_id.as_str() == "jb_impl_stale"
             )),
             "a ticket_implementation job with a moved ticket must complete, not resume",
         );
