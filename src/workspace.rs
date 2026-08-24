@@ -1561,7 +1561,7 @@ pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
 /// `config_kv` key holding the RFC 3339 UTC timestamp of the last nightly
 /// rediscovery pass start.
 ///
-/// Deliberately stored in `config_kv` (in the consolidated `mahbot.db`) rather than in the
+/// Deliberately stored in `config_kv` (in the consolidated `core.db`) rather than in the
 /// workspaces table: the schema has no migration path (new columns are
 /// invisible on existing live databases) and workspace rows are deleted
 /// during rediscovery, so the timestamp must live in a table that outlives

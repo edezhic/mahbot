@@ -107,7 +107,10 @@ pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiproces
 /// integrity is enforceable with real foreign keys and phase+stage updates are
 /// atomic within a single transaction domain. The logs store remains a
 /// separate file ([`LOG_DB_NAME`]).
-pub(crate) const CONSOLIDATED_DB_NAME: &str = "mahbot";
+///
+/// `core` distinguishes this domain database from the separate logs store and
+/// reads as the canonical core-domain file (`~/.mahbot/db/core.db`).
+pub(crate) const CONSOLIDATED_DB_NAME: &str = "core";
 
 /// Logical store names consolidated into [`CONSOLIDATED_DB_NAME`].
 ///

@@ -1,7 +1,7 @@
 //! Durable jobs layer: jobs/agents/pending_jobs lifecycle, boot recovery
 //! scan, and stale purge orchestration.
 //!
-//! All rows live in the consolidated domain database (`mahbot.db`) behind the
+//! All rows live in the consolidated domain database (`core.db`) behind the
 //! one shared connection — the jobs/session/board tables now share a single
 //! transaction domain, so cross-store ordering and crash-safety can be
 //! expressed in a single transaction (see the purge section in the design).

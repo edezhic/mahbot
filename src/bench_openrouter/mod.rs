@@ -348,7 +348,7 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
 
 /// Read one `config_kv` value from the live config store, read-only.
 ///
-/// Opens the consolidated `mahbot.db` (the config store's home) with
+/// Opens the consolidated `core.db` (the config store's home) with
 /// `ReadOnly|NoLock` — the same path `mahbot debug` uses — and never creates
 /// or mutates files, reusing the daemon's `.tshm` coordination. On a
 /// pre-consolidation install it falls back to the legacy per-store

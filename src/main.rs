@@ -52,7 +52,7 @@ async fn bootstrap_mahbot() -> Result<()> {
     mahbot::config::load_or_init().await?;
 
     // Boot pre-flight: classify every physical store (the consolidated
-    // `mahbot.db` plus the separate `logs.db`) BEFORE any store is opened (the
+    // `core.db` plus the separate `logs.db`) BEFORE any store is opened (the
     // logs store opens first inside init_tracing, and turso's own reopen
     // would consume the coordination evidence). The per-store heal strategy
     // flows from this scan into turso::open_store.

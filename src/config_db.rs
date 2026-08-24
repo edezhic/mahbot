@@ -1,5 +1,5 @@
 //! Config key-value pairs and per-model routing rules stored in the
-//! consolidated domain database (`mahbot.db`).
+//! consolidated domain database (`core.db`).
 //!
 //! Two tables:
 //! - `config_kv` — generic key-value string pairs for runtime configuration.

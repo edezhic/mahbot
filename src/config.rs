@@ -4,7 +4,7 @@
 //!
 //! The config system has a layered structure: hardcoded defaults in this module
 //! provide the base values, and the [`ConfigReload`] singleton is then overlayed
-//! with persisted values from the consolidated domain `mahbot.db` (via
+//! with persisted values from the consolidated domain `core.db` (via
 //! [`crate::config_db`]).
 //!
 //! At startup, [`load_or_init`] seeds `ConfigData::STRUCT_FIELDS_DEFAULT` into the
@@ -83,7 +83,7 @@
 //!
 //! # Persistence layer
 //!
-//! The tables live in the consolidated domain `mahbot.db` and are managed by [`crate::config_db`]:
+//! The tables live in the consolidated domain `core.db` and are managed by [`crate::config_db`]:
 //!
 //! | Table | Read | Write |
 //! |---|---|---|
@@ -762,7 +762,7 @@ fn persist_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 /// Fresh-install discriminator: set during [`load_or_init`] to
-/// whether the consolidated `mahbot.db` did not exist on disk before the
+/// whether the consolidated `core.db` did not exist on disk before the
 /// config store was opened this boot. [`reload_from_db`] seeds the
 /// fresh-install defaults into brand-new config databases only — existing
 /// databases receive zero writes (hard constraint).
@@ -955,7 +955,7 @@ pub async fn load_or_init() -> Result<()> {
     // Fresh-install discriminator: capture whether the config store file exists
     // BEFORE any store open creates it, so reload_from_db() can seed
     // fresh-install defaults into brand-new databases only. In the consolidated
-    // layout the config store lives in the single `mahbot.db`; an existing
+    // layout the config store lives in the single `core.db`; an existing
     // install is detected by EITHER that file OR a legacy per-store
     // `config.db` (pre-consolidation). Probing any other location would
     // classify every existing install as fresh and re-seed it on each boot,
@@ -1962,7 +1962,7 @@ mod tests {
     /// This test drives the real boot chain end-to-end instead of hand-picking
     /// `fresh` values: the discriminator probe (`config_db_is_fresh` — the
     /// exact function `load_or_init` uses), the boot flag it feeds, the store
-    /// open that creates the consolidated `mahbot.db`, and the flag-consumption + seed
+    /// open that creates the consolidated `core.db`, and the flag-consumption + seed
     /// (`seed_fresh_install_defaults_from_flag`, the `reload_from_db` path).
     ///
     /// Regression guard for the wrong-path probe: opening the config store
@@ -1980,7 +1980,7 @@ mod tests {
         );
         CONFIG_DB_FRESH_AT_BOOT.store(fresh, Ordering::Release);
 
-        // Opening the config store creates the consolidated mahbot.db — the
+        // Opening the config store creates the consolidated core.db — the
         // exact file the probe must check. This is the regression pin for the
         // original bug: probing a top-level <root>/config.db would still report
         // "fresh" here and re-seed existing installs on every boot.

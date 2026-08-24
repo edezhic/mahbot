@@ -503,7 +503,7 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
             validate_store_name(&name, false)?;
             vec![name]
         }
-        // No `--db` → diagnose each PHYSICAL file once (mahbot + logs), not
+        // No `--db` → diagnose each PHYSICAL file once (core + logs), not
         // once per logical domain name (the 6 domain names all share the one
         // consolidated file).
         None => physical_store_list(&mahbot_home)
@@ -2214,7 +2214,7 @@ mod tests {
         let msg = format!("{err:#}");
         // Compute the expectation from the physical store source (the single
         // source of truth) so the test does not hardcode the current store
-        // count — only the logs store exists, so the consolidated mahbot file
+        // count — only the logs store exists, so the consolidated core file
         // is missing.
         let total = physical_store_list(dir.path()).len();
         assert!(
@@ -2921,7 +2921,7 @@ mod tests {
     /// old child locks a different file), so the new pid lands with wide
     /// margin before the gate's second observation (~1s) and the PID change
     /// fires. Under the consolidated layout `board` is the domain file
-    /// (`mahbot.db`) and `logs` is the one separate physical store, so the two
+    /// (`core.db`) and `logs` is the one separate physical store, so the two
     /// names resolve to two distinct sidecar files.
     ///
     /// This test is `#[ignore]` by default because it exercises real cross-process fcntl locks (spawned perl lock-holder children) with multi-second waits. Run it

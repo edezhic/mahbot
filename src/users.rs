@@ -1,6 +1,6 @@
 //! Per-user identity, permissions, workspace and role preferences, and channel bindings.
 //!
-//! Two tables in the consolidated domain database (`mahbot.db`):
+//! Two tables in the consolidated domain database (`core.db`):
 //! - `users` — canonical user identity: `name`, `permissions`, `selected_workspace`, `selected_role`.
 //! - `user_channels` — channel bindings: maps a channel+identifier (e.g. Telegram @username)
 //!   to a user. The `reply_target` is stored here (per-channel routing address).

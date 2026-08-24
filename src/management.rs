@@ -1164,7 +1164,7 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 ///   `Arc<tokio::sync::Mutex<crate::turso::Connection>>` — SQL operations
 ///   serialize at the mutex,
 ///   so concurrent access is safe. All workspaces share the same consolidated
-///   `mahbot.db`;
+///   `core.db`;
 ///   per-workspace isolation is via SQL `WHERE workspace_name = ?` filtering.
 /// - The [`ticket_buffer`] and [`registry::AGENT_REGISTRY`] are
 ///   `Mutex`‑protected global singletons; contention is negligible because
