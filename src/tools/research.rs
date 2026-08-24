@@ -2882,7 +2882,7 @@ async fn research_verification_pass(
             &task_extra,
             deadline,
             resume,
-            run_key,
+            Some(crate::registry::ParentKey::Research(run_key.to_string())),
             question,
         )
         .await;

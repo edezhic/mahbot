@@ -10,8 +10,9 @@
 //! Analyst batches run three decorrelated analysts (distinct research angles)
 //! that report structured claim-level findings; consolidation runs the shared
 //! LLM grouping pass ([`crate::consensus`]) — semantic grouping + contradiction
-//! judgment with code-computed agreement brackets. The verification pass for
-//! disputed claims lives in the deep research tool only. Fail-open is
+//! judgment with code-computed agreement brackets. Disputed groups (those with
+//! a genuine contradiction) get an optional annotation-only verification round
+//! of fresh analysts, appended as a `## Verification` section. Fail-open is
 //! preserved throughout: findings are never silently lost.
 
 use crate::agent::{run_agent, run_default_agent};
@@ -115,6 +116,15 @@ impl Tool for AnalyzeTool {
     /// tools, this must be reconsidered.
     fn side_effects(&self) -> bool {
         false
+    }
+
+    /// The consolidated analysis (grouped claims + optional verification
+    /// section) must reach the calling agent in full — sandwich-truncating it
+    /// would silently drop findings and verification verdicts. The analyze
+    /// output is bounded by the analyst round itself, never by the shared
+    /// tool-output budget.
+    fn preserve_full_output(&self) -> bool {
+        true
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
@@ -788,16 +798,17 @@ impl AnalyzeRun {
 }
 
 /// Verdict of a single targeted claim verification, dispatched via
-/// `dispatch_claim_verifiers` on the deep research path only.
+/// [`dispatch_claim_verifiers`] (the deep research tool and the analyze
+/// dispute-verification round).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VerificationVerdict {
     pub verdict: String,
     pub evidence: String,
 }
 
-/// Verification outcome merged into the deep research run summary. The
-/// telemetry fields (the verifier analyst's tool calls / searches / queries)
-/// feed its query ledger.
+/// Verification outcome of one targeted claim. On the deep research path it is
+/// merged into the run summary (the telemetry fields feed its query ledger);
+/// on the analyze path it feeds the annotation-only `## Verification` section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VerificationResult {
     pub claim: String,
@@ -824,8 +835,10 @@ pub(crate) fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(
     }
 }
 
-/// Cap on verification analysts spawned by the deep research tool's
-/// verification gate (exactly one pass, bounded).
+/// Cap on verification analysts spawned by a verification gate (exactly one
+/// pass, bounded). The research tool caps at this; the analyze round needs at
+/// most 2 (see [`verification_units`]) so the cap is never reached there.
+/// Bounds the shared dispatch — never a per-run analyst budget.
 pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
 
 // ── Parallel analyst batch ───────────────────────────────────────────────
@@ -939,7 +952,7 @@ async fn consolidate_analyst_runs(
         1 => Ok(single_raw_response(&runs).expect("exactly one valid response")),
         _ => {
             let outcomes = extract_findings(runs, deadline).await;
-            consolidate_findings(ws, analyze, outcomes, round_key).await
+            consolidate_findings(ws, analyze, outcomes, round_key, deadline).await
         }
     }
 }
@@ -1030,9 +1043,9 @@ fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
 
 /// Render the fail-open analyst deliverable: the flat numbered claim list
 /// plus the raw analyst dumps, headed by an explicit `marker` naming why
-/// consolidation produced no groups. Head-placed so the sync path's 5 KB
-/// sandwich truncation keeps the marker. Shared by every no-groups path so
-/// the fallback shape stays identical.
+/// consolidation produced no groups. The marker is head-placed so it stays
+/// prominently visible in the delivered output. Shared by every no-groups path
+/// so the fallback shape stays identical.
 #[must_use]
 fn render_unconsolidated_fallback(
     marker: &str,
@@ -1057,6 +1070,7 @@ async fn consolidate_findings(
     analyze: &str,
     outcomes: Vec<AnalystOutcome>,
     round_key: &str,
+    deadline: std::time::Instant,
 ) -> Result<String> {
     let items_by_agent = claims_per_agent(&outcomes);
     let n_valid = items_by_agent.iter().filter(|l| !l.is_empty()).count();
@@ -1148,9 +1162,24 @@ async fn consolidate_findings(
     )
     .await
     {
-        crate::consensus::RepairOutcome::Repaired { output, references } => Ok(
-            render_analyze_groups(analyze, &output, &references, &table, n_valid, &outcomes),
-        ),
+        crate::consensus::RepairOutcome::Repaired { output, references } => {
+            // Annotation-only verification of disputed groups: fresh analysts
+            // re-check the contested findings, appended before the footer. The
+            // main grouped analysis is never re-run or re-rendered.
+            let verification = verify_disputed_groups(
+                ws, analyze, &output, &table, &outcomes, round_key, deadline,
+            )
+            .await;
+            Ok(render_analyze_groups(
+                analyze,
+                &output,
+                &references,
+                &table,
+                n_valid,
+                &outcomes,
+                &verification,
+            ))
+        }
         crate::consensus::RepairOutcome::Fallback => {
             tracing::warn!("Analyst consolidation failed — delivering raw claim list");
             Ok(render_unconsolidated_fallback(
@@ -1168,6 +1197,10 @@ async fn consolidate_findings(
 /// come from distinct cited agent ids; DISPUTED appears only when the group's
 /// contradiction flag is true. Self-reported caveats of a cited claim render
 /// as member metadata, never as contradictions.
+///
+/// `verification` is the annotation-only `## Verification` section (empty when
+/// no disputed group was verified) — inserted before the `_Original question:`
+/// footer so the main grouped analysis is never disturbed.
 #[must_use]
 fn render_analyze_groups(
     analyze: &str,
@@ -1176,6 +1209,7 @@ fn render_analyze_groups(
     table: &crate::consensus::ItemTable<'_>,
     n_valid: usize,
     outcomes: &[AnalystOutcome],
+    verification: &str,
 ) -> String {
     let mut out = String::new();
     let summary = output.summary.trim();
@@ -1215,6 +1249,9 @@ fn render_analyze_groups(
             line
         },
     ));
+    if !verification.is_empty() {
+        let _ = write!(out, "\n\n{verification}");
+    }
     // Original question for context (answers are delivered out of band).
     let _ = write!(out, "\n\n_Original question: {analyze}_");
     out
@@ -1279,8 +1316,9 @@ pub(crate) fn max_confidence(a: &str, b: &str) -> String {
     }
 }
 
-/// One claim targeted for verification by the deep research tool's
-/// verification gate, plus the material fed into the fresh analyst's task.
+/// One claim targeted for verification by a verification gate (deep research
+/// tool's, or the analyze dispute-verification round), plus the material fed
+/// into the fresh analyst's task.
 pub(crate) struct VerificationTarget {
     pub(crate) claim: String,
     pub(crate) sources: String,
@@ -1344,6 +1382,11 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
 /// ledger). The wait shares the round-wide `deadline`. Shared with the deep
 /// research tool's verification gate.
 ///
+/// `parent_key` names the parent invocation the verifiers group under
+/// (research verifiers pass [`ParentKey::Research`]; analyze verifiers pass
+/// [`ParentKey::AnalyzeRound`]) — the running-agents view and research-cancel
+/// sweep use it, so it must be supplied by the caller, never hardcoded.
+///
 /// Returns the results PLUS the dispatched agent IDs (the deep research
 /// sanitizer needs them at dispatch time — successful writers never appear in
 /// wrap-up snapshots; the ids ride the return value so the shared helper
@@ -1356,7 +1399,7 @@ pub(crate) async fn dispatch_claim_verifiers(
     task_extra: &str,
     deadline: std::time::Instant,
     resume: bool,
-    run_key: &str,
+    parent_key: Option<crate::registry::ParentKey>,
     question: &str,
 ) -> (Vec<VerificationResult>, Vec<String>) {
     let task_template = load_prompt("analyze/verify.md");
@@ -1382,7 +1425,7 @@ pub(crate) async fn dispatch_claim_verifiers(
             task.push_str(task_extra);
             let extraction_prompt = extraction_prompt.clone();
             let claim_text = t.claim.clone();
-            let run_key = run_key.to_string();
+            let parent_key = parent_key.clone();
             let question = question.to_string();
             move |round| async move {
                 run_claim_verifier(
@@ -1392,7 +1435,7 @@ pub(crate) async fn dispatch_claim_verifiers(
                     &task,
                     &extraction_prompt,
                     round,
-                    &run_key,
+                    parent_key,
                     &question,
                 )
                 .await
@@ -1424,8 +1467,10 @@ pub(crate) async fn dispatch_claim_verifiers(
 /// Run one claim verifier: a fresh Analyst researches the claim and returns
 /// its structured verdict. Any failure yields "unresolved" — fail-open.
 ///
-/// `question` is the research run's question — threaded as the run group's
-/// header label (purely presentational).
+/// `question` is the run's question — threaded as the run group's header
+/// label (purely presentational). `parent_key` is supplied by the dispatcher
+/// so the verifier groups under the correct parent invocation (research run /
+/// analyze round).
 #[expect(clippy::too_many_arguments)]
 async fn run_claim_verifier(
     ws: &Workspace,
@@ -1434,7 +1479,7 @@ async fn run_claim_verifier(
     task: &str,
     extraction_prompt: &str,
     round: crate::agent::RoundOpts,
-    run_key: &str,
+    parent_key: Option<crate::registry::ParentKey>,
     question: &str,
 ) -> VerificationResult {
     let (agent, response) = run_default_agent(
@@ -1443,10 +1488,14 @@ async fn run_claim_verifier(
         ws,
         task,
         Some(round),
-        Some(crate::registry::ParentKey::Research(run_key.to_string())),
+        parent_key,
         Some(question.to_string()),
     )
     .await;
+    // The telemetry fields ride every VerificationResult regardless of caller:
+    // the deep-research path consumes them for its run-summary/query ledger,
+    // while the analyze path only renders claim/verdict/evidence in the
+    // annotation section (the extra scan is cheap and keeps one shared shape).
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
     let Some(raw) = response else {
         return VerificationResult {
@@ -1501,6 +1550,171 @@ async fn run_claim_verifier(
 /// corruption in the consolidated output.
 pub(crate) fn escape_fences(s: &str) -> String {
     s.replace("```", "\\`\\`\\`")
+}
+
+// ── Analyze dispute-verification round ──────────────────────────────────
+
+/// Split the disputed groups into verification units.
+///
+/// Exactly one disputed group → a single unit (→ 1 verifier). More than one →
+/// two roughly-equal parts **by group count**, the FIRST part taking the extra
+/// group when the count is odd (→ 2 verifiers). Each unit is verified by
+/// exactly one fresh analyst, so the verification cost is bounded by the rule
+/// above — no per-run analyst budget.
+fn verification_units<'a>(
+    disputed: &[&'a crate::consensus::GroupingGroup],
+) -> Vec<Vec<&'a crate::consensus::GroupingGroup>> {
+    if disputed.len() <= 1 {
+        return vec![disputed.to_vec()];
+    }
+    // ceil(n / 2) — the first part takes the extra group on an odd count.
+    let first_count = disputed.len().div_ceil(2);
+    let (first, second) = disputed.split_at(first_count);
+    vec![first.to_vec(), second.to_vec()]
+}
+
+/// Synthesize ONE verifiable proposition for a verification unit (a disputed
+/// group, or — for a split unit — several groups treated as a single unit).
+///
+/// The claim is a single statement built from the group's heading + its member
+/// claims; member sources and self-reported contradictions are aggregated into
+/// the [`VerificationTarget`] fields so the verifier sees both the assertion
+/// and the evidence pointing both ways. A group with no resolvable member
+/// claims degrades to its bare heading (never silent).
+fn synthesize_verification_target(
+    unit: &[&crate::consensus::GroupingGroup],
+    table: &crate::consensus::ItemTable<'_>,
+    outcomes: &[AnalystOutcome],
+) -> VerificationTarget {
+    let mut claim_parts = Vec::new();
+    let mut sources = Vec::new();
+    let mut contradictions = Vec::new();
+    for group in unit {
+        let mut group_claims = Vec::new();
+        for member in &group.members {
+            if let Some((_, text)) = table.resolve(member.id) {
+                group_claims.push(text.to_string());
+            }
+            if let Some((agent_idx, item_idx)) = table.resolve_index(member.id)
+                && let Some(AnalystOutcome::Findings { findings, .. }) = outcomes.get(agent_idx)
+                && let Some(claim) = findings.claims.get(item_idx)
+            {
+                if !claim.source.is_empty() {
+                    sources.push(claim.source.clone());
+                }
+                contradictions.extend(claim.contradictions.iter().cloned());
+            }
+        }
+        let claim = if group_claims.is_empty() {
+            group.heading.clone()
+        } else {
+            format!("{}: {}", group.heading, group_claims.join("; "))
+        };
+        claim_parts.push(claim);
+    }
+    VerificationTarget::new(
+        &claim_parts.join("\n"),
+        &sources.join("; "),
+        &contradictions.join("; "),
+    )
+}
+
+/// Render the annotation-only `## Verification` section from verifier results.
+/// Empty when no verifier produced a verdict. Each verdict line carries the
+/// synthesized claim, the verdict, and the supporting evidence. Composite
+/// (multi-group) claims AND multi-line evidence render their newlines as
+/// semicolons so the bullet stays on one line.
+fn render_verification_section(results: &[VerificationResult]) -> String {
+    if results.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Verification");
+    for v in results {
+        let claim_line = escape_fences(&v.claim).replace('\n', "; ");
+        let evidence_line = escape_fences(&v.evidence).replace('\n', "; ");
+        let _ = write!(
+            out,
+            "\n- {claim_line} → **{}** — {evidence_line}",
+            v.verdict,
+        );
+    }
+    out
+}
+
+/// (Deadline agreement) Verification runs only while ≤ half of the round
+/// window has elapsed; past that, it is skipped entirely (nothing appended)
+/// rather than forced all-unresolved. The round window is
+/// [`round_timeout`] — the same bound the analyst round shares.
+fn verification_window_open(deadline: std::time::Instant) -> bool {
+    let Some(anchor) = deadline.checked_sub(round_timeout() / 2) else {
+        return false;
+    };
+    std::time::Instant::now() <= anchor
+}
+
+/// Annotation-only verification of disputed consensus groups.
+///
+/// Detects groups flagged `contradiction:true` (those rendered `[n/N ·
+/// DISPUTED]`), and — only when at least one exists — dispatches fresh
+/// verification analysts (1 for a single disputed group, 2 over two split
+/// parts for more) to re-check them. Results are appended as a
+/// `## Verification` section; the main grouped analysis is never modified and
+/// grouping is never re-run. No per-run analyst budget is introduced, and the
+/// round is best-effort (never checkpointed).
+async fn verify_disputed_groups(
+    ws: &Workspace,
+    analyze: &str,
+    output: &crate::consensus::GroupingOutput,
+    table: &crate::consensus::ItemTable<'_>,
+    outcomes: &[AnalystOutcome],
+    round_key: &str,
+    deadline: std::time::Instant,
+) -> String {
+    let disputed: Vec<&crate::consensus::GroupingGroup> =
+        output.groups.iter().filter(|g| g.contradiction).collect();
+    if disputed.is_empty() {
+        // No contested finding — the fast single-round path is preserved.
+        return String::new();
+    }
+    if !verification_window_open(deadline) {
+        tracing::warn!(
+            disputed_groups = disputed.len(),
+            "Analyze verification skipped — more than half the round window elapsed"
+        );
+        return String::new();
+    }
+    if crate::shutdown::aborting() {
+        tracing::warn!(
+            disputed_groups = disputed.len(),
+            "Analyze verification skipped — shutdown/drain in progress"
+        );
+        return String::new();
+    }
+    let units = verification_units(&disputed);
+    let targets: Vec<VerificationTarget> = units
+        .iter()
+        .map(|unit| synthesize_verification_target(unit, table, outcomes))
+        .collect();
+    tracing::info!(
+        disputed_groups = disputed.len(),
+        verifiers = units.len(),
+        "Analyze verification round dispatching fresh analysts"
+    );
+    let prefix = format!("analyze_{}_verify", ws.name);
+    let (results, _dispatched) = dispatch_claim_verifiers(
+        ws,
+        &prefix,
+        &targets,
+        "",
+        deadline,
+        false,
+        Some(crate::registry::ParentKey::AnalyzeRound(
+            round_key.to_string(),
+        )),
+        analyze,
+    )
+    .await;
+    render_verification_section(&results)
 }
 
 /// Render the fail-open raw dump: the raw response of every valid analyst
@@ -1826,7 +2040,7 @@ mod tests {
             ],
             ungrouped: vec![crate::consensus::GroupingMember { id: 3 }],
         };
-        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes);
+        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, "");
         assert!(
             text.contains("**Alpha** [2/2]"),
             "consensus group renders [2/2] from distinct cited agents: {text}"
@@ -1875,7 +2089,7 @@ mod tests {
             }],
             ungrouped: vec![],
         };
-        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes);
+        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, "");
         assert!(
             text.contains("**Alpha** [2/2 · DISPUTED]"),
             "contradiction group renders [2/2 · DISPUTED]: {text}"
@@ -1910,7 +2124,7 @@ mod tests {
             }],
             ungrouped: vec![],
         };
-        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes);
+        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, "");
         assert!(
             text.contains("caveat: source B says alpha may be false"),
             "self-reported caveat renders as member metadata: {text}"
@@ -1932,7 +2146,14 @@ mod tests {
         let provider: Arc<dyn crate::Provider> = Arc::new(fake);
         let _guard = install_fake_provider(provider);
         let ws = test_ws("/tmp/test_ws");
-        consolidate_findings(&ws, "test question", outcomes, "test_round").await
+        consolidate_findings(
+            &ws,
+            "test question",
+            outcomes,
+            "test_round",
+            std::time::Instant::now() + std::time::Duration::from_mins(60),
+        )
+        .await
     }
 
     /// Two analysts agreeing on one claim (2/3, no contradictions).
@@ -2070,7 +2291,14 @@ mod tests {
                 failure: "parse failed".into(),
             },
         ];
-        let result = consolidate_findings(&ws, "test question", outcomes, "test_round").await;
+        let result = consolidate_findings(
+            &ws,
+            "test question",
+            outcomes,
+            "test_round",
+            std::time::Instant::now() + std::time::Duration::from_mins(60),
+        )
+        .await;
         let text = result.expect("single parseable source succeeds");
         assert!(
             text.contains("only one analyst produced parseable claims — grouping skipped"),
@@ -2215,12 +2443,12 @@ mod tests {
         );
     }
 
-    /// The sync analyze path truncates tool output via the 5 KB sandwich (head
-    /// 2/3 + tail 1/3) — the fail-open marker is head-placed so it survives
-    /// even when the consolidated output overflows the budget.
+    /// The sync analyze path preserves tool output in full — the analyze tool
+    /// overrides `preserve_full_output` so the consolidated analysis (and any
+    /// appended verification section) is never sandwich-truncated.
     #[tokio::test]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
-    async fn fail_open_marker_survives_sync_truncation() {
+    async fn analyze_output_preserved_full_no_sandwich_truncation() {
         let _guard = retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -2228,15 +2456,21 @@ mod tests {
             .err(crate::retry::FailureClass::Transport, "down")
             .err(crate::retry::FailureClass::Transport, "down")
             .err(crate::retry::FailureClass::Transport, "down");
-        // A long raw report guarantees the output overflows the 5 KB budget.
+        // A long raw report would overflow the shared 5 KB budget if truncated.
         let long_report = "lorem ipsum ".repeat(2_000);
         let result = consolidate_with_script(agreed_outcomes(&long_report, "second"), fake).await;
         let text = result.expect("fail-open must succeed");
-        // Simulate the sync path's tool-output truncation (Tool::format_output).
-        let truncated = crate::util::truncate_tool_output(&text);
+        // The analyze tool's format_output returns the output verbatim — no
+        // head/tail sandwich, so the marker and all findings reach the caller.
+        let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
+        let formatted = tool.format_output(&text);
+        assert_eq!(
+            formatted, text,
+            "analyze output must be preserved in full (no sandwich truncation)"
+        );
         assert!(
-            truncated.contains("unconsolidated — consolidation failed"),
-            "head-placed marker must survive 5 KB sandwich truncation: {truncated}"
+            formatted.contains("unconsolidated — consolidation failed"),
+            "fail-open marker present: {formatted}"
         );
     }
 
@@ -2270,7 +2504,7 @@ mod tests {
             group: 0,
             member: crate::consensus::GroupingMember { id: 1 },
         }];
-        let text = render_analyze_groups("q", &output, &references, &table, 2, &outcomes);
+        let text = render_analyze_groups("q", &output, &references, &table, 2, &outcomes, "");
         assert!(
             text.contains("Agent 1: actually unsafe [DISPUTED — contradicts group 0 \"Safety\"]"),
             "reference must render with DISPUTED + cross-ref: {text}"
@@ -2405,5 +2639,189 @@ mod tests {
             "resumed envelope routes to the original caller role, not Manager"
         );
         assert_eq!(envelope.user_name, "caller-user");
+    }
+
+    // ── Analyze dispute-verification round helpers ────────────────────────
+
+    /// Build a disputed consensus group over the given flat item ids.
+    fn disputed_group(heading: &str, members: &[usize]) -> crate::consensus::GroupingGroup {
+        crate::consensus::GroupingGroup {
+            heading: heading.to_string(),
+            contradiction: true,
+            members: members
+                .iter()
+                .map(|id| crate::consensus::GroupingMember { id: *id })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn verification_units_single_group_is_one_unit() {
+        let groups = vec![disputed_group("Alpha", &[0, 1])];
+        let units = verification_units(&groups.iter().collect::<Vec<_>>());
+        assert_eq!(units.len(), 1, "exactly one disputed group → one unit");
+        assert_eq!(units[0].len(), 1);
+        assert_eq!(units[0][0].heading, "Alpha");
+    }
+
+    #[test]
+    fn verification_units_splits_by_group_count_first_takes_extra() {
+        let group = |h: &str| disputed_group(h, &[]);
+        // 3 groups → 2 units: first takes the extra (2), second gets 1.
+        let groups = vec![group("A"), group("B"), group("C")];
+        let refs = groups.iter().collect::<Vec<_>>();
+        let units = verification_units(&refs);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].len(), 2, "first part takes the extra group");
+        assert_eq!(units[1].len(), 1);
+        assert_eq!(units[0][1].heading, "B");
+        assert_eq!(units[1][0].heading, "C");
+
+        // 4 groups → 2 units of 2/2.
+        let groups = vec![group("A"), group("B"), group("C"), group("D")];
+        let refs = groups.iter().collect::<Vec<_>>();
+        let units = verification_units(&refs);
+        assert_eq!(units[0].len(), 2);
+        assert_eq!(units[1].len(), 2);
+    }
+
+    #[test]
+    fn synthesize_verification_target_merges_heading_claims_sources_contradictions() {
+        // Two disputed groups, each with member claims carrying a source and a
+        // self-reported contradiction (member caveat).
+        let mut f1 = findings(vec![("alpha is true", "url1", "high")]);
+        f1.claims[0].contradictions = vec!["src says alpha may be false".into()];
+        let f2 = findings(vec![("alpha is false", "url2", "high")]);
+        let mut f3 = findings(vec![("beta is true", "url3", "medium")]);
+        f3.claims[0].contradictions = vec!["src says beta unknown".into()];
+        let f4 = findings(vec![("beta is false", "url4", "medium")]);
+        let outcomes = vec![
+            AnalystOutcome::Findings {
+                raw: "r1".into(),
+                findings: f1,
+            },
+            AnalystOutcome::Findings {
+                raw: "r2".into(),
+                findings: f2,
+            },
+            AnalystOutcome::Findings {
+                raw: "r3".into(),
+                findings: f3,
+            },
+            AnalystOutcome::Findings {
+                raw: "r4".into(),
+                findings: f4,
+            },
+        ];
+        let items = claims_per_agent(&outcomes);
+        let table = crate::consensus::ItemTable::new(&items);
+        let group = |heading: &str, ids: &[usize]| disputed_group(heading, ids);
+        // Unit = one disputed group (Alpha over ids 0 and 1).
+        let groups = vec![group("Alpha", &[0, 1])];
+        let unit = groups.iter().collect::<Vec<_>>();
+        let target = synthesize_verification_target(&unit, &table, &outcomes);
+        assert!(
+            target
+                .claim
+                .contains("Alpha: alpha is true; alpha is false"),
+            "claim synthesizes heading + member claims: {}",
+            target.claim
+        );
+        assert!(
+            target.sources.contains("url1") && target.sources.contains("url2"),
+            "sources aggregate member sources: {}",
+            target.sources
+        );
+        assert!(
+            target
+                .contradictions
+                .contains("src says alpha may be false"),
+            "member self-reported contradictions aggregate: {}",
+            target.contradictions
+        );
+    }
+
+    #[test]
+    fn render_verification_section_formats_verdicts() {
+        let results = vec![
+            VerificationResult {
+                claim: "Alpha: x".into(),
+                verdict: "supported".into(),
+                evidence: "primary source confirms".into(),
+                tool_calls: 1,
+                searches: 2,
+                queries: vec!["q".into()],
+            },
+            VerificationResult {
+                claim: "Beta: y".into(),
+                verdict: "unresolved".into(),
+                evidence: "no evidence found".into(),
+                tool_calls: 0,
+                searches: 1,
+                queries: vec![],
+            },
+        ];
+        let text = render_verification_section(&results);
+        assert_eq!(
+            text,
+            "## Verification\n- Alpha: x → **supported** — primary source confirms\n- Beta: y → **unresolved** — no evidence found",
+            "verdicts render as annotation lines"
+        );
+        assert!(
+            render_verification_section(&[]).is_empty(),
+            "empty results render an empty section"
+        );
+    }
+
+    #[test]
+    fn render_analyze_groups_places_verification_before_footer() {
+        let outcomes = vec![
+            AnalystOutcome::Findings {
+                raw: "r1".into(),
+                findings: findings(vec![("alpha is true", "url1", "high")]),
+            },
+            AnalystOutcome::Findings {
+                raw: "r2".into(),
+                findings: findings(vec![("alpha is false", "url2", "high")]),
+            },
+        ];
+        let items = claims_per_agent(&outcomes);
+        let table = crate::consensus::ItemTable::new(&items);
+        let output = crate::consensus::GroupingOutput {
+            summary: "disputed.".into(),
+            groups: vec![disputed_group("Alpha", &[0, 1])],
+            ungrouped: vec![],
+        };
+        let verification = render_verification_section(&[VerificationResult {
+            claim: "Alpha: alpha is true; alpha is false".into(),
+            verdict: "unresolved".into(),
+            evidence: "not decided".into(),
+            tool_calls: 0,
+            searches: 0,
+            queries: vec![],
+        }]);
+        let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, &verification);
+        let footer = text.find("_Original question: q_").expect("footer present");
+        let verification_pos = text.find("## Verification").expect("verification present");
+        assert!(
+            verification_pos < footer,
+            "verification section inserted before the _Original question: footer"
+        );
+    }
+
+    #[test]
+    fn verification_window_open_guards_half_round_window() {
+        // A fresh round (deadline = now + window) is open: verification runs.
+        let open = verification_window_open(std::time::Instant::now() + round_timeout());
+        assert!(
+            open,
+            "verification runs while ≤ half the window has elapsed"
+        );
+        // An elapsed round (deadline already in the past) is closed: skip.
+        let closed = verification_window_open(std::time::Instant::now() - round_timeout() * 2);
+        assert!(
+            !closed,
+            "verification skipped when more than half the window elapsed"
+        );
     }
 }
