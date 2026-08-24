@@ -1128,21 +1128,10 @@ fn parse_messages_to_md_items(messages: &[ChatMessage]) -> Vec<Vec<markdown::Ite
                 .unwrap_or_else(|| m.content.clone());
             let processed = super::media_markers::preprocess(&display);
             let escaped = escape_html_blocks(&processed);
+            let escaped = super::markdown_breaks::hard_breaks(&escaped);
             markdown::parse(&escaped).collect()
         })
         .collect()
-}
-
-/// Markdown options iced's `markdown::parse` runs with (iced_widget
-/// `src/markdown.rs`, `parse_with`). [`escape_html_blocks`] pre-scans with the
-/// exact same option set so it classifies HTML regions identically to the real
-/// parse; keep in sync if iced's defaults change.
-fn iced_markdown_options() -> pulldown_cmark::Options {
-    pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | pulldown_cmark::Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
-        | pulldown_cmark::Options::ENABLE_TABLES
-        | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
-        | pulldown_cmark::Options::ENABLE_TASKLISTS
 }
 
 /// Escape `<` → `&lt;` only inside the regions the markdown parser classifies
@@ -1174,7 +1163,8 @@ fn escape_html_blocks(text: &str) -> std::borrow::Cow<'_, str> {
     }
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
     for (event, range) in
-        pulldown_cmark::Parser::new_ext(text, iced_markdown_options()).into_offset_iter()
+        pulldown_cmark::Parser::new_ext(text, super::markdown_breaks::iced_markdown_options())
+            .into_offset_iter()
     {
         match event {
             pulldown_cmark::Event::Html(_) | pulldown_cmark::Event::InlineHtml(_) => {

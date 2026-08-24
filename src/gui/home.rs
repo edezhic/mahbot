@@ -62,6 +62,7 @@ fn display_message(
         Vec::new()
     } else {
         let processed = super::media_markers::preprocess(&content);
+        let processed = super::markdown_breaks::hard_breaks(&processed);
         markdown::parse(&processed).collect()
     };
     DisplayMessage {
