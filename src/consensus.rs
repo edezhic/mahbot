@@ -847,7 +847,7 @@ pub(crate) async fn run_grouping_repair(
                 .first()
                 .map_or(FailureClass::ValidationOther, |(c, _)| *c)
         };
-        tracing::info!(
+        tracing::debug!(
             purpose,
             workspace = %ws.name,
             round,

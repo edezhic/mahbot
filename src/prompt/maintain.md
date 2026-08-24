@@ -2,9 +2,9 @@ I need you to thoroughly investigate the codebase and look for refactoring oppor
 Any simplification of the code without breaking current behaviour is relevant. 
 Don't rush and look where code is unnecessarily convoluted - our goal is to identify improvements. 
 
-Splitting up existing modules/functions without actually reducing complexity and the amount of code is very low priority. 
-Aligning names of variables/functions/etc, updating stale comments, trimming narration comments, consolidating overlapping tests, deduplicating things is medium priority. 
-Untangling complex code while resolving subtle bugs is high priority. 
+- Splitting up existing modules/functions without actually reducing complexity and the amount of code is very low priority. 
+- Aligning names of variables/functions/etc, updating stale comments, trimming narration comments, consolidating overlapping tests, deduplicating things is medium priority. 
+- Untangling complex code while resolving subtle bugs is high priority. 
 
 ## Code quality patterns to detect
 When investigating, also look for these specific design issues:
@@ -12,11 +12,11 @@ When investigating, also look for these specific design issues:
 - **Spaghetti growth** — ad-hoc conditionals, weird `if` statements, special cases tacked onto unrelated flows. These are design problems.
 - **Prefer direct code** — thin wrappers, identity abstractions, unnecessary generic mechanisms hiding simple data-shape assumptions.
 - **Sequential orchestration smell** — independent operations serialized without reason; non-atomic updates across unrelated systems.
-- **Type/boundary issues** — unnecessary casts, `as` conversions, redundant `Option` wrapping.
+- **Type/boundary issues** — unnecessary casts, unsafe conversions, redundant optional wrapping.
 - **Canonical layer violations** — feature logic leaking into shared paths; bespoke helpers where a canonical utility already exists.
 - **Premature optimization** - most projects aren't high-load low-latency services and would benefit more from cleaner code than saving a few microseconds of CPU time.
 - **Speculative hardening** — adding resilience, fallback, retry, or graceful-degradation logic for failure modes that the architecture either cannot produce or makes extremely unlikely.
-- **Outdated docs** - comments and documentation whose contents don't match the actual behaviour/code.
+- **Outdated docs** - comments and documentation whose contents don't match the actual behaviour/code. Including cases of comments near `X` stating that `X is not Y`, and all other obvious statements are noise that should be eliminated.
 - **Narration comments** — comments that restate the code line-by-line instead of explaining non-obvious intent, invariants, or tradeoffs.
 - **Test suite bloat** — clusters of narrow unit tests with overlapping scenarios; cases where one broader test already covers another; opportunities to merge, parametrize, or remove subsumed tests. Overtesting - unit-tests for simple straightforward code just for the sake of coverage.
 - **Confusing naming** - variable passed into the function with different arg name; same-meaning variables named differently in different places.

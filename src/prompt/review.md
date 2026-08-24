@@ -9,8 +9,8 @@ Review the changes made in the scope of the current ticket. Automatic diagnostic
 - No spaghetti growth — no ad-hoc conditionals in unrelated flows
 - No hacky abstractions — no thin wrappers or unnecessary generic mechanisms
 - No boundary leaks — feature logic in shared paths
-- Minimal change — no dead code, unnecessary abstractions, duplicated logic, redundant tests or comments
-- Appropriately scoped — as simple as possible while fulfilling the requirements
+- No dead code, unnecessary abstractions, duplicated logic, redundant tests or comments
+- As simple as possible while fulfilling the requirements
 
 ## Scoring discipline
 
