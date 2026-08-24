@@ -184,6 +184,15 @@ fn existing_image_marker_values(history: &[ChatMessage]) -> std::collections::Ha
 /// absolute or cannot be compressed into a bounded JPEG data-URI (e.g. an SVG,
 /// which the compressor cannot rasterize) — the user still receives the file via
 /// the marker in the raw output.
+///
+/// This deliberately does NOT route through the shared classifier: as a
+/// *producer* it must emit a bounded compressed payload, so the async
+/// full-decode + compression (`local_image_to_compressed_data_uri_with_meta`)
+/// is its authoritative validity check. Routing through the classifier would
+/// only add a redundant decode — the classifier's local-file validity check
+/// (`raster_decode_limits`: 256 MiB / 16384 px) is a bounded decode but adds no
+/// encoding value on top of the producer's own decode + resize + JPEG-encode,
+/// which is what actually bounds the emitted payload.
 async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> {
     // Cheap guard: skip the regex scan for outputs carrying no image marker.
     if !output.contains("[IMAGE:") {

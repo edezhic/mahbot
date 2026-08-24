@@ -26,6 +26,7 @@
 
 use crate::ChannelMessage;
 use crate::tools::browser::BrowserTool;
+use crate::util::media_target::{self, MediaTarget};
 use crate::util::{MEDIA_MARKER_RE, file_name_or_path, is_http_url, parse_media_marker};
 use regex::Regex;
 use std::borrow::Cow;
@@ -154,6 +155,47 @@ enum ImageAction {
     },
 }
 
+/// Produce a data-URI for a confirmed-decodable local raster that is guaranteed
+/// under the shared encoded-payload cap the provider accepts, so an image is
+/// never silently dropped downstream. When `compress` is set the primary encode
+/// is a bounded JPEG; a compression failure (the only non-validity error left
+/// after the classifier gate) falls back to the original bytes. Any over-cap
+/// result is re-encoded to a bounded JPEG, and a degenerate over-cap result even
+/// after that re-encode fails closed.
+async fn bounded_image_data_uri(path: &std::path::Path, compress: bool) -> anyhow::Result<String> {
+    let primary = if compress {
+        match crate::util::local_image_to_compressed_data_uri(path).await {
+            Ok(uri) => Ok(uri),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "Image compression failed — passing the original bytes through");
+                crate::util::local_image_to_data_uri(path).await
+            }
+        }
+    } else {
+        crate::util::local_image_to_data_uri(path).await
+    };
+    match primary {
+        Ok(uri) if uri.len() <= media_target::MAX_DATA_URI_ENCODED_BYTES => Ok(uri),
+        Ok(_) => {
+            // Over-cap: fall back to a bounded JPEG re-encode. On the compress
+            // path the primary is the byte-identical fallback (a compress-succeeded
+            // JPEG is always under cap), so re-running the compressor may recover
+            // the image; if it is still over-cap it fails closed rather than forward
+            // an over-cap payload.
+            tracing::warn!(path = %path.display(), "image data-URI exceeds the encoded-payload cap — re-encoding to a bounded JPEG");
+            let reencoded = crate::util::local_image_to_compressed_data_uri(path).await?;
+            if reencoded.len() <= media_target::MAX_DATA_URI_ENCODED_BYTES {
+                Ok(reencoded)
+            } else {
+                Err(anyhow::Error::msg(
+                    "image exceeds the compressed data-URI cap",
+                ))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Handle an IMAGE marker — convert to a data URI, invalid reference, or (for
 /// out-of-scope paths) a plain-text annotation. Saves a workspace copy if
 /// `uploads_dir` is available. When `compress` is set the data URI is a
@@ -167,8 +209,10 @@ async fn handle_image(
     uploads_dir: Option<&std::path::Path>,
     compress: bool,
 ) -> ImageAction {
-    // HTTP/HTTPS URLs can be sent as-is.
-    if is_http_url(path) {
+    // Only a well-formed http(s) URL is sent as-is; a malformed one falls
+    // through to the classifier (which is equally strict) and stays inert text,
+    // matching the provider's final image gate.
+    if media_target::is_valid_remote_url(path) {
         return ImageAction::Keep;
     }
 
@@ -192,24 +236,40 @@ async fn handle_image(
         };
     }
 
-    // Save a copy to workspace uploads so the agent can reference it
-    let saved = save_media_to_workspace(path_obj, uploads_dir, "image", "png")
-        .await
-        .map(|saved| saved.annotation);
+    // Only a real raster may be converted — a non-image file with an image
+    // extension inside the temp dir previously failed open to a junk data URI.
+    // The file is in-scope (containment passed), so it is a pure temp artifact
+    // and is cleaned up even though it is never consumed as an image. The
+    // classifier now requires a real decode for a local file (authoritative, not
+    // a magic sniff), so it is offloaded off the async worker (the cached result
+    // makes repeated calls cheap).
+    if !matches!(
+        crate::util::with_block_in_place(|| media_target::classify_media_image_target(path)),
+        MediaTarget::LocalImage
+    ) {
+        return ImageAction::Replace {
+            replacement: invalid_ref,
+            upload_annotation: None,
+            delete_temp: true,
+        };
+    }
 
-    // Convert to data URI for the API request. The compressed path is
-    // fail-open: any decode/encode error falls back to the original bytes
-    // untouched; a total conversion failure degrades to the invalid ref.
-    let data_uri = if compress {
-        match crate::util::local_image_to_compressed_data_uri(path_obj).await {
-            Ok(uri) => Ok(uri),
-            Err(e) => {
-                tracing::warn!(%path, error = %e, "Image compression failed — falling back to original bytes");
-                crate::util::local_image_to_data_uri(path_obj).await
-            }
-        }
-    } else {
-        crate::util::local_image_to_data_uri(path_obj).await
+    // Convert to data URI for the API request. The classifier above already
+    // established the file is a decodable native raster, so a compression
+    // failure is a bounded re-encode issue — not a validity one — and the
+    // helper falls back to the original bytes (fail-open) rather than a second
+    // decode. It is never a junk data-URI, because the authoritative classifier
+    // gate already rejected any corrupt-but-magic-valid file.
+    let data_uri = bounded_image_data_uri(path_obj, compress).await;
+
+    // Save a workspace copy only once the image actually converts, so a dead /
+    // corrupt file never leaves a junk upload copy plus a "[Saved image: ...]"
+    // annotation alongside the invalid ref.
+    let saved = match &data_uri {
+        Ok(_) => save_media_to_workspace(path_obj, uploads_dir, "image", "png")
+            .await
+            .map(|saved| saved.annotation),
+        Err(_) => None,
     };
     let replacement = match data_uri {
         Ok(data_uri) => format!("[IMAGE:{data_uri}]"),
@@ -788,14 +848,8 @@ mod tests {
         let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
         tokio::fs::create_dir_all(&tg_dir).await.unwrap();
         let tmp = tg_dir.join(format!("test_enrich_img_{}.png", std::process::id()));
-        let png_header: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0x60, 0x60, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE7, 0x21, 0x33, 0x7C,
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        tokio::fs::write(&tmp, png_header).await.unwrap();
+        let source_bytes = real_png(2, 1);
+        tokio::fs::write(&tmp, &source_bytes).await.unwrap();
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = test_msg(&format!("Image: [IMAGE:{path_str}]"));
@@ -833,14 +887,8 @@ mod tests {
         let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
         tokio::fs::create_dir_all(&tg_dir).await.unwrap();
         let tmp_img = tg_dir.join(format!("test_enrich_ws_img_{}.png", std::process::id()));
-        let png_header: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0x60, 0x60, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE7, 0x21, 0x33, 0x7C,
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        tokio::fs::write(&tmp_img, png_header).await.unwrap();
+        let source_bytes = real_png(2, 1);
+        tokio::fs::write(&tmp_img, &source_bytes).await.unwrap();
         let img_path_str = tmp_img.to_string_lossy().to_string();
 
         let mut msg = test_msg(&format!("Image: [IMAGE:{img_path_str}]"));
@@ -1197,9 +1245,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrich_image_compression_failure_passes_original_through() {
-        // Undecodable bytes: the compressed path fails open and the original
-        // bytes pass through untouched as a data URI.
+    async fn enrich_image_in_scope_non_raster_is_rejected_not_junk_data_uri() {
+        // A non-image file with an image extension inside the telegram temp dir
+        // must NOT fail open to a junk data URI (the fail-open bug). The
+        // classifier rejects it, the marker becomes an invalid reference, and
+        // the in-scope temp file is cleaned up (it is a pure intermediate).
         let source_bytes = b"not an image";
         let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
         tokio::fs::create_dir_all(&tg_dir).await.unwrap();
@@ -1217,20 +1267,105 @@ mod tests {
         };
         enrich_message(&mut msg, &strategy).await;
 
-        let expected = format!(
-            "[IMAGE:data:image/png;base64,{}]",
-            STANDARD.encode(source_bytes)
-        );
         assert!(
-            msg.content.contains(&expected),
-            "Compression failure must pass the original bytes through, got: {}",
+            msg.content
+                .contains(&format!("[Invalid image reference: {path_str}]")),
+            "Non-raster in-scope file must degrade to an invalid reference, got: {}",
             msg.content
         );
-        // Temp file deleted
+        assert!(
+            !msg.content.contains("[IMAGE:data:"),
+            "No junk data URI may be produced for a non-raster file, got: {}",
+            msg.content
+        );
+        // In-scope temp file is a pure intermediate: cleaned up even though it
+        // was never consumed as an image (it would otherwise accumulate).
         assert!(
             !tmp.exists(),
-            "Temp image file must be deleted after enrichment"
+            "In-scope non-raster temp file must be cleaned up"
         );
+        // Defensive cleanup in case the assertion above fails.
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn enrich_image_corrupt_raster_does_not_fail_open_to_junk_data_uri() {
+        // A file whose leading bytes sniff as PNG (valid magic + IHDR) but whose
+        // payload is truncated passes the structural classifier gate but is NOT
+        // decodable. Compression fails, and the fail-open fallback must NOT
+        // base64-encode the corrupt bytes into a junk data-URI — it degrades to
+        // an invalid reference instead.
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        let truncated = &buf[..buf.len().min(24)];
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp = tg_dir.join(format!("test_enrich_corrupt_{}.png", std::process::id()));
+        tokio::fs::write(&tmp, truncated).await.unwrap();
+        let path_str = tmp.to_string_lossy().to_string();
+
+        let mut msg = test_msg(&format!("Photo: [IMAGE:{path_str}]"));
+        let strategy = EnrichmentStrategy {
+            workspace_path: None,
+            compress_images: true,
+        };
+        enrich_message(&mut msg, &strategy).await;
+
+        assert!(
+            msg.content
+                .contains(&format!("[Invalid image reference: {path_str}]")),
+            "Corrupt-but-magic-valid in-scope file must degrade to an invalid reference, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("[IMAGE:data:"),
+            "No junk data URI may be produced for a corrupt file, got: {}",
+            msg.content
+        );
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn enrich_image_corrupt_raster_byte_identical_does_not_fail_open() {
+        // The Artist (compress=false) path sends the original bytes untouched;
+        // a corrupt-but-magic-valid file that passed the structural gate must not
+        // be base64-encoded into a junk data URI — it degrades to an invalid
+        // reference instead.
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        let truncated = &buf[..buf.len().min(24)];
+        let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
+        tokio::fs::create_dir_all(&tg_dir).await.unwrap();
+        let tmp = tg_dir.join(format!(
+            "test_enrich_byteidentical_{}.png",
+            std::process::id()
+        ));
+        tokio::fs::write(&tmp, truncated).await.unwrap();
+        let path_str = tmp.to_string_lossy().to_string();
+
+        let mut msg = test_msg(&format!("Photo: [IMAGE:{path_str}]"));
+        let strategy = EnrichmentStrategy {
+            workspace_path: None,
+            compress_images: false,
+        };
+        enrich_message(&mut msg, &strategy).await;
+
+        assert!(
+            msg.content
+                .contains(&format!("[Invalid image reference: {path_str}]")),
+            "Corrupt-but-magic-valid in-scope file (byte-identical) must degrade to an invalid reference, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("[IMAGE:data:"),
+            "No junk data URI may be produced for a corrupt file, got: {}",
+            msg.content
+        );
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
 
     #[tokio::test]

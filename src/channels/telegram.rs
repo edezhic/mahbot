@@ -1,4 +1,5 @@
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
+use crate::util::media_target::{self, MediaTarget};
 use crate::util::{TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, is_http_url, parse_media_marker};
 use crate::{Channel, ChannelMessage, Role, SendMessage};
 use anyhow::Context;
@@ -460,7 +461,18 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
     let kind = infer_attachment_kind_from_target(candidate)?;
 
-    if !is_http_url(candidate) && !Path::new(candidate).exists() {
+    // Only a real image target may be attached as a photo — a bare path to a
+    // non-image or an existing non-raster file stays plain text, matching the
+    // `[IMAGE:...]` marker gate. Audio/video/document keep their existing
+    // URL-or-existing-file semantics.
+    if kind == TelegramAttachmentKind::Image {
+        if !matches!(
+            media_target::classify_media_image_target(candidate),
+            MediaTarget::LocalImage | MediaTarget::RemoteUrl
+        ) {
+            return None;
+        }
+    } else if !is_http_url(candidate) && !Path::new(candidate).exists() {
         return None;
     }
 
@@ -486,11 +498,37 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
             let (kind_str, path) = parse_media_marker(caps);
             let path = path.trim();
 
-            // Preserve markers whose target is not an http(s) URL and does not
-            // resolve to an existing regular file as original text — prose
+            // For IMAGE markers, only a valid image target is attached — an
+            // existing regular raster file or an http(s) URL. A data-URI IMAGE
+            // marker (or a non-image target) stays as literal text, because
+            // telegram's `send_attachment` reads a local file path or sends
+            // by URL and cannot send a data URI. The kind gate is
+            // case-insensitive to match TELEGRAM_MEDIA_MARKER_RE (lowercase
+            // `[image:...]` must not bypass the classifier into the loose
+            // is_file check). AUDIO/VIDEO markers keep their existing
+            // semantics (an http(s) URL or an existing regular file); prose
             // quoting the marker syntax must stay visible and never abort the
             // send of other attachments in the same message.
-            if path.is_empty() || (!is_http_url(path) && !Path::new(path).is_file()) {
+            if matches!(
+                TelegramAttachmentKind::from_marker(kind_str),
+                Some(TelegramAttachmentKind::Image)
+            ) {
+                // Telegram cannot attach an inline data URI — keep it literal
+                // WITHOUT a wasted bounded decode (classifying it would fully
+                // decode, then reject it). Local raster / URL targets use the
+                // shared classifier.
+                let ok = if path.starts_with("data:") {
+                    false
+                } else {
+                    matches!(
+                        media_target::classify_media_image_target(path),
+                        MediaTarget::LocalImage | MediaTarget::RemoteUrl
+                    )
+                };
+                if !ok {
+                    return caps.get_match().as_str().to_string();
+                }
+            } else if path.is_empty() || (!is_http_url(path) && !Path::new(path).is_file()) {
                 return caps.get_match().as_str().to_string();
             }
 
@@ -2142,8 +2180,12 @@ impl Channel for TelegramChannel {
         // blocks or affects message delivery.
         self.spawn_menu_refresh(chat_id);
 
-        // Look for inline attachment markers like [IMAGE:path/to/file.png]
-        let (text_without_markers, attachments) = parse_attachment_markers(content);
+        // Look for inline attachment markers like [IMAGE:path/to/file.png].
+        // Marker parsing now runs the shared classifier, whose local-file branch
+        // is a blocking raster decode — offload it so a Tokio worker is not
+        // parked while a local image is decoded for attachment.
+        let (text_without_markers, attachments) =
+            crate::util::with_block_in_place(|| parse_attachment_markers(content));
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
@@ -2163,7 +2205,9 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        if let Some(attachment) = parse_path_only_attachment(content) {
+        if let Some(attachment) =
+            crate::util::with_block_in_place(|| parse_path_only_attachment(content))
+        {
             self.send_attachment(chat_id, thread_id, &attachment)
                 .await?;
             return Ok(());

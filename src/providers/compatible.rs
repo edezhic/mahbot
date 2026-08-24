@@ -12,17 +12,12 @@ use crate::{
     ChatRole, Provider, ProviderUsage, Reasoning, ToolCall as ProviderToolCall, ToolSpec,
 };
 use async_trait::async_trait;
-use base64::{
-    Engine as _,
-    engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
-};
 use futures_util::StreamExt;
 use reqwest::{
     Client, RequestBuilder,
     header::{HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -369,94 +364,25 @@ impl NativeMessage {
 
 // ── Message content types for API serialization ──
 
-/// Image subtypes DeepSeek (and the OpenAI image_url shape) will actually
-/// decode. Placeholders like `data:image/...;base64,...` must not match.
-const NATIVE_IMAGE_SUBTYPES: &[&str] = &["jpeg", "jpg", "png", "gif", "webp"];
-
-/// True when `path` is a payload the chat-completions `image_url` field accepts:
-/// an http(s) URL, or a `data:image/{jpeg|png|gif|webp};base64,…` URI whose
-/// payload is valid base64 **and** decodes to a real jpeg/png/gif/webp raster.
-/// Prose / path / ellipsis / fake-base64 markers stay in the surrounding text.
-#[must_use]
-fn is_native_image_url(path: &str) -> bool {
-    if crate::util::is_http_url(path) {
-        return true;
-    }
-    let Some(bytes) = decode_image_data_uri_payload(path) else {
-        return false;
-    };
-    is_supported_raster(&bytes)
-}
-
-/// Pull the base64 payload out of a `data:image/<subtype>[;params];base64,…`
-/// URI and decode it. `None` for a non-image MIME, empty payload, or bytes
-/// that are not valid standard / URL-safe base64.
-#[must_use]
-fn decode_image_data_uri_payload(path: &str) -> Option<Vec<u8>> {
-    let rest = path.strip_prefix("data:image/")?;
-    let (head, payload) = rest.rsplit_once(";base64,")?;
-    let subtype = head.split(';').next().unwrap_or("").trim();
-    if !NATIVE_IMAGE_SUBTYPES
-        .iter()
-        .any(|allowed| subtype.eq_ignore_ascii_case(allowed))
-    {
-        return None;
-    }
-    decode_base64_payload(payload)
-}
-
-/// Decode standard or URL-safe base64, stripping ASCII whitespace. Rejects
-/// alphabet lookalikes that are not actually decodable (`...`, truncated pad).
-#[must_use]
-fn decode_base64_payload(s: &str) -> Option<Vec<u8>> {
-    let compact: Cow<'_, [u8]> = if s.as_bytes().iter().any(u8::is_ascii_whitespace) {
-        Cow::Owned(
-            s.bytes()
-                .filter(|b| !b.is_ascii_whitespace())
-                .collect::<Vec<u8>>(),
-        )
-    } else {
-        Cow::Borrowed(s.as_bytes())
-    };
-    if compact.is_empty() {
-        return None;
-    }
-    STANDARD
-        .decode(compact.as_ref())
-        .ok()
-        .or_else(|| URL_SAFE.decode(compact.as_ref()).ok())
-        .or_else(|| URL_SAFE_NO_PAD.decode(compact.as_ref()).ok())
-}
-
-/// True when `bytes` sniff as jpeg/png/gif/webp **and** decode as a raster
-/// (catches valid-base64 garbage like `abcd` and truncated files whose magic
-/// still looks like PNG).
-#[must_use]
-fn is_supported_raster(bytes: &[u8]) -> bool {
-    let Ok(format) = image::guess_format(bytes) else {
-        return false;
-    };
-    if !matches!(
-        format,
-        image::ImageFormat::Jpeg
-            | image::ImageFormat::Png
-            | image::ImageFormat::Gif
-            | image::ImageFormat::WebP
-    ) {
-        return false;
-    }
-    image::load_from_memory(bytes).is_ok()
-}
-
 /// Parse `[IMAGE:…]` markers from content, returning cleaned text and extracted
 /// native image payloads.
 ///
 /// Uses the shared [`MEDIA_MARKER_RE`](crate::util::MEDIA_MARKER_RE) to find markers.
-/// Only data-URI payloads that decode to a jpeg/png/gif/webp raster, plus
-/// http(s) IMAGE payloads, are extracted (and stripped from the cleaned text)
-/// — those become [`MessagePart::ImageUrl`]. Prose/path IMAGE markers, empty
-/// `[IMAGE:]`, fake/truncated data URIs, and non‑IMAGE markers (e.g.
-/// `[AUDIO:…]`) are left untouched in the cleaned text.
+/// Only data-URI payloads that decode to a jpeg/png/webp raster are extracted
+/// (and stripped from the cleaned text) — those become [`MessagePart::ImageUrl`].
+/// The decode-validated
+/// [`is_native_data_uri`](crate::util::media_target::is_native_data_uri) gate is
+/// used directly rather than the shared
+/// [`classify_media_image_target`](crate::util::media_target::classify_media_image_target)
+/// because that classifier would read a local file during request serialization,
+/// whereas here an inline data-URI raster is the only accepted payload and a
+/// local path / remote-URL marker must stay as prose text.
+/// Remote-URL IMAGE markers are NOT extracted (the provider cannot reliably
+/// download them, so they are never sent as an image part); they stay as inert
+/// literal text in the cleaned output, exactly like non-native IMAGE markers
+/// (local paths, prose, placeholders). Fake/truncated data URIs, empty
+/// `[IMAGE:]`, and non‑IMAGE markers (e.g. `[AUDIO:…]`) are likewise left
+/// untouched in the cleaned text.
 #[must_use]
 pub(crate) fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
@@ -466,7 +392,7 @@ pub(crate) fn parse_image_markers(content: &str) -> (String, Vec<String>) {
             let (kind, path) = crate::util::parse_media_marker(caps);
             let path = path.trim();
 
-            if kind == "IMAGE" && is_native_image_url(path) {
+            if kind == "IMAGE" && crate::util::media_target::is_native_data_uri(path) {
                 refs.push(path.to_string());
                 // Native IMAGE payloads are stripped — they become image parts.
                 String::new()
@@ -503,11 +429,11 @@ pub(crate) struct ImageUrlPart {
 /// Convert a role+content pair into the appropriate [`MessageContent`] variant.
 ///
 /// For [`ChatRole::User`] content, native image payloads (data URIs that
-/// decode to a real jpeg/png/gif/webp raster, and http(s) URLs inside
-/// `[IMAGE:…]`) are parsed into [`MessagePart::ImageUrl`] entries alongside
-/// the cleaned text — every role now emits native image parts. Prose/path
-/// markers and fake/truncated data URIs stay in the text. Everything else is
-/// returned as [`MessageContent::Text`].
+/// decode to a real jpeg/png/webp raster) are parsed into
+/// [`MessagePart::ImageUrl`] entries alongside the cleaned text — every role now
+/// emits native image parts. Remote http(s) IMAGE markers are never injected
+/// (they stay as literal text); prose/path markers and fake/truncated data URIs
+/// also stay in the text. Everything else is returned as [`MessageContent::Text`].
 ///
 /// The old estimator-side mirror of this marker handling
 /// (`crate::session::estimate_tokens`) was removed with the
@@ -1330,9 +1256,10 @@ async fn scoped_http_error(
 mod tests {
     use super::*;
     use crate::providers::test_request;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     /// 1×1 red PNG as a data URI — used wherever tests need a payload that
-    /// survives [`is_native_image_url`]'s decode + raster sniff.
+    /// survives the media gate's base64 + bounded raster decode.
     fn tiny_png_data_uri() -> String {
         use std::io::Cursor;
         let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
@@ -1977,15 +1904,21 @@ mod tests {
 
         let cases: Vec<(&str, String, Box<dyn Fn(&str, &[String], &str, &str)>)> = vec![
             (
-                "extracts_multiple_markers",
+                "extracts_data_uri_keeps_url_marker",
                 format!("Check this [IMAGE:{uri}] and this [IMAGE:https://example.com/b.jpg]"),
                 {
                     let uri = uri.clone();
                     Box::new(move |cleaned, refs, name, _input| {
-                        assert_eq!(cleaned, "Check this  and this", "case: {name}");
-                        assert_eq!(refs.len(), 2, "case: {name}");
+                        // Only the data-URI marker is extracted/stripped; the
+                        // remote-URL marker stays as inert literal text (the
+                        // provider cannot download it, so it is never an image part).
+                        assert_eq!(
+                            cleaned,
+                            "Check this  and this [IMAGE:https://example.com/b.jpg]",
+                            "case: {name}"
+                        );
+                        assert_eq!(refs.len(), 1, "case: {name}");
                         assert_eq!(refs[0], uri, "case: {name}");
-                        assert_eq!(refs[1], "https://example.com/b.jpg", "case: {name}");
                     })
                 },
             ),

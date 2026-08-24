@@ -6,6 +6,7 @@ pub(crate) mod html;
 pub(crate) mod http;
 pub(crate) mod json;
 pub(crate) mod macros;
+pub(crate) mod media_target;
 pub(crate) mod model_state;
 #[cfg(test)]
 pub(crate) mod test;
@@ -49,7 +50,7 @@ impl<T> UnwrapPoison for Result<T, std::sync::PoisonError<T>> {
 /// This is the single source of truth for the marker pattern. Both the case-sensitive
 /// [`MEDIA_MARKER_RE`] and the case-insensitive [`TELEGRAM_MEDIA_MARKER_RE`] are built
 /// from this constant, so adding a new marker kind here automatically keeps both in sync.
-const MEDIA_MARKER_PATTERN: &str = r"\[(?P<kind>IMAGE|AUDIO|VIDEO):(?P<path>[^\]]+)\]";
+const MEDIA_MARKER_PATTERN: &str = r"\[(?P<kind>IMAGE|AUDIO|VIDEO):(?P<path>[^\]\r\n]+)\]";
 
 /// Matches `[IMAGE:path]`, `[AUDIO:path]`, or `[VIDEO:path]` markers in message content.
 ///
@@ -397,11 +398,22 @@ pub fn truncate_tool_output(output: &str) -> String {
     truncate_sandwich(output, TOOL_OUTPUT_BUDGET_BYTES, "tool output")
 }
 
+/// Map a read image file's actual bytes to a raster MIME label, or `None` for a
+/// non-native raster. Used by [`local_image_to_data_uri`] so the MIME matches
+/// the bytes (not the extension), and the native set stays single-sourced in
+/// [`image_format_native_label`].
+fn mime_for_raster_bytes(bytes: &[u8]) -> Option<String> {
+    let label = image_format_native_label(image::guess_format(bytes).ok()?)?;
+    Some(format!("image/{}", label.to_ascii_lowercase()))
+}
+
 /// Read a local image file and return a base64 data URI suitable for native
-/// image-part model input (e.g., `data:image/png;base64,...`).
+/// image-part model input (e.g., `data:image/png;base64,...`). The MIME subtype
+/// is derived from the file's actual raster bytes (magic sniff), falling back
+/// to the path extension when the bytes aren't a recognised native raster.
 pub(crate) async fn local_image_to_data_uri(path: &std::path::Path) -> anyhow::Result<String> {
     let bytes = tokio::fs::read(path).await?;
-    let mime = mime_for_extension(path);
+    let mime = mime_for_raster_bytes(&bytes).unwrap_or_else(|| mime_for_extension(path).to_owned());
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)))
 }
 
@@ -414,8 +426,9 @@ const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;
 /// reference-image path's [`MAX_REFERENCE_INPUT_BYTES`] pattern: a decoded
 /// bitmap can be far larger than its compressed file, so over-cap files are
 /// refused from metadata BEFORE the file is read (the fail-open caller falls
-/// back to the original bytes as a data URI instead).
-const INBOUND_IMAGE_MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
+/// back to the original bytes as a data URI instead). Shared by the media-target
+/// classifier and the GUI render path so a single 50 MiB cap cannot drift.
+pub(crate) const INBOUND_IMAGE_MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Read a local image file and return a bounded-JPEG data URI: longest side
 /// capped at [`INBOUND_IMAGE_MAX_SIDE`], quality
@@ -1322,6 +1335,38 @@ pub(crate) fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> V
         }
     }
     output
+}
+
+#[cfg(test)]
+mod media_mime_tests {
+    use super::*;
+
+    // A mislabelled file (photo.png holding JPEG bytes) must produce a data-URI
+    // whose MIME matches the actual bytes, so the decoder's declared-subtype
+    // check accepts it instead of silently dropping the image downstream.
+    #[tokio::test]
+    async fn data_uri_mime_follows_bytes_not_extension() {
+        let img = image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]));
+        let mut jpeg = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .expect("test JPEG must encode");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        tokio::fs::write(&path, &jpeg).await.unwrap();
+
+        let uri = local_image_to_data_uri(&path).await.unwrap();
+        assert!(
+            uri.starts_with("data:image/jpeg;base64,"),
+            "MIME must come from the actual bytes; ext says png: {uri}"
+        );
+        assert!(
+            uri.ends_with(&STANDARD.encode(&jpeg)),
+            "payload bytes must pass through unchanged"
+        );
+    }
 }
 
 #[cfg(test)]

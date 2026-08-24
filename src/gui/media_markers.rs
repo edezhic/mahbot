@@ -31,15 +31,13 @@
 //! to this module, `enrichment.rs`, `telegram.rs`, `agent.rs`, and
 //! `compatible.rs` without needing per-kind regexes here.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::Cursor;
-use std::sync::{LazyLock, Mutex};
-
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use iced::advanced::{image as advanced_image, text};
 use iced::widget::{image, markdown};
 use iced::{ContentFit, Element, Font, Length};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{LazyLock, Mutex};
 
+use crate::util::media_target;
 use crate::util::{MEDIA_MARKER_RE, UnwrapPoison, file_name_or_path, parse_media_marker};
 
 /// The `image` crate, aliased because `image` here is iced's widget module.
@@ -89,7 +87,32 @@ fn replace_media_markers(s: &str) -> String {
         .replace_all(s, |caps: &regex::Captures| {
             let (kind, path) = parse_media_marker(caps);
             match kind {
-                "IMAGE" => format!("![Image]({path})"),
+                "IMAGE" => {
+                    let p = path.trim();
+                    if p.starts_with("data:") {
+                        // data-URI: hand off to the viewer, whose cached bounded
+                        // decode draws the image or the "🖼️ image" placeholder —
+                        // never a broken image. We deliberately do NOT run the
+                        // shared classifier here (it would base64-decode on the
+                        // render thread).
+                        format!("![Image]({p})")
+                    } else if media_target::is_valid_remote_url(p)
+                        || std::path::Path::new(p).is_absolute()
+                    {
+                        // Local path (existing or cleaned-up temp file) / URL: a cheap
+                        // O(1) structural gate only — NEVER the shared classifier,
+                        // whose local-file decode is a blocking raster decode that must
+                        // not run on the render thread. The viewer applies the
+                        // authoritative bounded decode and falls back to a placeholder
+                        // (🖼️ filename) for a missing / corrupt / non-image target, so
+                        // a broken image is never drawn and a replayed cleaned-up temp
+                        // marker still reads as a placeholder rather than raw marker text.
+                        format!("![Image]({p})")
+                    } else {
+                        // Relative or prose marker — keep as inert text.
+                        caps.get_match().as_str().to_string()
+                    }
+                }
                 "AUDIO" => format!("🎵 {}", file_name_or_path(path)),
                 "VIDEO" => format!("🎬 Video: {}", file_name_or_path(path)),
                 // Unreachable for well-formed markers (MEDIA_MARKER_RE only
@@ -135,83 +158,60 @@ fn replace_saved_annotations(s: &str) -> String {
         .to_string()
 }
 
-// ── Data-URI image rendering ─────────────────────────────────────
+// ── Raster image rendering (bounded, downscaled) ─────────────────
 
-/// Maximum length (bytes) of the base64 payload inside a `data:…;base64,…`
-/// marker the GUI will attempt to decode. Longer payloads are refused by a
-/// pure string-length check — never decoded, never cached. ~20 MiB far
-/// exceeds realistic inbound images (61 KiB–510 KiB encoded on the
-/// byte-identical passthrough path; the compressed path is 1024px/q85).
-const MAX_DATA_URI_ENCODED_BYTES: usize = 20 * 1024 * 1024;
-
-/// Maximum longest side (px) of a decoded data-URI image the GUI will render.
-/// Images whose header declares a longer side are refused from the header
-/// alone — no pixel decode is attempted, so decompression bombs cannot
-/// allocate. Over-cap → the "🖼️ image" placeholder.
+/// Maximum longest side (px) of the rendered image the GUI keeps per image — a
+/// `MAX_IMAGE_LONGEST_SIDE_PX² · 4` = 16 MiB RGBA tile. A larger — but still
+/// valid — raster is decoded under the shared generous raster budget and
+/// DOWNSCALED to this cap so a tall browser screenshot renders (not a
+/// placeholder); only a genuinely corrupt / missing / non-image / header-bomb
+/// target degrades to the "🖼️ …" placeholder.
 const MAX_IMAGE_LONGEST_SIDE_PX: u32 = 2048;
 
-/// Decode-allocation budget for [`decode_data_uri_image`]: the largest
-/// legitimate bitmap is `MAX_IMAGE_LONGEST_SIDE_PX² · 4` bytes (16 MiB for
-/// 2048×2048 RGBA); 64 MiB covers decoder intermediates while still bounding
-/// pathological inputs.
-const MAX_DATA_URI_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+/// Shrink a decoded raster to the display cap `MAX_IMAGE_LONGEST_SIDE_PX`.
+fn downscale_raster(width: u32, height: u32, rgba: Vec<u8>) -> Option<(u32, u32, Vec<u8>)> {
+    if width <= MAX_IMAGE_LONGEST_SIDE_PX && height <= MAX_IMAGE_LONGEST_SIDE_PX {
+        return Some((width, height, rgba));
+    }
+    // `thumbnail` computes the aspect-preserving target dims internally (no
+    // manual float casts) and only shrinks when the image exceeds the box.
+    let img = image_crate::DynamicImage::ImageRgba8(image_crate::RgbaImage::from_raw(
+        width, height, rgba,
+    )?);
+    let resized = img
+        .thumbnail(MAX_IMAGE_LONGEST_SIDE_PX, MAX_IMAGE_LONGEST_SIDE_PX)
+        .into_rgba8();
+    Some((resized.width(), resized.height(), resized.into_raw()))
+}
 
-/// Maximum number of data-URI decode outcomes retained in the process-lifetime
-/// cache. Each entry holds the data-URI key plus — for successful decodes —
-/// up to 16 MiB of RGBA pixels, so the bound keeps memory in check over long
-/// sessions.
-const MAX_CACHED_DATA_URI_IMAGES: usize = 64;
-
-/// Extract the base64 payload of a `data:…;base64,…` URI, or `None` when the
-/// string is not a data URI with a base64 payload. The payload is everything
-/// after the LAST `;base64,` token (RFC 2397 allows mediatype parameters
-/// before the marker, e.g. `data:image/png;charset=utf-8;base64,AAAA`).
+/// Decode `bytes` as a native raster and downscale it to the display cap,
+/// returning `(width, height, RGBA8 pixels)` on success and `None` on any
+/// failure — every `None` renders as the "🖼️ …" placeholder.
+///
+/// The decode step reuses the shared [`media_target::raster_decode_limits`]
+/// budget (generous dimension + alloc caps, so a legitimate tall screenshot
+/// still decodes) and then shrinks the result to the renderable cap so the
+/// persistent handle stays small and the renderer upload happens once. The
+/// transient decode is bounded by that budget; only a header-bomb target fails
+/// outright.
 #[must_use]
-fn data_uri_base64_payload(uri: &str) -> Option<&str> {
-    let rest = uri.strip_prefix("data:")?;
-    let payload_start = rest.rfind(";base64,")? + ";base64,".len();
-    Some(&rest[payload_start..])
+fn render_raster(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let (width, height, rgba) =
+        media_target::decode_raster_bytes(bytes, media_target::raster_decode_limits())?;
+    downscale_raster(width, height, rgba)
 }
 
 /// Decode and validate the image encoded in a `data:…` URI, returning
-/// `(width, height, RGBA8 pixels)` on success and `None` on any failure.
-///
-/// Check order — every `None` renders as the "🖼️ image" placeholder:
-/// 1. encoded-payload length cap (before any base64 work);
-/// 2. base64 decode;
-/// 3. header-only dimension read — oversized images are refused WITHOUT a
-///    pixel decode;
-/// 4. full decode under explicit [`image_crate::Limits`], converted to RGBA8.
+/// `(width, height, RGBA8 pixels)` on success and `None` on any failure — every
+/// `None` renders as the "🖼️ image" placeholder. Vets the URI through the same
+/// declared-subtype==actual-bytes gate the provider's image gate uses (a
+/// `data:image/png` holding JPEG bytes is mismatched and rejected), then uses
+/// the shared raster decode + downscale pipeline.
 #[must_use]
 fn decode_data_uri_image(uri: &str) -> Option<(u32, u32, Vec<u8>)> {
-    let payload = data_uri_base64_payload(uri)?;
-    if payload.len() > MAX_DATA_URI_ENCODED_BYTES {
-        return None;
-    }
-    let bytes = STANDARD.decode(payload).ok()?;
-
-    // Content sniff from the magic bytes; unknown/unsupported formats (gif,
-    // bmp, …) are refused here — only png/jpeg/webp are built in.
-    let format = image_crate::guess_format(&bytes).ok()?;
-
-    // Header-only dimension check — no pixel decode for oversized images.
-    let header = image_crate::ImageReader::with_format(Cursor::new(&bytes), format);
-    let (width, height) = header.into_dimensions().ok()?;
-    if width.max(height) > MAX_IMAGE_LONGEST_SIDE_PX {
-        return None;
-    }
-
-    // Full decode with explicit limits; the image crate's dimension caps are
-    // strict, so an over-cap decode fails instead of allocating. (`Limits` is
-    // `#[non_exhaustive]`, so it is built via `Default` + field mutation.)
-    let mut limits = image_crate::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_LONGEST_SIDE_PX);
-    limits.max_image_height = Some(MAX_IMAGE_LONGEST_SIDE_PX);
-    limits.max_alloc = Some(MAX_DATA_URI_DECODE_ALLOC_BYTES);
-    let mut decoder = image_crate::ImageReader::with_format(Cursor::new(&bytes), format);
-    decoder.limits(limits);
-    let rgba = decoder.decode().ok()?.to_rgba8();
-    Some((rgba.width(), rgba.height(), rgba.into_raw()))
+    let (width, height, rgba) =
+        media_target::decode_native_data_uri(uri, media_target::raster_decode_limits())?;
+    downscale_raster(width, height, rgba)
 }
 
 /// Outcome of a data-URI decode attempt, cached per URI string.
@@ -225,33 +225,46 @@ enum CachedDataUriImage {
 }
 
 /// Process-lifetime cache of data-URI decode outcomes, keyed by the full
-/// data-URI string.
-///
-/// iced [`image::Handle`]s carry a unique [`Id`](image::Handle::id) per
-/// construction and the wgpu renderer re-decodes/re-uploads on every new Id,
-/// so re-building a handle inside `view()` would decode on every frame.
-/// Caching the handle keeps the Id — and thus the uploaded texture — stable.
-/// Bounded LRU, evicting the least-recently-used entry past
-/// [`MAX_CACHED_DATA_URI_IMAGES`].
-static DATA_URI_IMAGE_CACHE: LazyLock<Mutex<DataUriImageCache>> = LazyLock::new(|| {
-    Mutex::new(DataUriImageCache {
-        entries: HashMap::new(),
-        lru: VecDeque::new(),
-    })
-});
+/// data-URI string. A bounded LRU shared with the local-image cache so both
+/// hold a stable iced [`image::Handle`] (whose [`Id`](image::Handle::id)
+/// keeps the wgpu texture stable across frames — re-building a handle in
+/// `view()` would decode every frame). Evicts the least-recently-used entry
+/// past [`MAX_CACHED_IMAGES`].
+static DATA_URI_IMAGE_CACHE: LazyLock<Mutex<BoundedLruCache<String, CachedDataUriImage>>> =
+    LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
 
-struct DataUriImageCache {
-    entries: HashMap<String, CachedDataUriImage>,
+/// A bounded least-recently-used cache: `get` bumps recency so a recently-viewed
+/// entry survives eviction, `insert` evicts the oldest once the capacity cap is
+/// hit. Keys are looked up by [`Borrow`](std::borrow::Borrow) so callers can use
+/// an unowned key (e.g. a `&str` media marker).
+struct BoundedLruCache<K, V> {
+    entries: HashMap<K, V>,
     /// LRU order of `entries` keys; back = most recently used.
-    lru: VecDeque<String>,
+    lru: VecDeque<K>,
+    cap: usize,
 }
 
-impl DataUriImageCache {
-    fn get(&mut self, uri: &str) -> Option<&CachedDataUriImage> {
-        let hit = self.entries.get(uri);
+impl<K, V> BoundedLruCache<K, V>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn get<Q>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let hit = self.entries.get(key);
         if hit.is_some() {
             // Bump recency so recently-viewed images survive eviction.
-            if let Some(pos) = self.lru.iter().position(|key| key.as_str() == uri) {
+            if let Some(pos) = self.lru.iter().position(|k| k.borrow() == key) {
                 let key = self.lru.remove(pos).expect("position found by iteration");
                 self.lru.push_back(key);
             }
@@ -259,10 +272,17 @@ impl DataUriImageCache {
         hit
     }
 
-    fn insert(&mut self, uri: String, outcome: CachedDataUriImage) {
-        self.entries.insert(uri.clone(), outcome);
-        self.lru.push_back(uri);
-        while self.entries.len() > MAX_CACHED_DATA_URI_IMAGES {
+    fn insert(&mut self, key: K, value: V) {
+        // Remove any existing occurrence so a re-insert replaces the value and
+        // moves the key to the most-recent position exactly once. Two concurrent
+        // check→decode→insert passes for the same key must not duplicate it in
+        // `lru`, or eviction could drop a live entry ahead of a stale copy.
+        if let Some(pos) = self.lru.iter().position(|k| k == &key) {
+            self.lru.remove(pos);
+        }
+        self.entries.insert(key.clone(), value);
+        self.lru.push_back(key);
+        while self.entries.len() > self.cap {
             let oldest = self
                 .lru
                 .pop_front()
@@ -277,19 +297,19 @@ impl DataUriImageCache {
 /// renders the "🖼️ image" placeholder in that case (never raw base64 text,
 /// never a silent blank).
 ///
-/// Over-cap payloads are refused by a pure length check BEFORE the cache is
-/// consulted, so an oversized data URI is never retained as a cache key.
+/// Over-cap payloads are refused by `media_target::data_uri_base64_payload`
+/// from length alone BEFORE the cache is consulted, so an oversized data URI is
+/// never retained as a cache key.
 #[must_use]
 fn data_uri_image_handle(uri: &str) -> Option<image::Handle> {
-    let payload = data_uri_base64_payload(uri)?;
-    if payload.len() > MAX_DATA_URI_ENCODED_BYTES {
-        return None;
-    }
-    let mut cache = DATA_URI_IMAGE_CACHE.lock().unwrap_poison();
-    match cache.get(uri) {
-        Some(CachedDataUriImage::Decoded(handle)) => return Some(handle.clone()),
-        Some(CachedDataUriImage::Failed) => return None,
-        None => {}
+    media_target::data_uri_base64_payload(uri)?;
+    {
+        let mut cache = DATA_URI_IMAGE_CACHE.lock().unwrap_poison();
+        match cache.get(uri) {
+            Some(CachedDataUriImage::Decoded(handle)) => return Some(handle.clone()),
+            Some(CachedDataUriImage::Failed) => return None,
+            None => {}
+        }
     }
     let outcome = match decode_data_uri_image(uri) {
         Some((width, height, rgba)) => {
@@ -301,7 +321,87 @@ fn data_uri_image_handle(uri: &str) -> Option<image::Handle> {
         CachedDataUriImage::Decoded(handle) => Some(handle.clone()),
         CachedDataUriImage::Failed => None,
     };
-    cache.insert(uri.to_string(), outcome);
+    DATA_URI_IMAGE_CACHE
+        .lock()
+        .unwrap_poison()
+        .insert(uri.to_string(), outcome);
+    handle
+}
+
+// ── Local-path image rendering (bounded, cached) ─────────────────
+
+/// Maximum decoded-image outcomes retained per process-lifetime cache (data-URI
+/// and local-path). Each `Decoded` entry holds up to
+/// `MAX_IMAGE_LONGEST_SIDE_PX² · 4` (16 MiB) of RGBA under the display budget,
+/// so this bound (32) caps worst-case retained pixels at ~512 MiB per cache.
+const MAX_CACHED_IMAGES: usize = 32;
+
+/// Outcome of a local-image decode attempt, cached per (canonical path, mtime).
+#[derive(Debug)]
+enum CachedLocalImage {
+    /// Successfully decoded; the stable handle is reused across frames.
+    Decoded(image::Handle),
+    /// Failed validation — cached so a corrupt file isn't re-decoded every frame.
+    Failed,
+}
+
+/// Process-lifetime cache of local-image decode outcomes, keyed by (canonical
+/// path, mtime). Same rationale as [`DATA_URI_IMAGE_CACHE`]: a stable iced
+/// handle keeps the texture Id — and the uploaded texture — stable across
+/// frames, and the result is bounded by an LRU.
+static LOCAL_IMAGE_CACHE: LazyLock<
+    Mutex<BoundedLruCache<(std::path::PathBuf, std::time::SystemTime), CachedLocalImage>>,
+> = LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
+
+/// Return a stable, cached iced handle for a local image file, or `None` when
+/// the file is missing, relative, over-cap, or undecodable — the caller renders
+/// the "🖼️ {filename}" placeholder (never a blank). The raster is decoded under
+/// the shared generous budget and downscaled to the display cap ([`render_raster`]),
+/// then cached at most once per (canonical path, mtime).
+#[must_use]
+fn local_path_image_handle(path: &str) -> Option<image::Handle> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return None;
+    }
+    let meta = std::fs::metadata(p).ok()?;
+    // Shared 50 MiB cap: a huge file is refused from metadata alone (never
+    // opened), so the render thread is not asked to read it.
+    if !meta.is_file() || meta.len() > crate::util::INBOUND_IMAGE_MAX_INPUT_BYTES {
+        return None;
+    }
+    let mtime = meta.modified().ok()?;
+    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let key = (canonical.clone(), mtime);
+    {
+        let mut cache = LOCAL_IMAGE_CACHE.lock().unwrap_poison();
+        match cache.get(&key) {
+            Some(CachedLocalImage::Decoded(handle)) => return Some(handle.clone()),
+            Some(CachedLocalImage::Failed) => return None,
+            None => {}
+        }
+    }
+    // Blocking read + bounded decode on the render thread, deliberately OUTSIDE
+    // the cache lock so a concurrent caller isn't blocked for the whole decode;
+    // the size/dimension caps bound the work and the result is cached, so it
+    // happens once per (canonical path, mtime).
+    let outcome = match std::fs::read(&canonical)
+        .ok()
+        .and_then(|b| render_raster(&b))
+    {
+        Some((width, height, rgba)) => {
+            CachedLocalImage::Decoded(image::Handle::from_rgba(width, height, rgba))
+        }
+        None => CachedLocalImage::Failed,
+    };
+    let handle = match &outcome {
+        CachedLocalImage::Decoded(handle) => Some(handle.clone()),
+        CachedLocalImage::Failed => None,
+    };
+    LOCAL_IMAGE_CACHE
+        .lock()
+        .unwrap_poison()
+        .insert(key, outcome);
     handle
 }
 
@@ -354,21 +454,15 @@ where
                     .into(),
             };
         }
-        let path = std::path::Path::new(url_str);
-        if path.exists() {
-            // Render the actual image, constrained to the bubble width.
-            // Note: path.exists() is synchronous I/O on the render thread,
-            // which is acceptable because file checks are fast (~µs) and
-            // images only appear for agent-generated files that were just
-            // created.  For sessions with many stale image references a
-            // cached-existence check could be added.
-            image::Image::new(url_str)
+        // Local path (or a URL that cannot be a local file): a bounded, cached
+        // decode draws the actual image, or the "🖼️ {filename}" placeholder
+        // when the file is missing / corrupt / over-cap — never a broken image.
+        if let Some(handle) = local_path_image_handle(url_str) {
+            image::Image::new(handle)
                 .width(Length::Fill)
                 .content_fit(ContentFit::Contain)
                 .into()
         } else {
-            // File doesn't exist (temp file cleaned up, or path is invalid).
-            // Show a fallback with the filename.
             let filename = file_name_or_path(url_str);
             iced::widget::text(format!("🖼️ {filename}"))
                 .size(settings.text_size)
@@ -427,90 +521,115 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use std::io::Cursor;
 
     #[test]
     fn preprocess_table() {
-        let cases: &[(&str, &str, &str)] = &[
+        // Real fixture files so the classifier accepts the local image markers
+        // (a marker whose target is not a real raster stays as literal text).
+        let tmp = tempfile::tempdir().unwrap();
+        let photo = tmp.path().join("photo.png");
+        let spaced = tmp.path().join("my file.png");
+        std::fs::write(&photo, tiny_png(2, 1)).unwrap();
+        std::fs::write(&spaced, tiny_png(2, 1)).unwrap();
+        let photo_str = photo.to_string_lossy().into_owned();
+        let spaced_str = spaced.to_string_lossy().into_owned();
+        let valid_uri = data_uri(&tiny_png(2, 1));
+        let cleaned = tmp.path().join("cleaned_up.png"); // does not exist
+        let cleaned_str = cleaned.to_string_lossy().into_owned();
+
+        let cases: Vec<(&str, String, String)> = vec![
             (
                 "replaces an image marker",
-                "Look [IMAGE:/tmp/photo.png] here",
-                "Look ![Image](/tmp/photo.png) here",
+                format!("Look [IMAGE:{photo_str}] here"),
+                format!("Look ![Image]({photo_str}) here"),
             ),
             (
                 "replaces an image marker with spaces in the path",
-                "img [IMAGE:/tmp/my file.png]",
-                "img ![Image](/tmp/my file.png)",
+                format!("img [IMAGE:{spaced_str}]"),
+                format!("img ![Image]({spaced_str})"),
+            ),
+            (
+                "renders a cleaned-up absolute temp-file marker as an image item (placeholder in the viewer)",
+                format!("Look [IMAGE:{cleaned_str}] here"),
+                format!("Look ![Image]({cleaned_str}) here"),
             ),
             (
                 "replaces an audio marker",
-                "Listen [AUDIO:/tmp/recording.ogg]",
-                "Listen 🎵 recording.ogg",
+                "Listen [AUDIO:/tmp/recording.ogg]".into(),
+                "Listen 🎵 recording.ogg".into(),
             ),
             (
                 "replaces an audio marker in a nested path",
-                "hear [AUDIO:/dir/subdir/rec.ogg]",
-                "hear 🎵 rec.ogg",
+                "hear [AUDIO:/dir/subdir/rec.ogg]".into(),
+                "hear 🎵 rec.ogg".into(),
             ),
             (
                 "replaces a video marker",
-                "Watch [VIDEO:/tmp/video.mp4]",
-                "Watch 🎬 Video: video.mp4",
+                "Watch [VIDEO:/tmp/video.mp4]".into(),
+                "Watch 🎬 Video: video.mp4".into(),
             ),
             (
                 "replaces an audio transcription block",
-                "[Audio transcription of recording.ogg]: Hello world",
-                "🔊 Hello world",
+                "[Audio transcription of recording.ogg]: Hello world".into(),
+                "🔊 Hello world".into(),
             ),
             (
                 "renders every line of a multiline audio transcription under 🔊",
-                "[Audio transcription of voice.ogg]: Line one\nLine two",
-                "🔊 Line one\nLine two",
+                "[Audio transcription of voice.ogg]: Line one\nLine two".into(),
+                "🔊 Line one\nLine two".into(),
             ),
             (
                 "renders every line of a multiline video transcription under 🎬 and leaves following message content untouched",
-                "[Video transcription of clip.mp4]: Line one\nLine two\n\nEdit this",
-                "🎬 Line one\nLine two\n\nEdit this",
+                "[Video transcription of clip.mp4]: Line one\nLine two\n\nEdit this".into(),
+                "🎬 Line one\nLine two\n\nEdit this".into(),
             ),
             (
                 "video-transcription format contains Video and is handled before the [VIDEO:...] pattern",
-                "[Video transcription of clip.mp4]: hi there [VIDEO:/tmp/other.mp4]",
-                "🎬 hi there 🎬 Video: other.mp4",
+                "[Video transcription of clip.mp4]: hi there [VIDEO:/tmp/other.mp4]".into(),
+                "🎬 hi there 🎬 Video: other.mp4".into(),
             ),
             (
                 "audio-transcription format contains Audio and is handled before the [AUDIO:...] pattern",
-                "[Audio transcription of msg.ogg]: hi there [AUDIO:/tmp/other.ogg]",
-                "🔊 hi there 🎵 other.ogg",
+                "[Audio transcription of msg.ogg]: hi there [AUDIO:/tmp/other.ogg]".into(),
+                "🔊 hi there 🎵 other.ogg".into(),
             ),
             (
                 "replaces mixed image/audio/video markers",
-                "![]() [IMAGE:/tmp/a.png] and [AUDIO:/tmp/b.ogg] end [VIDEO:/tmp/c.mp4]",
-                "![]() ![Image](/tmp/a.png) and 🎵 b.ogg end 🎬 Video: c.mp4",
+                format!("![]() [IMAGE:{photo_str}] and [AUDIO:/tmp/b.ogg] end [VIDEO:/tmp/c.mp4]"),
+                format!("![]() ![Image]({photo_str}) and 🎵 b.ogg end 🎬 Video: c.mp4"),
             ),
             (
                 "leaves content without markers unchanged",
-                "Hello world",
-                "Hello world",
+                "Hello world".into(),
+                "Hello world".into(),
             ),
-            ("returns the empty string unchanged", "", ""),
+            (
+                "returns the empty string unchanged",
+                String::new(),
+                String::new(),
+            ),
             (
                 "strips a saved image annotation and its blank-line separator",
-                "[IMAGE:data:image/png;base64,AAAA]\n\n[Saved image: /uploads/img.png]",
-                "![Image](data:image/png;base64,AAAA)",
+                format!("[IMAGE:{valid_uri}]\n\n[Saved image: /uploads/img.png]"),
+                format!("![Image]({valid_uri})"),
             ),
             (
                 "strips a saved image annotation at the start with no preceding separator",
-                "[Saved image: /uploads/img.png]",
-                "",
+                "[Saved image: /uploads/img.png]".into(),
+                String::new(),
             ),
             (
                 "turns a saved video annotation into a visible clip placeholder",
-                "Clip [Saved video: /uploads/clip.mp4] here",
-                "Clip 🎬 Video: clip.mp4 here",
+                "Clip [Saved video: /uploads/clip.mp4] here".into(),
+                "Clip 🎬 Video: clip.mp4 here".into(),
             ),
             (
                 "keeps the saved video clip visible alongside its transcription",
-                "[Video transcription of clip.mp4]: Line one\n\n[Saved video: /uploads/clip.mp4]",
-                "🎬 Line one\n\n🎬 Video: clip.mp4",
+                "[Video transcription of clip.mp4]: Line one\n\n[Saved video: /uploads/clip.mp4]"
+                    .into(),
+                "🎬 Line one\n\n🎬 Video: clip.mp4".into(),
             ),
         ];
 
@@ -549,37 +668,6 @@ mod tests {
     }
 
     #[test]
-    fn data_uri_base64_payload_table() {
-        let cases: &[(&str, &str, Option<&str>)] = &[
-            (
-                "extracts the base64 payload",
-                "data:image/png;base64,AAAA",
-                Some("AAAA"),
-            ),
-            (
-                "handles mediatype parameters before the base64 marker",
-                "data:image/png;charset=utf-8;base64,BBBB",
-                Some("BBBB"),
-            ),
-            ("rejects a plain file path", "/tmp/photo.png", None),
-            ("rejects an http URL", "https://example.com/img.png", None),
-            (
-                "rejects a data URI without a base64 marker",
-                "data:image/png,raw-bytes",
-                None,
-            ),
-            (
-                "allows an empty payload",
-                "data:image/png;base64,",
-                Some(""),
-            ),
-        ];
-        for (i, (name, uri, expected)) in cases.iter().enumerate() {
-            assert_eq!(data_uri_base64_payload(uri), *expected, "case {i} ({name})");
-        }
-    }
-
-    #[test]
     fn decode_data_uri_image_table() {
         // URIs are built before the table: the success case needs a real
         // encoded PNG, and the two over-cap cases need a payload/dimension
@@ -589,10 +677,15 @@ mod tests {
         let non_image = format!("data:text/plain;base64,{}", STANDARD.encode(b"hello world"));
         let oversized_payload = format!(
             "data:image/png;base64,{}",
-            "A".repeat(MAX_DATA_URI_ENCODED_BYTES + 1)
+            "A".repeat(media_target::MAX_DATA_URI_ENCODED_BYTES + 1)
         );
         let oversized_dimensions = data_uri(&tiny_png(MAX_IMAGE_LONGEST_SIDE_PX + 1, 1));
         let missing_marker = "data:image/png,AAAA".to_string();
+        let mut jbuf = Vec::new();
+        ::image::RgbImage::from_pixel(1, 1, ::image::Rgb([255, 0, 0]))
+            .write_to(&mut Cursor::new(&mut jbuf), ::image::ImageFormat::Jpeg)
+            .expect("test JPEG must encode");
+        let mismatched_uri = format!("data:image/png;base64,{}", STANDARD.encode(&jbuf));
 
         let cases: &[(&str, String, Option<(u32, u32, Vec<u8>)>)] = &[
             (
@@ -608,13 +701,22 @@ mod tests {
                 None,
             ),
             (
-                "rejects oversized dimensions from the header alone before any pixel decode",
+                "downscales a valid but over-display-cap raster to the render cap",
                 oversized_dimensions,
-                None,
+                Some((
+                    MAX_IMAGE_LONGEST_SIDE_PX,
+                    1,
+                    [255, 0, 0, 255].repeat(MAX_IMAGE_LONGEST_SIDE_PX as usize),
+                )),
             ),
             (
                 "rejects a data URI missing the base64 marker",
                 missing_marker,
+                None,
+            ),
+            (
+                "rejects a data URI whose declared subtype mismatches the actual bytes",
+                mismatched_uri,
                 None,
             ),
         ];
@@ -659,7 +761,7 @@ mod tests {
     fn data_uri_image_handle_rejects_oversized_payload_without_caching() {
         // Over-cap payloads are refused by the pure length check before the
         // cache is consulted — a ~20 MiB key must never be retained.
-        let huge = "A".repeat(MAX_DATA_URI_ENCODED_BYTES + 1);
+        let huge = "A".repeat(media_target::MAX_DATA_URI_ENCODED_BYTES + 1);
         let uri = format!("data:image/png;base64,{huge}");
         assert_eq!(data_uri_image_handle(&uri), None);
         let cache = DATA_URI_IMAGE_CACHE.lock().unwrap_poison();
@@ -671,14 +773,38 @@ mod tests {
 
     #[test]
     fn data_uri_marker_survives_markdown_parse() {
-        // The renderer must receive the full data URI — a truncated or
+        // The renderer must receive the full, valid data URI — a truncated or
         // escaped URL would fall back to the placeholder even for decodable
-        // images.
-        let processed = preprocess("[IMAGE:data:image/png;base64,AAAA]");
+        // images. A non-decodable `data:` payload still reaches the markdown
+        // Image item (replace_media_markers emits `![Image](...)` for every
+        // `data:` URI), and the viewer degrades it to the 🖼️ placeholder rather
+        // than drawing a broken image.
+        let uri = data_uri(&tiny_png(2, 1));
+        let processed = preprocess(&format!("[IMAGE:{uri}]"));
         let items: Vec<_> = markdown::parse(&processed).collect();
         let [markdown::Item::Image { url, .. }] = items.as_slice() else {
             panic!("expected a single Image item, got {items:?}");
         };
-        assert_eq!(url.as_str(), "data:image/png;base64,AAAA");
+        assert_eq!(url.as_str(), uri);
+    }
+
+    #[test]
+    fn bounded_cache_duplicate_insert_keeps_eviction_exact() {
+        // Two concurrent render passes decoding the same key and both reaching the
+        // check→decode→insert path must not leave a duplicate in the LRU order, or
+        // eviction could drop a live entry ahead of a stale copy.
+        let mut cache = BoundedLruCache::with_capacity(2);
+        cache.insert(1, "a");
+        cache.insert(1, "a2"); // same-key re-insert (concurrent check→decode→insert)
+        cache.insert(2, "b");
+        assert_eq!(cache.lru.len(), 2, "duplicate key must not survive in lru");
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.get(&2), Some(&"b"));
+        // capacity 2, lru now [1, 2] (back = most recently used). Inserting 3 evicts 1.
+        cache.insert(3, "c");
+        assert_eq!(cache.lru.len(), 2, "eviction must stay exact");
+        assert_eq!(cache.get(&1), None, "oldest (1) must be evicted");
+        assert_eq!(cache.get(&2), Some(&"b"));
+        assert_eq!(cache.get(&3), Some(&"c"));
     }
 }

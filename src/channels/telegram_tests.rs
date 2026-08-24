@@ -332,7 +332,16 @@ fn parse_attachment_markers_tests() {
     let png = dir.path().join("a.png");
     let ogg = dir.path().join("voice.ogg");
     let vid = dir.path().join("vid.mp4");
-    std::fs::write(&png, b"fake-png").unwrap();
+    // The IMAGE fixture must be a real decodable raster — the classifier
+    // rejects a non-image file, keeping the marker as literal text.
+    std::fs::write(&png, {
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("test PNG must encode");
+        buf
+    })
+    .unwrap();
     std::fs::write(&ogg, b"fake-ogg").unwrap();
     std::fs::write(&vid, b"fake-mp4").unwrap();
 
@@ -378,16 +387,41 @@ fn parse_attachment_markers_tests() {
     assert_eq!(cleaned, "");
     assert_eq!(att.len(), 1);
     assert_eq!(att[0].kind, TelegramAttachmentKind::Image);
+
+    // Regression (case-insensitive gate): a lowercase `[image:...]` targeting an
+    // existing NON-raster file must NOT bypass the classifier into the loose
+    // is_file() path — it stays as inert literal text.
+    let nonimg = dir.path().join("note.txt");
+    std::fs::write(&nonimg, b"not an image").unwrap();
+    let (cleaned, att) = parse_attachment_markers(&format!("[image:{}]", nonimg.display()));
+    assert_eq!(cleaned, format!("[image:{}]", nonimg.display()));
+    assert!(
+        att.is_empty(),
+        "non-raster lowercase image marker must stay literal"
+    );
 }
 
 #[test]
 fn parse_path_only_attachment_tests() {
     let dir = tempfile::tempdir().unwrap();
+
+    // A real 1×1 PNG raster is a valid image target → attached as a photo.
     let p = dir.path().join("snap.png");
-    std::fs::write(&p, b"fake-png").unwrap();
+    let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+    let mut buf = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(&p, &buf).unwrap();
     let parsed = parse_path_only_attachment(p.to_string_lossy().as_ref()).unwrap();
     assert_eq!(parsed.kind, TelegramAttachmentKind::Image);
     assert_eq!(parsed.target, p.to_string_lossy());
+
+    // A non-raster file with an image extension is NOT a valid image target —
+    // it stays plain text, never attached as a photo (matches the marker gate).
+    let bad = dir.path().join("fake.png");
+    std::fs::write(&bad, b"fake-png").unwrap();
+    assert!(parse_path_only_attachment(bad.to_string_lossy().as_ref()).is_none());
+
     assert!(parse_path_only_attachment("Screenshot saved to /tmp/snap.png").is_none());
 }
 

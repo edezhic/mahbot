@@ -549,6 +549,7 @@ static IMAGE_PLACEHOLDER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 mod tests {
     use super::*;
     use crate::util::UnwrapPoison;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::sync::OnceLock;
 
     /// Ensure JetBrains Mono is loaded into the global font system so wrap
@@ -790,8 +791,18 @@ mod tests {
 
     #[test]
     fn base64_data_uri_reduced_to_placeholder() {
-        let blob = "x".repeat(20_000);
-        let text = format!("before [IMAGE:data:image/png;base64,{blob}] after");
+        // A valid native data-URI image marker is reduced to a short
+        // `🖼️ image` placeholder rather than its base64 payload being counted
+        // as token text. (Non-raster markers stay as literal text.)
+        let png = {
+            let img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+            let mut buf = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .expect("test PNG must encode");
+            buf
+        };
+        let uri = format!("data:image/png;base64,{}", STANDARD.encode(&png));
+        let text = format!("before [IMAGE:{uri}] after");
         let m = measure(&text);
         // Two short words + "🖼️ image" placeholder — fits within the budget.
         assert!(m.wrapped_lines <= 3, "{} lines", m.wrapped_lines);
@@ -804,11 +815,19 @@ mod tests {
 
     #[test]
     fn image_marker_placeholder_uses_filename() {
-        let text = "see [IMAGE:/tmp/screenshots/cap.png] below";
-        let m = measure(text);
+        let dir = tempfile::tempdir().unwrap();
+        let cap = dir.path().join("cap.png");
+        let img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("test PNG must encode");
+        std::fs::write(&cap, &buf).unwrap();
+
+        let text = format!("see [IMAGE:{}] below", cap.display());
+        let m = measure(&text);
         assert_eq!(m.wrapped_lines, 1);
         assert!(m.preview.is_none());
-        let measured = placeholder_media(&media_markers::preprocess(text));
+        let measured = placeholder_media(&media_markers::preprocess(&text));
         assert!(measured.contains("🖼️ cap.png"), "got: {measured:?}");
     }
 
