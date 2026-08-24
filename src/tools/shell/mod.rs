@@ -1250,7 +1250,7 @@ static SPILL_OWNERS: std::sync::LazyLock<
 
 /// Record a spill file under the current tool's owning agent id (set during
 /// agent tool execution). Outside an agent run (diagnostics runner, tests)
-/// the file is recorded under [`crate::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`)
+/// the file is recorded under [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`)
 /// so the diagnostics runner can clean up what it created. Agent ids are always
 /// prefixed (`ticket_*`, `manager_*`, etc.) and never equal bare `"diagnostics"`
 /// so no collision. Tests outside an agent also bucket there (acceptable).
@@ -1261,11 +1261,11 @@ fn record_spill_owner(path: std::path::PathBuf) {
     if let Some(ref agent_id) = agent {
         debug_assert_ne!(
             agent_id,
-            crate::role::DIAGNOSTICS_ROLE,
+            crate::agent::role::DIAGNOSTICS_ROLE,
             "agent id must not collide with diagnostics spill owner"
         );
     }
-    let key = agent.unwrap_or_else(|| crate::role::DIAGNOSTICS_ROLE.to_string());
+    let key = agent.unwrap_or_else(|| crate::agent::role::DIAGNOSTICS_ROLE.to_string());
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
     map.entry(key).or_default().push(path);
 }
@@ -1273,8 +1273,8 @@ fn record_spill_owner(path: std::path::PathBuf) {
 /// Delete the spill files recorded for `agent_id` (owner-deletes-at-end).
 /// Also clears the registry entry so a later run of the same agent id starts
 /// fresh. Callers: the agent run end hook (`run_agent`) and the diagnostics
-/// runner (which passes [`crate::role::DIAGNOSTICS_ROLE`]) — the diagnostics
-/// spill owner is [`crate::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`).
+/// runner (which passes [`crate::agent::role::DIAGNOSTICS_ROLE`]) — the diagnostics
+/// spill owner is [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`).
 pub(crate) fn cleanup_agent_spills(agent_id: &str) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
     let Some(paths) = map.remove(agent_id) else {

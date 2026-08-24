@@ -19,7 +19,7 @@ pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
     let Some(ref last_str) = ws.maintainer_last_run_at else {
         return Some("Next maintenance: pending".to_string());
     };
-    let last_time = match crate::turso::parse_utc_timestamp(last_str) {
+    let last_time = match crate::db::parse_utc_timestamp(last_str) {
         Ok(dt) => dt,
         Err(e) => {
             tracing::warn!(maintainer_last_run_at = %last_str, error = %e, "Failed to parse maintainer_last_run_at in workspace label, showing 'pending'");

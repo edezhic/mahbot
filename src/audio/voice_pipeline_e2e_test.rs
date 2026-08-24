@@ -2557,8 +2557,8 @@ pub(crate) fn run_wake_word_benchmark() {
             Ok(proto) => {
                 let calibration =
                     crate::audio::wake_word::calibrate_negatives(&proto, &negative_embeddings);
-                let created_at = crate::turso::now();
-                let trained_at = crate::turso::now();
+                let created_at = crate::db::now();
+                let trained_at = crate::db::now();
                 let phrase = super::normalize_phrase(BENCH_WAKE_PHRASE);
                 crate::audio::wake_word::WakeWordEnrollment::build(
                     phrase,

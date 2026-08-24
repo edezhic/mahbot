@@ -1,10 +1,11 @@
+pub(crate) mod chat_history;
 mod enrichment;
 pub mod telegram;
 pub use enrichment::{EnrichmentStrategy, enrich_links, enrich_message, has_only_audio_markers};
 pub use telegram::mirror_gui_message_to_telegram;
 
-use crate::chat_history::ChatHistoryInsert;
-use crate::turso;
+use crate::channels::chat_history::ChatHistoryInsert;
+use crate::db;
 use crate::util::UnwrapPoison;
 use crate::{Channel, ChannelMessage, ChatDirection, SendMessage};
 use async_trait::async_trait;
@@ -38,7 +39,7 @@ impl BroadcastPersistEntry {
         );
 
         let message_id = crate::generate_id();
-        let timestamp = turso::now();
+        let timestamp = db::now();
 
         let db_direction = match self.direction {
             ChatDirection::Agent => "agent".to_string(),
@@ -60,7 +61,7 @@ impl BroadcastPersistEntry {
             &timestamp,
         );
 
-        let store = crate::chat_history::store();
+        let store = crate::channels::chat_history::store();
         let _ = store
             .insert(&ChatHistoryInsert {
                 message_id,
@@ -77,7 +78,7 @@ impl BroadcastPersistEntry {
 /// Broadcast an agent response to CHAT_BROADCAST for live GUI display and
 /// persist it to chat_history. This is the canonical entry point for all
 /// agent responses — used by the per-agent consumer loop in
-/// [`crate::message_router`] and by the raw reply-target delivery path.
+/// [`crate::agent::message_router`] and by the raw reply-target delivery path.
 ///
 /// TTS audio playback is handled separately by [`crate::audio::tts::init_listener()`],
 /// which subscribes to [`CHAT_BROADCAST`](crate::CHAT_BROADCAST) and triggers
@@ -160,7 +161,7 @@ pub async fn broadcast_and_persist_incoming_message(
     persist_content: &str,
 ) {
     let message_id = crate::generate_id();
-    let timestamp = turso::now();
+    let timestamp = db::now();
 
     broadcast_chat_event(
         &message_id,
@@ -176,7 +177,7 @@ pub async fn broadcast_and_persist_incoming_message(
 
     tokio::join!(
         async {
-            let store = crate::chat_history::store();
+            let store = crate::channels::chat_history::store();
             let _ = store
                 .insert(&ChatHistoryInsert {
                     message_id,

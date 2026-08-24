@@ -2542,7 +2542,11 @@ async fn post_set_my_commands(
 /// the title. Shared by the Telegram `/board` handler and its tests so the
 /// format cannot silently drift between them.
 #[must_use]
-pub fn format_board_line(phase: &crate::board::TicketPhase, id: &str, title: &str) -> String {
+pub fn format_board_line(
+    phase: &crate::pipeline::board::TicketPhase,
+    id: &str,
+    title: &str,
+) -> String {
     format!("• **{}** `{}` {}", phase.display_name(), id, title)
 }
 
@@ -2565,7 +2569,7 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     // Each pool role is a direct command; the active role's entry is marked.
     // Role switches lead the menu — the most frequent action.
     for role in &pool {
-        let label = crate::role::role_info(role).display_label;
+        let label = crate::agent::role::role_info(role).display_label;
         let desc = if Some(*role) == active_role {
             format!("{label} (current)")
         } else {

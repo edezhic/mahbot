@@ -6,7 +6,7 @@
 
 use crate::ChatDirection;
 use crate::Role;
-use crate::chat_history::ChatHistoryEntry;
+use crate::channels::chat_history::ChatHistoryEntry;
 use futures_util::SinkExt;
 use iced::widget::rule;
 use iced::widget::{
@@ -449,7 +449,7 @@ impl HomeState {
         };
         Task::perform(
             async move {
-                let store = crate::chat_history::store();
+                let store = crate::channels::chat_history::store();
                 store
                     .load_for_user_workspaces(&user_name, &chat.primary, chat.merge.as_deref())
                     .await
@@ -1216,7 +1216,7 @@ impl HomeState {
                         )
                         .await;
                         // Insert a divider marker instead of deleting history.
-                        let store = crate::chat_history::store();
+                        let store = crate::channels::chat_history::store();
                         match store.insert_divider(&sender, &ws.name).await {
                             Ok(()) => Ok(()),
                             Err(e) => {
@@ -1356,7 +1356,7 @@ impl HomeState {
                 let generation = self.pagination_gen;
                 Task::perform(
                     async move {
-                        let store = crate::chat_history::store();
+                        let store = crate::channels::chat_history::store();
                         store
                             .load_older_for_user_workspaces(
                                 &sender,

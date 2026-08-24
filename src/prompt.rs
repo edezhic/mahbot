@@ -134,7 +134,7 @@ pub(crate) async fn prepend_general_context(
 
 /// Format a ticket as a `<current-ticket>` block for injection as a
 /// separate system message (after memory context, before user message).
-pub(crate) fn format_ticket_block(ticket: &crate::board::Ticket) -> String {
+pub(crate) fn format_ticket_block(ticket: &crate::pipeline::board::Ticket) -> String {
     let mut comments = String::new();
     if !ticket.comments.is_empty() {
         let _ = writeln!(comments);
@@ -166,7 +166,7 @@ pub(crate) fn format_ticket_block(ticket: &crate::board::Ticket) -> String {
 
 /// Parse an ISO 8601 timestamp and format it as local date+time.
 fn format_local_timestamp(iso_str: &str) -> String {
-    crate::turso::parse_utc_timestamp(iso_str).map_or_else(
+    crate::db::parse_utc_timestamp(iso_str).map_or_else(
         |e| {
             tracing::warn!(iso_str = %iso_str, error = %e, "Failed to parse timestamp, falling back to raw string");
             iso_str.to_string()

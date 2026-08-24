@@ -833,7 +833,7 @@ fn review_agent_count_adjustments() {
 
 #[test]
 fn analysis_escalation_trigger() {
-    use crate::management::ParallelVerdict;
+    use crate::pipeline::management::ParallelVerdict;
     let v = |score: u8| {
         ParallelVerdict::Verdict(crate::Verdict {
             score,

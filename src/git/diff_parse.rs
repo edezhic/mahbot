@@ -4,7 +4,7 @@
 //! Untracked / new file content is assembled into synthetic DiffFile entries.
 //!
 //! For git subprocess wrappers that produce diff output or manage
-//! repository state, see [`crate::git_commands`].
+//! repository state, see [`crate::git::commands`].
 
 use tracing::warn;
 

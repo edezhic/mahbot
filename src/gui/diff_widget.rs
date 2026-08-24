@@ -43,7 +43,7 @@ use iced::advanced::{mouse, renderer};
 use iced::keyboard;
 use iced::{Color, Event, Length, Point, Rectangle, Size};
 
-use crate::diff_parse::{DiffFileStatus, DiffLineKind};
+use crate::git::diff_parse::{DiffFileStatus, DiffLineKind};
 
 use super::text_rendering::{
     GUTTER_FONT_SIZE, compute_total_height, cursor_to_buffer_coords, draw_background,
@@ -922,15 +922,15 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff_parse::{DiffContent, DiffFileStatus, DiffLine, DiffLineKind};
+    use crate::git::diff_parse::{DiffContent, DiffFileStatus, DiffLine, DiffLineKind};
 
     fn make_test_diff_file(
         path: &str,
-        hunks: Vec<crate::diff_parse::DiffHunk>,
+        hunks: Vec<crate::git::diff_parse::DiffHunk>,
         status: DiffFileStatus,
     ) -> super::super::diff::DiffFile {
         super::super::diff::DiffFile::from_parsed(
-            crate::diff_parse::DiffFile::new(path.to_string(), hunks, status),
+            crate::git::diff_parse::DiffFile::new(path.to_string(), hunks, status),
             None,
             None,
         )
@@ -950,8 +950,8 @@ mod tests {
         }
     }
 
-    fn make_hunk(header: &str, lines: Vec<DiffLine>) -> crate::diff_parse::DiffHunk {
-        crate::diff_parse::DiffHunk {
+    fn make_hunk(header: &str, lines: Vec<DiffLine>) -> crate::git::diff_parse::DiffHunk {
+        crate::git::diff_parse::DiffHunk {
             header: header.to_string(),
             lines,
         }
@@ -967,7 +967,7 @@ mod tests {
     #[test]
     fn test_binary_file_skipped() {
         let file = super::super::diff::DiffFile::from_parsed(
-            crate::diff_parse::DiffFile {
+            crate::git::diff_parse::DiffFile {
                 path: "binary.bin".to_string(),
                 old_path: None,
                 hunks: Vec::new(),
@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn test_too_large_file_skipped() {
         let file = super::super::diff::DiffFile::from_parsed(
-            crate::diff_parse::DiffFile {
+            crate::git::diff_parse::DiffFile {
                 path: "large.bin".to_string(),
                 old_path: None,
                 hunks: Vec::new(),

@@ -84,8 +84,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::time::sleep;
 
-use crate::turso as turso_mod;
-use crate::wal_guard;
+use crate::db as turso_mod;
+use crate::db::wal_guard;
 
 /// Row limit per query to prevent unbounded output.
 const ROW_LIMIT: usize = 10_000;
@@ -248,7 +248,7 @@ fn take_flock(lock_path: &Path) -> Option<File> {
         .truncate(false)
         .open(lock_path)
         .ok()?;
-    match crate::lock_utils::try_flock(&file) {
+    match crate::util::lock::try_flock(&file) {
         Ok(true) => Some(file),
         _ => None,
     }
@@ -319,7 +319,7 @@ async fn flock_gate_with_timeout(
     if cfg!(not(unix)) {
         return Ok(None);
     }
-    let lock_path = crate::lock_utils::lock_file_path(root);
+    let lock_path = crate::util::lock::lock_file_path(root);
     if !lock_path.exists() {
         return Ok(None);
     }
@@ -1483,7 +1483,7 @@ fn open_and_run_readonly<T>(
         if flock_guard.is_none() {
             let tshm = turso_mod::store_sidecars(file_path).tshm;
             if tshm.exists() && probe_tshm_byte0_pid(&tshm).is_none() {
-                let lock_path = crate::lock_utils::lock_file_path(root);
+                let lock_path = crate::util::lock::lock_file_path(root);
                 if lock_path.exists() && !probe_flock_free(&lock_path) {
                     bail!(
                         "live daemon lock-drop detected after open on '{}' — the open \
@@ -2701,7 +2701,7 @@ mod tests {
         let db_path = turso_mod::store_db_path(root, name);
         std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
         let mut bytes = vec![0u8; 116];
-        bytes[0..8].copy_from_slice(crate::wal_guard::TSHM_MAGIC.as_slice());
+        bytes[0..8].copy_from_slice(crate::db::wal_guard::TSHM_MAGIC.as_slice());
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         bytes[12..16].copy_from_slice(&64u32.to_le_bytes());
         std::fs::write(turso_mod::store_sidecars(&db_path).tshm, bytes).unwrap();
@@ -2728,7 +2728,7 @@ mod tests {
             .open(lock_path)
             .unwrap();
         assert!(
-            crate::lock_utils::try_flock(&file).unwrap(),
+            crate::util::lock::try_flock(&file).unwrap(),
             "test must hold the flock"
         );
         file
@@ -2796,7 +2796,7 @@ mod tests {
     async fn flock_gate_proceeds_when_daemon_alive() {
         let dir = tempfile::TempDir::new().unwrap();
         write_tshm_only(dir.path(), "board");
-        let _flock = hold_flock(&crate::lock_utils::lock_file_path(dir.path()));
+        let _flock = hold_flock(&crate::util::lock::lock_file_path(dir.path()));
         let tshm = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "board")).tshm;
         let mut child = hold_byte0_perl(&tshm);
         // Wait for the child to place the lock before probing.
@@ -2833,7 +2833,7 @@ mod tests {
     async fn flock_gate_takes_flock_in_crash_recovery() {
         let dir = tempfile::TempDir::new().unwrap();
         write_tshm_only(dir.path(), "board");
-        let lock_path = crate::lock_utils::lock_file_path(dir.path());
+        let lock_path = crate::util::lock::lock_file_path(dir.path());
         touch_lock(&lock_path);
         // The gate must first observe the flock busy (the daemon's release
         // precedes its exit), then see two consecutive free observations.
@@ -2886,7 +2886,7 @@ mod tests {
     async fn flock_gate_never_takes_flock_during_handoff() {
         let dir = tempfile::TempDir::new().unwrap();
         write_tshm_only(dir.path(), "board");
-        let lock_path = crate::lock_utils::lock_file_path(dir.path());
+        let lock_path = crate::util::lock::lock_file_path(dir.path());
         touch_lock(&lock_path);
         let tshm = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "board")).tshm;
         let mut child = hold_byte0_perl(&tshm);
@@ -2938,7 +2938,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         write_tshm_only(dir.path(), "board");
         write_tshm_only(dir.path(), "logs");
-        let lock_path = crate::lock_utils::lock_file_path(dir.path());
+        let lock_path = crate::util::lock::lock_file_path(dir.path());
         touch_lock(&lock_path);
         let tshm_a = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "board")).tshm;
         let tshm_b = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "logs")).tshm;
@@ -3004,7 +3004,7 @@ mod tests {
     async fn flock_gate_refuses_in_lock_drop_state() {
         let dir = tempfile::TempDir::new().unwrap();
         write_tshm_only(dir.path(), "board");
-        let _flock = hold_flock(&crate::lock_utils::lock_file_path(dir.path()));
+        let _flock = hold_flock(&crate::util::lock::lock_file_path(dir.path()));
         let err = flock_gate_with_timeout(dir.path(), &["board".into()], Duration::from_secs(1))
             .await
             .expect_err("flock held + byte-0 free must refuse");

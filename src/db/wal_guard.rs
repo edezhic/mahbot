@@ -32,7 +32,7 @@
 //! `-tshm`/`-wal` files after startup, or it silently releases the byte-0
 //! lifetime lock and a second process classifies its open as `Exclusive`
 //! (triggering repair that wipes live reader slots). All daemon-side reads go
-//! through the persistent per-store fds on [`crate::turso::Connection`]; the
+//! through the persistent per-store fds on [`crate::db::Connection`]; the
 //! path-based helpers here are reserved for processes that hold no locks
 //! (CLI, boot pre-flight, tests) and are counted by the regression counter
 //! [`tshm_open_close_count`].
@@ -260,7 +260,7 @@ impl WalStateClass {
 /// Read sources for one store's coordination files.
 ///
 /// The daemon passes the persistent per-store fds from
-/// [`crate::turso::Connection`]; processes that hold no locks (CLI, boot
+/// [`crate::db::Connection`]; processes that hold no locks (CLI, boot
 /// pre-flight, tests) pass `StoreFds::none()` and the path-based fallback
 /// (open+close, counted by the regression counter) is used.
 #[derive(Debug, Clone, Copy, Default)]
@@ -555,7 +555,7 @@ fn read_last_frame_header(
     let offset =
         WAL_HEADER_SIZE.saturating_add(tshm.max_frame.saturating_sub(1).saturating_mul(frame_size));
     let bytes: [u8; 24] = if let Some(f) = wal_fd {
-        crate::turso::pread_at(f, offset)?
+        crate::db::pread_at(f, offset)?
     } else {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(wal_path).ok()?;
@@ -605,14 +605,14 @@ fn read_tshm_disciplined(
 /// is the daemon (see [`StoreFds`]).
 #[must_use]
 pub fn inspect_store_at(db_path: &Path, fds: StoreFds<'_>) -> StoreArtifactStatus {
-    let sidecars = crate::turso::store_sidecars(db_path);
+    let sidecars = crate::db::store_sidecars(db_path);
     let tshm = read_tshm_disciplined(|| match fds.tshm {
-        Some(f) => crate::turso::pread::<TSHM_HEADER_READ_LEN>(f),
+        Some(f) => crate::db::pread::<TSHM_HEADER_READ_LEN>(f),
         None => read_tshm_bytes_path(&sidecars.tshm),
     });
     let wal_size = std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len());
     let wal_header = match fds.wal {
-        Some(f) => crate::turso::pread::<32>(f),
+        Some(f) => crate::db::pread::<32>(f),
         None => read_wal_bytes_path(&sidecars.wal),
     };
     let wal_header = wal_header.as_ref().and_then(parse_wal_header);
@@ -649,7 +649,7 @@ pub fn inspect_store_at(db_path: &Path, fds: StoreFds<'_>) -> StoreArtifactStatu
 /// Classify the file set of one store under `root/db/`.
 #[must_use]
 pub fn inspect_store(root: &Path, name: &str, fds: StoreFds<'_>) -> StoreArtifactStatus {
-    inspect_store_at(&crate::turso::store_db_path(root, name), fds)
+    inspect_store_at(&crate::db::store_db_path(root, name), fds)
 }
 
 // ── Boot pre-flight diagnosis ─────────────────────────────────────────────
@@ -720,7 +720,7 @@ pub(crate) fn take_boot_diagnosis(db_path: &Path) -> Option<BootDiagnosis> {
 }
 
 /// True when a boot pre-flight diagnosis exists for `db_path` (not yet
-/// consumed by [`crate::turso::open_store`]). Lets callers that open a store
+/// consumed by [`crate::db::open_store`]). Lets callers that open a store
 /// through the boot path know the repair flow (which runs quick_check) will
 /// run — e.g. the logs store's verify step, which would otherwise duplicate
 /// the boot scan.
@@ -805,9 +805,9 @@ fn classify_main_db(db_path: &Path, wal_exists: bool, wal_size: u64) -> BootDiag
 /// open+close regression counter is reset afterwards so the wal-guard's first
 /// reading reflects only post-startup paths.
 pub fn diagnose_all_stores(root: &Path) {
-    for (name, _) in crate::turso::iter_checkpoint_stores() {
-        let db_path = crate::turso::store_db_path(root, name);
-        let sidecars = crate::turso::store_sidecars(&db_path);
+    for (name, _) in crate::db::iter_checkpoint_stores() {
+        let db_path = crate::db::store_db_path(root, name);
+        let sidecars = crate::db::store_sidecars(&db_path);
         let status = inspect_store_at(&db_path, StoreFds::none());
         let wal_size = status.wal_size;
 
@@ -899,7 +899,7 @@ pub async fn run_wal_guard_loop() {
         std::collections::HashMap::new();
     // (identity condition, consecutive-observation count) per store — keyed
     // per condition so a Replaced→Deleted transition restarts the count.
-    let mut identity_seen: std::collections::HashMap<String, (crate::turso::SidecarIdentity, u64)> =
+    let mut identity_seen: std::collections::HashMap<String, (crate::db::SidecarIdentity, u64)> =
         std::collections::HashMap::new();
     let mut check_count: u64 = 0;
 
@@ -912,24 +912,24 @@ pub async fn run_wal_guard_loop() {
             break;
         }
         check_count += 1;
-        for (name, conn) in crate::turso::iter_checkpoint_stores() {
-            let identity = conn.and_then(crate::turso::Connection::check_coordination_identity);
+        for (name, conn) in crate::db::iter_checkpoint_stores() {
+            let identity = conn.and_then(crate::db::Connection::check_coordination_identity);
             // Replaced: the persistent fds read stale inodes — skip the
             // inspect entirely. A Deleted sidecar is inspected instead: the
             // fd still reads the old inode while wal_size comes from the path,
             // and that coupling classifies the resulting orphaned state
             // correctly (the Replaced branch skips for exactly the
             // stale-inode reason).
-            if identity == Some(crate::turso::SidecarIdentity::Replaced) {
+            if identity == Some(crate::db::SidecarIdentity::Replaced) {
                 announce_identity(
                     &mut identity_seen,
                     name,
-                    crate::turso::SidecarIdentity::Replaced,
+                    crate::db::SidecarIdentity::Replaced,
                     check_count,
                 );
                 continue;
             }
-            let fds = conn.map_or_else(StoreFds::none, crate::turso::Connection::store_fds);
+            let fds = conn.map_or_else(StoreFds::none, crate::db::Connection::store_fds);
             let status = inspect_store(&root, name, fds);
             let store = status.store.clone();
             // The Deleted identity warn fires only when the class is healthy
@@ -937,13 +937,13 @@ pub async fn run_wal_guard_loop() {
             // predicate) — a non-healthy class already announces on the class
             // throttle, so the loop stays at one warn per cycle (matching the
             // Replaced branch's single skip-warn).
-            if identity == Some(crate::turso::SidecarIdentity::Deleted)
+            if identity == Some(crate::db::SidecarIdentity::Deleted)
                 && status.class == WalStateClass::Healthy
             {
                 announce_identity(
                     &mut identity_seen,
                     name,
-                    crate::turso::SidecarIdentity::Deleted,
+                    crate::db::SidecarIdentity::Deleted,
                     check_count,
                 );
             } else {
@@ -997,9 +997,9 @@ pub async fn run_wal_guard_loop() {
 /// re-announce every [`REANNOUNCE_EVERY_CHECKS`] checks. Keyed per
 /// (store, condition) — a condition change restarts the count.
 fn announce_identity(
-    identity_seen: &mut std::collections::HashMap<String, (crate::turso::SidecarIdentity, u64)>,
+    identity_seen: &mut std::collections::HashMap<String, (crate::db::SidecarIdentity, u64)>,
     name: &str,
-    identity: crate::turso::SidecarIdentity,
+    identity: crate::db::SidecarIdentity,
     check_count: u64,
 ) {
     let entry = identity_seen
@@ -1011,12 +1011,12 @@ fn announce_identity(
     entry.1 += 1;
     if entry.1 == 2 || (entry.1 > 2 && check_count.is_multiple_of(REANNOUNCE_EVERY_CHECKS)) {
         match identity {
-            crate::turso::SidecarIdentity::Replaced => warn!(
+            crate::db::SidecarIdentity::Replaced => warn!(
                 db = %name,
                 "wal-guard: coordination files replaced by an external process \
                  (inode mismatch) — checks suspended for this store until restart",
             ),
-            crate::turso::SidecarIdentity::Deleted => warn!(
+            crate::db::SidecarIdentity::Deleted => warn!(
                 db = %name,
                 "wal-guard: coordination sidecar deleted by an external process \
                  (unlinked under the daemon) — the predicate will detect any \
@@ -1323,7 +1323,7 @@ mod tests {
         write(&dir.join("db/logs.db-tshm"), &tshm_bytes(0, 0, 0));
         // Path-based inspection (StoreFds::none) so live connections from
         // concurrently-running tests cannot leak real store state in here.
-        for name in crate::turso::store_names() {
+        for name in crate::db::store_names() {
             let s = inspect_store(&dir, name, StoreFds::none());
             assert_eq!(
                 s.class,
@@ -1394,9 +1394,9 @@ mod tests {
         let mut wal = vec![0u8; 32 + 120 * (24 + 4096)];
         wal[..32].copy_from_slice(&wal_header_bytes(4096, 0, 0));
         write(&dir.join("db/core.db-wal"), &wal);
-        crate::wal_guard::diagnose_all_stores(&dir);
+        crate::db::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
-            crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(&dir, "sessions")),
+            crate::db::wal_guard::take_boot_diagnosis(&crate::db::store_db_path(&dir, "sessions")),
             Some(BootDiagnosis::StaleTail)
         );
 
@@ -1405,9 +1405,9 @@ mod tests {
         let _ = std::fs::remove_file(&dir.join("db/core.db-wal"));
         write(&dir.join("db/core.db"), &[0u8; 64]);
         write(&dir.join("db/core.db-tshm"), &tshm_bytes(0, 0, 0));
-        crate::wal_guard::diagnose_all_stores(&dir);
+        crate::db::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
-            crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(&dir, "board")),
+            crate::db::wal_guard::take_boot_diagnosis(&crate::db::store_db_path(&dir, "board")),
             Some(BootDiagnosis::Structural)
         );
 
@@ -1418,9 +1418,9 @@ mod tests {
         db[16..18].copy_from_slice(&1u16.to_be_bytes());
         write(&dir.join("db/core.db"), &db);
         write(&dir.join("db/core.db-tshm"), &tshm_bytes(0, 0, 0));
-        crate::wal_guard::diagnose_all_stores(&dir);
+        crate::db::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
-            crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(
+            crate::db::wal_guard::take_boot_diagnosis(&crate::db::store_db_path(
                 &dir,
                 "chat_history"
             )),
@@ -1430,9 +1430,9 @@ mod tests {
         // (4) Healthy: fresh store state (no main DB file yet).
         let _ = std::fs::remove_file(&dir.join("db/core.db"));
         write(&dir.join("db/core.db-tshm"), &tshm_bytes(0, 0, 0));
-        crate::wal_guard::diagnose_all_stores(&dir);
+        crate::db::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
-            crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(&dir, "users")),
+            crate::db::wal_guard::take_boot_diagnosis(&crate::db::store_db_path(&dir, "users")),
             Some(BootDiagnosis::Healthy)
         );
 

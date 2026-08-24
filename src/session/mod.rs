@@ -1,12 +1,13 @@
 //! Session persistence — Turso-backed store + native history decoding.
 
 pub mod dead_session;
+pub(crate) mod image_strip;
 pub mod manager;
 pub(crate) use manager::FinalizeOutcome;
 pub(crate) use manager::RewriteOutcome;
 pub use manager::Session;
 
-use crate::turso::{self, IntoParams, Row, TxGuard, Value, params};
+use crate::db::{self, IntoParams, Row, TxGuard, Value, params};
 use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -231,7 +232,7 @@ pub(crate) struct SessionMetadata {
 /// Context data stored alongside a session for recovery purposes.
 ///
 /// Populated when a user initiates a direct agent session so the dead-session
-/// recovery poller can reconstruct an [`AgentJob`](crate::message_router::AgentJob)
+/// recovery poller can reconstruct an [`AgentJob`](crate::agent::message_router::AgentJob)
 /// without parsing the agent ID string.
 ///
 /// # Column naming note
@@ -256,7 +257,7 @@ fn session_metadata_from_row(
     count: i64,
     token_length: Option<i64>,
 ) -> Result<SessionMetadata> {
-    let last_activity = turso::parse_utc_timestamp(activity_str).with_context(|| {
+    let last_activity = db::parse_utc_timestamp(activity_str).with_context(|| {
         format!("invalid last_activity {activity_str:?} for session {agent_id}")
     })?;
     Ok(SessionMetadata {
@@ -287,7 +288,7 @@ async fn insert_messages_in_transaction(
     context: Option<(&str, &str, &str, &str)>,
     replace: bool,
 ) -> Result<()> {
-    let now = turso::now();
+    let now = db::now();
     for msg in messages {
         tx.execute(
             "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -363,7 +364,7 @@ async fn insert_messages_in_transaction(
 /// `agent_id` is passed as a structured tracing field; when `None`, tracing
 /// automatically suppresses it from the output.
 async fn query_map_collect<T, E>(
-    conn: &turso::Connection,
+    conn: &db::Connection,
     sql: &str,
     params: impl IntoParams + Send + 'static,
     row_parser: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
@@ -404,7 +405,7 @@ where
 /// second while the Sessions page is visible) and has been removed. Ordering and
 /// filtering are unchanged.
 async fn list_sessions_where(
-    conn: &turso::Connection,
+    conn: &db::Connection,
     where_clause: &str,
     params: impl IntoParams + Send + 'static,
     warn_context: &str,
@@ -571,7 +572,7 @@ impl SessionStore {
 
     /// Rewrite the content of the most recent `user`-role message row for the
     /// agent — the durable half of the input-image-rejection strip (see
-    /// [`crate::image_strip`]). A single-row positional UPDATE: the caller's
+    /// [`crate::session::image_strip`]). A single-row positional UPDATE: the caller's
     /// in-memory "most recent User-role message" corresponds to this row only
     /// while that message is within the persisted prefix; the in-memory guard
     /// lives in [`crate::session::Session::rewrite_last_user_message`].
@@ -641,9 +642,9 @@ impl SessionStore {
             .collect::<Vec<_>>()
             .join(" AND ");
 
-        let params: Vec<turso::Value> = exclude_prefixes
+        let params: Vec<db::Value> = exclude_prefixes
             .iter()
-            .map(|p| turso::Value::Text(format!("{p}%")))
+            .map(|p| db::Value::Text(format!("{p}%")))
             .collect();
 
         list_sessions_where(
@@ -707,7 +708,7 @@ impl SessionStore {
         value: Value,
     ) -> Result<()> {
         let col = column.as_str();
-        let now = turso::now();
+        let now = db::now();
         let sql = format!(
             "INSERT INTO session_metadata (agent_id, last_activity, {col}) \
              VALUES (?1, ?2, ?3) \
@@ -884,8 +885,8 @@ pub(crate) fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
 /// canary so a malformed `admin` fallback is traceable. This is the single
 /// source of the `admin` fallback, shared by the ID chokepoint
 /// ([`direct_agent_id`]) and the delivery-payload layers
-/// ([`crate::message_router::route_user_message`],
-/// [`crate::message_router::deliver_unregistered_user_response`]).
+/// ([`crate::agent::message_router::route_user_message`],
+/// [`crate::agent::message_router::deliver_unregistered_user_response`]).
 pub(crate) fn normalize_user_name<'a>(user_name: &'a str, context: &str) -> &'a str {
     if user_name.is_empty() {
         tracing::warn!(
@@ -934,7 +935,7 @@ fn safe_user_segment(user_name: &str) -> Cow<'_, str> {
 /// debugging. The role-last format is immune to underscores in user/workspace
 /// names since the role is always the final `_`-delimited segment, but note
 /// that the router no longer parses agent ID strings — the role is embedded
-/// directly in [`AgentJob`](crate::message_router::AgentJob).
+/// directly in [`AgentJob`](crate::agent::message_router::AgentJob).
 /// This ID is stable across messages — the same ID is used for every message
 /// in the same user/role/workspace combination, accumulating conversation
 /// history within a single session.
@@ -1512,7 +1513,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let deleted = cleanup_old_transient_sessions(&crate::turso::now())
+        let deleted = cleanup_old_transient_sessions(&crate::db::now())
             .await
             .unwrap();
         assert!(deleted >= 1, "TTL cleanup must remove the stale session");

@@ -14,13 +14,13 @@
 use super::diff_widget::{self, DiffBufferWidget, DiffFileBuffer};
 use super::highlight::{FileHighlights, HighlightLanguage, parse_highlights};
 
-use crate::diff_parse::{
-    DiffContent, DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff,
-};
-use crate::git_commands::{
+use crate::git::commands::{
     CommitInfo, DiscardTarget, MAX_UNTRACKED_SIZE, UntrackedFileRead, git_has_commits,
     git_is_installed, is_git_repo, parse_untracked_from_porcelain, read_untracked_file,
     run_git_commit, run_git_diff, run_git_discard, run_git_show, run_git_status,
+};
+use crate::git::diff_parse::{
+    DiffContent, DiffFileStatus, DiffLineKind, make_untracked_diff_file, parse_git_diff,
 };
 
 use iced::widget::Id;
@@ -156,7 +156,7 @@ pub enum DiffMessage {
 /// A single changed file, enhanced with highlight data and line counts.
 #[derive(Debug, Clone)]
 pub struct DiffFile {
-    dfile: crate::diff_parse::DiffFile,
+    dfile: crate::git::diff_parse::DiffFile,
     /// Per-line highlight spans for removed lines (from old version).
     pub old_highlights: Option<FileHighlights>,
     /// Per-line highlight spans for added/context lines (from new version).
@@ -168,7 +168,7 @@ pub struct DiffFile {
 }
 
 impl std::ops::Deref for DiffFile {
-    type Target = crate::diff_parse::DiffFile;
+    type Target = crate::git::diff_parse::DiffFile;
 
     fn deref(&self) -> &Self::Target {
         &self.dfile
@@ -180,7 +180,7 @@ impl DiffFile {
     /// `add_count` and `remove_count` automatically from hunks.
     #[must_use]
     pub fn from_parsed(
-        dfile: crate::diff_parse::DiffFile,
+        dfile: crate::git::diff_parse::DiffFile,
         old_highlights: Option<FileHighlights>,
         new_highlights: Option<FileHighlights>,
     ) -> Self {
@@ -468,7 +468,7 @@ impl DiffState {
                     async move {
                         let ws_path = resolve_workspace_path(&msg_ws, None).await;
                         match ws_path {
-                            Ok(path) => crate::git_commands::run_git_commit_message(
+                            Ok(path) => crate::git::commands::run_git_commit_message(
                                 &path,
                                 Some(&msg_hash_for_git),
                             )
@@ -1374,7 +1374,7 @@ async fn load_diff(
 /// Add untracked/new files from `git status --porcelain` to the parsed diff list.
 /// Only called for working-tree diffs (commit_ref is None).
 async fn add_untracked_files(
-    parsed: &mut Vec<crate::diff_parse::DiffFile>,
+    parsed: &mut Vec<crate::git::diff_parse::DiffFile>,
     ws_path: &Path,
 ) -> Result<(), String> {
     let status_output = run_git_status(ws_path)
@@ -1386,13 +1386,13 @@ async fn add_untracked_files(
         match read_untracked_file(&ws_path.join(path), MAX_UNTRACKED_SIZE).await {
             UntrackedFileRead::Text(text) => parsed.push(make_untracked_diff_file(path, &text)),
             UntrackedFileRead::TooLarge(size) => {
-                parsed.push(crate::diff_parse::DiffFile::placeholder(
+                parsed.push(crate::git::diff_parse::DiffFile::placeholder(
                     path.clone(),
                     DiffContent::TooLarge(size),
                 ));
             }
             UntrackedFileRead::Binary => {
-                parsed.push(crate::diff_parse::DiffFile::placeholder(
+                parsed.push(crate::git::diff_parse::DiffFile::placeholder(
                     path.clone(),
                     DiffContent::Binary,
                 ));
@@ -1406,7 +1406,7 @@ async fn add_untracked_files(
 }
 
 /// Count added and removed lines in a diff file.
-fn count_lines(dfile: &crate::diff_parse::DiffFile) -> (usize, usize) {
+fn count_lines(dfile: &crate::git::diff_parse::DiffFile) -> (usize, usize) {
     let mut add = 0;
     let mut remove = 0;
     for hunk in &dfile.hunks {
@@ -1423,7 +1423,7 @@ fn count_lines(dfile: &crate::diff_parse::DiffFile) -> (usize, usize) {
 
 /// Compute highlight spans for both old and new versions of a file.
 async fn compute_highlights(
-    dfile: &crate::diff_parse::DiffFile,
+    dfile: &crate::git::diff_parse::DiffFile,
     ws_path: &Path,
     commit_ref: Option<&str>,
 ) -> (Option<FileHighlights>, Option<FileHighlights>) {
@@ -1444,7 +1444,7 @@ async fn compute_highlights(
 }
 
 async fn compute_old_highlights(
-    dfile: &crate::diff_parse::DiffFile,
+    dfile: &crate::git::diff_parse::DiffFile,
     ws_path: &Path,
     lang: HighlightLanguage,
     commit_ref: Option<&str>,
@@ -1467,7 +1467,7 @@ async fn compute_old_highlights(
 }
 
 async fn compute_new_highlights(
-    dfile: &crate::diff_parse::DiffFile,
+    dfile: &crate::git::diff_parse::DiffFile,
     ws_path: &Path,
     lang: HighlightLanguage,
     commit_ref: Option<&str>,
@@ -1591,10 +1591,10 @@ mod tests {
 
     fn make_test_file(path: &str, add: usize, remove: usize) -> DiffFile {
         DiffFile {
-            dfile: crate::diff_parse::DiffFile::new(
+            dfile: crate::git::diff_parse::DiffFile::new(
                 path.to_string(),
                 Vec::new(),
-                crate::diff_parse::DiffFileStatus::Modified,
+                crate::git::diff_parse::DiffFileStatus::Modified,
             ),
             old_highlights: None,
             new_highlights: None,
@@ -2118,11 +2118,11 @@ mod tests {
 
     fn make_file_with_hunks(path: &str, num_hunks: usize, lines_per_hunk: usize) -> DiffFile {
         let hunks = (0..num_hunks)
-            .map(|_i| crate::diff_parse::DiffHunk {
+            .map(|_i| crate::git::diff_parse::DiffHunk {
                 header: format!("@@ -1,{lines_per_hunk} +1,{lines_per_hunk} @@"),
                 lines: (0..lines_per_hunk)
-                    .map(|_| crate::diff_parse::DiffLine {
-                        kind: crate::diff_parse::DiffLineKind::Added,
+                    .map(|_| crate::git::diff_parse::DiffLine {
+                        kind: crate::git::diff_parse::DiffLineKind::Added,
                         old_line_number: None,
                         new_line_number: Some(1),
                         content: String::new(),
@@ -2132,10 +2132,10 @@ mod tests {
             .collect();
 
         DiffFile::from_parsed(
-            crate::diff_parse::DiffFile::new(
+            crate::git::diff_parse::DiffFile::new(
                 path.to_string(),
                 hunks,
-                crate::diff_parse::DiffFileStatus::Modified,
+                crate::git::diff_parse::DiffFileStatus::Modified,
             ),
             None,
             None,
@@ -2144,11 +2144,11 @@ mod tests {
 
     fn make_binary_file(path: &str) -> DiffFile {
         DiffFile::from_parsed(
-            crate::diff_parse::DiffFile {
+            crate::git::diff_parse::DiffFile {
                 path: path.to_string(),
                 old_path: None,
                 hunks: Vec::new(),
-                status: crate::diff_parse::DiffFileStatus::Modified,
+                status: crate::git::diff_parse::DiffFileStatus::Modified,
                 content: DiffContent::Binary,
             },
             None,
@@ -2158,11 +2158,11 @@ mod tests {
 
     fn make_too_large_file(path: &str) -> DiffFile {
         DiffFile::from_parsed(
-            crate::diff_parse::DiffFile {
+            crate::git::diff_parse::DiffFile {
                 path: path.to_string(),
                 old_path: None,
                 hunks: Vec::new(),
-                status: crate::diff_parse::DiffFileStatus::Modified,
+                status: crate::git::diff_parse::DiffFileStatus::Modified,
                 content: DiffContent::TooLarge(5_000_000),
             },
             None,

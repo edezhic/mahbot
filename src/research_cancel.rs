@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use crate::registry::ParentKey;
+use crate::agent::registry::ParentKey;
 use crate::util::UnwrapPoison;
 
 /// Per-run cancel signals. An entry exists from the moment a run's
@@ -117,8 +117,10 @@ pub(crate) fn is_cancelled(job_id: &str) -> bool {
 ///    tx, then the folder, then the results.md archive).
 pub(crate) async fn cancel_research_run(job_id: &str) -> Result<(), String> {
     cancel(job_id);
-    crate::registry::AGENT_REGISTRY.cancel_by_parent_key(&ParentKey::Research(job_id.to_string()));
-    crate::registry::NON_AGENT_CALLS.remove_by_parent_key(&ParentKey::Research(job_id.to_string()));
+    crate::agent::registry::AGENT_REGISTRY
+        .cancel_by_parent_key(&ParentKey::Research(job_id.to_string()));
+    crate::agent::registry::NON_AGENT_CALLS
+        .remove_by_parent_key(&ParentKey::Research(job_id.to_string()));
     sweep_cancelled_run(job_id).await
 }
 
@@ -143,14 +145,11 @@ pub(crate) async fn sweep_cancelled_run(job_id: &str) -> Result<(), String> {
     let outcome: anyhow::Result<()> = async {
         tx.execute(
             "DELETE FROM pending_jobs WHERE id = ?1",
-            crate::turso::params![job_id],
+            crate::db::params![job_id],
         )
         .await?;
-        tx.execute(
-            "DELETE FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await?;
+        tx.execute("DELETE FROM jobs WHERE id = ?1", crate::db::params![job_id])
+            .await?;
         Ok(())
     }
     .await;
@@ -222,7 +221,7 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_midrun_1";
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
             .task("q")
             .user_name("u")
@@ -233,14 +232,14 @@ mod tests {
             .unwrap();
         conn.execute(
             "INSERT INTO research_jobs (id, state) VALUES (?1, '{}')",
-            crate::turso::params![job_id],
+            crate::db::params![job_id],
         )
         .await
         .unwrap();
         conn.execute(
             "INSERT INTO pending_jobs (id, envelope, target_agent_id, created_at) \
              VALUES (?1, ?2, 'manager_ws', ?3)",
-            crate::turso::params![
+            crate::db::params![
                 job_id,
                 r#"{"content":"report","workspace_name":"ws","user_name":"u","channel":"telegram","kind":"ResearchResult","role":"assistant","reply_target":null,"pending_job_id":null}"#,
                 now
@@ -271,7 +270,7 @@ mod tests {
         let jobs = conn
             .query(
                 "SELECT id FROM jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
@@ -279,7 +278,7 @@ mod tests {
         let pending = conn
             .query(
                 "SELECT id FROM pending_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
@@ -298,7 +297,7 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_terminal_1";
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         JobRowBuilder::new(conn, job_id, "research_cleanup", "sanitation", "ws")
             .task("cleanup prompt")
             .user_name("")
@@ -310,7 +309,7 @@ mod tests {
         conn.execute(
             "INSERT INTO pending_jobs (id, envelope, target_agent_id, created_at) \
              VALUES (?1, ?2, 'manager_ws', ?3)",
-            crate::turso::params![
+            crate::db::params![
                 job_id,
                 r#"{"content":"report","workspace_name":"ws","user_name":"u","channel":"telegram","kind":"ResearchResult","role":"assistant","reply_target":null,"pending_job_id":null}"#,
                 now
@@ -337,7 +336,7 @@ mod tests {
         let jobs = conn
             .query(
                 "SELECT id FROM jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
@@ -345,7 +344,7 @@ mod tests {
         let pending = conn
             .query(
                 "SELECT id FROM pending_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
@@ -393,7 +392,7 @@ mod tests {
         let envelope = crate::jobs::complete_durable_job(
             job_id,
             "report".to_string(),
-            crate::message_router::MessageKind::ResearchResult,
+            crate::agent::message_router::MessageKind::ResearchResult,
             crate::Role::Assistant,
             "caller-user",
             "telegram",
@@ -406,7 +405,7 @@ mod tests {
         let pending = conn
             .query(
                 "SELECT id FROM pending_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
@@ -417,7 +416,7 @@ mod tests {
         let jobs = conn
             .query(
                 "SELECT id FROM jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();

@@ -1,6 +1,6 @@
 //! WAL checkpointing for all Turso database stores.
 //!
-//! MahBot uses `multiprocess_wal` mode (configured in [`crate::turso::EXPERIMENTAL_FEATURES`]),
+//! MahBot uses `multiprocess_wal` mode (configured in [`crate::db::EXPERIMENTAL_FEATURES`]),
 //! which relies on a `.tshm` shared-memory file for WAL coordination between
 //! connections.
 //!
@@ -136,7 +136,7 @@ impl CheckpointPolicy {
     }
 }
 
-/// Iterate all stores via [`crate::turso::iter_checkpoint_stores`] and run an
+/// Iterate all stores via [`crate::db::iter_checkpoint_stores`] and run an
 /// async operation on each initialized store in parallel.
 ///
 /// This is the shared iteration pattern used by
@@ -156,10 +156,10 @@ impl CheckpointPolicy {
 /// covers the storage-layer panics that unwind through a poll.
 async fn for_each_store<F, Fut>(op: F)
 where
-    F: Fn(&'static str, &'static crate::turso::Connection) -> Fut,
+    F: Fn(&'static str, &'static crate::db::Connection) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let futs: Vec<_> = crate::turso::iter_checkpoint_stores()
+    let futs: Vec<_> = crate::db::iter_checkpoint_stores()
         .filter_map(|(name, conn_opt)| {
             let conn = conn_opt?;
             let fut = AssertUnwindSafe(op(name, conn)).catch_unwind();
@@ -195,7 +195,7 @@ where
 /// checkpoint on an orphaned WAL would attempt a zero-fill. Logs and swallows
 /// per-store errors to avoid blocking shutdown.
 ///
-/// The store entries come from [`crate::turso::iter_checkpoint_stores`] — the
+/// The store entries come from [`crate::db::iter_checkpoint_stores`] — the
 /// single source of truth for which stores get checkpointed.
 pub async fn checkpoint_all_databases() {
     checkpoint_stores(CheckpointPolicy::Truncate, false).await;
@@ -225,7 +225,7 @@ async fn checkpoint_stores(policy: CheckpointPolicy, verify: bool) {
             // Re-check the persistent sidecar fds against the paths: an
             // external process that replaced -wal/-tshm means any checkpoint
             // would touch a foreign file — suspend this store's checkpoints.
-            if conn.check_coordination_identity() == Some(crate::turso::SidecarIdentity::Replaced) {
+            if conn.check_coordination_identity() == Some(crate::db::SidecarIdentity::Replaced) {
                 warn!(
                     db = %name,
                     "Skipping checkpoint: coordination files replaced by an external process",
@@ -234,7 +234,7 @@ async fn checkpoint_stores(policy: CheckpointPolicy, verify: bool) {
             }
             let status = root
                 .as_deref()
-                .map(|r| crate::wal_guard::inspect_store(r, name, conn.store_fds()));
+                .map(|r| crate::db::wal_guard::inspect_store(r, name, conn.store_fds()));
             if let Some(status) = status.as_ref().filter(|s| s.class.blocks_checkpoint()) {
                 warn!(
                     db = %name,

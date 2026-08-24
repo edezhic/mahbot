@@ -18,11 +18,11 @@ use std::fmt::Write;
 use anyhow::Result;
 use futures_util::future::join_all;
 
-use crate::board::BOARD;
+use crate::pipeline::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
 use crate::workspace::truncate_workspace_notes;
 
-use crate::skills;
+use crate::agent::skills;
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
 use crate::{ChatMessage, ChatRole, Role, Workspace};
 
@@ -119,7 +119,7 @@ impl Session {
         msg: &str,
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::board::Ticket>,
+        ticket: Option<&crate::pipeline::board::Ticket>,
         channel: &str,
         user_name: &str,
         round_ts: Option<&str>,
@@ -328,7 +328,7 @@ impl Session {
         summary_text: &str,
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::board::Ticket>,
+        ticket: Option<&crate::pipeline::board::Ticket>,
     ) {
         // Build fresh system prompt (may have changed since session start).
         let (mut compacted, snapshot) = Self::build_context_messages(ws, role, ticket).await;
@@ -417,7 +417,7 @@ impl Session {
     async fn build_context_messages(
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::board::Ticket>,
+        ticket: Option<&crate::pipeline::board::Ticket>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (stored_context, board_context) = tokio::join!(
             lookup_workspace_context(ws, role),
@@ -506,7 +506,7 @@ impl Session {
         msg: &str,
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::board::Ticket>,
+        ticket: Option<&crate::pipeline::board::Ticket>,
         round_ts: Option<&str>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (mut msgs, snapshot) = Self::build_context_messages(ws, role, ticket).await;

@@ -107,7 +107,7 @@
 //! # See also
 //!
 //! * [`crate::config_db`] — database persistence for all three chains.
-//! * [`crate::role`] — [`crate::role::RoleInfo`] definitions with per-role defaults.
+//! * [`crate::agent::role`] — [`crate::agent::role::RoleInfo`] definitions with per-role defaults.
 //! * [`crate::providers::compatible`] — where `None` routing fields are resolved
 //!   at the provider layer.
 
@@ -977,7 +977,7 @@ pub async fn load_or_init() -> Result<()> {
 /// file does not yet exist at its real location.
 ///
 /// In the consolidated layout the config store lives in the single domain
-/// database ([`crate::turso::CONSOLIDATED_DB_NAME`]). An existing install is
+/// database ([`crate::db::CONSOLIDATED_DB_NAME`]). An existing install is
 /// detected by EITHER the consolidated file OR a legacy per-store `config.db`
 /// (pre-consolidation) — probing only the consolidated file would classify a
 /// legacy install as fresh and re-seed it on the first consolidated boot,
@@ -987,8 +987,8 @@ pub async fn load_or_init() -> Result<()> {
 /// exact path the open uses (`init_all_stores` → `open_store` →
 /// `store_db_path`).
 fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
-    !crate::turso::store_db_path(mahbot_dir, "config").exists()
-        && !crate::turso::legacy_store_db_path(mahbot_dir, "config").exists()
+    !crate::db::store_db_path(mahbot_dir, "config").exists()
+        && !crate::db::legacy_store_db_path(mahbot_dir, "config").exists()
 }
 
 /// Seed the fresh-install defaults into a brand-new config database

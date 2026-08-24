@@ -7,7 +7,7 @@ use iced::border;
 use iced::widget::{container, scrollable};
 
 use crate::WorkspaceStatus;
-use crate::board::TicketPhase;
+use crate::pipeline::board::TicketPhase;
 
 use iced_fonts::lucide;
 use std::sync::atomic::AtomicBool;
@@ -95,7 +95,7 @@ const fn badge_bg(fg: Color) -> Color {
 
 /// Returns the badge (foreground, background) color for a given [`crate::Role`].
 ///
-/// Reads from [`crate::role::role_info()`] and converts the RGB tuple to
+/// Reads from [`crate::agent::role::role_info()`] and converts the RGB tuple to
 /// [`iced::Color`] — this avoids duplicating color data in an exhaustive match.
 /// Adding a new [`crate::Role`] variant requires updating the `role_info()`
 /// match (`badge_fg` field); the compiler will not catch a missing field here
@@ -107,7 +107,7 @@ const fn badge_bg(fg: Color) -> Color {
 #[must_use]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
-    let info = crate::role::role_info(role);
+    let info = crate::agent::role::role_info(role);
     let (r, g, b) = info.badge_fg;
     let fg = Color::from_rgb(r, g, b);
     (fg, badge_bg(fg))
@@ -128,13 +128,13 @@ pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
 /// for canonical ones.
 ///
 /// Delegates to [`role_badge_color_for`] after resolving the string, which
-/// reads colors from [`crate::role::role_info()`] as the single source of truth.
+/// reads colors from [`crate::agent::role::role_info()`] as the single source of truth.
 #[must_use]
 pub fn role_badge_color(role: &str) -> (Color, Color) {
     // Stage-name comment roles from the joint-verdict pipeline ("Analysis"/
     // "Review"/"QA" — the comment role is the stage name). Resolved via the
     // shared inverse mapping so it can't drift from management::stage_name.
-    if let Some(r) = crate::management::stage_role(role) {
+    if let Some(r) = crate::pipeline::management::stage_role(role) {
         return role_badge_color_for(&r);
     }
 
@@ -343,7 +343,7 @@ static TIMESTAMP_PARSE_WARNED: AtomicBool = AtomicBool::new(false);
 /// If parsing fails, returns the first 16 characters as a fallback.
 #[must_use]
 pub fn format_timestamp(ts: &str) -> String {
-    if let Ok(dt) = crate::turso::parse_utc_timestamp(ts) {
+    if let Ok(dt) = crate::db::parse_utc_timestamp(ts) {
         dt.format("%b %-d, %H:%M").to_string()
     } else {
         if !TIMESTAMP_PARSE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {

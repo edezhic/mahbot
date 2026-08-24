@@ -84,7 +84,7 @@ async fn test_get_tickets_by_ids() {
     // sql_in_placeholders(0) produces invalid `WHERE id IN ()` —
     // the guard must short-circuit empty input before reaching SQL.
     let tickets = store
-        .get_tickets_by_ids(&[], crate::board::LoadComments::No)
+        .get_tickets_by_ids(&[], crate::pipeline::board::LoadComments::No)
         .await
         .expect("empty ids");
     assert!(tickets.is_empty(), "empty ids should return empty vec");
@@ -94,7 +94,7 @@ async fn test_get_tickets_by_ids() {
 
     let ids = vec![id_a.clone(), id_c.clone()];
     let tickets = store
-        .get_tickets_by_ids(&ids, crate::board::LoadComments::No)
+        .get_tickets_by_ids(&ids, crate::pipeline::board::LoadComments::No)
         .await
         .expect("get by ids");
     assert_eq!(tickets.len(), 2, "should return exactly 2 tickets");
@@ -491,7 +491,7 @@ async fn test_claim_ticket_in_workspace_respects_claim_grace() {
         .conn
         .execute(
             "UPDATE tickets SET created_at = ?1 WHERE id = ?2",
-            crate::turso::params![old_created, fresh.clone()],
+            crate::db::params![old_created, fresh.clone()],
         )
         .await
         .expect("backdate");
@@ -943,7 +943,7 @@ async fn test_archive_stale_cancelled() {
         .conn
         .execute(
             "UPDATE tickets SET updated_at = ?1 WHERE id = ?2",
-            crate::turso::params![two_hours_ago.clone(), old_cancelled_id.clone()],
+            crate::db::params![two_hours_ago.clone(), old_cancelled_id.clone()],
         )
         .await
         .expect("backdate");
@@ -959,7 +959,7 @@ async fn test_archive_stale_cancelled() {
         .conn
         .execute(
             "UPDATE tickets SET updated_at = ?1 WHERE id = ?2",
-            crate::turso::params![two_hours_ago.clone(), old_backlog_id.clone()],
+            crate::db::params![two_hours_ago.clone(), old_backlog_id.clone()],
         )
         .await
         .expect("backdate");
@@ -1133,7 +1133,7 @@ async fn test_archive_all_done_and_cancelled_workspace_filter() {
 async fn test_create_ticket_tool_with_prerequisites() {
     crate::util::test::init_test_stores().await;
 
-    let store = crate::board::BOARD.get().unwrap();
+    let store = crate::pipeline::board::BOARD.get().unwrap();
     let ws = test_ws("/tmp/test_ws_tool_prereqs");
 
     // Create a prerequisite via the store directly
@@ -1164,7 +1164,7 @@ async fn test_create_ticket_tool_with_prerequisites() {
 #[tokio::test]
 async fn test_supersede_and_create_basic() {
     init_test_stores().await;
-    let store = crate::board::BOARD.get().unwrap();
+    let store = crate::pipeline::board::BOARD.get().unwrap();
     let ws = test_ws_named("/ws", "ws");
     let old_id = make_ticket(store, &ws, "Test", TicketPhase::Backlog).await;
 
@@ -1195,7 +1195,7 @@ async fn test_supersede_and_create_basic() {
 #[tokio::test]
 async fn test_supersede_rewires_only_matching_prerequisite() {
     init_test_stores().await;
-    let store = crate::board::BOARD.get().unwrap();
+    let store = crate::pipeline::board::BOARD.get().unwrap();
     let ws = test_ws_named("/ws", "ws");
 
     // Create ticket A (will be superseded) and ticket C (independent).
@@ -1243,7 +1243,7 @@ async fn test_supersede_rewires_only_matching_prerequisite() {
 async fn test_supersede_tool() {
     crate::util::test::init_test_stores().await;
 
-    let store = crate::board::BOARD.get().unwrap();
+    let store = crate::pipeline::board::BOARD.get().unwrap();
     let ws = test_ws("/tmp/test_ws_supersede_tool");
 
     // Create old ticket
@@ -1283,7 +1283,7 @@ async fn test_transactional_triple_write() {
 
         let label = if should_succeed { "commit" } else { "rollback" };
         let result: anyhow::Result<()> =
-            crate::turso::with_tx(&store.conn, &id, "test_triple_write", async |tx| {
+            crate::db::with_tx(&store.conn, &id, "test_triple_write", async |tx| {
                 BoardStore::set_commit_info_tx(
                     tx,
                     &id,
@@ -1295,7 +1295,7 @@ async fn test_transactional_triple_write() {
                 BoardStore::add_comment_tx(
                     tx,
                     &id,
-                    crate::role::SYSTEM_ROLE,
+                    crate::agent::role::SYSTEM_ROLE,
                     "triple write comment",
                 )
                 .await?;
@@ -1428,7 +1428,7 @@ async fn corrupt_prerequisites_causes_query_errors() {
         .conn
         .execute(
             "UPDATE tickets SET prerequisites = ?1 WHERE id = ?2",
-            crate::turso::params!["{not valid json}", id.clone()],
+            crate::db::params!["{not valid json}", id.clone()],
         )
         .await
         .expect("corrupt update");
@@ -1780,7 +1780,7 @@ async fn create_archived_ticket(
     workspace_name: &str,
 ) -> String {
     let ws = test_ws(workspace_name);
-    let id = make_ticket(store, &ws, title, crate::board::TicketPhase::Done).await;
+    let id = make_ticket(store, &ws, title, crate::pipeline::board::TicketPhase::Done).await;
     store.set_archived(&id).await.expect("set_archived");
     id
 }
@@ -1792,7 +1792,13 @@ async fn create_active_ticket(
     workspace_name: &str,
 ) -> String {
     let ws = test_ws(workspace_name);
-    make_ticket(store, &ws, title, crate::board::TicketPhase::Backlog).await
+    make_ticket(
+        store,
+        &ws,
+        title,
+        crate::pipeline::board::TicketPhase::Backlog,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -2032,7 +2038,7 @@ async fn test_detailed_display_with_content() {
 #[tokio::test]
 async fn test_detailed_display_supersedes_chain() {
     init_test_stores().await;
-    let store = crate::board::BOARD.get().unwrap();
+    let store = crate::pipeline::board::BOARD.get().unwrap();
     let ws = test_ws_named("/ws", "ws");
 
     // Create an old ticket first
@@ -2089,7 +2095,7 @@ async fn test_list_archived_with_embeddings_returns_deserialized() {
 
     let id = TicketBuilder::new(&store, &ws)
         .title("Embedded ticket")
-        .phase(crate::board::TicketPhase::Done)
+        .phase(crate::pipeline::board::TicketPhase::Done)
         .embedding(&blob)
         .create()
         .await
@@ -2111,7 +2117,7 @@ async fn test_list_archived_with_embeddings_returns_deserialized() {
 #[tokio::test]
 async fn test_route_comment_to_agents_no_assignment() {
     crate::util::test::init_management_test_stores().await;
-    let store = crate::board::store();
+    let store = crate::pipeline::board::store();
     let ws = crate::workspace::test_ws("/tmp/test_route_comment_no_assign");
 
     // Create a ticket with no active agents / no assignment
@@ -2119,7 +2125,7 @@ async fn test_route_comment_to_agents_no_assignment() {
         store,
         &ws,
         "no-assign-test",
-        crate::board::TicketPhase::Backlog,
+        crate::pipeline::board::TicketPhase::Backlog,
     )
     .await;
 
@@ -2140,7 +2146,7 @@ async fn test_route_comment_to_agents_no_assignment() {
 #[serial_test::serial(reset_inflight)]
 async fn test_route_comment_to_agents_delivers_with_commenter_role() {
     crate::util::test::init_management_test_stores().await;
-    let store = crate::board::store();
+    let store = crate::pipeline::board::store();
 
     for (i, (commenter, content, expected_role)) in [
         ("manager", "Hello from test", crate::Role::Manager),
@@ -2154,7 +2160,7 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
             store,
             &ws,
             &format!("route-comment-test-{i}"),
-            crate::board::TicketPhase::InDevelopment,
+            crate::pipeline::board::TicketPhase::InDevelopment,
         )
         .await;
 
@@ -2185,7 +2191,7 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
         )
         .await
         .expect("set active agent");
-        let mut rx = crate::message_router::register_agent(&agent_id);
+        let mut rx = crate::agent::message_router::register_agent(&agent_id);
 
         store
             .add_comment(&ticket_id, commenter, content)
@@ -2196,7 +2202,7 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
         assert_eq!(received.content, content);
         assert_eq!(
             received.kind,
-            crate::message_router::MessageKind::TicketComment
+            crate::agent::message_router::MessageKind::TicketComment
         );
         assert_eq!(received.user_name, commenter);
         assert_eq!(
@@ -2208,6 +2214,6 @@ async fn test_route_comment_to_agents_delivers_with_commenter_role() {
             "should not have additional messages"
         );
 
-        crate::message_router::unregister_agent(&agent_id);
+        crate::agent::message_router::unregister_agent(&agent_id);
     }
 }

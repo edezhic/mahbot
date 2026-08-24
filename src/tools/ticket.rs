@@ -5,8 +5,8 @@
 
 use crate::Role;
 use crate::Workspace;
-use crate::board::store as board_store;
-use crate::board::{TicketParams, TicketPhase};
+use crate::pipeline::board::store as board_store;
+use crate::pipeline::board::{TicketParams, TicketPhase};
 use crate::tools::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -477,7 +477,7 @@ impl Tool for AddCommentTool {
 /// it — comments are allowed mid-pipeline and are delivered to running agents
 /// as soft deferred messages.
 async fn guard_not_pipeline_occupied(
-    store: &crate::board::BoardStore,
+    store: &crate::pipeline::board::BoardStore,
     ticket_id: &str,
 ) -> Result<()> {
     if let Some(current_phase) = store.get_ticket_phase(ticket_id).await?
@@ -543,7 +543,13 @@ mod tests {
 
         let store = board_store();
         let ws = test_ws("/ws");
-        let id = make_ticket(store, &ws, "Test", crate::board::TicketPhase::Backlog).await;
+        let id = make_ticket(
+            store,
+            &ws,
+            "Test",
+            crate::pipeline::board::TicketPhase::Backlog,
+        )
+        .await;
 
         let tool = UpdateTicketTool::new(&ws);
         let args = json!({
@@ -566,9 +572,27 @@ mod tests {
         let store = board_store();
         let ws = test_ws("/tmp_ws");
 
-        let _id_a = make_ticket(store, &ws, "A", crate::board::TicketPhase::Backlog).await;
-        let id_b = make_ticket(store, &ws, "B", crate::board::TicketPhase::Backlog).await;
-        let id_c = make_ticket(store, &ws, "C", crate::board::TicketPhase::Backlog).await;
+        let _id_a = make_ticket(
+            store,
+            &ws,
+            "A",
+            crate::pipeline::board::TicketPhase::Backlog,
+        )
+        .await;
+        let id_b = make_ticket(
+            store,
+            &ws,
+            "B",
+            crate::pipeline::board::TicketPhase::Backlog,
+        )
+        .await;
+        let id_c = make_ticket(
+            store,
+            &ws,
+            "C",
+            crate::pipeline::board::TicketPhase::Backlog,
+        )
+        .await;
         // Transition C to 'done' and B to 'cancelled'
         store
             .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done)
@@ -697,7 +721,13 @@ mod tests {
 
         let store = board_store();
         let ws = test_ws("/ws");
-        let id = make_ticket(store, &ws, "Test", crate::board::TicketPhase::Backlog).await;
+        let id = make_ticket(
+            store,
+            &ws,
+            "Test",
+            crate::pipeline::board::TicketPhase::Backlog,
+        )
+        .await;
 
         let tool = UpdateTicketTool::new(&ws);
         let args = json!({

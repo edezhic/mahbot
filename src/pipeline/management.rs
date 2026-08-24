@@ -36,27 +36,27 @@ use chrono::Duration as ChronoDuration;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, join_all};
 
+use crate::agent::message_router;
+use crate::agent::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
 use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
-use crate::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketPhase};
-use crate::git_commands::{
+use crate::db::TxGuard;
+use crate::git::commands::{
     has_unstaged_changes, list_new_or_untracked_files, run_git_add_all, run_git_diff_stats,
     run_git_head, run_git_status, run_git_write_tree,
 };
 use crate::jobs::ResumableJob;
-use crate::message_router;
+use crate::pipeline::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketPhase};
+use crate::pipeline::ticket_buffer;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
-use crate::role::{DIAGNOSTICS_ROLE, SANITATION_ROLE, SYSTEM_ROLE};
 use crate::session::manager_agent_id;
-use crate::ticket_buffer;
 use crate::tools::shell::{ShellMode, ShellTool};
-use crate::turso::TxGuard;
 use crate::util::panic_message;
 use crate::workspace::spawn_workspace_discovery;
 
 use crate::{Agent, DiagnosticsCommands, Role, Workspace, WorkspaceStatus};
 
 /// Default number of parallel analyst agents per round. Reviewers use a
-/// calibrated dynamic count (see [`crate::joint_verdict::review_agent_count`]);
+/// calibrated dynamic count (see [`crate::pipeline::joint_verdict::review_agent_count`]);
 /// QA runs a single tester (see [`QA_PARALLEL_AGENT_COUNT`]).
 const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
 
@@ -92,7 +92,7 @@ const IMPLEMENTATION_STAGE_SANITATION: &str = "sanitation";
 /// Returns the global [`BoardStore`] singleton.
 #[inline]
 fn board() -> &'static BoardStore {
-    crate::board::store()
+    crate::pipeline::board::store()
 }
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
@@ -256,7 +256,7 @@ enum FinalizeOutcome {
 
 /// Unified helper for combining comment writes + phase transition + notification.
 ///
-/// Wraps [`crate::turso::with_tx_outcome`] for the comment-writing closure and
+/// Wraps [`crate::db::with_tx_outcome`] for the comment-writing closure and
 /// phase transition, then dispatches a notification. The closure is
 /// responsible for writing all per-agent/system comments to the database.
 ///
@@ -277,7 +277,7 @@ async fn with_comment_and_transition<F>(
 where
     F: AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
 {
-    let outcome = match crate::turso::with_tx_outcome(
+    let outcome = match crate::db::with_tx_outcome(
         &board().conn,
         &ctx.ticket.id,
         ctx.log_label,
@@ -585,7 +585,7 @@ async fn notify_ticket(
     // Data-loss guard: drain only after workspace lookup succeeds
     // (above) — if lookup had failed, the buffer entries remain for
     // the next delivery attempt.
-    let drained = crate::ticket_buffer::drain(&ws.name);
+    let drained = crate::pipeline::ticket_buffer::drain(&ws.name);
 
     let mut message = substitute(
         &load_prompt("pipeline/notification.md"),
@@ -755,7 +755,7 @@ pub async fn run_management() {
                 job_id, ticket_id, ..
             } => {
                 // Analysis is not implementation-driven and is not paused-frozen.
-                match crate::board::store().get_ticket(&ticket_id).await {
+                match crate::pipeline::board::store().get_ticket(&ticket_id).await {
                     Ok(Some(ticket)) => {
                         info!(
                             job = %job_id,
@@ -800,7 +800,7 @@ pub async fn run_management() {
                     );
                     continue;
                 }
-                match crate::board::store().get_ticket(&ticket_id).await {
+                match crate::pipeline::board::store().get_ticket(&ticket_id).await {
                     Ok(Some(ticket)) => {
                         info!(
                             job = %job_id,
@@ -874,7 +874,7 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
 
     // Cancel any stale agents for this ticket before dispatching new ones.
     // This is a uniform pre-flight step that applies to all dispatch paths.
-    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
+    crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
 
     // Wrap in Arc so the panic-recovery clone is a cheap refcount bump
     // instead of a deep copy of the entire comments Vec.
@@ -1161,7 +1161,7 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 /// # Concurrency safety
 ///
 /// - The [`BoardStore`] wraps a single Turso connection in an
-///   `Arc<tokio::sync::Mutex<crate::turso::Connection>>` — SQL operations
+///   `Arc<tokio::sync::Mutex<crate::db::Connection>>` — SQL operations
 ///   serialize at the mutex,
 ///   so concurrent access is safe. All workspaces share the same consolidated
 ///   `core.db`;
@@ -1514,7 +1514,7 @@ async fn run_single_agent(
     ws: &Workspace,
     ticket: &Ticket,
     message: &str,
-    incoming_rx: tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>,
+    incoming_rx: tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob>,
     resume: bool,
 ) -> (Agent, Option<String>) {
     run_agent(
@@ -1891,12 +1891,12 @@ fn notify_engineer_pause(ws: &Workspace, failure_details: &str, paused: bool) {
     let agent_id = manager_agent_id(&ws.name);
     message_router::route(
         &agent_id,
-        crate::message_router::AgentJob {
+        crate::agent::message_router::AgentJob {
             content: warning,
             workspace_name: ws.name.clone(),
             user_name: "system".to_string(),
             channel: String::new(),
-            kind: crate::message_router::MessageKind::UserMessage,
+            kind: crate::agent::message_router::MessageKind::UserMessage,
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
@@ -2253,7 +2253,7 @@ async fn ensure_git_or_done_and_get_status(
 ) -> Option<String> {
     let repo_path = ws.as_path();
 
-    if !crate::git_commands::git_is_installed().await {
+    if !crate::git::commands::git_is_installed().await {
         transition_ticket_to_done(
             ticket,
             phase,
@@ -2262,7 +2262,7 @@ async fn ensure_git_or_done_and_get_status(
         .await;
         return None;
     }
-    if !crate::git_commands::is_git_repo(repo_path) {
+    if !crate::git::commands::is_git_repo(repo_path) {
         transition_ticket_to_done(
             ticket,
             phase,
@@ -2293,7 +2293,7 @@ async fn ensure_git_or_done_and_get_status(
 /// string via [`run_git_status`] before calling this function.
 ///
 /// - **Clean tree** (empty porcelain): transitions directly to Done.
-/// - **Dirty tree**: commits the changes via [`crate::git_commands::run_git_commit`].
+/// - **Dirty tree**: commits the changes via [`crate::git::commands::run_git_commit`].
 /// - **Commit failure**: ticket stays in `source` phase; the poller retries.
 async fn finalize_ticket_with_git_status(
     ticket: Ticket,
@@ -2313,7 +2313,7 @@ async fn finalize_ticket_with_git_status(
         return;
     }
 
-    match crate::git_commands::run_git_commit(repo_path, &ticket.title).await {
+    match crate::git::commands::run_git_commit(repo_path, &ticket.title).await {
         Ok(commit_info) => {
             finalize_commit_and_transition(&ticket, commit_info, source).await;
         }
@@ -2336,7 +2336,7 @@ async fn finalize_ticket_with_git_status(
 /// git-unavailable done paths share the same implementation.
 async fn finalize_commit_and_transition(
     ticket: &Ticket,
-    commit_info: crate::git_commands::CommitInfo,
+    commit_info: crate::git::commands::CommitInfo,
     source: TicketPhase,
 ) {
     let comment = format_commit_summary(
@@ -2353,7 +2353,7 @@ async fn finalize_commit_and_transition(
     // ticket is re-dispatched on the next poll cycle, the cancelled agents are
     // simply re-registered — wasted work is preferable to orphaned agents on a
     // Done ticket (which crash-recovery cannot rescue).
-    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
+    crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
 
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
 
@@ -2428,7 +2428,7 @@ async fn record_sanitation_failure(
             load_prompt("pipeline/sanitation_failed.md")
         ),
     };
-    if let Err(e) = crate::turso::with_tx(
+    if let Err(e) = crate::db::with_tx(
         &board().conn,
         ticket_id,
         "record sanitation failure",
@@ -2480,7 +2480,7 @@ async fn register_running_agent(
     agent_id: &str,
     kind: crate::jobs::AgentKind,
     warn_message: &str,
-) -> tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob> {
+) -> tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob> {
     // Register in the message router so comments can be delivered mid-work.
     let incoming_rx = message_router::register_agent(agent_id);
 
@@ -2869,7 +2869,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
     // The removed "Auto-diagnostics" header would leave the first command's
     // separator as leading blank lines — strip them.
     // Owner-deletes-at-end: the diagnostics runner is a non-agent consumer of
-    // ShellTool, so its spill files are recorded under [`crate::role::DIAGNOSTICS_ROLE`]
+    // ShellTool, so its spill files are recorded under [`crate::agent::role::DIAGNOSTICS_ROLE`]
     // (`"diagnostics"`) — clean them up here (equivalent to the agent-run-end hook).
     // Agent ids (`ticket_*`, `manager_*`, etc.) never equal bare `"diagnostics"` so
     // no collision.
@@ -2884,7 +2884,7 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
 /// ticket phase is the only stored representation. Failures log and continue —
 /// the implementation sync is best-effort; the next dispatch re-syncs.
 async fn sync_implementation(
-    conn: &crate::turso::Connection,
+    conn: &crate::db::Connection,
     job_id: &str,
     ticket_id: &str,
     stage: &str,
@@ -2923,7 +2923,7 @@ async fn advance_to_next_stage(
     ticket: &Ticket,
     ws: &Workspace,
     job_id: &str,
-    conn: &crate::turso::Connection,
+    conn: &crate::db::Connection,
     sync: Option<&str>,
     log: impl FnOnce(&Ticket),
     dispatch_next: impl FnOnce(Arc<Ticket>, Workspace) -> BoxFuture<'static, ()> + Send + 'static,
@@ -2948,7 +2948,7 @@ async fn conclude_diagnostics_success(
     job_id: &str,
     comment: &str,
     log_label: &str,
-    conn: &crate::turso::Connection,
+    conn: &crate::db::Connection,
     ws: &Workspace,
 ) {
     comment_and_transition_or_bail(
@@ -3221,27 +3221,31 @@ async fn build_round_joint_comment(
     ticket_id: &str,
     ticket_title: &str,
 ) -> String {
-    let mut verdicts: Vec<crate::joint_verdict::JointVerdict<'_>> = Vec::new();
-    let mut failures: Vec<crate::joint_verdict::JointFailure> = Vec::new();
+    let mut verdicts: Vec<crate::pipeline::joint_verdict::JointVerdict<'_>> = Vec::new();
+    let mut failures: Vec<crate::pipeline::joint_verdict::JointFailure> = Vec::new();
     for (i, r) in results.iter().enumerate() {
         match r {
-            ParallelVerdict::Verdict(v) => verdicts.push(crate::joint_verdict::JointVerdict {
-                agent_index: i,
-                verdict: v,
-            }),
+            ParallelVerdict::Verdict(v) => {
+                verdicts.push(crate::pipeline::joint_verdict::JointVerdict {
+                    agent_index: i,
+                    verdict: v,
+                });
+            }
             ParallelVerdict::NoResponse(reason) => {
-                failures.push(crate::joint_verdict::JointFailure {
+                failures.push(crate::pipeline::joint_verdict::JointFailure {
                     agent_index: i,
                     dump: reason.clone(),
                 });
             }
-            ParallelVerdict::ParseFailed(f) => failures.push(crate::joint_verdict::JointFailure {
-                agent_index: i,
-                dump: crate::util::scrub_credentials(&raw_response_dump_section(f)),
-            }),
+            ParallelVerdict::ParseFailed(f) => {
+                failures.push(crate::pipeline::joint_verdict::JointFailure {
+                    agent_index: i,
+                    dump: crate::util::scrub_credentials(&raw_response_dump_section(f)),
+                });
+            }
         }
     }
-    let round = crate::joint_verdict::JointRound {
+    let round = crate::pipeline::joint_verdict::JointRound {
         stage,
         dispatched: results.len(),
         verdicts,
@@ -3259,13 +3263,22 @@ async fn build_round_joint_comment(
         // A synthesis pass over zero issues would waste a provider call and
         // could produce a misleading "no issues" summary on a round that
         // actually bounced. Render the deterministic no-issues form instead.
-        crate::joint_verdict::render_joint_comment(
+        crate::pipeline::joint_verdict::render_joint_comment(
             &round,
             &crate::consensus::RepairOutcome::Fallback,
-            &crate::consensus::ItemTable::new(&crate::joint_verdict::issues_by_agent(&round)),
+            &crate::consensus::ItemTable::new(&crate::pipeline::joint_verdict::issues_by_agent(
+                &round,
+            )),
         )
     } else {
-        crate::joint_verdict::build_joint_comment(&round, role, ws, ticket_id, ticket_title).await
+        crate::pipeline::joint_verdict::build_joint_comment(
+            &round,
+            role,
+            ws,
+            ticket_id,
+            ticket_title,
+        )
+        .await
     }
 }
 
@@ -3806,7 +3819,10 @@ async fn maybe_escalate_analysis(
     results: &mut Vec<ParallelVerdict>,
 ) -> bool {
     if round_kind == AnalysisRoundKind::Base
-        && crate::joint_verdict::analysis_escalation_needed(results, ANALYSIS_BASE_ROSTER_SIZE)
+        && crate::pipeline::joint_verdict::analysis_escalation_needed(
+            results,
+            ANALYSIS_BASE_ROSTER_SIZE,
+        )
         && !crate::shutdown::aborting()
     {
         // Re-check the phase before spending the second batch — the ticket
@@ -4243,7 +4259,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// `eleventh_bounce_fails_ticket`).
 #[must_use]
 fn bounce_breaker_trip_comment() -> String {
-    let max = crate::joint_verdict::MAX_BOUNCES;
+    let max = crate::pipeline::joint_verdict::MAX_BOUNCES;
     format!(
         "Failed after {max} bounces — ticket bounced back too many times \
          (circuit breaker, max: {max}). Ticket failed — Manager will triage."
@@ -4254,7 +4270,8 @@ fn bounce_breaker_trip_comment() -> String {
 /// Negative or overflow counts are treated as exhausted (fail-closed).
 #[must_use]
 fn bounce_exhausted(bounce_count: i64) -> bool {
-    usize::try_from(bounce_count).unwrap_or(usize::MAX) >= crate::joint_verdict::MAX_BOUNCES
+    usize::try_from(bounce_count).unwrap_or(usize::MAX)
+        >= crate::pipeline::joint_verdict::MAX_BOUNCES
 }
 
 /// Unified validation-failure bounce.
@@ -4329,7 +4346,7 @@ async fn bounce_to_development(
             info!(
                 ticket = %ticket.id,
                 "Bounce circuit breaker tripped ({} bounces) — ticket failed",
-                crate::joint_verdict::MAX_BOUNCES,
+                crate::pipeline::joint_verdict::MAX_BOUNCES,
             );
         } else {
             // Re-fetch the ticket fresh (with comments) so the re-dispatched
@@ -4337,7 +4354,7 @@ async fn bounce_to_development(
             // would render implement.md instead of the bounce_feedback prompt.
             // dispatch_engineer's sync_implementation re-syncs the stage/phase,
             // so no sync is needed here (a duplicate write would follow).
-            let fresh = crate::board::store()
+            let fresh = crate::pipeline::board::store()
                 .get_ticket(&ticket.id)
                 .await
                 .ok()
@@ -4578,19 +4595,19 @@ async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
 /// The counterfactual signals are logged at info level as production
 /// telemetry, so the formula is validated against live cohorts.
 async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
-    let low = crate::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN;
-    let high = crate::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN;
+    let low = crate::pipeline::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN;
+    let high = crate::pipeline::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN;
 
     match working_tree_churn(repo_path).await {
         Ok(total) => {
-            let base = crate::joint_verdict::review_base_from_signals(total, low, high);
+            let base = crate::pipeline::joint_verdict::review_base_from_signals(total, low, high);
             info!(
                 ticket = %ticket.id,
                 total_churn = total,
                 reviewer_base = base,
                 "Reviewer count calibration: base {base} from total churn",
             );
-            crate::joint_verdict::review_agent_count(base, ticket.priority)
+            crate::pipeline::joint_verdict::review_agent_count(base, ticket.priority)
         }
         Err(e) => {
             warn!(
@@ -4722,7 +4739,7 @@ async fn job_task(job_id: &str) -> String {
         .conn
         .query_optional(
             "SELECT task FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
+            crate::db::params![job_id],
             |row| row.get::<String>(0),
         )
         .await
@@ -4776,8 +4793,8 @@ async fn verifier_git_state(ws: &Workspace, vi: VerifierInfo) -> (bool, &Path, b
     let is_reviewer = vi.role == Role::Reviewer;
     let repo_path = ws.as_path();
     let git_available = is_reviewer
-        && crate::git_commands::git_is_installed().await
-        && crate::git_commands::is_git_repo(repo_path);
+        && crate::git::commands::git_is_installed().await
+        && crate::git::commands::is_git_repo(repo_path);
     (is_reviewer, repo_path, git_available)
 }
 

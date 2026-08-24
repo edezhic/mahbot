@@ -13,6 +13,11 @@ pub(crate) use turso::{IntoParams, Row, Value, params};
 
 use crate::util::UnwrapPoison;
 
+pub mod checkpoint;
+pub mod debug;
+pub(crate) mod migrations;
+pub mod wal_guard;
+
 /// Read `N` bytes at `offset` via a positional read (does not move the shared
 /// file offset and never opens/closes the file).
 #[cfg(unix)]
@@ -151,7 +156,7 @@ pub(crate) static DOMAIN_CONN: tokio::sync::OnceCell<Connection> =
 /// by `mahbot debug --db <name>` — a deliberately separate list, because
 /// several logical names map to the same physical file.
 pub(crate) fn iter_checkpoint_stores()
--> impl Iterator<Item = (&'static str, Option<&'static crate::turso::Connection>)> {
+-> impl Iterator<Item = (&'static str, Option<&'static crate::db::Connection>)> {
     [
         (CONSOLIDATED_DB_NAME, DOMAIN_CONN.get()),
         (LOG_DB_NAME, crate::logs::LOG_STORE.get().map(|s| &s.conn)),
@@ -215,7 +220,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
 
     // Run the idempotent per-store post-open hooks on the shared connection,
     // in a defined order, before exposing the store cells.
-    let board = crate::board::BoardStore { conn: conn.clone() };
+    let board = crate::pipeline::board::BoardStore { conn: conn.clone() };
     board.after_open().await?;
     let users = crate::users::UserStore { conn: conn.clone() };
     users.ensure_admin_user().await?;
@@ -223,13 +228,13 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     let session = crate::session::SessionStore { conn: conn.clone() };
     let workspace = crate::workspace::WorkspaceStore { conn: conn.clone() };
     let config = crate::config_db::ConfigStore { conn: conn.clone() };
-    let chat_history = crate::chat_history::ChatHistoryStore { conn: conn.clone() };
+    let chat_history = crate::channels::chat_history::ChatHistoryStore { conn: conn.clone() };
 
     // Record the shared connection before setting any cell so a concurrent
     // re-entry observes it and short-circuits.
     let _ = DOMAIN_CONN.set(conn.clone());
 
-    crate::board::BOARD
+    crate::pipeline::board::BOARD
         .set(board)
         .map_err(|_| anyhow::anyhow!("BOARD already initialized"))?;
     crate::session::SESSIONS
@@ -244,7 +249,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     crate::config_db::CONFIG_STORE
         .set(config)
         .map_err(|_| anyhow::anyhow!("CONFIG_STORE already initialized"))?;
-    crate::chat_history::CHAT_HISTORY
+    crate::channels::chat_history::CHAT_HISTORY
         .set(chat_history)
         .map_err(|_| anyhow::anyhow!("CHAT_HISTORY already initialized"))?;
 
@@ -349,7 +354,7 @@ pub(crate) fn sanitize_fts_query(query: &str) -> String {
 /// # Example
 ///
 /// ```ignore
-/// // Internal utility — use `sql_in_placeholders(3)` from crate::turso
+/// // Internal utility — use `sql_in_placeholders(3)` from crate::db
 /// assert_eq!("?, ?, ?", vec!["?"; 3].join(", "));
 /// assert_eq!("", vec!["?"; 0].join(", "));
 /// ```
@@ -483,7 +488,7 @@ impl PersistentSidecarFd {
 }
 
 /// One store's coordination-file read sources for wal-guard inspection.
-pub(crate) type StoreFds<'a> = crate::wal_guard::StoreFds<'a>;
+pub(crate) type StoreFds<'a> = crate::db::wal_guard::StoreFds<'a>;
 
 /// A serialized handle to a turso connection with persistent sidecar fds.
 ///
@@ -1450,12 +1455,12 @@ pub(crate) async fn open_store(
     schema: &str,
 ) -> anyhow::Result<Connection> {
     let db_path = store_db_path(root, name);
-    let Some(diagnosis) = crate::wal_guard::take_boot_diagnosis(&db_path) else {
+    let Some(diagnosis) = crate::db::wal_guard::take_boot_diagnosis(&db_path) else {
         return open_with_schema(&db_path, schema).await;
     };
 
     match diagnosis {
-        crate::wal_guard::BootDiagnosis::BlockedCoordination => {
+        crate::db::wal_guard::BootDiagnosis::BlockedCoordination => {
             // Pre-open intent: the coordination state blocks a safe reopen
             // (orphaned/foreign/truncated WAL) — no heal; the open proceeds
             // panic-absorbed and turso's own reopen rebuilds the `.tshm` from
@@ -1484,7 +1489,7 @@ pub(crate) async fn open_store(
                 }
             }
         }
-        crate::wal_guard::BootDiagnosis::Healthy => {
+        crate::db::wal_guard::BootDiagnosis::Healthy => {
             // Healthy coordination + open panic is a main-DB content issue
             // (pager OOB), not a coordination one — the sidecar-only
             // quarantine path would discard -wal durability while the
@@ -1501,8 +1506,8 @@ pub(crate) async fn open_store(
                 }
             }
         }
-        healable @ (crate::wal_guard::BootDiagnosis::StaleTail
-        | crate::wal_guard::BootDiagnosis::DurableB) => {
+        healable @ (crate::db::wal_guard::BootDiagnosis::StaleTail
+        | crate::db::wal_guard::BootDiagnosis::DurableB) => {
             // Phase 1: the heal connection's own open — the risky reopen of
             // damaged coordination. A panic or persistent error (e.g. busy)
             // here is a recreate candidate — but only for corruption-
@@ -1549,7 +1554,7 @@ pub(crate) async fn open_store(
                 )),
             }
         }
-        crate::wal_guard::BootDiagnosis::Structural => {
+        crate::db::wal_guard::BootDiagnosis::Structural => {
             crate::boot::boot_diagnostic(format!(
                 "store '{name}' structurally damaged (pre-flight diagnosis) — \
                  quarantining and recreating",
@@ -1587,12 +1592,12 @@ pub(crate) async fn open_store(
 /// is a no-op.
 fn consolidated_schema() -> String {
     let mut s = String::with_capacity(2048);
-    s.push_str(crate::board::SCHEMA);
+    s.push_str(crate::pipeline::board::SCHEMA);
     s.push_str(crate::session::SCHEMA);
     s.push_str(crate::workspace::SCHEMA);
     s.push_str(crate::users::SCHEMA);
     s.push_str(crate::config_db::SCHEMA);
-    s.push_str(crate::chat_history::SCHEMA);
+    s.push_str(crate::channels::chat_history::SCHEMA);
     s
 }
 
@@ -1610,7 +1615,7 @@ fn consolidated_schema() -> String {
 ///
 /// # Migration ordering (an explicit decision)
 ///
-/// [`crate::migrations::run_domain_migrations`] runs **before** the one-time
+/// [`crate::db::migrations::run_domain_migrations`] runs **before** the one-time
 /// import. This is deliberate: the merged board+sessions history includes two
 /// UNGUARDED one-time data resets — board `003_reset_nonterminal_tickets`
 /// (resets every non-terminal ticket to `backlog`) and sessions
@@ -1638,7 +1643,7 @@ pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Conne
     // preserved (never renumbered — two of them are unguarded one-time data
     // resets that must not re-fire if renumbered). The unified
     // `schema_migrations` table holds all of them.
-    crate::migrations::run_domain_migrations(&conn).await?;
+    crate::db::migrations::run_domain_migrations(&conn).await?;
 
     // One-time consolidation import from legacy per-store files.
     run_consolidation_import_if_pending(&conn, root).await?;
@@ -2404,7 +2409,7 @@ async fn migrate_overflow_aliased_store(
     schema: &str,
 ) -> anyhow::Result<(RepairOutcome, Connection)> {
     // ── Precondition: fi_len == maxf, else TRUNCATE-checkpoint first ──
-    let status = crate::wal_guard::inspect_store_at(db_path, conn.store_fds());
+    let status = crate::db::wal_guard::inspect_store_at(db_path, conn.store_fds());
     if let Some(h) = status.tshm
         && u64::from(h.frame_index_len) != h.max_frame
     {
@@ -2944,14 +2949,14 @@ impl CheckpointMode {
 async fn heal_checkpoint_sequence(
     db_path: &Path,
     name: &str,
-    diagnosis: crate::wal_guard::BootDiagnosis,
+    diagnosis: crate::db::wal_guard::BootDiagnosis,
 ) -> anyhow::Result<()> {
     let sidecars = store_sidecars(db_path);
     // PASSIVE-first for durable-B (0-byte main DB + live WAL): backfill
     // without truncating, then a reopen + TRUNCATE compacts. Defensively
     // re-checked in the StaleTail arm — TRUNCATE-first on a 0-byte main DB
     // destroys committed frames.
-    let durable_b = matches!(diagnosis, crate::wal_guard::BootDiagnosis::DurableB)
+    let durable_b = matches!(diagnosis, crate::db::wal_guard::BootDiagnosis::DurableB)
         || (std::fs::metadata(db_path).is_ok_and(|m| m.len() == 0)
             && std::fs::metadata(&sidecars.wal).is_ok_and(|m| m.len() > 0));
     if durable_b {
@@ -2959,7 +2964,7 @@ async fn heal_checkpoint_sequence(
         heal_checkpoint(db_path, CheckpointMode::Truncate, name).await?;
         return Ok(());
     }
-    if matches!(diagnosis, crate::wal_guard::BootDiagnosis::StaleTail) {
+    if matches!(diagnosis, crate::db::wal_guard::BootDiagnosis::StaleTail) {
         // Defensive orphan guard: the WAL bytes are gone (a genuine stale
         // tail always has frames on disk, wal ≥ 32) — TRUNCATE-first has
         // nothing to heal and the heal connection's reopen could panic on the
@@ -3372,18 +3377,18 @@ mod tests {
                 .iter()
                 .find_map(|s| name.strip_suffix(s))
                 .unwrap_or(&name);
-            let meta = crate::debug::parse_family_name(base).unwrap_or_else(|| {
+            let meta = crate::db::debug::parse_family_name(base).unwrap_or_else(|| {
                 panic!("quarantine writer name must parse as a family id: {name}")
             });
             assert_eq!(meta.store, "board");
-            assert_eq!(meta.kind, crate::debug::FamilyKind::Quarantine);
+            assert_eq!(meta.kind, crate::db::debug::FamilyKind::Quarantine);
         }
 
         // Pre-reindex snapshot: the writer helper's base name must parse too.
         let snap = pre_reindex_snapshot_path(&db_path);
-        let meta = crate::debug::parse_family_name(snap.file_name().unwrap().to_str().unwrap())
+        let meta = crate::db::debug::parse_family_name(snap.file_name().unwrap().to_str().unwrap())
             .expect("pre-reindex snapshot name must parse as a family id");
-        assert_eq!(meta.kind, crate::debug::FamilyKind::PreReindex);
+        assert_eq!(meta.kind, crate::db::debug::FamilyKind::PreReindex);
     }
 
     #[test]
@@ -3434,9 +3439,9 @@ mod tests {
     }
 
     /// Guard: raw `turso::Builder` usage is confined to the persistence module
-    /// (`src/turso.rs`) and the debug CLI (`src/debug.rs`).
+    /// (`src/db/mod.rs`) and the debug CLI (`src/db/debug.rs`).
     ///
-    /// All database access must go through [`crate::turso::Connection`], which
+    /// All database access must go through [`crate::db::Connection`], which
     /// centralises the experimental feature flags, busy timeout, mutex
     /// serialization, and dangling-transaction handling. The debug CLI is the
     /// documented exception: it needs the upstream lazy `Rows` iterator for
@@ -3451,7 +3456,7 @@ mod tests {
     #[test]
     fn raw_builder_usage_is_confined_to_persistence_and_debug() {
         const PATTERNS: [&str; 2] = ["turso::Builder", "Builder::new_local"];
-        const ALLOWED: [&str; 2] = ["src/turso.rs", "src/debug.rs"];
+        const ALLOWED: [&str; 2] = ["src/db/mod.rs", "src/db/debug.rs"];
 
         fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).expect("read src directory") {
@@ -3497,8 +3502,8 @@ mod tests {
         assert!(
             violations.is_empty(),
             "raw turso::Builder usage outside the persistence module and debug CLI.\n\
-             All database access must go through crate::turso::Connection (turso.rs);\n\
-             the debug CLI (debug.rs) is the only documented exception.\n\
+             All database access must go through crate::db::Connection (db/mod.rs);\n\
+             the debug CLI (db/debug.rs) is the only documented exception.\n\
              Violations: {violations:#?}"
         );
     }
@@ -3517,9 +3522,9 @@ mod tests {
     /// intermediate query structures stay in RAM and a missing temp root
     /// cannot affect any turso operation.
     ///
-    /// The service connection factory (`Connection::open` in src/turso.rs)
+    /// The service connection factory (`Connection::open` in src/db/mod.rs)
     /// and the debug CLI's separate read-only path (`connect_readonly` in
-    /// src/debug.rs) do NOT share an opening path — both must carry the
+    /// src/db/debug.rs) do NOT share an opening path — both must carry the
     /// PRAGMA. If either regresses, the guarantee silently breaks; this
     /// source-scanning tripwire fails with a pointer to the requirement.
     /// The bench harnesses in `benches/` are outside this scan (documented
@@ -3529,8 +3534,8 @@ mod tests {
         const PRAGMA: &str = "PRAGMA temp_store = MEMORY";
         // (file, symbol that must carry the PRAGMA)
         const EXPECTED: [(&str, &str); 2] = [
-            ("src/turso.rs", "impl Connection"),
-            ("src/debug.rs", "fn connect_readonly"),
+            ("src/db/mod.rs", "impl Connection"),
+            ("src/db/debug.rs", "fn connect_readonly"),
         ];
 
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3735,7 +3740,10 @@ mod tests {
         // Truncated main DB header → structural.
         std::fs::write(&db_path, [0u8; 64]).unwrap();
         std::fs::write(format!("{}-tshm", db_path.display()), [0u8; 32]).unwrap();
-        crate::wal_guard::set_boot_diagnosis(&db_path, crate::wal_guard::BootDiagnosis::Structural);
+        crate::db::wal_guard::set_boot_diagnosis(
+            &db_path,
+            crate::db::wal_guard::BootDiagnosis::Structural,
+        );
 
         let conn = open_store(root, "board", "CREATE TABLE IF NOT EXISTS t (id INTEGER);")
             .await
@@ -4261,10 +4269,12 @@ mod tests {
         let root = tmp.path();
 
         // Legacy `board.db` with a ticket (current shape).
-        let board_conn =
-            open_with_schema(&legacy_store_db_path(root, "board"), crate::board::SCHEMA)
-                .await
-                .unwrap();
+        let board_conn = open_with_schema(
+            &legacy_store_db_path(root, "board"),
+            crate::pipeline::board::SCHEMA,
+        )
+        .await
+        .unwrap();
         board_conn
             .execute(
                 "INSERT INTO tickets (id, title, description, phase, workspace_name, \
@@ -4374,7 +4384,7 @@ mod tests {
             .expect("ticket_stage_jobs must be renamed to ticket_jobs on import");
         assert_eq!(tj_ticket_id, "t1");
         assert!(
-            !crate::turso::column_exists(&conn, "ticket_jobs", "stage")
+            !crate::db::column_exists(&conn, "ticket_jobs", "stage")
                 .await
                 .unwrap(),
             "stage column must be dropped by consolidate_002 migration"
@@ -4499,7 +4509,7 @@ mod tests {
             .expect("an already-migrated ticket_jobs table must be copied, not dropped");
         assert_eq!(tj_ticket_id, "t1");
         assert!(
-            !crate::turso::column_exists(&conn, "ticket_jobs", "stage")
+            !crate::db::column_exists(&conn, "ticket_jobs", "stage")
                 .await
                 .unwrap(),
             "stage column must be dropped by consolidate_002 migration"

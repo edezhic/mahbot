@@ -1,7 +1,7 @@
 //! Git subprocess wrappers — run git commands and parse porcelain/numstat output.
 //!
 //! Provides `run_git_*` async functions that operate on a repository path
-//! and return results. For diff output parsing, see [`crate::diff_parse`].
+//! and return results. For diff output parsing, see [`crate::git::diff_parse`].
 
 use anyhow::Context;
 use std::collections::HashSet;

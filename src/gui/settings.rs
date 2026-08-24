@@ -1570,8 +1570,8 @@ impl SettingsState {
                             {
                                 let mut left = Row::new().spacing(4).align_y(Alignment::Center);
                                 let mut role_btns = Row::new().spacing(2);
-                                for role in
-                                    Role::iter().filter(|r| crate::role::role_info(r).has_discovery)
+                                for role in Role::iter()
+                                    .filter(|r| crate::agent::role::role_info(r).has_discovery)
                                 {
                                     let name = role.as_str();
                                     let (color, _bg) = theme::role_badge_color_for(&role);
@@ -3456,7 +3456,7 @@ fn role_checkbox_row<'a>(
     let role_checks: Vec<Element<'a, SettingsMessage>> = Role::iter()
         .enumerate()
         .map(|(i, role)| {
-            let label = crate::role::role_info(&role).display_label;
+            let label = crate::agent::role::role_info(&role).display_label;
             Checkbox::new(checked(i))
                 .label(label)
                 .on_toggle(move |_| on_toggle(i))

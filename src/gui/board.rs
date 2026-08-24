@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::board::{Ticket, TicketPhase};
-use crate::git_commands::{parse_numstat_lines, run_git_output};
+use crate::git::commands::{parse_numstat_lines, run_git_output};
+use crate::pipeline::board::{Ticket, TicketPhase};
 
 use iced::widget::{
     Column, Row, Space, button, column, container, markdown, row, scrollable, text, text_editor,
@@ -325,7 +325,7 @@ impl BoardState {
         let ws_name = self.workspace_name.clone();
         Task::perform(
             async move {
-                let board = crate::board::store();
+                let board = crate::pipeline::board::store();
                 board
                     .list_all_tickets(ws_name.as_deref(), None)
                     .await
@@ -363,7 +363,7 @@ impl BoardState {
         let generation = self.comment_generation;
         Task::perform(
             async move {
-                let board = crate::board::store();
+                let board = crate::pipeline::board::store();
                 board.get_ticket(&id).await.map_err(|e| e.to_string())
             },
             move |res| match res {
@@ -606,7 +606,7 @@ impl BoardState {
     fn fetch_ticket(id: String) -> Task<BoardMessage> {
         Task::perform(
             async move {
-                let board = crate::board::store();
+                let board = crate::pipeline::board::store();
                 board.get_ticket(&id).await.map_err(|e| e.to_string())
             },
             |res| match res {
@@ -716,7 +716,7 @@ impl BoardState {
                 self.action_loading = Some(ticket_id.clone());
                 Task::perform(
                     async move {
-                        let board = crate::board::store();
+                        let board = crate::pipeline::board::store();
                         let phase: TicketPhase = new_phase
                             .parse()
                             .map_err(|_| format!("Invalid phase: {new_phase}"))?;
@@ -732,7 +732,7 @@ impl BoardState {
                         // cancels don't go through here; shutdown and
                         // already-paused are handled inside the helper.
                         if phase == TicketPhase::Cancelled && agent_in_flight(&ticket).await {
-                            let notice = crate::management::pause_workspace_on_failure(
+                            let notice = crate::pipeline::management::pause_workspace_on_failure(
                                 &ticket,
                                 "user cancelled the ticket while an agent was running",
                             )
@@ -741,7 +741,7 @@ impl BoardState {
                                 let _ = board
                                     .add_comment(
                                         &ticket_id,
-                                        crate::role::SYSTEM_ROLE,
+                                        crate::agent::role::SYSTEM_ROLE,
                                         notice.trim(),
                                     )
                                     .await;
@@ -760,12 +760,12 @@ impl BoardState {
                         // transition was a no-op and a self-transition entry
                         // would be a bogus hop.
                         if source != phase && applied {
-                            crate::ticket_buffer::push(
+                            crate::pipeline::ticket_buffer::push(
                                 &ticket.workspace_name,
                                 &ticket_id,
                                 source,
                                 phase,
-                                crate::ticket_buffer::TransitionOrigin::User,
+                                crate::pipeline::ticket_buffer::TransitionOrigin::User,
                             );
                         }
                         Ok(())
@@ -872,13 +872,13 @@ impl BoardState {
                 };
 
                 let role = format!("user:{user_name}");
-                let now = crate::turso::now();
+                let now = crate::db::now();
                 let content = trimmed;
 
                 // Optimistically add the comment to local state so it appears
                 // immediately in the comments list.
                 if let Some(ref mut ticket) = self.selected_ticket {
-                    ticket.comments.push(crate::board::TicketComment {
+                    ticket.comments.push(crate::pipeline::board::TicketComment {
                         role: role.clone(),
                         content: content.clone(),
                         created_at: now,
@@ -899,7 +899,7 @@ impl BoardState {
 
                 Task::perform(
                     async move {
-                        let board = crate::board::store();
+                        let board = crate::pipeline::board::store();
                         let result = board
                             .add_comment(&ticket_id, &role, &content)
                             .await
@@ -958,7 +958,7 @@ impl BoardState {
                 let ws = self.workspace_name.clone();
                 Task::perform(
                     async move {
-                        let board = crate::board::store();
+                        let board = crate::pipeline::board::store();
                         board
                             .archive_all_done_and_cancelled(ws.as_deref())
                             .await
@@ -983,7 +983,7 @@ impl BoardState {
                 self.action_loading = Some(ticket_id.clone());
                 Task::perform(
                     async move {
-                        let board = crate::board::store();
+                        let board = crate::pipeline::board::store();
                         board
                             .set_archived(&ticket_id)
                             .await
@@ -1070,7 +1070,7 @@ impl BoardState {
                         // creates at most a handful of short-lived sleep-only
                         // tasks, which is acceptably cheap.
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        let board = crate::board::store();
+                        let board = crate::pipeline::board::store();
                         board
                             .search_by_fts(&query, 20, ws.as_deref())
                             .await
@@ -1165,7 +1165,7 @@ impl BoardState {
     /// Partition tickets into the four board columns in display order:
     /// In Progress, Ready, Pending, Completed.
     pub(crate) fn board_sections(tickets: &[Ticket]) -> [Vec<&Ticket>; 4] {
-        crate::board::BoardStore::board_sections(tickets)
+        crate::pipeline::board::BoardStore::board_sections(tickets)
     }
 
     /// Render a single ticket card: clickable title, ID, phase badge, and action icons.
@@ -1723,7 +1723,7 @@ impl BoardState {
             let role_colors = theme::role_badge_color(&comment.role);
 
             // For diagnostics comments, optionally show only the summary
-            let is_diag = comment.role == crate::role::DIAGNOSTICS_ROLE;
+            let is_diag = comment.role == crate::agent::role::DIAGNOSTICS_ROLE;
             let is_expanded = expanded.contains(&i);
 
             let summary = if is_diag {
@@ -2074,7 +2074,7 @@ mod tests {
     /// Same-ticket refresh carrying a new phase plus an engineer comment.
     fn refreshed_ticket(phase: TicketPhase) -> Ticket {
         let mut ticket = make_ticket("T-1", phase);
-        ticket.comments = vec![crate::board::TicketComment {
+        ticket.comments = vec![crate::pipeline::board::TicketComment {
             role: "engineer".into(),
             content: "fixed the flaky test".into(),
             created_at: "2026-01-01T00:00:05Z".into(),

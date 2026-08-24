@@ -1,6 +1,6 @@
 //! Ticket/board system — Turso-backed task management.
 
-use crate::turso::{self, IntoParams, TxGuard, Value};
+use crate::db::{self, IntoParams, TxGuard, Value};
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use serde::Serialize;
@@ -20,7 +20,7 @@ crate::define_store! {
 ///
 /// Runs every 5 minutes, respects the global shutdown token via
 /// [`crate::shutdown::sleep_or_shutdown_or_drain`] (same pattern as
-/// [`crate::maintainer::run_maintainer_loop`]).
+/// [`crate::agent::maintainer::run_maintainer_loop`]).
 /// Logs per-pass failures and continues.
 pub async fn run_archive_cancelled_loop() {
     let interval = std::time::Duration::from_mins(5);
@@ -540,7 +540,7 @@ impl std::str::FromStr for TicketPhase {
 /// [`PreparedUpdate::execute_tx_matched`].
 struct PreparedUpdate {
     sql: String,
-    params: Vec<turso::Value>,
+    params: Vec<db::Value>,
     ticket_id: String,
 }
 
@@ -549,7 +549,7 @@ impl PreparedUpdate {
     /// affected. Does NOT cancel registered agents — the caller manages
     /// transaction lifecycle and should cancel agents before starting the
     /// transaction when needed.
-    async fn execute_tx(self, tx: &turso::TxGuard<'_>) -> Result<()> {
+    async fn execute_tx(self, tx: &db::TxGuard<'_>) -> Result<()> {
         let rows = tx.execute(&self.sql, self.params).await?;
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         Ok(())
@@ -560,7 +560,7 @@ impl PreparedUpdate {
     /// Use this for post-agent operations where the caller knows no agent
     /// is running and the implicit cancellation of
     /// [`execute_and_cancel`](Self::execute_and_cancel) is unnecessary.
-    async fn execute_no_cancel(self, conn: &turso::Connection) -> Result<()> {
+    async fn execute_no_cancel(self, conn: &db::Connection) -> Result<()> {
         let rows = conn.execute(&self.sql, self.params).await?;
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         Ok(())
@@ -581,10 +581,10 @@ impl PreparedUpdate {
     /// - **`BoardStore::claim_diagnostics`** — returns `Result<bool>`, only cancels on success.
     /// - **`BoardStore::supersede_and_create`** — runs inside a transaction, cancels
     ///   before commit via a different pattern.
-    async fn execute_and_cancel(self, conn: &turso::Connection) -> Result<()> {
+    async fn execute_and_cancel(self, conn: &db::Connection) -> Result<()> {
         let rows = conn.execute(&self.sql, self.params).await?;
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
-        crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&self.ticket_id);
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&self.ticket_id);
         Ok(())
     }
 
@@ -594,7 +594,7 @@ impl PreparedUpdate {
     /// externally) or does not exist. Follows the claim convention
     /// (guard miss = `Ok(false)`, an expected no-op), unlike the other
     /// executors which treat a no-row match as an error.
-    async fn execute_tx_matched(self, tx: &turso::TxGuard<'_>) -> Result<bool> {
+    async fn execute_tx_matched(self, tx: &db::TxGuard<'_>) -> Result<bool> {
         let rows = tx.execute(&self.sql, self.params).await?;
         Ok(rows > 0)
     }
@@ -641,13 +641,13 @@ impl BoardStore {
     /// creates it before the one-time import (guaranteeing imported tickets are
     /// FTS-searchable). This hook therefore only tokenizer-migrates an existing
     /// index (drops and recreates if the tokenizer changed); it is idempotent
-    /// and runs from both [`crate::turso::init_all_stores`] (production, on the
+    /// and runs from both [`crate::db::init_all_stores`] (production, on the
     /// shared consolidated connection) and each isolated board store open. The
     /// board migrations are NOT run here — they are part of the consolidated
     /// domain migration history applied once by
-    /// [`crate::migrations::run_domain_migrations`].
+    /// [`crate::db::migrations::run_domain_migrations`].
     pub(crate) async fn after_open(&self) -> anyhow::Result<()> {
-        crate::turso::ensure_fts_index(
+        crate::db::ensure_fts_index(
             &self.conn,
             TICKETS_FTS_INDEX_NAME,
             "ngram",
@@ -673,13 +673,13 @@ impl BoardStore {
         params: &TicketParams,
         supersedes: Option<&str>,
     ) -> Result<()> {
-        let now = turso::now();
+        let now = db::now();
         let prereqs_json = serde_json::to_string(&params.prerequisites)?;
         tx.execute(
             "INSERT INTO tickets (id, title, description, phase, workspace_name, \
              created_at, updated_at, prerequisites, supersedes, reporter, embedding, priority) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            turso::params![
+            db::params![
                 ticket_id,
                 params.title.as_str(),
                 params.description.as_str(),
@@ -715,7 +715,7 @@ impl BoardStore {
                 "SELECT DISTINCT t.id, t.prerequisites \
                  FROM tickets t, json_each(t.prerequisites) AS je \
                  WHERE je.value = ?1 AND t.workspace_name = ?2",
-                turso::params![supersede_id, workspace_name],
+                db::params![supersede_id, workspace_name],
             )
             .await?;
 
@@ -735,7 +735,7 @@ impl BoardStore {
                 let new_json = serde_json::to_string(&prereqs)?;
                 tx.execute(
                     "UPDATE tickets SET prerequisites = ?1, updated_at = ?2 WHERE id = ?3",
-                    turso::params![new_json, turso::now(), dep_id],
+                    db::params![new_json, db::now(), dep_id],
                 )
                 .await?;
             }
@@ -774,7 +774,7 @@ impl BoardStore {
                 "INSERT INTO ticket_counters (workspace_name, next_id) VALUES (?1, 1) \
                  ON CONFLICT(workspace_name) DO UPDATE SET next_id = ticket_counters.next_id + 1 \
                  RETURNING next_id - 1",
-                turso::params![workspace_name],
+                db::params![workspace_name],
                 |row| row.get(0),
             )
             .await?;
@@ -839,7 +839,7 @@ impl BoardStore {
         let rows = tx
             .query(
                 "SELECT workspace_name FROM tickets WHERE id = ?1",
-                turso::params![supersede_id],
+                db::params![supersede_id],
             )
             .await?;
         let row = rows
@@ -855,13 +855,13 @@ impl BoardStore {
             params.workspace_name,
         );
 
-        let now = turso::now();
+        let now = db::now();
         let cancelled_rows = tx
             .execute(
                 "UPDATE tickets SET phase = ?1, updated_at = ?2, \
                  superseded_by = ?4, is_archived = 1, done_at = NULL \
                  WHERE id = ?3",
-                turso::params![
+                db::params![
                     TicketPhase::Cancelled.as_ref(),
                     now,
                     supersede_id,
@@ -881,7 +881,7 @@ impl BoardStore {
         // keep running (orphaned agents on a cancelled ticket). Cancelling first
         // flips the trade-off: if the commit subsequently fails, agents were
         // cancelled unnecessarily but will be re-registered on re-dispatch.
-        crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
 
         // No ticket_buffer push for the cancellation: supersede is only reachable
         // through agent tools (Manager or Maintainer CreateTicketTool) and agent
@@ -894,11 +894,7 @@ impl BoardStore {
 
     /// Build a [`Ticket`] from a row returned by a
     /// [`TICKET_COLUMNS`] SELECT, optionally including its comments.
-    async fn ticket_from_row(
-        &self,
-        row: &turso::Row,
-        load_comments: LoadComments,
-    ) -> Result<Ticket> {
+    async fn ticket_from_row(&self, row: &db::Row, load_comments: LoadComments) -> Result<Ticket> {
         let id: String = row.get(COL_TICKET_ID)?;
         let comments = if load_comments == LoadComments::Yes {
             self.get_comments(&id).await?
@@ -987,7 +983,7 @@ impl BoardStore {
         pipeline_check: PipelineCheck,
         claim_grace: Option<Duration>,
     ) -> Result<Option<Ticket>> {
-        let now = turso::now();
+        let now = db::now();
 
         // Filter that excludes tickets with unmet prerequisites.
         let prereq_filter = format!(
@@ -1052,7 +1048,7 @@ impl BoardStore {
     /// This is the shared building block for all `SELECT {TICKET_COLUMNS}` queries.
     /// Accepts the full suffix — typically starting with `WHERE` and optionally
     /// including `ORDER BY`, `LIMIT`, etc. — and forwards `params` directly to
-    /// the underlying query so callers can use `turso::params![]` without conversions.
+    /// the underlying query so callers can use `db::params![]` without conversions.
     pub(crate) async fn select_tickets(
         &self,
         suffix: &str,
@@ -1071,11 +1067,7 @@ impl BoardStore {
     /// Get a ticket by id, loading its comments.
     pub async fn get_ticket(&self, ticket_id: &str) -> Result<Option<Ticket>> {
         Ok(self
-            .select_tickets(
-                "WHERE id = ?1",
-                turso::params![ticket_id],
-                LoadComments::Yes,
-            )
+            .select_tickets("WHERE id = ?1", db::params![ticket_id], LoadComments::Yes)
             .await?
             .into_iter()
             .next())
@@ -1104,7 +1096,7 @@ impl BoardStore {
     /// Callers must ensure `ids` is non-empty — the resulting SQL is invalid
     /// (syntax error from SQLite) when the list is empty.
     fn in_clause_for_ids(ids: &[String]) -> (String, Vec<Value>) {
-        let suffix = format!("WHERE id IN ({})", turso::sql_in_placeholders(ids.len()));
+        let suffix = format!("WHERE id IN ({})", db::sql_in_placeholders(ids.len()));
         let params: Vec<Value> = ids.iter().map(|id| Value::Text(id.clone())).collect();
         (suffix, params)
     }
@@ -1114,7 +1106,7 @@ impl BoardStore {
         self.conn
             .query_optional(
                 "SELECT phase FROM tickets WHERE id = ?1",
-                turso::params![ticket_id],
+                db::params![ticket_id],
                 |row| {
                     let phase: String = row.get(0)?;
                     phase.parse()
@@ -1133,7 +1125,7 @@ impl BoardStore {
     pub(crate) async fn get_ticket_priority(&self, ticket_id: &str) -> Result<Option<i64>> {
         let sql = "SELECT priority FROM tickets WHERE id = ?1";
         self.conn
-            .query_optional(sql, turso::params![ticket_id], |row| row.get::<i64>(0))
+            .query_optional(sql, db::params![ticket_id], |row| row.get::<i64>(0))
             .await
     }
 
@@ -1158,10 +1150,10 @@ impl BoardStore {
     /// ```
     fn build_ticket_update_with_updated_at(
         set_clause: &str,
-        set_params: Vec<turso::Value>,
+        set_params: Vec<db::Value>,
         ticket_id: &str,
     ) -> PreparedUpdate {
-        let now = turso::now();
+        let now = db::now();
         let sql = format!("UPDATE tickets SET {set_clause}, updated_at = ? WHERE id = ?");
         let mut params = set_params;
         params.push(Value::from(now));
@@ -1191,14 +1183,14 @@ impl BoardStore {
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
     ) -> PreparedUpdate {
-        let now = turso::now();
+        let now = db::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
         let sql = "UPDATE tickets SET phase = ?1, updated_at = ?2, \
                     done_at = CASE WHEN ?1 = 'done' THEN ?2 \
                                    WHEN phase = 'done' THEN NULL \
                                    ELSE done_at END \
                     WHERE id = ?3 AND (?4 IS NULL OR phase = ?4)";
-        let params: Vec<turso::Value> = vec![
+        let params: Vec<db::Value> = vec![
             Value::from(target_phase.as_ref()),
             Value::from(now),
             Value::from(ticket_id),
@@ -1289,7 +1281,7 @@ impl BoardStore {
     /// if no row matched (already claimed by another dispatch or ticket moved
     /// out of [`TicketPhase::InDiagnostics`]).
     pub async fn claim_diagnostics(&self, ticket_id: &str) -> Result<bool> {
-        let now = turso::now();
+        let now = db::now();
         let rows = self
             .conn
             .execute(
@@ -1298,12 +1290,12 @@ impl BoardStore {
                  WHERE id = ?2 \
                  AND phase = ?3 \
                  AND is_archived = 0",
-                turso::params![now, ticket_id, TicketPhase::InDiagnostics.as_ref()],
+                db::params![now, ticket_id, TicketPhase::InDiagnostics.as_ref()],
             )
             .await?;
 
         if rows > 0 {
-            crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
+            crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
         }
 
         Ok(rows > 0)
@@ -1371,7 +1363,7 @@ impl BoardStore {
             .query(
                 "UPDATE tickets SET bounce_count = bounce_count + 1, updated_at = ?1 \
                  WHERE id = ?2 RETURNING bounce_count",
-                turso::params![turso::now(), ticket_id],
+                db::params![db::now(), ticket_id],
             )
             .await
             .map_err(anyhow::Error::from)?;
@@ -1422,12 +1414,12 @@ impl BoardStore {
     /// agent runs (duplicate work/conflicting verdicts). Empty excludes nothing.
     pub async fn reset_analysis_tickets(&self, exclude_ticket_ids: &[String]) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
-        let now = turso::now();
+        let now = db::now();
         for transition in Self::RESET_ANALYSIS_TRANSITIONS {
-            let mut values: Vec<turso::Value> = vec![
-                turso::Value::Text(transition.to.as_ref().to_string()),
-                turso::Value::Text(now.clone()),
-                turso::Value::Text(transition.from.as_ref().to_string()),
+            let mut values: Vec<db::Value> = vec![
+                db::Value::Text(transition.to.as_ref().to_string()),
+                db::Value::Text(now.clone()),
+                db::Value::Text(transition.from.as_ref().to_string()),
             ];
             let clause = if exclude_ticket_ids.is_empty() {
                 String::new()
@@ -1436,11 +1428,11 @@ impl BoardStore {
                 values.extend(
                     exclude_ticket_ids
                         .iter()
-                        .map(|s| turso::Value::Text(s.clone())),
+                        .map(|s| db::Value::Text(s.clone())),
                 );
                 format!(
                     " AND id NOT IN ({})",
-                    turso::sql_in_placeholders(exclude_ticket_ids.len())
+                    db::sql_in_placeholders(exclude_ticket_ids.len())
                 )
             };
             let sql = format!(
@@ -1494,7 +1486,7 @@ impl BoardStore {
         let rfd = TicketPhase::ReadyForDevelopment.as_ref();
         let rows = self
             .conn
-            .query(&sql, turso::params![workspace_name, exclude_ticket_id, rfd])
+            .query(&sql, db::params![workspace_name, exclude_ticket_id, rfd])
             .await?;
         Ok(!rows.is_empty())
     }
@@ -1518,7 +1510,7 @@ impl BoardStore {
     /// each other as active and both buffer their Done transitions. In this
     /// scenario all tickets are already in Done in the database — the only
     /// consequence is that Done notifications are delayed until the next
-    /// [`crate::message_router::MessageKind::UserMessage`] drains the buffer. This is an accepted trade-off:
+    /// [`crate::agent::message_router::MessageKind::UserMessage`] drains the buffer. This is an accepted trade-off:
     /// the race window is small and the buffer always drains eventually.
     pub async fn has_active_tickets_excluding(
         &self,
@@ -1541,7 +1533,7 @@ impl BoardStore {
     /// deterministic stage session (engineer/sanitation) injects outstanding
     /// comments at the empty-message resume point.
     pub async fn add_comment(&self, ticket_id: &str, role: &str, content: &str) -> Result<()> {
-        crate::turso::with_tx(&self.conn, ticket_id, "add comment", async |tx| {
+        crate::db::with_tx(&self.conn, ticket_id, "add comment", async |tx| {
             Self::add_comment_tx(tx, ticket_id, role, content).await
         })
         .await?;
@@ -1605,18 +1597,18 @@ impl BoardStore {
             // in the consumer loop path, which pipeline agents never enter.
             let commenter_role = role.parse::<crate::Role>().unwrap_or(crate::Role::Manager);
 
-            let job = crate::message_router::AgentJob {
+            let job = crate::agent::message_router::AgentJob {
                 content: content.to_string(),
                 workspace_name: ticket.workspace_name.clone(),
                 user_name: role.to_string(),
                 channel: String::new(),
-                kind: crate::message_router::MessageKind::TicketComment,
+                kind: crate::agent::message_router::MessageKind::TicketComment,
                 role: commenter_role,
                 reply_target: None,
                 pending_job_id: None,
             };
 
-            if crate::message_router::try_route(&agent_id, job) {
+            if crate::agent::message_router::try_route(&agent_id, job) {
                 debug!(
                     ticket = %ticket_id,
                     agent = %agent_id,
@@ -1646,16 +1638,16 @@ impl BoardStore {
         content: &str,
     ) -> Result<()> {
         let comment_id = crate::generate_id();
-        let now = turso::now();
+        let now = db::now();
         tx.execute(
             "INSERT INTO ticket_comments (id, ticket_id, role, content, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            turso::params![comment_id, ticket_id, role, content, now.as_str()],
+            db::params![comment_id, ticket_id, role, content, now.as_str()],
         )
         .await?;
         tx.execute(
             "UPDATE tickets SET updated_at = ?1 WHERE id = ?2",
-            turso::params![now.as_str(), ticket_id],
+            db::params![now.as_str(), ticket_id],
         )
         .await?;
         Ok(())
@@ -1666,7 +1658,7 @@ impl BoardStore {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM ticket_comments WHERE ticket_id = ?1 ORDER BY created_at ASC"
         );
-        let rows = self.conn.query(&sql, turso::params![ticket_id]).await?;
+        let rows = self.conn.query(&sql, db::params![ticket_id]).await?;
         let mut comments = Vec::new();
         for row in rows {
             comments.push(TicketComment {
@@ -1742,7 +1734,7 @@ impl BoardStore {
              AND (?2 IS NULL OR phase = ?2) \
              AND is_archived = 0 \
              ORDER BY priority ASC, created_at DESC",
-            turso::params![workspace_name, phase_str],
+            db::params![workspace_name, phase_str],
             LoadComments::No,
         )
         .await
@@ -1765,7 +1757,7 @@ impl BoardStore {
                  WHERE phase = ?1 \
                    AND (?2 IS NULL OR workspace_name = ?2) \
                    AND is_archived = 0",
-                turso::params![phase.as_ref(), workspace_name],
+                db::params![phase.as_ref(), workspace_name],
                 |row| row.get(0),
             )
             .await
@@ -1800,13 +1792,13 @@ impl BoardStore {
         &self,
         workspace_name: &str,
     ) -> Result<u64> {
-        let now = turso::now();
+        let now = db::now();
         let updated = self
             .conn
             .execute(
                 "UPDATE tickets SET phase = ?1, updated_at = ?2 \
                  WHERE phase = ?3 AND workspace_name = ?4 AND is_archived = 0",
-                turso::params![
+                db::params![
                     TicketPhase::Planning.as_ref(),
                     now,
                     TicketPhase::ReadyForDevelopment.as_ref(),
@@ -1818,7 +1810,7 @@ impl BoardStore {
     }
 
     pub async fn archive_stale_cancelled(&self, hours: i64) -> Result<u64> {
-        let now = turso::now();
+        let now = db::now();
         let cutoff = (Utc::now() - Duration::hours(hours)).to_rfc3339();
         let updated = self
             .conn
@@ -1826,7 +1818,7 @@ impl BoardStore {
                 "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
                  WHERE phase = ?2 AND updated_at < ?3 \
                  AND is_archived = 0",
-                turso::params![now, TicketPhase::Cancelled.as_ref(), cutoff],
+                db::params![now, TicketPhase::Cancelled.as_ref(), cutoff],
             )
             .await
             .context("Failed to archive stale cancelled tickets")?;
@@ -1837,7 +1829,7 @@ impl BoardStore {
         &self,
         workspace_name: Option<&str>,
     ) -> Result<u64> {
-        let now = turso::now();
+        let now = db::now();
         let sql = format!(
             "UPDATE tickets SET is_archived = 1, updated_at = ?1 \
              WHERE phase IN ({}) AND is_archived = 0 \
@@ -1846,7 +1838,7 @@ impl BoardStore {
         );
         let updated = self
             .conn
-            .execute(&sql, turso::params![now, workspace_name])
+            .execute(&sql, db::params![now, workspace_name])
             .await
             .context("Failed to archive done/cancelled tickets")?;
         Ok(updated)
@@ -1983,7 +1975,7 @@ impl BoardStore {
         limit: usize,
         workspace_name: &str,
     ) -> Result<Vec<(String, f64)>> {
-        let sanitized = crate::turso::sanitize_fts_query(query);
+        let sanitized = crate::db::sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
@@ -2001,7 +1993,7 @@ impl BoardStore {
             .conn
             .query_map(
                 &sql,
-                turso::params![workspace_name, sanitized.clone()],
+                db::params![workspace_name, sanitized.clone()],
                 |row| {
                     let id: String = row.get(0)?;
                     let score: f64 = row.get(1)?;
@@ -2039,7 +2031,7 @@ impl BoardStore {
         limit: usize,
         workspace_name: Option<&str>,
     ) -> Result<Vec<Ticket>> {
-        let sanitized = crate::turso::sanitize_fts_query(query);
+        let sanitized = crate::db::sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
@@ -2057,7 +2049,7 @@ impl BoardStore {
         );
         match self
             .conn
-            .query(&sql, turso::params![workspace_name, sanitized.clone()])
+            .query(&sql, db::params![workspace_name, sanitized.clone()])
             .await
         {
             Ok(rows) => {
@@ -2107,7 +2099,7 @@ impl BoardStore {
             .query(
                 "SELECT id, embedding FROM tickets \
                  WHERE is_archived = 1 AND workspace_name = ?1 AND embedding IS NOT NULL",
-                turso::params![workspace_name],
+                db::params![workspace_name],
             )
             .await?;
 

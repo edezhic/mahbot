@@ -16,8 +16,8 @@
 //! never refunded. No per-agent tool-call caps and no wall-clock limit — the
 //! existing global iteration backstop and retry machinery remain untouched.
 
+use crate::agent::message_router::{self, AgentJob, MessageKind};
 use crate::agent::{chat_request, role_tools_and_specs, run_default_agent};
-use crate::message_router::{self, AgentJob, MessageKind};
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::FailureClass;
 use crate::tools::Tool;
@@ -155,7 +155,7 @@ impl ResearchState {
             .conn
             .query_optional(
                 "SELECT state FROM research_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
                 |r| r.get::<String>(0),
             )
             .await
@@ -204,7 +204,7 @@ impl ResearchState {
     /// continues.
     async fn save(&self, job_id: &str) {
         let json = serde_json::to_string(self).unwrap_or_default();
-        let now = crate::turso::now();
+        let now = crate::db::now();
         let conn = &crate::session::store().conn;
         let tx = match conn.begin_tx().await {
             Ok(tx) => tx,
@@ -216,12 +216,12 @@ impl ResearchState {
         let outcome: Result<()> = async {
             tx.execute(
                 "UPDATE research_jobs SET state = ?1 WHERE id = ?2",
-                crate::turso::params![json, job_id],
+                crate::db::params![json, job_id],
             )
             .await?;
             tx.execute(
                 "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                crate::turso::params![crate::jobs::RowStatus::Launched.as_str(), now, job_id],
+                crate::db::params![crate::jobs::RowStatus::Launched.as_str(), now, job_id],
             )
             .await?;
             Ok(())
@@ -703,7 +703,7 @@ async fn terminalize_research(
             "Research cleanup dispatch failed — run folder left for the OS temp sweep"
         );
     }
-    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+    crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
 /// Boot resume of a research run: re-enter the orchestrator at the
@@ -1197,10 +1197,12 @@ async fn wrap_up_timed_out(
     // batch actually runs (prep-only stages register nothing). Attaches to the
     // research run's group; the whole-run orchestrator guard already blocks
     // the drain-watch, so this row is purely observational.
-    let _wrap_up_call = crate::registry::NON_AGENT_CALLS.register(
+    let _wrap_up_call = crate::agent::registry::NON_AGENT_CALLS.register(
         "research_wrap_up",
         &ws.name,
-        Some(crate::registry::ParentKey::Research(run_key.to_string())),
+        Some(crate::agent::registry::ParentKey::Research(
+            run_key.to_string(),
+        )),
         false,
         Some(question.to_string()),
     );
@@ -1220,7 +1222,7 @@ async fn wrap_up_timed_out(
                 // task's 90s. Post-rollout telemetry distinguishes cache-hit
                 // from policy starvation (the policy's own backoff/attempts
                 // apply; the wrap-up adds nothing beyond them).
-                crate::extraction::retry_extract_structured_scoped::<AnalystFindings>(
+                crate::agent::extraction::retry_extract_structured_scoped::<AnalystFindings>(
                     &messages,
                     "",
                     &p.params,
@@ -1422,7 +1424,9 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
         ws,
         task,
         Some(round),
-        Some(crate::registry::ParentKey::Research(run_key.to_string())),
+        Some(crate::agent::registry::ParentKey::Research(
+            run_key.to_string(),
+        )),
         Some(question.to_string()),
     )
     .await;
@@ -1570,10 +1574,12 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     run_key: &str,
     question: &str,
 ) -> Result<T> {
-    let _call = crate::registry::NON_AGENT_CALLS.register(
+    let _call = crate::agent::registry::NON_AGENT_CALLS.register(
         purpose,
         &ws.name,
-        Some(crate::registry::ParentKey::Research(run_key.to_string())),
+        Some(crate::agent::registry::ParentKey::Research(
+            run_key.to_string(),
+        )),
         false,
         Some(question.to_string()),
     );
@@ -1581,9 +1587,11 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     let mut messages = Vec::with_capacity(2);
     crate::prompt::prepend_general_context(&mut messages, ws).await;
     messages.push(ChatMessage::user(prompt));
-    crate::extraction::retry_extract_structured_scoped::<T>(&messages, "", &params, validate, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("orchestrator extraction '{purpose}' failed: {e}"))
+    crate::agent::extraction::retry_extract_structured_scoped::<T>(
+        &messages, "", &params, validate, None,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("orchestrator extraction '{purpose}' failed: {e}"))
 }
 
 // ── Round 0: decomposition ───────────────────────────────────────────────
@@ -2116,7 +2124,9 @@ async fn run_coder_round(
         &coder_ws,
         &task,
         None,
-        Some(crate::registry::ParentKey::Research(job_id.to_string())),
+        Some(crate::agent::registry::ParentKey::Research(
+            job_id.to_string(),
+        )),
         Some(question.to_string()),
     )
     .await;
@@ -2664,10 +2674,12 @@ async fn synthesize(
     abstention: Option<&str>,
     run_key: &str,
 ) -> Result<SynthesisOutput> {
-    let _call = crate::registry::NON_AGENT_CALLS.register(
+    let _call = crate::agent::registry::NON_AGENT_CALLS.register(
         "synthesize",
         &ws.name,
-        Some(crate::registry::ParentKey::Research(run_key.to_string())),
+        Some(crate::agent::registry::ParentKey::Research(
+            run_key.to_string(),
+        )),
         false,
         Some(question.to_string()),
     );
@@ -2882,7 +2894,9 @@ async fn research_verification_pass(
             &task_extra,
             deadline,
             resume,
-            Some(crate::registry::ParentKey::Research(run_key.to_string())),
+            Some(crate::agent::registry::ParentKey::Research(
+                run_key.to_string(),
+            )),
             question,
         )
         .await;
@@ -3189,10 +3203,12 @@ async fn run_deep_research(
     // partial-report path, releasing the guard promptly. Registered as a
     // run-lifetime call: the Running Agents view renders it inside the run's
     // group as a run-lifetime indicator, not a transient LLM-call card.
-    let _orchestrator_guard = crate::registry::NON_AGENT_CALLS.register(
+    let _orchestrator_guard = crate::agent::registry::NON_AGENT_CALLS.register(
         "research_orchestrator",
         &ws.name,
-        Some(crate::registry::ParentKey::Research(job_id.to_string())),
+        Some(crate::agent::registry::ParentKey::Research(
+            job_id.to_string(),
+        )),
         true,
         Some(question.to_string()),
     );
@@ -3608,7 +3624,7 @@ mod tests {
         let ws = crate::workspace::test_ws("/tmp/test_ws_research_resume");
         let job_id = "research_job_resume_1";
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         crate::util::test::JobRowBuilder::new(conn, job_id, "research", "assistant", &ws.name)
             .task("question?")
             .user_name("caller-user")
@@ -3660,7 +3676,7 @@ mod tests {
         let state_json = serde_json::to_string(&state).unwrap();
         conn.execute(
             "INSERT INTO research_jobs (id, state) VALUES (?1, ?2)",
-            crate::turso::params![job_id, state_json],
+            crate::db::params![job_id, state_json],
         )
         .await
         .unwrap();
@@ -3675,7 +3691,7 @@ mod tests {
         let job_rows = conn
             .query(
                 "SELECT kind FROM jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
@@ -3692,13 +3708,13 @@ mod tests {
         let pending = conn
             .query(
                 "SELECT envelope FROM pending_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
         assert_eq!(pending.len(), 1, "resume envelope persisted");
         let envelope_json: String = pending[0].get(0).unwrap();
-        let envelope: crate::message_router::AgentJob =
+        let envelope: crate::agent::message_router::AgentJob =
             serde_json::from_str(&envelope_json).unwrap();
         assert_eq!(
             envelope.role,
@@ -4460,7 +4476,7 @@ mod tests {
         let _lock = crate::util::test::retry_tests_lock();
         let job_id = "research_dump_reload";
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         // The durable research job row (research_jobs.id FKs jobs.id).
         crate::util::test::JobRowBuilder::new(conn, job_id, "research", "assistant", "ws")
             .task("question?")
@@ -4474,7 +4490,7 @@ mod tests {
         let json = serde_json::to_string(&ResearchState::default()).unwrap();
         conn.execute(
             "INSERT INTO research_jobs (id, state) VALUES (?1, ?2)",
-            crate::turso::params![job_id, json],
+            crate::db::params![job_id, json],
         )
         .await
         .unwrap();
@@ -4495,11 +4511,8 @@ mod tests {
         // Clean up the run folder AND the DB rows the test created (research_jobs
         // FKs jobs(id) ON DELETE CASCADE — deleting the jobs row removes both).
         let _ = tokio::fs::remove_dir_all(crate::research_cleanup::run_root_path(job_id)).await;
-        conn.execute(
-            "DELETE FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
-        )
-        .await
-        .unwrap();
+        conn.execute("DELETE FROM jobs WHERE id = ?1", crate::db::params![job_id])
+            .await
+            .unwrap();
     }
 }

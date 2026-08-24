@@ -126,7 +126,7 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
         model,
         max_tokens: Some(PIPELINE_GROUPING_MAX_TOKENS),
         reasoning_effort: Some(
-            crate::role::role_info(&role)
+            crate::agent::role::role_info(&role)
                 .default_reasoning_effort
                 .to_string(),
         ),
@@ -178,7 +178,9 @@ pub(crate) async fn run_synthesis(
         "synthesis",
         request,
         &items,
-        Some(crate::registry::ParentKey::Ticket(ticket_id.to_string())),
+        Some(crate::agent::registry::ParentKey::Ticket(
+            ticket_id.to_string(),
+        )),
         Some(ticket_title.to_string()),
     )
     .await
@@ -348,15 +350,15 @@ pub(crate) fn review_agent_count(base: usize, priority: i64) -> usize {
 /// unanimous blocker escalation).
 #[must_use]
 pub(crate) fn analysis_escalation_needed(
-    results: &[crate::management::ParallelVerdict],
+    results: &[crate::pipeline::management::ParallelVerdict],
     dispatched: usize,
 ) -> bool {
     results.len() == dispatched
         && results.iter().all(|r| {
             matches!(
                 r,
-                crate::management::ParallelVerdict::Verdict(v)
-                    if v.score < crate::management::ANALYST_PASS_THRESHOLD
+                crate::pipeline::management::ParallelVerdict::Verdict(v)
+                    if v.score < crate::pipeline::management::ANALYST_PASS_THRESHOLD
             )
         })
 }

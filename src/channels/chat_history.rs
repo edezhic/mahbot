@@ -6,7 +6,7 @@
 //! Each message gets a NanoID for deduplication.
 
 use crate::ChatDirection;
-use crate::turso::{self, Row};
+use crate::db::{self, Row};
 use anyhow::Result;
 
 crate::define_store! {
@@ -115,7 +115,7 @@ impl ChatHistoryStore {
                 "INSERT OR IGNORE INTO chat_history \
                  (message_id, user_name, direction, content, agent_role, workspace) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                turso::params![
+                db::params![
                     entry.message_id.clone(),
                     entry.user_name.clone(),
                     entry.direction.clone(),
@@ -156,7 +156,7 @@ impl ChatHistoryStore {
                              ORDER BY id DESC \
                              LIMIT ?5",
                         ),
-                        turso::params![user_name, ws1, ws2, before_id, query_limit],
+                        db::params![user_name, ws1, ws2, before_id, query_limit],
                     )
                     .await?
             }
@@ -174,7 +174,7 @@ impl ChatHistoryStore {
                              ORDER BY id DESC \
                              LIMIT ?4",
                         ),
-                        turso::params![user_name, ws1, before_id, query_limit],
+                        db::params![user_name, ws1, before_id, query_limit],
                     )
                     .await?
             }
@@ -218,7 +218,7 @@ impl ChatHistoryStore {
             message_id,
             user_name: user_name.to_string(),
             direction: "divider".to_string(),
-            content: turso::now(),
+            content: db::now(),
             agent_role: None,
             workspace: workspace.to_string(),
         })
@@ -229,7 +229,7 @@ impl ChatHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turso;
+    use crate::db;
     use tempfile::TempDir;
 
     async fn test_setup() -> (ChatHistoryStore, TempDir) {
@@ -245,7 +245,7 @@ mod tests {
             .conn
             .query(
                 "SELECT 1 FROM pragma_table_info('chat_history') WHERE name = 'agent_id'",
-                turso::params![],
+                db::params![],
             )
             .await
             .expect("Failed to check column existence");

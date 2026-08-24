@@ -13,8 +13,8 @@ use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::agent::run_default_agent;
-use crate::board::TicketPhase;
-use crate::turso;
+use crate::db;
+use crate::pipeline::board::TicketPhase;
 
 /// Maximum number of tickets allowed in Analysis + Planning + ReadyForDevelopment
 /// before the maintainer pauses ticket creation.
@@ -123,7 +123,7 @@ pub async fn run_maintainer_loop() {
                         info!(workspace = %ws.name, "Maintainer: run complete");
 
                         // ── Debounce update after successful run ──────────────────
-                        let now_str = turso::now();
+                        let now_str = db::now();
                         let new_debounce = compute_debounce(
                             &agent.agent_id,
                             ws.maintainer_debounce_mins,
@@ -169,7 +169,7 @@ fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
         .maintainer_debounce_mins
         .clamp(0, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS);
     if let Some(ref last_str) = ws.maintainer_last_run_at {
-        match turso::parse_utc_timestamp(last_str) {
+        match db::parse_utc_timestamp(last_str) {
             Ok(last_time) => {
                 let elapsed = now - last_time;
                 let mins_elapsed = elapsed.num_minutes();
@@ -195,7 +195,7 @@ fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
 ///
 /// If the board is unavailable, returns `false` to allow the run through.
 async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
-    let Some(board) = crate::board::BOARD.get() else {
+    let Some(board) = crate::pipeline::board::BOARD.get() else {
         return false;
     };
 

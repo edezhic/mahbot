@@ -5,7 +5,7 @@
 //! (sync mode), and to the Manager and Assistant agents (async mode). In sync
 //! mode the caller blocks until the sub-agents complete. In async mode the
 //! sub-agents are dispatched in a background task and the result is injected
-//! back to the caller's agent channel via [`crate::message_router::route`].
+//! back to the caller's agent channel via [`crate::agent::message_router::route`].
 //!
 //! Analyst batches run three decorrelated analysts (distinct research angles)
 //! that report structured claim-level findings; consolidation runs the shared
@@ -15,9 +15,9 @@
 //! of fresh analysts, appended as a `## Verification` section. Fail-open is
 //! preserved throughout: findings are never silently lost.
 
+use crate::agent::message_router::{self, AgentJob, MessageKind};
 use crate::agent::{run_agent, run_default_agent};
 use crate::config::CONFIG;
-use crate::message_router::{self, AgentJob, MessageKind};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::Tool;
 use crate::{Agent, ChatMessage, DEFAULT_MAX_TOKENS, Role, Workspace};
@@ -380,7 +380,9 @@ async fn run_analyze_with_job(
                 None,
                 String::new(),
                 String::new(),
-                Some(crate::registry::ParentKey::AnalyzeRound(job_id.to_string())),
+                Some(crate::agent::registry::ParentKey::AnalyzeRound(
+                    job_id.to_string(),
+                )),
                 Some(analyze.to_string()),
             );
             let _ = agent
@@ -483,7 +485,7 @@ async fn run_analyze_slots(
                     None,
                     resume,
                     Some(round),
-                    Some(crate::registry::ParentKey::AnalyzeRound(round_key)),
+                    Some(crate::agent::registry::ParentKey::AnalyzeRound(round_key)),
                     Some(question),
                 )
                 .await
@@ -619,7 +621,7 @@ pub(crate) async fn complete_durable_job_and_route(
         workspace_name,
     )
     .await;
-    crate::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+    crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
 // ── Structured claim-level findings ──────────────────────────────────────
@@ -1124,7 +1126,7 @@ async fn consolidate_findings(
         &user,
         model,
         Some(
-            crate::role::role_info(&Role::Analyst)
+            crate::agent::role::role_info(&Role::Analyst)
                 .default_reasoning_effort
                 .to_string(),
         ),
@@ -1133,7 +1135,7 @@ async fn consolidate_findings(
     );
 
     let table = crate::consensus::ItemTable::new(&items_by_agent);
-    let parent = Some(crate::registry::ParentKey::AnalyzeRound(
+    let parent = Some(crate::agent::registry::ParentKey::AnalyzeRound(
         round_key.to_string(),
     ));
     // Drain fired in the extraction-end → grouping-start gap (the analyst
@@ -1399,7 +1401,7 @@ pub(crate) async fn dispatch_claim_verifiers(
     task_extra: &str,
     deadline: std::time::Instant,
     resume: bool,
-    parent_key: Option<crate::registry::ParentKey>,
+    parent_key: Option<crate::agent::registry::ParentKey>,
     question: &str,
 ) -> (Vec<VerificationResult>, Vec<String>) {
     let task_template = load_prompt("analyze/verify.md");
@@ -1479,7 +1481,7 @@ async fn run_claim_verifier(
     task: &str,
     extraction_prompt: &str,
     round: crate::agent::RoundOpts,
-    parent_key: Option<crate::registry::ParentKey>,
+    parent_key: Option<crate::agent::registry::ParentKey>,
     question: &str,
 ) -> VerificationResult {
     let (agent, response) = run_default_agent(
@@ -1708,7 +1710,7 @@ async fn verify_disputed_groups(
         "",
         deadline,
         false,
-        Some(crate::registry::ParentKey::AnalyzeRound(
+        Some(crate::agent::registry::ParentKey::AnalyzeRound(
             round_key.to_string(),
         )),
         analyze,
@@ -2618,7 +2620,7 @@ mod tests {
         let job_rows = conn
             .query(
                 "SELECT id FROM jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
@@ -2626,12 +2628,12 @@ mod tests {
         let pending = conn
             .query(
                 "SELECT envelope FROM pending_jobs WHERE id = ?1",
-                crate::turso::params![job_id],
+                crate::db::params![job_id],
             )
             .await
             .unwrap();
         assert_eq!(pending.len(), 1, "envelope persisted with the job id");
-        let envelope: crate::message_router::AgentJob =
+        let envelope: crate::agent::message_router::AgentJob =
             serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
         assert_eq!(
             envelope.role,

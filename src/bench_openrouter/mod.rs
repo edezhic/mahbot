@@ -377,9 +377,9 @@ fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option
     // In the consolidated layout the config store lives in the single domain
     // database; fall back to the legacy per-store config.db when the
     // consolidated file has not been created yet (pre-consolidation install).
-    let db_path = crate::turso::store_db_path(storage_root, "config");
+    let db_path = crate::db::store_db_path(storage_root, "config");
     if !db_path.exists() {
-        let legacy = crate::turso::legacy_store_db_path(storage_root, "config");
+        let legacy = crate::db::legacy_store_db_path(storage_root, "config");
         if !legacy.exists() {
             return Ok(None);
         }
@@ -394,8 +394,8 @@ fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<Strin
     let opts = turso::core::DatabaseOpts::new()
         .with_multiprocess_wal(true)
         .with_index_method(true);
-    let (io, db) = crate::debug::open_readonly(db_path, db_path, opts)?;
-    let conn = crate::debug::connect_readonly(&db, db_path)?;
+    let (io, db) = crate::db::debug::open_readonly(db_path, db_path, opts)?;
+    let conn = crate::db::debug::connect_readonly(&db, db_path)?;
 
     let mut stmt = conn
         .query("SELECT value FROM config_kv WHERE key = ?1")
@@ -1012,7 +1012,7 @@ pub(crate) fn build_plan(data: &PlanData<'_>) -> serde_json::Value {
 
     json!({
         "mode": "dry-run",
-        "timestamp": crate::turso::now(),
+        "timestamp": crate::db::now(),
         "model": {
             "requested": opts.model,
             "resolved_id": resolved_id,

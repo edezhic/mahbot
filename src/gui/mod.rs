@@ -34,8 +34,8 @@ pub(crate) mod users;
 pub(crate) mod widgets;
 pub(crate) mod workspaces;
 
-use crate::board::Ticket;
 use crate::logs::LogStore;
+use crate::pipeline::board::Ticket;
 
 use iced::keyboard;
 use iced::widget::{
@@ -1273,7 +1273,7 @@ impl Dashboard {
                                     Ok(role) => Message::Home(home::HomeMessage::Toast(
                                         ToastMessage::SuccessMsg(format!(
                                             "Switched to {} role",
-                                            crate::role::role_info(&role).display_label
+                                            crate::agent::role::role_info(&role).display_label
                                         )),
                                     )),
                                     // On failure, refresh the role cache so the
@@ -2641,7 +2641,7 @@ impl Dashboard {
     /// Each role-icon indicator is a clickable button navigating to the
     /// Running Agents page; its tooltip carries the role name.
     fn render_active_agents() -> Option<Element<'static, Message>> {
-        let handles = crate::registry::AGENT_REGISTRY.list();
+        let handles = crate::agent::registry::AGENT_REGISTRY.list();
         let mut role_counts: std::collections::BTreeMap<&str, usize> =
             std::collections::BTreeMap::new();
         for h in &handles {
@@ -2689,7 +2689,7 @@ impl Dashboard {
     /// is a clickable button navigating to the Running Agents page.
     /// Returns `None` when none are in flight.
     fn render_non_agent_calls() -> Option<Element<'static, Message>> {
-        let handles = crate::registry::NON_AGENT_CALLS.list();
+        let handles = crate::agent::registry::NON_AGENT_CALLS.list();
         if handles.is_empty() {
             return None;
         }
@@ -2711,7 +2711,7 @@ impl Dashboard {
         // deduping raw kinds first could repeat it.
         let mut labels: Vec<&str> = handles
             .iter()
-            .map(|h| crate::registry::call_kind_label(h.kind))
+            .map(|h| crate::agent::registry::call_kind_label(h.kind))
             .collect();
         labels.sort_unstable();
         labels.dedup();

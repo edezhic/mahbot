@@ -2,16 +2,16 @@
 //!
 //! Each migration is a ready-made SQL statement/script applied exactly once,
 //! in order, tracked via the consolidated `schema_migrations` table. The
-//! runner ([`crate::turso::run_pending_migrations`]) fires from the
+//! runner ([`crate::db::run_pending_migrations`]) fires from the
 //! consolidated-store init path.
 //!
-//! Adding a migration: append a new [`crate::turso::Migration`] to the store's
+//! Adding a migration: append a new [`crate::db::Migration`] to the store's
 //! list with a stable unique id, the ready SQL, and — when the fresh-DB
 //! SCHEMA already contains the migrated shape — an existence guard so the
 //! wipe-and-recreate path records it as applied instead of failing with a
 //! duplicate-column error.
 
-use crate::turso::{Migration, MigrationGuard};
+use crate::db::{Migration, MigrationGuard};
 
 /// Migrations for the sessions store (applied in the consolidated domain
 /// database, alongside the merged board history).
@@ -147,7 +147,7 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
 /// **001 — drop `tickets.pipeline_reservation`.** The job-centric pipeline
 /// rework removes the ticket-level pipeline reservation in favor of the
 /// implementation job (see `src/jobs.rs`). The fresh-DB SCHEMA
-/// (`src/board.rs`) no longer declares the column, so the ALTER only fires on
+/// (`src/pipeline/board.rs`) no longer declares the column, so the ALTER only fires on
 /// pre-existing databases; the drop guard makes both paths converge (fresh-DB
 /// path: column already absent, SQL skipped, migration recorded as applied).
 ///
@@ -219,7 +219,7 @@ pub(crate) const BOARD_MIGRATIONS: &[Migration] = &[
 ///
 /// # Runs BEFORE the one-time import
 ///
-/// [`crate::turso::open_consolidated_store`] calls this before the one-time
+/// [`crate::db::open_consolidated_store`] calls this before the one-time
 /// consolidation import. That ordering is intentional: the two unguarded data
 /// resets fire against the EMPTY consolidated file (no-ops) and are recorded as
 /// applied, so the import that follows copies the legacy user tables
@@ -228,19 +228,19 @@ pub(crate) const BOARD_MIGRATIONS: &[Migration] = &[
 ///
 /// Future schema changes run only here, in the consolidated database, using a
 /// new non-colliding id prefix (e.g. `consolidate_002_...`).
-pub(crate) async fn run_domain_migrations(conn: &crate::turso::Connection) -> anyhow::Result<()> {
+pub(crate) async fn run_domain_migrations(conn: &crate::db::Connection) -> anyhow::Result<()> {
     // `run_pending_migrations` is idempotent per-migration: a second call
     // re-reads the unified tracking table and skips already-applied ids. The
     // `store` label is the consolidated scope, not a legacy per-store file.
-    crate::turso::run_pending_migrations(conn, "consolidated", BOARD_MIGRATIONS).await?;
-    crate::turso::run_pending_migrations(conn, "consolidated", SESSION_MIGRATIONS).await?;
+    crate::db::run_pending_migrations(conn, "consolidated", BOARD_MIGRATIONS).await?;
+    crate::db::run_pending_migrations(conn, "consolidated", SESSION_MIGRATIONS).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turso::{column_exists, run_pending_migrations, table_exists};
+    use crate::db::{column_exists, run_pending_migrations, table_exists};
 
     /// Old-DB schema: `session_metadata` WITHOUT the token-length or
     /// message-count columns — simulates the live pre-migration database
@@ -287,7 +287,7 @@ mod tests {
          CREATE TABLE ticket_jobs (\
          id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL);";
 
-    async fn applied_ids(conn: &crate::turso::Connection) -> Vec<String> {
+    async fn applied_ids(conn: &crate::db::Connection) -> Vec<String> {
         conn.query("SELECT id FROM schema_migrations ORDER BY id", ())
             .await
             .expect("read tracking table")
@@ -296,7 +296,7 @@ mod tests {
             .collect()
     }
 
-    async fn message_count(conn: &crate::turso::Connection, agent_id: &str) -> i64 {
+    async fn message_count(conn: &crate::db::Connection, agent_id: &str) -> i64 {
         conn.query_optional(
             "SELECT message_count FROM session_metadata WHERE agent_id = ?1",
             (turso::Value::Text(agent_id.to_string()),),
@@ -310,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn migrations_alter_old_db_exactly_once_with_backfill() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::turso::open_with_schema(&tmp.path().join("sessions.db"), OLD_SCHEMA)
+        let conn = crate::db::open_with_schema(&tmp.path().join("sessions.db"), OLD_SCHEMA)
             .await
             .expect("open old-db test store");
         assert!(
@@ -416,7 +416,7 @@ mod tests {
         // the migrated columns, so the ALTERs must NOT fire (duplicate-column
         // failure).
         let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::turso::open_with_schema(&tmp.path().join("sessions.db"), FRESH_SCHEMA)
+        let conn = crate::db::open_with_schema(&tmp.path().join("sessions.db"), FRESH_SCHEMA)
             .await
             .expect("open fresh-db test store");
         assert!(
@@ -499,7 +499,7 @@ mod tests {
         // the ACTUAL `ALTER TABLE ... DROP COLUMN` DDL against turso on an
         // upgraded-in-place database.
         let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::turso::open_with_schema(&tmp.path().join("board.db"), OLD_BOARD_SCHEMA)
+        let conn = crate::db::open_with_schema(&tmp.path().join("board.db"), OLD_BOARD_SCHEMA)
             .await
             .expect("open old board test store");
         assert!(
@@ -566,7 +566,7 @@ mod tests {
         // DROPs must NOT fire (the DROP would fail on a missing column); the
         // guard turns them into recorded no-ops.
         let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::turso::open_with_schema(&tmp.path().join("board.db"), FRESH_BOARD_SCHEMA)
+        let conn = crate::db::open_with_schema(&tmp.path().join("board.db"), FRESH_BOARD_SCHEMA)
             .await
             .expect("open fresh board test store");
         assert!(

@@ -76,7 +76,7 @@ pub(crate) fn acquire_run_lock(output_dir: &Path) -> anyhow::Result<std::fs::Fil
         .write(true)
         .truncate(false)
         .open(&path)?;
-    if !crate::lock_utils::try_flock(&file)? {
+    if !crate::util::lock::try_flock(&file)? {
         anyhow::bail!(
             "another bench-openrouter run is in progress (lock: {})",
             path.display()

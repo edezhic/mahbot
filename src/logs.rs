@@ -3,10 +3,11 @@
 //! Each log entry is inserted asynchronously via a background channel task.
 //! A broadcast channel feeds live log entries to the Iced native GUI dashboard.
 
-use crate::turso;
+use crate::db;
 use crate::util::UnwrapPoison;
 use crate::util::json;
 use anyhow::Context;
+use db::{Row, Value, params};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -19,7 +20,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::warn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-use turso::{Row, Value, params};
 
 /// Schema for a single log entry stored in Turso.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ crate::columns! {
 /// [`LOG_STORE`] for details.
 #[derive(Clone, Debug)]
 pub struct LogStore {
-    pub(crate) conn: crate::turso::Connection,
+    pub(crate) conn: crate::db::Connection,
 }
 
 /// Global log store, set during [`init_tracing()`].
@@ -188,12 +188,10 @@ impl LogStore {
                 // second quarantine: the fresh store is not corrupt, a failure
                 // is a code bug, and a double quarantine would destroy the
                 // forensic record.
-                let conn = crate::turso::open_with_schema(
-                    &turso::store_db_path(root, "logs"),
-                    LOGS_SCHEMA,
-                )
-                .await
-                .context("Failed to recreate logs store after quarantine")?;
+                let conn =
+                    crate::db::open_with_schema(&db::store_db_path(root, "logs"), LOGS_SCHEMA)
+                        .await
+                        .context("Failed to recreate logs store after quarantine")?;
                 Self { conn }
             }
             Err(OpenFailure::Other(e)) => return Err(e),
@@ -321,13 +319,13 @@ enum OpenFailure {
 /// The open itself is panic-absorbed: opening a corrupt store under
 /// multiprocess_wal can panic (e.g. the shared-WAL frame-index invariant), and
 /// a boot-time panic here must quarantine rather than crash startup.
-async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connection, OpenFailure> {
-    let db_path = turso::store_db_path(root, "logs");
+async fn open_verified_logs_store(root: &Path) -> Result<crate::db::Connection, OpenFailure> {
+    let db_path = db::store_db_path(root, "logs");
     // The boot path (a pre-flight diagnosis exists) already ran quick_check
     // inside open_and_repair — the verify below would duplicate the 7× boot
     // scan for the logs store. Non-boot opens (tests) verify here.
-    let boot_verified = crate::wal_guard::has_boot_diagnosis(&db_path);
-    let open = AssertUnwindSafe(crate::turso::open_store(root, "logs", LOGS_SCHEMA))
+    let boot_verified = crate::db::wal_guard::has_boot_diagnosis(&db_path);
+    let open = AssertUnwindSafe(crate::db::open_store(root, "logs", LOGS_SCHEMA))
         .catch_unwind()
         .await;
     let conn = match open {
@@ -342,12 +340,12 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connectio
             // store open failure after the boot-heal path already quarantined
             // the original family is NOT corrupt either — the recreate itself
             // failed; propagate without a second quarantine.
-            if let Some(crate::turso::RecreateFailed(inner)) =
-                e.downcast_ref::<crate::turso::RecreateFailed>()
+            if let Some(crate::db::RecreateFailed(inner)) =
+                e.downcast_ref::<crate::db::RecreateFailed>()
             {
                 return Err(OpenFailure::Other(anyhow::anyhow!("{inner:#}")));
             }
-            if db_path.exists() && crate::turso::is_corruption_class(&e) {
+            if db_path.exists() && crate::db::is_corruption_class(&e) {
                 return Err(OpenFailure::Corrupt(format!("open failed: {e:#}")));
             }
             return Err(OpenFailure::Other(e));
@@ -365,7 +363,7 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connectio
     let verify = AssertUnwindSafe(conn.quick_check()).catch_unwind().await;
     match verify {
         Ok(Ok(())) => Ok(conn),
-        Ok(Err(e)) if crate::turso::is_corruption_class(&e) => {
+        Ok(Err(e)) if crate::db::is_corruption_class(&e) => {
             Err(OpenFailure::Corrupt(format!("{e:#}")))
         }
         Ok(Err(e)) => Err(OpenFailure::Other(e)),
@@ -382,7 +380,7 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::turso::Connectio
 /// the logs-specific wrapper keeps the call sites' intent explicit). The
 /// recreate path tolerates a partial quarantine — the bool is ignored.
 fn quarantine_logs_artifacts(root: &Path) {
-    let _ = turso::quarantine_store_artifacts(&turso::store_db_path(root, "logs"));
+    let _ = db::quarantine_store_artifacts(&db::store_db_path(root, "logs"));
 }
 
 /// Parameters for filtering log queries.
@@ -416,7 +414,7 @@ fn build_where_clause(filters: &LogQuery) -> (String, Vec<Value>) {
         if !levels.is_empty() {
             conditions.push(format!(
                 "level IN ({})",
-                turso::sql_in_placeholders(levels.len()),
+                db::sql_in_placeholders(levels.len()),
             ));
             values.extend(levels);
         }
@@ -869,7 +867,7 @@ fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
     let (count, consecutive) = {
         let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
         guard.count += 1;
-        guard.last_timestamp = Some(turso::now());
+        guard.last_timestamp = Some(db::now());
         guard.last_message = Some(message.to_string());
         let consecutive = if kind.records_panic() {
             guard.panic_state.record_panic()
@@ -1563,7 +1561,7 @@ mod tests {
 
         // Corrupt a b-tree page in the main DB file (zero page 2; the header
         // page 1 stays intact so the file still opens).
-        let db_path = turso::store_db_path(root, "logs");
+        let db_path = db::store_db_path(root, "logs");
         let bytes = std::fs::read(&db_path).expect("read db file");
         assert!(bytes.len() > 8192, "test needs a multi-page db file");
         let mut corrupted = bytes.clone();
@@ -1639,7 +1637,7 @@ mod tests {
         // Zero the header's page-size field (big-endian u16 at byte offset 16)
         // so the file cannot be opened at all — Limbo bails with a corruption
         // error ("invalid page size in database header") rather than an IO error.
-        let db_path = turso::store_db_path(root, "logs");
+        let db_path = db::store_db_path(root, "logs");
         let mut bytes = std::fs::read(&db_path).expect("read db file");
         bytes[16] = 0;
         bytes[17] = 0;

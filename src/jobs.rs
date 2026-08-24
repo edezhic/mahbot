@@ -11,8 +11,8 @@
 //! helpers, the boot scan, and the purge orchestrator.
 
 use crate::Role;
-use crate::message_router::{AgentJob, MessageKind};
-use crate::turso::{self, Connection, Row, TxGuard, Value, params};
+use crate::agent::message_router::{AgentJob, MessageKind};
+use crate::db::{self, Connection, Row, TxGuard, Value, params};
 use anyhow::{Context, Result};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -274,7 +274,7 @@ pub(crate) async fn spawn_job(
     child: &SpawnChild,
 ) -> Result<()> {
     let kind = child.kind_str();
-    let now = turso::now();
+    let now = db::now();
     let tx = conn.begin_tx().await?;
     tx.execute(
         "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
@@ -343,7 +343,7 @@ pub(crate) struct NewAgent {
 pub(crate) async fn checkpoint_job(conn: &Connection, id: &str, retry_count: i64) -> Result<()> {
     // Boot resumes re-arm status to Launched (failed → launched re-activation).
     let status = RowStatus::Launched;
-    let now = turso::now();
+    let now = db::now();
     conn.execute(
         "UPDATE jobs SET status = ?1, retry_count = ?2, updated_at = ?3 WHERE id = ?4",
         params![status.as_str(), retry_count, now, id],
@@ -389,7 +389,7 @@ pub(crate) async fn complete_job_with_envelope(
     job_id: &str,
     envelope: &AgentJob,
 ) -> Result<()> {
-    let now = turso::now();
+    let now = db::now();
     let tx = conn.begin_tx().await?;
     tx.execute(
         PENDING_JOB_INSERT_SQL,
@@ -461,7 +461,7 @@ pub(crate) async fn complete_ticket_job(conn: &Connection, job_id: &str) -> Resu
     let tx = conn.begin_tx().await?;
     tx.execute(
         "UPDATE jobs SET status = 'done', updated_at = ?1 WHERE id = ?2",
-        params![turso::now(), job_id],
+        params![db::now(), job_id],
     )
     .await?;
     // Belt-and-braces explicit delete alongside FK CASCADE.
@@ -556,7 +556,7 @@ pub(crate) async fn update_implementation_job_task(
 ) -> Result<()> {
     conn.execute(
         "UPDATE jobs SET task = ?2, updated_at = ?3 WHERE id = ?1",
-        params![job_id, task, turso::now()],
+        params![job_id, task, db::now()],
     )
     .await
     .context("update ticket implementation task")?;
@@ -792,7 +792,7 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
 /// LLM call in flight → every in-flight round has unwound (each running agent
 /// is registered until its finalize_session completes; orchestrator calls —
 /// analyze consolidation, research synthesis, joint-verdict grouping — are
-/// tracked in [`crate::registry::NON_AGENT_CALLS`]; the research
+/// tracked in [`crate::agent::registry::NON_AGENT_CALLS`]; the research
 /// orchestrator additionally holds a whole-run guard, so the token is never
 /// fired into an inter-phase window between analyst deregistration and the
 /// next orchestrator call) → fires the global token, which the GUI
@@ -846,8 +846,8 @@ pub async fn run_drain_watch() {
         // forbids. Drain-cut leftovers are covered: cut rounds leave their
         // agents unregistered AND their jobs status='launched' (never
         // re-registered), so the registries drain without them.
-        if crate::registry::AGENT_REGISTRY.list().is_empty()
-            && crate::registry::NON_AGENT_CALLS.list().is_empty()
+        if crate::agent::registry::AGENT_REGISTRY.list().is_empty()
+            && crate::agent::registry::NON_AGENT_CALLS.list().is_empty()
         {
             info!("Drain complete — no in-flight agents or orchestrator calls; exiting");
             shutdown();
@@ -855,7 +855,7 @@ pub async fn run_drain_watch() {
         }
         if start.elapsed() >= Duration::from_secs(DRAIN_CAP_SECS) {
             warn!("Drain cap ({DRAIN_CAP_SECS}s) reached — force-cancelling in-flight work");
-            crate::registry::AGENT_REGISTRY.shutdown_all();
+            crate::agent::registry::AGENT_REGISTRY.shutdown_all();
             force_cancel();
             return;
         }
@@ -982,7 +982,7 @@ fn is_timestamp_body(s: &str) -> bool {
 /// created_at tiebreaker: skip only if pending.created_at <= the last user
 /// message's created_at (closes the silent at-most-once hole for identical
 /// consecutive messages). Both timestamps are compared via
-/// [`crate::turso::parse_utc_timestamp`] (chrono parsing, not raw lexical
+/// [`crate::db::parse_utc_timestamp`] (chrono parsing, not raw lexical
 /// string comparison — AutoSi trailing-zero trimming can theoretically
 /// misorder sub-microsecond-different timestamps).
 async fn pending_already_appended(conn: &Connection, row: &PendingJobRow) -> bool {
@@ -1003,10 +1003,10 @@ async fn pending_already_appended(conn: &Connection, row: &PendingJobRow) -> boo
     // chrono parse beats raw lexical comparison (AutoSi trailing-zero
     // trimming can theoretically misorder sub-microsecond-different
     // timestamps); lexical order remains the fallback if either string is
-    // unparseable (unreachable in practice — both come from turso::now()).
+    // unparseable (unreachable in practice — both come from db::now()).
     let appended_before = match (
-        crate::turso::parse_utc_timestamp(&row.created_at).ok(),
-        crate::turso::parse_utc_timestamp(&last_created).ok(),
+        crate::db::parse_utc_timestamp(&row.created_at).ok(),
+        crate::db::parse_utc_timestamp(&last_created).ok(),
     ) {
         (Some(row_ts), Some(last_ts)) => row_ts <= last_ts,
         _ => row.created_at <= last_created,
@@ -1073,7 +1073,7 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
         // route and the consumer's append) — route the FULL content. Replaying
         // empty here would silently lose the envelope forever (at-most-once
         // violation).
-        crate::message_router::route(&row.target_agent_id, job);
+        crate::agent::message_router::route(&row.target_agent_id, job);
         replayed += 1;
     }
     Ok(replayed)
@@ -1185,7 +1185,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     // blocking phase with no runtime recovery until the next boot reset).
     let mut rollback_ok = true;
     if !rollbacks.is_empty() {
-        if crate::board::BOARD.get().is_some() {
+        if crate::pipeline::board::BOARD.get().is_some() {
             rollback_ok = rollback_stranded_tickets(&rollbacks).await;
         } else {
             rollback_ok = false;
@@ -1226,8 +1226,8 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
 /// rollback (the implementation-protected phases no longer produce ticket_analysis
 /// rows). Transitory handoffs need no rollback — the phase CAS no-ops.
 fn rollback_transition(phase: &str) -> Option<String> {
-    let from = phase.parse::<crate::board::TicketPhase>().ok()?;
-    crate::board::BoardStore::reset_analysis_transition(from).map(|to| to.to_string())
+    let from = phase.parse::<crate::pipeline::board::TicketPhase>().ok()?;
+    crate::pipeline::board::BoardStore::reset_analysis_transition(from).map(|to| to.to_string())
 }
 
 /// Roll back stranded tickets in place: phase + updated_at. Guarded by phase
@@ -1235,7 +1235,9 @@ fn rollback_transition(phase: &str) -> Option<String> {
 /// Returns whether the board tx committed (false → purge keeps ticket_analysis
 /// job rows so the next tick retries the CAS).
 async fn rollback_stranded_tickets(rollbacks: &[(String, String)]) -> bool {
-    let board = crate::board::BOARD.get().expect("BOARD initialized");
+    let board = crate::pipeline::board::BOARD
+        .get()
+        .expect("BOARD initialized");
     let tx = match board.conn.begin_tx().await {
         Ok(tx) => tx,
         Err(e) => {
@@ -1243,7 +1245,7 @@ async fn rollback_stranded_tickets(rollbacks: &[(String, String)]) -> bool {
             return false;
         }
     };
-    let now = crate::turso::now();
+    let now = crate::db::now();
     let mut rolled_back = 0usize;
     for (ticket_id, phase) in rollbacks {
         let Some(to) = rollback_transition(phase) else {
@@ -1253,12 +1255,12 @@ async fn rollback_stranded_tickets(rollbacks: &[(String, String)]) -> bool {
         // phase — a moved ticket is not rolled back.
         let sql = format!(
             "UPDATE tickets SET {} WHERE id = ?3 AND phase = ?4",
-            crate::board::BoardStore::RESET_TICKET_SET_CLAUSE
+            crate::pipeline::board::BoardStore::RESET_TICKET_SET_CLAUSE
         );
         let updated = tx
             .execute(
                 &sql,
-                crate::turso::params![to, now.clone(), ticket_id.clone(), phase.clone(),],
+                crate::db::params![to, now.clone(), ticket_id.clone(), phase.clone(),],
             )
             .await;
         match updated {
@@ -1344,7 +1346,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                 // feeds escalation). Bump updated_at (the boot bump) AND
                 // increment retry_count (every bump here is one boot resume).
                 let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
-                let phase = crate::board::store()
+                let phase = crate::pipeline::board::store()
                     .get_ticket_phase(&row.ticket_id)
                     .await
                     .ok()
@@ -1352,7 +1354,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                 let in_phase = if is_implementation {
                     phase.is_some_and(|p| p.is_pipeline_occupied())
                 } else {
-                    phase == Some(crate::board::TicketPhase::Analysis)
+                    phase == Some(crate::pipeline::board::TicketPhase::Analysis)
                 };
                 if in_phase {
                     if is_implementation {
@@ -1441,7 +1443,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
 
     // (2) reset_analysis_tickets with the exclusion (empty exclusion omits
     // the NOT IN clause).
-    if let Some(board) = crate::board::BOARD.get()
+    if let Some(board) = crate::pipeline::board::BOARD.get()
         && let Err(e) = board.reset_analysis_tickets(&exclusion).await
     {
         warn!(error = %e, "Failed to reset in-flight tickets");
@@ -1540,7 +1542,7 @@ pub(crate) async fn purge_terminal_engineer_session_pins() -> usize {
     let mut deleted = 0usize;
     // Guarded access — the purge may run before BOARD is initialized (the
     // archive loop checks later in the same tick; boot sweep runs after init).
-    let board_ready = crate::board::BOARD.get().is_some();
+    let board_ready = crate::pipeline::board::BOARD.get().is_some();
     for row in &rows {
         let Ok(agent_id) = row.get::<String>(0) else {
             continue;
@@ -1549,7 +1551,7 @@ pub(crate) async fn purge_terminal_engineer_session_pins() -> usize {
             continue;
         };
         let terminal = board_ready
-            && crate::board::store()
+            && crate::pipeline::board::store()
                 .get_ticket_phase(&ticket_id)
                 .await
                 .is_ok_and(|p| p.is_some_and(|ph| ph.is_terminal()));
@@ -1578,7 +1580,7 @@ pub(crate) async fn purge_terminal_engineer_session_pins() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::turso::params;
+    use crate::db::params;
 
     // ── S5 anchor spike: turso 0.7.2 must accept the
     // partial-index UPSERT with identical syntactic WHERE on DDL + UPSERT.
@@ -1624,7 +1626,7 @@ mod tests {
         // A roster row (non-NULL job_id) for the SAME agent_id must coexist
         // under the composite PK (job row first — FK constraint).
         crate::util::test::JobRowBuilder::new(conn, "j1", "ticket_analysis", "engineer", "ws")
-            .timestamps(turso::now())
+            .timestamps(db::now())
             .insert()
             .await
             .expect("insert job for roster row");
@@ -1802,7 +1804,7 @@ mod tests {
             params![
                 agent_id,
                 format!("{content}\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
-                turso::now()
+                db::now()
             ],
         )
         .await
@@ -1902,7 +1904,7 @@ mod tests {
             params![
                 agent_id,
                 format!("<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>\n\n{content}"),
-                turso::now()
+                db::now()
             ],
         )
         .await
@@ -1941,11 +1943,11 @@ mod tests {
     /// authoritative in-session signal.
     #[tokio::test]
     async fn pending_replay_not_in_session_routes_full_content() {
-        let _ = crate::message_router::init_global();
+        let _ = crate::agent::message_router::init_global();
         let (store, _tmp) = crate::open_test_store!(crate::session::SessionStore, "session");
         let conn = &store.conn;
         let agent_id = "f1_replay_target";
-        let mut rx = crate::message_router::register_agent(agent_id);
+        let mut rx = crate::agent::message_router::register_agent(agent_id);
         let content = "FULL CONTENT";
         conn.execute(
             "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
@@ -1963,7 +1965,7 @@ mod tests {
                     pending_job_id: None,
                 })
                 .unwrap(),
-                turso::now(),
+                db::now(),
             ],
         )
         .await
@@ -1977,7 +1979,7 @@ mod tests {
             routed.content, content,
             "not-in-session routes the FULL content, never empty"
         );
-        crate::message_router::unregister_agent(agent_id);
+        crate::agent::message_router::unregister_agent(agent_id);
     }
 
     // ── TTL guard ────────────────────────────────────────────────────
@@ -2075,13 +2077,13 @@ mod tests {
     async fn purge_rolls_back_stale_analysis_job_unconditionally() {
         crate::util::test::init_test_stores().await;
         let conn = &crate::session::store().conn;
-        let board = crate::board::store();
+        let board = crate::pipeline::board::store();
         let ws = crate::workspace::test_ws_named("/tmp/purge_ws2", "purge_ws2");
         let ticket_id = crate::util::test::make_ticket(
             board,
             &ws,
             "Unconditional rollback",
-            crate::board::TicketPhase::Analysis,
+            crate::pipeline::board::TicketPhase::Analysis,
         )
         .await;
         let stale = (chrono::Utc::now() - chrono::Duration::hours(20)).to_rfc3339();
@@ -2109,7 +2111,7 @@ mod tests {
         let t = board.get_ticket(&ticket_id).await.unwrap().unwrap();
         assert_eq!(
             t.phase,
-            crate::board::TicketPhase::Backlog,
+            crate::pipeline::board::TicketPhase::Backlog,
             "stale analysis job rolls the ticket back unconditionally (no round guard)"
         );
     }
@@ -2133,10 +2135,10 @@ mod tests {
         )
         .await;
         let ticket_id = crate::util::test::make_ticket(
-            crate::board::store(),
+            crate::pipeline::board::store(),
             &ws,
             "Frozen Implementation",
-            crate::board::TicketPhase::InDevelopment,
+            crate::pipeline::board::TicketPhase::InDevelopment,
         )
         .await;
         // Real implementation job + ticket_jobs child row, then freeze it.
@@ -2216,13 +2218,13 @@ mod tests {
     async fn purge_keeps_ticket_analysis_rows_when_rollback_fails() {
         crate::util::test::init_test_stores().await;
         let conn = &crate::session::store().conn;
-        let board = crate::board::store();
+        let board = crate::pipeline::board::store();
         let ws = crate::workspace::test_ws_named("/tmp/purge_ws3", "purge_ws3");
         let ticket_id = crate::util::test::make_ticket(
             board,
             &ws,
             "Rollback failure",
-            crate::board::TicketPhase::Analysis,
+            crate::pipeline::board::TicketPhase::Analysis,
         )
         .await;
         let stale = (chrono::Utc::now() - chrono::Duration::hours(20)).to_rfc3339();
@@ -2262,7 +2264,7 @@ mod tests {
         // rollback AND the sessions purge — it makes the board rollback's
         // begin_tx fail deterministically ("cannot start a transaction within a
         // transaction") and the whole purge is blocked.
-        crate::board::store()
+        crate::pipeline::board::store()
             .conn
             .execute("BEGIN", ())
             .await
@@ -2274,13 +2276,16 @@ mod tests {
         // (its own begin_tx fails), so the ticket_analysis row is KEPT.
         let rollback_ok = rollback_stranded_tickets(&[(
             ticket_id.clone(),
-            crate::board::TicketPhase::Analysis.to_string(),
+            crate::pipeline::board::TicketPhase::Analysis.to_string(),
         )])
         .await;
         // Restore the shared connection — ALWAYS, before any assertion, so the
         // raw tx never leaks into a later begin_tx across all stores even when
         // the rollback assertion below panics.
-        let _ = crate::board::store().conn.execute("ROLLBACK", ()).await;
+        let _ = crate::pipeline::board::store()
+            .conn
+            .execute("ROLLBACK", ())
+            .await;
         assert!(
             !rollback_ok,
             "board rollback must fail to land while a raw tx is held"
@@ -2320,20 +2325,20 @@ mod tests {
     #[serial_test::serial(reset_inflight)]
     async fn reset_analysis_tickets_exclusion() {
         crate::util::test::init_test_stores().await;
-        let board = crate::board::store();
+        let board = crate::pipeline::board::store();
         let ws = crate::workspace::test_ws_named("/tmp/ws_x", "ws_x");
         let resumed = crate::util::test::make_ticket(
             board,
             &ws,
             "resume me",
-            crate::board::TicketPhase::Analysis,
+            crate::pipeline::board::TicketPhase::Analysis,
         )
         .await;
         let reset = crate::util::test::make_ticket(
             board,
             &ws,
             "reset me",
-            crate::board::TicketPhase::Analysis,
+            crate::pipeline::board::TicketPhase::Analysis,
         )
         .await;
         board
@@ -2342,8 +2347,11 @@ mod tests {
             .unwrap();
         let t_resumed = board.get_ticket(&resumed).await.unwrap().unwrap();
         let t_reset = board.get_ticket(&reset).await.unwrap().unwrap();
-        assert_eq!(t_resumed.phase, crate::board::TicketPhase::Analysis);
-        assert_eq!(t_reset.phase, crate::board::TicketPhase::Backlog);
+        assert_eq!(
+            t_resumed.phase,
+            crate::pipeline::board::TicketPhase::Analysis
+        );
+        assert_eq!(t_reset.phase, crate::pipeline::board::TicketPhase::Backlog);
     }
 
     /// The boot scan adds an in-phase ticket_analysis job to the resumed-ticket
@@ -2365,7 +2373,7 @@ mod tests {
         // route envelopes (panic if ROUTER is uninitialized).
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         crate::util::test::JobRowBuilder::new(
             conn,
             "jclean",
@@ -2409,8 +2417,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            crate::turso::parse_utc_timestamp(&updated).unwrap()
-                > crate::turso::parse_utc_timestamp(&now).unwrap(),
+            crate::db::parse_utc_timestamp(&updated).unwrap()
+                > crate::db::parse_utc_timestamp(&now).unwrap(),
             "the checkpoint bump must refresh updated_at"
         );
     }
@@ -2425,7 +2433,7 @@ mod tests {
     async fn recover_from_restart_terminalizes_temp_cleanup_rows() {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         crate::util::test::JobRowBuilder::new(
             conn,
             "jtmpclean",
@@ -2472,7 +2480,7 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         crate::util::test::create_test_workspace("/tmp/test_ws_replay_cleanup", "ws_replay").await;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         crate::util::test::JobRowBuilder::new(
             conn,
             "rcln",
@@ -2555,7 +2563,7 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         crate::util::test::create_test_workspace("/tmp/test_ws_replay_resume", "ws_replay2").await;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         conn.execute(
             "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
              VALUES ('rcln2', 'manager_ws_replay2', ?1, ?2)",
@@ -2637,7 +2645,7 @@ mod tests {
         let conn = &crate::session::store().conn;
         crate::util::test::create_test_workspace("/tmp/test_ws_replay_archived", "ws_replay3")
             .await;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         // Simulate a cleanup that completed in a previous lifetime: the run
         // folder was released by the cleanup tail (folder removed, row
         // terminalized) while the envelope stayed undelivered.
@@ -2709,8 +2717,8 @@ mod tests {
             "boot_predicate_ws",
         )
         .await;
-        let board = crate::board::store();
-        async fn job_status(conn: &crate::turso::Connection, id: &str) -> String {
+        let board = crate::pipeline::board::store();
+        async fn job_status(conn: &crate::db::Connection, id: &str) -> String {
             conn.query_row("SELECT status FROM jobs WHERE id = ?1", params![id], |r| {
                 r.get::<String>(0)
             })
@@ -2723,7 +2731,7 @@ mod tests {
             board,
             &ws,
             "Analysis resume",
-            crate::board::TicketPhase::Analysis,
+            crate::pipeline::board::TicketPhase::Analysis,
         )
         .await;
         spawn_job(
@@ -2747,7 +2755,7 @@ mod tests {
             board,
             &ws,
             "Stale analysis",
-            crate::board::TicketPhase::Backlog,
+            crate::pipeline::board::TicketPhase::Backlog,
         )
         .await;
         spawn_job(
@@ -2771,7 +2779,7 @@ mod tests {
             board,
             &ws,
             "Implementation resume",
-            crate::board::TicketPhase::InDevelopment,
+            crate::pipeline::board::TicketPhase::InDevelopment,
         )
         .await;
         spawn_job(
@@ -2795,7 +2803,7 @@ mod tests {
             board,
             &ws,
             "Stale implementation",
-            crate::board::TicketPhase::Backlog,
+            crate::pipeline::board::TicketPhase::Backlog,
         )
         .await;
         spawn_job(

@@ -1,5 +1,5 @@
 use super::*;
-use crate::board::TicketComment;
+use crate::pipeline::board::TicketComment;
 use crate::util::test::make_ticket;
 use crate::util::test::{
     JobRowBuilder, create_test_workspace, expect_ticket, expect_ticket_phase,
@@ -78,7 +78,7 @@ async fn transition_ticket_to_done_buffer_and_notify() {
     // by the final empty-buffer check — which could still pass if the Notify
     // path also happened to drain the buffer cleanly (e.g., by sending an
     // empty notification). Draining here verifies entry was pushed.
-    let intermediate = crate::ticket_buffer::drain("ws_drains_buffer");
+    let intermediate = crate::pipeline::ticket_buffer::drain("ws_drains_buffer");
     assert!(
         !intermediate.is_empty(),
         "After first InQa → Done with other active tickets: \
@@ -110,7 +110,7 @@ async fn transition_ticket_to_done_buffer_and_notify() {
     // No entries should remain for this workspace (the Notify path on
     // ticket B calls drain() internally; we drained the intermediate
     // buffer above, so this check is for leftover / stale entries).
-    let drained = crate::ticket_buffer::drain("ws_drains_buffer");
+    let drained = crate::pipeline::ticket_buffer::drain("ws_drains_buffer");
     assert!(
         drained.is_empty(),
         "Buffer should be empty after last ticket's Notify drains it",
@@ -313,7 +313,7 @@ async fn parallel_round_phase_gate_bail_unregisters_router() {
             "member must bail at the phase gate with the neutral reason"
         );
         assert!(
-            !crate::message_router::router_contains(&slot.agent_id),
+            !crate::agent::message_router::router_contains(&slot.agent_id),
             "phase-gate bail must unregister the router entry for {}",
             slot.agent_id,
         );
@@ -475,7 +475,7 @@ async fn eleventh_bounce_fails_ticket() {
         .execute(
             "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
             turso::params![
-                i64::try_from(crate::joint_verdict::MAX_BOUNCES).unwrap(),
+                i64::try_from(crate::pipeline::joint_verdict::MAX_BOUNCES).unwrap(),
                 ticket_id.as_str()
             ],
         )
@@ -504,7 +504,7 @@ async fn eleventh_bounce_fails_ticket() {
     );
     assert_eq!(
         ticket.bounce_count,
-        i64::try_from(crate::joint_verdict::MAX_BOUNCES).unwrap(),
+        i64::try_from(crate::pipeline::joint_verdict::MAX_BOUNCES).unwrap(),
         "bounce counter stays at the max — the failing bounce is not counted"
     );
     let comments = board()
@@ -641,7 +641,7 @@ async fn paused_workspace_holds_backlog_and_rfd_until_unpause() {
             .conn
             .execute(
                 "UPDATE tickets SET created_at = ?1 WHERE id = ?2",
-                crate::turso::params![old.clone(), id.clone()],
+                crate::db::params![old.clone(), id.clone()],
             )
             .await
             .expect("backdate ticket created_at");
@@ -970,7 +970,7 @@ async fn process_sanitation_verdict_cases() {
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
 async fn dispatch_verifiers_skip_review_when_content_matches_base() {
-    if !crate::git_commands::git_is_installed().await {
+    if !crate::git::commands::git_is_installed().await {
         eprintln!("git not installed — skipping git-dependent test");
         return;
     }
@@ -988,10 +988,10 @@ async fn dispatch_verifiers_skip_review_when_content_matches_base() {
 
     // Record a reviewed base matching the current repo content
     // (HEAD + index tree of the clean committed tree).
-    let head = crate::git_commands::run_git_head(&repo_path)
+    let head = crate::git::commands::run_git_head(&repo_path)
         .await
         .expect("repo has commits");
-    let tree = crate::git_commands::run_git_write_tree(&repo_path)
+    let tree = crate::git::commands::run_git_write_tree(&repo_path)
         .await
         .expect("index writable");
     board()
@@ -1088,18 +1088,18 @@ fn retry_exhausted_with_raw(last_raw: Option<String>) -> crate::retry::RetryExha
 #[test]
 fn joint_comment_includes_failed_agent_dumps() {
     let raw = r#"{"score": 9, "critique": "solid", "issues": []}"#;
-    let round = crate::joint_verdict::JointRound {
+    let round = crate::pipeline::joint_verdict::JointRound {
         stage: "Review",
         dispatched: 2,
         verdicts: vec![],
         failures: vec![
-            crate::joint_verdict::JointFailure {
+            crate::pipeline::joint_verdict::JointFailure {
                 agent_index: 0,
                 dump: crate::util::scrub_credentials(&raw_response_dump_section(
                     &retry_exhausted_with_raw(Some(raw.to_string())),
                 )),
             },
-            crate::joint_verdict::JointFailure {
+            crate::pipeline::joint_verdict::JointFailure {
                 agent_index: 1,
                 dump: "agent produced no response".to_string(),
             },
@@ -1107,10 +1107,10 @@ fn joint_comment_includes_failed_agent_dumps() {
         header: String::new(),
         threshold: 9,
     };
-    let comment = crate::joint_verdict::render_joint_comment(
+    let comment = crate::pipeline::joint_verdict::render_joint_comment(
         &round,
         &crate::consensus::RepairOutcome::Fallback,
-        &crate::consensus::ItemTable::new(&crate::joint_verdict::issues_by_agent(&round)),
+        &crate::consensus::ItemTable::new(&crate::pipeline::joint_verdict::issues_by_agent(&round)),
     );
     assert!(
         !comment.contains("valid verdicts"),
@@ -1310,7 +1310,7 @@ async fn engineer_cancel_fails_ticket_without_bounce() {
     let ticket_id = make_ticket(board(), &ws, "Eng Cancel", TicketPhase::InDevelopment).await;
     let ticket = expect_ticket(board(), &ticket_id).await;
     let agent = engineer_finalize_test_agent(&ws, &ticket, "cancel");
-    crate::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
+    crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
 
     finalize_engineer_stage(&ticket, &agent, None, "job_eng_cancel", &ws, false).await;
 
@@ -1411,7 +1411,7 @@ async fn engineer_hard_failure_pauses_workspace_and_freezes_implementation() {
     let status: Option<String> = conn
         .query_optional(
             "SELECT status FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
+            crate::db::params![job_id],
             |row| row.get::<String>(0),
         )
         .await
@@ -1425,7 +1425,7 @@ async fn engineer_hard_failure_pauses_workspace_and_freezes_implementation() {
     let active: i64 = conn
         .query_optional(
             "SELECT COUNT(*) FROM agents WHERE job_id = ?1 AND status = 'launched'",
-            crate::turso::params![job_id],
+            crate::db::params![job_id],
             |row| row.get(0),
         )
         .await
@@ -1656,7 +1656,7 @@ async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
     let ws = create_test_workspace("/tmp/eng_drain_ws", "ws_eng_drain").await;
     let ticket_id = make_ticket(board(), &ws, "Eng Drain", TicketPhase::InDevelopment).await;
     let job_id = "job_eng_drain";
-    let now = crate::turso::now();
+    let now = crate::db::now();
     JobRowBuilder::new(
         &crate::session::store().conn,
         job_id,
@@ -1709,7 +1709,7 @@ async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
         .conn
         .query_optional(
             "SELECT status FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
+            crate::db::params![job_id],
             |row| row.get::<String>(0),
         )
         .await
@@ -1745,7 +1745,7 @@ async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
     )
     .await;
     let job_id = "job_eng_midtail";
-    let now = crate::turso::now();
+    let now = crate::db::now();
     JobRowBuilder::new(
         &crate::session::store().conn,
         job_id,
@@ -1803,7 +1803,7 @@ async fn engineer_failure_post_pause_drain_bails_leaves_job_launched() {
         .conn
         .query_optional(
             "SELECT status FROM jobs WHERE id = ?1",
-            crate::turso::params![job_id],
+            crate::db::params![job_id],
             |row| row.get::<String>(0),
         )
         .await

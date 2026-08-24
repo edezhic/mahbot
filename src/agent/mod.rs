@@ -15,6 +15,13 @@ use crate::tools::{
 use crate::util::{MEDIA_MARKER_RE, UnwrapPoison, parse_media_marker, scrub_credentials};
 use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
 
+pub(crate) mod extraction;
+pub mod maintainer;
+pub mod message_router;
+pub mod registry;
+pub(crate) mod role;
+pub(crate) mod skills;
+
 // ── Per-tool-call user context ─────────────────────────────────────
 // Set by the Agent work loop before each tool execute(), read by tools
 // that need user context (e.g. AnalyzeTool async dispatch).
@@ -39,7 +46,7 @@ tokio::task_local! {
     /// analyze round / research run) — set for the duration of tool execution so
     /// tools that spawn sub-agents (e.g. implement) can propagate the caller's
     /// group to the Running Agents view. `None` = workspace singleton caller.
-    pub(crate) static CURRENT_TOOL_PARENT_KEY: Option<crate::registry::ParentKey>;
+    pub(crate) static CURRENT_TOOL_PARENT_KEY: Option<crate::agent::registry::ParentKey>;
     /// The calling agent's DIRECT PARENT INVOCATION human-readable label
     /// (ticket title / analyze question / research question) — set alongside
     /// [`CURRENT_TOOL_PARENT_KEY`] for the duration of tool execution so tools
@@ -64,9 +71,9 @@ tokio::task_local! {
     /// transcription in video tool results) can attribute themselves to the
     /// owning agent's Running Agents card and telemetry. `None` outside an
     /// agent run (inbound enrichment, tests) — such calls register in
-    /// [`crate::registry::NON_AGENT_CALLS`] instead.
+    /// [`crate::agent::registry::NON_AGENT_CALLS`] instead.
     pub(crate) static CURRENT_TOOL_AGENT_TRACKING:
-        Option<crate::registry::AgentTracking>;
+        Option<crate::agent::registry::AgentTracking>;
 }
 
 /// Maximum number of completed tool rounds before the agent loop bails out.
@@ -260,7 +267,7 @@ pub(crate) fn chat_request(
         model,
         max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
         reasoning_effort: Some(
-            crate::role::role_info(&role)
+            crate::agent::role::role_info(&role)
                 .default_reasoning_effort
                 .to_string(),
         ),
@@ -273,7 +280,7 @@ impl Agent {
     /// Create a new agent with the given agent_id, role, workspace, and optional ticket.
     ///
     /// Tools are derived from [`crate::Role`] via [`crate::Role::tools`].
-    /// Automatically registers with [`crate::registry::AGENT_REGISTRY`] and creates an
+    /// Automatically registers with [`crate::agent::registry::AGENT_REGISTRY`] and creates an
     /// internal [`tokio_util::sync::CancellationToken`]. The agent is deregistered on [`Drop`].
     ///
     /// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
@@ -293,10 +300,10 @@ impl Agent {
         agent_id: String,
         role: crate::Role,
         ws: &crate::Workspace,
-        ticket: Option<crate::board::Ticket>,
+        ticket: Option<crate::pipeline::board::Ticket>,
         user_name: String,
         channel: String,
-        parent_key: Option<crate::registry::ParentKey>,
+        parent_key: Option<crate::agent::registry::ParentKey>,
         parent_label: Option<String>,
     ) -> Self {
         let (tools, tool_specs) = role_tools_and_specs(role, ws);
@@ -312,13 +319,15 @@ impl Agent {
         let parent_key = parent_key.or_else(|| {
             ticket
                 .as_ref()
-                .map(|t| crate::registry::ParentKey::Ticket(t.id.clone()))
+                .map(|t| crate::agent::registry::ParentKey::Ticket(t.id.clone()))
         });
         // The group header label: an explicit parent label (analyze/research
         // question) wins; a ticket-parented agent without one falls back to
         // the ticket title. Purely presentational — never affects behavior.
         let parent_label = parent_label.or_else(|| match parent_key {
-            Some(crate::registry::ParentKey::Ticket(_)) => ticket.as_ref().map(|t| t.title.clone()),
+            Some(crate::agent::registry::ParentKey::Ticket(_)) => {
+                ticket.as_ref().map(|t| t.title.clone())
+            }
             _ => None,
         });
         // Registration-time manual-cancel check: a sub-agent of a research
@@ -327,12 +336,12 @@ impl Agent {
         // registers AFTER the registry's cancel sweep (the late-register
         // race). The token is pre-cancelled, so the agent's llm_loop bails at
         // its first tool-round-top check and the round yields no response.
-        if let Some(crate::registry::ParentKey::Research(run_id)) = &parent_key
+        if let Some(crate::agent::registry::ParentKey::Research(run_id)) = &parent_key
             && crate::research_cancel::is_cancelled(run_id)
         {
             cancel_token.cancel();
         }
-        let generation = crate::registry::AGENT_REGISTRY.register(
+        let generation = crate::agent::registry::AGENT_REGISTRY.register(
             agent_id.clone(),
             role.to_string(),
             ticket.as_ref().map(|t| t.id.clone()),
@@ -373,7 +382,7 @@ impl Agent {
 impl Drop for Agent {
     fn drop(&mut self) {
         if self.generation > 0 {
-            crate::registry::AGENT_REGISTRY.deregister(&self.agent_id, self.generation);
+            crate::agent::registry::AGENT_REGISTRY.deregister(&self.agent_id, self.generation);
         }
         // Teardown kill: the agent's background shell sessions must not
         // outlive it. Force-kill only (no grace), mirroring the existing
@@ -521,7 +530,7 @@ impl Agent {
         // successful LLM call of the turn. Purely observational — the page
         // reads the registry, never the database.
         if let Some(token_length) = self.session.token_length() {
-            crate::registry::AGENT_REGISTRY.set_session_tokens(
+            crate::agent::registry::AGENT_REGISTRY.set_session_tokens(
                 &self.agent_id,
                 self.generation,
                 token_length,
@@ -720,7 +729,7 @@ impl Agent {
         let parent_label = self.parent_label.clone();
         let background_sessions = Some(self.background_sessions.clone());
         let agent_id = Some(self.agent_id.clone());
-        let agent_tracking = Some(crate::registry::AgentTracking {
+        let agent_tracking = Some(crate::agent::registry::AgentTracking {
             agent_id: self.agent_id.clone(),
             generation: self.generation,
             role: self.role.as_str().to_string(),
@@ -881,7 +890,7 @@ impl Agent {
                 // guard removes the entry when execution completes (RAII).
                 // Parallel read-only tools each carry their own instance, so a
                 // single "current tool" slot is never a lie.
-                let _live_tool = crate::registry::AGENT_REGISTRY.tool_started(
+                let _live_tool = crate::agent::registry::AGENT_REGISTRY.tool_started(
                     &self.agent_id,
                     self.generation,
                     &tool_name,
@@ -996,12 +1005,13 @@ impl Agent {
         &mut self,
         exhausted: &crate::retry::RetryExhausted,
     ) -> bool {
-        let Some(idx) =
-            crate::image_strip::detect_input_image_rejection(exhausted, self.session.history())
-        else {
+        let Some(idx) = crate::session::image_strip::detect_input_image_rejection(
+            exhausted,
+            self.session.history(),
+        ) else {
             return false;
         };
-        let reason = crate::image_strip::extract_provider_reason(exhausted);
+        let reason = crate::session::image_strip::extract_provider_reason(exhausted);
         // Invariant guard: detection and the strip share one marker predicate
         // (see `image_strip::has_image_marker`), so a detected rejection always
         // changes the content. If they ever drift — e.g. a malformed `[IMAGE:`
@@ -1011,7 +1021,8 @@ impl Agent {
         // no-change strip as a non-strip: keep the original error path.
         let content = {
             let original = &self.session.history()[idx].content;
-            let stripped = crate::image_strip::strip_image_markers(original, reason.as_deref());
+            let stripped =
+                crate::session::image_strip::strip_image_markers(original, reason.as_deref());
             if stripped == *original {
                 tracing::warn!(
                     agent_id = %self.agent_id,
@@ -1293,7 +1304,7 @@ impl Agent {
                 "Failed to persist session token length — in-memory value may drift from the store until the next successful call"
             );
         }
-        crate::registry::AGENT_REGISTRY.set_session_tokens(
+        crate::agent::registry::AGENT_REGISTRY.set_session_tokens(
             &self.agent_id,
             self.generation,
             token_length,
@@ -1416,7 +1427,7 @@ impl Agent {
             match rx.try_recv() {
                 Ok(job) => {
                     let content = match job.kind {
-                        crate::message_router::MessageKind::TicketComment => {
+                        crate::agent::message_router::MessageKind::TicketComment => {
                             format_comment_message(&job.user_name, &job.content)
                         }
                         _ => job.content,
@@ -1486,7 +1497,10 @@ impl Agent {
         // already in the channel and deduped against the post-drain history. A
         // comment routed after the drain can still be delivered twice; that is
         // the accepted no-watermark limitation (content-based dedup only).
-        let comments = match crate::board::store().get_comments(&ticket_id).await {
+        let comments = match crate::pipeline::board::store()
+            .get_comments(&ticket_id)
+            .await
+        {
             Ok(comments) => comments,
             Err(e) => {
                 tracing::warn!(
@@ -1589,13 +1603,13 @@ impl Agent {
         // extractions (they never register a separate non-agent call row) —
         // without it the card would look idle while the extraction LLM call
         // runs. Purely observational; the guard clears on every exit path.
-        let _activity = crate::registry::AGENT_REGISTRY.activity_started(
+        let _activity = crate::agent::registry::AGENT_REGISTRY.activity_started(
             &self.agent_id,
             self.generation,
             "extracting",
         );
         let params = self.build_chat_request(vec![], "extraction");
-        crate::extraction::retry_extract_structured_scoped(
+        crate::agent::extraction::retry_extract_structured_scoped(
             self.session.history(),
             extraction_prompt,
             &params,
@@ -1612,7 +1626,7 @@ impl Agent {
         // Live-view indicator: same single-tracker contract as extraction —
         // the agent's card shows the summarization phase instead of looking
         // idle during the (potentially large) compaction call.
-        let _activity = crate::registry::AGENT_REGISTRY.activity_started(
+        let _activity = crate::agent::registry::AGENT_REGISTRY.activity_started(
             &self.agent_id,
             self.generation,
             "summarizing",
@@ -1898,14 +1912,16 @@ pub(crate) async fn run_agent(
     agent_id: String,
     role: crate::Role,
     ws: &crate::Workspace,
-    ticket: Option<&crate::board::Ticket>,
+    ticket: Option<&crate::pipeline::board::Ticket>,
     message: &str,
     user_name: String,
     channel: String,
-    incoming_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
+    incoming_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob>,
+    >,
     resume: bool,
     round: Option<RoundOpts>,
-    parent_key: Option<crate::registry::ParentKey>,
+    parent_key: Option<crate::agent::registry::ParentKey>,
     parent_label: Option<String>,
 ) -> (Agent, Option<String>) {
     // Unregister from the message router on EVERY exit path, including a
@@ -1917,7 +1933,7 @@ pub(crate) async fn run_agent(
     struct UnregisterOnDrop(String);
     impl Drop for UnregisterOnDrop {
         fn drop(&mut self) {
-            crate::message_router::unregister_agent(&self.0);
+            crate::agent::message_router::unregister_agent(&self.0);
         }
     }
     let _router_guard = incoming_rx
@@ -2019,7 +2035,7 @@ pub(crate) async fn run_default_agent(
     ws: &crate::Workspace,
     message: &str,
     round: Option<RoundOpts>,
-    parent_key: Option<crate::registry::ParentKey>,
+    parent_key: Option<crate::agent::registry::ParentKey>,
     parent_label: Option<String>,
 ) -> (Agent, Option<String>) {
     run_agent(
@@ -2060,7 +2076,7 @@ pub(crate) fn failure_class_from_error(
 /// dashboard close, the per-agent token on /stop — check the global token
 /// first so shutdown isn't mislabeled as a user cancel. The global token also
 /// cancels every per-agent token via
-/// [`crate::registry::AgentRegistry::shutdown_all`], so the cancelled branch
+/// [`crate::agent::registry::AgentRegistry::shutdown_all`], so the cancelled branch
 /// is only a user cancel when the global token has not fired. `error` is
 /// `None` on the cancelled early-return path (no error exists to classify);
 /// otherwise [`RetryExhausted`] (kept as an error source by
@@ -2615,12 +2631,12 @@ mod tests {
         agent.agent_id = "_test_drain_ticket_comment".into();
 
         // Send a TicketComment job
-        let job = crate::message_router::AgentJob {
+        let job = crate::agent::message_router::AgentJob {
             content: "Please fix the formatting".to_string(),
             workspace_name: "test_ws".to_string(),
             user_name: "manager".to_string(),
             channel: String::new(),
-            kind: crate::message_router::MessageKind::TicketComment,
+            kind: crate::agent::message_router::MessageKind::TicketComment,
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
@@ -2656,12 +2672,12 @@ mod tests {
         agent.agent_id = "_test_drain_non_comment".into();
 
         // Send a plain UserMessage job
-        let job = crate::message_router::AgentJob {
+        let job = crate::agent::message_router::AgentJob {
             content: "Hello agent".to_string(),
             workspace_name: "test_ws".to_string(),
             user_name: "user".to_string(),
             channel: String::new(),
-            kind: crate::message_router::MessageKind::UserMessage,
+            kind: crate::agent::message_router::MessageKind::UserMessage,
             role: crate::Role::Assistant,
             reply_target: None,
             pending_job_id: None,
@@ -2684,7 +2700,8 @@ mod tests {
     /// (sets incoming_rx to None, no panic).
     #[tokio::test]
     async fn test_drain_incoming_messages_disconnected() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::message_router::AgentJob>();
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::agent::message_router::AgentJob>();
         let mut agent = make_agent(vec![]);
         agent.incoming_rx = Some(rx);
         agent.agent_id = "_test_drain_disconnected".into();
@@ -2710,17 +2727,17 @@ mod tests {
         agent_id: &str,
         role: crate::Role,
         ws: &crate::Workspace,
-        ticket: crate::board::Ticket,
+        ticket: crate::pipeline::board::Ticket,
         seed_content: Option<&str>,
     ) -> Agent {
         if let Some(content) = seed_content {
-            let now = crate::turso::now();
+            let now = crate::db::now();
             crate::session::store()
                 .conn
                 .execute(
                     "INSERT INTO sessions (agent_id, role, content, created_at) \
                      VALUES (?1, 'user', ?2, ?3)",
-                    crate::turso::params![agent_id, content, now],
+                    crate::db::params![agent_id, content, now],
                 )
                 .await
                 .unwrap();
@@ -2742,32 +2759,43 @@ mod tests {
     #[tokio::test]
     async fn test_inject_outstanding_comments_injects_for_stage_roles() {
         crate::util::test::init_management_test_stores().await;
-        let cases: &[(&str, crate::Role, &str, &str, crate::board::TicketPhase)] = &[
+        let cases: &[(
+            &str,
+            crate::Role,
+            &str,
+            &str,
+            crate::pipeline::board::TicketPhase,
+        )] = &[
             (
                 "inject-new-agent",
                 crate::Role::Engineer,
                 "inject_new",
                 "please fix the formatting",
-                crate::board::TicketPhase::InDevelopment,
+                crate::pipeline::board::TicketPhase::InDevelopment,
             ),
             (
                 "inject-sanitation-agent",
                 crate::Role::Sanitation,
                 "inject_sanitation",
                 "please verify the cleanup",
-                crate::board::TicketPhase::InSanitation,
+                crate::pipeline::board::TicketPhase::InSanitation,
             ),
         ];
         for &(agent_id, role, ws_name, comment, phase) in cases {
             let ws = crate::workspace::test_ws_named("/tmp/test", ws_name);
-            let ticket_id =
-                crate::util::test::make_ticket(crate::board::store(), &ws, "Inject Comment", phase)
-                    .await;
-            crate::board::store()
+            let ticket_id = crate::util::test::make_ticket(
+                crate::pipeline::board::store(),
+                &ws,
+                "Inject Comment",
+                phase,
+            )
+            .await;
+            crate::pipeline::board::store()
                 .add_comment(&ticket_id, "manager", comment)
                 .await
                 .unwrap();
-            let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+            let ticket =
+                crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
 
             let mut agent =
                 make_inject_agent(agent_id, role, &ws, ticket, Some("round 1 task")).await;
@@ -2791,18 +2819,19 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws_named("/tmp/test", "inject_dedup");
         let ticket_id = crate::util::test::make_ticket(
-            crate::board::store(),
+            crate::pipeline::board::store(),
             &ws,
             "Inject Dedup",
-            crate::board::TicketPhase::InDevelopment,
+            crate::pipeline::board::TicketPhase::InDevelopment,
         )
         .await;
         let content = "the comment content already seen";
-        crate::board::store()
+        crate::pipeline::board::store()
             .add_comment(&ticket_id, "manager", content)
             .await
             .unwrap();
-        let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+        let ticket =
+            crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
 
         // Seed a history row that already carries the comment content (as a
         // previously delivered `[Comment from ...]` message) — the dedup must
@@ -2835,17 +2864,18 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws_named("/tmp/test", "inject_own_role");
         let ticket_id = crate::util::test::make_ticket(
-            crate::board::store(),
+            crate::pipeline::board::store(),
             &ws,
             "Inject Own Role",
-            crate::board::TicketPhase::InDevelopment,
+            crate::pipeline::board::TicketPhase::InDevelopment,
         )
         .await;
-        crate::board::store()
+        crate::pipeline::board::store()
             .add_comment(&ticket_id, "engineer", "note from the engineer")
             .await
             .unwrap();
-        let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+        let ticket =
+            crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
 
         let mut agent = make_inject_agent(
             "inject-own-role-agent",
@@ -2873,17 +2903,18 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws_named("/tmp/test", "inject_noop");
         let ticket_id = crate::util::test::make_ticket(
-            crate::board::store(),
+            crate::pipeline::board::store(),
             &ws,
             "Inject Noop",
-            crate::board::TicketPhase::InDevelopment,
+            crate::pipeline::board::TicketPhase::InDevelopment,
         )
         .await;
-        crate::board::store()
+        crate::pipeline::board::store()
             .add_comment(&ticket_id, "manager", "please fix the formatting")
             .await
             .unwrap();
-        let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+        let ticket =
+            crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
 
         let mut agent = make_inject_agent(
             "inject-noop-agent",
@@ -2917,17 +2948,18 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws_named("/tmp/test", "inject_analyst");
         let ticket_id = crate::util::test::make_ticket(
-            crate::board::store(),
+            crate::pipeline::board::store(),
             &ws,
             "Inject Analyst",
-            crate::board::TicketPhase::InDevelopment,
+            crate::pipeline::board::TicketPhase::InDevelopment,
         )
         .await;
-        crate::board::store()
+        crate::pipeline::board::store()
             .add_comment(&ticket_id, "manager", "please fix the formatting")
             .await
             .unwrap();
-        let ticket = crate::util::test::expect_ticket(crate::board::store(), &ticket_id).await;
+        let ticket =
+            crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
 
         let mut agent = make_inject_agent(
             "inject-analyst-agent",

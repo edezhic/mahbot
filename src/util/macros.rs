@@ -131,9 +131,9 @@ macro_rules! columns {
 ///
 /// The macro no longer takes `db_name`/`schema`: after consolidation every
 /// domain store opens the ONE consolidated database file via
-/// [`crate::turso::open_consolidated_store`]. The per-module `SCHEMA` const is
+/// [`crate::db::open_consolidated_store`]. The per-module `SCHEMA` const is
 /// still declared (and referenced directly by
-/// [`crate::turso::consolidated_schema`]) but is no longer threaded through
+/// [`crate::db::consolidated_schema`]) but is no longer threaded through
 /// this macro.
 ///
 /// An arbitrary-block form is **not** provided because Rust `macro_rules!`
@@ -150,30 +150,30 @@ macro_rules! define_store {
         $(#[$attr])*
         #[derive(Clone, Debug)]
         $vis struct $ty {
-            pub(crate) conn: $crate::turso::Connection,
+            pub(crate) conn: $crate::db::Connection,
         }
 
         impl $ty {
             /// Open the store's database — the single consolidated domain file.
             ///
             /// For the domain stores this opens the consolidated database file
-            /// ([`crate::turso::CONSOLIDATED_DB_NAME`]) via
-            /// [`crate::turso::open_consolidated_store`], which runs the shared
+            /// ([`crate::db::CONSOLIDATED_DB_NAME`]) via
+            /// [`crate::db::open_consolidated_store`], which runs the shared
             /// schema + consolidated migrations + one-time consolidation import.
             /// The connection returned is **fresh** and owned by this store
             /// (used by isolated `open_test_store!`); the production bootstrap
             /// shares one connection across all domain stores via
-            /// [`crate::turso::init_all_stores`].
+            /// [`crate::db::init_all_stores`].
             ///
             /// This is intentionally **test-only**: production never calls it for
             /// the domain stores (they are constructed directly in
-            /// [`crate::turso::init_all_stores`]), so the `dead_code` lint is
+            /// [`crate::db::init_all_stores`]), so the `dead_code` lint is
             /// silenced.
             #[allow(dead_code)]
             $vis async fn open(
                 root: &std::path::Path,
             ) -> ::anyhow::Result<Self> {
-                let conn = $crate::turso::open_consolidated_store(root).await?;
+                let conn = $crate::db::open_consolidated_store(root).await?;
                 let this = Self { conn };
                 $(this.$method().await?;)?
                 Ok(this)

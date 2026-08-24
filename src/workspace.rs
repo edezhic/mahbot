@@ -6,11 +6,11 @@
 use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
+use crate::agent::role::DIAGNOSTICS_ROLE;
 use crate::agent::run_default_agent;
 use crate::config_db::ConfigStore;
-use crate::role::DIAGNOSTICS_ROLE;
+use crate::db::{self, Value};
 use crate::session::discovery_agent_id;
-use crate::turso::{self, Value};
 use crate::util::UnwrapPoison;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike, Utc};
@@ -397,7 +397,7 @@ async fn finalize_discovery(
             // Capture the current git HEAD commit hash for nightly re-analysis detection.
             // If the git command fails (not a git repo, no commits, or other error),
             // store NULL — this is not an error for the discovery itself.
-            let commit_hash = crate::git_commands::run_git_head(std::path::Path::new(ws_path))
+            let commit_hash = crate::git::commands::run_git_head(std::path::Path::new(ws_path))
                 .await
                 .ok();
 
@@ -811,7 +811,7 @@ pub fn spawn_workspace_discovery(
             // Build role discovery futures (always needed). The general
             // (non-role) project overview discovery runs alongside them.
             let role_futures: Vec<_> = Role::iter()
-                .filter(|r| crate::role::role_info(r).has_discovery)
+                .filter(|r| crate::agent::role::role_info(r).has_discovery)
                 .map(|role| {
                     let ws = ws.clone();
                     async move { run_workspace_discovery(&ws, role, discovery_generation).await }
@@ -973,7 +973,7 @@ fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
-fn workspace_from_row(row: &turso::Row) -> anyhow::Result<Workspace> {
+fn workspace_from_row(row: &db::Row) -> anyhow::Result<Workspace> {
     Ok(Workspace {
         name: row.get(COL_WS_NAME)?,
         path: row.get(COL_WS_PATH)?,
@@ -1008,7 +1008,7 @@ impl WorkspaceStore {
     async fn query_one(
         &self,
         where_clause: &str,
-        params: impl turso::IntoParams + Send + 'static,
+        params: impl db::IntoParams + Send + 'static,
     ) -> Result<Option<Workspace>> {
         let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE {where_clause}");
         self.conn
@@ -1022,12 +1022,12 @@ impl WorkspaceStore {
     async fn exec_update_with_updated_at(
         &self,
         set_clause: &str,
-        set_params: Vec<turso::Value>,
+        set_params: Vec<db::Value>,
         name: &str,
     ) -> Result<()> {
         let sql = format!("UPDATE workspaces SET {set_clause}, updated_at = ? WHERE name = ?");
         let mut params = set_params;
-        params.push(Value::from(turso::now()));
+        params.push(Value::from(db::now()));
         params.push(Value::from(name));
         self.conn.execute(&sql, params).await?;
         Ok(())
@@ -1048,7 +1048,7 @@ impl WorkspaceStore {
         // Canonicalize and validate the path so bad paths never enter the system.
         let canonical = canonicalize_workspace_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
         let path = ensure_trailing_slash(&canonical);
-        let now = turso::now();
+        let now = db::now();
         let pending = WorkspaceStatus::Pending.to_string();
         let ws = self
             .conn
@@ -1057,7 +1057,7 @@ impl WorkspaceStore {
                     "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING {WORKSPACE_COLUMNS}"
                 ),
-                turso::params![name, path, pending, now.clone(), now.clone(), 1],
+                db::params![name, path, pending, now.clone(), now.clone(), 1],
                 workspace_from_row,
             )
             .await?;
@@ -1080,7 +1080,7 @@ impl WorkspaceStore {
         self.conn
             .query_map_strict(
                 &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces ORDER BY name"),
-                turso::params![],
+                db::params![],
                 workspace_from_row,
             )
             .await
@@ -1094,7 +1094,7 @@ impl WorkspaceStore {
             .conn
             .query(
                 &format!("SELECT {WS_STATE_COLUMNS} FROM workspaces ORDER BY name"),
-                turso::params![],
+                db::params![],
             )
             .await?;
         let mut states = Vec::with_capacity(rows.len());
@@ -1109,17 +1109,14 @@ impl WorkspaceStore {
 
     /// Look up a workspace by name.
     pub async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
-        self.query_one("name = ?1", turso::params![name]).await
+        self.query_one("name = ?1", db::params![name]).await
     }
 
     /// Delete a workspace by name. Context rows are cascaded automatically.
     /// The associated search engine is also removed from the in-memory registry.
     pub async fn delete(&self, name: &str) -> Result<()> {
         self.conn
-            .execute(
-                "DELETE FROM workspaces WHERE name = ?1",
-                turso::params![name],
-            )
+            .execute("DELETE FROM workspaces WHERE name = ?1", db::params![name])
             .await?;
         crate::search_engine::remove_engine(name);
         clear_pending_pickup_cooldown(name);
@@ -1146,9 +1143,9 @@ impl WorkspaceStore {
             .query_optional(
                 "UPDATE workspaces SET status = ?, paused = 1, updated_at = ? \
                  WHERE name = ? AND status = ? RETURNING discovery_generation",
-                turso::params![
+                db::params![
                     WorkspaceStatus::Analyzing.to_string(),
-                    turso::now(),
+                    db::now(),
                     name,
                     WorkspaceStatus::Pending.to_string()
                 ],
@@ -1167,9 +1164,9 @@ impl WorkspaceStore {
             .conn
             .execute(
                 "UPDATE workspaces SET status = ?, updated_at = ? WHERE status = ?",
-                turso::params![
+                db::params![
                     WorkspaceStatus::Pending.to_string(),
-                    turso::now(),
+                    db::now(),
                     WorkspaceStatus::Analyzing.to_string()
                 ],
             )
@@ -1202,7 +1199,7 @@ impl WorkspaceStore {
             // Cancel any running maintainer agent for this workspace so it
             // doesn't continue creating tickets after maintenance was disabled.
             if let Some(ws) = self.get_by_name(name).await? {
-                crate::registry::AGENT_REGISTRY
+                crate::agent::registry::AGENT_REGISTRY
                     .cancel_by_role_and_workspace_path(Role::Maintainer.as_str(), &ws.path);
             }
         }
@@ -1275,7 +1272,7 @@ impl WorkspaceStore {
             .conn
             .query_optional(
                 "SELECT diagnostics FROM workspaces WHERE name = ?1",
-                turso::params![name],
+                db::params![name],
                 |row| row.get::<Option<String>>(0),
             )
             .await?
@@ -1304,7 +1301,7 @@ impl WorkspaceStore {
         self.conn
             .execute(
                 "DELETE FROM workspace_contexts WHERE workspace_name = ?1",
-                turso::params![name],
+                db::params![name],
             )
             .await?;
         Ok(())
@@ -1318,7 +1315,7 @@ impl WorkspaceStore {
         self.conn
             .query_row(
                 &format!("SELECT {} FROM workspaces WHERE name = ?1", column.name),
-                turso::params![name],
+                db::params![name],
                 |row| row.get(0),
             )
             .await
@@ -1414,7 +1411,7 @@ impl WorkspaceStore {
         self.conn
             .query_optional(
                 "SELECT content FROM workspace_contexts WHERE workspace_name = ?1 AND role = ?2",
-                turso::params![name, role],
+                db::params![name, role],
                 |row| row.get::<String>(0),
             )
             .await
@@ -1422,12 +1419,12 @@ impl WorkspaceStore {
 
     /// Upsert a single context entry for a workspace and role.
     pub async fn set_context(&self, name: &str, role: &str, content: &str) -> Result<()> {
-        let now = turso::now();
+        let now = db::now();
         self.conn
             .execute(
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(workspace_name, role) DO UPDATE SET content = excluded.content, created_at = excluded.created_at",
-                turso::params![name, role, content, now],
+                db::params![name, role, content, now],
             )
             .await?;
         Ok(())
@@ -1439,7 +1436,7 @@ impl WorkspaceStore {
         self.conn
             .query_optional(
                 "SELECT content FROM workspace_contexts WHERE workspace_name = ?1 AND role IS NULL",
-                turso::params![name],
+                db::params![name],
                 |row| row.get::<String>(0),
             )
             .await
@@ -1448,12 +1445,12 @@ impl WorkspaceStore {
     /// Upsert the general (non-role) workspace context. The partial unique
     /// index guarantees at most one NULL-role row per workspace.
     pub async fn set_general_context(&self, name: &str, content: &str) -> Result<()> {
-        let now = turso::now();
+        let now = db::now();
         self.conn
             .execute(
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) VALUES (?1, NULL, ?2, ?3) \
                  ON CONFLICT(workspace_name) WHERE role IS NULL DO UPDATE SET content = excluded.content, created_at = excluded.created_at",
-                turso::params![name, content, now],
+                db::params![name, content, now],
             )
             .await?;
         Ok(())
@@ -1467,13 +1464,13 @@ impl WorkspaceStore {
         let tx = self.conn.begin_tx().await?;
         tx.execute(
             "DELETE FROM editor_tabs WHERE workspace_name = ?1",
-            turso::params![name],
+            db::params![name],
         )
         .await?;
         for tab in tabs {
             tx.execute(
                 "INSERT INTO editor_tabs (workspace_name, file_path, tab_order, is_active, is_dirty, dirty_content) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                turso::params![
+                db::params![
                     name,
                     tab.file_path.clone(),
                     i64::try_from(tab.tab_order).unwrap_or(i64::MAX),
@@ -1493,7 +1490,7 @@ impl WorkspaceStore {
         let rows = self.conn
             .query_map(
                 &format!("SELECT {EDITOR_TAB_COLUMNS} FROM editor_tabs WHERE workspace_name = ?1 ORDER BY tab_order"),
-                turso::params![name],
+                db::params![name],
                 |row| -> std::result::Result<EditorTabRecord, String> {
                     Ok(EditorTabRecord {
                         file_path: row
@@ -1592,7 +1589,7 @@ fn is_nightly_check_hour(local_hour: u32) -> bool {
 fn nightly_gate_allows(last_pass_at: Option<&str>, now: DateTime<Utc>) -> bool {
     match last_pass_at {
         None => true,
-        Some(raw) => match turso::parse_utc_timestamp(raw) {
+        Some(raw) => match db::parse_utc_timestamp(raw) {
             Ok(last) => now.signed_duration_since(last) >= chrono::Duration::days(7),
             Err(e) => {
                 warn!(
@@ -1645,7 +1642,7 @@ async fn nightly_gate_should_run(config_store: Option<&ConfigStore>) -> bool {
     // Record the pass start. Fail-closed: skip the pass when the timestamp
     // cannot be recorded.
     if let Some(store) = config_store {
-        let started_at = turso::now();
+        let started_at = db::now();
         if let Err(e) = store
             .set_kv(NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY, &started_at)
             .await
@@ -1775,7 +1772,7 @@ pub async fn run_nightly_check_loop() {
             let repo_path = std::path::Path::new(&ws.path);
 
             // Run git rev-parse HEAD to get the current commit.
-            let current_hash = match crate::git_commands::run_git_head(repo_path).await {
+            let current_hash = match crate::git::commands::run_git_head(repo_path).await {
                 Ok(hash) => hash,
                 Err(e) => {
                     // Non-git workspace, no commits, or git not available — skip.
@@ -1897,7 +1894,7 @@ mod tests {
         discovery_generation: i64,
         diagnostics_generation: i64,
     ) -> Workspace {
-        let now = crate::turso::now();
+        let now = crate::db::now();
         let paused_int: i64 = i64::from(paused);
         let maint_int: i64 = i64::from(maintenance_enabled);
         store
@@ -1905,7 +1902,7 @@ mod tests {
             .execute(
                 "INSERT INTO workspaces (name, path, created_at, updated_at, paused, maintenance, discovery_generation, diagnostics_generation) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                crate::turso::params![name, path, now.clone(), now.clone(), paused_int, maint_int, discovery_generation, diagnostics_generation],
+                crate::db::params![name, path, now.clone(), now.clone(), paused_int, maint_int, discovery_generation, diagnostics_generation],
             )
             .await
             .expect("insert workspace");
@@ -1930,13 +1927,13 @@ mod tests {
     async fn schema_default_is_paused() {
         // Insert WITHOUT specifying paused, relying on the schema DEFAULT.
         let (store, _tmp) = test_store().await;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         store
             .conn
             .execute(
                 "INSERT INTO workspaces (name, path, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4)",
-                crate::turso::params!["schema_test", "/tmp/schema_test", now.clone(), now.clone()],
+                crate::db::params!["schema_test", "/tmp/schema_test", now.clone(), now.clone()],
             )
             .await
             .expect("insert workspace");
@@ -2818,7 +2815,7 @@ mod tests {
             .conn
             .execute(
                 "UPDATE workspaces SET diagnostics_generation = 99 WHERE name = ?1",
-                crate::turso::params!["diag_stale"],
+                crate::db::params!["diag_stale"],
             )
             .await
             .expect("bump diagnostics_generation");
@@ -2877,7 +2874,7 @@ mod tests {
             .execute(
                 "INSERT INTO workspace_contexts (workspace_name, role, content, created_at) \
                  VALUES (?1, NULL, 'dup', ?2)",
-                crate::turso::params!["gctx", crate::turso::now()],
+                crate::db::params!["gctx", crate::db::now()],
             )
             .await
             .unwrap_err();
@@ -3026,7 +3023,7 @@ mod tests {
             .unwrap()
             .expect("pass-start write must store a value");
         assert!(
-            crate::turso::parse_utc_timestamp(&healed).is_ok(),
+            crate::db::parse_utc_timestamp(&healed).is_ok(),
             "pass-start write must self-heal the stored value",
         );
     }

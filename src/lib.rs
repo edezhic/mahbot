@@ -10,54 +10,37 @@
     clippy::doc_markdown
 )]
 
-pub(crate) mod agent;
+pub mod agent;
 pub mod audio;
 pub mod bench_openrouter;
-pub mod board;
 pub(crate) mod boot;
 pub mod channels;
-pub(crate) mod chat_history;
-pub mod checkpoint;
 pub mod config;
 pub mod config_db;
 pub(crate) mod consensus;
-pub mod debug;
-pub(crate) mod diff_parse;
+pub mod db;
 pub(crate) mod embedder;
-pub(crate) mod extraction;
-pub(crate) mod git_commands;
+pub mod git;
 pub mod gui;
-pub(crate) mod image_strip;
 pub mod jobs;
-pub(crate) mod joint_verdict;
-pub mod lock_utils;
 pub mod logs;
-pub mod maintainer;
-pub mod management;
-pub mod message_router;
-pub(crate) mod migrations;
 pub(crate) mod onnx;
+pub mod pipeline;
 pub(crate) mod prompt;
 pub mod providers;
-pub mod registry;
 pub(crate) mod research_cancel;
 pub mod research_cleanup;
 pub(crate) mod retry;
-pub(crate) mod role;
 pub mod search_engine;
 pub mod self_update;
 pub mod session;
 pub mod shutdown;
-pub(crate) mod skills;
 pub(crate) mod stats;
 pub mod temp;
-pub mod ticket_buffer;
 pub mod tools;
-pub mod turso;
 pub mod users;
 pub mod util;
 pub(crate) mod vector;
-pub mod wal_guard;
 pub mod workspace;
 
 /// Hidden grep-engine subcommand entry (dispatched from `main()` before the
@@ -723,7 +706,7 @@ pub struct Agent {
     /// Cancellation token for cooperative mid-loop cancellation (e.g. /stop).
     cancel_token: CancellationToken,
     /// Board ticket this agent is currently working on (set for board-dispatched agents).
-    ticket: Option<crate::board::Ticket>,
+    ticket: Option<crate::pipeline::board::Ticket>,
     /// Generation counter from the agent registry — used in [`Drop`] for
     /// safe deregistration. 0 means not registered (e.g. test agents).
     generation: u64,
@@ -740,7 +723,7 @@ pub struct Agent {
     /// (ticket / analyze round / research run). `None` for workspace singletons.
     /// Propagated to sub-agents spawned by tools via
     /// [`CURRENT_TOOL_PARENT_KEY`](crate::agent::CURRENT_TOOL_PARENT_KEY).
-    pub(crate) parent_key: Option<crate::registry::ParentKey>,
+    pub(crate) parent_key: Option<crate::agent::registry::ParentKey>,
     /// Human-readable label of the DIRECT PARENT INVOCATION (ticket title /
     /// analyze question / research question) — shown on the Running Agents
     /// group header. Purely presentational. Propagated to sub-agents spawned
@@ -751,7 +734,7 @@ pub struct Agent {
     /// When set, the `llm_loop` drains this channel before each LLM call
     /// and injects received messages into the session history.
     pub(crate) incoming_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<crate::message_router::AgentJob>>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob>>,
     /// Round-fixed timestamp for the first user message (one value per round
     /// for byte-identical task messages across parallel members).
     pub(crate) round_ts: Option<String>,

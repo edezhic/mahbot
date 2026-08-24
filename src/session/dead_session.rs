@@ -40,8 +40,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::message_router::{AgentJob, MessageKind};
-use crate::registry::AGENT_REGISTRY;
+use crate::agent::message_router::{AgentJob, MessageKind};
+use crate::agent::registry::AGENT_REGISTRY;
 use crate::session::SessionContext;
 use crate::{ChatRole, Role};
 
@@ -367,7 +367,7 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
         "Dead session recovery: routing retry job"
     );
 
-    crate::message_router::route(agent_id, job);
+    crate::agent::message_router::route(agent_id, job);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

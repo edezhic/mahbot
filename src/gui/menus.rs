@@ -1111,7 +1111,7 @@ where
             .items
             .iter()
             .map(|item| {
-                let label = crate::role::role_info(&item.role).display_label;
+                let label = crate::agent::role::role_info(&item.role).display_label;
                 let paragraph = Renderer::Paragraph::with_text(text::Text {
                     content: label,
                     bounds: Size::new(f32::MAX, MENU_ITEM_HEIGHT),
@@ -1347,7 +1347,9 @@ fn draw_item<Message, Renderer>(
         - ROLE_MENU_CHECK_SIZE;
     renderer.fill_text(
         text::Text {
-            content: crate::role::role_info(&item.role).display_label.to_string(),
+            content: crate::agent::role::role_info(&item.role)
+                .display_label
+                .to_string(),
             bounds: Size::new(label_bounds_width, MENU_ITEM_HEIGHT),
             size: Pixels(ROLE_MENU_LABEL_FONT_SIZE),
             line_height: text::LineHeight::Relative(1.3),

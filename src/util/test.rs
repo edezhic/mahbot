@@ -26,8 +26,8 @@
 
 #![cfg(test)]
 
-use crate::board::{BoardStore, Ticket, TicketParams, TicketPhase};
-use crate::turso;
+use crate::db;
+use crate::pipeline::board::{BoardStore, Ticket, TicketParams, TicketPhase};
 use crate::util::UnwrapPoison;
 use crate::workspace::test_ws_named;
 use std::path::PathBuf;
@@ -801,7 +801,7 @@ impl<'a> TicketBuilder<'a> {
 ///
 /// [`Self::insert`] panics if [`Self::timestamps`] was not called.
 pub(crate) struct JobRowBuilder<'a> {
-    conn: &'a crate::turso::Connection,
+    conn: &'a crate::db::Connection,
     id: String,
     kind: String,
     role: String,
@@ -816,7 +816,7 @@ pub(crate) struct JobRowBuilder<'a> {
 impl<'a> JobRowBuilder<'a> {
     /// Start a builder for a `jobs` row with the schema-required columns.
     pub(crate) fn new(
-        conn: &'a crate::turso::Connection,
+        conn: &'a crate::db::Connection,
         id: impl Into<String>,
         kind: impl Into<String>,
         role: impl Into<String>,
@@ -884,32 +884,32 @@ impl<'a> JobRowBuilder<'a> {
             timestamps,
         } = self;
         let mut columns = vec!["id", "kind", "task", "workspace_name", "role"];
-        let mut values: Vec<crate::turso::Value> = vec![
-            crate::turso::Value::Text(id),
-            crate::turso::Value::Text(kind),
-            crate::turso::Value::Text(task),
-            crate::turso::Value::Text(workspace_name),
-            crate::turso::Value::Text(role),
+        let mut values: Vec<crate::db::Value> = vec![
+            crate::db::Value::Text(id),
+            crate::db::Value::Text(kind),
+            crate::db::Value::Text(task),
+            crate::db::Value::Text(workspace_name),
+            crate::db::Value::Text(role),
         ];
         if let Some(user_name) = user_name {
             columns.push("user_name");
-            values.push(crate::turso::Value::Text(user_name));
+            values.push(crate::db::Value::Text(user_name));
         }
         if let Some(channel) = channel {
             columns.push("channel");
-            values.push(crate::turso::Value::Text(channel));
+            values.push(crate::db::Value::Text(channel));
         }
         if let Some(retry_count) = retry_count {
             columns.push("retry_count");
-            values.push(crate::turso::Value::Integer(retry_count));
+            values.push(crate::db::Value::Integer(retry_count));
         }
         let timestamps = timestamps.expect(
             "JobRowBuilder::insert: `.timestamps()` is required — the helper never generates timestamps internally",
         );
         columns.push("created_at");
         columns.push("updated_at");
-        values.push(crate::turso::Value::Text(timestamps.clone()));
-        values.push(crate::turso::Value::Text(timestamps));
+        values.push(crate::db::Value::Text(timestamps.clone()));
+        values.push(crate::db::Value::Text(timestamps));
         let placeholders = vec!["?"; values.len()].join(", ");
         let table = "jobs";
         let sql = format!(
@@ -923,7 +923,7 @@ impl<'a> JobRowBuilder<'a> {
 
 /// Initialize all global test stores (session, board, workspace, users,
 /// config, stats, chat_history) with a shared temp directory by delegating
-/// to [`turso::init_all_stores`].
+/// to [`db::init_all_stores`].
 ///
 /// Also initializes the search engine registry (required by workspace store)
 /// and sets the CONFIG storage root.
@@ -939,9 +939,9 @@ pub async fn init_test_stores() {
         crate::search_engine::init_global();
 
         // ticket_buffer is sync — lightweight allocation, no DB I/O.
-        crate::ticket_buffer::init_global();
+        crate::pipeline::ticket_buffer::init_global();
 
-        crate::turso::init_all_stores()
+        crate::db::init_all_stores()
             .await
             .expect("failed to initialize test stores (see chained error for per-store details)");
     })
@@ -953,8 +953,8 @@ pub async fn init_test_stores() {
 ///
 /// Calls [`init_test_stores`] (all test DBs) then initializes the global
 /// message_router. The router is required by callers that
-/// exercise [`notify_ticket`](crate::management::notify_ticket) which
-/// enqueues notifications via [`crate::message_router::route`].
+/// exercise [`notify_ticket`](crate::pipeline::management::notify_ticket) which
+/// enqueues notifications via [`crate::agent::message_router::route`].
 ///
 /// # Panics
 ///
@@ -965,14 +965,14 @@ pub async fn init_test_stores() {
 /// # Idempotency note
 ///
 /// [`init_test_stores`] is idempotent (uses a [`tokio::sync::OnceCell`]).
-/// [`crate::message_router::init_global`] initialises the router's internal
+/// [`crate::agent::message_router::init_global`] initialises the router's internal
 /// [`HashMap`](std::collections::HashMap) (via [`std::sync::OnceLock`]).
-/// No consumer loops are spawned until the first [`route`](crate::message_router::route)
+/// No consumer loops are spawned until the first [`route`](crate::agent::message_router::route)
 /// to each agent ID.
 pub async fn init_management_test_stores() {
     init_test_stores().await;
 
-    let _ = crate::message_router::init_global();
+    let _ = crate::agent::message_router::init_global();
 }
 
 /// Create a test workspace by inserting it into the test DB and returning
@@ -992,13 +992,13 @@ pub async fn init_management_test_stores() {
 /// Panics if the workspace store is not initialized, or if the INSERT
 /// SQL query fails.
 pub async fn create_test_workspace(path: &str, name: &str) -> crate::Workspace {
-    let now = crate::turso::now();
+    let now = crate::db::now();
     crate::workspace::store()
         .conn
         .execute(
             "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            turso::params![name, path, now.clone(), now, 0],
+            db::params![name, path, now.clone(), now, 0],
         )
         .await
         .expect("insert test workspace");

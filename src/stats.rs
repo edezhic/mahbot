@@ -11,7 +11,7 @@
 //! quarantine recreate also recreates it. Consumers access the table
 //! through [`crate::logs::LOG_STORE`] with fail-open accessors.
 
-use crate::turso::{self};
+use crate::db::{self};
 use anyhow::Result;
 
 // Column definitions for tool_error SELECT queries.
@@ -59,7 +59,7 @@ impl crate::logs::LogStore {
             .query_optional(
                 "SELECT COUNT(*) FROM tool_calls \
                  WHERE agent_id = ?1 AND tool_name = ?2",
-                turso::params![agent_id, tool_name],
+                db::params![agent_id, tool_name],
                 |row| row.get::<i64>(0),
             )
             .await
@@ -111,8 +111,8 @@ impl crate::logs::LogStore {
         );
 
         let mut all_params = filter_params;
-        all_params.push(turso::Value::Integer(limit_val));
-        all_params.push(turso::Value::Integer(offset_val));
+        all_params.push(db::Value::Integer(limit_val));
+        all_params.push(db::Value::Integer(offset_val));
 
         let rows = self.conn.query(&sql, all_params).await?;
 
@@ -145,14 +145,14 @@ impl crate::logs::LogStore {
             return Ok(());
         }
 
-        let recorded_at = turso::now();
+        let recorded_at = db::now();
         let tx = self.conn.begin_tx().await?;
         for record in stats {
             tx.execute(
                 "INSERT INTO tool_calls \
                  (agent_id, role, tool_name, arguments, duration_ms, success, error_message, workspace, recorded_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                turso::params![
+                db::params![
                     agent_id,
                     role,
                     record.tool_name.clone(),
@@ -182,7 +182,7 @@ impl crate::logs::LogStore {
                   duration_ms, retry_attempts, finish_reason, failure_class, success) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                          ?17, ?18, ?19, ?20, ?21)",
-                turso::params![
+                db::params![
                     rec.recorded_at.clone(),
                     rec.purpose,
                     rec.agent_id.clone(),
@@ -329,7 +329,7 @@ fn llm_request_record_meta(
         finish_reason: finish_reason.map(str::to_string),
         failure_class: failure_class.map(str::to_string),
         success: failure_class.is_none(),
-        recorded_at: crate::turso::now(),
+        recorded_at: crate::db::now(),
     }
 }
 
@@ -472,15 +472,15 @@ pub(crate) async fn record_llm_failure(
 /// Returns `(where_clause, params)` where `where_clause` does NOT include
 /// the leading `WHERE` keyword — it is a set of `AND`-joined expressions
 /// suitable for embedding directly into SQL.  All placeholders use unnamed
-/// `?` — pass a `Vec<turso::Value>` to bind params positionally (it
-/// implements [`IntoParams`](crate::turso::IntoParams)).
+/// `?` — pass a `Vec<db::Value>` to bind params positionally (it
+/// implements [`IntoParams`](crate::db::IntoParams)).
 #[must_use]
-fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<turso::Value>) {
+fn build_tool_error_filter(query: &ToolErrorQuery) -> (String, Vec<db::Value>) {
     let mut clauses = vec!["error_message IS NOT NULL".to_string()];
     let mut params = Vec::new();
 
     if let Some(ref search) = query.search {
-        params.push(turso::Value::Text(format!("%{search}%")));
+        params.push(db::Value::Text(format!("%{search}%")));
         clauses.push("error_message LIKE ?".to_string());
     }
 
@@ -502,7 +502,7 @@ mod tests {
             name: &'static str,
             query: ToolErrorQuery,
             expected_clause: &'static str,
-            expected_params: Vec<turso::Value>,
+            expected_params: Vec<db::Value>,
         }
 
         let cases = [
@@ -518,7 +518,7 @@ mod tests {
                     search: Some("timeout".to_string()),
                 },
                 expected_clause: "error_message IS NOT NULL AND error_message LIKE ?",
-                expected_params: vec![turso::Value::Text("%timeout%".to_string())],
+                expected_params: vec![db::Value::Text("%timeout%".to_string())],
             },
         ];
 
@@ -648,7 +648,7 @@ mod tests {
             finish_reason: Some("stop".to_string()),
             failure_class: None,
             success: true,
-            recorded_at: crate::turso::now(),
+            recorded_at: crate::db::now(),
         };
 
         store
@@ -665,7 +665,7 @@ mod tests {
                         duration_ms, retry_attempts, finish_reason, \
                         failure_class, success \
                  FROM llm_requests WHERE agent_id = ?1",
-                crate::turso::params!["alice_ws1_engineer"],
+                crate::db::params!["alice_ws1_engineer"],
             )
             .await
             .expect("query llm request");

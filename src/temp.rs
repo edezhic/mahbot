@@ -207,7 +207,7 @@ const TEMP_CLEANUP_WORKSPACE_NAME: &str = "tmp";
 /// dedup marker: a surviving row means a previous cleaner never finished
 /// (crash); the boot scan terminalizes leftover rows, so a row present at
 /// dispatch time is an anomaly — skip rather than double-run.
-pub(crate) async fn temp_cleanup_row_exists(conn: &crate::turso::Connection) -> Result<bool> {
+pub(crate) async fn temp_cleanup_row_exists(conn: &crate::db::Connection) -> Result<bool> {
     Ok(conn
         .query_optional(
             "SELECT 1 FROM jobs WHERE kind = 'temp_cleanup' AND status != 'done' LIMIT 1",

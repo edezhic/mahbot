@@ -13,11 +13,11 @@ use std::borrow::Cow;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use mahbot::agent::message_router;
 use mahbot::channels::broadcast_and_persist_incoming_message;
 use mahbot::channels::telegram::{decode_action, user_command_entries};
 use mahbot::config::{CONFIG, CONFIG_KEY_IMAGE_GEN_MODEL, CONFIG_KEY_VIDEO_MODEL};
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
-use mahbot::message_router;
 use mahbot::parse_bot_command;
 use mahbot::session::clear_session;
 use mahbot::util::UnwrapPoison;
@@ -57,18 +57,18 @@ async fn bootstrap_mahbot() -> Result<()> {
     // would consume the coordination evidence). The per-store heal strategy
     // flows from this scan into turso::open_store.
     let storage_root = mahbot::config::CONFIG.global_storage_root();
-    mahbot::wal_guard::diagnose_all_stores(std::path::Path::new(&storage_root));
+    mahbot::db::wal_guard::diagnose_all_stores(std::path::Path::new(&storage_root));
 
     let (log_store, log_broadcast) = mahbot::logs::init_tracing(&storage_root).await?;
     let _ = mahbot::gui::LOG_BROADCAST.set(log_broadcast);
 
     mahbot::search_engine::init_global(); // sync — no I/O
-    mahbot::ticket_buffer::init_global(); // sync — no I/O
-    mahbot::message_router::init_global()?;
+    mahbot::pipeline::ticket_buffer::init_global(); // sync — no I/O
+    mahbot::agent::message_router::init_global()?;
     mahbot::audio::voice::init_global()?;
     mahbot::audio::tts::init_global()?;
 
-    mahbot::turso::init_all_stores().await?;
+    mahbot::db::init_all_stores().await?;
 
     // Config DB must be loaded before providers, so that API keys
     // and model settings take effect.
@@ -187,14 +187,14 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &mut tasks,
         &shutdown_token,
         "maintainer",
-        mahbot::maintainer::run_maintainer_loop(),
+        mahbot::agent::maintainer::run_maintainer_loop(),
     );
 
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
         "archive-cancelled",
-        mahbot::board::run_archive_cancelled_loop(),
+        mahbot::pipeline::board::run_archive_cancelled_loop(),
     );
 
     // Dead-session recovery: detects user-agent sessions that failed silently
@@ -227,7 +227,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &mut tasks,
         &shutdown_token,
         "wal-guard",
-        mahbot::wal_guard::run_wal_guard_loop(),
+        mahbot::db::wal_guard::run_wal_guard_loop(),
     );
 
     // Eagerly initialize search engines for all existing workspaces.
@@ -276,7 +276,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &mut tasks,
         &shutdown_token,
         "management",
-        mahbot::management::run_management(),
+        mahbot::pipeline::management::run_management(),
     );
 
     // Listen for SIGTERM/SIGINT and drive the two-signal drain protocol.
@@ -346,7 +346,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
             }
             // One hygiene round: WAL checkpoint + integrity verification
             // sharing a single coordination-state inspection per store.
-            mahbot::checkpoint::periodic_checkpoint_and_verify().await;
+            mahbot::db::checkpoint::periodic_checkpoint_and_verify().await;
         }
     });
 
@@ -450,7 +450,7 @@ async fn shutdown_after_dashboard() {
     // cancellation, and the UpdateResult-failure exit (save_and_exit) runs only
     // after the update's finalizing drain fired it. A future exit path that
     // drops the runtime without firing the token would break this invariant.
-    mahbot::registry::AGENT_REGISTRY.shutdown_all();
+    mahbot::agent::registry::AGENT_REGISTRY.shutdown_all();
     mahbot::tools::browser::close_all_browser_sessions().await;
 
     // Take the JoinSet out of the lock before awaiting (drop guard).
@@ -476,7 +476,7 @@ async fn shutdown_after_dashboard() {
     // Single-writer checkpoint: the iced runtime is gone, so no background
     // writer is live. Relocated here from save_and_exit (which ran it while
     // background writers were still active — contradicting single-writer).
-    mahbot::checkpoint::checkpoint_all_databases().await;
+    mahbot::db::checkpoint::checkpoint_all_databases().await;
 }
 
 fn main() -> Result<()> {
@@ -489,9 +489,9 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        match rt.block_on(mahbot::debug::run_debug()) {
+        match rt.block_on(mahbot::db::debug::run_debug()) {
             Ok(()) => std::process::exit(0),
-            Err(e) if e.downcast_ref::<mahbot::debug::GateRefusal>().is_some() => {
+            Err(e) if e.downcast_ref::<mahbot::db::debug::GateRefusal>().is_some() => {
                 eprintln!("Error: {e:#}");
                 std::process::exit(2);
             }
@@ -922,7 +922,7 @@ async fn handle_admin_command(msg: &ChannelMessage, cmd: mahbot::BotCommand) {
     match (cmd, maintenance_arg) {
         (BotCommand::Board, _) => handle_board_listing(msg, &ws_name).await,
         (BotCommand::Archive, _) => {
-            let count = mahbot::board::store()
+            let count = mahbot::pipeline::board::store()
                 .archive_all_done_and_cancelled(Some(&ws_name))
                 .await;
             match count {
@@ -973,7 +973,7 @@ async fn toggle_workspace_state(
 /// Handle `/board` — list the active workspace's non-archived tickets in the
 /// exact order the GUI board column shows them (shared ordering helper).
 async fn handle_board_listing(msg: &ChannelMessage, ws_name: &str) {
-    let tickets = match mahbot::board::store()
+    let tickets = match mahbot::pipeline::board::store()
         .list_all_tickets(Some(ws_name), None)
         .await
     {
@@ -983,7 +983,7 @@ async fn handle_board_listing(msg: &ChannelMessage, ws_name: &str) {
             return;
         }
     };
-    let ordered = mahbot::board::BoardStore::board_display_order(&tickets);
+    let ordered = mahbot::pipeline::board::BoardStore::board_display_order(&tickets);
     if ordered.is_empty() {
         send_telegram_reply(msg, "No tickets.".to_string()).await;
         return;

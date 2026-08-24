@@ -19,8 +19,8 @@
 use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
-use crate::git_commands::run_git_output;
-use crate::turso::{self, TxGuard};
+use crate::db::{self, TxGuard};
+use crate::git::commands::run_git_output;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -78,12 +78,12 @@ crate::columns! {
 impl UserStore {
     /// Auto-create the admin user if this is a fresh database.
     ///
-    /// Runs idempotently from both [`crate::turso::init_all_stores`] (production,
+    /// Runs idempotently from both [`crate::db::init_all_stores`] (production,
     /// on the shared consolidated connection) and each isolated user store open.
     pub(crate) async fn ensure_admin_user(&self) -> Result<()> {
         let rows = self
             .conn
-            .query("SELECT 1 FROM users WHERE name = 'admin'", turso::params![])
+            .query("SELECT 1 FROM users WHERE name = 'admin'", db::params![])
             .await?;
         if rows.is_empty() {
             // Analyst first so add_user seeds the pre-pool default active
@@ -114,14 +114,14 @@ impl UserStore {
             .execute(
                 "INSERT OR IGNORE INTO users (name, permissions) \
                  VALUES (?1, ?2)",
-                turso::params![name, permissions],
+                db::params![name, permissions],
             )
             .await?;
         let tx = self.conn.begin_tx().await?;
         for role in roles {
             tx.execute(
                 "INSERT OR IGNORE INTO user_roles (user_name, role) VALUES (?1, ?2)",
-                turso::params![name, role.as_str()],
+                db::params![name, role.as_str()],
             )
             .await?;
         }
@@ -130,7 +130,7 @@ impl UserStore {
         {
             tx.execute(
                 "UPDATE users SET selected_role = ?1 WHERE name = ?2",
-                turso::params![first.as_str(), name],
+                db::params![first.as_str(), name],
             )
             .await?;
         }
@@ -149,20 +149,20 @@ impl UserStore {
         let tx = self.conn.begin_tx().await?;
         tx.execute(
             "DELETE FROM user_roles WHERE user_name = ?1",
-            turso::params![name],
+            db::params![name],
         )
         .await?;
         for role in roles {
             tx.execute(
                 "INSERT INTO user_roles (user_name, role) VALUES (?1, ?2)",
-                turso::params![name, role.as_str()],
+                db::params![name, role.as_str()],
             )
             .await?;
         }
         let selected: Option<String> = tx
             .query_row(
                 "SELECT selected_role FROM users WHERE name = ?1",
-                turso::params![name],
+                db::params![name],
                 |row| row.get::<Option<String>>(0),
             )
             .await
@@ -175,7 +175,7 @@ impl UserStore {
                 let fallback = roles.first().map(|r| r.as_str().to_string());
                 tx.execute(
                     "UPDATE users SET selected_role = ?1 WHERE name = ?2",
-                    turso::params![fallback, name],
+                    db::params![fallback, name],
                 )
                 .await?;
             }
@@ -191,7 +191,7 @@ impl UserStore {
             .conn
             .query_map_strict(
                 "SELECT role FROM user_roles WHERE user_name = ?1",
-                turso::params![user_name],
+                db::params![user_name],
                 |row| row.get::<String>(0),
             )
             .await?;
@@ -207,15 +207,15 @@ impl UserStore {
         let tx = self.conn.begin_tx().await?;
         tx.execute(
             "DELETE FROM user_roles WHERE user_name = ?1",
-            turso::params![name],
+            db::params![name],
         )
         .await?;
         tx.execute(
             "DELETE FROM user_channels WHERE user_name = ?1",
-            turso::params![name],
+            db::params![name],
         )
         .await?;
-        tx.execute("DELETE FROM users WHERE name = ?1", turso::params![name])
+        tx.execute("DELETE FROM users WHERE name = ?1", db::params![name])
             .await?;
         tx.commit().await?;
         Ok(())
@@ -229,7 +229,7 @@ impl UserStore {
         self.conn
             .query_optional(
                 &format!("SELECT {column} FROM users WHERE name = ?1"),
-                turso::params![user_name],
+                db::params![user_name],
                 |row| row.get::<Option<String>>(0),
             )
             .await
@@ -264,7 +264,7 @@ impl UserStore {
             .conn
             .query(
                 "SELECT user_name, reply_target FROM user_channels WHERE channel = ?1",
-                turso::params![channel],
+                db::params![channel],
             )
             .await?;
         let thread_prefix = format!("{target}:");
@@ -296,7 +296,7 @@ impl UserStore {
             .execute(
                 "INSERT OR REPLACE INTO user_channels (user_name, channel, identifier) \
                  VALUES (?1, ?2, ?3)",
-                turso::params![user_name, channel, identifier],
+                db::params![user_name, channel, identifier],
             )
             .await?;
         Ok(())
@@ -312,7 +312,7 @@ impl UserStore {
         self.conn
             .execute(
                 "DELETE FROM user_channels WHERE user_name = ?1 AND channel = ?2 AND identifier = ?3",
-                turso::params![user_name, channel, identifier],
+                db::params![user_name, channel, identifier],
             )
             .await?;
         Ok(())
@@ -329,7 +329,7 @@ impl UserStore {
             .execute(
                 "UPDATE user_channels SET reply_target = ?1 \
                  WHERE channel = ?2 AND identifier = ?3",
-                turso::params![reply_target, channel, identifier],
+                db::params![reply_target, channel, identifier],
             )
             .await?;
         Ok(())
@@ -345,7 +345,7 @@ impl UserStore {
         self.conn
             .query_optional(
                 "SELECT user_name FROM user_channels WHERE channel = ?1 AND identifier = ?2",
-                turso::params![channel, identifier],
+                db::params![channel, identifier],
                 |row| row.get::<String>(0),
             )
             .await
@@ -356,7 +356,7 @@ impl UserStore {
         self.conn
             .query_map_strict(
                 &format!("SELECT {USER_CHANNEL_COLUMNS} FROM user_channels WHERE user_name = ?1"),
-                turso::params![user_name],
+                db::params![user_name],
                 |row| {
                     Ok::<_, ::turso::Error>(ChannelBinding {
                         channel: row.get::<String>(COL_UC_CHANNEL)?,
@@ -369,7 +369,7 @@ impl UserStore {
     }
 
     /// Convert a `users` table row into a [`UserRecord`], loading channel bindings.
-    async fn user_record_from_row(&self, row: &turso::Row) -> Result<UserRecord> {
+    async fn user_record_from_row(&self, row: &db::Row) -> Result<UserRecord> {
         let name: String = row.get(COL_USERS_NAME)?;
         let roles = self.get_user_roles(&name).await.unwrap_or_default();
         Ok(UserRecord {
@@ -389,7 +389,7 @@ impl UserStore {
     async fn list_users_where(
         &self,
         suffix: &str,
-        params: impl turso::IntoParams + Send + 'static,
+        params: impl db::IntoParams + Send + 'static,
     ) -> Result<Vec<UserRecord>> {
         let sql = format!("SELECT {USERS_COLUMNS} FROM users {suffix}");
         let rows = self.conn.query(&sql, params).await?;
@@ -403,11 +403,8 @@ impl UserStore {
     /// Find all users whose `selected_workspace` matches the given name
     /// (shared workspaces only — personal workspace users with NULL are excluded).
     pub async fn find_by_workspace(&self, workspace_name: &str) -> Result<Vec<UserRecord>> {
-        self.list_users_where(
-            "WHERE selected_workspace = ?1",
-            turso::params![workspace_name],
-        )
-        .await
+        self.list_users_where("WHERE selected_workspace = ?1", db::params![workspace_name])
+            .await
     }
 
     /// Find a single user by exact name, returning their full record with channel bindings.
@@ -417,7 +414,7 @@ impl UserStore {
             .conn
             .query(
                 &format!("SELECT {USERS_COLUMNS} FROM users WHERE name = ?1"),
-                turso::params![user_name],
+                db::params![user_name],
             )
             .await?;
         match rows.into_iter().next() {
@@ -428,12 +425,12 @@ impl UserStore {
 
     /// List all users.
     pub async fn list_users(&self) -> Result<Vec<UserRecord>> {
-        self.list_users_where("", turso::params![]).await
+        self.list_users_where("", db::params![]).await
     }
 
     /// Find the user with admin (full) permissions, if any.
     pub async fn find_admin(&self) -> Result<Option<UserRecord>> {
-        self.list_users_where("WHERE permissions = ?1", turso::params!["full"])
+        self.list_users_where("WHERE permissions = ?1", db::params!["full"])
             .await
             .map(|users| users.into_iter().next())
     }
@@ -492,7 +489,7 @@ async fn upsert_user_column(
         "INSERT INTO users (name, {field}) VALUES (?1, ?2) \
          ON CONFLICT(name) DO UPDATE SET {field} = excluded.{field}"
     );
-    tx.execute(&sql, turso::params![name, val]).await?;
+    tx.execute(&sql, db::params![name, val]).await?;
     Ok(())
 }
 
@@ -1024,7 +1021,7 @@ mod tests {
                 .conn
                 .query(
                     "SELECT 1 FROM user_roles WHERE user_name = 'doomed'",
-                    crate::turso::params![],
+                    crate::db::params![],
                 )
                 .await
                 .unwrap()

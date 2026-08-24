@@ -32,7 +32,7 @@
 /// teardown — this happens on normal `Drop`, on `process::exit` (Rust
 /// destructors do NOT run, but the kernel closes all fds), and on SIGKILL.
 /// There is no stale-lock scenario.
-use mahbot::lock_utils::try_flock;
+use mahbot::util::lock::try_flock;
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::time::Duration;

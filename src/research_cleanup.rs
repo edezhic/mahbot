@@ -42,7 +42,7 @@
 
 use crate::Workspace;
 use crate::config;
-use crate::turso::params;
+use crate::db::params;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -325,7 +325,7 @@ pub(crate) fn build_cleanup_prompt(
 /// hook, and tests (which pre-create the row to assert dedup without running
 /// the agent).
 pub(crate) async fn research_cleanup_row_exists(
-    conn: &crate::turso::Connection,
+    conn: &crate::db::Connection,
     job_id: &str,
 ) -> Result<bool> {
     Ok(conn
@@ -363,7 +363,7 @@ pub(crate) async fn research_cleanup_row_exists(
 /// envelope is routed.
 pub(crate) async fn dispatch_cleanup_for_pending_envelope(
     job_id: &str,
-    envelope: &crate::message_router::AgentJob,
+    envelope: &crate::agent::message_router::AgentJob,
 ) {
     let Ok(Some(ws)) = crate::workspace::store()
         .get_by_name(&envelope.workspace_name)
@@ -539,7 +539,9 @@ async fn run_cleanup_agent_and_finish(
         ws,
         prompt,
         None,
-        Some(crate::registry::ParentKey::Research(job_id.to_string())),
+        Some(crate::agent::registry::ParentKey::Research(
+            job_id.to_string(),
+        )),
         question.map(str::to_string),
     )
     .await;
@@ -631,7 +633,7 @@ struct MediaCursor {
     /// the deletion pass — deleting against a stale keep-set is the unsafe
     /// direction. An unchanged activity skips the DB re-read entirely (the
     /// per-tick scan budget stays available for other users — no starvation).
-    /// `last_activity` is written by [`crate::turso::now`] (chrono AutoSi —
+    /// `last_activity` is written by [`crate::db::now`] (chrono AutoSi —
     /// fractional-second precision when non-zero), so the practical residual
     /// of an unchanged activity hiding a content append is sub-microsecond —
     /// far narrower than a whole-second window.
@@ -1097,7 +1099,7 @@ mod tests {
         // One artist session mentioning the first file by absolute path.
         let session = format!("[IMAGE:{}]", mentioned.canonicalize().unwrap().display());
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         conn.execute(
             "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role) \
              VALUES ('artist_a', ?1, 'alice', 'personal:alice', 'artist')",
@@ -1125,7 +1127,7 @@ mod tests {
         let image3 = files[0].parent().unwrap().join("image_3.png");
         tokio::fs::write(&image3, "x").await.unwrap();
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         conn.execute(
             "INSERT INTO sessions (agent_id, role, content, created_at) \
              VALUES ('artist_a', 'assistant', ?1, ?2)",
@@ -1351,7 +1353,7 @@ mod tests {
     /// Insert one artist session (metadata + one message) for a user.
     async fn insert_artist_session(agent_id: &str, user: &str, content: &str) {
         let conn = &crate::session::store().conn;
-        let now = crate::turso::now();
+        let now = crate::db::now();
         conn.execute(
             "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role) \
              VALUES (?1, ?2, ?3, ?4, 'artist')",
@@ -1441,7 +1443,7 @@ mod tests {
         let conn = &crate::session::store().conn;
         conn.execute(
             "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = 'artist_r1'",
-            params![crate::turso::now()],
+            params![crate::db::now()],
         )
         .await
         .unwrap();
@@ -1576,14 +1578,14 @@ mod tests {
              VALUES ('artist_grow2', 'assistant', ?1, ?2)",
             params![
                 format!("[IMAGE:{}]", files[2].canonicalize().unwrap().display()),
-                crate::turso::now()
+                crate::db::now()
             ],
         )
         .await
         .unwrap();
         conn.execute(
             "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = 'artist_grow2'",
-            params![crate::turso::now()],
+            params![crate::db::now()],
         )
         .await
         .unwrap();

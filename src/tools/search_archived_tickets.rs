@@ -55,7 +55,7 @@ impl Tool for SearchArchivedTicketsTool {
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let query = super::get_str(&args, "query")?;
-        let board = crate::board::store();
+        let board = crate::pipeline::board::store();
 
         let (fts_results, vector_results) = tokio::join!(
             Self::fts_search(board, &self.ws_name, query),
@@ -77,11 +77,11 @@ impl Tool for SearchArchivedTicketsTool {
 }
 
 impl SearchArchivedTicketsTool {
-    /// FTS keyword search. Delegates to [`crate::board::BoardStore::search_archived_by_fts`]
+    /// FTS keyword search. Delegates to [`crate::pipeline::board::BoardStore::search_archived_by_fts`]
     /// which sanitizes the query internally. A graceful failure returns an
     /// empty vec (fall through to vector search).
     async fn fts_search(
-        board: &crate::board::BoardStore,
+        board: &crate::pipeline::board::BoardStore,
         workspace_name: &str,
         query: &str,
     ) -> Result<Vec<(String, f32)>> {
@@ -100,7 +100,7 @@ impl SearchArchivedTicketsTool {
     /// Semantic vector search: embed the query, then rank all archived ticket
     /// embeddings by cosine similarity.
     async fn vector_search(
-        board: &crate::board::BoardStore,
+        board: &crate::pipeline::board::BoardStore,
         workspace_name: &str,
         query: &str,
     ) -> Result<Vec<(String, f32)>> {
@@ -130,14 +130,14 @@ impl SearchArchivedTicketsTool {
 
     /// Format the top-N results for display.
     ///
-    /// Fetches id/title/phase via [`crate::board::BoardStore::get_tickets_by_ids`]
+    /// Fetches id/title/phase via [`crate::pipeline::board::BoardStore::get_tickets_by_ids`]
     /// and formats them in rank order. At N ≤ 10 a linear scan suffices.
     async fn format_results(
-        board: &crate::board::BoardStore,
+        board: &crate::pipeline::board::BoardStore,
         top_ids: &[String],
     ) -> Result<String> {
         let tickets = board
-            .get_tickets_by_ids(top_ids, crate::board::LoadComments::No)
+            .get_tickets_by_ids(top_ids, crate::pipeline::board::LoadComments::No)
             .await?;
 
         let mut output = String::from("Search results (top 10, highest score first):\n");
@@ -153,8 +153,8 @@ impl SearchArchivedTicketsTool {
 
 #[cfg(test)]
 mod tests {
-    use crate::board::BoardStore;
     use crate::open_test_store;
+    use crate::pipeline::board::BoardStore;
     use crate::util::test::make_ticket;
 
     /// Test that the tool-layer fts_search wrapper correctly converts
@@ -168,7 +168,7 @@ mod tests {
             &store,
             &ws,
             "UniqueSearchableTitleXYZ",
-            crate::board::TicketPhase::Done,
+            crate::pipeline::board::TicketPhase::Done,
         )
         .await;
         store.set_archived(&id).await.expect("archive");
@@ -188,13 +188,19 @@ mod tests {
     async fn test_format_results_formats_correctly() {
         let (store, _tmp) = open_test_store!(BoardStore, "board");
         let ws = crate::workspace::test_ws("ws");
-        let id_a = make_ticket(&store, &ws, "Alpha ticket", crate::board::TicketPhase::Done).await;
+        let id_a = make_ticket(
+            &store,
+            &ws,
+            "Alpha ticket",
+            crate::pipeline::board::TicketPhase::Done,
+        )
+        .await;
         store.set_archived(&id_a).await.expect("archive");
         let id_b = make_ticket(
             &store,
             &ws,
             "Beta ticket",
-            crate::board::TicketPhase::Cancelled,
+            crate::pipeline::board::TicketPhase::Cancelled,
         )
         .await;
         store.set_archived(&id_b).await.expect("archive");

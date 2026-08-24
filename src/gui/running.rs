@@ -4,8 +4,8 @@
 //! singleton / unattributable orchestrator calls).
 //!
 //! The view is a running-only window: it reads the in-memory registries
-//! ([`crate::registry::AGENT_REGISTRY`] and
-//! [`crate::registry::NON_AGENT_CALLS`]) at render time — no database
+//! ([`crate::agent::registry::AGENT_REGISTRY`] and
+//! [`crate::agent::registry::NON_AGENT_CALLS`]) at render time — no database
 //! reads, no schema changes, no new subscriptions, no history retained
 //! between ticks. The existing 1-second UI tick re-renders the page, so the
 //! view refreshes at that cadence for free.
@@ -37,9 +37,9 @@
 //! sections). All header labels (ticket titles, analyze/research questions)
 //! are captured observationally at spawn — never read from the DB.
 
+use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey};
 use crate::gui::theme;
 use crate::gui::widgets;
-use crate::registry::{AgentHandle, NonAgentCallHandle, ParentKey};
 use chrono::{DateTime, Utc};
 
 use iced::widget::{
@@ -103,8 +103,8 @@ pub(crate) fn view(
     workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
     pending_cancel: Option<&str>,
 ) -> Element<'static, Message> {
-    let agents = crate::registry::AGENT_REGISTRY.list();
-    let calls = crate::registry::NON_AGENT_CALLS.list();
+    let agents = crate::agent::registry::AGENT_REGISTRY.list();
+    let calls = crate::agent::registry::NON_AGENT_CALLS.list();
 
     // Workspace-first sections: each section holds its groups, groups
     // sorted by kind (tickets → analyze rounds → research runs →
@@ -667,7 +667,9 @@ fn render_thinking_indicator() -> Element<'static, RunningMessage> {
 /// Render one tool block: bold white tool name on top, the comma-separated
 /// key-value pairs below it in regular weight. The whole block is the hover
 /// target of a tooltip showing the FULL untruncated argument values.
-fn render_tool_block(tool: &crate::registry::RunningTool) -> Element<'static, RunningMessage> {
+fn render_tool_block(
+    tool: &crate::agent::registry::RunningTool,
+) -> Element<'static, RunningMessage> {
     let mut block = Column::new().spacing(2).align_x(Alignment::Start).push(
         text(tool.name.clone())
             .size(11)
@@ -737,7 +739,9 @@ fn value_display(value: &str) -> String {
 /// (stable, so equal-length pairs keep registration order) — the shortest
 /// pairs sit at the top and stay visible even when the longest values extend
 /// beyond the viewport. Values are full and untruncated, including secrets.
-fn render_tool_tooltip(tool: &crate::registry::RunningTool) -> Element<'static, RunningMessage> {
+fn render_tool_tooltip(
+    tool: &crate::agent::registry::RunningTool,
+) -> Element<'static, RunningMessage> {
     let mut pairs = tool.args.clone();
     pairs.sort_by_key(|(_, v)| v.chars().count());
 
@@ -766,7 +770,7 @@ fn render_tool_tooltip(tool: &crate::registry::RunningTool) -> Element<'static, 
 fn render_call_row(call: &CallRow) -> Element<'static, RunningMessage> {
     let h = &call.handle;
     let elapsed = format_elapsed(h.started_at);
-    let purpose = crate::registry::call_kind_label(h.kind);
+    let purpose = crate::agent::registry::call_kind_label(h.kind);
 
     row![
         lucide::zap::<iced::Theme, iced::Renderer>()
@@ -797,7 +801,7 @@ fn format_elapsed(started_at: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::AgentHandle;
+    use crate::agent::registry::AgentHandle;
 
     fn agent_handle(
         id: &str,

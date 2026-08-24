@@ -32,7 +32,7 @@ use fff_search::parse_grep_query;
 
 use super::menus::{ContextMenu, MenuItem};
 
-use crate::git_commands::{is_git_repo, run_git_check_ignore, run_git_output, run_git_status};
+use crate::git::commands::{is_git_repo, run_git_check_ignore, run_git_output, run_git_status};
 use crate::util::unquote_c_style;
 
 use super::common::{UndoSnapshot, UndoStack};

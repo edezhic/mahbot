@@ -106,14 +106,14 @@ impl MediaTranscriber {
             .flatten();
         let live = match &tracking {
             Some(t) => Some(LiveTrackingGuard::Agent {
-                _guard: crate::registry::AGENT_REGISTRY.activity_started(
+                _guard: crate::agent::registry::AGENT_REGISTRY.activity_started(
                     &t.agent_id,
                     t.generation,
                     "transcribing",
                 ),
             }),
             None => workspace.map(|ws| LiveTrackingGuard::Call {
-                _guard: crate::registry::NON_AGENT_CALLS.register(
+                _guard: crate::agent::registry::NON_AGENT_CALLS.register(
                     "media_transcription",
                     ws,
                     None,
@@ -253,10 +253,10 @@ async fn finish_transcription(
 /// purely for its RAII Drop side effect — it is never read by name.
 enum LiveTrackingGuard {
     Agent {
-        _guard: crate::registry::ActivityGuard,
+        _guard: crate::agent::registry::ActivityGuard,
     },
     Call {
-        _guard: crate::registry::NonAgentCallGuard,
+        _guard: crate::agent::registry::NonAgentCallGuard,
     },
 }
 

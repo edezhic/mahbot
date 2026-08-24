@@ -8,7 +8,7 @@
 use crate::config::{
     CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_VOICE_ENABLED, ModelRouting,
 };
-use crate::turso::{self};
+use crate::db::{self};
 use anyhow::Result;
 
 crate::define_store! {
@@ -50,7 +50,7 @@ crate::columns! {
 // ── Shared row-parsing helpers ──────────────────────────────────
 
 /// Parse a `ModelRouting` from a `config_model_routing` row.
-fn model_routing_from_row(row: &turso::Row) -> Result<ModelRouting, ::turso::Error> {
+fn model_routing_from_row(row: &db::Row) -> Result<ModelRouting, ::turso::Error> {
     let model = row.get::<String>(COL_MR_MODEL)?;
     let provider_order = row.get::<Option<String>>(COL_MR_PROVIDER_ORDER)?;
     Ok(ModelRouting {
@@ -60,7 +60,7 @@ fn model_routing_from_row(row: &turso::Row) -> Result<ModelRouting, ::turso::Err
 }
 
 /// Parse a `(key, value)` pair from a `config_kv` row.
-fn kv_from_row(row: &turso::Row) -> Result<(String, String), ::turso::Error> {
+fn kv_from_row(row: &db::Row) -> Result<(String, String), ::turso::Error> {
     let key = row.get::<String>(COL_KV_KEY)?;
     let value = row.get::<String>(COL_KV_VALUE)?;
     Ok((key, value))
@@ -90,16 +90,14 @@ impl ConfigStore {
     /// Upsert a key-value pair.
     pub async fn set_kv(&self, key: &str, value: &str) -> Result<()> {
         self.conn
-            .execute(SET_KV_SQL, turso::params![key, value])
+            .execute(SET_KV_SQL, db::params![key, value])
             .await?;
         Ok(())
     }
 
     /// Delete a key-value pair. Succeeds even if the key does not exist.
     pub async fn delete_kv(&self, key: &str) -> Result<()> {
-        self.conn
-            .execute(DELETE_KV_SQL, turso::params![key])
-            .await?;
+        self.conn.execute(DELETE_KV_SQL, db::params![key]).await?;
         Ok(())
     }
 
@@ -120,7 +118,7 @@ impl ConfigStore {
             .conn
             .execute(
                 MIGRATE_KV_IF_EQUALS_SQL,
-                turso::params![key, old_value, new_value],
+                db::params![key, old_value, new_value],
             )
             .await?;
         Ok(changed)
@@ -142,18 +140,18 @@ impl ConfigStore {
         if transcription_enabled {
             tx.execute(
                 DELETE_KV_SQL,
-                turso::params![CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL],
+                db::params![CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL],
             )
             .await?;
         } else {
             tx.execute(
                 SET_KV_SQL,
-                turso::params![CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, "false"],
+                db::params![CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, "false"],
             )
             .await?;
         }
         if cascade_voice_off {
-            tx.execute(DELETE_KV_SQL, turso::params![CONFIG_KEY_VOICE_ENABLED])
+            tx.execute(DELETE_KV_SQL, db::params![CONFIG_KEY_VOICE_ENABLED])
                 .await?;
         }
         tx.commit().await?;
@@ -165,7 +163,7 @@ impl ConfigStore {
         self.conn
             .query_optional(
                 "SELECT value FROM config_kv WHERE key = ?1",
-                turso::params![key],
+                db::params![key],
                 |row| row.get::<String>(0),
             )
             .await
@@ -207,14 +205,11 @@ impl ConfigStore {
     ) -> Result<()> {
         if provider_order.is_none() {
             self.conn
-                .execute(DELETE_MODEL_ROUTING_SQL, turso::params![model])
+                .execute(DELETE_MODEL_ROUTING_SQL, db::params![model])
                 .await?;
         } else {
             self.conn
-                .execute(
-                    UPSERT_MODEL_ROUTING_SQL,
-                    turso::params![model, provider_order],
-                )
+                .execute(UPSERT_MODEL_ROUTING_SQL, db::params![model, provider_order])
                 .await?;
         }
         Ok(())
@@ -235,7 +230,7 @@ impl ConfigStore {
         columns: &str,
         table: &str,
         order_by: &str,
-        parser: impl FnMut(&turso::Row) -> std::result::Result<T, E> + Send + 'static,
+        parser: impl FnMut(&db::Row) -> std::result::Result<T, E> + Send + 'static,
     ) -> Result<Vec<T>>
     where
         T: Send + 'static,
@@ -243,7 +238,7 @@ impl ConfigStore {
     {
         let sql = format!("SELECT {columns} FROM {table} ORDER BY {order_by}");
         self.conn
-            .query_map_strict(&sql, turso::params![], parser)
+            .query_map_strict(&sql, db::params![], parser)
             .await
     }
 }

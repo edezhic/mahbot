@@ -171,14 +171,14 @@ fn board_listing_isolates_hostile_titles() {
     // drifts, this test fails instead of silently covering a stale fixture.
     assert_eq!(
         format_board_line(
-            &crate::board::TicketPhase::InDevelopment,
+            &crate::pipeline::board::TicketPhase::InDevelopment,
             "mahbot-123",
             "Title",
         ),
         "• **in development** `mahbot-123` Title"
     );
 
-    let state = crate::board::TicketPhase::InDevelopment;
+    let state = crate::pipeline::board::TicketPhase::InDevelopment;
     let lines = [
         format_board_line(&state, "mahbot-1", "Fix * unclosed italic"),
         format_board_line(&state, "mahbot-2", "Use `git status` and *pair* ok"),

@@ -75,7 +75,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// Panics if called more than once (only called from `main()` at startup).
 pub fn acquire_lock(storage_root: &Path) -> Result<()> {
-    let lock_path = crate::lock_utils::lock_file_path(storage_root);
+    let lock_path = crate::util::lock::lock_file_path(storage_root);
 
     // Ensure parent directory exists.
     if let Some(parent) = lock_path.parent() {
@@ -135,7 +135,7 @@ fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
     let file = open_lock_file(path)
         .with_context(|| format!("failed to open lock file {}", path.display()))?;
 
-    if crate::lock_utils::try_flock(&file)
+    if crate::util::lock::try_flock(&file)
         .with_context(|| format!("flock failed on lock file {}", path.display()))?
     {
         Ok(Some(file))
@@ -780,7 +780,7 @@ async fn finalize_update_and_restart(
 
     // 11. Checkpoint all databases BEFORE releasing the instance lock and
     //     spawning the replacement (see doc comment above).
-    crate::checkpoint::checkpoint_all_databases().await;
+    crate::db::checkpoint::checkpoint_all_databases().await;
 
     // 12. Release instance lock so the child process can acquire it on startup.
     release_instance_lock().await;
@@ -1313,7 +1313,7 @@ fn truncate_to_last_64k(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock_utils::{lock_file_path, try_flock};
+    use crate::util::lock::{lock_file_path, try_flock};
 
     /// Make a file executable (0o755) on Unix; no-op on other platforms.
     fn make_executable(path: &Path) {

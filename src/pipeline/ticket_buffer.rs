@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
 use std::sync::{Mutex, OnceLock};
 
-use crate::board::TicketPhase;
+use crate::pipeline::board::TicketPhase;
 use crate::util::UnwrapPoison;
 
 /// Who caused a ticket phase transition.
@@ -88,7 +88,7 @@ pub(crate) fn push(
         id: id.to_string(),
         source,
         target,
-        at: crate::turso::now(),
+        at: crate::db::now(),
         origin,
     });
 }
@@ -148,7 +148,7 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::TicketPhase;
+    use crate::pipeline::board::TicketPhase;
     use std::sync::Mutex;
 
     /// Test serialization guard — Rust runs tests in parallel by default,
@@ -161,7 +161,7 @@ mod tests {
     }
 
     /// Push an entry with a deterministic timestamp (tests pin the exact
-    /// rendered format; [`push`] timestamps via [`crate::turso::now`]).
+    /// rendered format; [`push`] timestamps via [`crate::db::now`]).
     fn push_raw(
         ws: &str,
         id: &str,

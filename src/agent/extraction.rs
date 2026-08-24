@@ -560,7 +560,7 @@ mod tests {
             .query(
                 "SELECT cost, upstream_provider, success \
                  FROM llm_requests WHERE agent_id = ?1 ORDER BY rowid",
-                crate::turso::params!["extraction-flag-test"],
+                crate::db::params!["extraction-flag-test"],
             )
             .await
             .expect("query recorded rows");

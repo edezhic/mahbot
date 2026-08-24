@@ -36,7 +36,7 @@ use tracing::{debug, error, info, warn};
 use crate::channels::{
     broadcast_and_persist_agent_response, spawn_scoped_typing_task, stop_typing,
 };
-use crate::turso;
+use crate::db;
 use crate::users::UserRecord;
 use crate::util::UnwrapPoison;
 use crate::{Channel, ChatEvent, Role, SendMessage, Workspace};
@@ -90,7 +90,7 @@ fn telegram_delivery_content<'a>(
     Cow::Owned(format!(
         "{} {}:\n{}",
         telegram_role_emoji(role),
-        crate::role::role_info(&role).display_label,
+        crate::agent::role::role_info(&role).display_label,
         response
     ))
 }
@@ -330,7 +330,7 @@ pub async fn route_user_message(
 /// Used by the durable producers (manager-bound messages here; analyze/research
 /// use the source job id via [`crate::jobs::complete_job_with_envelope`]).
 async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
-    let now = turso::now();
+    let now = db::now();
     crate::session::store()
         .conn
         .execute(
@@ -535,7 +535,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // try_route(), or the agent's receiver was dropped.
         let message = match (role, job.kind) {
             (Role::Manager, MessageKind::UserMessage) => {
-                let drained = crate::ticket_buffer::drain(&job.workspace_name);
+                let drained = crate::pipeline::ticket_buffer::drain(&job.workspace_name);
                 if drained.is_empty() {
                     job.content.clone()
                 } else {

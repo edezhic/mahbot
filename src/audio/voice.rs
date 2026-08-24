@@ -57,7 +57,7 @@ use crate::audio::wake_word::{
     calibrate_negatives, encode_window,
 };
 use crate::config::{CONFIG, CONFIG_KEY_WAKE_WORD_TEMPLATES};
-use crate::turso;
+use crate::db;
 use crate::util::UnwrapPoison;
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -1651,7 +1651,7 @@ async fn route_to_agent(text: String) {
         // while the agent is still working.
         broadcast_voice_transcript(&text, &user_name, &ws.name).await;
 
-        crate::message_router::route_user_message(
+        crate::agent::message_router::route_user_message(
             text,
             ws.name,
             user_name,
@@ -1688,7 +1688,7 @@ async fn route_to_agent(text: String) {
     info!("Voice command -> {role} (workspace: {})", ws.name);
     broadcast_voice_transcript(&text, "admin", &ws.name).await;
 
-    crate::message_router::route_user_message(
+    crate::agent::message_router::route_user_message(
         text,
         ws.name,
         "admin".to_string(),
@@ -3108,8 +3108,8 @@ async fn finalize_enrollment_pipeline() -> bool {
     // (re-enrollment keeps the first creation time); trained_at is now.
     let created_at = get_enrollment()
         .filter(|e| !e.created_at.is_empty())
-        .map_or_else(turso::now, |e| e.created_at.clone());
-    let trained_at = turso::now();
+        .map_or_else(db::now, |e| e.created_at.clone());
+    let trained_at = db::now();
 
     let Some(enrollment) = WakeWordEnrollment::build(
         enrolled_phrase.clone(),

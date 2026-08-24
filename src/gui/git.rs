@@ -276,7 +276,7 @@ impl GitState {
                     async move {
                         match ws_path {
                             Some(path) => {
-                                let out = crate::git_commands::run_git_command(
+                                let out = crate::git::commands::run_git_command(
                                     &path,
                                     &["branch", "--format=%(refname:short)"],
                                 )
@@ -310,7 +310,7 @@ impl GitState {
                 let ws_path = self.workspace_path.clone();
                 Task::perform(
                     with_ws_path(ws_path, |path: PathBuf| async move {
-                        crate::git_commands::run_git_sync(&path)
+                        crate::git::commands::run_git_sync(&path)
                             .await
                             .map_err(|e| e.to_string())
                     }),
@@ -344,7 +344,7 @@ impl GitState {
                 let branch_clone = branch;
                 Task::perform(
                     with_ws_path(ws_path, |path: PathBuf| async move {
-                        crate::git_commands::run_git_command(
+                        crate::git::commands::run_git_command(
                             &path,
                             &["switch", branch_clone.as_str()],
                         )
@@ -372,7 +372,7 @@ impl GitState {
                 self.syncing = true;
                 Task::perform(
                     with_ws_path(ws_path, |path: PathBuf| async move {
-                        crate::git_commands::run_git_command(
+                        crate::git::commands::run_git_command(
                             &path,
                             &["switch", "-c", branch_clone.as_str()],
                         )
@@ -553,7 +553,7 @@ impl GitState {
     /// out-of-order results are dropped. Transient git failures surface as
     /// `Err` and leave the cached last-known-good values untouched.
     fn refresh_inner(path: PathBuf, generation: u64) -> Task<GitMessage> {
-        if !crate::git_commands::is_git_repo(&path) {
+        if !crate::git::commands::is_git_repo(&path) {
             return Task::none();
         }
 
@@ -561,7 +561,7 @@ impl GitState {
         let stats_path = path.clone();
         let stats_task = Task::perform(
             async move {
-                crate::git_commands::run_git_diff_stats(&stats_path)
+                crate::git::commands::run_git_diff_stats(&stats_path)
                     .await
                     .map_err(|e| e.to_string())
             },
@@ -572,7 +572,7 @@ impl GitState {
         let branch_path = path.clone();
         let branch_task = Task::perform(
             async move {
-                crate::git_commands::run_git_current_branch(&branch_path)
+                crate::git::commands::run_git_current_branch(&branch_path)
                     .await
                     .map_err(|e| e.to_string())
             },
@@ -583,7 +583,7 @@ impl GitState {
         let ahead_path = path;
         let ahead_task = Task::perform(
             async move {
-                crate::git_commands::run_git_behind_ahead(&ahead_path)
+                crate::git::commands::run_git_behind_ahead(&ahead_path)
                     .await
                     .map_err(|e| e.to_string())
             },
