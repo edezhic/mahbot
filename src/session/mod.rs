@@ -95,13 +95,10 @@ pub(crate) fn user_msg_with_ts(content: &str, round_ts: Option<&str>) -> ChatMes
 crate::define_store! {
     /// Global session store.
     pub(crate) static SESSIONS: SessionStore,
-    db_name = "sessions",
-    schema = SCHEMA,
-    post_open = run_migrations,
-    expect = "SESSIONS not initialized",
+    expect = "SESSIONS not initialized — call init_all_stores() first",
 }
 
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
+pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id    TEXT NOT NULL,
     role        TEXT NOT NULL,
@@ -162,7 +159,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target
 
 CREATE TABLE IF NOT EXISTS ticket_jobs (
     id          TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    ticket_id   TEXT NOT NULL,
+    ticket_id   TEXT NOT NULL REFERENCES tickets(id),
     stage       TEXT NOT NULL
 );
 
@@ -171,24 +168,7 @@ CREATE TABLE IF NOT EXISTS research_jobs (
     state TEXT NOT NULL
 );";
 
-impl SessionStore {
-    /// Apply pending schema migrations (see [`crate::migrations`]). Fires
-    /// from the store `open` hook after the SCHEMA batch ran; the first
-    /// migration adds the real provider-reported session length column to
-    /// `session_metadata`.
-    async fn run_migrations(&self) -> anyhow::Result<()> {
-        crate::turso::run_pending_migrations(
-            &self.conn,
-            "sessions",
-            crate::migrations::SESSION_MIGRATIONS,
-        )
-        .await
-    }
-}
-
 // ── Column index constants ──────────────────────────────────
-
-// Session messages (2-column SELECT: role, content)
 crate::columns! {
     SESSION_MESSAGE_COLUMNS [SM] {
         ROLE    => "role",
@@ -1562,7 +1542,12 @@ mod tests {
 
     #[tokio::test]
     async fn session_list_excluding_prefixes() {
-        crate::util::test::init_test_stores().await;
+        // Use an ISOLATED store (not the shared `store()` backed by
+        // `test_root()`): the shared global DB is mutated by parallel tests
+        // (e.g. management/jobs purging `ticket_`/`analyze_`/`research_`
+        // session metadata), which deletes this test's just-appended rows and
+        // makes exact-set assertions flaky under high test-thread counts.
+        let (store, _dir) = crate::open_test_store!(crate::session::SessionStore, "session");
 
         // Direct session plus one session per excluded prefix — the union of
         // `manager_` and [`TRANSIENT_AGENT_ID_PREFIXES`].
@@ -1576,7 +1561,7 @@ mod tests {
         for id in std::iter::once(&direct_id).chain(prefixed_ids.iter()) {
             // list_sessions_with_metadata joins with session_metadata, so the
             // context columns are needed too (append alone doesn't create them).
-            store()
+            store
                 .append_with_context(
                     id,
                     &ChatMessage::user("msg"),
@@ -1590,7 +1575,7 @@ mod tests {
         }
 
         // Without exclusions, all 7 sessions should be listed.
-        let all = store().list_sessions_with_metadata().await;
+        let all = store.list_sessions_with_metadata().await;
         let all_ids: Vec<&str> = all.iter().map(|s| s.agent_id.as_str()).collect();
         assert!(
             all_ids.contains(&direct_id.as_str()),
@@ -1604,7 +1589,7 @@ mod tests {
         }
 
         // Excluding manager_ + every transient prefix → only the direct session remains.
-        let excluded = store()
+        let excluded = store
             .list_sessions_with_metadata_excluding(&excluded_prefixes)
             .await;
         let excluded_ids: Vec<&str> = excluded.iter().map(|s| s.agent_id.as_str()).collect();

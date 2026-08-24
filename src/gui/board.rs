@@ -41,7 +41,7 @@ const AGENT_RUNNING_PHASES: &[TicketPhase] = &[
 /// text untrue).
 ///
 /// The authoritative form is async ([`agent_in_flight`]) because the active
-/// agents live in sessions.db; the synchronous [`in_agent_phase`] proxy is
+/// agents live in the session store; the synchronous [`in_agent_phase`] proxy is
 /// used only for the UI's confirmation-eligibility heuristic, and the
 /// `PerformAction` gate re-checks authoritatively at execution.
 fn in_agent_phase(ticket: &Ticket) -> bool {

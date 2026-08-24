@@ -3,7 +3,7 @@
 //! Dispatched from `main()` BEFORE the instance flock is acquired (like
 //! `debug` and `__grep-engine`), so it runs while the live daemon holds the
 //! lock. It never opens a live mahbot store for writing: the only database
-//! touch is a read-only (ReadOnly|NoLock) `config.db` lookup for the worker
+//! touch is a read-only (ReadOnly|NoLock) config-store lookup for the worker
 //! model / provider key fallback, identical in spirit to `mahbot debug`.
 //!
 //! # Modes
@@ -90,8 +90,8 @@ pub(crate) enum CliError {
 /// Parsed `bench-openrouter` options.
 ///
 /// `model` is fully resolved at parse time (flag > env `MAHBOT_BENCH_MODEL` >
-/// read-only config.db `worker_model` > [`crate::config::DEFAULT_WORKER_MODEL`]);
-/// the API key is resolved later (flag > env > config.db, hard error when
+/// read-only config-store `worker_model` > [`crate::config::DEFAULT_WORKER_MODEL`]);
+/// the API key is resolved later (flag > env > config store, hard error when
 /// nothing is configured) so the error path can be reported cleanly.
 pub(crate) struct BenchOptions {
     pub model: String,
@@ -295,7 +295,7 @@ impl BenchOptions {
 }
 
 /// Resolve the benchmark model when `--model` was not given:
-/// env `MAHBOT_BENCH_MODEL` > read-only config.db `worker_model` >
+/// env `MAHBOT_BENCH_MODEL` > read-only config-store `worker_model` >
 /// [`crate::config::DEFAULT_WORKER_MODEL`]. Never fails.
 fn model_from_env_or_config() -> String {
     if let Ok(m) = std::env::var("MAHBOT_BENCH_MODEL")
@@ -313,7 +313,7 @@ fn model_from_env_or_config() -> String {
 }
 
 /// Resolve the API key: `--api-key` > env `MAHBOT_BENCH_API_KEY` >
-/// env `OPENROUTER_API_KEY` > read-only config.db `provider_key` > hard error.
+/// env `OPENROUTER_API_KEY` > read-only config-store `provider_key` > hard error.
 /// Returns the key and its source label for the plan.
 fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> {
     if let Some(k) = &opts.api_key
@@ -344,15 +344,17 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
     ))
 }
 
-// ── Read-only config.db helper ─────────────────────────────────────
+// ── Read-only config-store helper ────────────────────────────────────
 
 /// Read one `config_kv` value from the live config store, read-only.
 ///
-/// Opens `<storage_root>/db/config.db` with `ReadOnly|NoLock` (the same path
-/// `mahbot debug` uses — never creates or mutates files, reuses the daemon's
-/// `.tshm` coordination). Any failure — missing file, unreadable store,
-/// missing row — degrades to `Ok(None)` with a `tracing::warn`: this is a
-/// fallback resolution path, never fatal.
+/// Opens the consolidated `mahbot.db` (the config store's home) with
+/// `ReadOnly|NoLock` — the same path `mahbot debug` uses — and never creates
+/// or mutates files, reusing the daemon's `.tshm` coordination. On a
+/// pre-consolidation install it falls back to the legacy per-store
+/// `config.db`. Any failure — missing file, unreadable store, missing row —
+/// degrades to `Ok(None)` with a `tracing::warn`: this is a fallback resolution
+/// path, never fatal.
 // The `Result` wrapper is part of the shared helper contract even though the
 // body swallows all errors (read-only fallback path).
 #[allow(clippy::unnecessary_wraps)]
@@ -372,15 +374,28 @@ pub(crate) fn read_config_kv(storage_root: &Path, key: &str) -> anyhow::Result<O
 }
 
 fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option<String>> {
+    // In the consolidated layout the config store lives in the single domain
+    // database; fall back to the legacy per-store config.db when the
+    // consolidated file has not been created yet (pre-consolidation install).
     let db_path = crate::turso::store_db_path(storage_root, "config");
     if !db_path.exists() {
-        return Ok(None);
+        let legacy = crate::turso::legacy_store_db_path(storage_root, "config");
+        if !legacy.exists() {
+            return Ok(None);
+        }
+        return read_config_kv_file(&legacy, key);
     }
+    read_config_kv_file(&db_path, key)
+}
+
+fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<String>> {
+    // Callers guarantee `db_path` exists (see `read_config_kv_inner`), so this
+    // does not re-check — a missing file degrades to `Ok(None)` there.
     let opts = turso::core::DatabaseOpts::new()
         .with_multiprocess_wal(true)
         .with_index_method(true);
-    let (io, db) = crate::debug::open_readonly(&db_path, &db_path, opts)?;
-    let conn = crate::debug::connect_readonly(&db, &db_path)?;
+    let (io, db) = crate::debug::open_readonly(db_path, db_path, opts)?;
+    let conn = crate::debug::connect_readonly(&db, db_path)?;
 
     let mut stmt = conn
         .query("SELECT value FROM config_kv WHERE key = ?1")
@@ -466,10 +481,10 @@ Two modes:
 
 Flags:
   --model <slug>         Model id to benchmark. Resolution: --model, env
-                         MAHBOT_BENCH_MODEL, config.db worker_model, default.
+                         MAHBOT_BENCH_MODEL, config-store worker_model, default.
   --api-key <key>        OpenRouter API key. Resolution: --api-key, env
                          MAHBOT_BENCH_API_KEY, env OPENROUTER_API_KEY,
-                         config.db provider_key. Never printed; the manifest
+                         config-store provider_key. Never printed; the manifest
                          stores only '***' for its value.
   --cap-usd <f64>        Total cost cap in USD (default: 2.00). Also sets the
                          per-provider guard (cap x2 / selected count).

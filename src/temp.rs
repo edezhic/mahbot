@@ -198,7 +198,7 @@ pub(crate) fn bare_mktemp_landing_root() -> PathBuf {
 const TEMP_CLEANUP_PROMPT_KEY: &str = "sanitation/temp_cleanup.md";
 
 /// Synthetic workspace name for the cleaner. Never registered in
-/// workspaces.db — ephemeral, like research run roots. Explicit name: the
+/// the `workspaces` table — ephemeral, like research run roots. Explicit name: the
 /// pinned temp root's last path component is "mahbot", which would collide
 /// with the registered repo workspace via `Workspace::from_path`.
 const TEMP_CLEANUP_WORKSPACE_NAME: &str = "tmp";

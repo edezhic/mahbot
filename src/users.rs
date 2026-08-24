@@ -1,6 +1,6 @@
 //! Per-user identity, permissions, workspace and role preferences, and channel bindings.
 //!
-//! Two tables in `users.db`:
+//! Two tables in the consolidated domain database (`mahbot.db`):
 //! - `users` — canonical user identity: `name`, `permissions`, `selected_workspace`, `selected_role`.
 //! - `user_channels` — channel bindings: maps a channel+identifier (e.g. Telegram @username)
 //!   to a user. The `reply_target` is stored here (per-channel routing address).
@@ -12,7 +12,7 @@
 //! ## Personal workspaces
 //!
 //! When `selected_workspace` is NULL, the user has a personal workspace at
-//! `~/.mahbot/userspaces/<name>/`. It is NOT registered in `workspaces.db` —
+//! `~/.mahbot/userspaces/<name>/`. It is NOT registered in the `workspaces` table —
 //! computed on the fly. Personal workspaces have no board pipeline, no
 //! maintainer, no diagnostics discovery.
 
@@ -30,13 +30,11 @@ use tracing::warn;
 crate::define_store! {
     /// Global user store.
     pub(crate) static USER_STORE: UserStore,
-    db_name = "users",
-    schema = SCHEMA,
     post_open = ensure_admin_user,
-    expect = "USER_STORE not initialized — call init_global() first",
+    expect = "USER_STORE not initialized — call init_all_stores() first",
 }
 
-const SCHEMA: &str = "\
+pub(crate) const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS users (
     name                TEXT PRIMARY KEY,
     permissions         TEXT,
@@ -79,7 +77,10 @@ crate::columns! {
 
 impl UserStore {
     /// Auto-create the admin user if this is a fresh database.
-    async fn ensure_admin_user(&self) -> Result<()> {
+    ///
+    /// Runs idempotently from both [`crate::turso::init_all_stores`] (production,
+    /// on the shared consolidated connection) and each isolated user store open.
+    pub(crate) async fn ensure_admin_user(&self) -> Result<()> {
         let rows = self
             .conn
             .query("SELECT 1 FROM users WHERE name = 'admin'", turso::params![])
@@ -584,7 +585,7 @@ fn fallback_storage_root() -> PathBuf {
 /// `<storage_root>/userspaces/<name>/`.
 ///
 /// This path is computed on the fly — personal workspaces are NOT registered
-/// in `workspaces.db`.
+/// in the `workspaces` table.
 #[must_use]
 pub fn personal_workspace_path(user_name: &str) -> PathBuf {
     userspaces_root().join(user_name)
@@ -629,14 +630,14 @@ pub async fn get_raw_selected_workspace(user_name: &str) -> Result<Option<String
 
 /// Get the current active workspace for a user.
 ///
-/// If `selected_workspace` is set, looks up from `workspaces.db`.
+/// If `selected_workspace` is set, looks up from the `workspaces` table.
 /// If NULL, constructs a personal workspace from the user's name
 /// (path: `~/.mahbot/userspaces/<user_name>/`).
 pub async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
     let s = store();
     let selected = s.get_selected_workspace_name(user_name).await?;
     if let Some(ws_name) = selected {
-        // Shared workspace: look up from workspaces.db
+        // Shared workspace: look up from the workspaces table
         crate::workspace::get_by_name(&ws_name).await
     } else {
         // Personal workspace: construct from userspace path

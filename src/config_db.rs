@@ -1,4 +1,5 @@
-//! Config key-value pairs and per-model routing rules stored in `config.db`.
+//! Config key-value pairs and per-model routing rules stored in the
+//! consolidated domain database (`mahbot.db`).
 //!
 //! Two tables:
 //! - `config_kv` — generic key-value string pairs for runtime configuration.
@@ -13,12 +14,10 @@ use anyhow::Result;
 crate::define_store! {
     /// Global config store.
     pub static CONFIG_STORE: ConfigStore,
-    db_name = "config",
-    schema = SCHEMA,
-    expect = "CONFIG_STORE not initialized — call init_global() first",
+    expect = "CONFIG_STORE not initialized — call init_all_stores() first",
 }
 
-const SCHEMA: &str = "\
+pub(crate) const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS config_kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -555,7 +554,7 @@ mod tests {
     /// endpoint can be configured before its server is reachable. Port 1 →
     /// immediate connection refused — fast, no external network.
     #[tokio::test]
-    #[serial_test::serial(config_persist)]
+    #[serial_test::serial(config_persist, provider)] // snapshots/restores the process-global PROVIDER singleton
     async fn test_persist_settled_unreachable_custom_endpoint_saves_with_warning() {
         crate::util::test::init_test_stores().await;
         let store = crate::config_db::store();

@@ -51,7 +51,8 @@ fn format_startup_panic(payload: &(dyn std::any::Any + Send)) -> String {
 async fn bootstrap_mahbot() -> Result<()> {
     mahbot::config::load_or_init().await?;
 
-    // Boot pre-flight: classify all 7 stores BEFORE any store is opened (the
+    // Boot pre-flight: classify every physical store (the consolidated
+    // `mahbot.db` plus the separate `logs.db`) BEFORE any store is opened (the
     // logs store opens first inside init_tracing, and turso's own reopen
     // would consume the coordination evidence). The per-store heal strategy
     // flows from this scan into turso::open_store.
@@ -512,7 +513,7 @@ fn main() -> Result<()> {
 
     // bench-openrouter subcommand: standalone OpenRouter provider benchmark.
     // Dispatched before lock acquisition — must run while the daemon holds the
-    // flock. Never touches live stores (config.db reads are read-only).
+    // flock. Never touches live stores (config-store reads are read-only).
     if std::env::args().nth(1).as_deref() == Some("bench-openrouter") {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

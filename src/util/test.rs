@@ -16,8 +16,8 @@
 //! modules. Moved here so all test infrastructure lives in one place.
 //!
 //! Also provides [`JobRowBuilder`], a builder for inserting test `jobs` rows
-//! (the sessions.db durability/resume substrate) that mirrors the production
-//! INSERT in [`crate::jobs::spawn_job`].
+//! (the durability/resume substrate in the consolidated domain database) that
+//! mirrors the production INSERT in [`crate::jobs::spawn_job`].
 //!
 //! Also provides [`create_test_workspace`] (inserting a workspace into the test DB)
 //! and [`init_management_test_stores`] (initializing all stores plus the manager
@@ -329,25 +329,33 @@ impl crate::Provider for FakeProvider {
 ///
 /// Returned by [`install_fake_provider`] — holding it (typically `let _guard`)
 /// restores the pre-test provider (or unset state) when the test finishes,
-/// including on panic, so the fake never leaks into other tests.
+/// including on panic, so the fake never leaks into other tests. The restore is
+/// conditional on the provider not having been replaced by a concurrent test
+/// (see [`restore_provider_for_test_if`]), so a guard never clobbers a newer
+/// fake installed by another test.
 #[must_use]
 pub(crate) struct FakeProviderGuard {
     previous: Option<Arc<dyn crate::Provider>>,
+    installed: Arc<dyn crate::Provider>,
 }
 
 impl Drop for FakeProviderGuard {
     fn drop(&mut self) {
-        crate::providers::restore_provider_for_test(self.previous.take());
+        crate::providers::restore_provider_for_test_if(&self.installed, self.previous.take());
     }
 }
 
 /// Install a [`FakeProvider`] as the global provider for tests.
 ///
 /// Callers must hold [`retry_tests_lock()`] for the duration and keep the
-/// returned guard alive — dropping it restores the previous provider.
+/// returned guard alive — dropping it (on test end or panic) restores the
+/// previous provider without clobbering a newer fake installed concurrently.
 pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeProviderGuard {
-    let previous = crate::providers::swap_provider_for_test(provider);
-    FakeProviderGuard { previous }
+    let previous = crate::providers::swap_provider_for_test(provider.clone());
+    FakeProviderGuard {
+        previous,
+        installed: provider,
+    }
 }
 
 /// Install a caller-owned logs store for `record_llm_*` stat writes for the
@@ -776,7 +784,8 @@ impl<'a> TicketBuilder<'a> {
     }
 }
 
-/// Builder for inserting a test `jobs` row (sessions.db durability substrate).
+/// Builder for inserting a test `jobs` row (the durability/resume substrate
+/// in the consolidated domain database).
 ///
 /// Mirrors the production INSERT in [`crate::jobs::spawn_job`] — when the
 /// `jobs` schema changes, update both this builder and the production insert.

@@ -2046,6 +2046,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_consolidation_single_parseable_source_skips_grouping() {
         let _guard = retry_tests_lock();
@@ -2110,6 +2111,7 @@ mod tests {
     /// delivered with the extraction-failure marker (fail-open at the
     /// extraction step, not the synthesis step).
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn test_extraction_fail_open_delivers_raw_reports() {
         let _lock = retry_tests_lock();

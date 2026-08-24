@@ -12,12 +12,10 @@ use anyhow::Result;
 crate::define_store! {
     /// Global chat history store.
     pub(crate) static CHAT_HISTORY: ChatHistoryStore,
-    db_name = "chat_history",
-    schema = SCHEMA,
-    expect = "CHAT_HISTORY not initialized — call init_global() first",
+    expect = "CHAT_HISTORY not initialized — call init_all_stores() first",
 }
 
-const SCHEMA: &str = "\
+pub(crate) const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS chat_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id TEXT NOT NULL UNIQUE,

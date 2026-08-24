@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::OnceCell;
 use tracing::{info, warn};
 use turso::Builder;
 pub(crate) use turso::{IntoParams, Row, Value, params};
@@ -100,48 +99,87 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 )]
 pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"];
 
-/// Return an iterator over all checkpointable database stores.
+/// Name (file stem) of the single consolidated domain database file that backs
+/// the board, sessions, workspaces, users, config, and chat_history stores.
+///
+/// The 6 domain stores were historically split across 6 separate files; they
+/// now share one file (and one shared [`Connection`]) so that cross-store
+/// integrity is enforceable with real foreign keys and phase+stage updates are
+/// atomic within a single transaction domain. The logs store remains a
+/// separate file ([`LOG_DB_NAME`]).
+pub(crate) const CONSOLIDATED_DB_NAME: &str = "mahbot";
+
+/// Logical store names consolidated into [`CONSOLIDATED_DB_NAME`].
+///
+/// These are the names accepted by `mahbot debug --db <name>` and used to
+/// resolve the consolidated file path; each maps to the single physical
+/// [`CONSOLIDATED_DB_NAME`] file. The logs store is NOT in this list — it
+/// remains its own file.
+pub(crate) const DOMAIN_STORE_NAMES: &[&str] = &[
+    "board",
+    "sessions",
+    "workspaces",
+    "users",
+    "config",
+    "chat_history",
+];
+
+/// Name (file stem) of the logs store — the one store that stays a separate
+/// file/connection. Opened manually in [`crate::logs::init_tracing`] before the
+/// other stores; it carries no migration runner.
+pub(crate) const LOG_DB_NAME: &str = "logs";
+
+/// The single shared consolidated domain connection, set once by
+/// [`init_all_stores`]. Each domain store struct holds a clone of this
+/// connection (same underlying turso connection — the shared transaction
+/// domain). The logs store does NOT use this connection.
+pub(crate) static DOMAIN_CONN: tokio::sync::OnceCell<Connection> =
+    tokio::sync::OnceCell::const_new();
+
+/// Return an iterator over all **physical, checkpointable** database stores.
 ///
 /// Each item is `(name, Option<&'static Connection>)` where `None` means the
 /// store has not been initialized yet.
 ///
-/// This is the **single source of truth** for which stores exist and are
-/// checkpointed.  [`store_names`] derives the name list from this iterator,
-/// guaranteeing no drift between the name list and the checkpoint list.
+/// This is the single source of truth for which **physical files** exist and
+/// are checkpointed. After consolidation the 6 domain stores share ONE file
+/// ([`CONSOLIDATED_DB_NAME`]) plus the separate logs file, so this yields
+/// exactly two units. [`store_names`] returns the LOGICAL store names accepted
+/// by `mahbot debug --db <name>` — a deliberately separate list, because
+/// several logical names map to the same physical file.
 pub(crate) fn iter_checkpoint_stores()
 -> impl Iterator<Item = (&'static str, Option<&'static crate::turso::Connection>)> {
     [
-        ("board", crate::board::BOARD.get().map(|s| &s.conn)),
-        (
-            "chat_history",
-            crate::chat_history::CHAT_HISTORY.get().map(|s| &s.conn),
-        ),
-        (
-            "config",
-            crate::config_db::CONFIG_STORE.get().map(|s| &s.conn),
-        ),
-        ("logs", crate::logs::LOG_STORE.get().map(|s| &s.conn)),
-        ("sessions", crate::session::SESSIONS.get().map(|s| &s.conn)),
-        ("users", crate::users::USER_STORE.get().map(|s| &s.conn)),
-        (
-            "workspaces",
-            crate::workspace::WORKSPACES.get().map(|s| &s.conn),
-        ),
+        (CONSOLIDATED_DB_NAME, DOMAIN_CONN.get()),
+        (LOG_DB_NAME, crate::logs::LOG_STORE.get().map(|s| &s.conn)),
     ]
     .into_iter()
 }
 
-/// Return all canonical store names, derived from [`iter_checkpoint_stores`].
+/// Return all canonical **logical** store names accepted by `mahbot debug --db`.
 ///
-/// This replaces the former `ALL_STORE_NAMES` constant — the name list is now
-/// derived from the same single-source-of-truth iterator that drives
-/// checkpointing, so no drift is possible.
+/// These are the names users address stores by (`board`, `sessions`, …,
+/// `chat_history`) plus `logs`. Several map to the single consolidated file via
+/// [`store_db_path`]. This is **not** derived from
+/// [`iter_checkpoint_stores`] (which enumerates the *physical* files): the two
+/// lists are intentionally separate — several logical names share one physical
+/// file — so both must be updated when a store is added or consolidated.
 ///
 /// Used by:
 /// - `mahbot debug` — validates `--db` argument values.
 /// - Callers that previously referenced `ALL_STORE_NAMES`.
+///
+/// # Consolidated layout
+///
+/// The 6 domain stores (board, sessions, workspaces, users, config,
+/// chat_history) are consolidated into ONE physical file
+/// ([`CONSOLIDATED_DB_NAME`]); only the logs store is a separate file. This
+/// function returns the LOGICAL store names so `--db board`, `--db sessions`,
+/// etc. resolve to the single consolidated file via [`store_db_path`].
 pub(crate) fn store_names() -> Vec<&'static str> {
-    iter_checkpoint_stores().map(|(name, _)| name).collect()
+    let mut names: Vec<&'static str> = DOMAIN_STORE_NAMES.to_vec();
+    names.push(LOG_DB_NAME);
+    names
 }
 
 /// Initialize all database stores concurrently.
@@ -153,66 +191,61 @@ pub(crate) fn store_names() -> Vec<&'static str> {
 /// other subsystem is ready. The stats tables (tool_calls, llm_requests)
 /// live in the logs store.
 ///
-/// > **Keep this list in sync with [`iter_checkpoint_stores`]** — every store
-/// > listed here must also appear in that iterator.  The converse is not strictly
-/// > required because `logs` (and any future store initialized outside this path)
-/// > lives only in the checkpoint iterator.
+/// # Consolidated layout (decision 1)
 ///
-/// # Real parallelism (decision 5)
-///
-/// Each store is spawned onto the runtime rather than joined via `try_join!`.
-/// turso's async query API performs the actual scan synchronously inside
-/// `poll` (a `step` only returns `Pending` on async I/O; for page-cache hits it
-/// returns `Row`/`Done` immediately), so `try_join!` polls the six
-/// opens — each ending in a full-DB `quick_check` — sequentially on a single
-/// task. Spawning gives each store its own worker, so the integrity scans run
-/// in parallel (the win scales with DB size).
-///
-/// # Error semantics
-///
-/// Unlike `try_join!` (fail-fast: cancels sibling opens on the first error,
-/// propagates panics), the spawned tasks all run to completion — every store
-/// gets its integrity verified even when a sibling fails — and the first error
-/// (in completion order) is reported. A panic inside a store init surfaces as
-/// a `JoinError` and is mapped back to an error so the boot failure surfaces
-/// through the binary's `bootstrap_mahbot_safe` catch_unwind instead of
-/// vanishing into the runtime.
+/// The 6 domain stores now share ONE file ([`CONSOLIDATED_DB_NAME`]) and ONE
+/// shared [`Connection`] ([`DOMAIN_CONN`]) — every store struct holds a clone
+/// of the same connection, so `begin_tx` on any store acquires the same mutex
+/// and phase+stage updates are atomic within a single transaction domain. The
+/// consolidated schema + migrations are applied once via
+/// [`open_consolidated_store`], and per-store post-open hooks (tickets FTS
+/// index, admin-user seed) run idempotently before the cells are set.
 pub async fn init_all_stores() -> anyhow::Result<()> {
-    let mut set = tokio::task::JoinSet::new();
-    set.spawn(crate::session::init_global());
-    set.spawn(crate::workspace::init_global());
-    set.spawn(crate::users::init_global());
-    set.spawn(crate::board::init_global());
-    set.spawn(crate::chat_history::init_global());
-    set.spawn(crate::config_db::init_global());
-
-    let mut first_error: Option<anyhow::Error> = None;
-    while let Some(result) = set.join_next().await {
-        let outcome = match result {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(e),
-            Err(join_err) => {
-                // A store-init panic surfaces as JoinError — preserve the
-                // boot-failure UX (previously panics propagated through
-                // try_join! into bootstrap_mahbot_safe's catch_unwind).
-                let message = join_err.try_into_panic().map_or_else(
-                    |_| "store init task failed to join".to_string(),
-                    |p| crate::util::panic_message(&*p),
-                );
-                Some(anyhow::anyhow!("store init task panicked: {message}"))
-            }
-        };
-        if let Some(e) = outcome
-            && first_error.is_none()
-        {
-            first_error = Some(e);
-        }
+    // Idempotent: the consolidated connection is set once. Re-entering (e.g.
+    // a test that calls init_test_stores twice) must not re-open / re-migrate.
+    if DOMAIN_CONN.get().is_some() {
+        return Ok(());
     }
 
-    match first_error {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    let root = crate::config::CONFIG.global_storage_root();
+    let conn = open_consolidated_store(&root).await?;
+
+    // Run the idempotent per-store post-open hooks on the shared connection,
+    // in a defined order, before exposing the store cells.
+    let board = crate::board::BoardStore { conn: conn.clone() };
+    board.after_open().await?;
+    let users = crate::users::UserStore { conn: conn.clone() };
+    users.ensure_admin_user().await?;
+
+    let session = crate::session::SessionStore { conn: conn.clone() };
+    let workspace = crate::workspace::WorkspaceStore { conn: conn.clone() };
+    let config = crate::config_db::ConfigStore { conn: conn.clone() };
+    let chat_history = crate::chat_history::ChatHistoryStore { conn: conn.clone() };
+
+    // Record the shared connection before setting any cell so a concurrent
+    // re-entry observes it and short-circuits.
+    let _ = DOMAIN_CONN.set(conn.clone());
+
+    crate::board::BOARD
+        .set(board)
+        .map_err(|_| anyhow::anyhow!("BOARD already initialized"))?;
+    crate::session::SESSIONS
+        .set(session)
+        .map_err(|_| anyhow::anyhow!("SESSIONS already initialized"))?;
+    crate::workspace::WORKSPACES
+        .set(workspace)
+        .map_err(|_| anyhow::anyhow!("WORKSPACES already initialized"))?;
+    crate::users::USER_STORE
+        .set(users)
+        .map_err(|_| anyhow::anyhow!("USER_STORE already initialized"))?;
+    crate::config_db::CONFIG_STORE
+        .set(config)
+        .map_err(|_| anyhow::anyhow!("CONFIG_STORE already initialized"))?;
+    crate::chat_history::CHAT_HISTORY
+        .set(chat_history)
+        .map_err(|_| anyhow::anyhow!("CHAT_HISTORY already initialized"))?;
+
+    Ok(())
 }
 
 /// Create [`turso::core::DatabaseOpts`] with all experimental features enabled.
@@ -248,86 +281,6 @@ pub(crate) fn experimental_database_opts() -> turso::core::DatabaseOpts {
 #[must_use]
 pub(crate) fn family_database_opts() -> turso::core::DatabaseOpts {
     experimental_database_opts().with_multiprocess_wal(false)
-}
-
-/// Register a global singleton store.
-///
-/// This is the canonical init pattern for all DB-backed global stores. Each module
-/// calls this from its `init_global()` function with its `OnceCell`, a name for
-/// error messages, and an async open function (typically a closure that captures
-/// the storage root and calls the store's `open` method).
-///
-/// # Errors
-/// Returns an error if the store fails to open, or if the cell is already set.
-pub(crate) async fn register_global_store<T, F, Fut>(
-    cell: &OnceCell<T>,
-    name: &str,
-    open_fn: F,
-) -> anyhow::Result<()>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = anyhow::Result<T>> + Send,
-{
-    let store = open_fn().await?;
-    cell.set(store)
-        .map_err(|_| anyhow::anyhow!("{name} already initialized"))?;
-    Ok(())
-}
-
-/// Declare a global `OnceCell`-backed store with `init_global()` and `store()`.
-///
-/// Generates three items:
-/// - `pub static $NAME: OnceCell<$Type>` — the underlying cell.
-/// - `pub async fn init_global()` — calls `register_global_store` with the
-///   constructor function invoked on `CONFIG.global_storage_root()`.
-/// - `#[must_use] pub fn store()` — returns `&'static $Type`, panicking if
-///   not yet initialized.
-///
-/// # Syntax
-///
-/// Invocation with a required custom expect message:
-/// ```ignore
-/// global_store! {
-///     /// Doc comment for the static.
-///     pub static $NAME: $Type,
-///     constructor = $constructor_expr,
-///     expect = $expect_message,
-/// }
-/// ```
-#[macro_export]
-macro_rules! global_store {
-    // Custom expect form.
-    (
-        $(#[$attr:meta])*
-        $vis:vis static $name:ident: $ty:ty,
-        constructor = $constructor:expr,
-        expect = $expect:expr,
-    ) => {
-        $(#[$attr])*
-        $vis static $name: ::tokio::sync::OnceCell<$ty> =
-            ::tokio::sync::OnceCell::const_new();
-
-        #[doc = concat!("Initialize the global ", stringify!($name), " store.")]
-        $vis async fn init_global() -> ::anyhow::Result<()> {
-            let root = $crate::config::CONFIG.global_storage_root();
-            $crate::turso::register_global_store(
-                &$name,
-                stringify!($name),
-                || $constructor(&root),
-            )
-            .await
-        }
-
-        #[must_use]
-        #[doc = concat!(
-            "Get a reference to the global ",
-            stringify!($name),
-            " store.\n\n# Panics\n\nPanics if the store has not been initialized.",
-        )]
-        $vis fn store() -> &'static $ty {
-            $name.get().expect($expect)
-        }
-    };
 }
 
 /// Remove characters that cause FTS query parser errors.
@@ -539,6 +492,18 @@ pub(crate) type StoreFds<'a> = crate::wal_guard::StoreFds<'a>;
 /// in `Drop`). The persistent sidecar fds (see [`PersistentSidecarFd`]) are
 /// opened once at store open and never closed — the daemon-side open+close
 /// of `.tshm`/`-wal` is what drops the macOS process-scoped fcntl locks.
+///
+/// # Shared-connection discipline (consolidated layout)
+///
+/// After consolidation all 6 domain stores hold a **clone of one** connection
+/// (the same [`Mutex`]), so the mutex is NOT reentrant and is never shared
+/// between independent locks. A code path that holds a [`TxGuard`] (which keeps
+/// the mutex locked for the transaction's lifetime) MUST use `tx.query()` /
+/// `tx.execute()` / `tx.begin_tx()` for any further access to that connection —
+/// calling another store's `conn.query()` / `conn.execute()` / `conn.begin_tx()`
+/// while holding the guard deadlocks (the guard's mutex is already held). Before
+/// consolidation each store had its own mutex, so cross-store calls were safe;
+/// they are now a single lock and must be routed through the guard.
 #[derive(Clone, Debug)]
 pub(crate) struct Connection {
     /// Persistent turso connection — reused for all execute/query calls.
@@ -1346,10 +1311,32 @@ pub(crate) async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Re
     Ok(conn)
 }
 
-/// Absolute path to `<root>/db/<name>.db` — single source of truth for store
-/// file naming across the debug CLI, WAL guard, and logs quarantine.
+/// Resolve a logical store name to its physical database file path.
+///
+/// # Consolidated layout (decision 1)
+///
+/// The 6 domain stores ([`DOMAIN_STORE_NAMES`]) are consolidated into ONE file
+/// ([`CONSOLIDATED_DB_NAME`]); the logs store remains its own file. So this
+/// function maps every domain name (and the canonical
+/// [`CONSOLIDATED_DB_NAME`] itself) to `root/db/{CONSOLIDATED_DB_NAME}.db`, and
+/// [`LOG_DB_NAME`] to `root/db/{LOG_DB_NAME}.db`.
 #[must_use]
 pub(crate) fn store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
+    let stem = if name == LOG_DB_NAME {
+        LOG_DB_NAME
+    } else {
+        CONSOLIDATED_DB_NAME
+    };
+    root.join("db").join(format!("{stem}.db"))
+}
+
+/// Resolve a logical store name to its **legacy** per-store file path
+/// (`root/db/{name}.db`), as it existed before consolidation.
+///
+/// Used only by the one-time consolidation import (reading pre-consolidation
+/// store files) and the fresh-install probe, so the upgrade path can detect an
+/// existing install that still uses the legacy layout.
+pub(crate) fn legacy_store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
     root.join("db").join(format!("{name}.db"))
 }
 
@@ -1585,6 +1572,512 @@ pub(crate) async fn open_store(
             }
         }
     }
+}
+
+/// The consolidated schema for the single domain database: the concatenation
+/// of all six domain-store schemas (board, sessions, workspaces, users,
+/// config, chat_history), which now share one file.
+///
+/// Built at runtime because Rust `concat!` only accepts string literals, not
+/// the per-module `SCHEMA` constants. Every `CREATE TABLE`/`CREATE INDEX` is
+/// `IF NOT EXISTS`, so rebuilding the schema on an existing consolidated file
+/// is a no-op.
+fn consolidated_schema() -> String {
+    let mut s = String::with_capacity(2048);
+    s.push_str(crate::board::SCHEMA);
+    s.push_str(crate::session::SCHEMA);
+    s.push_str(crate::workspace::SCHEMA);
+    s.push_str(crate::users::SCHEMA);
+    s.push_str(crate::config_db::SCHEMA);
+    s.push_str(crate::chat_history::SCHEMA);
+    s
+}
+
+/// Open (or create) the single consolidated domain database file.
+///
+/// This is the canonical open for the 6 domain stores: it opens the one
+/// consolidated file ([`store_db_path`] mapping all domain names to
+/// [`CONSOLIDATED_DB_NAME`]), runs the consolidated schema, applies the
+/// consolidated migration list (board + sessions, ids NOT renumbered) via a
+/// single `run_pending_migrations` pass, and runs the one-time consolidation
+/// import when legacy per-store files are present. It does NOT run the
+/// per-store post-open hooks (tickets FTS index, admin-user seed) — those are
+/// idempotent and run in [`init_all_stores`] (production) and each store's
+/// `open` (isolated tests).
+///
+/// # Migration ordering (an explicit decision)
+///
+/// [`crate::migrations::run_domain_migrations`] runs **before** the one-time
+/// import. This is deliberate: the merged board+sessions history includes two
+/// UNGUARDED one-time data resets — board `003_reset_nonterminal_tickets`
+/// (resets every non-terminal ticket to `backlog`) and sessions
+/// `004_reset_implementation_jobs` (deletes `kind='ticket_stage'` jobs). On the
+/// fresh consolidated file those run against EMPTY tables (no-ops) and are
+/// recorded as applied; the import then copies the legacy user tables
+/// **verbatim**. So the resets never destructively re-fire on migrated data,
+/// and the consolidation contract is *migrate without losing data*: stale
+/// `kind='ticket_stage'` jobs and pre-rework ticket phases roll in as-is
+/// (downstream phase parsing/kind dispatch sees them exactly as the legacy
+/// store carried them — a separate concern from the storage consolidation).
+///
+/// Returns a **fresh** connection. Production shares it across all domain
+/// stores via [`DOMAIN_CONN`]; isolated test opens (`open_test_store!`) drop it
+/// with the store. There is deliberately no process-global cache here so test
+/// isolation never leaks a connection across roots.
+pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Connection> {
+    let schema = consolidated_schema();
+    // `CONSOLIDATED_DB_NAME` maps (via store_db_path) to the one consolidated
+    // file; the boot-diagnosis heal path keys off that same path, so a
+    // pre-flight diagnosis set for the consolidated file is consumed here.
+    let conn = open_store(root, CONSOLIDATED_DB_NAME, &schema).await?;
+
+    // Single consolidated migration runner: board + sessions migrations, ids
+    // preserved (never renumbered — two of them are unguarded one-time data
+    // resets that must not re-fire if renumbered). The unified
+    // `schema_migrations` table holds all of them.
+    crate::migrations::run_domain_migrations(&conn).await?;
+
+    // One-time consolidation import from legacy per-store files.
+    run_consolidation_import_if_pending(&conn, root).await?;
+
+    Ok(conn)
+}
+
+/// Id recorded in the unified `schema_migrations` table for the one-time
+/// consolidation import. This is the ONLY migration that brings the merged
+/// stores into the consolidated schema; future schema changes use the
+/// `consolidate_` prefix (e.g. `consolidate_002_...`).
+const CONSOLIDATION_MIGRATION_ID: &str = "consolidate_001_import_domain_stores";
+
+/// True when `id` is recorded in the unified `schema_migrations` table.
+async fn migration_applied(conn: &Connection, id: &str) -> anyhow::Result<bool> {
+    conn.query_optional(
+        "SELECT 1 FROM schema_migrations WHERE id = ?1",
+        params![id],
+        |_| Ok::<_, ::turso::Error>(()),
+    )
+    .await
+    .map(|row| row.is_some())
+    .context("Failed to read schema_migrations")
+}
+
+/// Record `id` as applied in the unified `schema_migrations` table.
+async fn record_migration(conn: &Connection, id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2) \
+         ON CONFLICT(id) DO NOTHING",
+        params![id, now()],
+    )
+    .await
+    .map(|_| ())
+    .context("Failed to record consolidation migration as applied")
+}
+
+/// Run the one-time consolidation import when legacy per-store files are
+/// present and it has not already been applied.
+///
+/// *Idempotency / crash safety*: the import is tracked by
+/// [`CONSOLIDATION_MIGRATION_ID`] in the unified `schema_migrations` table. If
+/// it is already recorded, the function is a no-op. If it failed partway
+/// through, it is NOT recorded, so the next boot re-runs it — the import is
+/// written to be re-runnable (each table is emptied before re-copy, and rows
+/// are copied by the source rowid, so a partial copy leaves no duplicate rows).
+///
+/// *Non-atomicity*: copying from 6 separate legacy files cannot be atomic in a
+/// single transaction. The import therefore runs FK enforcement OFF during the
+/// bulk load (per decision 4), then turns FK enforcement back ON and validates
+/// with `PRAGMA foreign_key_check`. Violations are REPORTED (a `warn!`), not
+/// fatal — the one-time migration must preserve all legacy data even if a store
+/// carried orphan child rows (they remain soft references; FK enforcement
+/// applies only to subsequent writes).
+async fn run_consolidation_import_if_pending(conn: &Connection, root: &Path) -> anyhow::Result<()> {
+    if migration_applied(conn, CONSOLIDATION_MIGRATION_ID).await? {
+        return Ok(());
+    }
+    // `run_domain_migrations` already created schema_migrations; the import
+    // records its own id after success.
+    let any_legacy = DOMAIN_STORE_NAMES
+        .iter()
+        .any(|name| legacy_store_db_path(root, name).exists());
+    if any_legacy {
+        import_legacy_stores(conn, root).await?;
+    }
+    record_migration(conn, CONSOLIDATION_MIGRATION_ID).await?;
+    Ok(())
+}
+
+/// Copy user tables from the 6 legacy per-store files into the consolidated
+/// database, preserving the AUTOINCREMENT watermark (`sqlite_sequence`).
+///
+/// *FK handling*: FK enforcement is OFF during the bulk load (children may be
+/// copied before their parents, and the target schema's new FK on
+/// `ticket_jobs.ticket_id` must not fire mid-copy). It is restored to ON and
+/// validated with `PRAGMA foreign_key_check` afterwards.
+async fn import_legacy_stores(conn: &Connection, root: &Path) -> anyhow::Result<()> {
+    conn.execute("PRAGMA foreign_keys = OFF;", ())
+        .await
+        .context("Failed to disable FK enforcement during consolidation import")?;
+
+    let result = import_legacy_stores_inner(conn, root).await;
+
+    conn.execute("PRAGMA foreign_keys = ON;", ())
+        .await
+        .context("Failed to re-enable FK enforcement after consolidation import")?;
+    result?;
+
+    // Validate referential integrity: the newly-added FK
+    // (ticket_jobs.ticket_id -> tickets.id) and the existing jobs/tickets
+    // cascades must hold on the migrated data. Validation REPORTS (does not
+    // fail) — the one-time migration must preserve all data even if a legacy
+    // store carried orphan child rows (they remain soft references; FK
+    // enforcement applies only to subsequent writes).
+    let violations = conn
+        .query("PRAGMA foreign_key_check", ())
+        .await
+        .context("Failed to run PRAGMA foreign_key_check after consolidation import")?;
+    if !violations.is_empty() {
+        tracing::warn!(
+            count = violations.len(),
+            "consolidation import found orphan rows violating the new FK \
+             (ticket_jobs.ticket_id -> tickets.id); preserving them as soft references \
+             (future writes still enforce the FK)",
+        );
+    }
+    Ok(())
+}
+
+async fn import_legacy_stores_inner(conn: &Connection, root: &Path) -> anyhow::Result<()> {
+    for name in DOMAIN_STORE_NAMES {
+        let legacy_path = legacy_store_db_path(root, name);
+        if !legacy_path.exists() {
+            continue;
+        }
+        if let Err(e) = import_one_legacy_store(conn, name, &legacy_path).await {
+            return Err(e).with_context(|| format!("consolidation import failed for '{name}'"));
+        }
+    }
+    Ok(())
+}
+
+/// Copy one legacy store's user tables into the consolidated database.
+///
+/// The source is opened READ-ONLY (`ReadOnly | NoLock`) with the same
+/// experimental feature set as the daemon so the WAL/`.tshm` coordination is
+/// read correctly. Turso internals (`sqlite_%`, `__turso_internal_%`) are never
+/// copied — the consolidated schema recreates them. A source table that has no
+/// matching target table (schema drift) is skipped; a renamed table
+/// (`ticket_stage_jobs` → `ticket_jobs`) is mapped via [`consolidate_table_name`].
+async fn import_one_legacy_store(
+    conn: &Connection,
+    store_name: &str,
+    legacy_path: &Path,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    let io: Arc<dyn turso::core::IO> = Arc::new(turso::core::PlatformIO::new()?);
+    let path_str = legacy_path
+        .to_str()
+        .with_context(|| format!("legacy store path must be UTF-8: {}", legacy_path.display()))?;
+    let db = turso::core::Database::open_file_with_flags(
+        io.clone(),
+        path_str,
+        turso::core::OpenFlags::ReadOnly | turso::core::OpenFlags::NoLock,
+        experimental_database_opts(),
+        None,
+    )
+    .with_context(|| format!("failed to open legacy store '{store_name}' read-only"))?;
+    let src = db
+        .connect()
+        .with_context(|| format!("failed to connect to legacy store '{store_name}'"))?;
+    // NB: `turso::core::Connection` (the source) is SYNCHRONOUS — rows are
+    // read via `stmt.step()`; the consolidated target `conn` is our async
+    // wrapper. The source is read fully into memory per table so the sync
+    // statement is never held across an await (keeps the future `Send`).
+
+    // Enumerate source user tables.
+    let src_tables = read_sync_rows(
+        &io,
+        &src,
+        &format!("SELECT name FROM sqlite_master WHERE type='table' AND {USER_OBJECT_FILTER}"),
+        1,
+    )?;
+
+    for table_row in src_tables {
+        let Some(src_table) = table_row.first().and_then(|v| match v {
+            Value::Text(s) => Some(s.as_str()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(target_table) = consolidate_table_name(src_table) else {
+            continue;
+        };
+        if !table_exists(conn, target_table).await? {
+            continue;
+        }
+        copy_table(conn, &io, &src, src_table, target_table).await?;
+    }
+
+    // Preserve the AUTOINCREMENT watermark (sqlite_sequence) so id counters
+    // keep incrementing correctly after consolidation.
+    copy_sqlite_sequence(conn, &io, &src).await?;
+
+    Ok(())
+}
+
+/// Map a legacy source table name to its consolidated target name. Returns
+/// `None` for tables that have no consolidated counterpart (schema drift).
+///
+/// The only rename across the consolidation is the sessions store's
+/// `ticket_stage_jobs` → `ticket_jobs` (the pre-rework child table name).
+///
+/// **Dormant legacy tables are deliberately dropped** (mapped to `None`): the
+/// consolidated SCHEMA never recreates them and no production code reads them.
+/// The one such table is `config_role` — historically created for the
+/// (removed) per-role config override rows; it has no code references and is
+/// not part of [`crate::config_db::SCHEMA`], so its rows are not carried
+/// forward. The consolidated `schema_migrations`/fresh-install probe paths do
+/// not depend on it.
+fn consolidate_table_name(src: &str) -> Option<&'static str> {
+    match src {
+        // The rework child table ships as `ticket_jobs` in the consolidated
+        // schema; a pre-rework legacy file still calls it `ticket_stage_jobs`,
+        // and an already-migrated legacy file uses the new name — both map to
+        // the same target.
+        "ticket_stage_jobs" | "ticket_jobs" => Some("ticket_jobs"),
+        // All other current user tables keep their name.
+        "tickets" => Some("tickets"),
+        "ticket_comments" => Some("ticket_comments"),
+        "ticket_counters" => Some("ticket_counters"),
+        "sessions" => Some("sessions"),
+        "session_metadata" => Some("session_metadata"),
+        "jobs" => Some("jobs"),
+        "agents" => Some("agents"),
+        "pending_jobs" => Some("pending_jobs"),
+        "research_jobs" => Some("research_jobs"),
+        "workspaces" => Some("workspaces"),
+        "workspace_contexts" => Some("workspace_contexts"),
+        "editor_tabs" => Some("editor_tabs"),
+        "users" => Some("users"),
+        "user_channels" => Some("user_channels"),
+        "user_roles" => Some("user_roles"),
+        "config_kv" => Some("config_kv"),
+        "config_model_routing" => Some("config_model_routing"),
+        "chat_history" => Some("chat_history"),
+        // Anything else — including the dormant `config_role` table — is a
+        // pre-consolidation artifact with no consolidated counterpart; drop it.
+        _ => None,
+    }
+}
+
+/// Copy one table's rows (intersecting columns) from the read-only source to
+/// the consolidated target.
+///
+/// The clear + bulk insert run inside **one transaction** (FK enforcement is
+/// already OFF during the import): a large table is copied with a single fsync
+/// rather than one per row, and a crash mid-copy rolls back the whole table so
+/// a re-run leaves no partial rows.
+///
+/// The source is read in BOUNDED batches via `LIMIT/OFFSET` pagination, ordered
+/// by `rowid` so each batch is deterministic and does not depend on an
+/// unspecified scan order — a large legacy table (e.g. the ~251MB sessions
+/// store) is never fully materialized in memory, bounding the deploy-time OOM
+/// risk that a whole-table `Vec<Vec<Value>>` would pose. Each batch statement is
+/// fully consumed before the next await, keeping the future `Send`. (The source
+/// is opened read-only and unmodified during the import; every copied user table
+/// is a rowid table, so `ORDER BY rowid` is always valid.)
+///
+/// *Batch size*: [`IMPORT_READ_BATCH`]. Offset scans re-scan from the start, so
+/// the cost is one full rescan per batch — acceptable for a one-time migration
+/// versus unbounded memory.
+const IMPORT_READ_BATCH: usize = 10_000;
+
+async fn copy_table(
+    conn: &Connection,
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    src: &std::sync::Arc<turso::core::Connection>,
+    src_table: &str,
+    target_table: &str,
+) -> anyhow::Result<()> {
+    let src_cols = column_names_sync(io, src, src_table)?;
+    let target_cols = column_names_async(conn, target_table).await?;
+
+    // Intersect on column name, preserving the target's column order.
+    let common: Vec<String> = target_cols
+        .iter()
+        .filter(|c| src_cols.contains(*c))
+        .cloned()
+        .collect();
+    if common.is_empty() {
+        return Ok(());
+    }
+    let col_list = common.join(", ");
+    let placeholders = vec!["?"; common.len()].join(", ");
+    let insert_sql = format!("INSERT INTO {target_table} ({col_list}) VALUES ({placeholders})");
+
+    // Empty the target table before re-copy so a re-run (crash mid-import) does
+    // not leave duplicate rows — atomically with the inserts so a failure rolls
+    // back both.
+    let tx = conn
+        .begin_tx()
+        .await
+        .with_context(|| format!("failed to begin import for '{target_table}'"))?;
+    tx.execute(&format!("DELETE FROM {target_table}"), ())
+        .await
+        .with_context(|| format!("failed to clear target table '{target_table}'"))?;
+
+    // Read bounded batches from the (read-only, unmodified) source and insert
+    // each into the same per-table transaction, bounding peak memory to one
+    // batch.
+    let mut offset = 0usize;
+    loop {
+        let batch_select = format!(
+            "SELECT {col_list} FROM {src_table} ORDER BY rowid LIMIT {IMPORT_READ_BATCH} OFFSET {offset}"
+        );
+        let rows = read_sync_rows(io, src, &batch_select, common.len())?;
+        if rows.is_empty() {
+            break;
+        }
+        for vals in rows {
+            tx.execute(&insert_sql, vals).await.with_context(|| {
+                format!("failed to insert row into '{target_table}' during import")
+            })?;
+        }
+        offset += IMPORT_READ_BATCH;
+    }
+
+    tx.commit()
+        .await
+        .with_context(|| format!("failed to commit import for '{target_table}'"))?;
+    Ok(())
+}
+
+/// Run a read-only SQL that returns `ncols` columns and collect every row's
+/// values as owned [`Value`]s. The source connection is synchronous; the
+/// statement is fully consumed here so no non-`Send` statement is held across
+/// an await in the caller.
+fn read_sync_rows(
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    src: &std::sync::Arc<turso::core::Connection>,
+    sql: &str,
+    ncols: usize,
+) -> anyhow::Result<Vec<Vec<Value>>> {
+    use turso::core::StepResult;
+    let Some(mut stmt) = src
+        .query(sql)
+        .with_context(|| format!("failed to prepare read: {sql}"))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => {
+                let row = stmt.row().context("row missing after StepResult::Row")?;
+                let mut vals = Vec::with_capacity(ncols);
+                for idx in 0..ncols {
+                    vals.push(row_to_value(row.get_value(idx)));
+                }
+                out.push(vals);
+            }
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::IO | StepResult::Yield) => {
+                io.step().context("I/O step during read-only import")?;
+            }
+            Ok(StepResult::Interrupt) => {
+                return Err(anyhow::anyhow!("read-only import query interrupted"));
+            }
+            Ok(StepResult::Busy) => {
+                return Err(anyhow::anyhow!(
+                    "read-only import query busy; try again later"
+                ));
+            }
+            Err(e) => return Err(anyhow::anyhow!("read-only import query failed: {e}")),
+        }
+    }
+    Ok(out)
+}
+
+/// Enumerate a source table's column names (synchronous core connection).
+fn column_names_sync(
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    src: &std::sync::Arc<turso::core::Connection>,
+    table: &str,
+) -> anyhow::Result<Vec<String>> {
+    let rows = read_sync_rows(io, src, &format!("PRAGMA table_info({table})"), 2)?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| match r.get(1) {
+            Some(Value::Text(s)) => Some(s.as_str().to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Enumerate a target table's column names (our async wrapper).
+async fn column_names_async(conn: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
+    let rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .with_context(|| format!("failed to read columns of target '{table}'"))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.get::<String>(1).ok())
+        .collect())
+}
+
+/// Convert a `turso::core::Value` into a `turso::Value` for the async insert.
+fn row_to_value(v: &turso::core::Value) -> Value {
+    match v {
+        turso::core::Value::Null => Value::Null,
+        turso::core::Value::Numeric(turso::core::Numeric::Integer(i)) => Value::Integer(*i),
+        turso::core::Value::Numeric(turso::core::Numeric::Float(f)) => {
+            let f64_val: f64 = (*f).into();
+            Value::Real(f64_val)
+        }
+        turso::core::Value::Text(t) => Value::Text(t.as_str().to_string()),
+        turso::core::Value::Blob(b) => Value::Blob(b.clone()),
+    }
+}
+
+/// Copy the `sqlite_sequence` AUTOINCREMENT watermark (only for tables present
+/// in both source and target) so `sessions.id` / `chat_history.id` keep
+/// incrementing correctly after consolidation.
+async fn copy_sqlite_sequence(
+    conn: &Connection,
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    src: &std::sync::Arc<turso::core::Connection>,
+) -> anyhow::Result<()> {
+    // `sqlite_sequence` only exists when the source has AUTOINCREMENT tables;
+    // a missing table makes the query return an error, which we treat as empty.
+    let Ok(rows) = read_sync_rows(io, src, "SELECT name, seq FROM sqlite_sequence", 2) else {
+        return Ok(());
+    };
+    for row in rows {
+        let (Some(name), Some(seq)) = (
+            row.first().and_then(|v| match v {
+                Value::Text(s) => Some(s.as_str().to_string()),
+                _ => None,
+            }),
+            row.get(1).and_then(|v| match v {
+                Value::Integer(i) => Some(*i),
+                _ => None,
+            }),
+        ) else {
+            continue;
+        };
+        if !table_exists(conn, &name).await? {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2) \
+             ON CONFLICT(name) DO UPDATE SET seq = excluded.seq",
+            params![name.clone(), seq],
+        )
+        .await
+        .with_context(|| format!("failed to preserve AUTOINCREMENT watermark for '{name}'"))?;
+    }
+    Ok(())
 }
 
 /// Format a catch_unwind panic payload into a store-open error.
@@ -3745,5 +4238,252 @@ mod tests {
             quarantined,
             "original family must be quarantined (forensic record)"
         );
+    }
+
+    /// The one-time consolidation import copies user tables from the legacy
+    /// per-store files into the consolidated database, renames the
+    /// pre-rework `ticket_stage_jobs` child table, drops schema-drift columns,
+    /// preserves the AUTOINCREMENT watermark, and leaves the newly-added FK
+    /// (`ticket_jobs.ticket_id -> tickets.id`) holding.
+    ///
+    /// It also pins the migration-ordering contract: the unguarded data-reset
+    /// migrations (board `003_reset_nonterminal_tickets`, sessions
+    /// `004_reset_implementation_jobs`) run on the EMPTY consolidated file, so
+    /// a pre-rework `kind='ticket_stage'` job and a non-terminal ticket phase
+    /// survive the import verbatim (never reset/deleted). And the FTS index is
+    /// created before the import, so imported tickets are FTS-searchable.
+    #[tokio::test]
+    async fn consolidation_import_copies_legacy_store_data_and_enforces_fk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Legacy `board.db` with a ticket (current shape).
+        let board_conn =
+            open_with_schema(&legacy_store_db_path(root, "board"), crate::board::SCHEMA)
+                .await
+                .unwrap();
+        board_conn
+            .execute(
+                "INSERT INTO tickets (id, title, description, phase, workspace_name, \
+                 created_at, updated_at) \
+                 VALUES ('t1', 'Title', 'Desc', 'analysis', 'ws1', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        drop(board_conn);
+
+        // Legacy `sessions.db` with the OLD `ticket_stage_jobs` shape
+        // (has `phase`/`round` columns that the consolidated target drops).
+        let legacy_session_schema = "CREATE TABLE jobs (\
+             id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
+             status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
+             workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
+             channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
+             retry_count INTEGER NOT NULL DEFAULT 0, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL);\
+             CREATE TABLE ticket_stage_jobs (\
+             id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL, \
+             stage TEXT NOT NULL, phase TEXT NOT NULL, round INTEGER NOT NULL);";
+        let session_conn = open_with_schema(
+            &legacy_store_db_path(root, "sessions"),
+            legacy_session_schema,
+        )
+        .await
+        .unwrap();
+        session_conn
+            .execute(
+                "INSERT INTO jobs (id, kind, workspace_name, role, created_at, updated_at) \
+                 VALUES ('j1', 'ticket_analysis', 'ws1', 'analyst', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        // A pre-rework `kind='ticket_stage'` job: the unguarded sessions
+        // migration 004 (`DELETE FROM jobs WHERE kind='ticket_stage'`) must run
+        // on the EMPTY consolidated file and never delete this imported row.
+        session_conn
+            .execute(
+                "INSERT INTO jobs (id, kind, workspace_name, role, created_at, updated_at) \
+                 VALUES ('j2', 'ticket_stage', 'ws1', 'engineer', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        session_conn
+            .execute(
+                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
+                 VALUES ('j1', 't1', 'analysis', 'analysis', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        drop(session_conn);
+
+        // Legacy `config.db` with a config_kv row.
+        let config_conn = open_with_schema(
+            &legacy_store_db_path(root, "config"),
+            crate::config_db::SCHEMA,
+        )
+        .await
+        .unwrap();
+        config_conn
+            .execute(
+                "INSERT INTO config_kv (key, value) \
+                 VALUES ('provider_endpoint', 'http://localhost:1234')",
+                (),
+            )
+            .await
+            .unwrap();
+        drop(config_conn);
+
+        // Run the consolidated open (schema + migrations + one-time import).
+        let conn = open_consolidated_store(root).await.unwrap();
+
+        // Board ticket copied.
+        let ticket_phase: String = conn
+            .query_optional("SELECT phase FROM tickets WHERE id = 't1'", (), |r| {
+                r.get(0)
+            })
+            .await
+            .unwrap()
+            .expect("ticket must be imported");
+        assert_eq!(ticket_phase, "analysis", "ticket phase preserved");
+
+        // Job + renamed child row (old phase/round columns dropped).
+        let job_kind: String = conn
+            .query_optional("SELECT kind FROM jobs WHERE id = 'j1'", (), |r| r.get(0))
+            .await
+            .unwrap()
+            .expect("job must be imported");
+        assert_eq!(job_kind, "ticket_analysis");
+        let tj_stage: String = conn
+            .query_optional("SELECT stage FROM ticket_jobs WHERE id = 'j1'", (), |r| {
+                r.get(0)
+            })
+            .await
+            .unwrap()
+            .expect("ticket_stage_jobs must be renamed to ticket_jobs on import");
+        assert_eq!(tj_stage, "analysis");
+
+        // Migration-ordering contract: the unguarded sessions migration 004
+        // (`DELETE FROM jobs WHERE kind='ticket_stage'`) ran on the EMPTY
+        // consolidated file, so the imported pre-rework `ticket_stage` job
+        // survives verbatim.
+        let stale_job_kind: String = conn
+            .query_optional("SELECT kind FROM jobs WHERE id = 'j2'", (), |r| r.get(0))
+            .await
+            .unwrap()
+            .expect("ticket_stage job must be imported");
+        assert_eq!(
+            stale_job_kind, "ticket_stage",
+            "unguarded migration 004 must not have deleted the imported data"
+        );
+
+        // config_kv copied.
+        let endpoint: String = conn
+            .query_optional(
+                "SELECT value FROM config_kv WHERE key = 'provider_endpoint'",
+                (),
+                |r| r.get(0),
+            )
+            .await
+            .unwrap()
+            .expect("config_kv must be imported");
+        assert_eq!(endpoint, "http://localhost:1234");
+
+        // The FTS index is created by the consolidated schema BEFORE the
+        // import, so the imported ticket's title is immediately FTS-searchable
+        // (turso's `CREATE INDEX ... USING fts` does not backfill pre-existing
+        // rows — the index must exist before the bulk insert, not after).
+        let fts_hits: i64 = conn
+            .query_optional(
+                "SELECT COUNT(*) FROM tickets WHERE title MATCH 'Title'",
+                (),
+                |r| r.get(0),
+            )
+            .await
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(
+            fts_hits, 1,
+            "imported ticket must be FTS-searchable immediately"
+        );
+
+        // The newly-added FK holds (no orphan child rows).
+        let violations = conn.query("PRAGMA foreign_key_check", ()).await.unwrap();
+        assert!(
+            violations.is_empty(),
+            "imported data must satisfy ticket_jobs.ticket_id -> tickets.id"
+        );
+
+        // The consolidation migration is recorded exactly once.
+        let applied: i64 = conn
+            .query_optional(
+                "SELECT COUNT(*) FROM schema_migrations \
+                 WHERE id = 'consolidate_001_import_domain_stores'",
+                (),
+                |r| r.get(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied, 1, "consolidation import recorded once");
+    }
+
+    /// A legacy sessions.db already migrated to the rework schema (migration
+    /// 006 applied) carries a `ticket_jobs` table (not the old
+    /// `ticket_stage_jobs` name). It must be copied as-is — a missing mapping
+    /// here would silently drop the child rows during import.
+    #[tokio::test]
+    async fn consolidation_import_copies_already_migrated_ticket_jobs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Legacy sessions.db on the REWORK schema: `ticket_jobs` (identity name).
+        let legacy_schema = "CREATE TABLE jobs (\
+             id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
+             status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
+             workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
+             channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
+             retry_count INTEGER NOT NULL DEFAULT 0, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL);\
+             CREATE TABLE ticket_jobs (\
+             id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL, stage TEXT NOT NULL);";
+        let session_conn = open_with_schema(&legacy_store_db_path(root, "sessions"), legacy_schema)
+            .await
+            .unwrap();
+        session_conn
+            .execute(
+                "INSERT INTO jobs (id, kind, workspace_name, role, created_at, updated_at) \
+                 VALUES ('j1', 'ticket_analysis', 'ws1', 'analyst', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+        session_conn
+            .execute(
+                "INSERT INTO ticket_jobs (id, ticket_id, stage) \
+                 VALUES ('j1', 't1', 'analysis')",
+                (),
+            )
+            .await
+            .unwrap();
+        drop(session_conn);
+
+        let conn = open_consolidated_store(root).await.unwrap();
+
+        let tj_stage: String = conn
+            .query_optional("SELECT stage FROM ticket_jobs WHERE id = 'j1'", (), |r| {
+                r.get(0)
+            })
+            .await
+            .unwrap()
+            .expect("an already-migrated ticket_jobs table must be copied, not dropped");
+        assert_eq!(tj_stage, "analysis");
     }
 }

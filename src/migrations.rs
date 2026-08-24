@@ -1,9 +1,9 @@
 //! Centralized database migrations.
 //!
 //! Each migration is a ready-made SQL statement/script applied exactly once,
-//! in order, tracked via a per-store `schema_migrations` table. The runner
-//! lives in [`crate::turso::run_pending_migrations`] and fires from the
-//! store's `post_open` hook at initialization.
+//! in order, tracked via the consolidated `schema_migrations` table. The
+//! runner ([`crate::turso::run_pending_migrations`]) fires from the
+//! consolidated-store init path.
 //!
 //! Adding a migration: append a new [`crate::turso::Migration`] to the store's
 //! list with a stable unique id, the ready SQL, and — when the fresh-DB
@@ -13,7 +13,8 @@
 
 use crate::turso::{Migration, MigrationGuard};
 
-/// Migrations for the sessions store (sessions.db).
+/// Migrations for the sessions store (applied in the consolidated domain
+/// database, alongside the merged board history).
 ///
 /// **001 — session token length.** Adds the real provider-reported session
 /// length column (`session_metadata.token_length`) — the durable backing for
@@ -121,7 +122,8 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
     },
 ];
 
-/// Migrations for the board store (board.db).
+/// Migrations for the board store (applied in the consolidated domain
+/// database, alongside the merged session history).
 ///
 /// **001 — drop `tickets.pipeline_reservation`.** The job-centric pipeline
 /// rework removes the ticket-level pipeline reservation in favor of the
@@ -131,7 +133,7 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
 /// path: column already absent, SQL skipped, migration recorded as applied).
 ///
 /// **002 — drop `tickets.assigned_to`.** Replaced by the `agents` roster in
-/// sessions.db (`status='launched'` rows bound to the implementation/analysis jobs),
+/// the jobs store (`status='launched'` rows bound to the implementation/analysis jobs),
 /// which drives comment routing and the mid-execution re-dispatch guard.
 ///
 /// **003 — reset non-terminal tickets.** A deliberate one-time data reset for
@@ -177,6 +179,44 @@ pub(crate) const BOARD_MIGRATIONS: &[Migration] = &[
         }),
     },
 ];
+
+/// Apply the consolidated **domain** migration history to the single
+/// consolidated database.
+///
+/// This is the SINGLE migration runner for the one consolidated domain file.
+/// It applies the board and sessions migration lists in order against the same
+/// unified `schema_migrations` table.
+///
+/// # Id preservation (decision 2)
+///
+/// The ids are the ORIGINAL per-store ids, deliberately NOT renumbered — two
+/// of them (`003_reset_nonterminal_tickets`, `004_reset_implementation_jobs`)
+/// are unguarded one-time data resets that would re-run destructively if
+/// renumbered: a renumbered id would not be found in the unified tracking
+/// table and would fire again on migrated data. The tracking table therefore
+/// holds the full merged history and never re-runs a reset. All other domain
+/// stores (workspaces, users, config, chat_history) carry no migration
+/// history.
+///
+/// # Runs BEFORE the one-time import
+///
+/// [`crate::turso::open_consolidated_store`] calls this before the one-time
+/// consolidation import. That ordering is intentional: the two unguarded data
+/// resets fire against the EMPTY consolidated file (no-ops) and are recorded as
+/// applied, so the import that follows copies the legacy user tables
+/// **verbatim** — pre-rework phases and stale `kind='ticket_stage'` jobs are
+/// never destructively reset/deleted (migrate without losing data).
+///
+/// Future schema changes run only here, in the consolidated database, using a
+/// new non-colliding id prefix (e.g. `consolidate_002_...`).
+pub(crate) async fn run_domain_migrations(conn: &crate::turso::Connection) -> anyhow::Result<()> {
+    // `run_pending_migrations` is idempotent per-migration: a second call
+    // re-reads the unified tracking table and skips already-applied ids. The
+    // `store` label is the consolidated scope, not a legacy per-store file.
+    crate::turso::run_pending_migrations(conn, "consolidated", BOARD_MIGRATIONS).await?;
+    crate::turso::run_pending_migrations(conn, "consolidated", SESSION_MIGRATIONS).await?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

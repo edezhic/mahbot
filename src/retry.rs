@@ -802,6 +802,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn agent_chat_rides_out_sustained_outage_and_recovers() {
         let _guard = crate::util::test::retry_tests_lock();
@@ -828,6 +829,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn agent_chat_wall_clock_cap_binds() {
         let _guard = crate::util::test::retry_tests_lock();

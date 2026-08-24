@@ -109,7 +109,7 @@ const RENAME_COLOR: Color = theme::ACCENT_LIGHT;
 #[derive(Debug, Clone)]
 pub enum DiffMessage {
     /// workspace name and optional filesystem path override (used for personal workspaces
-    /// that don't exist in workspaces.db).
+    /// that don't exist in the `workspaces` table).
     WorkspaceSelected(String, Option<String>),
     DiffLoaded(u64, Result<Vec<DiffFile>, String>),
     Tick,
@@ -219,7 +219,7 @@ pub struct DiffState {
     error: Option<String>,
     selected_workspace_name: Option<String>,
     /// Filesystem path when the workspace is a personal workspace
-    /// (not registered in workspaces.db). `None` for shared workspaces.
+    /// (not registered in the `workspaces` table). `None` for shared workspaces.
     personal_workspace_path: Option<String>,
     generation: u64,
     diff_files: Vec<DiffFile>,
@@ -1328,7 +1328,7 @@ async fn resolve_workspace_path(
 
 /// Load the diff, compute per-file highlights, and return enhanced DiffFiles.
 /// `ws_path_override` is used for personal workspaces that don't exist in
-/// workspaces.db — when provided, it's used directly as the filesystem path.
+/// the `workspaces` table — when provided, it's used directly as the filesystem path.
 async fn load_diff(
     ws_name: String,
     ws_path_override: Option<String>,

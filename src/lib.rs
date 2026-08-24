@@ -248,7 +248,7 @@ pub struct Workspace {
     /// Used by the nightly re-analysis check to detect new commits.
     pub last_analyzed_commit: Option<String>,
     /// Ephemeral per-run workspace (research run roots): never registered in
-    /// `workspaces.db`, created on the fly for a single run's lifetime.
+    /// the `workspaces` table, created on the fly for a single run's lifetime.
     /// Ephemeral workspaces get local handling in shared tool paths — e.g.
     /// the search tool downgrades an empty index to a warning instead of an
     /// error (a fresh per-run folder has no files yet).
@@ -324,7 +324,7 @@ impl Workspace {
 
     /// Create an ephemeral per-run workspace (research run roots). `name`
     /// becomes the search-engine registry key (e.g. the research `job_id`);
-    /// the workspace is never registered in `workspaces.db` and its lifetime
+    /// the workspace is never registered in the `workspaces` table and its lifetime
     /// is bounded by the run it serves.
     #[must_use]
     pub fn ephemeral_run(name: &str, path: &Path) -> Self {

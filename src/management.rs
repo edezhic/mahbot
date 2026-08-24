@@ -5,7 +5,7 @@
 //! implementation job as it advances — PLUS an input gate for the claim step
 //! (Backlog → Analysis, ReadyForDevelopment → InDevelopment). It is not a pure
 //! mirror: it also gates entry into the pipeline. The poll loop iterates the
-//! implementation jobs (sessions.db) and dispatches the matching stage agent; the
+//! implementation jobs (the jobs store) and dispatches the matching stage agent; the
 //! implementation job dispatches the next stage immediately in the same
 //! dispatch-finalizer (no separate poll tick).
 //!
@@ -1122,7 +1122,8 @@ const CLAIM_PHASES: &[(TicketPhase, PollPhase)] = &[
 /// - The [`BoardStore`] wraps a single Turso connection in an
 ///   `Arc<tokio::sync::Mutex<crate::turso::Connection>>` — SQL operations
 ///   serialize at the mutex,
-///   so concurrent access is safe. All workspaces share the same `board.db`;
+///   so concurrent access is safe. All workspaces share the same consolidated
+///   `mahbot.db`;
 ///   per-workspace isolation is via SQL `WHERE workspace_name = ?` filtering.
 /// - The [`ticket_buffer`] and [`registry::AGENT_REGISTRY`] are
 ///   `Mutex`‑protected global singletons; contention is negligible because
@@ -1180,7 +1181,7 @@ async fn process_single_workspace(ws: Workspace) {
 
     // 2. Implementation-iteration dispatch — the implementation job is the single authority
     // for an occupied ticket's pipeline. Iterate the workspace's implementations
-    // (sessions.db) and dispatch the matching stage agent when its stage agent
+    // (the jobs store) and dispatch the matching stage agent when its stage agent
     // is not running. A paused workspace keeps its implementations frozen (no new
     // stage dispatch); a terminal ticket completes its implementation.
     let conn = &crate::session::store().conn;
@@ -2405,7 +2406,7 @@ async fn record_sanitation_failure(
             "Failed to record sanitation failure (failure marker comment)",
         );
     }
-    // Best-effort clear of the job's running roster rows (sessions.db).
+    // Best-effort clear of the job's running roster rows (the jobs store).
     if let Err(e) =
         crate::jobs::clear_launched_agents_for_job(&crate::session::store().conn, job_id).await
     {
@@ -2429,7 +2430,7 @@ async fn record_sanitation_failure(
 /// routing looks the stored ID up in the router, so persisting an ID
 /// that is not yet registered would create a drop window.
 ///
-/// Uses [`crate::jobs::upsert_job_agent`] (best-effort sessions.db
+/// Uses [`crate::jobs::upsert_job_agent`] (best-effort jobs-store
 /// ops; failures warn, never propagate — comment routing is already
 /// best-effort).
 ///

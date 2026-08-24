@@ -196,8 +196,8 @@ impl ResearchState {
     }
 
     /// Checkpoint the state blob + jobs updated_at touch in ONE transaction
-    /// (both rows live in sessions.db — the documented single transaction
-    /// domain), so a crash can't advance research_jobs.state without the
+    /// (both rows live in the consolidated domain database — the single
+    /// transaction domain), so a crash can't advance research_jobs.state without the
     /// matching jobs touch. retry_count is deliberately untouched: the boot
     /// scan's retry_count bump is the only writer and must survive
     /// checkpoints. A failed checkpoint logs a structured warning and the run
@@ -3593,6 +3593,7 @@ mod tests {
     /// durable envelope, and delivers to the ORIGINAL caller
     /// (role/user/channel persisted on the job row, never the Manager).
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn resume_research_run_continues_at_synthesis_stage() {
         crate::util::test::init_management_test_stores().await;
@@ -3732,12 +3733,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn test_synthesis_truncated_output_is_marked_and_transport_fails_open() {
         let _lock = crate::util::test::retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let ws = crate::workspace::test_ws("/tmp/test_ws");
+        let ws = crate::workspace::test_ws_named("/tmp/test_ws", "research_synth_truncated");
         let acc = AccumulatedEvidence::default();
 
         // Every attempt provider-truncated (finish_reason=length): the last
@@ -4236,6 +4238,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn test_annotate_round_confirm_failure_fail_open() {
         // End-to-end fail-open: the annotation pass succeeds, the confirm pass
@@ -4245,7 +4248,7 @@ mod tests {
         let _lock = crate::util::test::retry_tests_lock();
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        let ws = crate::workspace::test_ws("/tmp/test_ws");
+        let ws = crate::workspace::test_ws_named("/tmp/test_ws", "research_annotate_fail_open");
         let mut acc = AccumulatedEvidence::default();
         acc.claims.push(Claim {
             claim: "alpha is true".into(),

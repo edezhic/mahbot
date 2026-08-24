@@ -3979,6 +3979,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(voice)] // touches the process-global audio::voice pipeline via init_global()
     fn voice_toggle_generation_counter_and_rollback() {
         // The update handler calls sync_voice_state which accesses voice pipeline
         // globals.  Initialise the pipeline state (no-op if already initialised

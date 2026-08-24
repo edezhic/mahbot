@@ -99,7 +99,7 @@ macro_rules! columns {
 // Declarative macro: define_store!
 
 /// Generate a DB-backed store struct, its `open()` constructor, and a global
-/// singleton (via [`crate::global_store!`]).
+/// singleton accessor (`store()`).
 ///
 /// Eliminates ~64 lines of boilerplate per store module.
 ///
@@ -109,8 +109,6 @@ macro_rules! columns {
 /// define_store! {
 ///     /// Doc comment for the global static.
 ///     pub static STORE_NAME: StoreType,
-///     db_name = "db_file_name",
-///     schema = SCHEMA,
 ///     post_open = ensure_admin_user,  // optional; omitted when not needed
 ///     expect = "custom panic message",
 /// }
@@ -127,8 +125,16 @@ macro_rules! columns {
 /// The macro generates:
 /// - `#[derive(Clone, Debug)] pub struct $Store { pub(crate) conn: Connection }`
 /// - `impl $Store { pub async fn open(root: &Path) -> anyhow::Result<Self> { … } }`
-/// - A `global_store!` invocation creating the `OnceCell`, `init_global()`, and
-///   `store()` singleton accessor
+/// - A `static` [`OnceCell`] plus a `store()` accessor returning `&'static $Store`
+///
+/// # Consolidated layout
+///
+/// The macro no longer takes `db_name`/`schema`: after consolidation every
+/// domain store opens the ONE consolidated database file via
+/// [`crate::turso::open_consolidated_store`]. The per-module `SCHEMA` const is
+/// still declared (and referenced directly by
+/// [`crate::turso::consolidated_schema`]) but is no longer threaded through
+/// this macro.
 ///
 /// An arbitrary-block form is **not** provided because Rust `macro_rules!`
 /// hygiene prevents user-provided `self` / `conn` tokens inside generated
@@ -138,8 +144,6 @@ macro_rules! define_store {
     (
         $(#[$attr:meta])*
         $vis:vis static $name:ident: $ty:ident,
-        db_name = $db_name:literal,
-        schema = $schema:ident,
         $(post_open = $method:ident,)?
         expect = $expect:expr,
     ) => {
@@ -150,22 +154,44 @@ macro_rules! define_store {
         }
 
         impl $ty {
-            /// Open (or create) the database at `root/db/{name}.db`.
+            /// Open the store's database — the single consolidated domain file.
+            ///
+            /// For the domain stores this opens the consolidated database file
+            /// ([`crate::turso::CONSOLIDATED_DB_NAME`]) via
+            /// [`crate::turso::open_consolidated_store`], which runs the shared
+            /// schema + consolidated migrations + one-time consolidation import.
+            /// The connection returned is **fresh** and owned by this store
+            /// (used by isolated `open_test_store!`); the production bootstrap
+            /// shares one connection across all domain stores via
+            /// [`crate::turso::init_all_stores`].
+            ///
+            /// This is intentionally **test-only**: production never calls it for
+            /// the domain stores (they are constructed directly in
+            /// [`crate::turso::init_all_stores`]), so the `dead_code` lint is
+            /// silenced.
+            #[allow(dead_code)]
             $vis async fn open(
                 root: &std::path::Path,
             ) -> ::anyhow::Result<Self> {
-                let conn = $crate::turso::open_store(root, $db_name, $schema).await?;
+                let conn = $crate::turso::open_consolidated_store(root).await?;
                 let this = Self { conn };
                 $(this.$method().await?;)?
                 Ok(this)
             }
         }
 
-        $crate::global_store! {
-            $(#[$attr])*
-            $vis static $name: $ty,
-            constructor = $ty::open,
-            expect = $expect,
+        $(#[$attr])*
+        $vis static $name: ::tokio::sync::OnceCell<$ty> =
+            ::tokio::sync::OnceCell::const_new();
+
+        #[must_use]
+        #[doc = concat!(
+            "Get a reference to the global ",
+            stringify!($name),
+            " store.\n\n# Panics\n\nPanics if the store has not been initialized.",
+        )]
+        $vis fn store() -> &'static $ty {
+            $name.get().expect($expect)
         }
     };
 }

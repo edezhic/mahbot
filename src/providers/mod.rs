@@ -387,6 +387,27 @@ pub(crate) fn restore_provider_for_test(previous: Option<Arc<dyn Provider>>) {
     *PROVIDER.write().unwrap_poison() = previous;
 }
 
+/// Restore the previous global provider ONLY if the current provider is still
+/// the one this guard installed.
+///
+/// A concurrent test may have swapped a newer fake in over ours; clobbering it
+/// back to a stale `previous` would unset the provider under that test (the
+/// intermittent "PROVIDER not initialized" panic). If a newer provider is
+/// present, this guard's restore is a no-op — the newer guard owns the slot.
+#[cfg(test)]
+pub(crate) fn restore_provider_for_test_if(
+    installed: &Arc<dyn Provider>,
+    previous: Option<Arc<dyn Provider>>,
+) {
+    let mut guard = PROVIDER.write().unwrap_poison();
+    if guard
+        .as_ref()
+        .is_some_and(|cur| Arc::ptr_eq(cur, installed))
+    {
+        *guard = previous;
+    }
+}
+
 /// Snapshot the current global provider for later restore (test isolation
 /// — the persist path rebuilds the singleton; pairs with
 /// [`restore_provider_for_test`]).

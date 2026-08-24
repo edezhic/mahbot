@@ -371,7 +371,7 @@ impl crate::Provider for PanicProvider {
 /// Serialized with the reset_analysis_tickets tests (shared global board + the
 /// process-global drain flag).
 #[tokio::test]
-#[serial_test::serial(reset_inflight)]
+#[serial_test::serial(reset_inflight, provider)] // process-global board + fake provider (providers::PROVIDER)
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn dispatch_panic_during_drain_skips_failed_transition() {
     init_management_test_stores().await;
@@ -1205,6 +1205,7 @@ fn engineer_failure_comment_scrubs_and_truncates() {
 /// (credential-scrubbed), while a valid item list renders the compact bullet
 /// summary (also scrubbed).
 #[tokio::test]
+#[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn engineer_comment_text_fail_open_and_renders() {
     use crate::util::test::{
@@ -1566,7 +1567,7 @@ async fn in_development_redispatch_lane_feeds_feedback() {
 /// overwrite `jobs.task` — but `request_messages[0]` is the immutable original
 /// re-dispatch prompt.
 #[tokio::test]
-#[serial_test::serial(reset_inflight)]
+#[serial_test::serial(reset_inflight, provider)] // process-global board + fake provider (providers::PROVIDER)
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
 async fn bounce_to_development_feeds_feedback_to_redispatch() {
     use crate::util::test::{FakeProvider, install_fake_provider, install_test_retry_policy};

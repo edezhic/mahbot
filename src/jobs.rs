@@ -1,9 +1,10 @@
 //! Durable jobs layer: jobs/agents/pending_jobs lifecycle, boot recovery
 //! scan, and stale purge orchestration.
 //!
-//! All rows live in sessions.db — the only DB sharing a transaction domain
-//! with session appends (no cross-DB transactions; ordering and
-//! crash-safety per the purge section in the design).
+//! All rows live in the consolidated domain database (`mahbot.db`) behind the
+//! one shared connection — the jobs/session/board tables now share a single
+//! transaction domain, so cross-store ordering and crash-safety can be
+//! expressed in a single transaction (see the purge section in the design).
 //!
 //! Table ownership: the DDL is appended to the session SCHEMA const
 //! (see `session/mod.rs`); this module owns the row model, the lifecycle
@@ -465,7 +466,7 @@ pub(crate) async fn complete_durable_job(
 /// single unified completion for both `ticket_analysis` and
 /// `ticket_implementation` ticket jobs over the shared `ticket_jobs`
 /// substrate. Ordering contract: the board transition+comment runs FIRST; this
-/// is the sessions.db completion tx.
+/// is the jobs/session completion tx.
 pub(crate) async fn complete_ticket_job(conn: &Connection, job_id: &str) -> Result<()> {
     let tx = conn.begin_tx().await?;
     tx.execute(
@@ -1142,16 +1143,18 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
 /// roster agents' sessions are all stale too (live sessions referenced by
 /// unfinished jobs are NEVER purged — the agents table IS the marker).
 /// `ticket_analysis` jobs stranded in a blocking phase are rolled back IN PLACE
-/// at purge time — cross-DB (jobs delete in sessions.db + ticket phase
-/// rollback in board.db), no cross-DB tx.
+/// at purge time — two sequential transactions on the single consolidated
+/// domain connection (ticket phase rollback, then jobs delete), no cross-file
+/// tx (board/sessions now share one file).
 ///
 /// Crash-safe ordering:
 /// 1. SELECT the purge set (ticket_id, stage → derived phase) BEFORE deleting —
 ///    CASCADE destroys ticket_jobs rows at delete time.
-/// 2. ONE board.db tx with per-ticket CAS rollback (phase CAS as the
+/// 2. ONE transaction (the shared consolidated connection) that rolls back each
+///    stale analysis ticket's phase with a per-ticket CAS (phase CAS as the
 ///    last-line race guard; the rollback is unconditional per stale analysis
 ///    row — one-round analysis has no round guard).
-/// 3. ONE sessions.db tx DELETE FROM jobs.
+/// 3. A SECOND transaction on the same connection: DELETE FROM jobs.
 ///
 /// Crash after (2) → CAS fails next tick, boot phase-check deletes the stale
 /// row; crash after (1) → nothing changed. Jobs-delete-first would strand a
@@ -1192,7 +1195,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
         return Ok(0);
     }
     // Paused workspace names: a frozen implementation must survive the stale purge.
-    // Best-effort — a workspaces.db read failure falls back to purging.
+    // Best-effort — a `workspaces` table read failure falls back to purging.
     let paused_ws: std::collections::HashSet<String> = match crate::workspace::store().list().await
     {
         Ok(list) => list
@@ -1210,9 +1213,10 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
         std::collections::HashSet::with_capacity(rows.len());
     // (ticket_id, phase) pairs for the board rollback. One-round analysis has
     // no round guard — every stale analysis row rolls its ticket back
-    // unconditionally (the board tx cannot see ticket_jobs — it lives in
-    // sessions.db, so the pair is read here). The phase is re-derived from
-    // (kind, stage) — it is no longer stored on the row.
+    // unconditionally (the board rollback reads the stored jobs rows from
+    // here rather than opening a board-side view of ticket_jobs, and the
+    // phase is re-derived from (kind, stage) — it is no longer stored on
+    // the row).
     let mut rollbacks: Vec<(String, String)> = Vec::new();
     for row in &rows {
         let id: String = row.get(0)?;
@@ -1236,7 +1240,8 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
         }
     }
 
-    // (2) ONE board.db tx with per-ticket CAS rollback. A missing board
+    // (2) ONE transaction (shared consolidated connection) that rolls back each
+    // stale analysis ticket's phase with a per-ticket CAS. A missing board
     // (uninitialized) or a failed tx means the rollback did NOT land — keep
     // the ticket_analysis rows so the next tick retries the CAS (aligned with
     // the tx-failure path; deleting the job would strand the ticket in a
@@ -1250,7 +1255,8 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
         }
     }
 
-    // (3) ONE sessions.db tx DELETE FROM jobs (CASCADE removes roster +
+    // (3) A SECOND transaction on the same consolidated connection:
+    // DELETE FROM jobs (CASCADE removes roster +
     // child rows; the engineer anchor survives — NULL FK child). A failed
     // board rollback keeps ticket_analysis rows in place so the next purge tick
     // retries the CAS — deleting the job first would strand the ticket in a
@@ -1470,7 +1476,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                 // scheduled pass re-runs it, so a leftover row is
                 // terminalized (never resumed). The cleaner's workspace is a
                 // synthetic ephemeral name that is never registered in
-                // workspaces.db — resuming would hit run_management's
+                // the `workspaces` table — resuming would hit run_management's
                 // unresolvable-workspace path; terminalizing here keeps that
                 // explicit and skips the catch-all warning.
                 info!(
@@ -2030,7 +2036,13 @@ mod tests {
 
     /// The agents table IS the marker: a transient session referenced by an
     /// agents row is NEVER purged by cleanup_old_transient_sessions.
+    ///
+    /// Serialized with the reset_inflight group: this test and those purge tests
+    /// share the one consolidated connection (single transaction domain), and a
+    /// purge test holds a raw tx briefly — running concurrently would break its
+    /// begin_tx with "cannot start a transaction within a transaction".
     #[tokio::test]
+    #[serial_test::serial(reset_inflight)]
     async fn ttl_guard_protects_job_tracked_sessions() {
         crate::util::test::init_test_stores().await;
         let store = crate::session::store();
@@ -2242,10 +2254,14 @@ mod tests {
     }
 
     /// The rollback-failure path: when the board rollback cannot land, the
-    /// ticket_analysis job rows are KEPT (next tick retries the CAS) while
-    /// non-ticket_analysis stale rows are still purged. A held raw board
-    /// transaction makes the rollback's begin_tx fail deterministically
-    /// ("cannot start a transaction within a transaction").
+    /// ticket_analysis job rows are KEPT (next tick retries the CAS). A held
+    /// raw transaction makes the rollback's begin_tx fail deterministically
+    /// ("cannot start a transaction within a transaction"). Because all stores
+    /// now share ONE consolidated connection (single transaction domain), the
+    /// same raw tx also blocks the whole sessions purge — so the test verifies
+    /// the rollback-path guard directly ([`rollback_stranded_tickets`]) and
+    /// then confirms a stale non-ticket_analysis row is purged once the raw tx
+    /// is released.
     ///
     /// Serialized with the other reset_analysis_tickets tests (shared global
     /// board — the raw tx would clobber concurrent fixtures).
@@ -2254,6 +2270,15 @@ mod tests {
     async fn purge_keeps_ticket_analysis_rows_when_rollback_fails() {
         crate::util::test::init_test_stores().await;
         let conn = &crate::session::store().conn;
+        let board = crate::board::store();
+        let ws = crate::workspace::test_ws_named("/tmp/purge_ws3", "purge_ws3");
+        let ticket_id = crate::util::test::make_ticket(
+            board,
+            &ws,
+            "Rollback failure",
+            crate::board::TicketPhase::Analysis,
+        )
+        .await;
         let stale = (chrono::Utc::now() - chrono::Duration::hours(20)).to_rfc3339();
         // Stale ticket_analysis job (must be retained) + stale analyze job (purged).
         crate::util::test::JobRowBuilder::new(
@@ -2269,8 +2294,8 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO ticket_jobs (id, ticket_id, stage) \
-             VALUES ('jfail_ts', 'ticket-missing', 'analysis')",
-            (),
+             VALUES (?1, ?2, 'analysis')",
+            params!["jfail_ts", ticket_id.clone()],
         )
         .await
         .unwrap();
@@ -2285,8 +2310,12 @@ mod tests {
         .insert()
         .await
         .unwrap();
-        // Raw BEGIN on the board connection (bypasses the wrapper's tx
-        // tracking) → the rollback's begin_tx fails → rollback_ok = false.
+        // Raw BEGIN on the shared consolidated connection (bypasses the
+        // wrapper's tx tracking). Under the consolidated connection every store
+        // shares one transaction domain, so this raw tx blocks BOTH the board
+        // rollback AND the sessions purge — it makes the board rollback's
+        // begin_tx fail deterministically ("cannot start a transaction within a
+        // transaction") and the whole purge is blocked.
         crate::board::store()
             .conn
             .execute("BEGIN", ())
@@ -2294,13 +2323,24 @@ mod tests {
             .expect("raw board BEGIN");
         let cutoff =
             (chrono::Utc::now() - chrono::Duration::hours(PURGE_CUTOFF_HOURS)).to_rfc3339();
-        purge_stale_jobs(&cutoff).await.unwrap();
-        // Restore the board connection for the next serial test.
-        crate::board::store()
-            .conn
-            .execute("ROLLBACK", ())
-            .await
-            .expect("restore raw board tx");
+        // The board rollback path cannot land while the raw tx is held. Under
+        // the shared connection the same raw tx also blocks the sessions purge
+        // (its own begin_tx fails), so the ticket_analysis row is KEPT.
+        let rollback_ok = rollback_stranded_tickets(&[(
+            ticket_id.clone(),
+            crate::board::TicketPhase::Analysis.to_string(),
+        )])
+        .await;
+        // Restore the shared connection — ALWAYS, before any assertion, so the
+        // raw tx never leaks into a later begin_tx across all stores even when
+        // the rollback assertion below panics.
+        let _ = crate::board::store().conn.execute("ROLLBACK", ()).await;
+        assert!(
+            !rollback_ok,
+            "board rollback must fail to land while a raw tx is held"
+        );
+        // The ticket_analysis row survives (nothing was purged — the whole
+        // purge was blocked by the open raw tx until just now).
         let ts_left = conn
             .query("SELECT COUNT(*) FROM jobs WHERE id = 'jfail_ts'", ())
             .await
@@ -2310,6 +2350,9 @@ mod tests {
             1,
             "ticket_analysis row must survive a failed rollback (next tick retries)"
         );
+        // Once the raw tx is released the full purge runs (the rollback now
+        // lands) and stale non-ticket_analysis rows are purged.
+        purge_stale_jobs(&cutoff).await.unwrap();
         let analyze_left = conn
             .query("SELECT COUNT(*) FROM jobs WHERE id = 'jfail_analyze'", ())
             .await
@@ -2317,7 +2360,7 @@ mod tests {
         assert_eq!(
             analyze_left[0].get::<i64>(0).unwrap(),
             0,
-            "non-ticket_analysis stale rows are purged regardless of the rollback"
+            "non-ticket_analysis stale rows are purged once the tx is released"
         );
     }
 
@@ -2429,7 +2472,7 @@ mod tests {
     /// A `temp_cleanup` row left over from a previous lifetime (crash
     /// mid-cleaner) must be TERMINALIZED at boot, never resumed: the cleaner
     /// is fire-and-forget, its workspace is a synthetic ephemeral name that
-    /// is never registered in workspaces.db, and the next scheduled pass
+    /// is never registered in the `workspaces` table, and the next scheduled pass
     /// re-runs the cleanup cleanly.
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // recover_from_restart resets the shared global board

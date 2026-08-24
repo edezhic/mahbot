@@ -12,10 +12,8 @@ use tracing::{debug, info, warn};
 crate::define_store! {
     /// Global board store.
     pub static BOARD: BoardStore,
-    db_name = "board",
-    schema = SCHEMA,
     post_open = after_open,
-    expect = "BOARD not initialized — call init_global() first",
+    expect = "BOARD not initialized — call init_all_stores() first",
 }
 
 /// Background task: auto-archive cancelled tickets older than 1 hour.
@@ -51,7 +49,7 @@ pub async fn run_archive_cancelled_loop() {
     }
 }
 
-const SCHEMA: &str = "\
+pub(crate) const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS tickets (
     id              TEXT PRIMARY KEY,
     title           TEXT NOT NULL,
@@ -88,6 +86,15 @@ CREATE TABLE IF NOT EXISTS ticket_counters (
     workspace_name TEXT PRIMARY KEY,
     next_id        INTEGER NOT NULL DEFAULT 1
 );
+-- The `idx_tickets_title_fts` FTS index is declared HERE (not only via the
+-- tokenizer-checking `ensure_fts_index` in `after_open`) so the consolidated
+-- schema creates it BEFORE the one-time import populates `tickets`: once the
+-- index exists, the bulk INSERTs maintain it, so imported tickets are
+-- FTS-searchable immediately. (turso's `CREATE INDEX ... USING fts` does NOT
+-- backfill pre-existing rows.) `ensure_fts_index` still runs later to
+-- tokenizer-migrate the index; its DDL must match this one — keep in sync.
+CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
+USING fts (title) WITH (tokenizer = 'ngram');
 ";
 
 const TICKETS_FTS_INDEX_NAME: &str = "idx_tickets_title_fts";
@@ -628,19 +635,23 @@ pub(crate) enum LoadComments {
 }
 
 impl BoardStore {
-    /// Post-open setup: create the FTS index.
-    async fn after_open(&self) -> anyhow::Result<()> {
+    /// Post-open setup: ensure the FTS index exists with the correct tokenizer.
+    ///
+    /// The index is ALSO declared in [`SCHEMA`] so the consolidated schema
+    /// creates it before the one-time import (guaranteeing imported tickets are
+    /// FTS-searchable). This hook therefore only tokenizer-migrates an existing
+    /// index (drops and recreates if the tokenizer changed); it is idempotent
+    /// and runs from both [`crate::turso::init_all_stores`] (production, on the
+    /// shared consolidated connection) and each isolated board store open. The
+    /// board migrations are NOT run here — they are part of the consolidated
+    /// domain migration history applied once by
+    /// [`crate::migrations::run_domain_migrations`].
+    pub(crate) async fn after_open(&self) -> anyhow::Result<()> {
         crate::turso::ensure_fts_index(
             &self.conn,
             TICKETS_FTS_INDEX_NAME,
             "ngram",
             TICKETS_FTS_INDEX_DDL,
-        )
-        .await?;
-        crate::turso::run_pending_migrations(
-            &self.conn,
-            "board",
-            crate::migrations::BOARD_MIGRATIONS,
         )
         .await?;
         Ok(())
@@ -964,9 +975,9 @@ impl BoardStore {
     ///
     /// Note: the mid-execution re-dispatch guard (the historical `assigned_to
     /// IS NULL` clause) is enforced by the caller via
-    /// [`crate::jobs::ticket_has_active_agents`] — the agents roster
-    /// lives in sessions.db, which board.db cannot reference in a single
-    /// statement. The claim source phases (Backlog, ReadyForDevelopment)
+    /// [`crate::jobs::ticket_has_active_agents`] — the claim SELECT is kept to
+    /// the tickets table, and the agents roster is a separate logical table.
+    /// The claim source phases (Backlog, ReadyForDevelopment)
     /// have no running agent.
     pub(crate) async fn claim_ticket_in_workspace(
         &self,

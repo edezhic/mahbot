@@ -24,9 +24,7 @@ use tracing::warn;
 crate::define_store! {
     /// Global workspace store.
     pub static WORKSPACES: WorkspaceStore,
-    db_name = "workspaces",
-    schema = SCHEMA,
-    expect = "workspace::WORKSPACES not initialized — call workspace::init_global() in main.rs",
+    expect = "workspace::WORKSPACES not initialized — call init_all_stores() first",
 }
 
 /// Look up a workspace by its name.
@@ -34,7 +32,7 @@ pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
     store().get_by_name(name).await
 }
 
-const SCHEMA: &str = "\
+pub(crate) const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS workspaces (
     name       TEXT PRIMARY KEY,
     path       TEXT NOT NULL UNIQUE,
@@ -1563,7 +1561,7 @@ pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
 /// `config_kv` key holding the RFC 3339 UTC timestamp of the last nightly
 /// rediscovery pass start.
 ///
-/// Deliberately stored in `config_kv` (config.db) rather than in the
+/// Deliberately stored in `config_kv` (in the consolidated `mahbot.db`) rather than in the
 /// workspaces table: the schema has no migration path (new columns are
 /// invisible on existing live databases) and workspace rows are deleted
 /// during rediscovery, so the timestamp must live in a table that outlives

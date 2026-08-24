@@ -233,6 +233,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_consecutive_transport_errors() {
         let _guard = retry_tests_lock();
@@ -249,6 +250,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_truncated_envelope_parse_errors() {
         let _guard = retry_tests_lock();
@@ -268,6 +270,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn recovers_after_llm_parse_failure_via_reprompt() {
         let _guard = retry_tests_lock();
@@ -282,6 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn exhausts_attempts_with_bounded_call_count() {
         let _guard = retry_tests_lock();
@@ -300,6 +304,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn non_retryable_error_propagates_immediately() {
         let _guard = retry_tests_lock();
@@ -318,6 +323,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn transport_final_failure_clears_earlier_text_from_last_raw() {
         // Mixed sequence: an early attempt produces text (parse failure), then
@@ -353,6 +359,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn tool_call_final_attempt_keeps_empty_last_raw() {
         // A tool-call final attempt (empty text) survives as Some("") so the
@@ -372,6 +379,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn attempts_byte_identical_except_reprompt() {
         let _guard = retry_tests_lock();
@@ -400,6 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn score_out_of_range_never_passes_and_reprompts() {
         let _guard = retry_tests_lock();
@@ -415,6 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn score_out_of_range_all_attempts_classifies_as_out_of_range() {
         let _guard = retry_tests_lock();
@@ -443,6 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn wall_clock_cap_binds_before_attempt_exhaustion() {
         let _guard = retry_tests_lock();
@@ -477,6 +488,7 @@ mod tests {
     /// row keeps cost/provider NULL (no envelope on the failure path).
     /// Catches the extraction path drifting from the recorded request.
     #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn extraction_rows_record_base_params_and_retry_context() {
         let _guard = retry_tests_lock();

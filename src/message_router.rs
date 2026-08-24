@@ -411,7 +411,7 @@ pub fn try_route(agent_id: &str, job: AgentJob) -> bool {
 /// Resolve a workspace by name, with personal workspace fallback.
 ///
 /// Personal workspaces (names starting with `"personal:"`) are NOT stored
-/// in `workspaces.db` — they live at `~/.mahbot/userspaces/<user>/` and are
+/// in the `workspaces` table — they live at `~/.mahbot/userspaces/<user>/` and are
 /// constructed on the fly as ephemeral [`Workspace`] structs.
 ///
 /// Returns `Ok(Some(ws))` when the workspace is found or constructed.

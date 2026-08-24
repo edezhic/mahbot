@@ -47,8 +47,8 @@ use tokio::sync::OnceCell;
 /// Global search-engine registry, keyed by workspace name.
 static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<SearchEngineEntry>>>> = OnceCell::const_new();
 
-/// Initialize the global registry. Must be called during bootstrap, after
-/// [`crate::workspace::init_global`] and before any background task that may search.
+/// Initialize the global registry. Must be called during bootstrap, before
+/// any background task that may search.
 ///
 /// Idempotent: a second call (e.g. a test init path racing another test's
 /// bootstrap) is a no-op that preserves the existing registry — the map is

@@ -474,8 +474,14 @@ fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
 /// Validate a store name against the canonical list. `all_valid` appends the
 /// literal `all` option to the hint — only callers that accept `--db all`
 /// pass `true`.
+///
+/// Accepts both the LOGICAL store names ([`turso_mod::store_names`]) and the
+/// PHYSICAL consolidated file name ([`turso_mod::CONSOLIDATED_DB_NAME`], shown
+/// as the label in `--db all`/`detect` output). Both lists must stay in sync
+/// with the debug CLI's `--db` surface.
 fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
-    let names = turso_mod::store_names();
+    let mut names = turso_mod::store_names();
+    names.push(turso_mod::CONSOLIDATED_DB_NAME);
     if names.contains(&name) {
         return Ok(());
     }
@@ -497,9 +503,12 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
             validate_store_name(&name, false)?;
             vec![name]
         }
-        None => turso_mod::store_names()
+        // No `--db` → diagnose each PHYSICAL file once (mahbot + logs), not
+        // once per logical domain name (the 6 domain names all share the one
+        // consolidated file).
+        None => physical_store_list(&mahbot_home)
             .into_iter()
-            .map(String::from)
+            .map(|(n, _)| n)
             .collect(),
     };
     let mut failures = 0usize;
@@ -1325,7 +1334,7 @@ fn is_engine_panic_error(err: &anyhow::Error) -> bool {
 
 /// Open a store file read-only with the given engine opts.
 ///
-/// Also used by the `bench-openrouter` subcommand for read-only `config.db`
+/// Also used by the `bench-openrouter` subcommand for read-only config-store
 /// lookups (worker model / provider key fallbacks) — same guarantees, same
 /// no-write path as the debug CLI.
 ///
@@ -1369,7 +1378,7 @@ pub(crate) fn open_readonly(
 
 /// Connect to an opened store, applying the in-memory temp-store setting.
 ///
-/// Also used by the `bench-openrouter` subcommand for read-only `config.db`
+/// Also used by the `bench-openrouter` subcommand for read-only config-store
 /// lookups — see [`open_readonly`].
 ///
 /// Every turso connection the application opens — the service connection
@@ -1707,14 +1716,22 @@ fn is_torn_frame_error(err: &anyhow::Error) -> bool {
     TORN_FRAME_SIGNATURES.iter().any(|sig| msg.contains(sig))
 }
 
+/// The physical database files for the debug CLI, each opened once.
+///
+/// After consolidation the 6 domain stores share ONE file, so `--db all` and
+/// `detect` (with no `--db`) open each unique file once rather than once per
+/// logical domain name. Labels are the physical store names from
+/// [`turso_mod::iter_checkpoint_stores`].
+fn physical_store_list(root: &Path) -> Vec<(String, PathBuf)> {
+    turso_mod::iter_checkpoint_stores()
+        .map(|(name, _)| (name.to_string(), turso_mod::store_db_path(root, name)))
+        .collect()
+}
+
 /// Map a `--db` argument to a list of `(label, absolute db path)` pairs.
 fn resolve_db_list(name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>> {
     if name == "all" {
-        let names = turso_mod::store_names();
-        return Ok(names
-            .iter()
-            .map(|n| (n.to_string(), turso_mod::store_db_path(root, n)))
-            .collect());
+        return Ok(physical_store_list(root));
     }
     validate_store_name(name, true)?;
     Ok(vec![(
@@ -1811,7 +1828,9 @@ fn print_usage() {
     eprintln!("       mahbot debug detect [--db <name>]");
     eprintln!("       mahbot debug families [--db <name>]");
     eprintln!("       mahbot debug --family <id> \"SQL query\"");
-    let names = turso_mod::store_names().join(" | ");
+    let mut names = turso_mod::store_names();
+    names.push(turso_mod::CONSOLIDATED_DB_NAME);
+    let names = names.join(" | ");
     eprintln!("  -h, --help  print this help and exit 0");
     eprintln!("  --db <name> {names} | all");
     eprintln!("              with a SQL argument: read-only query, pipe-delimited output");
@@ -2193,10 +2212,11 @@ mod tests {
             .await
             .expect_err("--db all with missing stores must report a failure summary");
         let msg = format!("{err:#}");
-        // Compute the expectation from the store-name source (the single
+        // Compute the expectation from the physical store source (the single
         // source of truth) so the test does not hardcode the current store
-        // count — only the logs store exists, so every other store is missing.
-        let total = turso_mod::store_names().len();
+        // count — only the logs store exists, so the consolidated mahbot file
+        // is missing.
+        let total = physical_store_list(dir.path()).len();
         assert!(
             msg.contains(&format!("{} of {total} store(s) failed", total - 1)),
             "must summarize per-store failures, got: {msg}"
@@ -2896,11 +2916,13 @@ mod tests {
     /// PID, never by re-probing the flock.
     ///
     /// Two stores make the swap deterministic: the gate's first observation
-    /// records `[Some(old), None]` (old holds `board`, `chat_history` unheld),
-    /// and the new child acquires `chat_history` mid-run — uncontended (the
+    /// records `[Some(old), None]` (old holds `board`, `logs` unheld),
+    /// and the new child acquires `logs` mid-run — uncontended (the
     /// old child locks a different file), so the new pid lands with wide
     /// margin before the gate's second observation (~1s) and the PID change
-    /// fires.
+    /// fires. Under the consolidated layout `board` is the domain file
+    /// (`mahbot.db`) and `logs` is the one separate physical store, so the two
+    /// names resolve to two distinct sidecar files.
     ///
     /// This test is `#[ignore]` by default because it exercises real cross-process fcntl locks (spawned perl lock-holder children) with multi-second waits. Run it
     /// explicitly with:
@@ -2915,23 +2937,22 @@ mod tests {
     async fn flock_gate_proceeds_after_handoff_pid_change() {
         let dir = tempfile::TempDir::new().unwrap();
         write_tshm_only(dir.path(), "board");
-        write_tshm_only(dir.path(), "chat_history");
+        write_tshm_only(dir.path(), "logs");
         let lock_path = crate::lock_utils::lock_file_path(dir.path());
         touch_lock(&lock_path);
         let tshm_a = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "board")).tshm;
-        let tshm_b =
-            turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "chat_history")).tshm;
+        let tshm_b = turso_mod::store_sidecars(&turso_mod::store_db_path(dir.path(), "logs")).tshm;
         let mut old = hold_byte0_perl(&tshm_a);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
             probe_tshm_byte0_pid(&tshm_a).is_some() && probe_tshm_byte0_pid(&tshm_b).is_none(),
-            "old daemon holds board; chat_history starts unheld"
+            "old daemon holds board; logs starts unheld"
         );
         let dir_path = dir.path().to_path_buf();
-        let names = vec!["board".to_string(), "chat_history".to_string()];
+        let names = vec!["board".to_string(), "logs".to_string()];
         // The first observation runs immediately at spawn (old holds board)
         // and establishes the handoff as [Some(old), None]. Swap children
-        // early: chat_history is uncontended, so the new pid lands with wide
+        // early: logs is uncontended, so the new pid lands with wide
         // margin before the gate's second observation (~1s after spawn).
         let gate = tokio::spawn(async move {
             flock_gate_with_timeout(&dir_path, &names, Duration::from_secs(5)).await

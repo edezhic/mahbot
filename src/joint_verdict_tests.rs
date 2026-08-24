@@ -507,7 +507,7 @@ fn synthesis_request_uses_global_flat_item_ids() {
         vec![],
         "",
     );
-    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let ws = crate::workspace::test_ws_named("/tmp/test_ws", "joint_verdict_synth_request");
     let request = synthesis_request(&r, Role::Reviewer, &ws);
     let system = &request.messages[0].content;
     assert!(
@@ -534,6 +534,7 @@ fn synthesis_request_uses_global_flat_item_ids() {
 }
 
 #[tokio::test]
+#[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn run_synthesis_end_to_end_zero_based_contract() {
     let _lock = crate::util::test::retry_tests_lock();
@@ -555,7 +556,7 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
         r#"{"summary":"Two distinct issues.","groups":[{"heading":"Robustness","contradiction":false,"members":[{"id":0},{"id":1}]}],"ungrouped":[]}"#,
     );
     let _provider = crate::util::test::install_fake_provider(std::sync::Arc::new(provider));
-    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let ws = crate::workspace::test_ws_named("/tmp/test_ws", "joint_verdict_zero_based");
     let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     match outcome {
         RepairOutcome::Repaired { output, .. } => assert_eq!(output.groups.len(), 1),
@@ -595,6 +596,7 @@ async fn run_synthesis_end_to_end_zero_based_contract() {
 }
 
 #[tokio::test]
+#[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn repair_rounds_freeze_groups_and_converge() {
     let _lock = crate::util::test::retry_tests_lock();
@@ -628,7 +630,7 @@ async fn repair_rounds_freeze_groups_and_converge() {
         );
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake.clone());
-    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let ws = crate::workspace::test_ws_named("/tmp/test_ws", "joint_verdict_freeze");
     let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     let RepairOutcome::Repaired { output, references } = outcome else {
         panic!("repair must converge, got fallback");
@@ -659,6 +661,7 @@ async fn repair_rounds_freeze_groups_and_converge() {
 }
 
 #[tokio::test]
+#[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn repair_zero_progress_with_no_frozen_groups_falls_back() {
     let _lock = crate::util::test::retry_tests_lock();
@@ -687,7 +690,7 @@ async fn repair_zero_progress_with_no_frozen_groups_falls_back() {
         );
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake);
-    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let ws = crate::workspace::test_ws_named("/tmp/test_ws", "joint_verdict_zero_progress");
     let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     assert!(
         matches!(outcome, RepairOutcome::Fallback),
@@ -696,6 +699,7 @@ async fn repair_zero_progress_with_no_frozen_groups_falls_back() {
 }
 
 #[tokio::test]
+#[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn repair_contradiction_reference_renders_disputed() {
     let _lock = crate::util::test::retry_tests_lock();
@@ -724,7 +728,7 @@ async fn repair_contradiction_reference_renders_disputed() {
         );
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake);
-    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let ws = crate::workspace::test_ws_named("/tmp/test_ws", "joint_verdict_disputed");
     let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     let RepairOutcome::Repaired { output, references } = outcome else {
         panic!("reference round must converge, got fallback");
@@ -742,6 +746,7 @@ async fn repair_contradiction_reference_renders_disputed() {
 }
 
 #[tokio::test]
+#[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
 #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global seams
 async fn repair_rejects_empty_member_group() {
     let _lock = crate::util::test::retry_tests_lock();
@@ -766,7 +771,7 @@ async fn repair_rejects_empty_member_group() {
         );
     let fake = std::sync::Arc::new(fake);
     let _provider = crate::util::test::install_fake_provider(fake.clone());
-    let ws = crate::workspace::test_ws("/tmp/test_ws");
+    let ws = crate::workspace::test_ws_named("/tmp/test_ws", "joint_verdict_empty_member");
     let outcome = run_synthesis(&r, Role::Reviewer, &ws, "test_ticket", "Test ticket").await;
     let RepairOutcome::Repaired { output, .. } = outcome else {
         panic!("empty-member rejection must not force a fallback");

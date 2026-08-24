@@ -598,7 +598,7 @@ fn read_tshm_disciplined(
 
 /// Classify the file set of one store given its main database file path.
 ///
-/// The store name is derived from the file name (`board.db` → `board`).
+/// The store name is derived from the file name (`mahbot.db` → `mahbot`).
 /// This is a pure filesystem inspection — it never opens the database, so it
 /// is safe to run against live stores and is unit-testable with synthetic
 /// file states. `fds` provides the persistent per-store fds when the caller
@@ -795,10 +795,11 @@ fn classify_main_db(db_path: &Path, wal_exists: bool, wal_size: u64) -> BootDiag
     }
 }
 
-/// Boot pre-flight: classify all 7 stores **before any store is opened**
-/// (logs opens first inside `init_tracing`; turso's own reopen would consume
-/// the evidence). Runs before the process holds any lock, so path-based reads
-/// are safe; the instance lock already excludes a second daemon.
+/// Boot pre-flight: classify every physical store (the consolidated `mahbot.db`
+/// plus the separate `logs.db`) **before any store is opened** (logs opens
+/// first inside `init_tracing`; turso's own reopen would consume the evidence).
+/// Runs before the process holds any lock, so path-based reads are safe; the
+/// instance lock already excludes a second daemon.
 ///
 /// The result feeds the per-store heal strategy in `turso::open_store`. The
 /// open+close regression counter is reset afterwards so the wal-guard's first
@@ -1282,25 +1283,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wal_guard_state_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
+        // All 6 domain stores map onto the one consolidated file (mahbot.db);
+        // only `logs` is a separate physical file. Write sidecars for
+        // mahbot.db (reused across the three classifications below).
         // Healthy store: tshm advertises 0 frames, wal empty.
-        write(&dir.join("db/board.db-tshm"), &tshm_bytes(0, 0, 5));
-        write(&dir.join("db/board.db-wal"), &[]);
+        write(&dir.join("db/mahbot.db-tshm"), &tshm_bytes(0, 0, 5));
+        write(&dir.join("db/mahbot.db-wal"), &[]);
         let s = inspect_store(&dir, "board", StoreFds::none());
         assert_eq!(s.class, WalStateClass::Healthy);
 
         // Orphaned store: tshm advertises live frames, wal empty.
-        write(
-            &dir.join("db/sessions.db-tshm"),
-            &tshm_bytes(356, 0, 710_565),
-        );
-        write(&dir.join("db/sessions.db-wal"), &[]);
+        write(&dir.join("db/mahbot.db-tshm"), &tshm_bytes(356, 0, 710_565));
+        write(&dir.join("db/mahbot.db-wal"), &[]);
         let s = inspect_store(&dir, "sessions", StoreFds::none());
         assert_eq!(s.class, WalStateClass::Orphaned);
         assert!(s.tshm.is_some());
         assert_eq!(s.tshm.unwrap().max_frame, 356);
 
         // Missing tshm → unreadable (never blocks checkpoint).
-        write(&dir.join("db/users.db-wal"), &[0u8; 4096]);
+        let _ = std::fs::remove_file(&dir.join("db/mahbot.db-tshm"));
+        write(&dir.join("db/mahbot.db-wal"), &[0u8; 4096]);
         let s = inspect_store(&dir, "users", StoreFds::none());
         assert_eq!(s.class, WalStateClass::Unreadable);
 
@@ -1312,12 +1314,13 @@ mod tests {
     fn inspect_store_visits_every_store() {
         let dir = std::env::temp_dir().join(format!("wal_guard_all_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        for name in crate::turso::store_names() {
-            write(
-                &dir.join(format!("db/{name}.db-tshm")),
-                &tshm_bytes(0, 0, 0),
-            );
-        }
+        // Only the PHYSICAL store files exist on disk: one consolidated domain
+        // file (mahbot.db, backing all 6 domain stores) + the logs file. The
+        // logical store_names() map onto these via store_db_path — write
+        // healthy sidecars for both physical files so every logical name
+        // resolves to a Healthy fixture.
+        write(&dir.join("db/mahbot.db-tshm"), &tshm_bytes(0, 0, 0));
+        write(&dir.join("db/logs.db-tshm"), &tshm_bytes(0, 0, 0));
         // Path-based inspection (StoreFds::none) so live connections from
         // concurrently-running tests cannot leak real store state in here.
         for name in crate::turso::store_names() {
@@ -1336,14 +1339,14 @@ mod tests {
     fn path_read_counts_open_close_and_fd_read_does_not() {
         let dir = std::env::temp_dir().join(format!("wal_guard_cnt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let tshm_path = dir.join("db/board.db-tshm");
+        let tshm_path = dir.join("db/mahbot.db-tshm");
         write(&tshm_path, &tshm_bytes(0, 0, 0));
 
         reset_tshm_open_close_count();
         let file = File::open(&tshm_path).unwrap();
         let before = tshm_open_close_count();
         let s = inspect_store_at(
-            &dir.join("db/board.db"),
+            &dir.join("db/mahbot.db"),
             StoreFds {
                 tshm: Some(&file),
                 wal: None,
@@ -1356,7 +1359,7 @@ mod tests {
             "fd read must not open+close"
         );
 
-        let s = inspect_store_at(&dir.join("db/board.db"), StoreFds::none());
+        let s = inspect_store_at(&dir.join("db/mahbot.db"), StoreFds::none());
         assert_eq!(s.class, WalStateClass::Healthy);
         assert_eq!(
             tshm_open_close_count(),
@@ -1374,39 +1377,48 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wal_guard_preflight_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Stale-tail: live frames (valid matching WAL header + exact expected
-        // length) with the frame index longer than max_frame.
+        // Only two PHYSICAL store files exist: the consolidated domain file
+        // (mahbot.db — every domain store name maps onto it) and the logs file.
+        // Exercise each classification by re-writing mahbot.db's sidecars and
+        // re-running the pre-flight scan (diagnose_all_stores diagnoses the
+        // mahbot + logs physical pair each call).
+
+        // (1) Stale-tail: live frames (valid matching WAL header + exact
+        // expected length) with the frame index longer than max_frame.
         let mut stale = tshm_bytes(120, 0, 7);
         stale[TSHM_FRAME_INDEX_LEN_OFFSET..TSHM_FRAME_INDEX_LEN_OFFSET + 4]
             .copy_from_slice(&130u32.to_le_bytes());
         stale[TSHM_PAGE_SIZE_OFFSET..TSHM_PAGE_SIZE_OFFSET + 4]
             .copy_from_slice(&4096u32.to_le_bytes());
-        write(&dir.join("db/sessions.db-tshm"), &stale);
+        write(&dir.join("db/mahbot.db-tshm"), &stale);
         let mut wal = vec![0u8; 32 + 120 * (24 + 4096)];
         wal[..32].copy_from_slice(&wal_header_bytes(4096, 0, 0));
-        write(&dir.join("db/sessions.db-wal"), &wal);
-        // Structural: truncated main DB header.
-        write(&dir.join("db/board.db"), &[0u8; 64]);
-        write(&dir.join("db/board.db-tshm"), &tshm_bytes(0, 0, 0));
-        // Healthy: 64 KiB page size (raw 1 in the header field) must not be
-        // misclassified as structural (quarantine + recreate).
-        let mut db = vec![0u8; 4096];
-        db[..16].copy_from_slice(b"SQLite format 3\0");
-        db[16..18].copy_from_slice(&1u16.to_be_bytes());
-        write(&dir.join("db/chat_history.db"), &db);
-        write(&dir.join("db/chat_history.db-tshm"), &tshm_bytes(0, 0, 0));
-        // Healthy: fresh store state.
-        write(&dir.join("db/users.db-tshm"), &tshm_bytes(0, 0, 0));
-
+        write(&dir.join("db/mahbot.db-wal"), &wal);
         crate::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
             crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(&dir, "sessions")),
             Some(BootDiagnosis::StaleTail)
         );
+
+        // (2) Structural: truncated main DB header (drop the stale WAL so the
+        // coordination class is Healthy and the main-DB gate decides).
+        let _ = std::fs::remove_file(&dir.join("db/mahbot.db-wal"));
+        write(&dir.join("db/mahbot.db"), &[0u8; 64]);
+        write(&dir.join("db/mahbot.db-tshm"), &tshm_bytes(0, 0, 0));
+        crate::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
             crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(&dir, "board")),
             Some(BootDiagnosis::Structural)
         );
+
+        // (3) Healthy: 64 KiB page size (raw 1 in the header field) must not be
+        // misclassified as structural (quarantine + recreate).
+        let mut db = vec![0u8; 4096];
+        db[..16].copy_from_slice(b"SQLite format 3\0");
+        db[16..18].copy_from_slice(&1u16.to_be_bytes());
+        write(&dir.join("db/mahbot.db"), &db);
+        write(&dir.join("db/mahbot.db-tshm"), &tshm_bytes(0, 0, 0));
+        crate::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
             crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(
                 &dir,
@@ -1414,10 +1426,16 @@ mod tests {
             )),
             Some(BootDiagnosis::Healthy)
         );
+
+        // (4) Healthy: fresh store state (no main DB file yet).
+        let _ = std::fs::remove_file(&dir.join("db/mahbot.db"));
+        write(&dir.join("db/mahbot.db-tshm"), &tshm_bytes(0, 0, 0));
+        crate::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
             crate::wal_guard::take_boot_diagnosis(&crate::turso::store_db_path(&dir, "users")),
             Some(BootDiagnosis::Healthy)
         );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,7 +4,7 @@
 //!
 //! The config system has a layered structure: hardcoded defaults in this module
 //! provide the base values, and the [`ConfigReload`] singleton is then overlayed
-//! with persisted values from the `config.db` Turso database (via
+//! with persisted values from the consolidated domain `mahbot.db` (via
 //! [`crate::config_db`]).
 //!
 //! At startup, [`load_or_init`] seeds `ConfigData::STRUCT_FIELDS_DEFAULT` into the
@@ -83,7 +83,7 @@
 //!
 //! # Persistence layer
 //!
-//! The tables live in `config.db` and are managed by [`crate::config_db`]:
+//! The tables live in the consolidated domain `mahbot.db` and are managed by [`crate::config_db`]:
 //!
 //! | Table | Read | Write |
 //! |---|---|---|
@@ -762,10 +762,10 @@ fn persist_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 /// Fresh-install discriminator: set during [`load_or_init`] to
-/// whether `config.db` did not exist on disk before the config store was
-/// opened this boot. [`reload_from_db`] seeds the fresh-install defaults
-/// into brand-new config databases only — existing databases receive zero
-/// writes (hard constraint).
+/// whether the consolidated `mahbot.db` did not exist on disk before the
+/// config store was opened this boot. [`reload_from_db`] seeds the
+/// fresh-install defaults into brand-new config databases only — existing
+/// databases receive zero writes (hard constraint).
 static CONFIG_DB_FRESH_AT_BOOT: AtomicBool = AtomicBool::new(false);
 
 /// Reloadable configuration with atomic swap capability.
@@ -941,7 +941,7 @@ pub fn default_config_dir() -> Result<PathBuf> {
 /// 4. Stores the result in the global [`CONFIG`] singleton.
 ///
 /// The caller must subsequently call [`reload_from_db`] to load any
-/// persisted configuration from `config.db`. Providers must be
+/// persisted configuration from the consolidated database. Providers must be
 /// initialised **after** `reload_from_db` so API keys and model
 /// settings take effect.
 pub async fn load_or_init() -> Result<()> {
@@ -954,15 +954,16 @@ pub async fn load_or_init() -> Result<()> {
 
     // Fresh-install discriminator: capture whether the config store file exists
     // BEFORE any store open creates it, so reload_from_db() can seed
-    // fresh-install defaults into brand-new databases only. The
-    // probe must check the exact path the store open uses (`<root>/db/config.db`
-    // — see [`crate::turso::store_db_path`]); probing any other location would
+    // fresh-install defaults into brand-new databases only. In the consolidated
+    // layout the config store lives in the single `mahbot.db`; an existing
+    // install is detected by EITHER that file OR a legacy per-store
+    // `config.db` (pre-consolidation). Probing any other location would
     // classify every existing install as fresh and re-seed it on each boot,
     // violating the zero-write hard constraint.
     CONFIG_DB_FRESH_AT_BOOT.store(config_db_is_fresh(&mahbot_dir), Ordering::Release);
 
     // Start with hardcoded defaults — reload_from_db() will overlay
-    // any persisted values from config.db (called later in bootstrap).
+    // any persisted values from the config store (called later in bootstrap).
     CONFIG.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
 
     tracing::info!(
@@ -973,16 +974,21 @@ pub async fn load_or_init() -> Result<()> {
 }
 
 /// Fresh-install discriminator: `true` when the config store
-/// file does not yet exist at its real location (`<root>/db/config.db` — see
-/// [`crate::turso::store_db_path`]).
+/// file does not yet exist at its real location.
+///
+/// In the consolidated layout the config store lives in the single domain
+/// database ([`crate::turso::CONSOLIDATED_DB_NAME`]). An existing install is
+/// detected by EITHER the consolidated file OR a legacy per-store `config.db`
+/// (pre-consolidation) — probing only the consolidated file would classify a
+/// legacy install as fresh and re-seed it on the first consolidated boot,
+/// violating the zero-write hard constraint.
 ///
 /// Must be probed BEFORE any store open creates the file, and must check the
 /// exact path the open uses (`init_all_stores` → `open_store` →
-/// `store_db_path`). A probe of any other location would classify existing
-/// installs as fresh and re-seed them on every boot, violating the zero-write
-/// hard constraint.
+/// `store_db_path`).
 fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
     !crate::turso::store_db_path(mahbot_dir, "config").exists()
+        && !crate::turso::legacy_store_db_path(mahbot_dir, "config").exists()
 }
 
 /// Seed the fresh-install defaults into a brand-new config database
@@ -1088,7 +1094,7 @@ async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Re
     Ok(())
 }
 
-/// Reload config from the `config.db` database, atomically swapping the
+/// Reload config from the consolidated domain database, atomically swapping the
 /// runtime config. Called at startup (after config_db init) to overlay
 /// persisted settings on top of hardcoded defaults.
 pub async fn reload_from_db() -> Result<()> {
@@ -1099,8 +1105,8 @@ pub async fn reload_from_db() -> Result<()> {
     // database gets the transcription-off default (so no audio model is
     // downloaded or loaded at boot) plus the image/video generation model
     // lists and active selections (so the Settings GUI pickers are populated).
-    // Existing installs are never written (the flag is only set when config.db
-    // did not exist before the store open).
+    // Existing installs are never written (the flag is only set when the config
+    // store did not exist before the store open).
     seed_fresh_install_defaults_from_flag(store).await?;
 
     // Rewrite persisted old-default manager/worker rows to the new default
@@ -1956,7 +1962,7 @@ mod tests {
     /// This test drives the real boot chain end-to-end instead of hand-picking
     /// `fresh` values: the discriminator probe (`config_db_is_fresh` — the
     /// exact function `load_or_init` uses), the boot flag it feeds, the store
-    /// open that creates `db/config.db`, and the flag-consumption + seed
+    /// open that creates the consolidated `mahbot.db`, and the flag-consumption + seed
     /// (`seed_fresh_install_defaults_from_flag`, the `reload_from_db` path).
     ///
     /// Regression guard for the wrong-path probe: opening the config store
@@ -1974,10 +1980,10 @@ mod tests {
         );
         CONFIG_DB_FRESH_AT_BOOT.store(fresh, Ordering::Release);
 
-        // Opening the config store creates <root>/db/config.db — the exact
-        // file the probe must check. This is the regression pin for the
-        // original bug: probing <root>/config.db would still report "fresh"
-        // here and re-seed existing installs on every boot.
+        // Opening the config store creates the consolidated mahbot.db — the
+        // exact file the probe must check. This is the regression pin for the
+        // original bug: probing a top-level <root>/config.db would still report
+        // "fresh" here and re-seed existing installs on every boot.
         let fresh_store = crate::config_db::ConfigStore::open(fresh_root.path())
             .await
             .unwrap();
