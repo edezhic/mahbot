@@ -705,6 +705,14 @@ pub struct Agent {
     pub(crate) tool_specs: Vec<ToolSpec>,
     /// Cancellation token for cooperative mid-loop cancellation (e.g. /stop).
     cancel_token: CancellationToken,
+    /// Whether a GENUINE user/operator stop was requested for this run.
+    /// Set only by user-facing stop paths (e.g. GUI ticket cancel via
+    /// `cancel_by_ticket_id_user`); code-driven internal cancellations
+    /// (re-dispatch, register replacement, phase transition) set the
+    /// generic `cancel_token` but NEVER this flag. Used to distinguish
+    /// a real user stop from an internal cancellation in the pipeline
+    /// failure classifier.
+    user_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Board ticket this agent is currently working on (set for board-dispatched agents).
     ticket: Option<crate::pipeline::board::Ticket>,
     /// Generation counter from the agent registry — used in [`Drop`] for

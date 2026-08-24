@@ -309,6 +309,7 @@ impl Agent {
         let (tools, tool_specs) = role_tools_and_specs(role, ws);
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
+        let user_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let label = if let Some(ref t) = ticket {
             format!("{}: {}", role.as_str(), t.title)
         } else {
@@ -350,6 +351,7 @@ impl Agent {
             cancel_token.clone(),
             parent_key.clone(),
             parent_label.clone(),
+            user_stop.clone(),
         );
 
         Self {
@@ -360,6 +362,7 @@ impl Agent {
             tools,
             tool_specs,
             cancel_token,
+            user_stop,
             ticket,
             generation,
             tool_stats: std::sync::Mutex::new(Vec::new()),
@@ -493,6 +496,14 @@ impl Agent {
         self.cancel_token.is_cancelled()
     }
 
+    /// Check whether a GENUINE user/operator stop was requested (distinct
+    /// from a code-driven internal cancellation that also fires the
+    /// generic `cancel_token`).
+    #[must_use]
+    pub fn is_cancelled_by_user(&self) -> bool {
+        self.user_stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Human-readable failure reason with the same global-token-first ordering
     /// as [`failure_classification`]: shutdown cancels every per-agent token,
     /// so the global token must be checked before a user cancel is reported.
@@ -500,8 +511,10 @@ impl Agent {
     pub(crate) fn failure_reason(&self, fallback: &str) -> String {
         if crate::shutdown::shutdown_token().is_cancelled() {
             "service shutting down".to_string()
-        } else if self.is_cancelled() {
+        } else if self.is_cancelled_by_user() {
             "agent cancelled by user".to_string()
+        } else if self.is_cancelled() {
+            "agent cancelled internally".to_string()
         } else {
             self.failure.clone().unwrap_or_else(|| fallback.to_string())
         }
@@ -1957,22 +1970,29 @@ pub(crate) async fn run_agent(
     }
     let result = agent.work(message, resume).await;
 
-    // Cancellation safety: if the token fired after work() completed but
-    // before we checked, discard the result to prevent overwriting of
-    // externally-set cancelled status in downstream code.
-    let outcome = if agent.is_cancelled() {
+    // Cancellation safety: if the user-stop token fired after work() completed
+    // but before we checked, discard the result. A code-driven (internal)
+    // cancellation that fired after work() finished is NOT a user stop — a
+    // completed run must not be reclassified/discarded as cancelled.
+    let outcome = if agent.is_cancelled_by_user() {
         tracing::debug!(
             agent_id = %agent.agent_id,
             workspace = %ws.name,
             role = %role,
             ticket = ticket.map(|t| t.id.as_str()),
             classification = failure_classification(&agent, None),
-            "Agent cancelled"
+            "Agent cancelled by user"
         );
         (agent, None)
     } else {
         match result {
-            Ok(response) => (agent, Some(response)),
+            Ok(response) => {
+                // Work completed. A code-driven (internal) token cancellation
+                // that fired AFTER work() finished is NOT a user stop — a
+                // completed run must not be reclassified/discarded as
+                // cancelled. Genuine user stops are handled above.
+                (agent, Some(response))
+            }
             Err(e) => {
                 // Capture the real cause (full chain) so ticket dispatchers can
                 // persist it in failure comments instead of a generic placeholder.
@@ -2091,8 +2111,10 @@ fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'sta
         "drain"
     } else if crate::shutdown::shutdown_token().is_cancelled() {
         "shutdown"
-    } else if agent.is_cancelled() {
+    } else if agent.is_cancelled_by_user() {
         "cancelled"
+    } else if agent.is_cancelled() {
+        "internal_cancel"
     } else if let Some(class) = error.and_then(failure_class_from_error) {
         class.label()
     } else {
@@ -2160,6 +2182,7 @@ mod tests {
             tools,
             tool_specs,
             cancel_token: CancellationToken::new(),
+            user_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ticket: None,
             generation: 0,
             tool_stats: std::sync::Mutex::new(Vec::new()),
@@ -2215,8 +2238,12 @@ mod tests {
             "runtime"
         );
 
-        // User cancellation (per-agent token) is distinct from shutdown.
+        // User cancellation (per-agent token + genuine user-stop flag) is
+        // distinct from shutdown.
         let cancelled = make_agent(vec![]);
+        cancelled
+            .user_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         cancelled.cancel_token.cancel();
         assert_eq!(
             failure_classification(&cancelled, Some(&runtime_err)),
@@ -2225,6 +2252,16 @@ mod tests {
 
         // The cancelled early-return path classifies with no error present.
         assert_eq!(failure_classification(&cancelled, None), "cancelled");
+
+        // A code-driven (internal) cancellation fires the generic token but NOT
+        // the user-stop flag — it must classify as an internal cancel, never
+        // "cancelled" (user stop).
+        let internally_cancelled = make_agent(vec![]);
+        internally_cancelled.cancel_token.cancel();
+        assert_eq!(
+            failure_classification(&internally_cancelled, None),
+            "internal_cancel"
+        );
     }
 
     /// The graceful-drain cut is classified as "drain" (NOT cancelled/

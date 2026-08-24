@@ -10,9 +10,10 @@
 //! results.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::util::UnwrapPoison;
 use chrono::{DateTime, Utc};
@@ -138,6 +139,11 @@ struct AgentEntry {
     generation: u64,
     handle: AgentHandle,
     cancel_token: CancellationToken,
+    /// Whether a GENUINE user/operator stop was requested for this agent.
+    /// Set only by [`AgentRegistry::cancel_by_ticket_id_user`]; code-driven
+    /// internal cancellations (re-dispatch, register replacement, phase
+    /// transition/supersede) fire only [`Self::cancel_token`].
+    user_stop: Arc<AtomicBool>,
     /// Live tool instrumentation for this agent (mutable across the agent's
     /// lifetime; snapshot into [`AgentHandle::current_tools`] by `list()`).
     /// Every access is already serialized by the outer
@@ -222,6 +228,7 @@ impl AgentRegistry {
         cancel_token: CancellationToken,
         parent_key: Option<ParentKey>,
         parent_label: Option<String>,
+        user_stop: Arc<AtomicBool>,
     ) -> u64 {
         let generation = NEXT_ENTRY_GENERATION.fetch_add(1, Ordering::Relaxed);
         let handle = AgentHandle {
@@ -240,6 +247,9 @@ impl AgentRegistry {
             session_tokens: None,
         };
         let mut map = self.inner.lock().unwrap_poison();
+        // Replacing an old agent cancels the old token but is an INTERNAL
+        // (non-user) cancellation — the new agent is a re-dispatch/replacement,
+        // not a genuine user stop, so `old.user_stop` is deliberately never set.
         if let Some(old) = map.remove(&agent_id) {
             old.cancel_token.cancel();
         }
@@ -249,6 +259,7 @@ impl AgentRegistry {
                 generation,
                 handle,
                 cancel_token,
+                user_stop,
                 current_tools: Vec::new(),
                 last_tool: None,
                 activity: None,
@@ -414,6 +425,30 @@ impl AgentRegistry {
     /// Used on ticket phase transitions — stops any agent currently working on it.
     pub fn cancel_by_ticket_id(&self, ticket_id: &str) {
         self.cancel_matching(|entry| entry.handle.ticket_id.as_deref() == Some(ticket_id));
+    }
+
+    /// Cancel all agents running for a `ticket_id` as a GENUINE user/operator
+    /// stop: sets the user-stop flag on each matched agent AND fires its
+    /// cancel token. Distinct from [`Self::cancel_by_ticket_id`], which is the
+    /// code-driven/internal cancellation used by re-dispatch, phase
+    /// transitions, supersede, and claim. Follows the same lock-ordering
+    /// invariant as [`cancel_matching`] (set the flag under the lock, cancel
+    /// outside it).
+    pub fn cancel_by_ticket_id_user(&self, ticket_id: &str) {
+        let to_cancel: Vec<String> = {
+            let map = self.inner.lock().unwrap_poison();
+            let mut ids = Vec::new();
+            for (id, entry) in map.iter() {
+                if entry.handle.ticket_id.as_deref() == Some(ticket_id) {
+                    entry.user_stop.store(true, Ordering::SeqCst);
+                    ids.push(id.clone());
+                }
+            }
+            ids
+        };
+        for agent_id in to_cancel {
+            self.cancel(&agent_id);
+        }
     }
 
     /// Cancel all agents running for a specific role within a specific workspace path.
@@ -689,6 +724,7 @@ mod tests {
             CancellationToken::new(),
             None,
             None,
+            std::sync::Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -910,6 +946,7 @@ mod tests {
             CancellationToken::new(),
             Some(ParentKey::Ticket("T-42".to_string())),
             Some("Fix login bug".to_string()),
+            std::sync::Arc::new(AtomicBool::new(false)),
         );
         let handles = AGENT_REGISTRY.list();
         let h = handles
@@ -1001,6 +1038,7 @@ mod tests {
                 CancellationToken::new(),
                 Some(parent),
                 None,
+                std::sync::Arc::new(AtomicBool::new(false)),
             )
         };
         let gen_a1 = register_with_parent(&a1, ParentKey::Research("runA".to_string()));

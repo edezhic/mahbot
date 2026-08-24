@@ -271,6 +271,11 @@ async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
 /// cleanup via router_contains (try_route cannot distinguish an absent
 /// entry from a dead receiver).
 ///
+/// The gate validates against the round's REQUIRED phase (`expected_phase`,
+/// here Analysis), NOT the stale in-memory `ticket.phase` snapshot — so the
+/// stale Arc (captured before the DB moved to Planning) must still bail
+/// against the live DB.
+///
 /// Serialized with reset_inflight (shared global board — the stale-Phase
 /// fixture transitions the ticket out of Analysis).
 #[tokio::test]
@@ -304,6 +309,7 @@ async fn parallel_round_phase_gate_bail_unregisters_router() {
         "pg_bail_job",
         &slots,
         false,
+        TicketPhase::Analysis,
     )
     .await;
     assert_eq!(results.len(), 2);
@@ -318,6 +324,63 @@ async fn parallel_round_phase_gate_bail_unregisters_router() {
             slot.agent_id,
         );
     }
+}
+
+/// The stage-handoff finalizer advances the DB phase but hands the NEXT stage
+/// a pre-transition in-memory ticket. [`advance_to_next_stage`] must refresh
+/// that ticket so the next dispatcher sees the CURRENT phase — otherwise the
+/// verifier phase gate spuriously bails (the dev→review loop). The refresh is
+/// fail-open: on a DB read error the passed-in ticket is used.
+///
+/// Serialized with reset_inflight (shared global board — the transition moves
+/// the fixture's phase).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn advance_to_next_stage_refreshes_ticket_phase_for_next_dispatch() {
+    init_management_test_stores().await;
+    let ws = test_ws_named("/tmp/advance_phase", "ws_advance_phase");
+    let ticket_id = make_ticket(board(), &ws, "Advance Phase", TicketPhase::InDiagnostics).await;
+    // Stale in-memory ticket captured BEFORE the DB moves to InReview — exactly
+    // the snapshot a stage-handoff finalizer hands to the next dispatch.
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(ticket.phase, TicketPhase::InDiagnostics);
+    board()
+        .transition_to(
+            &ticket_id,
+            Some(TicketPhase::InDiagnostics),
+            TicketPhase::InReview,
+        )
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<TicketPhase>(1);
+    let conn = &crate::session::store().conn;
+    advance_to_next_stage(
+        &ticket,
+        &ws,
+        "job_advance_phase",
+        conn,
+        None,
+        |_| {},
+        move |ticket_arc, _ws| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(ticket_arc.phase).await;
+            })
+        },
+    )
+    .await;
+
+    // The next-stage dispatch must receive the CURRENT (refreshed) phase.
+    let received = rx
+        .recv()
+        .await
+        .expect("dispatch_next must send the refreshed ticket phase");
+    assert_eq!(
+        received,
+        TicketPhase::InReview,
+        "advance_to_next_stage must refresh the in-memory ticket to the current DB phase"
+    );
 }
 
 /// A panicked round member maps to a contained NoResponse (fail-open) with
@@ -1293,8 +1356,11 @@ fn engineer_finalize_test_agent(ws: &Workspace, ticket: &Ticket, suffix: &str) -
 /// InDevelopment), and records the concrete error as a SYSTEM-role comment so
 /// the Manager notification and the resumed engineer's feedback surface it.
 
-/// A user-initiated cancellation of the engineer keeps today's semantics:
-/// ticket Failed + workspace paused, never auto-re-queued (no bounce).
+/// A GENUINE user-initiated cancellation of the engineer (via the user-stop
+/// signal) keeps today's semantics: ticket Failed + workspace paused, never
+/// auto-re-queued (no bounce). Distinct from an internal (code-driven)
+/// cancellation, which must NOT pause or fail — see
+/// [`engineer_internal_cancel_does_not_pause_or_fail`].
 #[tokio::test]
 #[serial_test::serial(reset_inflight)]
 #[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
@@ -1307,7 +1373,8 @@ async fn engineer_cancel_fails_ticket_without_bounce() {
     let ticket_id = make_ticket(board(), &ws, "Eng Cancel", TicketPhase::InDevelopment).await;
     let ticket = expect_ticket(board(), &ticket_id).await;
     let agent = engineer_finalize_test_agent(&ws, &ticket, "cancel");
-    crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
+    // A genuine user stop sets both the user-stop flag and the cancel token.
+    crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id_user(&ticket_id);
 
     finalize_engineer_stage(&ticket, &agent, None, "job_eng_cancel", &ws, false).await;
 
@@ -1341,6 +1408,62 @@ async fn engineer_cancel_fails_ticket_without_bounce() {
         last.content.contains("cancelled by user"),
         "the cancel cause must be recorded: {}",
         last.content
+    );
+}
+
+/// A code-driven (internal) cancellation of the engineer — re-dispatch,
+/// register replacement, phase transition/supersede — must NOT pause or fail
+/// the ticket: it is a NO-OP. The ticket stays in InDevelopment (not Failed),
+/// the workspace is NOT paused, no "cancelled by user" comment is written, and
+/// the bounce budget is untouched.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn engineer_internal_cancel_does_not_pause_or_fail() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
+
+    let ws = create_test_workspace("/tmp/eng_internal_ws", "ws_eng_internal").await;
+    let ticket_id = make_ticket(board(), &ws, "Eng Internal", TicketPhase::InDevelopment).await;
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let agent = engineer_finalize_test_agent(&ws, &ticket, "internal");
+    // Code-driven internal cancellation fires the generic cancel token but NOT
+    // the user-stop flag — see AgentRegistry::cancel_by_ticket_id.
+    crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
+
+    finalize_engineer_stage(&ticket, &agent, None, "job_eng_internal", &ws, false).await;
+
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::InDevelopment,
+        "an internal (code-driven) cancel must NOT fail the ticket"
+    );
+    assert_eq!(
+        t.bounce_count, 0,
+        "an internal cancel must not consume the bounce budget"
+    );
+
+    let ws_after = crate::workspace::store()
+        .get_by_name("ws_eng_internal")
+        .await
+        .expect("query workspace")
+        .expect("workspace exists");
+    assert!(
+        !ws_after.paused,
+        "an internal (code-driven) cancel must NOT pause the workspace"
+    );
+
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    assert!(
+        !comments
+            .iter()
+            .any(|c| c.content.contains("cancelled by user")),
+        "an internal cancel must not write a 'cancelled by user' comment"
     );
 }
 

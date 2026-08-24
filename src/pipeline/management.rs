@@ -1542,8 +1542,10 @@ async fn run_single_agent(
 ///
 /// Receives pre-computed `shutdown`/`cancelled` booleans — the caller decides
 /// which mechanism applies, so the formatter never interprets token ordering
-/// itself. Persists the classified cause + underlying detail so distinct root
-/// causes (LLM retry exhaustion, process shutdown, user cancellation, concrete
+/// itself. The `cancelled` parameter means a GENUINE user/operator stop (not a
+/// code-driven internal cancellation, which is a no-op and never reaches this
+/// formatter). Persists the classified cause + underlying detail so distinct
+/// root causes (LLM retry exhaustion, process shutdown, user cancellation, concrete
 /// agent errors) stop looking identical in ticket history. The generic
 /// template branch is a total-function fallback for genuinely-unknown causes
 /// (currently unreachable via run_agent's contract, which yields either a
@@ -1758,6 +1760,13 @@ async fn finalize_engineer_stage(
 ///
 /// - **User cancel** → ticket Failed + workspace pause (unchanged, never
 ///   auto-re-queued). The implementation job is completed.
+/// - **Internal (code-driven) cancellation** → a NO-OP: no pause, no
+///   transition, no job mutation. These are re-dispatch, register-replacement,
+///   phase transition/supersede cancellations where the ticket is being
+///   re-driven by a replacement run or a phase transition, so this run must
+///   not disturb that. Shutdown/drain is NOT this path (the caller's
+///   `stage_drain_cut` already bailed; a drain landing later is handled by
+///   the `aborting()` gate below).
 /// - **Hard failure** ("Agent failed") → the workspace pauses and the implementation
 ///   is FROZEN in place: the ticket stays in **InDevelopment** (no bounce to
 ///   ReadyForDevelopment, no Failed trip, no bounce-budget consumption). The
@@ -1769,6 +1778,9 @@ async fn finalize_engineer_stage(
 ///   check and before the transition commit) → no bounce, no Failed transition;
 ///   the job stays 'launched' for boot resume.
 ///
+/// `cancelled_by_user` is the GENUINE user-stop classification — distinct from
+/// a code-driven internal cancellation.
+///
 /// Returns `false` when a shutdown/drain cut the failure handling short (the
 /// caller leaves the job 'launched'); `true` otherwise.
 async fn handle_engineer_failure(
@@ -1778,7 +1790,19 @@ async fn handle_engineer_failure(
     ws: &Workspace,
     resumed: bool,
 ) -> bool {
-    let cancelled = agent.is_cancelled();
+    let cancelled_by_user = agent.is_cancelled_by_user();
+
+    // A code-driven (internal) cancellation — re-dispatch, register
+    // replacement, phase transition/supersede — is NOT a genuine user stop.
+    // It must never be reported as "cancelled by user" and must never pause
+    // the workspace: the ticket is being re-driven by the replacement run or
+    // a phase transition, so this run must not disturb that. Shutdown/drain
+    // is NOT this path (the caller's stage_drain_cut already bailed; a drain
+    // landing later is handled by the aborting() gate below).
+    if !cancelled_by_user && agent.is_cancelled() && !crate::shutdown::aborting() {
+        info!(ticket = %ticket.id, "Engineer run interrupted by an internal (code-driven) cancellation — leaving the ticket for the replacement run");
+        return true;
+    }
 
     // No drain re-check here: the caller's stage_drain_cut just ran
     // aborting() and no await separates that read from this point, so a
@@ -1787,7 +1811,7 @@ async fn handle_engineer_failure(
 
     // Pause before the transition so the failure notification reflects the
     // paused workspace. Both user-cancel and hard-failure paths pause.
-    let pause_reason = if cancelled {
+    let pause_reason = if cancelled_by_user {
         "user cancelled the agent run"
     } else {
         "engineer agent failure"
@@ -1809,12 +1833,12 @@ async fn handle_engineer_failure(
 
     let failure_comment = engineer_failure_comment(
         crate::shutdown::shutdown_token().is_cancelled(),
-        cancelled,
+        cancelled_by_user,
         agent.failure.as_deref(),
     );
     let comment_text = format!("{failure_comment}{pause_note}");
 
-    if cancelled {
+    if cancelled_by_user {
         // User-initiated cancellation keeps today's semantics: ticket Failed
         // + workspace pause, never auto-re-queued.
         comment_and_transition_or_bail(
@@ -2936,7 +2960,19 @@ async fn advance_to_next_stage(
         sync_implementation(conn, job_id, &ticket.id, stage, None).await;
     }
     log(ticket);
-    let ticket_arc = Arc::new(ticket.clone());
+    // Refresh the ticket for the next-stage dispatch: the just-written
+    // transition (or the stage-handoff sync above) advanced the DB phase but
+    // the passed-in `ticket` is a pre-transition snapshot, so the next
+    // dispatcher would otherwise see a stale phase and its phase gate would
+    // bail. Fail-open: on a read error the passed-in ticket is used, so a
+    // transient DB failure never drops the dispatch.
+    let fresh = board()
+        .get_ticket(&ticket.id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ticket.clone());
+    let ticket_arc = Arc::new(fresh);
     let ws = ws.clone();
     tokio::spawn(Box::pin(async move {
         dispatch_next(ticket_arc, ws).await;
@@ -3364,6 +3400,7 @@ fn assemble_parallel_results(
 /// concurrently (leader-staggered: the first member starts immediately, the
 /// rest after its first LLM call so they hit its cached prefix; skipped on
 /// boot resume).
+#[expect(clippy::too_many_arguments)] // expected_phase is the live phase the round must match
 async fn run_parallel_agents(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
@@ -3372,6 +3409,7 @@ async fn run_parallel_agents(
     job_id: &str,
     slots: &[AgentSlot],
     resume: bool,
+    expected_phase: TicketPhase,
 ) -> Vec<ParallelVerdict> {
     // ── Register the not-yet-done agents in the message router BEFORE
     // spawning ── This allows the board's comment-routing to deliver
@@ -3414,7 +3452,13 @@ async fn run_parallel_agents(
                     // A move-away-and-back between the leader's gate failure
                     // and a follower's check lets that follower run a full
                     // round with N-1 members — rare, fail-open, accepted.
-                    if !is_ticket_in_phase(&ticket.id, ticket.phase).await {
+                    // The gate validates against the round's REQUIRED phase
+                    // (passed by the dispatcher), NOT the in-memory snapshot:
+                    // a stage-handoff finalizer advances the DB phase without
+                    // refreshing the in-memory ticket, so comparing against
+                    // `ticket.phase` would spuriously bail every member of a
+                    // verifier (reviewer/QA) round — the dev→review loop.
+                    if !is_ticket_in_phase(&ticket.id, expected_phase).await {
                         // Release the stagger wait immediately: the ticket
                         // moved, so every follower bails at its own gate too —
                         // don't make them sit out the bound. Then drop the
@@ -3863,6 +3907,7 @@ async fn maybe_escalate_analysis(
                 job_id,
                 &extra_slots,
                 resume,
+                TicketPhase::Analysis,
             )
             .await
         };
@@ -3973,6 +4018,7 @@ async fn run_analysis_round(
         job_id,
         slots,
         resumed,
+        TicketPhase::Analysis,
     )
     .await;
     if !maybe_escalate_analysis(
@@ -4947,6 +4993,7 @@ async fn dispatch_verifiers_impl(
         &job_id,
         &slots,
         resumed,
+        vi.active_phase,
     )
     .await;
     if guard_job_phase(&ticket.id, vi.active_phase, &job_id, false).await {

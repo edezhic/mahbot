@@ -747,6 +747,15 @@ impl BoardState {
                                     .await;
                             }
                         }
+                        // This is the GENUINE user-stop signal: mark any in-flight
+                        // agents as user stops so the cancelled agent's failure tail
+                        // (if it wins the race before the phase transition lands)
+                        // reports "cancelled by user" and pauses, instead of being
+                        // treated as an internal (code-driven) cancel.
+                        if phase == TicketPhase::Cancelled {
+                            crate::agent::registry::AGENT_REGISTRY
+                                .cancel_by_ticket_id_user(&ticket_id);
+                        }
                         // Re-dispatch into development is automatic via a
                         // validation non-success (the unified bounce) — there
                         // is no manual "Redo Dev" action anymore.
