@@ -474,10 +474,7 @@ async fn eleventh_bounce_fails_ticket() {
         .conn
         .execute(
             "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
-            turso::params![
-                i64::try_from(crate::pipeline::joint_verdict::MAX_BOUNCES).unwrap(),
-                ticket_id.as_str()
-            ],
+            turso::params![i64::try_from(MAX_BOUNCES).unwrap(), ticket_id.as_str()],
         )
         .await
         .expect("set bounce_count to max");
@@ -504,7 +501,7 @@ async fn eleventh_bounce_fails_ticket() {
     );
     assert_eq!(
         ticket.bounce_count,
-        i64::try_from(crate::pipeline::joint_verdict::MAX_BOUNCES).unwrap(),
+        i64::try_from(MAX_BOUNCES).unwrap(),
         "bounce counter stays at the max — the failing bounce is not counted"
     );
     let comments = board()

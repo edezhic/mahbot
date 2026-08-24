@@ -78,6 +78,10 @@ const REVIEW_QA_THRESHOLD: u8 = 9;
 /// Neutral reason for a phase-gate bail (transients are not misattributed).
 const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 
+/// Maximum tolerated validation-phase bounces before the ticket fails (the
+/// 11th bounce fails). Enforced by the unified validation-failure bounce path.
+const MAX_BOUNCES: usize = 10;
+
 /// Implementation stage identifiers: human-readable stage-label strings used
 /// by the advance/sync handoff and [`verifier_success_stage`]. One
 /// implementation job owns a ticket's entire occupied pipeline; each stage is
@@ -4259,7 +4263,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
 /// `eleventh_bounce_fails_ticket`).
 #[must_use]
 fn bounce_breaker_trip_comment() -> String {
-    let max = crate::pipeline::joint_verdict::MAX_BOUNCES;
+    let max = MAX_BOUNCES;
     format!(
         "Failed after {max} bounces — ticket bounced back too many times \
          (circuit breaker, max: {max}). Ticket failed — Manager will triage."
@@ -4270,8 +4274,7 @@ fn bounce_breaker_trip_comment() -> String {
 /// Negative or overflow counts are treated as exhausted (fail-closed).
 #[must_use]
 fn bounce_exhausted(bounce_count: i64) -> bool {
-    usize::try_from(bounce_count).unwrap_or(usize::MAX)
-        >= crate::pipeline::joint_verdict::MAX_BOUNCES
+    usize::try_from(bounce_count).unwrap_or(usize::MAX) >= MAX_BOUNCES
 }
 
 /// Unified validation-failure bounce.
@@ -4346,7 +4349,7 @@ async fn bounce_to_development(
             info!(
                 ticket = %ticket.id,
                 "Bounce circuit breaker tripped ({} bounces) — ticket failed",
-                crate::pipeline::joint_verdict::MAX_BOUNCES,
+                MAX_BOUNCES,
             );
         } else {
             // Re-fetch the ticket fresh (with comments) so the re-dispatched
