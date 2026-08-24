@@ -2053,7 +2053,8 @@ fn dispatch_engineer(
             return;
         };
         let conn = &crate::session::store().conn;
-        // Sync the implementation's authoritative stage + task for boot resume.
+        // Sync the implementation's dispatch task for boot resume; the ticket
+        // phase is the authoritative stage.
         sync_implementation(
             conn,
             &job_id,
@@ -2939,8 +2940,8 @@ async fn sync_implementation(
 ///
 /// `sync` is `Some(stage)` when the stage handoff sync must run before dispatch
 /// (roster-clear on task=None, task write on task=Some); `None` on the
-/// validation-failure bounce path, where the re-dispatched engineer re-syncs the
-/// stage itself. No stage is written as a stored mirror — `sync` carries only
+/// validation-failure bounce path, where the re-dispatched engineer writes the
+/// dispatch task itself. No stage is written as a stored mirror — `sync` carries only
 /// the stage label for the handoff. The
 /// per-site `log` runs after the sync and before the spawn so the message stays
 /// byte-identical per caller; callers that do not log pass a no-op.
@@ -4332,8 +4333,8 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
 /// Planning, and the implementation job is completed. When NOT exhausted the ticket is
 /// kept in the pipeline: it does NOT go to ReadyForDevelopment and is NOT
 /// re-claimed — the engineer is re-dispatched directly back to
-/// `development`/InDevelopment on the same implementation job (it re-syncs the
-/// stage on dispatch). No reservation; no re-claim path.
+/// `development`/InDevelopment on the same implementation job (it re-writes the
+/// dispatch task on dispatch). No reservation; no re-claim path.
 ///
 /// Comment order is normalized to `[breaker, failure]` failure-last so
 /// `notify_ticket`'s last-comment lookup surfaces the concrete error.
@@ -4401,7 +4402,7 @@ async fn bounce_to_development(
             // Re-fetch the ticket fresh (with comments) so the re-dispatched
             // engineer sees the just-written failure/joint comment — a stale clone
             // would render implement.md instead of the bounce_feedback prompt.
-            // dispatch_engineer's sync_implementation re-syncs the stage/phase,
+            // dispatch_engineer's sync_implementation writes the dispatch task,
             // so no sync is needed here (a duplicate write would follow).
             let fresh = crate::pipeline::board::store()
                 .get_ticket(&ticket.id)
