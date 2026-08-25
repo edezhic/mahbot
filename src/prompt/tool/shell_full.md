@@ -13,3 +13,7 @@ For long-running non-interactive commands (e.g. starting a dev server that must 
 - Launch failures (command not found, not executable) are returned as a tool error immediately — check the tool response before assuming the session started.
 
 Caveats: output is unbounded — a command that prints forever will fill the temp disk. Prefer commands that write modest output, and tail large outputs via the shell tool (the read tool caps at 10 MB). Output files persist in the temp area until the OS temp sweep reclaims them (the daemon performs no startup purge).
+
+## Grep notes
+
+Recursive greps (`grep -rn <pat> .`) are served by a fast built-in engine that skips hidden/gitignored content (e.g. `target/`, `.git/`, `node_modules/`) — matches under those paths are not found. To search there, pass an explicit path or `cd` into the subdir. Engine-served recursive greps may also return files in a different order than the system `grep` (parallel walk); the set of matching lines is the same. `background: true` greps are NOT served by the engine (they run on the real system `grep`).

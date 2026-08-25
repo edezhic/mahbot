@@ -55,6 +55,18 @@ pub use tools::shell::grep_engine::run_engine as run_grep_engine;
 #[doc(hidden)]
 pub use tools::shell::grep_engine::try_serve_command_for_test as grep_engine_rewrite_for_test;
 
+/// Whether the served grep member(s) exercise the parallel recursive walk
+/// (subprocess harness relaxes its byte-exact diff to sorted-line comparison).
+#[cfg(all(unix, feature = "grep-engine-e2e"))]
+#[doc(hidden)]
+pub use tools::shell::grep_engine::served_spec_walks_directory;
+
+/// Record-split + byte-sort helper for ordering-insensitive output comparison
+/// (shared with the e2e bench's parallel-walk rows).
+#[cfg(all(unix, feature = "grep-engine-e2e"))]
+#[doc(hidden)]
+pub use tools::shell::grep_engine::grep_sorted_lines;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

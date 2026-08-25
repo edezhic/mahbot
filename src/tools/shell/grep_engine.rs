@@ -1,19 +1,30 @@
-//! Transparent grep/egrep/fgrep interception for the read-only shell tool.
+//! Transparent grep/egrep/fgrep interception for the shell tool, in BOTH
+//! read-only and full modes (the engine itself is inherently read-only).
 //!
-//! The read-only shell guard passes commands to a real shell. Grep-family
-//! invocations that can be served with byte-identical behavior are rewritten
-//! to a hidden `__grep-engine` subcommand of the current binary (dispatched
-//! before instance-lock acquisition in `main()`), which runs the ripgrep
-//! substrate (grep-regex/grep-searcher + the ignore crate for rg-default
-//! recursive-walk exclusions). Anything not provably safe executes the
-//! original command unchanged (fallback); the engine itself re-validates and
-//! `exec`s the real grep on any runtime doubt.
+//! The shell guard passes commands to a real shell. Grep-family invocations
+//! that can be served are rewritten to a hidden `__grep-engine` subcommand of
+//! the current binary (dispatched before instance-lock acquisition in
+//! `main()`), which runs the ripgrep substrate (grep-regex/grep-searcher + the
+//! ignore crate for rg-default recursive-walk exclusions). Substitution is
+//! per-segment: an unservable grep (single-file perf gate, unsupported flag,
+//! compound/nested shape, …) is kept verbatim while a servable sibling grep
+//! elsewhere in the command is still served — one bad member no longer poisons
+//! the whole command. Anything not provably safe executes the original command
+//! unchanged (fallback); the engine itself re-validates and `exec`s the real
+//! grep on any runtime doubt.
 //!
-//! Parity target: the host system grep (BSD grep on macOS) under the shell
-//! tool's pinned `LC_ALL=C.UTF-8` environment. The one approved behavioral
-//! delta: recursive walks skip hidden/gitignored content (rg defaults) — a
-//! served pipeline tail (`grep -rn … | wc -l`) sees that filtered stream.
-//! The differential matrix (macOS-gated) is the authoritative parity gate.
+//! The engine enables the fast matcher (SIMD literal prefilter) and uses a
+//! parallel recursive walk, so cross-file output ordering may differ from the
+//! host BSD grep (in-file ordering is stable). The approved behavioral deltas:
+//! recursive walks skip hidden/gitignored content (rg defaults; a served tail
+//! like `grep -rn … | wc -l` sees that filtered stream), and `-o` + alternation
+//! stays fail-closed (a match-set/span difference, not an ordering one).
+//!
+//! Parity target is the host BSD grep under the shell tool's pinned
+//! `LC_ALL=C.UTF-8`. The macOS-gated differential matrix is the authoritative
+//! parity gate; recursive-walk rows compare as sorted line-sets (parallel
+//! ordering), everything else byte-exact. Grep decisions are recorded in the
+//! dedicated `grep_telemetry` table (logs DB), not the general log stream.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -112,47 +123,141 @@ struct Operand {
 
 // ── Parent side: command analysis ─────────────────────────────────────────
 
-/// Try to rewrite `command` into an engine-served equivalent; `None` = the
-/// original command executes unchanged. Read-only mode only (checked by the
-/// caller); Unix only.
-pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<String> {
-    let home = pinned_home()?;
-    let (specs, shapes, rewritten) = match analyze_command(command, workspace_root, &home, false) {
-        Ok(v) => v,
-        Err(reason) => {
-            // INFO for the gate-relaxation classes: stdin-reject fallbacks of
-            // producer-first pipelines (the new serving surface), the
-            // nested-introducer and grep-first-stdin classes kept on fallback,
-            // and empty-member syntax errors. Commands without a grep member —
-            // including empty-member syntax errors like `cat f | | head` —
-            // stay DEBUG.
-            if matches!(
-                reason,
-                Fallback::SegmentEmpty
-                    | Fallback::StdinOperands
-                    | Fallback::StdinRecursive
-                    | Fallback::NestedGrep
-                    | Fallback::StdinMode
-            ) && command.split_whitespace().any(is_grep_verb)
-            {
-                tracing::info!(command = command, %reason, "grep engine: fallback");
-            } else {
-                tracing::debug!(command = command, %reason, "grep engine: fallback");
-            }
-            return None;
+/// One analyzed grep member's serve decision (for grep telemetry).
+#[derive(Debug)]
+pub(super) struct GrepOutcome {
+    /// Whether this grep member was served by the engine.
+    pub served: bool,
+    /// The fallback reason when not served ('' when served).
+    pub reason: String,
+    /// Whether the grep was recursive (-r/-R).
+    pub recursive: bool,
+    /// Whether the grep sits in a pipeline.
+    pub piped: bool,
+    /// Number of resolved operands (files + directories).
+    pub operand_count: usize,
+    /// Normalized flag surface (e.g. "nivro...", single string).
+    pub flags: String,
+}
+
+/// Result of analyzing a shell command for grep serving.
+#[derive(Debug)]
+pub(super) struct GrepServe {
+    /// The rewritten command; `None` when no grep was served (original runs).
+    pub rewritten: Option<String>,
+    /// Per-grep-member decisions; empty when the command is not greppable.
+    pub outcomes: Vec<GrepOutcome>,
+}
+
+/// Aggregate telemetry fields derived purely from the per-member outcomes
+/// (shape + counts). The row-level `served`/`reason` depend on runtime facts
+/// (whether the rewrite was actually applied, whether a sentinel re-run
+/// replaced the engine) and are computed by the caller.
+pub(super) struct GrepTelemetryShape {
+    pub recursive: bool,
+    pub piped: bool,
+    pub operand_count: usize,
+    pub flags: String,
+    pub grep_count: usize,
+    pub served_count: usize,
+    pub skipped_count: usize,
+}
+
+impl GrepServe {
+    /// Fold the per-member outcomes into the telemetry shape/count fields.
+    /// `applied` gates served_count: when the rewrite wasn't actually applied
+    /// (engine unavailable, spec too large, ReadOnly rejection, sentinel
+    /// re-run) the engine served nothing, regardless of the per-member analysis.
+    pub(super) fn telemetry_shape(&self, applied: bool) -> GrepTelemetryShape {
+        let grep_count = self.outcomes.len();
+        let served_count = if applied {
+            self.outcomes.iter().filter(|o| o.served).count()
+        } else {
+            0
+        };
+        GrepTelemetryShape {
+            recursive: self.outcomes.iter().any(|o| o.recursive),
+            piped: self.outcomes.iter().any(|o| o.piped),
+            operand_count: self.outcomes.iter().map(|o| o.operand_count).sum(),
+            flags: self
+                .outcomes
+                .iter()
+                .map(|o| o.flags.as_str())
+                .filter(|s| !s.is_empty())
+                .fold(String::new(), |mut acc, s| {
+                    if !acc.is_empty() {
+                        acc.push('|');
+                    }
+                    acc.push_str(s);
+                    acc
+                }),
+            grep_count,
+            served_count,
+            skipped_count: grep_count - served_count,
         }
+    }
+}
+
+/// Try to rewrite `command` into an engine-served equivalent. Returns the
+/// rewritten command plus per-grep serve decisions (for telemetry). The
+/// engine is inherently read-only (it preserves non-grep segments verbatim),
+/// so the caller runs it in both ReadOnly and Full modes; Unix only.
+pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepServe {
+    let Some(home) = pinned_home() else {
+        return GrepServe {
+            rewritten: None,
+            outcomes: Vec::new(),
+        };
     };
+    let (specs, shapes, rewritten, mut outcomes) =
+        match analyze_command(command, workspace_root, &home, false) {
+            Ok(v) => v,
+            Err(fail) => {
+                // Pre-analysis structural failures (NoGrep/Heredoc/SegmentEmpty)
+                // carry no grep member — no telemetry row is written. Otherwise
+                // the per-member outcomes are preserved so an all-skipped
+                // command still records its shape; a would-be serve discarded
+                // by a structural abort (untrackable `cd`) is demoted so the
+                // row's served field matches the ACTUAL (real-grep) execution.
+                if fail.outcomes.is_empty() {
+                    return GrepServe {
+                        rewritten: None,
+                        outcomes: Vec::new(),
+                    };
+                }
+                tracing::debug!(command = command, %fail.reason, "grep engine: fallback");
+                let AnalyzeFailure {
+                    reason,
+                    mut outcomes,
+                } = fail;
+                if outcomes.iter().any(|o| o.served) {
+                    all_not_served(&mut outcomes, &reason.to_string());
+                }
+                return GrepServe {
+                    rewritten: None,
+                    outcomes,
+                };
+            }
+        };
     if !engine_available() {
-        return None;
+        all_not_served(&mut outcomes, "engine unavailable");
+        return GrepServe {
+            rewritten: None,
+            outcomes,
+        };
     }
     for spec in &specs {
         if !spec_json_ok(spec) {
-            return None;
+            all_not_served(&mut outcomes, "spec exceeds payload limit");
+            return GrepServe {
+                rewritten: None,
+                outcomes,
+            };
         }
     }
     // Both served forms log at DEBUG — gate-relaxation volume telemetry is
-    // too noisy for INFO. The stdin field marks producer-first stdin-fed
-    // serves.
+    // too noisy for INFO (the dedicated telemetry table is the source of
+    // truth). The stdin field marks producer-first stdin-fed serves.
     if shapes.is_empty() {
         tracing::debug!(
             command = command,
@@ -170,7 +275,84 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> Option<
             );
         }
     }
-    Some(rewritten)
+    GrepServe {
+        rewritten: (!specs.is_empty()).then_some(rewritten),
+        outcomes,
+    }
+}
+
+/// Best-effort `GrepOutcome` for a per-segment grep skip (compound/nested,
+/// in-group, or an unservable member) that is kept verbatim in the rewrite.
+fn skipped_grep_outcome(reason: String, seg: &str, piped: bool) -> GrepOutcome {
+    let (recursive, operand_count, flags) = lightweight_scan(seg);
+    GrepOutcome {
+        served: false,
+        reason,
+        recursive,
+        piped,
+        operand_count,
+        flags,
+    }
+}
+
+/// Canonical telemetry flag order, shared by `flags_surface` and
+/// `lightweight_scan` so a served and a skipped member render the same flag set
+/// in the same relative order.
+const FLAG_ORDER: &[char] = &[
+    'n', 'i', 'v', 'w', 'x', 'a', 'h', 'H', 's', 'r', 'o', 'z', 'c', 'l', 'm', 'C', 'A', 'B',
+];
+
+/// Best-effort scan of a command/segment for a skipped grep's telemetry
+/// fields: detects `-r`/`-R` (recursive), counts whitespace-separated
+/// non-flag words after the verb (rough operand count), and collects the
+/// short-flag letters in canonical order. Not a full parse — feeds telemetry
+/// only. Case-sensitive distinctions (`-h`/`-H`, `-A`/`-B`/`-C`, `-r`/`-R`)
+/// are collapsed to lowercase, so a skipped member's flag string is a
+/// best-effort approximation of `flags_surface` (which has the parsed struct).
+fn lightweight_scan(command: &str) -> (bool, usize, String) {
+    let mut recursive = false;
+    let mut operand_count = 0usize;
+    let mut flags: std::collections::BTreeSet<char> = std::collections::BTreeSet::new();
+    let mut saw_pattern = false;
+    for (i, word) in command.split_whitespace().enumerate() {
+        if i == 0 {
+            continue; // verb
+        }
+        if word.starts_with("--") {
+            continue; // long option: not part of the short-flag surface
+        }
+        if let Some(cluster) = word.strip_prefix('-') {
+            if cluster.is_empty() {
+                // Bare `-` is a stdin operand, not a flag.
+                if saw_pattern {
+                    operand_count += 1;
+                } else {
+                    saw_pattern = true;
+                }
+                continue;
+            }
+            for c in cluster.chars().filter(char::is_ascii_alphabetic) {
+                if c == 'r' || c == 'R' {
+                    recursive = true;
+                }
+                flags.insert(c.to_ascii_lowercase());
+            }
+            continue;
+        }
+        // Non-flag token: the first one is the positional pattern, the rest
+        // are operands (best-effort — `-e` patterns over-count slightly).
+        if saw_pattern {
+            operand_count += 1;
+        } else {
+            saw_pattern = true;
+        }
+    }
+    let flag_str = FLAG_ORDER
+        .iter()
+        .filter(|c| flags.contains(c))
+        .copied()
+        .collect();
+    (recursive, operand_count, flag_str)
 }
 
 /// Rewrite with an explicit home (subprocess harness uses a fixture home for
@@ -183,13 +365,59 @@ pub fn try_serve_command_for_test(
     workspace_root: &Path,
     home: &Path,
 ) -> Option<String> {
-    let (specs, _, rewritten) = analyze_command(command, workspace_root, home, false).ok()?;
+    let (specs, _, rewritten, _) = analyze_command(command, workspace_root, home, false).ok()?;
+    if specs.is_empty() {
+        return None;
+    }
     for spec in &specs {
         if !spec_json_ok(spec) {
             return None;
         }
     }
     Some(rewritten)
+}
+
+/// Whether a served spec exercises the parallel recursive directory walk
+/// (`-r`/`-R` with at least one directory operand). Cross-file worker ordering
+/// is non-deterministic for such rows, so parity comparisons relax to sorted
+/// line-sets; in-file ordering stays stable. Only the macOS parity tests and
+/// the e2e harness use this, so a plain build leaves it intentionally unused.
+#[cfg_attr(not(any(test, feature = "grep-engine-e2e")), allow(dead_code))]
+fn spec_uses_parallel_walk(spec: &EngineSpec) -> bool {
+    spec.flags.r
+        && spec
+            .operands
+            .iter()
+            .any(|op| std::fs::metadata(&op.resolved).is_ok_and(|m| m.is_dir()))
+}
+
+/// Whether the served grep member(s) for `command` exercise the parallel
+/// recursive directory walk (the subprocess harness relaxes its byte-identical
+/// diff to sorted-line comparison for those rows — cross-file worker ordering
+/// is non-deterministic).
+#[cfg(feature = "grep-engine-e2e")]
+#[doc(hidden)]
+#[must_use]
+pub fn served_spec_walks_directory(command: &str, workspace_root: &Path, home: &Path) -> bool {
+    let Ok((specs, _, _, _)) = analyze_command(command, workspace_root, home, false) else {
+        return false;
+    };
+    specs.iter().any(spec_uses_parallel_walk)
+}
+
+/// Split `bytes` on `\n`/`\0` record terminators and sort the non-empty records
+/// byte-wise. Ordering-insensitive output comparison for parallel-walk rows;
+/// shared with the e2e bench so the differential gate uses the same matcher.
+#[cfg(feature = "grep-engine-e2e")]
+#[doc(hidden)]
+#[must_use]
+pub fn grep_sorted_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut v: Vec<&[u8]> = bytes
+        .split(|&b| b == b'\n' || b == b'\0')
+        .filter(|l| !l.is_empty())
+        .collect();
+    v.sort();
+    v
 }
 
 /// The shell tool's pinned `$HOME` — the child shell's synthetic baseline
@@ -329,30 +557,68 @@ impl std::fmt::Display for Fallback {
     }
 }
 
+/// A wholesale `analyze_command` failure: the command could not be served, so
+/// the whole original runs. `reason` names the cause; `outcomes` preserves the
+/// per-grep-member decisions collected before the abort (empty for pre-analysis
+/// structural failures like NoGrep/Heredoc/SegmentEmpty).
+#[derive(Debug)]
+struct AnalyzeFailure {
+    reason: Fallback,
+    outcomes: Vec<GrepOutcome>,
+}
+
+impl From<Fallback> for AnalyzeFailure {
+    fn from(reason: Fallback) -> Self {
+        AnalyzeFailure {
+            reason,
+            outcomes: Vec::new(),
+        }
+    }
+}
+
+/// Demote every analyzed grep member to not-served with `reason`. The
+/// telemetry served/skip fields must reflect the ACTUAL execution: when the
+/// rewrite was abandoned (engine unavailable, spec too large, untrackable `cd`)
+/// the engine served nothing, even if a member had been analyzed as servable.
+/// Per-member shape fields are preserved for the analysis.
+fn all_not_served(outcomes: &mut [GrepOutcome], reason: &str) {
+    for o in outcomes {
+        o.served = false;
+        o.reason = reason.to_string();
+    }
+}
+
 /// Analyze output: one spec per served grep, the shape of every served
 /// multi-member pipeline (members, verbs — grep-family normalized to "grep",
-/// stdin-fed flag) for volume telemetry, and the rewritten command.
-type AnalyzeOutput = (Vec<EngineSpec>, Vec<(usize, String, bool)>, String);
+/// stdin-fed flag) for volume telemetry, the rewritten command, and the
+/// per-grep serve decisions (telemetry).
+type AnalyzeOutput = (
+    Vec<EngineSpec>,
+    Vec<(usize, String, bool)>,
+    String,
+    Vec<GrepOutcome>,
+);
 
 /// Analyze a full shell command: segment it, track cds, serve every grep
 /// member, keep everything else verbatim. Returns the analyze output or the
 /// first fallback reason.
+#[expect(clippy::too_many_lines)] // per-segment serve/skip decision loop
 fn analyze_command(
     command: &str,
     workspace_root: &Path,
     home: &Path,
     allow_single: bool,
-) -> Result<AnalyzeOutput, Fallback> {
+) -> Result<AnalyzeOutput, AnalyzeFailure> {
     let stripped = strip_heredoc_bodies(command);
     if stripped != command {
         // strip_heredoc_bodies drops the `<<` marker, body and terminator (they
         // are stripped for read-only scanning). Rewriting around them would
         // leave a bare non-grep member reading inherited stdin — fail-closed.
-        return Err(Fallback::Heredoc);
+        return Err(Fallback::Heredoc.into());
     }
     let segments = split_segments(&stripped)?;
     if segments.is_empty() {
-        return Err(Fallback::SegmentEmpty);
+        return Err(Fallback::SegmentEmpty.into());
     }
     // No grep member anywhere: not an interception candidate. Before the shape
     // checks so non-grep pipelines (`cat f | head`) don't pollute the
@@ -361,7 +627,7 @@ fn analyze_command(
         let verb = first_word(seg);
         is_grep_verb(verb) || segment_contains_grep(seg, verb)
     }) {
-        return Err(Fallback::NoGrep);
+        return Err(Fallback::NoGrep.into());
     }
 
     // Pipeline grouping: consecutive segments joined by `|`/`|&`.
@@ -392,22 +658,45 @@ fn analyze_command(
     // byte-identical uncapped stream, never analyzed (only the first grep in
     // a pipeline is served; later greps stay real).
     let mut tail_preserved = vec![false; n];
+    // Per-grep serve decisions (telemetry), collected for every analyzed grep
+    // member (served or skipped). The first per-segment skip reason is kept
+    // so an all-skipped command still falls back wholesale with a cause.
+    let mut outcomes: Vec<GrepOutcome> = Vec::new();
+    let mut first_skip_reason: Option<Fallback> = None;
+    // Group depth across segments (unquoted `(`/`{` openers minus closers):
+    // greps inside an open compound group are never served, even when the
+    // segment splitter separated them from the group opener (e.g. `( cd d &&
+    // grep … )` splits the grep out of the `(` segment).
+    let mut group_depth = 0isize;
 
     for (idx, (seg, conn)) in segments.iter().enumerate() {
+        let in_group = group_depth > 0;
+        let delta = group_delta(seg);
         // Preserved tails bypass all analysis (cd/grep/compound checks
         // included): second/third greps and grep introducers (xargs grep,
         // sh -c, cd) in tail positions are real tools on that stream.
         if tail_preserved[idx] {
             rewritten.push((seg.clone(), conn.clone()));
+            group_depth = (group_depth + delta).max(0);
             continue;
         }
         let verb = first_word(seg);
         if is_cd_segment(verb) {
             if pstart[idx] != pend[idx] {
-                return Err(Fallback::CdUntrackable);
+                return Err(AnalyzeFailure {
+                    reason: Fallback::CdUntrackable,
+                    outcomes,
+                });
             }
-            cwd = resolve_cd(seg, &cwd, home)?;
+            let new_cwd = match resolve_cd(seg, &cwd, home) {
+                Ok(c) => c,
+                Err(reason) => {
+                    return Err(AnalyzeFailure { reason, outcomes });
+                }
+            };
+            cwd = new_cwd;
             rewritten.push((seg.clone(), conn.clone()));
+            group_depth = (group_depth + delta).max(0);
             continue;
         }
         if is_grep_verb(verb) {
@@ -422,6 +711,24 @@ fn analyze_command(
                 // captured stdout, where the parent's strip cannot reach it.
                 marker_ok: !exec_redirects_stderr,
             };
+            // Grep inside an open compound group: never served (the group's
+            // opener segment was skipped; this member is inside the construct).
+            if in_group {
+                if ctx.piped {
+                    tail_preserved[idx + 1..=pend[idx]].fill(true);
+                }
+                if first_skip_reason.is_none() {
+                    first_skip_reason = Some(Fallback::NestedGrep);
+                }
+                outcomes.push(skipped_grep_outcome(
+                    Fallback::NestedGrep.to_string(),
+                    seg,
+                    ctx.piped,
+                ));
+                rewritten.push((seg.clone(), conn.clone()));
+                group_depth = (group_depth + delta).max(0);
+                continue;
+            }
             match serve_one_grep(seg, verb, &cwd, home, allow_single, ctx) {
                 Ok((spec, rewritten_seg)) => {
                     if ctx.piped {
@@ -437,19 +744,59 @@ fn analyze_command(
                             .collect();
                         shapes.push((verbs.len(), verbs.join("|"), spec.stdin));
                     }
+                    outcomes.push(GrepOutcome {
+                        served: true,
+                        reason: String::new(),
+                        recursive: spec.flags.r,
+                        piped: ctx.piped,
+                        operand_count: spec.operands.len(),
+                        flags: flags_surface(&spec.flags),
+                    });
                     rewritten.push((rewritten_seg, conn.clone()));
                     specs.push(spec);
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Per-grep fallback: skip this segment (keep it verbatim),
+                    // record the skip, and continue to the next — a servable
+                    // sibling elsewhere in the command is still served.
+                    let reason = e.to_string();
+                    if ctx.piped {
+                        tail_preserved[idx + 1..=pend[idx]].fill(true);
+                    }
+                    if first_skip_reason.is_none() {
+                        first_skip_reason = Some(e);
+                    }
+                    outcomes.push(skipped_grep_outcome(reason, seg, ctx.piped));
+                    rewritten.push((seg.clone(), conn.clone()));
+                }
             }
+            group_depth = (group_depth + delta).max(0);
             continue;
         }
         // Non-grep member: verbatim. In a pipeline it is a producer — the
         // first grep in that pipeline is served from its stdout. Indirect/
         // compound grep invocations (xargs grep, git grep, sh -c, sudo, for
-        // bodies) make the whole command fall back (fail-closed).
+        // bodies) are skipped per-segment (kept verbatim) rather than making
+        // the whole command fall back; a served sibling grep elsewhere in the
+        // command is still served.
         if is_compound_segment(seg) || segment_contains_grep(seg, verb) {
-            return Err(Fallback::NestedGrep);
+            // A telemetry skip is recorded only when the segment actually
+            // carries a grep member; bare construct keywords (`then`, `fi`,
+            // `done`) and grep-less indirect prefixes must not inflate the
+            // grep/skipped counts in the compound case.
+            if segment_contains_grep(seg, verb) {
+                if first_skip_reason.is_none() {
+                    first_skip_reason = Some(Fallback::NestedGrep);
+                }
+                outcomes.push(skipped_grep_outcome(
+                    Fallback::NestedGrep.to_string(),
+                    seg,
+                    pstart[idx] != pend[idx],
+                ));
+            }
+            rewritten.push((seg.clone(), conn.clone()));
+            group_depth = (group_depth + delta).max(0);
+            continue;
         }
         if verb == "exec" && (seg.contains("2>") || seg.contains("&>")) {
             // `exec 2>&1`/`exec 2>…`/`exec &>…` moves the shell's stderr for
@@ -464,9 +811,22 @@ fn analyze_command(
             exec_redirects_stderr = true;
         }
         rewritten.push((seg.clone(), conn.clone()));
+        group_depth = (group_depth + delta).max(0);
     }
 
-    Ok((specs, shapes, join_rewritten(&rewritten)))
+    // Served iff at least one grep was served. If none was, the command falls
+    // back wholesale (the original runs) with the first per-segment skip
+    // reason naming the cause — a pure-skip command must not run the engine.
+    // The collected per-member outcomes are preserved (the caller records the
+    // shape; a would-be serve demoted by the whole-command abort is handled at
+    // the call site).
+    if specs.is_empty() {
+        return Err(AnalyzeFailure {
+            reason: first_skip_reason.unwrap_or(Fallback::NoGrep),
+            outcomes,
+        });
+    }
+    Ok((specs, shapes, join_rewritten(&rewritten), outcomes))
 }
 
 /// Join rewritten segments with their original connectors into one command.
@@ -496,6 +856,38 @@ fn split_segments(command: &str) -> Result<Vec<(String, String)>, Fallback> {
     super::segment_command(command, super::SegmentMode::Grep).ok_or(Fallback::SegmentEmpty)
 }
 
+/// Net group-open delta contributed by one segment's unquoted `(`/`{` and
+/// `)`/`}` delimiters. Quote- and escape-aware so pattern parens/braces
+/// (`'a(b'`, `\(`) don't count; `${…}`/`$(…)`/`$((…))` balance to zero within
+/// a segment (the `$`-expansion's own open/close pair cancels), so a real
+/// group that spans segments (e.g. `( cd d && grep … )`) is counted correctly.
+/// An unbalanced unquoted `(`/`{` inside a grep pattern or operand word (e.g.
+/// `grep -E a(b file`, `grep -E x{2 file`) leaves the depth positive and
+/// misclassifies a later top-level sibling grep as in-group — it is skipped
+/// (fail-closed: the real grep runs, so the output is correct; only the serve
+/// is wrongly declined). This errs on the skip side, so it is accepted.
+fn group_delta(segment: &str) -> isize {
+    let mut delta = 0isize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && !in_single {
+            chars.next();
+            continue;
+        }
+        if !super::check_outside_quotes(c, &mut in_single, &mut in_double) {
+            continue;
+        }
+        match c {
+            '(' | '{' => delta += 1,
+            ')' | '}' => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
+}
+
 /// First whitespace-delimited word of a segment (raw, quote-preserving).
 fn first_word(segment: &str) -> &str {
     segment.split_whitespace().next().unwrap_or("")
@@ -510,8 +902,11 @@ fn is_cd_segment(verb: &str) -> bool {
 }
 
 /// Command-introducer verbs whose argument list may contain a nested grep
-/// invocation (compounds, indirect invocations). Presence of a grep-family
-/// word in such a segment falls the whole command back.
+/// invocation (compounds, indirect invocations). A grep-family word in such a
+/// segment is kept verbatim — never served, since its semantics are uncertain —
+/// and the segment is recorded as a telemetry skip; a servable sibling grep
+/// elsewhere in the command is still served (per-segment substitution no longer
+/// falls the whole command back).
 const GREP_INTRODUCERS: &[&str] = &[
     "if", "while", "until", "case", "for", "select", "then", "else", "elif", "do", "!", "time",
     "command", "builtin", "exec", "eval", "sudo", "env", "nice", "nohup", "xargs", "ssh", "sh",
@@ -520,11 +915,9 @@ const GREP_INTRODUCERS: &[&str] = &[
 ];
 
 /// Compound-construct keywords: a segment starting with one (or with a `(`/`{`
-/// group opener) means the command nests a compound construct, so no grep in
-/// it — even in a later segment — may be served (criterion 3: compounds fall
-/// back). Without this, `case … in a) grep x a;; esac` and `(cd d && grep x a
-/// b)` serve the grep member, and a trailing `)` glued to an operand changes
-/// the served argv.
+/// group opener) nests a compound construct, so no grep inside THAT segment is
+/// ever served. A servable grep in a sibling segment outside the compound is
+/// still served; only the nested member falls back.
 const COMPOUND_KEYWORDS: &[&str] = &[
     "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
     "select",
@@ -663,6 +1056,68 @@ impl GrepFlags {
     fn count_mode(&self) -> bool {
         self.c || self.l
     }
+}
+
+/// Normalized single-string flag surface for a served grep (telemetry), laid
+/// out in the `GrepFlags` field order (e.g. "nivro...").
+fn flags_surface(flags: &GrepFlags) -> String {
+    let mut s = String::new();
+    if flags.n {
+        s.push('n');
+    }
+    if flags.i {
+        s.push('i');
+    }
+    if flags.v {
+        s.push('v');
+    }
+    if flags.w {
+        s.push('w');
+    }
+    if flags.x {
+        s.push('x');
+    }
+    if flags.a {
+        s.push('a');
+    }
+    if flags.h {
+        s.push('h');
+    }
+    if flags.H {
+        s.push('H');
+    }
+    if flags.s {
+        s.push('s');
+    }
+    if flags.r {
+        s.push('r');
+    }
+    if flags.o {
+        s.push('o');
+    }
+    if flags.null {
+        s.push('z');
+    }
+    if flags.c {
+        s.push('c');
+    }
+    if flags.l {
+        s.push('l');
+    }
+    if flags.m.is_some() {
+        s.push('m');
+    }
+    if flags.before > 0 && flags.after > 0 {
+        s.push('C');
+    } else {
+        if flags.before > 0 {
+            s.push('A');
+        }
+        if flags.after > 0 {
+            s.push('B');
+        }
+    }
+    s
 }
 
 /// A word from the grep segment: its unquoted value plus redirect metadata.
@@ -1257,7 +1712,8 @@ fn build_matcher(
     b.case_insensitive(flags.i)
         .word(flags.w)
         .whole_line(flags.x)
-        .unicode(true);
+        .unicode(true)
+        .line_terminator(Some(b'\n'));
     if mode == MatchMode::Fixed {
         b.fixed_strings(true);
     }
@@ -1268,9 +1724,12 @@ fn build_matcher(
 /// UTF-8 as a silent non-match for every matcher mode (-F/-E/-i/-v alike) —
 /// except in binary files, where a NUL in the first 32 KiB switches grep to
 /// byte-oriented matching and invalid-UTF-8 match lines still count. The
-/// wrapper rejects invalid haystacks when `validate_utf8` is set (text files)
-/// and hides the line-terminator/fast-path hints, forcing the searcher's
-/// line-by-line slow path (the only place per-line validation is sound).
+/// wrapper rejects invalid haystacks when `validate_utf8` is set (text files).
+/// With a configured line terminator, the inner matcher engages the whole-buffer
+/// SIMD prefilter (grep-regex's `fast_line_regex`/`find_candidate_line`); the
+/// `find_candidate_line` override re-validates `Confirmed` lines so invalid-UTF-8
+/// lines do not produce false matches (the searcher reports `Confirmed` lines
+/// without calling `find_at`).
 #[derive(Clone)]
 struct SearchMatcher {
     inner: grep_regex::RegexMatcher,
@@ -1297,12 +1756,77 @@ impl grep_matcher::Matcher for SearchMatcher {
     }
 
     fn line_terminator(&self) -> Option<grep_matcher::LineTerminator> {
-        None // force the slow per-line path (see struct doc)
+        self.inner.line_terminator()
     }
 
     fn non_matching_bytes(&self) -> Option<&grep_matcher::ByteSet> {
-        None // ditto
+        self.inner.non_matching_bytes()
     }
+
+    fn find_candidate_line(
+        &self,
+        haystack: &[u8],
+    ) -> Result<Option<grep_matcher::LineMatchKind>, Self::Error> {
+        let Some(kind) = self.inner.find_candidate_line(haystack)? else {
+            return Ok(None);
+        };
+        // Binary files are byte-oriented: the inner candidate/confirmed result
+        // stands on its own.
+        if !self.validate_utf8 {
+            return Ok(Some(kind));
+        }
+        match kind {
+            // The searcher verifies Candidate lines via `is_match` → `find_at`,
+            // which already rejects invalid-UTF-8 lines.
+            grep_matcher::LineMatchKind::Candidate(i) => {
+                Ok(Some(grep_matcher::LineMatchKind::Candidate(i)))
+            }
+            // The searcher reports Confirmed lines without calling `find_at`, so
+            // an invalid-UTF-8 line would be a false match. Re-validate the line
+            // and, when it is invalid, skip past it and keep searching. Iterative
+            // (not recursive): a large non-UTF-8 file littered with literal-
+            // matching invalid lines would otherwise build a lengthy call chain
+            // and overflow the worker stack.
+            grep_matcher::LineMatchKind::Confirmed(i) => {
+                let (start, end) = locate_line(haystack, b'\n', i);
+                if std::str::from_utf8(&haystack[start..end]).is_ok() {
+                    return Ok(Some(grep_matcher::LineMatchKind::Confirmed(i)));
+                }
+                let mut pos = end;
+                loop {
+                    let Some(kind) = self.inner.find_candidate_line(&haystack[pos..])? else {
+                        return Ok(None);
+                    };
+                    match kind {
+                        grep_matcher::LineMatchKind::Candidate(j) => {
+                            return Ok(Some(grep_matcher::LineMatchKind::Candidate(pos + j)));
+                        }
+                        grep_matcher::LineMatchKind::Confirmed(j) => {
+                            let (start, end) = locate_line(haystack, b'\n', pos + j);
+                            if std::str::from_utf8(&haystack[start..end]).is_ok() {
+                                return Ok(Some(grep_matcher::LineMatchKind::Confirmed(pos + j)));
+                            }
+                            pos = end;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Locate the line (terminator included) containing the byte offset `pos`,
+/// mirroring the (private) `grep_searcher::lines::locate` for a single point.
+fn locate_line(bytes: &[u8], term: u8, pos: usize) -> (usize, usize) {
+    let start = bytes[..pos]
+        .iter()
+        .rposition(|&b| b == term)
+        .map_or(0, |i| i + 1);
+    let end = bytes[pos..]
+        .iter()
+        .position(|&b| b == term)
+        .map_or(bytes.len(), |i| pos + i + 1);
+    (start, end)
 }
 
 // ── Operand resolution and the serve gate ─────────────────────────────────
@@ -2007,8 +2531,16 @@ fn fnmatch(pattern: &str, s: &str) -> bool {
 }
 
 /// Recursive walk with rg-default exclusions (hidden, gitignore, .ignore, git
-/// exclude, global gitignore) in walkdir order, plus BSD include/exclude
-/// filters and symlink skipping. Explicit operands never pass through here.
+/// exclude, global gitignore) plus BSD include/exclude filters and symlink
+/// skipping. Explicit operands never pass through here.
+///
+/// The SEARCH runs on multiple worker threads: each file is searched into a
+/// per-file buffer (no global lock during search, so the search itself is
+/// parallel), then the buffered stdout/stderr are merged into the real `out`
+/// under a brief mutex and the aggregate `OperandResult` is maxed. In-file
+/// order is preserved; cross-file output order is non-deterministic (the
+/// accepted worker-scheduling delta). The hidden/gitignore exclusion and the
+/// symlink skip are preserved unchanged by the builder configuration.
 fn walk_dir(
     op: &Operand,
     spec: &EngineSpec,
@@ -2020,46 +2552,96 @@ fn walk_dir(
     let root_display = op.display.clone();
     let exclude_dir = spec.exclude_dir.clone();
     let root_for_filter = root_abs.clone();
-    let mut result = OperandResult::NoMatch;
+    let limit = if spec.piped { None } else { Some(OUTPUT_CAP) };
 
     let mut builder = ignore::WalkBuilder::new(&root_abs);
-    builder.filter_entry(move |entry| {
-        if entry.file_type().is_some_and(|t| t.is_dir()) && entry.depth() > 0 {
-            let display = traversal_display(&root_display, &root_for_filter, entry.path());
-            !dir_excluded(&display, &exclude_dir)
-        } else {
-            true
+    builder.filter_entry({
+        // The filter closure is `'static` (it must OWN its captured state), so
+        // it gets its own copy of the root label; the walker's worker closure
+        // keeps the original.
+        let root_display = root_display.clone();
+        move |entry| {
+            if entry.file_type().is_some_and(|t| t.is_dir()) && entry.depth() > 0 {
+                let display = traversal_display(&root_display, &root_for_filter, entry.path());
+                !dir_excluded(&display, &exclude_dir)
+            } else {
+                true
+            }
         }
     });
-    for entry in builder.build() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                // Unreadable dir/file during traversal → grep-style error.
-                let (path, message) = walk_error_info(&e);
-                let display = path.as_deref().map_or_else(
-                    || op.display.clone(),
-                    |p| traversal_display(&op.display, &root_abs, p),
-                );
-                emit_error(spec, out, &display, &message);
-                result = OperandResult::Error;
-                continue;
+
+    // Shared output + aggregate result; search runs per-file into a buffer, the
+    // merge lock is held only for the buffer copy (streams per file, and
+    // cross-file order is non-deterministic — the accepted parallel-walk delta).
+    // The worker closures capture these OWNED state pieces by reference so the
+    // per-thread builder closure can be invoked more than once.
+    //
+    // Accepted parallel-walk trade-offs (documented, not errors): (1) when a
+    // recursive walk's total output exceeds OUTPUT_CAP, which files' lines
+    // survive the cap is non-deterministic across workers — only the count is
+    // preserved, not operand-order; (2) a piped member (limit None) buffers a
+    // single file's matches in the worker buffer before releasing them, so per
+    // worker memory is bounded by ONE matching file's output (not a constant),
+    // where the serial path streamed per-line. Both are rare (the dominant
+    // target/ timeout is a non-piped walk, and `| head` ends the walk early via
+    // SIGPIPE once tail-prefixed output is flushed).
+    let shared_out = std::sync::Mutex::new(&mut *out);
+    let shared_result = std::sync::Mutex::new(OperandResult::NoMatch);
+    let root_abs = &root_abs;
+    let root_display = &root_display;
+    let out_ref = &shared_out;
+    let result_ref = &shared_result;
+
+    builder.build_parallel().run(|| {
+        let mut local = Output::new(OutputSink::Buffer(Vec::new()), limit);
+        Box::new(move |entry| {
+            let (buf, err, r) = match entry {
+                Ok(e) => {
+                    let ft = e.file_type();
+                    if ft.is_some_and(|t| t.is_symlink() || t.is_dir()) {
+                        return ignore::WalkState::Continue; // grep -r skips symlinks; dirs traversed by the walk
+                    }
+                    let display = traversal_display(root_display, root_abs, e.path());
+                    if !file_allowed_by_filters(&display, spec) {
+                        return ignore::WalkState::Continue;
+                    }
+                    let r = search_file(e.path(), &display, spec, matcher, &mut local, show_prefix);
+                    let (buf, err) = local.take_stdio();
+                    (buf, err, r)
+                }
+                Err(e) => {
+                    // Unreadable dir/file during traversal → grep-style error.
+                    let (path, message) = walk_error_info(&e);
+                    let display = path.as_deref().map_or_else(
+                        || op.display.clone(),
+                        |p| traversal_display(&op.display, root_abs, p),
+                    );
+                    emit_error(spec, &mut local, &display, &message);
+                    let (buf, err) = local.take_stdio();
+                    (buf, err, OperandResult::Error)
+                }
+            };
+            let mut guard = out_ref
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.write_bytes(&buf);
+            for chunk in err.chunks(4096) {
+                guard.write_err(&String::from_utf8_lossy(chunk));
             }
-        };
-        let ft = entry.file_type();
-        if ft.is_some_and(|t| t.is_symlink() || t.is_dir()) {
-            continue; // grep -r skips symlinks; dirs are traversed by the walk
-        }
-        let display = traversal_display(&op.display, &root_abs, entry.path());
-        if !file_allowed_by_filters(&display, spec) {
-            continue;
-        }
-        // Any error yields exit 2 even when matches were printed (BSD);
-        // `max` keeps Error over Match/NoMatch.
-        let r = search_file(entry.path(), &display, spec, matcher, out, show_prefix);
-        result = result.max(r);
-    }
-    result
+            // Flush so a piped tail (`| head`) sees data as each file completes.
+            guard.flush();
+            drop(guard);
+            let mut gr = result_ref
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *gr = (*gr).max(r);
+            ignore::WalkState::Continue
+        })
+    });
+
+    shared_result
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Display path for a walked entry: the operand spelling + relative suffix.
@@ -2311,8 +2893,8 @@ struct Output {
 
 enum OutputSink {
     Stdout(io::BufWriter<io::Stdout>),
-    // In-memory sink used only by the macOS-gated parity tests.
-    #[cfg_attr(not(all(test, target_os = "macos")), allow(dead_code))]
+    // In-memory sink: the parallel-walk per-worker buffers (production) and the
+    // macOS-gated parity tests.
     Buffer(Vec<u8>),
 }
 
@@ -2344,6 +2926,18 @@ impl Output {
 
     fn write_byte(&mut self, b: u8) {
         self.write_bytes(&[b]);
+    }
+
+    /// Drain the buffered stdout and stderr, leaving the sink empty. For the
+    /// buffer sink the stdout Vec is taken; for the stdout sink nothing is
+    /// buffered in-process, so the stdout half is empty. Resets `written`
+    /// (the per-file cap accounting of the parallel-walk worker buffers).
+    fn take_stdio(&mut self) -> (Vec<u8>, Vec<u8>) {
+        self.written = 0;
+        match &mut self.sink {
+            OutputSink::Buffer(v) => (std::mem::take(v), std::mem::take(&mut self.err)),
+            OutputSink::Stdout(_) => (Vec::new(), std::mem::take(&mut self.err)),
+        }
     }
 
     /// Error message (stderr) — bounded.
@@ -2602,14 +3196,18 @@ mod parity_tests {
     }
 
     /// Assert the engine's output/exit are byte-identical to the real grep.
+    /// Recursive DIRECTORY walks (the parallel-walk path) may order files
+    /// differently across workers, so those are compared as sorted line-sets;
+    /// everything else stays byte-exact (the fast matcher's ordering is pinned).
     fn assert_parity(command: &str, ws: &Path, home: &Path) {
-        let (specs, _, rewritten) = analyze_command(command, ws, home, true)
-            .unwrap_or_else(|e| panic!("{command}: expected servable, got {e}"));
+        let (specs, _, rewritten, _) = analyze_command(command, ws, home, true)
+            .unwrap_or_else(|e| panic!("{command}: expected servable, got {}", e.reason));
         assert_eq!(specs.len(), 1, "{command}: expected one grep member");
         if specs[0].stdin {
             assert_stdin_parity(command, &specs[0], &rewritten, ws, home);
             return;
         }
+        let parallel = spec_uses_parallel_walk(&specs[0]);
         let (eout, eerr, ecode) = engine_run(&specs[0]);
         let piped = command.split_whitespace().any(|w| w == "|" || w == "|&");
         let (rout, rerr, rcode) = if piped {
@@ -2622,9 +3220,33 @@ mod parity_tests {
         } else {
             real_run_shell(command, ws, home)
         };
-        assert_eq!(eout, rout, "stdout mismatch for {command}");
-        assert_eq!(eerr, rerr, "stderr mismatch for {command}");
+        if parallel {
+            assert_eq!(
+                sorted_lines(&eout),
+                sorted_lines(&rout),
+                "stdout mismatch (parallel-walk ordering) for {command}"
+            );
+            assert_eq!(
+                sorted_lines(&eerr),
+                sorted_lines(&rerr),
+                "stderr mismatch (parallel-walk ordering) for {command}"
+            );
+        } else {
+            assert_eq!(eout, rout, "stdout mismatch for {command}");
+            assert_eq!(eerr, rerr, "stderr mismatch for {command}");
+        }
         assert_eq!(ecode, rcode, "exit mismatch for {command}");
+    }
+
+    /// Records (separated by `\n` or BSD's `--null`/`-z` `\0` terminator)
+    /// sorted byte-wise; ordering-insensitive parity for parallel-walk rows.
+    fn sorted_lines(bytes: &[u8]) -> Vec<&[u8]> {
+        let mut v: Vec<&[u8]> = bytes
+            .split(|&b| b == b'\n' || b == b'\0')
+            .filter(|l| !l.is_empty())
+            .collect();
+        v.sort();
+        v
     }
 
     /// The members after the served grep member, rejoined with their
@@ -2712,7 +3334,7 @@ mod parity_tests {
         let err = analyze_command(command, ws, home, false)
             .err()
             .unwrap_or_else(|| panic!("{command}: expected fallback, got served"));
-        assert_eq!(err.to_string(), reason, "{command}");
+        assert_eq!(err.reason.to_string(), reason, "{command}");
     }
 
     #[test]
@@ -3007,7 +3629,7 @@ mod parity_tests {
         fs::create_dir_all(&ws).expect("ws");
         fs::create_dir_all(&home).expect("home");
         build_fixture(&ws, &home);
-        let (specs, _, _) =
+        let (specs, _, _, _) =
             analyze_command("seq 1 100000 | grep -m1 5", &ws, &home, true).expect("servable");
         let (stream, _, _) = real_run_shell("seq 1 100000", &ws, &home);
         assert!(stream.len() > BINARY_WINDOW, "fixture stream too small");
@@ -3126,6 +3748,61 @@ mod parity_tests {
     }
 
     #[test]
+    fn per_segment_skip_with_served_sibling() {
+        // A single-file grep (perf gate) no longer poisons a sibling servable
+        // recursive grep: the unservable member is kept verbatim, the servable
+        // one rewritten, and the whole command is served.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&ws).expect("ws");
+        fs::create_dir_all(&home).expect("home");
+        build_fixture(&ws, &home);
+
+        let (specs, _, rewritten, outcomes) =
+            analyze_command("grep x a.txt; grep -rn needle sub", &ws, &home, false)
+                .expect("chain with a servable sibling served");
+        assert_eq!(specs.len(), 1, "only the recursive grep is served");
+        assert!(
+            rewritten.starts_with("grep x a.txt ;"),
+            "first grep kept verbatim: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__grep-engine"),
+            "rewritten has engine verb: {rewritten}"
+        );
+        assert_eq!(outcomes.len(), 2, "one skip + one serve recorded");
+        assert!(!outcomes[0].served && outcomes[0].reason == "single file");
+        assert!(outcomes[1].served && outcomes[1].reason.is_empty());
+
+        // A compound (`if`) containing a grep is skipped (kept verbatim) while
+        // a sibling recursive grep is served.
+        let (specs, _, rewritten, outcomes) = analyze_command(
+            "grep -rn needle sub; if grep x a.txt; then echo hi; fi",
+            &ws,
+            &home,
+            false,
+        )
+        .expect("compound sibling does not poison");
+        assert_eq!(specs.len(), 1, "only the recursive grep is served");
+        assert!(
+            rewritten.contains("__grep-engine"),
+            "recursive grep served: {rewritten}"
+        );
+        assert!(
+            rewritten.ends_with("if grep x a.txt ; then echo hi ; fi"),
+            "compound kept verbatim: {rewritten}"
+        );
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "serve + the compound segment containing grep; bare `then`/`fi` carry no grep"
+        );
+        assert!(outcomes[0].served && outcomes[0].reason.is_empty());
+        assert!(!outcomes[1].served && outcomes[1].reason == "nested grep");
+    }
+
+    #[test]
     fn substitution_escape_resegments() {
         // Escape-aware substitution scans (consume_substitution) change
         // segmentation: an escaped backtick no longer truncates a backtick
@@ -3154,7 +3831,7 @@ mod parity_tests {
         fs::create_dir_all(&home).expect("home");
         build_fixture(&ws, &home);
 
-        let (specs, _, _) =
+        let (specs, _, _, _) =
             analyze_command("grep -r x ign", &ws, &home, true).expect("ign walk servable");
         let (eout, _, ecode) = engine_run(&specs[0]);
         let text = String::from_utf8_lossy(&eout).to_string();
@@ -3164,7 +3841,7 @@ mod parity_tests {
         assert!(!text.contains("skip.log"), "gitignored skipped: {text}");
 
         // Explicit file operands bypass the exclusion filters entirely.
-        let (specs, _, _) =
+        let (specs, _, _, _) =
             analyze_command("grep -r x ign/.hidden.txt ign/skip.log", &ws, &home, true)
                 .expect("explicit operands servable");
         let (eout, _, ecode) = engine_run(&specs[0]);

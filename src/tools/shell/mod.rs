@@ -782,20 +782,37 @@ impl ShellTool {
         let command_str = super::get_str(&args, "command")?;
 
         // Read-only mode: validate command before execution.
-        // The grep engine interception also runs here (read-only mode only).
+        // The grep engine interception runs in BOTH modes (read-only for the
+        // validation path, full for the inherent read-only engine) — see below.
         let mut exec_str = command_str.to_string();
+
+        // Capture the grep-engine serve decision once, before the mode branch
+        // (the engine is Unix-only); reused by both branches for the rewrite
+        // and by the telemetry write after execution.
+        #[cfg(unix)]
+        let grep_serve = grep_engine::try_serve_command(command_str, ws.as_path());
+
         if self.mode == ShellMode::ReadOnly {
             let ctx = self::readonly::CheckContext::for_workspace(ws.as_path());
             if let Err(rejection) = check_command(command_str, &ctx) {
                 anyhow::bail!("{rejection}");
             }
             #[cfg(unix)]
-            if let Some(rewritten) = grep_engine::try_serve_command(command_str, ws.as_path()) {
+            if let Some(rewritten) = grep_serve.rewritten.as_deref() {
                 // The engine verb is an unlisted literal and passes validation;
                 // on the off chance it does not, keep the original command.
-                if check_command(&rewritten, &ctx).is_ok() {
-                    exec_str = rewritten;
+                if check_command(rewritten, &ctx).is_ok() {
+                    exec_str = rewritten.to_string();
                 }
+            }
+        } else {
+            // Full mode: no read-only validation; the engine is inherently
+            // read-only and preserves non-grep (incl. mutating) segments
+            // verbatim. Background-mode Full greps are deliberately NOT served
+            // (the early return above keeps them on the original command).
+            #[cfg(unix)]
+            if let Some(rewritten) = grep_serve.rewritten.as_deref() {
+                exec_str = rewritten.to_string();
             }
         }
 
@@ -842,13 +859,17 @@ impl ShellTool {
         // original command so the agent sees the authentic result. A stale
         // self-update binary (one lacking the hidden subcommand) runs full
         // main() and dies at instance-lock with the lock message; that
-        // signature re-runs too. Residual: a mid-search panic after output
+        // signature re-runs too. In Full mode the re-run re-executes the whole
+        // original command, including any preserved mutation segments
+        // (mv/cp/mkdir/…) kept verbatim in the rewrite — documented behavior:
+        // a mid-command engine failure may repeat them. Residual: a
+        // mid-search panic after output
         // was streamed exits sentinel-3, but a pipe/chain member's exit
         // status masks it — aggregation tails (`grep | wc -l`, `grep | sort`)
         // are the worst case, turning the partial stream into authoritative-
         // looking wrong answers — so the agent sees the partial output.
         #[cfg(unix)]
-        let result = if exec_str != command_str
+        let sentinel_rerun = exec_str != command_str
             && matches!(
                 &result,
                 ShellRunResult::Completed { status, stderr, .. }
@@ -856,15 +877,19 @@ impl ShellTool {
                         || stderr
                             .windows(grep_engine::STALE_BINARY_LOCK_MSG.len())
                             .any(|w| w == grep_engine::STALE_BINARY_LOCK_MSG.as_bytes())
-            ) {
+            );
+        #[cfg(unix)]
+        let result = if sentinel_rerun {
             let mut original = build_shell_command(command_str, ws.as_path());
             run_command_with_timeout(&mut original, timeout, drain_limit).await
         } else {
             result
         };
 
-        // Criterion 11: record the served invocation's exit code (the
-        // served-vs-fallback decision + reason are logged in grep_engine).
+        // Criterion 11: record the served invocation's exit code at DEBUG
+        // (filtered from the general log stream). The dedicated
+        // `grep_telemetry` table is the source of truth for grep decisions;
+        // this line is observability only.
         if exec_str != command_str {
             let exit_code = match &result {
                 ShellRunResult::Completed { status, .. } => status.code(),
@@ -875,6 +900,82 @@ impl ShellTool {
                 ?exit_code,
                 "grep engine: served exit"
             );
+        }
+
+        // Grep-engine telemetry: one row per greppable call lands in the
+        // dedicated `grep_telemetry` table, keeping the general `logs` stream
+        // clean of grep detail. Best-effort/fail-open — a telemetry failure
+        // never affects the shell result.
+        #[cfg(unix)]
+        if !grep_serve.outcomes.is_empty() {
+            // `applied` is the ground truth of whether the shell was rewritten
+            // to the engine. The analysis outcomes can report served even when
+            // no engine ran (engine unavailable, spec too large, ReadOnly
+            // rejection) — and a sentinel re-run replaced the engine with a
+            // real-grep run — so the row's served flag must reflect the ACTUAL
+            // execution. The engine-internal `exec_grep` path (cwd mismatch,
+            // matcher-build failure, version mismatch) re-execs real grep in
+            // place, which is NOT observable from the parent; that residual is
+            // documented rather than fixed.
+            let applied = exec_str != command_str;
+            let served = applied && !sentinel_rerun;
+            let reason = if sentinel_rerun {
+                "engine sentinel re-run (real grep)"
+            } else if !applied && grep_serve.rewritten.is_some() {
+                // The rewrite was produced but ReadOnly validation rejected it —
+                // the whole command ran real grep. Per-member skip reasons
+                // describe the analysis, not why real grep ran.
+                "rewrite not applied"
+            } else if applied {
+                grep_serve
+                    .outcomes
+                    .iter()
+                    .find(|o| !o.served)
+                    .map(|o| o.reason.as_str())
+                    .unwrap_or_default()
+            } else {
+                // Engine unavailable / spec too large: the outcomes already
+                // carry the concrete reason.
+                grep_serve
+                    .outcomes
+                    .iter()
+                    .find(|o| !o.reason.is_empty())
+                    .map_or("rewrite not applied", |o| o.reason.as_str())
+            };
+            let shape = grep_serve.telemetry_shape(served);
+            let mode = match self.mode {
+                ShellMode::ReadOnly => "ReadOnly",
+                ShellMode::Full => "Full",
+            };
+            let workspace = ws.as_path().to_string_lossy().into_owned();
+            let (elapsed, exit_code) = match &result {
+                ShellRunResult::Completed {
+                    elapsed, status, ..
+                } => (*elapsed, status.code()),
+                ShellRunResult::TimedOut { elapsed, .. }
+                | ShellRunResult::DrainTimedOut { elapsed, .. } => (*elapsed, None),
+                ShellRunResult::SpawnFailed(_) => (std::time::Duration::ZERO, None),
+            };
+            let duration_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+            if let Some(store) = crate::logs::LOG_STORE.get() {
+                let row = crate::logs::GrepTelemetryRow {
+                    command: command_str,
+                    served,
+                    reason,
+                    recursive: shape.recursive,
+                    piped: shape.piped,
+                    operand_count: shape.operand_count,
+                    flags: shape.flags.as_str(),
+                    mode,
+                    workspace: workspace.as_str(),
+                    grep_count: shape.grep_count,
+                    served_count: shape.served_count,
+                    skipped_count: shape.skipped_count,
+                    duration_ms: Some(duration_ms),
+                    exit_code,
+                };
+                let _ = store.record_grep_telemetry(row).await;
+            }
         }
 
         match result {

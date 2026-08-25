@@ -154,7 +154,56 @@ CREATE TABLE IF NOT EXISTS llm_requests (
 CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);";
+CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
+-- Dedicated grep-engine telemetry: one row per greppable shell call,
+-- recording what the engine decided (served vs skipped + first fallback
+-- reason) and the command shape. Self-contained (no tool_calls.id
+-- correlation) so a grep-specific analysis can be run without joins.
+CREATE TABLE IF NOT EXISTS grep_telemetry (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at   TEXT NOT NULL,
+    command       TEXT NOT NULL,
+    served        INTEGER NOT NULL DEFAULT 0,
+    reason        TEXT NOT NULL DEFAULT '',
+    recursive     INTEGER NOT NULL DEFAULT 0,
+    piped         INTEGER NOT NULL DEFAULT 0,
+    operand_count INTEGER NOT NULL DEFAULT 0,
+    flags         TEXT NOT NULL DEFAULT '',
+    mode          TEXT NOT NULL DEFAULT '',
+    workspace     TEXT NOT NULL DEFAULT '',
+    grep_count    INTEGER NOT NULL DEFAULT 0,
+    served_count  INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    duration_ms   INTEGER,
+    exit_code     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_recorded_at ON grep_telemetry(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_served ON grep_telemetry(served);
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_reason ON grep_telemetry(reason);
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command);";
+
+/// One greppable shell call's grep-engine decision, persisted to the dedicated
+/// `grep_telemetry` table (self-contained — no tool_calls.id correlation).
+/// Bundled into a struct so the writer's signature stays shallow; the caller
+/// constructs the row from the serve outcomes + the runtime facts (actual apply,
+/// sentinel re-run, duration, exit).
+#[derive(Debug)]
+pub(crate) struct GrepTelemetryRow<'a> {
+    pub command: &'a str,
+    pub served: bool,
+    pub reason: &'a str,
+    pub recursive: bool,
+    pub piped: bool,
+    pub operand_count: usize,
+    pub flags: &'a str,
+    pub mode: &'a str,
+    pub workspace: &'a str,
+    pub grep_count: usize,
+    pub served_count: usize,
+    pub skipped_count: usize,
+    pub duration_ms: Option<i64>,
+    pub exit_code: Option<i32>,
+}
 
 impl LogStore {
     /// Open (or create) the log database at `root/db/logs.db`.
@@ -296,6 +345,41 @@ impl LogStore {
         }
 
         Ok((entries, total))
+    }
+
+    /// Persist one greppable shell call's grep-engine decision to the dedicated
+    /// `grep_telemetry` table. Metadata only; the caller treats failures as
+    /// fail-open. Self-contained for grep-specific analysis.
+    pub(crate) async fn record_grep_telemetry(
+        &self,
+        row: GrepTelemetryRow<'_>,
+    ) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO grep_telemetry \
+                 (recorded_at, command, served, reason, recursive, piped, operand_count, flags, \
+                  mode, workspace, grep_count, served_count, skipped_count, duration_ms, exit_code) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    crate::db::now(),
+                    row.command,
+                    i64::from(row.served),
+                    row.reason,
+                    i64::from(row.recursive),
+                    i64::from(row.piped),
+                    i64::try_from(row.operand_count)?,
+                    row.flags,
+                    row.mode,
+                    row.workspace,
+                    i64::try_from(row.grep_count)?,
+                    i64::try_from(row.served_count)?,
+                    i64::try_from(row.skipped_count)?,
+                    row.duration_ms,
+                    row.exit_code.map(i64::from),
+                ],
+            )
+            .await?;
+        Ok(())
     }
 }
 

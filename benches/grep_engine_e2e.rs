@@ -310,7 +310,34 @@ fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
     // execution path) — this also validates the rewrite against the original.
     let real_out = run_sh(row, ws)?;
     if engine_out == real_out {
-        Ok(())
+        return Ok(());
+    }
+    if mahbot::served_spec_walks_directory(row, ws, home) {
+        // Parallel-walk rows may order files across workers non-deterministically,
+        // so an order-sensitive pipeline tail (head/tail) selects a different
+        // subset. Fall back to comparing the engine member's own output (before
+        // any tail) as a sorted line-set; in-file order is still stable.
+        //
+        // `engine_member_prefix` isolates everything before the first top-level
+        // `|`. For a hypothetical producer-first parallel-walk row
+        // (`producer | grep -rn … | tail`) that prefix is the PRODUCER, so this
+        // would compare the producer's output against itself without exercising
+        // the grep member — a latent false-pass. No such row exists in the
+        // matrix today (all parallel-walk rows are grep-first), so it is noted
+        // rather than guarded.
+        let engine_member = run_sh(engine_member_prefix(&rewritten), ws)?;
+        let real_member = run_sh(engine_member_prefix(row), ws)?;
+        if mahbot::grep_sorted_lines(&engine_member.0) == mahbot::grep_sorted_lines(&real_member.0)
+            && engine_member.1 == real_member.1
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "engine {:?} != real {:?} (parallel-walk ordering)",
+                String::from_utf8_lossy(&engine_member.0),
+                String::from_utf8_lossy(&real_member.0)
+            ))
+        }
     } else {
         Err(format!(
             "engine {:?} != real {:?}",
@@ -318,6 +345,30 @@ fn check_row(row: &str, ws: &Path, home: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&real_out.0)
         ))
     }
+}
+
+/// The leading pipeline member of a shell command (up to the first top-level
+/// `|`/`|&`, outside quotes). Isolates the engine's output for parallel-walk
+/// rows, whose tail may be order-sensitive (e.g. `head`, `tail`).
+fn engine_member_prefix(cmd: &str) -> &str {
+    let bytes = cmd.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (i, &c) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if c == b'\\' {
+            escaped = true;
+        } else if c == b'\'' && !in_double {
+            in_single = !in_single;
+        } else if c == b'"' && !in_single {
+            in_double = !in_double;
+        } else if c == b'|' && !in_single && !in_double {
+            return &cmd[..i];
+        }
+    }
+    cmd
 }
 
 fn run_sh(command: &str, cwd: &Path) -> Result<(Vec<u8>, i32), String> {
