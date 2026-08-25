@@ -28,6 +28,7 @@ use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, Workspace};
 
 // ── Hardcoded review-count calibration defaults (no config surface) ──────
 
+pub(crate) const DEFAULT_REVIEW_COUNT_TINY_CHURN: i64 = 100;
 pub(crate) const DEFAULT_REVIEW_COUNT_LOW_CHURN: i64 = 500;
 pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: i64 = 2000;
 
@@ -259,8 +260,12 @@ pub(crate) fn render_joint_comment(
         }
         crate::consensus::RepairOutcome::Fallback => {
             if has_issues {
-                out.push_str(
-                    "\n\n### Summary\nLLM grouping unavailable — deterministic member dump only.",
+                // Neutral marker: the grouping pass either failed or was
+                // deliberately skipped (single-verdict verifier round) — both
+                // reduce to the deterministic per-agent dump.
+                let _ = write!(
+                    out,
+                    "\n\n### Summary\nNo LLM grouping — deterministic member dump only."
                 );
             } else {
                 // No issues existed to merge — the synthesis pass was
@@ -321,11 +326,19 @@ fn member_text(
 // ── Calibrated dynamic agent counts ─────────────────────────────────────
 
 /// Compute the reviewer-count base from total working-tree churn (added +
-/// deleted lines, including lines of new files): 2 for churn ≤ low, 4 for
-/// churn > high (strict — exactly `high` stays 3), 3 otherwise. Never 1.
+/// deleted lines, including lines of new files): 1 for churn < tiny, 2 for
+/// churn ≤ low, 4 for churn > high (strict — exactly `high` stays 3), 3
+/// otherwise.
 #[must_use]
-pub(crate) fn review_base_from_signals(total_churn: i64, low_churn: i64, high_churn: i64) -> usize {
-    if total_churn <= low_churn {
+pub(crate) fn review_base_from_signals(
+    total_churn: i64,
+    tiny_churn: i64,
+    low_churn: i64,
+    high_churn: i64,
+) -> usize {
+    if total_churn < tiny_churn {
+        1
+    } else if total_churn <= low_churn {
         2
     } else if total_churn > high_churn {
         4
@@ -334,11 +347,11 @@ pub(crate) fn review_base_from_signals(total_churn: i64, low_churn: i64, high_ch
     }
 }
 
-/// Apply the P0 floor: priority-0 tickets never get 2 reviewers (floor 3).
-/// Bounces do not change the count.
+/// Apply the P0 floor: priority-0 tickets never drop below 2 reviewers
+/// (floor 2). Bounces do not change the count.
 #[must_use]
 pub(crate) fn review_agent_count(base: usize, priority: i64) -> usize {
-    if priority == 0 { base.max(3) } else { base }
+    if priority == 0 { base.max(2) } else { base }
 }
 
 #[cfg(test)]

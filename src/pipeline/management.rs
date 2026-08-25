@@ -3511,9 +3511,12 @@ pub(crate) fn stage_role(name: &str) -> Option<Role> {
     }
 }
 
-/// Build the joint comment for a round: deterministic merge + single LLM
-/// synthesis pass (stage role's own model) + rendering. Runs entirely before
-/// any board transaction — the synthesis must never hold the board write lock.
+/// Build the joint comment for a round: deterministic merge + a single LLM
+/// synthesis pass (stage role's own model) + rendering — except verifier
+/// rounds with a lone valid verdict (and no-issues rounds), which skip the
+/// synthesis pass entirely and render the deterministic per-agent dump.
+/// Runs entirely before any board transaction — the synthesis must never
+/// hold the board write lock.
 ///
 /// `ticket_title` is threaded into the synthesis call's Running Agents group
 /// header label (purely presentational — the ticket group keeps its name even
@@ -3565,16 +3568,21 @@ async fn build_round_joint_comment(
         header: header.to_string(),
         threshold,
     };
-    if round
+    let has_no_issues = round
         .verdicts
         .iter()
-        .all(|v| v.verdict.issues_detected.is_empty())
-    {
-        // No issues to merge: either all agents failed (no response / parse
-        // failure) or every valid verdict reported an empty issues list.
-        // A synthesis pass over zero issues would waste a provider call and
-        // could produce a misleading "no issues" summary on a round that
-        // actually bounced. Render the deterministic no-issues form instead.
+        .all(|v| v.verdict.issues_detected.is_empty());
+    let single_verifier_verdict = matches!(role, Role::Reviewer | Role::Qa) && round.n_valid() == 1;
+    if has_no_issues || single_verifier_verdict {
+        // Skip the LLM synthesis pass: either there are no issues to merge
+        // (all agents failed, or every valid verdict reported an empty
+        // issues list — a synthesis pass over zero issues would waste a
+        // provider call and could produce a misleading "no issues" summary
+        // on a round that actually bounced), or a verifier round produced
+        // exactly one valid verdict — grouping a lone verdict would be a
+        // single-source reorganization, not a consensus, so the
+        // deterministic per-agent dump is the right form instead (QA always
+        // dispatches exactly one agent, so every QA round takes this path).
         crate::pipeline::joint_verdict::render_joint_comment(
             &round,
             &crate::consensus::RepairOutcome::Fallback,
@@ -5179,18 +5187,20 @@ async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
 ///
 /// The base is recomputed from the LIVE working-tree diff at every review
 /// round dispatch — rework-grown diffs can escalate reviewer counts across
-/// rounds (2 → 3 → 4), which is intended. Bounces do not change the count.
+/// rounds (1 → 2 → 3 → 4), which is intended. Bounces do not change the count.
 /// QA never passes through here (fixed 1).
 ///
 /// The counterfactual signals are logged at info level as production
 /// telemetry, so the formula is validated against live cohorts.
 async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
+    let tiny = crate::pipeline::joint_verdict::DEFAULT_REVIEW_COUNT_TINY_CHURN;
     let low = crate::pipeline::joint_verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN;
     let high = crate::pipeline::joint_verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN;
 
     match working_tree_churn(repo_path).await {
         Ok(total) => {
-            let base = crate::pipeline::joint_verdict::review_base_from_signals(total, low, high);
+            let base =
+                crate::pipeline::joint_verdict::review_base_from_signals(total, tiny, low, high);
             info!(
                 ticket = %ticket.id,
                 total_churn = total,
@@ -5205,6 +5215,8 @@ async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
                 error = %e,
                 "Could not compute working-tree churn — reviewer base defaults to 3",
             );
+            // Unknown churn → conservative 3-reviewer default. This already
+            // exceeds the P0 floor (2), so no floor wrapper is needed.
             3
         }
     }

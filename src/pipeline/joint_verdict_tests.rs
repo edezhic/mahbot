@@ -327,10 +327,7 @@ fn renderer_with_partial_failures() {
     );
     assert!(text.contains("### Agent failures"));
     assert!(text.contains("Agent 3: agent produced no response — crashed"));
-    assert!(
-        text.contains("LLM grouping unavailable"),
-        "fallback marker: {text}"
-    );
+    assert!(text.contains("No LLM grouping"), "fallback marker: {text}");
 }
 
 #[test]
@@ -356,8 +353,8 @@ fn renderer_no_issues_summary_respects_threshold() {
         "clean-round summary must state the pass outcome: {text}"
     );
     assert!(
-        !text.contains("LLM grouping unavailable"),
-        "clean rounds must not imply the grouping step failed: {text}"
+        !text.contains("No LLM grouping"),
+        "clean rounds must not render the fallback marker: {text}"
     );
 
     // Bounced round: a sub-threshold verdict with an empty issues list
@@ -795,27 +792,40 @@ async fn repair_rejects_empty_member_group() {
 fn review_base_from_signals_thresholds() {
     // Arguments reference the calibration constants so threshold changes
     // cannot silently drift the test away from the shipped ladder.
+    let tiny = DEFAULT_REVIEW_COUNT_TINY_CHURN;
     let low = DEFAULT_REVIEW_COUNT_LOW_CHURN;
     let high = DEFAULT_REVIEW_COUNT_HIGH_CHURN;
-    // Low churn (≤ low) → 2.
-    assert_eq!(review_base_from_signals(10, low, high), 2);
+    // Tiny churn (< tiny) → 1.
+    assert_eq!(review_base_from_signals(0, tiny, low, high), 1);
+    assert_eq!(review_base_from_signals(tiny - 1, tiny, low, high), 1);
     assert_eq!(
-        review_base_from_signals(low, low, high),
+        review_base_from_signals(tiny, tiny, low, high),
+        2,
+        "boundary {tiny} is exclusive for the 1-bucket → 2"
+    );
+    // Low churn (≤ low) → 2.
+    assert_eq!(
+        review_base_from_signals((tiny + low) / 2, tiny, low, high),
+        2,
+        "a value strictly inside the low bucket (>{tiny}, ≤{low}) → 2"
+    );
+    assert_eq!(
+        review_base_from_signals(low, tiny, low, high),
         2,
         "boundary {low} is inclusive → 2"
     );
     // High churn (> high) → 4.
     assert_eq!(
-        review_base_from_signals(high + 1, low, high),
+        review_base_from_signals(high + 1, tiny, low, high),
         4,
         "boundary {high} is exclusive → 4 requires > {high}"
     );
-    assert_eq!(review_base_from_signals(high * 2, low, high), 4);
+    assert_eq!(review_base_from_signals(high * 2, tiny, low, high), 4);
     // Middle → 3, including exactly `high`.
-    assert_eq!(review_base_from_signals(low + 1, low, high), 3);
-    assert_eq!(review_base_from_signals(high - 1, low, high), 3);
+    assert_eq!(review_base_from_signals(low + 1, tiny, low, high), 3);
+    assert_eq!(review_base_from_signals(high - 1, tiny, low, high), 3);
     assert_eq!(
-        review_base_from_signals(high, low, high),
+        review_base_from_signals(high, tiny, low, high),
         3,
         "exactly {high} stays 3 (strict > boundary)"
     );
@@ -826,7 +836,8 @@ fn review_agent_count_adjustments() {
     assert_eq!(review_agent_count(2, 1), 2, "normal ticket keeps base");
     assert_eq!(review_agent_count(3, 1), 3, "no bounce adjustment");
     assert_eq!(review_agent_count(4, 1), 4, "capped at 4");
-    assert_eq!(review_agent_count(2, 0), 3, "P0 never gets 2");
-    assert_eq!(review_agent_count(3, 0), 3, "P0 floor 3");
+    assert_eq!(review_agent_count(1, 0), 2, "P0 never gets 1");
+    assert_eq!(review_agent_count(2, 0), 2, "P0 floor 2");
+    assert_eq!(review_agent_count(3, 0), 3, "P0 floor keeps base 3");
     assert_eq!(review_agent_count(4, 0), 4, "P0 with base 4");
 }

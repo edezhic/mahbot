@@ -988,7 +988,7 @@ async fn analyst_round_fails_open_with_fallback_comment() {
         .find(|c| c.role == stage_name(Role::Analyst))
         .expect("joint comment written");
     assert!(
-        joint.content.contains("LLM grouping unavailable"),
+        joint.content.contains("No LLM grouping"),
         "fallback marker must be explicit: {}",
         joint.content,
     );
@@ -1428,6 +1428,67 @@ fn joint_comment_includes_failed_agent_dumps() {
     assert!(
         comment.contains("Agent 2"),
         "agent indices are 1-based: {comment}"
+    );
+}
+
+/// A verifier round with exactly one valid verdict skips the LLM synthesis
+/// pass and renders the deterministic per-agent dump instead. The skip is
+/// keyed on the VALID-verdict count, not the dispatched count — a round
+/// dispatched with 2+ agents can still end up with a single valid verdict
+/// after a no-response / parse failure.
+#[tokio::test]
+async fn build_round_joint_comment_skips_synthesis_on_single_valid_amid_failures() {
+    let ws = test_ws_named("/tmp/test", "single_valid_mid_failures");
+    let results = vec![
+        ParallelVerdict::Verdict(fail_verdict()),
+        ParallelVerdict::NoResponse("agent produced no response".into()),
+    ];
+    let comment = build_round_joint_comment(
+        stage_name(Role::Reviewer),
+        &results,
+        REVIEW_QA_THRESHOLD,
+        Role::Reviewer,
+        "",
+        &ws,
+        "ticket_id",
+        "ticket_title",
+    )
+    .await;
+    assert!(
+        comment.contains("No LLM grouping"),
+        "round with 2 dispatched but 1 valid must skip synthesis: {comment}"
+    );
+    assert!(
+        comment.contains("- No timeout check"),
+        "the raw per-agent issue dump must render: {comment}"
+    );
+    assert!(
+        comment.contains("### Agent failures"),
+        "failed-agent appendix must render: {comment}"
+    );
+}
+
+/// QA always dispatches exactly one agent, so every QA round with a valid
+/// verdict now skips the synthesis pass and renders the deterministic dump
+/// (the ticket's intended blast radius — a lone verdict needs no consensus).
+#[tokio::test]
+async fn build_round_joint_comment_qa_skips_synthesis_for_its_single_verdict() {
+    let ws = test_ws_named("/tmp/test", "qa_single_verdict_skip");
+    let results = vec![ParallelVerdict::Verdict(fail_verdict())];
+    let comment = build_round_joint_comment(
+        stage_name(Role::Qa),
+        &results,
+        REVIEW_QA_THRESHOLD,
+        Role::Qa,
+        "",
+        &ws,
+        "ticket_id",
+        "ticket_title",
+    )
+    .await;
+    assert!(
+        comment.contains("No LLM grouping"),
+        "QA single-verdict round must skip synthesis: {comment}"
     );
 }
 
