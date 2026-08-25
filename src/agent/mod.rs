@@ -836,9 +836,12 @@ impl Agent {
 
     /// Construct a failure outcome tuple for an error reason.
     ///
-    /// Both error arms in [`Self::execute_tool`] (unknown tool and execution error) produce
-    /// the same `(ToolExecutionOutcome, String)` shape; this helper
-    /// eliminates the byte-for-byte duplicated construction.
+    /// [`Self::execute_tool`] calls this helper from three arms: the pre-flight
+    /// cancellation bail and the two error arms (unknown tool and execution error).
+    /// The helper always returns a full `(ToolExecutionOutcome, String)` tuple; the
+    /// two error arms consume it as-is, while the cancellation bail unwraps `.0`
+    /// and discards the reason string. This centralizes the byte-for-byte duplicated
+    /// construction of the two error arms.
     ///
     /// Assumes `reason` may contain sensitive data; scrubs before use in feedback
     /// text, tracing logs, and stats.

@@ -54,8 +54,8 @@ crate::columns! {
 
 /// Turso-backed log store.
 ///
-/// NOTE: This store does NOT use `define_store!` or `global_store!`. The store
-/// is opened manually inside [`init_tracing()`] because bootstrapping order
+/// NOTE: This store does NOT use `define_store!`, but does use `crate::columns!`.
+/// The store is opened manually inside [`init_tracing()`] because bootstrapping order
 /// requires logs to be available before other stores are initialized. See
 /// [`LOG_STORE`] for details.
 #[derive(Clone, Debug)]
