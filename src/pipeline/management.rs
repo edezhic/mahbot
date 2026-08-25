@@ -1364,7 +1364,7 @@ async fn process_single_workspace(ws: Workspace) {
         && live.paused
         && live.status == WorkspaceStatus::Ready
     {
-        info!(workspace = %ws.name, "Workspace paused mid-poll — skipping claim/dispatch for this round");
+        tracing::debug!(workspace = %ws.name, "Workspace paused mid-poll — skipping claim/dispatch for this round");
         return;
     }
 

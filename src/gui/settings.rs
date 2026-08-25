@@ -2618,9 +2618,7 @@ impl SettingsState {
                 toggler(custom_section_open)
                     .on_toggle(SettingsMessage::CustomEndpointToggle)
                     .into(),
-                Some(
-                    "custom chat-completions server (e.g. llama.cpp or vLLM)",
-                ),
+                Some("custom chat-completions server (e.g. llama.cpp or vLLM)"),
             ),
         ];
 
