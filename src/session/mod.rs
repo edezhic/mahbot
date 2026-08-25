@@ -202,9 +202,10 @@ crate::columns! {
 ///
 /// User-facing agents — those the user can directly converse with — persist
 /// indefinitely and are intentionally excluded:
-/// - Direct chat: `{user}_{ws_name}_{role}` — a real user whose name collides
-///   with a reserved prefix is escaped with a `user_` prefix (see
-///   [`safe_user_segment`]).
+/// - Direct chat: `{user}_{ws_name}_{role}` (or the deduped
+///   `{user}_personal:{role}` for the user's own personal workspace) — a real
+///   user whose name collides with a reserved prefix is escaped with a `user_`
+///   prefix (see [`safe_user_segment`]).
 /// - Manager: `manager_{ws_name}` — the Manager session carries both chat conversation
 ///   and notification context and must never be added here.
 ///
@@ -931,12 +932,16 @@ fn safe_user_segment(user_name: &str) -> Cow<'_, str> {
 /// Construct an agent ID for direct user-to-agent chat.
 ///
 /// Format: `{user}_{ws_name}_{role}` — channel-agnostic: one conversation per
-/// (user + workspace + role) regardless of the originating channel.
+/// (user + workspace + role) regardless of the originating channel. For the
+/// user's OWN personal workspace (`personal:{user}`) the duplicated user
+/// segment is dropped, producing `{user}_personal:{role}` (the role is
+/// `:`-delimited after the `personal` marker).
 /// Role is the last segment for consistent identification in logs and
 /// debugging. The role-last format is immune to underscores in user/workspace
-/// names since the role is always the final `_`-delimited segment, but note
-/// that the router no longer parses agent ID strings — the role is embedded
-/// directly in [`AgentJob`](crate::agent::message_router::AgentJob).
+/// names since the role is always the final `_`-delimited (or `:`-delimited for
+/// a personal workspace) segment, but note that the router no longer parses
+/// agent ID strings — the role is embedded directly in
+/// [`AgentJob`](crate::agent::message_router::AgentJob).
 /// This ID is stable across messages — the same ID is used for every message
 /// in the same user/role/workspace combination, accumulating conversation
 /// history within a single session.
@@ -953,6 +958,16 @@ pub fn direct_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
     // the delivery payload; the two layers are complementary (that one feeds
     // `job.user_name`, this one the ID key), not redundant.
     let user_name = normalize_user_name(user_name, "direct_agent_id");
+    // Dedup the user for the user's OWN personal workspace (`personal:{user}`)
+    // so the ID reads `{user}_personal:{role}`. Key strictly on the `personal:`
+    // prefix AND the embedded user matching the routed raw user — a project
+    // named `personal_work` or another user's personal workspace keeps the
+    // full `{user}_{ws_name}_{role}` form. The leading segment stays escaped
+    // (`safe_user_segment`), comparing the embedded user raw so reserved names
+    // like `manager` yield `user_manager_personal:{role}`.
+    if ws_name.strip_prefix("personal:") == Some(user_name) {
+        return format!("{}_personal:{role}", safe_user_segment(user_name));
+    }
     format!("{}_{}_{}", safe_user_segment(user_name), ws_name, role)
 }
 
@@ -987,7 +1002,8 @@ pub fn manager_agent_id(ws_name: &str) -> String {
 ///
 /// - **Manager** agents use workspace-scoped IDs (`manager_{ws_name}`).
 /// - **Non-Manager** agents use channel-agnostic per (user + workspace + role)
-///   IDs (`{user}_{ws_name}_{role}`).
+///   IDs (`{user}_{ws_name}_{role}`, or the deduped `{user}_personal:{role}`
+///   for the user's own personal workspace).
 ///
 /// This is a convenience wrapper around [`manager_agent_id`] and
 /// [`direct_agent_id`] that selects the right format based on
@@ -2029,6 +2045,47 @@ mod transient_prefix_tests {
         let key = resolve_agent_id("carol", "Manager", "ws");
         assert_ne!(key, "manager_ws", "capital-M 'Manager' should NOT match");
         assert_eq!(key, "carol_ws_Manager");
+    }
+
+    #[test]
+    fn direct_agent_id_personal_workspace_dedup() {
+        // A user's OWN personal workspace (`personal:{user}`) dedups the
+        // duplicated user segment, so role is `:`-delimited after the marker.
+        assert_eq!(
+            direct_agent_id("alice", "assistant", "personal:alice"),
+            "alice_personal:assistant",
+        );
+        assert_eq!(
+            direct_agent_id("alice", "artist", "personal:alice"),
+            "alice_personal:artist",
+        );
+
+        // Another user's personal workspace keeps the full form.
+        assert_eq!(
+            direct_agent_id("bob", "assistant", "personal:admin"),
+            "bob_personal:admin_assistant",
+        );
+
+        // A project named `personal_work` (no `personal:` prefix) is NOT
+        // deduped.
+        assert_eq!(
+            direct_agent_id("alice", "analyst", "personal_work"),
+            "alice_personal_work_analyst",
+        );
+
+        // A reserved-name user still gets the `user_` escape on the leading
+        // segment while the embedded user is compared raw — so the ID stays
+        // collision-safe yet deduped.
+        assert_eq!(
+            direct_agent_id("manager", "engineer", "personal:manager"),
+            "user_manager_personal:engineer",
+        );
+
+        // A user already starting with `user_` is injectively double-escaped.
+        assert_eq!(
+            direct_agent_id("user_ticket", "analyst", "personal:user_ticket"),
+            "user_user_ticket_personal:analyst",
+        );
     }
 }
 

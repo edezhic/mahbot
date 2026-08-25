@@ -688,8 +688,9 @@ pub(crate) struct ToolCallRecord {
 /// Running context for an agent turn.
 pub struct Agent {
     /// Session persistence key; also serves as the registry agent ID.
-    /// Direct-chat agents use `{user}_{ws}_{role}` as the key (stable across messages,
-    /// channel-agnostic per user+workspace+role).
+    /// Direct-chat agents use `{user}_{ws_name}_{role}` (or the deduped
+    /// `{user}_personal:{role}` for the user's own personal workspace) as the
+    /// key (stable across messages, channel-agnostic per user+workspace+role).
     /// Sub-agents and ticket handlers use a fresh NanoID per invocation.
     #[expect(clippy::struct_field_names)]
     pub(crate) agent_id: String,

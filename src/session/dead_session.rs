@@ -18,8 +18,9 @@
 //! prefix in [`crate::session::TRANSIENT_AGENT_ID_PREFIXES`] (transient or
 //! background-only agents).
 //!
-//! Only direct user-agent sessions (format `{user}_{ws}_{role}`) are eligible
-//! for recovery.
+//! Only direct user-agent sessions (format `{user}_{ws}_{role}`, or the
+//! deduped `{user}_personal:{role}` for the user's own personal workspace)
+//! are eligible for recovery.
 //!
 //! # Retry safety design
 //!
