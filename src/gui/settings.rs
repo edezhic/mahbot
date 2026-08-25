@@ -3194,7 +3194,7 @@ impl SettingsState {
                 self.config_password_field(
                     "Exa API Key",
                     PasswordTarget::ExaKey,
-                    "exa-...",
+                    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
                     self.config.exa_key.as_deref().unwrap_or_default(),
                     CONFIG_KEY_EXA_KEY,
                     None,
