@@ -139,6 +139,14 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
             column: "stage",
         }),
     },
+    Migration {
+        id: "007_jobs_paused_frozen",
+        sql: "ALTER TABLE jobs ADD COLUMN paused_frozen INTEGER NOT NULL DEFAULT 0",
+        guard: Some(MigrationGuard::ColumnExists {
+            table: "jobs",
+            column: "paused_frozen",
+        }),
+    },
 ];
 
 /// Migrations for the board store (applied in the consolidated domain
@@ -282,7 +290,9 @@ mod tests {
          status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
          workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
          channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
-         retry_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, \
+         retry_count INTEGER NOT NULL DEFAULT 0, \
+         paused_frozen INTEGER NOT NULL DEFAULT 0, \
+         created_at TEXT NOT NULL, \
          updated_at TEXT NOT NULL);\
          CREATE TABLE ticket_jobs (\
          id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL);";
@@ -360,6 +370,10 @@ mod tests {
                 .unwrap(),
             "ALTER must add message_count"
         );
+        assert!(
+            column_exists(&conn, "jobs", "paused_frozen").await.unwrap(),
+            "ALTER must add jobs.paused_frozen"
+        );
         // Backfill: counts match the historical COUNT(s.id) definition —
         // system prompts, tool frames, and tool results all count (here all
         // rows are plain 'user' messages; the definition is one row per
@@ -376,6 +390,7 @@ mod tests {
                 "004_reset_implementation_jobs",
                 "005_drop_ticket_stage_jobs_phase",
                 "006_rename_ticket_stage_jobs_to_ticket_jobs",
+                "007_jobs_paused_frozen",
                 "consolidate_002_drop_ticket_jobs_stage",
             ],
             "migrations recorded in order"
@@ -407,7 +422,7 @@ mod tests {
         run_pending_migrations(&conn, "sessions", SESSION_MIGRATIONS)
             .await
             .expect("second run is a no-op");
-        assert_eq!(applied_ids(&conn).await.len(), 7, "never re-run");
+        assert_eq!(applied_ids(&conn).await.len(), 8, "never re-run");
     }
 
     #[tokio::test]
@@ -430,6 +445,10 @@ mod tests {
                 .await
                 .unwrap(),
             "fresh DB has message_count from the SCHEMA"
+        );
+        assert!(
+            column_exists(&conn, "jobs", "paused_frozen").await.unwrap(),
+            "fresh DB has jobs.paused_frozen from the SCHEMA"
         );
 
         run_pending_migrations(&conn, "sessions", SESSION_MIGRATIONS)
@@ -456,6 +475,7 @@ mod tests {
                 "004_reset_implementation_jobs",
                 "005_drop_ticket_stage_jobs_phase",
                 "006_rename_ticket_stage_jobs_to_ticket_jobs",
+                "007_jobs_paused_frozen",
                 "consolidate_002_drop_ticket_jobs_stage",
             ],
             "migrations recorded as applied even though the SQL was skipped"

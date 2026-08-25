@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     channel        TEXT NOT NULL DEFAULT '',
     role           TEXT NOT NULL,
     retry_count    INTEGER NOT NULL DEFAULT 0,
+    paused_frozen  INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );

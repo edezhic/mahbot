@@ -310,6 +310,7 @@ impl Agent {
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let user_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let label = if let Some(ref t) = ticket {
             format!("{}: {}", role.as_str(), t.title)
         } else {
@@ -352,6 +353,7 @@ impl Agent {
             parent_key.clone(),
             parent_label.clone(),
             user_stop.clone(),
+            pause_stop.clone(),
         );
 
         Self {
@@ -363,6 +365,7 @@ impl Agent {
             tool_specs,
             cancel_token,
             user_stop,
+            pause_stop,
             ticket,
             generation,
             tool_stats: std::sync::Mutex::new(Vec::new()),
@@ -502,6 +505,13 @@ impl Agent {
     #[must_use]
     pub fn is_cancelled_by_user(&self) -> bool {
         self.user_stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Check whether a workspace-pause (strict freeze) cancellation was requested
+    /// (distinct from a user stop and an internal code-driven cancellation).
+    #[must_use]
+    pub fn is_cancelled_by_pause(&self) -> bool {
+        self.pause_stop.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Human-readable failure reason with the same global-token-first ordering
@@ -2183,6 +2193,7 @@ mod tests {
             tool_specs,
             cancel_token: CancellationToken::new(),
             user_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ticket: None,
             generation: 0,
             tool_stats: std::sync::Mutex::new(Vec::new()),

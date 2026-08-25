@@ -254,6 +254,10 @@ enum FinalizeOutcome {
     /// finishing. Nothing was written; a silent, expected skip (at most a
     /// low-level log entry).
     Moved,
+    /// The workspace is under a strict pipeline freeze — the caller bailed
+    /// without writing or transitioning. Nothing moved; the freeze is the
+    /// intended outcome (the ticket stays put for a later unpause re-drive).
+    Frozen,
     /// Genuine write failure — warning already logged, assignment cleared.
     Failed,
 }
@@ -417,14 +421,66 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<cr
     }
 }
 
+/// Whether `ticket`'s workspace is under a strict pipeline freeze: status
+/// `Ready` + `paused` (the user/operator/failure freeze, NOT the discovery
+/// analysis-pause which leaves status != `Ready`). Fail-open: an unresolvable
+/// workspace (e.g. a struct-only test workspace) is NOT frozen.
+async fn workspace_paused_frozen(ticket: &Ticket) -> bool {
+    let Some(ws) = resolve_ticket_workspace(ticket, "pause-freeze check").await else {
+        return false;
+    };
+    ws.paused && ws.status == WorkspaceStatus::Ready
+}
+
+/// Re-read the LIVE paused state of `ticket`'s workspace and, when it is
+/// genuinely frozen (see [`workspace_paused_frozen`]), freeze the
+/// implementation finalizer: no stage advance, no agent spawn. Clears the
+/// implementation's launched roster so the unpause re-dispatches from the
+/// ticket phase. Returns `true` when the caller must bail (frozen).
+async fn pipeline_pause_freeze(ticket: &Ticket, job_id: &str) -> bool {
+    if !workspace_paused_frozen(ticket).await {
+        return false;
+    }
+    info!(
+        ticket = %ticket.id,
+        "Workspace paused — freezing implementation (no stage advance)"
+    );
+    let conn = &crate::session::store().conn;
+    if let Err(e) = crate::jobs::clear_launched_agents_for_job(conn, job_id).await {
+        warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to clear launched agents on pause freeze");
+    }
+    true
+}
+
+/// Frozen-pause check for the analysis round. Identical to
+/// [`pipeline_pause_freeze`] EXCEPT it does **not** clear the launched roster —
+/// the analysis round needs its roster outcomes (and cancelled-analyst
+/// `failed` rows) to replay / re-run on unpause. Returns `true` when the caller
+/// must bail (frozen) — no advance to Planning.
+async fn analysis_pause_freeze(ticket: &Ticket, job_id: &str) -> bool {
+    if !workspace_paused_frozen(ticket).await {
+        return false;
+    }
+    info!(
+        ticket = %ticket.id,
+        job = %job_id,
+        "Workspace paused — freezing analysis round (no advance to Planning)"
+    );
+    // Persistent freeze marker: `re_drive_analysis_rounds` re-drives ONLY a
+    // round that was frozen here, so a normally-finalizing round (never frozen)
+    // can never be mistaken for one and re-driven during its own completion.
+    if let Err(e) = crate::jobs::mark_analysis_frozen(&crate::session::store().conn, job_id).await {
+        warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to mark analysis round frozen");
+    }
+    true
+}
+
 /// Wording shared by the failure-comment pause note and the Manager
-/// notification: the pause gate blocks automatic Backlog→Analysis and
-/// ReadyForDevelopment→InDevelopment claims (see [`run_claim_pipeline`]);
-/// poll stages 2-6 (InDevelopment/InDiagnostics/InReview/InQA/InSanitation)
-/// early-return on `ws.paused` and wait for the unpause.
+/// notification: the pause gate freezes ALL in-flight work — no new claims,
+/// no stage advances — until the workspace is manually resumed.
 /// Single-sourced so the two sites cannot drift.
 fn paused_workspace_sentence() -> &'static str {
-    "new analysis and development claims are blocked until the workspace is resumed"
+    "all in-flight work stops and no pipeline stage advances until the workspace is resumed"
 }
 
 /// Pause the workspace after a technical/agent failure so queued development
@@ -455,12 +511,11 @@ fn paused_workspace_sentence() -> &'static str {
 ///
 /// # Scope
 ///
-/// The pause gate blocks automatic Backlog→Analysis and
-/// ReadyForDevelopment→InDevelopment claims; poll stages 2-6
-/// (InDevelopment/InDiagnostics/InReview/InQA/InSanitation) early-return on
-/// `ws.paused` and wait for the unpause. Analyst failures never fail the
-/// ticket (analysts always advance to Planning); mixed verifier rounds (some
-/// failures + a sub-threshold verdict) bounce to development without pausing.
+/// The pause gate is a strict freeze: ALL in-flight pipeline work stops and
+/// no pipeline stage advances until the workspace is manually resumed.
+/// Analyst failures never fail the ticket (analysts always advance to
+/// Planning); mixed verifier rounds (some failures + a sub-threshold verdict)
+/// bounce to development without pausing.
 /// Analyze-tool sub-agent failures (parallel analysts under
 /// [`AnalyzeTool`](crate::tools::AnalyzeTool)) likewise never reach this helper
 /// — they are tool calls inside a caller's run, not ticket-level failures.
@@ -758,7 +813,29 @@ pub async fn run_management() {
             ResumableJob::TicketAnalysis {
                 job_id, ticket_id, ..
             } => {
-                // Analysis is not implementation-driven and is not paused-frozen.
+                // Analysis is not implementation-driven but IS paused-frozen:
+                // a paused workspace freezes the analysis round (no advance to
+                // Planning) and the poll re-drives it on unpause. Leave a paused
+                // workspace's analysis job frozen at boot (do not launch analysts);
+                // the unpause re-drive resumes it.
+                if workspace.paused {
+                    // Left frozen at boot; mark it frozen so the unpause
+                    // re-drive picks it up even if the round was crash-stranded
+                    // (marker was never set because `analysis_pause_freeze`
+                    // didn't run before the crash).
+                    if let Err(e) =
+                        crate::jobs::mark_analysis_frozen(&crate::session::store().conn, &job_id)
+                            .await
+                    {
+                        warn!(job = %job_id, error = %e, "Failed to mark paused analysis round frozen at boot");
+                    }
+                    info!(
+                        job = %job_id,
+                        ticket = %ticket_id,
+                        "Analysis round is frozen at boot (workspace paused) — leaving frozen",
+                    );
+                    continue;
+                }
                 match crate::pipeline::board::store().get_ticket(&ticket_id).await {
                     Ok(Some(ticket)) => {
                         info!(
@@ -766,6 +843,17 @@ pub async fn run_management() {
                             ticket = %ticket_id,
                             "Resuming ticket analysis job at boot",
                         );
+                        // Clear the freeze marker (atomic claim) so the poll
+                        // re-drive can't double-resume the same job in the gap
+                        // before this spawn's agents register.
+                        if let Err(e) = crate::jobs::claim_analysis_resume(
+                            &crate::session::store().conn,
+                            &job_id,
+                        )
+                        .await
+                        {
+                            warn!(job = %job_id, error = %e, "Failed to clear analysis freeze marker on boot resume");
+                        }
                         tokio::spawn(resume_analysis_job(job_id, ticket, workspace));
                     }
                     Ok(None) => {
@@ -1204,9 +1292,10 @@ async fn poll_round() {
 /// Step 0 (pending pickup) and step 1 (pipeline claims) are issued in order
 /// because claims must be ordered and the git tree is shared; step 2
 /// (implementation-iteration dispatch) lists the workspace's implementation jobs and
-/// dispatches each stage whose agent is not running. Per-ticket work runs
-/// concurrently in detached tasks. Across workspaces this function is called
-/// concurrently by [`poll_round`].
+/// dispatches each stage whose agent is not running; step 3 re-drives frozen
+/// analysis rounds on unpause. Per-ticket work runs concurrently in detached
+/// tasks. Across workspaces this function is called concurrently by
+/// [`poll_round`].
 async fn process_single_workspace(ws: Workspace) {
     // 0. Pending-workspace pickup — a pending workspace (added without a
     // provider key, or returned to pending after provider-class discovery
@@ -1220,6 +1309,19 @@ async fn process_single_workspace(ws: Workspace) {
         Some(claimed) => claimed,
         None => ws,
     };
+
+    // Re-read the LIVE pause state: the poll-round `ws` snapshot may be stale
+    // (a GUI/Telegram pause could land between `poll_round`'s read and here).
+    // A genuinely frozen workspace must not claim new work, dispatch stage
+    // agents, or re-drive in this round — the freeze already cancelled any
+    // in-flight ticket agents via `set_paused`.
+    if let Ok(Some(live)) = crate::workspace::store().get_by_name(&ws.name).await
+        && live.paused
+        && live.status == WorkspaceStatus::Ready
+    {
+        info!(workspace = %ws.name, "Workspace paused mid-poll — skipping claim/dispatch for this round");
+        return;
+    }
 
     // 1. Pipeline claims — atomic source→target transitions
     run_claim_pipeline(&ws).await;
@@ -1303,6 +1405,71 @@ async fn process_single_workspace(ws: Workspace) {
                 let _ = crate::jobs::complete_ticket_job(conn, &implementation.id).await;
             }
         }
+    }
+
+    // 3. Analysis re-drive — a frozen analysis round (paused mid-round then
+    // unpaused) is re-driven here because the poll loop otherwise only re-drives
+    // implementation jobs. Only a round marked `paused_frozen` by the freeze is
+    // re-driven (a normally-finalizing round is never marked), and the resume is
+    // claimed atomically so exactly one tick wins it.
+    if !ws.paused && ws.status == WorkspaceStatus::Ready {
+        re_drive_analysis_rounds(&ws).await;
+    }
+}
+
+/// Re-drive a workspace's Analysis-phase tickets whose `ticket_analysis` job is
+/// frozen by a workspace pause (`paused_frozen = 1`). The freeze marker is the
+/// unambiguous signal: only a round that [`analysis_pause_freeze`] actually
+/// froze is re-driven here, so a round that is merely finalizing (analysts
+/// checkpointed, joint-comment synthesis still running) — which looks
+/// identical in the registry/roster — can never be mistaken for a frozen one
+/// and re-driven during its own completion.
+///
+/// The resume is claimed atomically ([`crate::jobs::claim_analysis_resume`]):
+/// the conditional `paused_frozen = 1 → 0` UPDATE means exactly one poll tick
+/// (or the boot-resume path) wins the re-drive, closing the double-resume race
+/// between the poll loop and [`ResumableJob::TicketAnalysis`]. Cancelled
+/// analysts checkpoint 'failed' and are re-run on resume; a round that
+/// completed before the freeze replays its done outcomes and finalizes.
+async fn re_drive_analysis_rounds(ws: &Workspace) {
+    let conn = &crate::session::store().conn;
+    let Ok(jobs) = crate::jobs::list_workspace_analysis_jobs(conn, &ws.name).await else {
+        return;
+    };
+    for job in jobs {
+        let Ok(Some(ticket)) = board().get_ticket(&job.ticket_id).await else {
+            continue;
+        };
+        if ticket.phase != TicketPhase::Analysis {
+            continue;
+        }
+        // Only a round that was actually frozen by a pause is re-driven.
+        if !job.paused_frozen {
+            continue;
+        }
+        // A round that's actively running must not be re-driven (a concurrent
+        // resume won the claim and registered its agents).
+        if crate::agent::registry::AGENT_REGISTRY.has_agents_for_ticket(&job.ticket_id) {
+            continue;
+        }
+        // Atomic claim: clears the marker only if still set, so exactly one
+        // caller wins the resume (poll tick or boot-resume path).
+        let claimed = match crate::jobs::claim_analysis_resume(conn, &job.id).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(job = %job.id, error = %e, "Failed to claim analysis resume");
+                continue;
+            }
+        };
+        if !claimed {
+            continue;
+        }
+        info!(ticket = %job.ticket_id, job = %job.id, "Re-driving frozen analysis round on unpause");
+        let job_id = job.id.clone();
+        let ws_clone = ws.clone();
+        tokio::spawn(async move {
+            resume_analysis_round(&job_id, ticket, ws_clone).await;
+        });
     }
 }
 
@@ -1431,11 +1598,11 @@ async fn pickup_claim(ws: &Workspace) -> Option<(i64, bool)> {
 ///   a pending-pickup claim) must not re-enable new-work claims.
 ///
 /// Later-phase stage advances (diagnostics→review→qa→sanitation) happen
-/// inside the implementation dispatch finalizers, not via separate claims — pausing
-/// and incomplete discovery gate new analysis/development, not in-progress
-/// work.
+/// inside the implementation dispatch finalizers, not via separate claims —
+/// a paused workspace additionally freezes those finalizers (no stage
+/// advances) until the workspace is unpaused.
 fn blocks_claim(ws: &Workspace, phase: PollPhase) -> bool {
-    // A paused workspace freezes the entire occupied implementation: no claim
+    // A paused workspace freezes the entire occupied pipeline: no claim
     // advances while paused (resume re-arms the poll on unpause). The
     // discovery-readiness gate still applies only to new-work claims.
     if ws.paused {
@@ -1455,7 +1622,7 @@ fn blocks_claim(ws: &Workspace, phase: PollPhase) -> bool {
 /// [`blocks_claim`] skips the automatic pickup of new work (backlog →
 /// analysis and ready_for_development → in_development) when the workspace is
 /// paused **or** has not completed discovery (`Ready`). A paused workspace
-/// additionally freezes the entire occupied implementation: no stage advances until
+/// additionally freezes the entire occupied pipeline: no stage advances until
 /// the workspace is unpaused — pause is a real freeze, not just a new-work
 /// gate.
 ///
@@ -1791,6 +1958,21 @@ async fn handle_engineer_failure(
     resumed: bool,
 ) -> bool {
     let cancelled_by_user = agent.is_cancelled_by_user();
+
+    // A workspace-pause (strict freeze) cancellation is a FREEZE, not a failure
+    // and not a user cancel: the workspace was paused mid-run, so leave the
+    // ticket in its source phase, clear the launched roster so the unpause
+    // re-dispatches, and keep the job 'launched' (no comment, no transition, no
+    // auto-pause — the workspace is already paused).
+    if agent.is_cancelled_by_pause() {
+        info!(ticket = %ticket.id, workspace = %ws.name, "Engineer run frozen by workspace pause — implementation stays in place for unpause resume");
+        if let Err(e) =
+            crate::jobs::clear_launched_agents_for_job(&crate::session::store().conn, job_id).await
+        {
+            warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to clear launched agents on pause freeze");
+        }
+        return true;
+    }
 
     // A code-driven (internal) cancellation — re-dispatch, register
     // replacement, phase transition/supersede — is NOT a genuine user stop.
@@ -2547,6 +2729,11 @@ async fn finalize_sanitation_failure(
     raw_dump: Option<&crate::retry::RetryExhausted>,
     ws: &Workspace,
 ) {
+    // A strict workspace freeze stops ALL in-flight pipeline work: no failure
+    // record, no bounce-to-development.
+    if pipeline_pause_freeze(ticket, job_id).await {
+        return;
+    }
     record_sanitation_failure(&ticket.id, job_id, reason, raw_dump).await;
     // `record_sanitation_failure` already recorded the detailed
     // "Sanitation failed — <reason>" marker; bounce_to_development adds no
@@ -2752,6 +2939,11 @@ async fn process_sanitation_verdict(
     verdict: crate::SanitationVerdict,
     ws: &Workspace,
 ) {
+    // A strict workspace freeze stops ALL in-flight pipeline work: no pass
+    // transition, no commit-to-Done, no bounce.
+    if pipeline_pause_freeze(ticket, job_id).await {
+        return;
+    }
     if verdict.pass {
         let passed_suffix = if verdict.garbage_files.is_empty() {
             ""
@@ -2957,6 +3149,11 @@ async fn advance_to_next_stage(
     log: impl FnOnce(&Ticket),
     dispatch_next: impl FnOnce(Arc<Ticket>, Workspace) -> BoxFuture<'static, ()> + Send + 'static,
 ) {
+    // A strict workspace freeze (user/operator/failure pause) stops ALL
+    // in-flight pipeline work: no stage advance, no next-dispatch spawn.
+    if pipeline_pause_freeze(ticket, job_id).await {
+        return;
+    }
     if let Some(stage) = sync {
         sync_implementation(conn, job_id, &ticket.id, stage, None).await;
     }
@@ -2992,6 +3189,11 @@ async fn conclude_diagnostics_success(
     conn: &crate::db::Connection,
     ws: &Workspace,
 ) {
+    // A strict workspace freeze stops ALL in-flight pipeline work: no
+    // diagnostics→review transition, no reviewer dispatch.
+    if pipeline_pause_freeze(ticket, job_id).await {
+        return;
+    }
     comment_and_transition_or_bail(
         TransitionCtx::buffered(
             ticket,
@@ -3026,6 +3228,12 @@ async fn conclude_diagnostics_failure(
     comment: &str,
     ws: &Workspace,
 ) {
+    // A strict workspace freeze stops ALL in-flight pipeline work: no bounce.
+    // (Consistent with the other bounce callers — this is the only one that
+    // previously relied on [`bounce_to_development`]'s internal gate.)
+    if pipeline_pause_freeze(ticket, job_id).await {
+        return;
+    }
     bounce_to_development(
         ticket,
         TicketPhase::InDiagnostics,
@@ -4175,6 +4383,13 @@ async fn finalize_analysis_round(
     if crate::shutdown::aborting() {
         return;
     }
+    // A paused workspace freezes the analysis round: no advance to Planning. The
+    // job stays 'launched' (with its roster outcomes) so the poll re-drive below
+    // completes it on unpause. Analysis is fail-open, so on unpause the round
+    // finishes and the Manager decides — consistent with the existing semantics.
+    if analysis_pause_freeze(ticket, job_id).await {
+        return;
+    }
     process_analyst_verdicts(ws, ticket, results).await;
     if crate::shutdown::aborting() {
         return;
@@ -4351,6 +4566,11 @@ async fn bounce_to_development(
     implementation_job_id: &str,
     ws: &Workspace,
 ) -> FinalizeOutcome {
+    // A strict workspace freeze stops ALL in-flight pipeline work: no bounce,
+    // no engineer re-dispatch, no Failed trip.
+    if pipeline_pause_freeze(ticket, implementation_job_id).await {
+        return FinalizeOutcome::Frozen;
+    }
     // `trip` ⟺ `target == TicketPhase::Failed` ⟺ the bounce budget exhausted.
     let trip = bounce_exhausted(ticket.bounce_count);
     let target = if trip {
@@ -4479,6 +4699,12 @@ async fn process_verifier_verdicts(
             stage = %verifier.log_label,
             "Verifier round cut short by drain — job stays launched for boot resume",
         );
+        return false;
+    }
+
+    // A strict workspace freeze stops ALL in-flight pipeline work: no pass/fail
+    // transition, no next-stage advance, no bounce.
+    if pipeline_pause_freeze(ticket, job_id).await {
         return false;
     }
 

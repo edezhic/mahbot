@@ -679,7 +679,8 @@ impl Dashboard {
             .and_then(|name| self.workspaces.get(name))
     }
 
-    /// Whether the selected workspace's pipeline is paused (no new tickets claimed).
+    /// Whether the selected workspace's pipeline is paused (a strict freeze:
+    /// all in-flight work stops and no pipeline stage advances until resume).
     fn paused(&self) -> bool {
         self.selected_workspace_info().is_some_and(|w| w.paused)
     }

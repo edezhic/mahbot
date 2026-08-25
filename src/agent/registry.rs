@@ -144,6 +144,11 @@ struct AgentEntry {
     /// internal cancellations (re-dispatch, register replacement, phase
     /// transition/supersede) fire only [`Self::cancel_token`].
     user_stop: Arc<AtomicBool>,
+    /// Whether a workspace-pause (strict freeze) cancellation was requested for
+    /// this agent. Set by [`AgentRegistry::cancel_by_workspace_pause`] when the
+    /// agent's workspace is paused — a FREEZE distinct from a user stop and an
+    /// internal code-driven cancellation.
+    pause_stop: Arc<AtomicBool>,
     /// Live tool instrumentation for this agent (mutable across the agent's
     /// lifetime; snapshot into [`AgentHandle::current_tools`] by `list()`).
     /// Every access is already serialized by the outer
@@ -229,6 +234,7 @@ impl AgentRegistry {
         parent_key: Option<ParentKey>,
         parent_label: Option<String>,
         user_stop: Arc<AtomicBool>,
+        pause_stop: Arc<AtomicBool>,
     ) -> u64 {
         let generation = NEXT_ENTRY_GENERATION.fetch_add(1, Ordering::Relaxed);
         let handle = AgentHandle {
@@ -260,6 +266,7 @@ impl AgentRegistry {
                 handle,
                 cancel_token,
                 user_stop,
+                pause_stop,
                 current_tools: Vec::new(),
                 last_tool: None,
                 activity: None,
@@ -451,6 +458,38 @@ impl AgentRegistry {
         }
     }
 
+    /// Cancel all agents running for a `workspace_name` as a workspace-pause
+    /// (strict freeze): sets the pause-stop flag on each matched agent AND fires
+    /// its cancel token. Distinct from [`Self::cancel_by_ticket_id_user`] (a
+    /// genuine user stop) and [`Self::cancel_by_ticket_id`] (an internal
+    /// code-driven cancellation). The pause flag lets the failure classifier
+    /// treat a frozen run as a FREEZE (leave the ticket in place for unpause),
+    /// not a failure and not a user cancel. Follows the same lock-ordering
+    /// invariant as [`cancel_matching`] (set the flag under the lock, cancel
+    /// outside it).
+    ///
+    /// Scoped to TICKET-parented pipeline agents (engineer, verifiers, QA,
+    /// analysts, sanitation) — the managers, maintainers, and on-demand
+    /// analyze/research sub-agents (all `ticket_id = None`) are intentionally
+    /// left running so a pause only halts the ticket pipeline.
+    pub fn cancel_by_workspace_pause(&self, workspace_name: &str) {
+        let to_cancel: Vec<String> = {
+            let map = self.inner.lock().unwrap_poison();
+            let mut ids = Vec::new();
+            for (id, entry) in map.iter() {
+                if entry.handle.workspace_name == workspace_name && entry.handle.ticket_id.is_some()
+                {
+                    entry.pause_stop.store(true, Ordering::SeqCst);
+                    ids.push(id.clone());
+                }
+            }
+            ids
+        };
+        for agent_id in to_cancel {
+            self.cancel(&agent_id);
+        }
+    }
+
     /// Cancel all agents running for a specific role within a specific workspace path.
     /// Used when maintenance is disabled for a workspace — stops the in-flight maintainer agent.
     pub fn cancel_by_role_and_workspace_path(&self, role: &str, ws_path: &str) {
@@ -470,6 +509,19 @@ impl AgentRegistry {
     pub fn cancel_by_parent_key(&self, parent: &ParentKey) {
         let parent = parent.clone();
         self.cancel_matching(move |entry| entry.handle.parent_key.as_ref() == Some(&parent));
+    }
+
+    /// Whether any agent currently running is parented to `ticket_id`. Used to
+    /// distinguish an idle/frozen round (no running agents) from a mid-flight
+    /// one (agents registered) when the DB roster alone can't (cancelled
+    /// analysts check out as 'failed', not 'launched').
+    #[must_use]
+    pub fn has_agents_for_ticket(&self, ticket_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_poison()
+            .values()
+            .any(|e| e.handle.ticket_id.as_deref() == Some(ticket_id))
     }
 
     /// Snapshot of all currently running agents (serializable).
@@ -725,6 +777,7 @@ mod tests {
             None,
             None,
             std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -947,6 +1000,7 @@ mod tests {
             Some(ParentKey::Ticket("T-42".to_string())),
             Some("Fix login bug".to_string()),
             std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicBool::new(false)),
         );
         let handles = AGENT_REGISTRY.list();
         let h = handles
@@ -1038,6 +1092,7 @@ mod tests {
                 CancellationToken::new(),
                 Some(parent),
                 None,
+                std::sync::Arc::new(AtomicBool::new(false)),
                 std::sync::Arc::new(AtomicBool::new(false)),
             )
         };

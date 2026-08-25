@@ -503,12 +503,14 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
 pub(crate) struct TicketJobRow {
     pub id: String,
     pub ticket_id: String,
+    pub paused_frozen: bool,
 }
 
 fn ticket_job_row_from(row: &Row) -> anyhow::Result<TicketJobRow> {
     Ok(TicketJobRow {
         id: row.get(0)?,
         ticket_id: row.get(1)?,
+        paused_frozen: row.get::<bool>(2)?,
     })
 }
 
@@ -518,7 +520,7 @@ pub(crate) async fn find_implementation_job(
     ticket_id: &str,
 ) -> Result<Option<TicketJobRow>> {
     conn.query_optional(
-        "SELECT sj.id, sj.ticket_id \
+        "SELECT sj.id, sj.ticket_id, j.paused_frozen \
          FROM ticket_jobs sj \
          JOIN jobs j ON j.id = sj.id \
          WHERE sj.ticket_id = ?1 AND j.kind = 'ticket_implementation'",
@@ -536,7 +538,7 @@ pub(crate) async fn list_workspace_implementation_jobs(
 ) -> Result<Vec<TicketJobRow>> {
     let rows = conn
         .query(
-            "SELECT sj.id, sj.ticket_id \
+            "SELECT sj.id, sj.ticket_id, j.paused_frozen \
              FROM ticket_jobs sj \
              JOIN jobs j ON j.id = sj.id \
              WHERE j.kind = 'ticket_implementation' AND j.workspace_name = ?1",
@@ -544,6 +546,24 @@ pub(crate) async fn list_workspace_implementation_jobs(
         )
         .await
         .context("list workspace implementations")?;
+    rows.iter().map(ticket_job_row_from).collect()
+}
+
+/// Load every analysis job for a workspace (jobs kind='ticket_analysis').
+pub(crate) async fn list_workspace_analysis_jobs(
+    conn: &Connection,
+    ws_name: &str,
+) -> Result<Vec<TicketJobRow>> {
+    let rows = conn
+        .query(
+            "SELECT sj.id, sj.ticket_id, j.paused_frozen \
+             FROM ticket_jobs sj \
+             JOIN jobs j ON j.id = sj.id \
+             WHERE j.kind = 'ticket_analysis' AND j.workspace_name = ?1",
+            params![ws_name],
+        )
+        .await
+        .context("list workspace analysis jobs")?;
     rows.iter().map(ticket_job_row_from).collect()
 }
 
@@ -661,6 +681,37 @@ pub(crate) async fn clear_launched_agents_for_job(conn: &Connection, job_id: &st
     .await
     .context("clear launched agents for job")?;
     Ok(())
+}
+
+/// Mark a `ticket_analysis` job as frozen by a workspace pause. The freeze
+/// marker is what allows [`crate::pipeline::management::re_drive_analysis_rounds`]
+/// to tell a genuinely frozen round from a normally-finalizing one (which is
+/// never marked). Idempotent; a no-op for non-analysis kinds.
+pub(crate) async fn mark_analysis_frozen(conn: &Connection, job_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET paused_frozen = 1 WHERE id = ?1 AND kind = 'ticket_analysis'",
+        params![job_id],
+    )
+    .await
+    .context("mark analysis job frozen")?;
+    Ok(())
+}
+
+/// Atomically claim a frozen `ticket_analysis` round for resume: clears the
+/// freeze marker only while it is still set. Returns `true` when THIS caller
+/// won the claim (the round was frozen) and must re-drive it; `false` when it
+/// was already clear (resumed by another path, or never frozen). The
+/// conditional UPDATE closes the double-resume race between the poll re-drive
+/// and the boot-resume path.
+pub(crate) async fn claim_analysis_resume(conn: &Connection, job_id: &str) -> Result<bool> {
+    let n = conn
+        .execute(
+            "UPDATE jobs SET paused_frozen = 0 WHERE id = ?1 AND paused_frozen = 1",
+            params![job_id],
+        )
+        .await
+        .context("claim analysis resume")?;
+    Ok(n > 0)
 }
 
 /// Delete the jobs row (CASCADE destroys ticket_jobs/research child rows)
@@ -1329,8 +1380,10 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                 // analysis iff it is `Analysis`.
                 let rows = conn
                     .query_map_strict(
-                        "SELECT id, ticket_id \
-                         FROM ticket_jobs WHERE id = ?1",
+                        "SELECT tj.id, tj.ticket_id, j.paused_frozen \
+                         FROM ticket_jobs tj \
+                         JOIN jobs j ON j.id = tj.id \
+                         WHERE tj.id = ?1",
                         params![job.id.clone()],
                         ticket_job_row_from,
                     )
@@ -2865,5 +2918,113 @@ mod tests {
             "a ticket_implementation job with a moved ticket must complete, not resume",
         );
         assert_eq!(job_status(conn, "jb_impl_stale").await, "done");
+    }
+
+    /// The workspace-pause freeze marker round-trips through the CAS claim:
+    /// only a job marked by [`mark_analysis_frozen`] is claimable, and exactly
+    /// one caller wins the claim (`paused_frozen = 1 → 0`). This is what
+    /// lets [`crate::pipeline::management::re_drive_analysis_rounds`] tell a
+    /// genuinely frozen round (re-driven) from a normally-finalizing one
+    /// (never marked, never re-driven).
+    #[tokio::test]
+    #[serial_test::serial(reset_inflight)]
+    async fn analysis_freeze_marker_roundtrips_through_cas_claim() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let ws =
+            crate::util::test::create_test_workspace("/tmp/ws_freeze_marker", "ws_freeze_marker")
+                .await;
+        let board = crate::pipeline::board::store();
+        let ticket = crate::util::test::make_ticket(
+            board,
+            &ws,
+            "Freeze marker",
+            crate::pipeline::board::TicketPhase::Analysis,
+        )
+        .await;
+        spawn_job(
+            conn,
+            "jb_freeze_marker",
+            "task",
+            &ws.name,
+            "",
+            "",
+            crate::Role::Analyst,
+            &[],
+            &SpawnChild::TicketAnalysis {
+                ticket_id: ticket.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        async fn marker(conn: &crate::db::Connection, job_id: &str) -> bool {
+            conn.query_row(
+                "SELECT paused_frozen FROM jobs WHERE id = ?1",
+                params![job_id],
+                |r| r.get::<bool>(0),
+            )
+            .await
+            .unwrap()
+        }
+
+        // Freshly spawned: not frozen.
+        assert!(!marker(conn, "jb_freeze_marker").await);
+
+        // Mark frozen → re-drive sees it as frozen.
+        mark_analysis_frozen(conn, "jb_freeze_marker")
+            .await
+            .unwrap();
+        assert!(marker(conn, "jb_freeze_marker").await);
+
+        // First claim wins; the marker clears.
+        assert!(
+            claim_analysis_resume(conn, "jb_freeze_marker")
+                .await
+                .unwrap()
+        );
+        assert!(!marker(conn, "jb_freeze_marker").await);
+
+        // A second claim on the now-clear marker loses (already resumed).
+        assert!(
+            !claim_analysis_resume(conn, "jb_freeze_marker")
+                .await
+                .unwrap()
+        );
+
+        // An unmarked job is never claimable (never frozen).
+        mark_analysis_frozen(conn, "jb_freeze_marker")
+            .await
+            .unwrap();
+        assert!(
+            claim_analysis_resume(conn, "jb_freeze_marker")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !claim_analysis_resume(conn, "jb_freeze_marker")
+                .await
+                .unwrap()
+        );
+
+        // Non-analysis kinds are never marked (guard in the helper).
+        spawn_job(
+            conn,
+            "jb_freeze_impl",
+            "task",
+            &ws.name,
+            "",
+            "",
+            crate::Role::Engineer,
+            &[],
+            &SpawnChild::TicketImplementation {
+                ticket_id: ticket.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        mark_analysis_frozen(conn, "jb_freeze_impl").await.unwrap();
+        assert!(!marker(conn, "jb_freeze_impl").await);
+        assert!(!claim_analysis_resume(conn, "jb_freeze_impl").await.unwrap());
     }
 }

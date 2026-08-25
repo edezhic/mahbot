@@ -188,8 +188,8 @@ pub struct Workspace {
     /// `true`  — the maintainer loop processes this workspace on each cycle.
     /// `false` — the maintainer skips this workspace entirely (default).
     ///
-    /// Unlike [`Self::paused`] (which blocks automatic analysis and development
-    /// claims but allows all other pipeline phases to run normally),
+    /// Unlike [`Self::paused`] (which is a strict freeze — all in-flight work
+    /// stops and no stage advances until manual resume),
     /// `maintenance_enabled` specifically controls only the maintainer loop.
     /// A paused workspace can still be maintained if
     /// `maintenance_enabled` is `true`, and vice versa.
@@ -197,10 +197,10 @@ pub struct Workspace {
     /// Persisted in the `workspaces` table with a `DEFAULT 0` schema default.
     /// Toggled via the settings panel in the GUI.
     pub maintenance_enabled: bool,
-    /// Whether automatic claim dispatch is paused for this workspace (blocks
-    /// backlog → analysis and ready_for_development → in_development). Later
-    /// pipeline phases (review, QA, diagnostics, sanitation, maintainer) run
-    /// normally, and tickets already past analysis keep progressing.
+    /// Whether automatic claim dispatch is paused for this workspace (a strict
+    /// freeze): ALL in-flight pipeline work stops (in-flight agents are
+    /// cancelled) and NO pipeline stage advances — including the
+    /// dispatcher finalizers — until the workspace is manually resumed.
     ///
     /// Automatically set to `true` on technical/agent failures (dispatch panic,
     /// agent run failure, all verifiers failing, user cancelling an in-flight
@@ -713,6 +713,12 @@ pub struct Agent {
     /// a real user stop from an internal cancellation in the pipeline
     /// failure classifier.
     user_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether a workspace-pause (strict freeze) cancellation was requested
+    /// for this run. Set by `cancel_by_workspace_pause` when the agent's
+    /// workspace is paused mid-run — a FREEZE distinct from a genuine user
+    /// stop and an internal code-driven cancellation. Used by the pipeline
+    /// failure classifier to leave the ticket in its source phase for unpause.
+    pause_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Board ticket this agent is currently working on (set for board-dispatched agents).
     ticket: Option<crate::pipeline::board::Ticket>,
     /// Generation counter from the agent registry — used in [`Drop`] for

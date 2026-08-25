@@ -1217,6 +1217,17 @@ impl WorkspaceStore {
         self.exec_update_with_updated_at("paused = ?", vec![Value::from(val)], name)
             .await?;
         if paused {
+            // Keyed to the user/operator/failure pause — the one place that
+            // sets `paused` via this method. The discovery "analysis-pause"
+            // writes `paused` via DIRECT SQL in `add`/`claim_pending_for_discovery`/
+            // `rediscover`, NOT via `set_paused`, so it does NOT trigger this
+            // cancel and must not cancel the in-flight discovery agents.
+            //
+            // The store→registry call mirrors `set_maintainer` below (which
+            // cancels Maintainer agents): the store is the single choke point
+            // for every pause entry point (GUI, Telegram, failure), so the
+            // cancel is guaranteed rather than left to each caller.
+            crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(name);
             tracing::info!(workspace = name, "Workspace pipeline paused");
         } else {
             tracing::info!(workspace = name, "Workspace pipeline resumed");

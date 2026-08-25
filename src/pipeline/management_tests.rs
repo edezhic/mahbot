@@ -383,6 +383,55 @@ async fn advance_to_next_stage_refreshes_ticket_phase_for_next_dispatch() {
     );
 }
 
+/// A DB-backed `Ready` + `paused` workspace freezes [`advance_to_next_stage`]:
+/// no next-stage dispatch (or stage sync) may spawn.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn advance_to_next_stage_freeze_does_not_dispatch() {
+    init_management_test_stores().await;
+    let ws = setup_db_workspace("adv_freeze").await;
+    let ws_name = ws.name.clone();
+    crate::workspace::store()
+        .set_status(&ws_name, &WorkspaceStatus::Ready)
+        .await
+        .expect("set ready");
+    crate::workspace::store()
+        .set_paused(&ws_name, true)
+        .await
+        .expect("set paused");
+
+    let ticket_id = make_ticket(board(), &ws, "Advance Freeze", TicketPhase::InDiagnostics).await;
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let conn = &crate::session::store().conn;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+    advance_to_next_stage(
+        &ticket,
+        &ws,
+        "job_adv_freeze",
+        conn,
+        None,
+        |_| {},
+        move |_ticket_arc, _ws| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(()).await;
+            })
+        },
+    )
+    .await;
+
+    // A paused Ready workspace must freeze the finalizer: no next-stage
+    // dispatch may spawn. The `dispatch_next` closure is dropped (never
+    // invoked) on the frozen path, which closes the channel → `recv()` yields
+    // `None` rather than a message.
+    let received = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        matches!(received, Ok(None)),
+        "advance_to_next_stage must not dispatch the next stage on a paused Ready workspace"
+    );
+}
+
 /// A panicked round member maps to a contained NoResponse (fail-open) with
 /// the scrubbed panic message as the reason — the round continues, matching
 /// the analyze/research precedent.
@@ -649,6 +698,69 @@ fn blocks_claim_gate_matrix() {
             );
         }
     }
+}
+
+/// A DB-backed `Ready` + `paused` workspace freezes [`pipeline_pause_freeze`]
+/// (and [`analysis_pause_freeze`]); an unpaused workspace does not. The pause
+/// gate is the user/operator/failure freeze — NOT the discovery analysis-pause,
+/// which leaves status != `Ready`.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn pipeline_pause_freeze_freezes_paused_ready_workspace() {
+    init_management_test_stores().await;
+    let ws = setup_db_workspace("pause_freeze_ws").await;
+    let ws_name = ws.name.clone();
+    let ticket_id = make_ticket(board(), &ws, "Pause Freeze", TicketPhase::InDevelopment).await;
+    let ticket = expect_ticket(board(), &ticket_id).await;
+
+    // Unpaused (and not yet Ready) — not frozen.
+    assert!(
+        !pipeline_pause_freeze(&ticket, "job_pause_freeze").await,
+        "an unpaused workspace must not freeze"
+    );
+
+    // Ready + paused → frozen.
+    crate::workspace::store()
+        .set_status(&ws_name, &WorkspaceStatus::Ready)
+        .await
+        .expect("set ready");
+    crate::workspace::store()
+        .set_paused(&ws_name, true)
+        .await
+        .expect("set paused");
+    assert!(
+        pipeline_pause_freeze(&ticket, "job_pause_freeze").await,
+        "a paused Ready workspace must freeze the implementation"
+    );
+    assert!(
+        analysis_pause_freeze(&ticket, "job_pause_freeze").await,
+        "a paused Ready workspace must freeze the analysis round"
+    );
+
+    // Unpause → not frozen.
+    crate::workspace::store()
+        .set_paused(&ws_name, false)
+        .await
+        .expect("set unpaused");
+    assert!(
+        !pipeline_pause_freeze(&ticket, "job_pause_freeze").await,
+        "an unpaused workspace must not freeze after resume"
+    );
+}
+
+/// Fail-open: a paused+Ready struct-only workspace (not in the DB) must never
+/// freeze — the freeze helper re-reads the live workspace and cannot resolve it.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn pipeline_pause_freeze_fail_open_on_struct_only_workspace() {
+    init_management_test_stores().await;
+    let ws = test_ws_named("/tmp/test", "ws_struct_only");
+    let ticket_id = make_ticket(board(), &ws, "Struct Only", TicketPhase::InDevelopment).await;
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    assert!(
+        !pipeline_pause_freeze(&ticket, "job_struct_only").await,
+        "an unresolvable (struct-only) workspace must never freeze"
+    );
 }
 
 /// Regression test for the pause gate: a paused workspace must keep its
@@ -1464,6 +1576,90 @@ async fn engineer_internal_cancel_does_not_pause_or_fail() {
             .iter()
             .any(|c| c.content.contains("cancelled by user")),
         "an internal cancel must not write a 'cancelled by user' comment"
+    );
+}
+
+/// A workspace-pause (strict freeze) cancellation of the engineer is a FREEZE,
+/// not a failure and not a user cancel: `handle_engineer_failure` leaves the
+/// ticket in its source phase (no Failed transition, no bounce, no comment) and
+/// clears the launched roster so the unpause re-dispatches from the same phase.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn engineer_pause_cancel_freezes_ticket_in_source_phase() {
+    init_management_test_stores().await;
+    let ws = create_test_workspace("/tmp/eng_pause_ws", "ws_eng_pause").await;
+    let ws_name = ws.name.clone();
+    let ticket_id = make_ticket(board(), &ws, "Eng Pause", TicketPhase::InDevelopment).await;
+    let job_id = "job_eng_pause";
+    let now = crate::db::now();
+    JobRowBuilder::new(
+        &crate::session::store().conn,
+        job_id,
+        "ticket_implementation",
+        "engineer",
+        &ws.name,
+    )
+    .timestamps(now)
+    .insert()
+    .await
+    .expect("insert launched job row");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    let agent = engineer_finalize_test_agent(&ws, &ticket, "pause");
+    // A workspace-pause (strict freeze) pause writes `paused=1` in the DB and
+    // cancels every in-flight agent of the workspace via `set_paused`.
+    crate::workspace::store()
+        .set_paused(&ws_name, true)
+        .await
+        .expect("pause workspace");
+    assert!(
+        agent.is_cancelled_by_pause(),
+        "precondition: the pause cancel flag must be set on the agent"
+    );
+
+    let ok = handle_engineer_failure(&ticket, &agent, job_id, &ws, false).await;
+    assert!(
+        ok,
+        "a pause-cancel must report a clean (non-drain) handling"
+    );
+
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::InDevelopment,
+        "a workspace-pause cancel must leave the ticket in its source phase (no Failed, no bounce)"
+    );
+    assert_eq!(t.bounce_count, 0, "a pause freezes the bounces");
+    let ws_after = crate::workspace::store()
+        .get_by_name(&ws_name)
+        .await
+        .expect("query workspace")
+        .expect("workspace exists");
+    assert!(
+        ws_after.paused,
+        "a workspace-pause cancel must preserve the existing pause"
+    );
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    assert!(
+        comments.is_empty(),
+        "a workspace-pause cancel must not write a failure comment"
+    );
+    let status: Option<String> = crate::session::store()
+        .conn
+        .query_optional(
+            "SELECT status FROM jobs WHERE id = ?1",
+            crate::db::params![job_id],
+            |row| row.get::<String>(0),
+        )
+        .await
+        .expect("query job status");
+    assert_eq!(
+        status.as_deref(),
+        Some("launched"),
+        "a workspace-pause cancel must keep the job 'launched' for unpause resume"
     );
 }
 
