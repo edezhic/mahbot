@@ -46,6 +46,7 @@ use crate::git::commands::{
 };
 use crate::jobs::ResumableJob;
 use crate::pipeline::board::{BOARD, BoardStore, PipelineCheck, Ticket, TicketPhase};
+use crate::pipeline::dispatch_latch::{LATCH, LatchGuard};
 use crate::pipeline::ticket_buffer;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::session::manager_agent_id;
@@ -1007,6 +1008,38 @@ fn dispatch_for_phase(phase: TicketPhase) -> Option<DispatchAction> {
 /// [`FutureExt::catch_unwind`](futures_util::FutureExt::catch_unwind) to catch
 /// panics.  On panic the ticket transitions to [`TicketPhase::Failed`] with
 /// notification so the manager can investigate.
+/// Phases whose stage dispatches participate in the per-ticket dispatch latch
+/// (engineer, verifier/review/QA, sanitation). Analysis and Diagnostics are
+/// excluded: Analysis has its own atomic claims
+/// ([`BoardStore::claim_ticket_in_workspace`], [`crate::jobs::claim_analysis_resume`]),
+/// and Diagnostics has [`BoardStore::claim_diagnostics`], so they must not be
+/// double-gated by the latch.
+fn is_latch_scoped_phase(phase: TicketPhase) -> bool {
+    matches!(
+        phase,
+        TicketPhase::InDevelopment
+            | TicketPhase::InReview
+            | TicketPhase::InQa
+            | TicketPhase::InSanitation
+    )
+}
+
+/// Claim the per-ticket dispatch latch and cancel any stale same-ticket agents.
+///
+/// Returns `None` when a stage dispatch is already in flight for the ticket —
+/// the caller must bail *before* doing any work (no cancel, no registration, no
+/// roster write) so a redundant poll/handoff/resume attempt can never cancel a
+/// healthy in-phase agent or double-dispatch the stage. The returned guard is
+/// held for the whole dispatch and releases the latch on drop (and on explicit
+/// [`LatchGuard::release`] at a stage handoff).
+fn claim_stage_dispatch(ticket_id: &str) -> Option<LatchGuard<'static>> {
+    let guard = LATCH.try_claim(ticket_id)?;
+    // Cancel stale agents only after a successful claim: a dispatch that failed
+    // to claim (because a healthy agent is in flight) must not cancel it.
+    crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
+    Some(guard)
+}
+
 fn spawn_dispatch(phase: TicketPhase, ticket: Ticket, ws: Workspace) {
     // Resolve the dispatcher through the single authoritative phase→dispatch
     // map. Callers only pass dispatchable phases (the claim pipeline and the
@@ -1031,10 +1064,6 @@ fn spawn_dispatch(phase: TicketPhase, ticket: Ticket, ws: Workspace) {
         action.log_label,
     );
 
-    // Cancel any stale agents for this ticket before dispatching new ones.
-    // This is a uniform pre-flight step that applies to all dispatch paths.
-    crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
-
     // Wrap in Arc so the panic-recovery clone is a cheap refcount bump
     // instead of a deep copy of the entire comments Vec.
     let ticket = Arc::new(ticket);
@@ -1047,6 +1076,16 @@ fn spawn_dispatch(phase: TicketPhase, ticket: Ticket, ws: Workspace) {
         // a separate concern (race-condition guard) and is preserved there.
         if !is_ticket_in_phase(&ticket.id, expected_phase).await {
             return;
+        }
+        // Cancel stale agents for the non-latch phases (Analysis/Diagnostics)
+        // AFTER the phase re-check: these phases rely on their own atomic claims
+        // (`claim_ticket_in_workspace`/`claim_diagnostics`) and are not
+        // latch-scoped, so the cancel here must run only once the dispatch is
+        // confirmed to be in-phase. The latch-scoped stages cancel inside
+        // `claim_stage_dispatch` (after claiming) instead, so a redundant
+        // dispatch never cancels a healthy in-phase agent.
+        if !is_latch_scoped_phase(expected_phase) {
+            crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
         }
 
         // Correctness: AssertUnwindSafe is sound because:
@@ -1894,6 +1933,7 @@ async fn finalize_engineer_stage(
     job_id: &str,
     ws: &Workspace,
     resumed: bool,
+    latch_guard: Option<LatchGuard<'static>>,
 ) {
     if guard_stage(
         &ticket.id,
@@ -1932,7 +1972,8 @@ async fn finalize_engineer_stage(
         let conn = &crate::session::store().conn;
         // The implementation dispatches the next stage in the same finalizer: the
         // diagnostics runner. `claim_diagnostics` (CAS) inside the dispatch
-        // prevents a concurrent poll re-dispatch.
+        // prevents a concurrent poll re-dispatch. Release the latch so the next
+        // stage's dispatch can claim it.
         advance_to_next_stage(
             ticket,
             ws,
@@ -1941,6 +1982,7 @@ async fn finalize_engineer_stage(
             true,
             |_| {},
             |ticket_arc, ws| dispatch_diagnostics(ticket_arc, ws).boxed(),
+            latch_guard,
         )
         .await;
         return;
@@ -2256,6 +2298,14 @@ fn dispatch_engineer(
     resumed: bool,
 ) -> futures_util::future::BoxFuture<'static, ()> {
     Box::pin(async move {
+        // Claim the per-ticket dispatch latch before any await: only one stage
+        // dispatch per ticket may be in flight. A redundant dispatch bails here
+        // before cancelling a healthy agent or registering a roster row.
+        let Some(latch_guard) = claim_stage_dispatch(&ticket.id) else {
+            debug!(ticket = %ticket.id, "Engineer dispatch already in flight — skipping duplicate");
+            return;
+        };
+
         let message = engineer_work_message(&ticket);
 
         // The implementation job is the single owner of the workspace's running slot
@@ -2276,6 +2326,7 @@ fn dispatch_engineer(
             &message,
             resumed,
             StageRunKind::Engineer,
+            Some(latch_guard),
         )
         .await;
     })
@@ -2324,6 +2375,7 @@ async fn run_stage_agent(
     task: &str,
     resumed: bool,
     kind: StageRunKind,
+    latch_guard: Option<LatchGuard<'static>>,
 ) {
     if let StageRunKind::Engineer = kind
         && let Err(e) = crate::jobs::upsert_engineer_session_pin(
@@ -2390,11 +2442,28 @@ async fn run_stage_agent(
 
     match kind {
         StageRunKind::Engineer => {
-            finalize_engineer_stage(ticket, &agent, response.as_deref(), job_id, ws, resumed).await;
+            finalize_engineer_stage(
+                ticket,
+                &agent,
+                response.as_deref(),
+                job_id,
+                ws,
+                resumed,
+                latch_guard,
+            )
+            .await;
         }
         StageRunKind::Sanitation => {
-            finalize_sanitation_stage(ticket, &agent, response.as_deref(), job_id, resumed, ws)
-                .await;
+            finalize_sanitation_stage(
+                ticket,
+                &agent,
+                response.as_deref(),
+                job_id,
+                resumed,
+                ws,
+                latch_guard,
+            )
+            .await;
         }
     }
 }
@@ -2751,6 +2820,7 @@ async fn finalize_sanitation_failure(
     reason: String,
     raw_dump: Option<&crate::retry::RetryExhausted>,
     ws: &Workspace,
+    latch_guard: Option<LatchGuard<'static>>,
 ) {
     // A strict workspace freeze stops ALL in-flight pipeline work: no failure
     // record, no bounce-to-development.
@@ -2771,6 +2841,7 @@ async fn finalize_sanitation_failure(
         "",
         job_id,
         ws,
+        latch_guard,
     )
     .await;
 }
@@ -2788,6 +2859,7 @@ async fn finalize_sanitation_stage(
     job_id: &str,
     resumed: bool,
     ws: &Workspace,
+    latch_guard: Option<LatchGuard<'static>>,
 ) {
     if guard_stage(
         &ticket.id,
@@ -2816,6 +2888,7 @@ async fn finalize_sanitation_stage(
             format!("agent returned no output{resumed_suffix}"),
             None,
             ws,
+            latch_guard,
         )
         .await;
         return;
@@ -2827,7 +2900,7 @@ async fn finalize_sanitation_stage(
         .await
     {
         Ok(verdict) => {
-            process_sanitation_verdict(ticket, job_id, verdict, ws).await;
+            process_sanitation_verdict(ticket, job_id, verdict, ws, latch_guard).await;
         }
         Err(failure) => {
             warn!(
@@ -2841,6 +2914,7 @@ async fn finalize_sanitation_stage(
                 format!("verdict extraction error{resumed_suffix}: {failure}"),
                 Some(&failure),
                 ws,
+                latch_guard,
             )
             .await;
         }
@@ -2857,6 +2931,16 @@ async fn finalize_sanitation_stage(
 /// After the agent completes, extracts a structured [`SanitationVerdict`] and
 /// delegates to [`process_sanitation_verdict`] for pass/fail processing.
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, resumed: bool) {
+    // Claim the per-ticket dispatch latch before any await: exactly one
+    // sanitation dispatch per ticket. The guard is held for the whole dispatch
+    // (including the no-agent skip path) so a redundant poll re-dispatch — which
+    // would otherwise re-write the skip comment or race the Done transition —
+    // bails before writing anything.
+    let Some(latch_guard) = claim_stage_dispatch(&ticket.id) else {
+        debug!(ticket = %ticket.id, "Sanitation dispatch already in flight — skipping duplicate");
+        return;
+    };
+
     // Fail-open listing: a listing error is passed to the agent (we cannot
     // prove there are no files); an empty list skips the agent and commits to
     // Done.
@@ -2867,13 +2951,26 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, resumed: bool) 
             let Some(job_id) = find_implementation_or_bail(&ticket).await else {
                 return;
             };
-            let comment =
-                "🧹 No new or untracked files — skipping sanitation agent, committing to Done.";
-            if let Err(e) = board()
-                .add_comment(&ticket.id, Role::Sanitation.as_str(), comment)
+            // Idempotency guard: a commit failure (or transient git-status
+            // error) can re-run this skip path on the next poll; only record the
+            // skip comment once so the ticket never accumulates duplicates.
+            let already_skipped = board()
+                .has_comment_containing(
+                    &ticket.id,
+                    Role::Sanitation.as_str(),
+                    "skipping sanitation agent",
+                )
                 .await
-            {
-                warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation skip comment");
+                .unwrap_or(false);
+            if !already_skipped {
+                let comment =
+                    "🧹 No new or untracked files — skipping sanitation agent, committing to Done.";
+                if let Err(e) = board()
+                    .add_comment(&ticket.id, Role::Sanitation.as_str(), comment)
+                    .await
+                {
+                    warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation skip comment");
+                }
             }
             clear_implementation_roster(&crate::session::store().conn, &job_id, &ticket.id).await;
             let Some(porcelain) = ensure_git_or_done_and_get_status(
@@ -2929,6 +3026,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, resumed: bool) 
         &prompt,
         resumed,
         StageRunKind::Sanitation,
+        Some(latch_guard),
     )
     .await;
 }
@@ -2948,6 +3046,7 @@ async fn process_sanitation_verdict(
     job_id: &str,
     verdict: crate::SanitationVerdict,
     ws: &Workspace,
+    latch_guard: Option<LatchGuard<'static>>,
 ) {
     // A strict workspace freeze stops ALL in-flight pipeline work: no pass
     // transition, no commit-to-Done, no bounce.
@@ -3008,6 +3107,7 @@ async fn process_sanitation_verdict(
             &comment,
             job_id,
             ws,
+            latch_guard,
         )
         .await;
     }
@@ -3139,6 +3239,7 @@ async fn clear_implementation_roster(conn: &crate::db::Connection, job_id: &str,
 /// `dispatch_next` builds the correct next-dispatch future:
 /// `dispatch_diagnostics`, `dispatch_verifiers(.., QA_VI, ..)`,
 /// `dispatch_sanitation`, or `dispatch_engineer`.
+#[expect(clippy::too_many_arguments)]
 async fn advance_to_next_stage(
     ticket: &Ticket,
     ws: &Workspace,
@@ -3147,9 +3248,12 @@ async fn advance_to_next_stage(
     clear_roster: bool,
     log: impl FnOnce(&Ticket),
     dispatch_next: impl FnOnce(Arc<Ticket>, Workspace) -> BoxFuture<'static, ()> + Send + 'static,
+    latch: Option<LatchGuard<'static>>,
 ) {
     // A strict workspace freeze (user/operator/failure pause) stops ALL
     // in-flight pipeline work: no stage advance, no next-dispatch spawn.
+    // `latch` is dropped (released) on this early return so a freeze never
+    // strands the ticket.
     if pipeline_pause_freeze(ticket, job_id).await {
         return;
     }
@@ -3171,6 +3275,13 @@ async fn advance_to_next_stage(
         .unwrap_or_else(|| ticket.clone());
     let ticket_arc = Arc::new(fresh);
     let ws = ws.clone();
+    // Release the latch so the next stage's dispatch can claim it — the stage
+    // handoff transfers ownership rather than leaving the next dispatch to bail
+    // on a held claim (which would strand the ticket between the roster-clear
+    // and the next roster write).
+    if let Some(guard) = latch {
+        guard.release();
+    }
     tokio::spawn(Box::pin(async move {
         dispatch_next(ticket_arc, ws).await;
     }));
@@ -3206,7 +3317,8 @@ async fn conclude_diagnostics_success(
     )
     .await;
     // The implementation dispatches the next stage in the same finalizer: the
-    // reviewers.
+    // reviewers. Diagnostics does not participate in the dispatch latch (it has
+    // its own `claim_diagnostics` CAS), so no latch is handed off.
     advance_to_next_stage(
         ticket,
         ws,
@@ -3215,6 +3327,7 @@ async fn conclude_diagnostics_success(
         true,
         |_| {},
         |ticket_arc, ws| dispatch_verifiers(ticket_arc, ws, REVIEWER_VI, false),
+        None,
     )
     .await;
 }
@@ -3242,6 +3355,7 @@ async fn conclude_diagnostics_failure(
         comment,
         job_id,
         ws,
+        None,
     )
     .await;
 }
@@ -4896,9 +5010,11 @@ async fn bounce_to_development(
     failure_comment: &str,
     implementation_job_id: &str,
     ws: &Workspace,
+    latch: Option<LatchGuard<'static>>,
 ) -> FinalizeOutcome {
     // A strict workspace freeze stops ALL in-flight pipeline work: no bounce,
-    // no engineer re-dispatch, no Failed trip.
+    // no engineer re-dispatch, no Failed trip. `latch` is dropped (released) on
+    // this early return.
     if pipeline_pause_freeze(ticket, implementation_job_id).await {
         return FinalizeOutcome::Frozen;
     }
@@ -4975,6 +5091,7 @@ async fn bounce_to_development(
                     );
                 },
                 |ticket_arc, ws| dispatch_engineer(ticket_arc, ws, false),
+                latch,
             )
             .await;
         }
@@ -5012,6 +5129,7 @@ async fn process_verifier_verdicts(
     results: &[ParallelVerdict],
     verifier: VerifierInfo,
     job_id: &str,
+    latch_guard: Option<LatchGuard<'static>>,
 ) -> bool {
     // Gate against the actually-dispatched count (N_gate): a no-response or
     // parse failure counts as a failed agent, so a partial round bounces.
@@ -5098,6 +5216,7 @@ async fn process_verifier_verdicts(
                     dispatch_sanitation(ticket_arc, ws, false).boxed()
                 }
             },
+            latch_guard,
         )
         .await;
         return true;
@@ -5117,6 +5236,7 @@ async fn process_verifier_verdicts(
         &joint_comment,
         job_id,
         ws,
+        latch_guard,
     )
     .await;
     matches!(outcome, FinalizeOutcome::Applied)
@@ -5348,6 +5468,7 @@ async fn record_reviewed_base_after_review(
 /// The drain guard inside [`process_verifier_verdicts`] already logged the
 /// cut-short (the outer re-log is the pre-existing double-log, kept as-is);
 /// the job stays status='launched' for boot resume.
+#[expect(clippy::too_many_arguments)]
 async fn finalize_verifier_round(
     ws: &Workspace,
     ticket: &Ticket,
@@ -5356,8 +5477,10 @@ async fn finalize_verifier_round(
     job_id: &str,
     resumed: bool,
     git_available: bool,
+    latch_guard: Option<LatchGuard<'static>>,
 ) {
-    let transitioned = process_verifier_verdicts(ws, ticket, results, vi, job_id).await;
+    let transitioned =
+        process_verifier_verdicts(ws, ticket, results, vi, job_id, latch_guard).await;
     if !transitioned && crate::shutdown::aborting() {
         let cut_short = if resumed {
             "Resumed verifier round cut short by drain — job stays launched for boot resume"
@@ -5414,6 +5537,14 @@ async fn dispatch_verifiers_impl(
     vi: VerifierInfo,
     resumed: bool,
 ) {
+    // Claim the per-ticket dispatch latch before any await: exactly one verifier
+    // round (review or QA) per ticket. A redundant poll re-dispatch bails here
+    // before cancelling the healthy round's agents or registering roster rows.
+    let Some(latch_guard) = claim_stage_dispatch(&ticket.id) else {
+        debug!(ticket = %ticket.id, "Verifier dispatch already in flight — skipping duplicate");
+        return;
+    };
+
     let (is_reviewer, repo_path, git_available) = verifier_git_state(&ws, vi).await;
 
     if git_available {
@@ -5447,6 +5578,7 @@ async fn dispatch_verifiers_impl(
                         true,
                         |_| {},
                         |ticket_arc, ws| dispatch_verifiers(ticket_arc, ws, QA_VI, false),
+                        Some(latch_guard),
                     )
                     .await;
                 }
@@ -5547,7 +5679,17 @@ async fn dispatch_verifiers_impl(
         return;
     }
 
-    finalize_verifier_round(&ws, &ticket, vi, &results, &job_id, resumed, git_available).await;
+    finalize_verifier_round(
+        &ws,
+        &ticket,
+        vi,
+        &results,
+        &job_id,
+        resumed,
+        git_available,
+        Some(latch_guard),
+    )
+    .await;
 }
 
 #[cfg(test)]

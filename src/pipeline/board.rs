@@ -1670,6 +1670,28 @@ impl BoardStore {
         Ok(comments)
     }
 
+    /// True when the ticket already has a comment with `role` whose `content`
+    /// contains `needle`. Used as an idempotency guard for best-effort comments
+    /// written on a retryable path (e.g. the sanitation empty-file skip comment,
+    /// which can re-run after a transient git-commit failure).
+    pub async fn has_comment_containing(
+        &self,
+        ticket_id: &str,
+        role: &str,
+        needle: &str,
+    ) -> Result<bool> {
+        let exists = self
+            .conn
+            .query_optional(
+                "SELECT 1 FROM ticket_comments WHERE ticket_id = ?1 AND role = ?2 AND content LIKE ?3 LIMIT 1",
+                db::params![ticket_id, role, format!("%{needle}%")],
+                |_| Ok::<_, anyhow::Error>(1_i64),
+            )
+            .await?
+            .is_some();
+        Ok(exists)
+    }
+
     /// Validate prerequisites for a new ticket being created.
     ///
     /// Checks that every prerequisite ticket exists and belongs to the same

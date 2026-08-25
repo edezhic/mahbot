@@ -237,6 +237,7 @@ async fn verifier_finalization_on_moved_ticket_is_clean_skip() {
         &[pass_result(), fail_result(), pass_result()],
         REVIEWER_VI,
         "test_job",
+        None,
     )
     .await;
     assert!(!transitioned, "guard miss must not report a transition");
@@ -369,6 +370,7 @@ async fn advance_to_next_stage_refreshes_ticket_phase_for_next_dispatch() {
                 let _ = tx.send(ticket_arc.phase).await;
             })
         },
+        None,
     )
     .await;
 
@@ -419,6 +421,7 @@ async fn advance_to_next_stage_freeze_does_not_dispatch() {
                 let _ = tx.send(()).await;
             })
         },
+        None,
     )
     .await;
 
@@ -599,6 +602,7 @@ async fn eleventh_bounce_fails_ticket() {
         &[pass_result(), fail_result(), pass_result()],
         REVIEWER_VI,
         "test_job",
+        None,
     )
     .await;
     assert!(
@@ -1226,7 +1230,7 @@ async fn process_sanitation_verdict_cases() {
         .await
         .expect("create implementation job");
         let ticket = expect_ticket(board(), &id).await;
-        process_sanitation_verdict(&ticket, &job_id, case.verdict.clone(), &ws).await;
+        process_sanitation_verdict(&ticket, &job_id, case.verdict.clone(), &ws, None).await;
 
         let phase = expect_ticket_phase(board(), &id).await;
         assert_eq!(
@@ -1673,7 +1677,7 @@ async fn engineer_cancel_fails_ticket_without_bounce() {
     // A genuine user stop sets both the user-stop flag and the cancel token.
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id_user(&ticket_id);
 
-    finalize_engineer_stage(&ticket, &agent, None, "job_eng_cancel", &ws, false).await;
+    finalize_engineer_stage(&ticket, &agent, None, "job_eng_cancel", &ws, false, None).await;
 
     let t = expect_ticket(board(), &ticket_id).await;
     assert_eq!(
@@ -1729,7 +1733,7 @@ async fn engineer_internal_cancel_does_not_pause_or_fail() {
     // the user-stop flag — see AgentRegistry::cancel_by_ticket_id.
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
 
-    finalize_engineer_stage(&ticket, &agent, None, "job_eng_internal", &ws, false).await;
+    finalize_engineer_stage(&ticket, &agent, None, "job_eng_internal", &ws, false, None).await;
 
     let t = expect_ticket(board(), &ticket_id).await;
     assert_eq!(
@@ -1886,7 +1890,7 @@ async fn engineer_hard_failure_pauses_workspace_and_freezes_implementation() {
     let mut agent = engineer_finalize_test_agent(&ws, &ticket, "hard");
     agent.failure = Some("boom".to_string());
 
-    finalize_engineer_stage(&ticket, &agent, None, job_id, &ws, false).await;
+    finalize_engineer_stage(&ticket, &agent, None, job_id, &ws, false, None).await;
 
     let t = expect_ticket(board(), &ticket_id).await;
     assert_eq!(
@@ -2113,6 +2117,7 @@ async fn bounce_to_development_feeds_feedback_to_redispatch() {
         "failed: type error",
         job_id,
         &ws,
+        None,
     )
     .await;
     assert!(matches!(outcome, FinalizeOutcome::Applied));
@@ -2174,7 +2179,7 @@ async fn engineer_failure_during_drain_stays_queued_for_boot_resume() {
     agent.failure = Some("drained boom".to_string());
 
     crate::shutdown::drain_begin();
-    finalize_engineer_stage(&ticket, &agent, None, job_id, &ws, false).await;
+    finalize_engineer_stage(&ticket, &agent, None, job_id, &ws, false, None).await;
     // Clear the process-global drain flag BEFORE the assertions so a failing
     // assert cannot poison the serialized group.
     crate::shutdown::drain_clear();
@@ -2747,4 +2752,266 @@ fn validate_blocker_verification_coverage_and_sharpened() {
         ],
     };
     assert!(validate_blocker_verification(&empty_reasoning, &blockers).is_err());
+}
+
+// ── Dispatch-in-flight latch ─────────────────────────────────────────
+
+/// A redundant dispatch attempt must fail the per-ticket latch claim BEFORE it
+/// can cancel a healthy in-phase agent (the cancel-after-phase-check ordering):
+/// while a stage dispatch holds the latch, `claim_stage_dispatch` returns `None`
+/// without touching the agent registry.
+///
+/// Serialized with the reset_analysis_tickets tests (shared global board +
+/// process-global agent registry).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn redundant_dispatch_does_not_cancel_healthy_agent_when_latch_held() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tokio_util::sync::CancellationToken;
+
+    init_management_test_stores().await;
+    let ws = test_ws_named("/tmp/test", "latch_cancel_ordering");
+    let ticket_id = make_ticket(board(), &ws, "Latch Cancel Ordering", TicketPhase::InQa).await;
+
+    // A healthy in-phase agent is running: its owning dispatch holds the latch.
+    let token = CancellationToken::new();
+    let agent_id = format!("ticket_{ticket_id}_qa");
+    crate::agent::registry::AGENT_REGISTRY.register(
+        agent_id.clone(),
+        Role::Qa.as_str().to_string(),
+        Some(ticket_id.clone()),
+        &ws,
+        "healthy".into(),
+        token.clone(),
+        None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    // Hold the latch as the in-flight dispatch would, then attempt a redundant
+    // dispatch: it must fail the claim AND not cancel the healthy agent.
+    let held = LATCH
+        .try_claim(&ticket_id)
+        .expect("hold the dispatch latch");
+    let redundant = claim_stage_dispatch(&ticket_id);
+    assert!(
+        redundant.is_none(),
+        "a redundant dispatch must not claim a held latch"
+    );
+    assert!(
+        !token.is_cancelled(),
+        "a redundant dispatch must never cancel a healthy in-phase agent"
+    );
+
+    // Once the in-flight dispatch releases the latch, a genuine re-dispatch may
+    // claim it (and, being the superseding run, cancels the stale agent).
+    drop(held);
+    assert!(
+        claim_stage_dispatch(&ticket_id).is_some(),
+        "a released latch must be reclaimable"
+    );
+}
+
+/// The sanitation empty-file skip path emits ONE skip comment and, when a dirty
+/// tree is committed, records `commit_hash` + "Committed as" atomically with the
+/// Done transition — even though it writes no roster row (the no-agent fast
+/// path). Also proves the dispatch latch does not leak after the Done finalize.
+///
+/// Serialized with the reset_analysis_tickets tests (shared global board).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn sanitation_skip_path_emits_one_comment_and_attributes_commit() {
+    if !crate::git::commands::git_is_installed().await {
+        eprintln!("git not installed — skipping git-dependent test");
+        return;
+    }
+
+    let (_dir, repo_path) = crate::util::test::init_temp_repo();
+    let repo_str = repo_path.to_str().expect("temp path is valid UTF-8");
+
+    let (ws, ticket_id) = setup_ticket(
+        repo_str,
+        "sanit_skip_commit",
+        "Sanitize Skip Commit",
+        TicketPhase::InSanitation,
+    )
+    .await;
+
+    // Create a real implementation job so dispatch_sanitation's
+    // find_implementation_or_bail resolves and the Done path terminalizes it.
+    let job_id = "job_san_skip_commit";
+    crate::jobs::spawn_job(
+        &crate::session::store().conn,
+        job_id,
+        "task",
+        &ws.name,
+        "",
+        "",
+        Role::Engineer,
+        &[],
+        &crate::jobs::SpawnChild::TicketImplementation {
+            ticket_id: ticket_id.clone(),
+        },
+    )
+    .await
+    .expect("create implementation job");
+
+    // Make the tree dirty with a MODIFIED tracked file (not new/untracked), so
+    // the skip path fires (list_new_or_untracked_files returns empty) and the
+    // dirty tree is committed and attributed.
+    std::fs::write(
+        repo_path.join("test.txt"),
+        b"line1\nline2\nline3\nmodified\n",
+    )
+    .expect("modify tracked file");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    dispatch_sanitation(Arc::new(ticket), ws, false).await;
+
+    // The skip path records exactly ONE sanitation skip comment.
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get_comments");
+    let skip_count = comments
+        .iter()
+        .filter(|c| {
+            c.role == Role::Sanitation.as_str() && c.content.contains("skipping sanitation agent")
+        })
+        .count();
+    assert_eq!(
+        skip_count, 1,
+        "the empty-file skip path must emit exactly one skip comment"
+    );
+
+    // The committed ticket is Done, records commit_hash + "Committed as".
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::Done,
+        "skip path must transition to Done"
+    );
+    assert!(
+        t.commit_hash.is_some(),
+        "a committed ticket must record its commit_hash"
+    );
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.role == SYSTEM_ROLE && c.content.starts_with("Committed as")),
+        "the commit must be attributed with a 'Committed as' comment"
+    );
+
+    // Leak-proof: the dispatch latch is released after the Done finalize.
+    assert!(
+        LATCH.try_claim(&ticket_id).is_some(),
+        "the dispatch latch must not leak after a finalized sanitation skip"
+    );
+}
+
+/// The sanitation empty-file skip path is idempotent: when the skip comment was
+/// already recorded by a prior attempt (e.g. a transient git-commit failure left
+/// the ticket in InSanitation and the latch was drop-released), a re-dispatch
+/// must not duplicate the comment or lose the commit attribution.
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+async fn sanitation_skip_path_does_not_duplicate_comment_when_already_recorded() {
+    if !crate::git::commands::git_is_installed().await {
+        eprintln!("git not installed — skipping git-dependent test");
+        return;
+    }
+
+    let (_dir, repo_path) = crate::util::test::init_temp_repo();
+    let repo_str = repo_path.to_str().expect("temp path is valid UTF-8");
+
+    let (ws, ticket_id) = setup_ticket(
+        repo_str,
+        "sanit_skip_dedup",
+        "Sanitize Skip Dedup",
+        TicketPhase::InSanitation,
+    )
+    .await;
+
+    // Create a real implementation job so dispatch_sanitation's
+    // find_implementation_or_bail resolves and the Done path terminalizes it.
+    let job_id = "job_san_skip_dedup";
+    crate::jobs::spawn_job(
+        &crate::session::store().conn,
+        job_id,
+        "task",
+        &ws.name,
+        "",
+        "",
+        Role::Engineer,
+        &[],
+        &crate::jobs::SpawnChild::TicketImplementation {
+            ticket_id: ticket_id.clone(),
+        },
+    )
+    .await
+    .expect("create implementation job");
+
+    // Simulate the state after a prior skip run whose commit failed: the skip
+    // comment is already recorded, the ticket is still InSanitation. This is the
+    // retry that must not emit a second comment.
+    board()
+        .add_comment(
+            &ticket_id,
+            Role::Sanitation.as_str(),
+            "🧹 No new or untracked files — skipping sanitation agent, committing to Done.",
+        )
+        .await
+        .expect("pre-write skip comment");
+
+    // Make a MODIFIED tracked file (not new/untracked) so the skip path fires.
+    std::fs::write(
+        repo_path.join("test.txt"),
+        b"line1\nline2\nline3\nmodified\n",
+    )
+    .expect("modify tracked file");
+
+    let ticket = expect_ticket(board(), &ticket_id).await;
+    dispatch_sanitation(Arc::new(ticket), ws, false).await;
+
+    // Exactly ONE skip comment — the idempotency guard prevented a second write.
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get_comments");
+    let skip_count = comments
+        .iter()
+        .filter(|c| {
+            c.role == Role::Sanitation.as_str() && c.content.contains("skipping sanitation agent")
+        })
+        .count();
+    assert_eq!(
+        skip_count, 1,
+        "the skip comment must not be duplicated on a retry"
+    );
+
+    // The committed ticket is Done, records commit_hash + "Committed as".
+    let t = expect_ticket(board(), &ticket_id).await;
+    assert_eq!(
+        t.phase,
+        TicketPhase::Done,
+        "skip path must transition to Done"
+    );
+    assert!(
+        t.commit_hash.is_some(),
+        "a committed ticket must record its commit_hash"
+    );
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.role == SYSTEM_ROLE && c.content.starts_with("Committed as")),
+        "the commit must be attributed with a 'Committed as' comment"
+    );
+
+    // Leak-proof: the dispatch latch is released after the Done finalize.
+    assert!(
+        LATCH.try_claim(&ticket_id).is_some(),
+        "the dispatch latch must not leak after a finalized sanitation skip"
+    );
 }
