@@ -95,6 +95,16 @@ CREATE TABLE IF NOT EXISTS ticket_counters (
 -- tokenizer-migrate the index; its DDL must match this one — keep in sync.
 CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
 USING fts (title) WITH (tokenizer = 'ngram');
+-- The `idx_tickets_board_active` composite index serves the board query in
+-- [`BoardStore::list_all_tickets`]: `WHERE is_archived = 0 ORDER BY
+-- priority ASC, created_at DESC`. It is deliberately NON-partial (full table)
+-- because Turso has known partial-index maintenance/integrity issues, and the
+-- `? IS NULL OR col = ?` optional workspace/phase predicates are not
+-- indexable, so `is_archived` is the only sargable leading column. Both
+-- `priority` and `created_at` are set at insert and never updated, so the
+-- write cost is negligible.
+CREATE INDEX IF NOT EXISTS idx_tickets_board_active ON tickets \
+(is_archived, priority ASC, created_at DESC);
 ";
 
 const TICKETS_FTS_INDEX_NAME: &str = "idx_tickets_title_fts";
