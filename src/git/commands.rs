@@ -5,7 +5,7 @@
 
 use anyhow::Context;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use crate::tools::shell::apply_safe_env;
@@ -138,6 +138,39 @@ pub async fn run_git_show(
     run_git_command(repo_path, &["show", &show_arg]).await.ok()
 }
 
+/// Resolve the repository top-level directory (the `.git`-containing ancestor).
+///
+/// `repo_path` may be the repo root or a subdirectory of it. Walks upward to
+/// the first ancestor that contains a `.git` entry — a directory for normal
+/// repos, or a *file* for linked worktrees/submodules, hence [`is_git_repo`]
+/// (which uses `exists()`, not `is_dir()`).
+///
+/// Deliberately does NOT use `git rev-parse --show-toplevel`: repo discovery
+/// itself runs the dubious-ownership check this exists to satisfy, so it would
+/// recurse into the same failure (circular). Canonicalizes the resolved path
+/// where possible so the value matches git's own realpath-normalized discovery.
+fn resolve_git_top_level(repo_path: &Path) -> Option<PathBuf> {
+    let dir = repo_path.ancestors().find(|dir| is_git_repo(dir))?;
+    Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+}
+
+/// Inject the repo top-level into git's per-process config as `safe.directory`.
+///
+/// Uses the process-scoped `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/
+/// `GIT_CONFIG_VALUE_0` env form — never writes the user's global gitconfig and
+/// never uses `*` (which would fully opt out of the CVE ownership guard). The
+/// value is scoped to the single resolved repo top-level. On git < 2.38 the env
+/// form is silently ignored by git, which is acceptable for the supported
+/// target as long as the repo is owned by the running user.
+fn inject_safe_directory(cmd: &mut tokio::process::Command, repo_path: &Path) {
+    let Some(top_level) = resolve_git_top_level(repo_path) else {
+        return;
+    };
+    cmd.env("GIT_CONFIG_COUNT", "1");
+    cmd.env("GIT_CONFIG_KEY_0", "safe.directory");
+    cmd.env("GIT_CONFIG_VALUE_0", top_level.as_path());
+}
+
 /// Create a [`tokio::process::Command`] for `git` with a sanitized environment.
 ///
 /// The subprocess environment is cleared and re-populated with only safe
@@ -146,12 +179,21 @@ pub async fn run_git_show(
 /// across all git invocations. This is the only entry point for production git
 /// subprocess creation in this module — all callers must use this helper.
 ///
+/// `repo_root` is the workspace/`current_dir` path for repo-bound invocations;
+/// when present, the resolved repo top-level is injected as `safe.directory`
+/// (see [`inject_safe_directory`]) so git works on repos owned by a different
+/// UID. Pass `None` for repo-agnostic invocations (e.g. [`git_is_installed`]),
+/// which must not receive a repo-path value.
+///
 /// Callers should add further configuration (args, current_dir, stdio, etc.)
 /// and then spawn or execute the command.
-fn git_command() -> tokio::process::Command {
+fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("git");
     apply_safe_env(&mut cmd);
     cmd.env("LC_ALL", "C");
+    if let Some(path) = repo_root {
+        inject_safe_directory(&mut cmd, path);
+    }
     cmd
 }
 
@@ -174,7 +216,7 @@ pub(crate) async fn run_git_output(
     repo_path: &Path,
     args: &[&str],
 ) -> anyhow::Result<std::process::Output> {
-    let mut cmd = git_command();
+    let mut cmd = git_command(Some(repo_path));
     cmd.args(args).current_dir(repo_path);
     cmd.output()
         .await
@@ -215,7 +257,7 @@ async fn run_git_with_stdin(
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
-    let mut cmd = git_command();
+    let mut cmd = git_command(Some(repo_path));
     cmd.args(args)
         .current_dir(repo_path)
         .stdin(Stdio::piped())
@@ -500,7 +542,7 @@ async fn parse_numstat(repo_path: &Path, range: &[&str]) -> anyhow::Result<(i64,
 
 /// Check if git is installed.
 pub async fn git_is_installed() -> bool {
-    let mut cmd = git_command();
+    let mut cmd = git_command(None);
     cmd.arg("--version");
     cmd.output().await.is_ok_and(|o| o.status.success())
 }
@@ -775,6 +817,108 @@ mod tests {
             };
             assert_eq!(info.short_hash(), *expected, "{name}");
         }
+    }
+
+    // ── safe.directory resolver (CVE-2022-24765 ancestor walk) ───
+
+    #[test]
+    fn resolve_git_top_level_repo_root() {
+        let (_dir, repo_path) = init_temp_repo();
+        let expected = std::fs::canonicalize(&repo_path).expect("canonicalize repo");
+        assert_eq!(resolve_git_top_level(&repo_path), Some(expected));
+    }
+
+    #[test]
+    fn resolve_git_top_level_from_subdir() {
+        let (_dir, repo_path) = init_temp_repo();
+        let subdir = repo_path.join("src");
+        std::fs::create_dir(&subdir).expect("create subdir");
+        let expected = std::fs::canonicalize(&repo_path).expect("canonicalize repo");
+        assert_eq!(resolve_git_top_level(&subdir), Some(expected));
+    }
+
+    #[test]
+    fn resolve_git_top_level_non_repo_is_none() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        assert_eq!(
+            resolve_git_top_level(dir.path()),
+            None,
+            "non-repo dir must resolve to None"
+        );
+    }
+
+    #[test]
+    fn resolve_git_top_level_accepts_git_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        // A `.git` *file* (linked worktree / submodule marker) is sufficient —
+        // the walk uses `exists()`, not `is_dir()`.
+        std::fs::write(dir.path().join(".git"), b"gitdir: /elsewhere").expect("write .git file");
+        let expected = std::fs::canonicalize(dir.path()).expect("canonicalize dir");
+        assert_eq!(resolve_git_top_level(dir.path()), Some(expected));
+    }
+
+    // ── Safe.directory injection (dubious-ownership fix) ──────────
+
+    /// Build a git command with a hermetic config environment: `safe.directory`
+    /// must come only from the injected `GIT_CONFIG_*` env, never from the
+    /// developer's global/system gitconfig (which may already list the repo or
+    /// use `*`). `GIT_TEST_ASSUME_DIFFERENT_OWNER=1` simulates a repo owned by a
+    /// different UID without requiring `chown`/root.
+    fn hermetic_git_command(repo_root: Option<&Path>) -> tokio::process::Command {
+        let mut cmd = git_command(repo_root);
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+        cmd.env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1");
+        cmd
+    }
+
+    /// Simulates a repo owned by a different UID via git's
+    /// `GIT_TEST_ASSUME_DIFFERENT_OWNER` hook: the injected top-level
+    /// `safe.directory` must make git operable.
+    #[tokio::test]
+    async fn test_safe_directory_injection_bypasses_dubious_ownership() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        let mut cmd = hermetic_git_command(Some(&repo_path));
+        cmd.arg("status").arg("--porcelain").current_dir(&repo_path);
+        let out = cmd.output().await.expect("run git status");
+        assert!(
+            out.status.success(),
+            "git status must succeed with safe.directory injected: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_without_safe_directory_fails_dubious_ownership() {
+        let (_dir, repo_path) = init_temp_repo();
+
+        let mut cmd = hermetic_git_command(None);
+        cmd.arg("status").arg("--porcelain").current_dir(&repo_path);
+        let out = cmd.output().await.expect("run git status");
+        assert!(
+            !out.status.success(),
+            "git must refuse dubious ownership without safe.directory injection"
+        );
+    }
+
+    /// The injected value must be the repo *top-level* even when the invocation
+    /// runs from a subdirectory workspace — git's own discovery normalizes to
+    /// the top-level, so a subdir value would not match.
+    #[tokio::test]
+    async fn test_safe_directory_injects_top_level_for_subdir_workspace() {
+        let (_dir, repo_path) = init_temp_repo();
+        let subdir = repo_path.join("src");
+        std::fs::create_dir(&subdir).expect("create subdir");
+
+        let mut cmd = hermetic_git_command(Some(&subdir));
+        cmd.arg("status").arg("--porcelain").current_dir(&subdir);
+        let out = cmd.output().await.expect("run git status");
+        assert!(
+            out.status.success(),
+            "git from a repo subdir must match the repo top-level safe.directory: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     // ── Integration tests for run_git_* functions ────────────────

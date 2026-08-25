@@ -2236,6 +2236,10 @@ fn is_path_under_temp(path: &std::path::Path, ctx: &CheckContext) -> bool {
 /// GIT_TRACE*, GIT_ASKPASS — all invisible to the subcommand allowlist.
 /// Also fires on non-git commands (`GIT_DIR=/tmp ls`): fail-closed trade-off
 /// closing transitive git invocation (make inheriting GIT_*).
+///
+/// This rejects *user-supplied* shell assignments. MahBot's git module sets
+/// `GIT_CONFIG_*` internally on the spawned `Command` (not via the shell), so
+/// the two layers don't conflict.
 fn check_git_env_binding(word: &str) -> Result<(), String> {
     let w = scan::strip_quoted_word(word);
     if let Some((name, _)) = w.split_once('=')
