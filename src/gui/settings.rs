@@ -2619,7 +2619,7 @@ impl SettingsState {
                     .on_toggle(SettingsMessage::CustomEndpointToggle)
                     .into(),
                 Some(
-                    "Route chat requests to a self-hosted OpenAI-compatible server (e.g. Ollama, LM Studio, vLLM)",
+                    "custom chat-completions server (e.g. llama.cpp or vLLM)",
                 ),
             ),
         ];
@@ -2632,9 +2632,7 @@ impl SettingsState {
                 "https://openrouter.ai/api/v1",
                 self.config.provider_endpoint.as_deref().unwrap_or_default(),
                 CONFIG_KEY_PROVIDER_ENDPOINT,
-                Some(
-                    "Reasoning effort is auto-translated per model family (e.g. Ollama max/high, MiMo thinking field, MiniMax none); unknown models fall back to max/high. An unreachable endpoint still saves (with a warning)",
-                ),
+                None,
             );
             if let Some(w) = self.endpoint_warning.as_ref() {
                 endpoint_row = column![endpoint_row, inline_warning(w, 188.0)]
@@ -2654,7 +2652,7 @@ impl SettingsState {
                         .as_deref()
                         .unwrap_or_default(),
                     CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
-                    Some("Only sent to the custom endpoint — never to OpenRouter"),
+                    None,
                     false,
                 ),
             );
@@ -2686,7 +2684,7 @@ impl SettingsState {
                 .as_deref()
                 .unwrap_or_default(),
             CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
-            Some("Video transcription only"),
+            None,
         );
         section(
             "Models",
@@ -2751,7 +2749,7 @@ impl SettingsState {
             ]
             .align_y(Alignment::Center)
             .into(),
-            Some("Local Qwen3-ASR (offline) — audio never leaves the machine"),
+            Some("using local CPU-optimized Qwen3-ASR"),
         );
 
         // ── Row 2: Wake Word Detection (toggle gated on Transcription + live status) ──
@@ -3213,7 +3211,7 @@ impl SettingsState {
                         .as_deref()
                         .unwrap_or_default(),
                     CONFIG_KEY_TELEGRAM_BOT_TOKEN,
-                    Some("Applied automatically"),
+                    None,
                     false,
                 ),
             ],
