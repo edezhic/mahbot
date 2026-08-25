@@ -2023,10 +2023,13 @@ async fn user_command_entries_reflect_role_and_admin() {
         .unwrap();
 
     // alice: admin (full permissions), pool = all roles → role commands,
-    // Artist commands, and state-aware admin commands.
+    // Artist commands, and state-aware admin commands. In the (LocalCheckout)
+    // test environment the shared availability cache seeds `available = true`,
+    // so `/update` is present for the admin.
     let alice = user_command_entries("alice").await;
     let cmds: Vec<&str> = alice.iter().map(|(c, _)| c.as_str()).collect();
     assert!(cmds.contains(&"board"));
+    assert!(cmds.contains(&"update"));
     // State-aware pairs reflect the workspace state: not paused →
     // /pause, maintenance disabled → /maintenance_on.
     assert!(cmds.contains(&"pause"));
@@ -2040,12 +2043,13 @@ async fn user_command_entries_reflect_role_and_admin() {
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
     assert_eq!(cmds[0], "manager");
-    // Menu order: role commands first, then board/admin, then model
-    // commands, with /clear last.
+    // Menu order: role commands first, then board/admin (+ /update), then
+    // workspace-state pairs, then model commands, with /clear last.
     assert_eq!(cmds.last(), Some(&"clear"));
     let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
     assert!(pos("manager") < pos("board"));
-    assert!(pos("board") < pos("image_models"));
+    assert!(pos("board") < pos("update"));
+    assert!(pos("update") < pos("image_models"));
     assert!(pos("image_models") < pos("clear"));
 
     // The active role's entry is marked. add_user seeds the selection to the
@@ -2099,10 +2103,22 @@ async fn user_command_entries_reflect_role_and_admin() {
     assert!(flipped_cmds.contains(&"maintenance_off"));
     assert!(!flipped_cmds.contains(&"maintenance_on"));
 
-    // bob: restricted user — pool commands but no admin commands.
+    // Registry-hidden branch: no available update → `/update` is absent even
+    // for the admin (the cache is a process-local single source of truth). The
+    // RAII guard restores the LocalCheckout default on drop.
+    {
+        let _guard = crate::self_update::set_update_cache_for_test(false, false);
+        let hidden = user_command_entries("alice").await;
+        let hidden_cmds: Vec<&str> = hidden.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(!hidden_cmds.contains(&"update"));
+    }
+
+    // bob: restricted user — pool commands but no admin commands (and no
+    // `/update`, even though an update is available).
     let bob = user_command_entries("bob").await;
     let cmds: Vec<&str> = bob.iter().map(|(c, _)| c.as_str()).collect();
     assert!(!cmds.contains(&"board"));
+    assert!(!cmds.contains(&"update"));
     assert!(!cmds.contains(&"pause"));
     assert!(!cmds.contains(&"unpause"));
     assert!(cmds.contains(&"engineer"));

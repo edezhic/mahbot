@@ -38,7 +38,8 @@
 //! spawn target during validation produces empty stderr (SIGKILL by `syspolicyd`).
 //! See `should_delete_build_artifact()` and `execute_update()` steps 13–14.
 
-use crate::util::is_executable;
+use crate::ChannelMessage;
+use crate::util::{UnwrapPoison, is_executable};
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use directories::UserDirs;
@@ -46,6 +47,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -250,7 +252,7 @@ async fn reacquire_instance_lock() -> Result<()> {
 /// binary whose build source is unreachable); update checks crates.io and runs
 /// `cargo install <crate> --force`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateMode {
+pub(crate) enum UpdateMode {
     /// Built from a local source checkout (`.git` present, or a plain source
     /// tree with `Cargo.toml` at the compile-time manifest dir).
     LocalCheckout,
@@ -308,28 +310,127 @@ fn classify_update_mode(manifest_dir: &Path) -> UpdateMode {
 
 /// Determine how the running binary was installed — see [`UpdateMode`].
 #[must_use]
-pub fn update_mode() -> UpdateMode {
+pub(crate) fn update_mode() -> UpdateMode {
     classify_update_mode(Path::new(env!("CARGO_MANIFEST_DIR")))
 }
 
-/// Whether a self-update is available on this installation, independent of
-/// whether a newer version exists.
+// ── Shared update availability cache ──────────────────────────────────────
+
+/// A point-in-time snapshot of the shared self-update availability cache.
 ///
-/// - Local checkout: the build checkout (with `Cargo.toml`) is reachable.
-/// - Registry: non-Windows (the platform can run the update). Note this does
-///   NOT verify that `cargo` is on PATH — that prerequisite is checked
-///   inside [`execute_registry_update`], which reports a proper error if it
-///   is missing. Registry self-update is not offered on Windows (a running
-///   `.exe` cannot be replaced), matching the local-checkout behavior of
-///   hiding the button.
+/// Passed by value to pure predicates like [`should_show_update`] so the
+/// registry-hidden and restricted-user branches are deterministically
+/// testable without a network call or a real newer version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UpdateAvailability {
+    /// Whether an update is available (mode-aware: local checkout always;
+    /// registry only when a strictly newer stable version is published).
+    pub(crate) available: bool,
+    /// Whether an update is currently in flight (build/install running, and
+    /// the finalizing window inclusive).
+    pub(crate) in_progress: bool,
+}
+
+/// Process-local, single-source-of-truth cache of self-update availability
+/// and progress. Both the GUI (button visibility, tooltip, finalize guards)
+/// and the Telegram command menu (`/update` visibility + dispatch gate) read
+/// this; a single periodic background task is the sole writer of the
+/// availability fields, so the two surfaces cannot diverge. Reset implicitly
+/// on boot — a fresh process has no stale `available` state from a previous
+/// run, so an already-installed update is never advertised across a restart.
+struct UpdateCache {
+    /// Whether an update is available. Local checkout: statically true (the
+    /// build checkout is reachable). Registry: derived from the periodic
+    /// crates.io check, boot-seeded false until the first refresh tick.
+    available: AtomicBool,
+    /// The discovered latest published stable version (registry mode) — drives
+    /// the GUI "Update MahBot to vX" tooltip. `None` in local-checkout mode,
+    /// and in registry mode when up to date / not yet checked.
+    latest: std::sync::Mutex<Option<semver::Version>>,
+    /// Whether an update is currently in flight. Set at [`execute_update`]
+    /// entry, cleared on failure; a successful update exits the process.
+    in_progress: AtomicBool,
+}
+
+static UPDATE_CACHE: OnceLock<UpdateCache> = OnceLock::new();
+
+fn update_cache() -> &'static UpdateCache {
+    UPDATE_CACHE.get_or_init(|| UpdateCache {
+        // Boot-seed mode-aware: local checkout is always available without a
+        // network call; registry starts unknown until the first refresh tick.
+        available: AtomicBool::new(update_mode() == UpdateMode::LocalCheckout),
+        latest: std::sync::Mutex::new(None),
+        in_progress: AtomicBool::new(false),
+    })
+}
+
+/// Snapshot of the shared update-availability cache.
 #[must_use]
-pub fn is_update_available() -> bool {
-    match update_mode() {
-        UpdateMode::LocalCheckout => Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("Cargo.toml")
-            .is_file(),
-        UpdateMode::Registry => !cfg!(windows),
+pub(crate) fn update_availability() -> UpdateAvailability {
+    let cache = update_cache();
+    UpdateAvailability {
+        available: cache.available.load(Ordering::SeqCst),
+        in_progress: cache.in_progress.load(Ordering::SeqCst),
     }
+}
+
+/// The latest published stable version discovered by the periodic registry
+/// check (registry mode). `None` in local-checkout mode, and in registry mode
+/// when up to date or no newer version exists yet.
+#[must_use]
+pub(crate) fn update_latest() -> Option<semver::Version> {
+    update_cache().latest.lock().unwrap_poison().clone()
+}
+
+/// Whether an update is currently in flight (build/install running, and the
+/// finalizing window inclusive).
+#[must_use]
+pub(crate) fn update_in_progress() -> bool {
+    update_availability().in_progress
+}
+
+/// Pure visibility predicate for the `/update` command (and the GUI button):
+/// shown only to full-permission (admin) users when an update is available.
+/// The menu reflects the shared cached availability — it does NOT issue a
+/// network request per refresh.
+#[must_use]
+pub(crate) fn should_show_update(availability: UpdateAvailability, is_admin: bool) -> bool {
+    is_admin && availability.available
+}
+
+/// RAII guard returned by [`set_update_cache_for_test`] that restores the
+/// cache to its prior state on drop, so a panicking test cannot leak a
+/// mutated `available`/`in_progress` into later tests.
+#[cfg(test)]
+pub(crate) struct UpdateCacheTestGuard {
+    previous: UpdateAvailability,
+}
+
+#[cfg(test)]
+impl Drop for UpdateCacheTestGuard {
+    fn drop(&mut self) {
+        let cache = update_cache();
+        cache
+            .available
+            .store(self.previous.available, Ordering::SeqCst);
+        cache
+            .in_progress
+            .store(self.previous.in_progress, Ordering::SeqCst);
+    }
+}
+
+/// Set the shared update-availability cache for a test's duration and return a
+/// guard that restores the prior state on drop.
+#[cfg(test)]
+pub(crate) fn set_update_cache_for_test(
+    available: bool,
+    in_progress: bool,
+) -> UpdateCacheTestGuard {
+    let previous = update_availability();
+    let cache = update_cache();
+    cache.available.store(available, Ordering::SeqCst);
+    cache.in_progress.store(in_progress, Ordering::SeqCst);
+    UpdateCacheTestGuard { previous }
 }
 
 // ── crates.io registry check (registry mode) ─────────────────────────────
@@ -447,11 +548,10 @@ async fn fetch_latest_stable_version() -> Result<Option<semver::Version>> {
 /// never a user-visible error for a failed check).
 ///
 /// Windows: always `Ok(None)` — the running `.exe` cannot be replaced, so the
-/// registry update is not offered there. The GUI never calls this on Windows
-/// (the subscription is wired only for non-Windows), but the guard is kept as
-/// public-API safety so a stray caller cannot discover an update that cannot
-/// be installed.
-pub async fn check_registry_update() -> Result<Option<semver::Version>> {
+/// registry update is not offered there. The background refresh task skips the
+/// check on Windows entirely, but the guard is kept as a safety net so a stray
+/// caller cannot discover an update that cannot be installed.
+pub(crate) async fn check_registry_update() -> Result<Option<semver::Version>> {
     if cfg!(windows) {
         return Ok(None);
     }
@@ -461,6 +561,70 @@ pub async fn check_registry_update() -> Result<Option<semver::Version>> {
     let current = semver::Version::parse(VERSION)
         .with_context(|| format!("embedded version {VERSION} is not valid semver"))?;
     Ok((latest > current).then_some(latest))
+}
+
+// ── Update availability refresh ──────────────────────────────────────────
+
+/// Refresh the shared update-availability cache once.
+///
+/// Local-checkout mode seeds `available = true` (idempotent, no network).
+/// Registry mode performs the crates.io check, preserving the last-known
+/// availability on a transient check failure so a network blip never hides a
+/// previously discovered update. While an update is in flight the check is
+/// skipped entirely (not just the write) — a long cargo install would
+/// otherwise waste a request per tick, and the InProgress status must never be
+/// clobbered. The `in_progress` flag is re-checked after the network await so
+/// an update that starts while the check is in flight cannot be clobbered by
+/// its result.
+async fn refresh_update_cache() {
+    let cache = update_cache();
+    match update_mode() {
+        UpdateMode::LocalCheckout => {
+            cache.available.store(true, Ordering::SeqCst);
+        }
+        UpdateMode::Registry => {
+            if cache.in_progress.load(Ordering::SeqCst) {
+                return;
+            }
+            let result = check_registry_update().await;
+            // Re-check after the await: an update may have started while this
+            // network request was in flight, and the write must not clobber
+            // the in-progress state (which would hide the "Updating…" UI and
+            // the `/update` command mid-update).
+            if cache.in_progress.load(Ordering::SeqCst) {
+                return;
+            }
+            match result {
+                Ok(Some(latest)) => {
+                    *cache.latest.lock().unwrap_poison() = Some(latest);
+                    cache.available.store(true, Ordering::SeqCst);
+                }
+                Ok(None) => {
+                    *cache.latest.lock().unwrap_poison() = None;
+                    cache.available.store(false, Ordering::SeqCst);
+                }
+                Err(_) => {
+                    // Transient failure — preserve last-known availability.
+                }
+            }
+        }
+    }
+}
+
+/// Periodic refresh of the shared update-availability cache.
+///
+/// Spawned from the binary's background task set (cancellable via the global
+/// shutdown token). Ticks immediately so a fresh registry install isn't hidden
+/// until the first 10-minute interval elapses, then every 10 minutes. Runs on
+/// all platforms/modes to keep the contract uniform — local-checkout mode is a
+/// no-op network-wise but keeps `available` seeded.
+pub async fn run_update_availability_refresh() {
+    loop {
+        refresh_update_cache().await;
+        if !crate::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)).await {
+            return;
+        }
+    }
 }
 
 // ── Update mutex ──────────────────────────────────────────────────────────
@@ -477,13 +641,13 @@ static UPDATE_MUTEX: Mutex<()> = Mutex::const_new(());
 /// the GUI exit path waits ([`update_is_finalizing`]) instead of exiting, so a
 /// window close or SIGINT cannot abort the update's checkpoint on the iced
 /// runtime and leave the daemon down without a replacement.
-static UPDATE_FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UPDATE_FINALIZING: AtomicBool = AtomicBool::new(false);
 
 /// True while [`execute_update`] is in its finalizing window (daemon shut
 /// down; checkpoint, lock release, spawn, and `exit(0)` pending).
 #[must_use]
 pub fn update_is_finalizing() -> bool {
-    UPDATE_FINALIZING.load(std::sync::atomic::Ordering::SeqCst)
+    UPDATE_FINALIZING.load(Ordering::SeqCst)
 }
 
 /// Verify `cargo` is on PATH, returning an error with a mode-appropriate
@@ -529,16 +693,31 @@ async fn resolve_update_admin_target() -> Option<String> {
 /// - [`UpdateMode::Registry`]: `cargo install <crate> --force` from crates.io,
 ///   notify admin, restart.
 ///
-/// Called from the GUI update button.
+/// Called from the GUI update button and the Telegram `/update` command.
 /// Only one update runs at a time — concurrent calls return an error immediately.
 ///
 /// On success, this function never returns (`std::process::exit(0)`).
 /// On failure, returns an error.
 pub(crate) async fn execute_update() -> Result<()> {
-    match update_mode() {
+    // Concurrent guard — only one update at a time. A second trigger while an
+    // update is in progress gets an immediate error.
+    let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
+        anyhow::bail!("An update is already in progress. Please wait for it to complete.");
+    };
+    // Mark the shared in-progress state so both the GUI and the Telegram
+    // `/update` gate report the update, and the GUI's window-close/finalize
+    // guards key off it (a Telegram-initiated update must also protect the
+    // finalize/checkpoint window). Cleared on failure; a successful update
+    // exits the process.
+    update_cache().in_progress.store(true, Ordering::SeqCst);
+    let result = match update_mode() {
         UpdateMode::LocalCheckout => execute_local_update().await,
         UpdateMode::Registry => execute_registry_update().await,
+    };
+    if result.is_err() {
+        update_cache().in_progress.store(false, Ordering::SeqCst);
     }
+    result
 }
 
 /// Local-checkout self-update: rebuild from the source checkout, swap the
@@ -546,11 +725,6 @@ pub(crate) async fn execute_update() -> Result<()> {
 ///
 /// See [`execute_update`] for the concurrent-guard and exit contracts.
 async fn execute_local_update() -> Result<()> {
-    // Concurrent guard — only one update at a time.
-    let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
-        anyhow::bail!("An update is already in progress. Please wait for it to complete.");
-    };
-
     // 1. Validate prerequisites.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo_toml = manifest_dir.join("Cargo.toml");
@@ -597,7 +771,6 @@ async fn execute_local_update() -> Result<()> {
         std::time::Duration::from_mins(30),
         "cargo build --release",
         "Build",
-        admin_target.as_deref(),
     )
     .await?;
 
@@ -632,7 +805,7 @@ async fn execute_local_update() -> Result<()> {
     // 10–15. Shared finalize tail: graceful drain, checkpoint, lock release,
     // spawn, build-artifact cleanup, exit. The artifact cleanup runs only after
     // a successful spawn (Gatekeeper safety), then the process exits.
-    finalize_update_and_restart(&spawn_path, admin_target.as_deref(), || {
+    finalize_update_and_restart(&spawn_path, || {
         // 14. Clean up the build output binary after successful spawn.
         //     Note: never delete:
         //     - The spawn target (prevents macOS Gatekeeper race — see step 13).
@@ -668,11 +841,6 @@ async fn execute_local_update() -> Result<()> {
 ///
 /// See [`execute_update`] for the concurrent-guard and exit contracts.
 async fn execute_registry_update() -> Result<()> {
-    // Concurrent guard — only one update at a time.
-    let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
-        anyhow::bail!("An update is already in progress. Please wait for it to complete.");
-    };
-
     // Registry self-update is not offered on Windows (the running .exe cannot
     // be replaced). The GUI never shows the button there, but guard the entry
     // point as well so a stray call cannot half-update.
@@ -709,7 +877,6 @@ async fn execute_registry_update() -> Result<()> {
         Duration::from_hours(1),
         &format!("cargo install {crate_name} --force"),
         "Update",
-        admin_target.as_deref(),
     )
     .await?;
 
@@ -731,7 +898,7 @@ async fn execute_registry_update() -> Result<()> {
 
     // 7–12. Shared finalize tail: graceful drain, checkpoint, lock release,
     // spawn, exit. No build artifact to clean up in registry mode.
-    finalize_update_and_restart(&spawn_path, admin_target.as_deref(), || {}).await
+    finalize_update_and_restart(&spawn_path, || {}).await
 }
 
 /// Shared finalize tail for both update modes: graceful drain, final
@@ -765,13 +932,9 @@ async fn execute_registry_update() -> Result<()> {
 ///
 /// `after_spawn` must not fail the update (best-effort cleanup) — a panic here
 /// would still exit the process, so it must be infallible in practice.
-async fn finalize_update_and_restart(
-    spawn_path: &Path,
-    admin_target: Option<&str>,
-    after_spawn: impl FnOnce(),
-) -> Result<()> {
+async fn finalize_update_and_restart(spawn_path: &Path, after_spawn: impl FnOnce()) -> Result<()> {
     // 10. Begin the graceful drain (local numbering; shared across modes).
-    UPDATE_FINALIZING.store(true, std::sync::atomic::Ordering::SeqCst);
+    UPDATE_FINALIZING.store(true, Ordering::SeqCst);
     crate::shutdown::drain_begin();
     while !crate::shutdown::shutdown_token().is_cancelled() {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -786,12 +949,12 @@ async fn finalize_update_and_restart(
     release_instance_lock().await;
 
     // 13. Spawn the new instance from the determined spawn path.
-    if let Err(e) = spawn_new_instance_from(spawn_path, admin_target).await {
+    if let Err(e) = spawn_new_instance_from(spawn_path) {
         // Spawn failed — the process stays alive (unless a genuine window
         // close was requested during the finalizing window, in which case the
         // GUI honors it with its own checkpoint + exit via UpdateResult).
         // Clear the finalizing flag and re-acquire the lock.
-        UPDATE_FINALIZING.store(false, std::sync::atomic::Ordering::SeqCst);
+        UPDATE_FINALIZING.store(false, Ordering::SeqCst);
         // Re-acquire the lock since the process stays alive.
         if let Err(lock_err) = reacquire_instance_lock().await {
             error!(%lock_err, "Failed to re-acquire instance lock after spawn failure");
@@ -808,23 +971,24 @@ async fn finalize_update_and_restart(
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Run a long-running cargo subcommand with a timeout, notifying the admin
-/// on failure. Shared by the local-build and registry-install update paths
-/// (the only differences are the arguments, working directory, timeout, and
-/// user-facing labels).
+/// Run a long-running cargo subcommand with a timeout. Shared by the
+/// local-build and registry-install update paths (the only differences are the
+/// arguments, working directory, timeout, and user-facing labels).
 ///
 /// `args` are the cargo arguments (excluding the `cargo` binary itself),
 /// `cwd` the working directory, `timeout` the hard deadline, `label` a
 /// short human-readable description used in logs and error messages (e.g.
 /// "cargo build --release"), and `failure_kind` the noun used in failure
 /// messages ("Build" / "Update").
+///
+/// On failure the error is returned (no admin notification — the caller owns
+/// failure reporting via the single [`handle_update_command`]/GUI path).
 async fn run_cargo_with_timeout(
     args: &[&str],
     cwd: &Path,
     timeout: Duration,
     label: &str,
     failure_kind: &str,
-    admin_target: Option<&str>,
 ) -> Result<()> {
     info!("Starting {label} in {}", cwd.display());
     let cargo_result = tokio::time::timeout(
@@ -847,26 +1011,20 @@ async fn run_cargo_with_timeout(
 
     match cargo_result {
         Err(_elapsed) => {
-            let msg = format!(
-                "❌ {failure_kind} failed: {label} timed out after {} minutes",
+            anyhow::bail!(
+                "{failure_kind} failed: {label} timed out after {} minutes",
                 timeout.as_secs() / 60
             );
-            notify_admin(&msg, admin_target).await;
-            anyhow::bail!(msg);
         }
         Ok(Err(e)) => {
-            let msg = format!("❌ {failure_kind} failed: could not start cargo: {e}");
-            notify_admin(&msg, admin_target).await;
-            anyhow::bail!(msg);
+            anyhow::bail!("{failure_kind} failed: could not start cargo: {e}");
         }
         Ok(Ok(output)) if !output.status.success() => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let combined = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
             let truncated = truncate_to_last_64k(&combined);
-            let msg = format!("❌ {failure_kind} failed:\n```\n{truncated}\n```");
-            notify_admin(&msg, admin_target).await;
-            anyhow::bail!("{label} failed with exit status: {}", output.status);
+            anyhow::bail!("{failure_kind} failed:\n```\n{truncated}\n```");
         }
         Ok(Ok(_)) => {
             info!("{label} completed successfully");
@@ -1010,6 +1168,102 @@ pub async fn notify_admin(message: &str, target: Option<&str>) {
     {
         error!(error = %e, "Failed to send update notification to admin");
     }
+}
+
+/// Reply used when a command requires full (admin) permissions. Used by both
+/// the Telegram command dispatch (binary) and the `/update` handler (library)
+/// so the denial wording stays consistent.
+pub const ADMIN_ONLY_CMD_MSG: &str = "This command is only available to admin users.";
+
+/// Handle a Telegram `/update` command.
+///
+/// Gated on the shared availability cache (admin + update available), with a
+/// synchronous reply for the early-failure cases (not an admin / already in
+/// progress / no update / cargo not on PATH). The actual update runs as a
+/// spawned async task so it does not block the Telegram message dispatch loop.
+/// Progress notifications route via the normal update notification path (first
+/// bound admin); a failure is also reported directly to the invoking admin.
+/// There is NO confirmation modal — an admin invoking `/update` from Telegram
+/// is itself sufficient confirmation.
+pub async fn handle_update_command(msg: &ChannelMessage) {
+    if !crate::users::is_admin(&msg.user_name).await {
+        crate::channels::telegram::send_reply(&msg.reply_target, ADMIN_ONLY_CMD_MSG).await;
+        return;
+    }
+
+    // Fast path for an already-running update, then the atomic claim below.
+    if update_availability().in_progress {
+        crate::channels::telegram::send_reply(
+            &msg.reply_target,
+            "An update is already in progress. Please wait for it to complete.",
+        )
+        .await;
+        return;
+    }
+
+    if !should_show_update(update_availability(), true) {
+        crate::channels::telegram::send_reply(
+            &msg.reply_target,
+            "No update is available at the moment.",
+        )
+        .await;
+        return;
+    }
+
+    // Synchronous pre-check so the early-failure reply is guaranteed before the
+    // update is spawned. `cargo --version` is cheap, but this briefly awaits a
+    // subprocess inline in the dispatch loop — accepted so the invoker gets an
+    // immediate answer instead of a silent no-op.
+    if let Err(e) = verify_cargo_on_path("perform the update").await {
+        crate::channels::telegram::send_reply(
+            &msg.reply_target,
+            &format!("Cannot start the update: {e}"),
+        )
+        .await;
+        return;
+    }
+
+    // Atomically claim the in-progress flag before spawning. This closes the
+    // TOCTOU where a concurrent `/update` could pass the pre-check above, then
+    // lose `UPDATE_MUTEX.try_lock` inside `execute_update` and be misreported
+    // as "Update failed: An update is already in progress." `execute_update`
+    // keeps the flag set and clears it on failure.
+    if update_cache()
+        .in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        crate::channels::telegram::send_reply(
+            &msg.reply_target,
+            "An update is already in progress. Please wait for it to complete.",
+        )
+        .await;
+        return;
+    }
+
+    crate::channels::telegram::send_reply(
+        &msg.reply_target,
+        "✅ Update triggered — it will build/install in the background and restart the daemon when complete.",
+    )
+    .await;
+
+    // Fire-and-forget: the build/install (10–60 min) must not block the
+    // dispatch loop. Progress notifications route via the normal update
+    // notification path (first bound admin); on failure the invoking admin is
+    // also told directly so a non-primary invoker isn't left guessing.
+    let invoker_target = msg.reply_target.clone();
+    tokio::spawn(async move {
+        if let Err(e) = execute_update().await {
+            // Single failure report: the first bound admin (the normal update
+            // notification path), plus the invoking admin when they differ.
+            let failure = format!("❌ Update failed:\n{e:#}");
+            let admin_target = resolve_update_admin_target().await;
+            notify_admin(&failure, admin_target.as_deref()).await;
+            if admin_target.as_deref() != Some(invoker_target.as_str()) {
+                crate::channels::telegram::send_reply(&invoker_target, &failure).await;
+            }
+        }
+    });
 }
 
 // ── Cargo bin path resolution and installation ───────────────────────────
@@ -1234,7 +1488,9 @@ fn executable_or_current_exe(
 /// cargo install bin path or `current_exe()` as fallback).
 ///
 /// On Unix: null stdin/stdout, stderr → update.log. On Windows: same + `DETACHED_PROCESS | CREATE_NO_WINDOW`.
-/// On spawn failure: notifies admin, keeps running (does NOT exit).
+/// On spawn failure the error is returned (no admin notification — the caller
+/// [`finalize_update_and_restart`] owns failure reporting); the process keeps
+/// running (does NOT exit).
 ///
 /// ## macOS Gatekeeper safety
 ///
@@ -1242,7 +1498,7 @@ fn executable_or_current_exe(
 /// the child's startup window (see deletion safety in [`execute_update`]).
 /// Deleting the spawn target while Gatekeeper is validating its code signature
 /// causes `syspolicyd` to SIGKILL the child.
-async fn spawn_new_instance_from(binary_path: &Path, admin_target: Option<&str>) -> Result<()> {
+fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
 
     info!(
@@ -1283,8 +1539,6 @@ async fn spawn_new_instance_from(binary_path: &Path, admin_target: Option<&str>)
             Ok(())
         }
         Err(e) => {
-            let msg = format!("❌ Failed to start new instance: {e}");
-            notify_admin(&msg, admin_target).await;
             warn!(
                 error = %e,
                 "New instance spawn failed — keeping current instance alive"
@@ -1399,21 +1653,6 @@ mod tests {
             path.ends_with("mahbot.lock"),
             "Lock file path must end with mahbot.lock, got: {}",
             path.display(),
-        );
-    }
-
-    #[test]
-    fn test_is_update_available() {
-        // This test runs from the MahBot repo — a local checkout (`.git`
-        // present) with a reachable Cargo.toml — so self-update is available.
-        assert!(
-            is_update_available(),
-            "Self-update should be available when running from repo"
-        );
-        assert_eq!(
-            update_mode(),
-            UpdateMode::LocalCheckout,
-            "The repo checkout must classify as LocalCheckout"
         );
     }
 

@@ -46,7 +46,6 @@ use iced::{Alignment, Color, Element, Length, Task};
 
 use crate::Role;
 use crate::audio::voice::VoiceStatus;
-use crate::self_update::UpdateMode;
 
 use self::menus::ContextMenu;
 
@@ -123,17 +122,6 @@ pub enum ToastKind {
     Success,
     Warning,
     Error,
-}
-
-/// Whether a self-update is available or in progress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UpdateStatus {
-    /// Self-update not available (button hidden).
-    Unavailable,
-    /// Self-update available and idle (button visible, clickable).
-    Available,
-    /// Self-update in progress (button visible, disabled).
-    InProgress,
 }
 
 /// A floating toast notification.
@@ -261,15 +249,6 @@ pub enum Message {
     CancelUpdate,
     /// Self-update result.
     UpdateResult(Result<String, String>),
-    /// Registry-mode: periodic crates.io availability check tick (immediate
-    /// first check, then every 10 minutes). Only emitted in registry mode on
-    /// non-Windows platforms (see `subscription()`).
-    RegistryUpdateCheck,
-    /// Registry-mode: result of a crates.io availability check.
-    /// `Ok(Some(v))` = a strictly newer stable version is published;
-    /// `Ok(None)` = up to date; `Err` = network failure (silently tolerated,
-    /// retried on the next tick — never a user-visible error).
-    RegistryUpdateResult(Result<Option<semver::Version>, String>),
     /// Toggle the selected workspace's pipeline pause or maintainer state.
     Toggle(ToggleKind),
     /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
@@ -527,16 +506,6 @@ pub struct Dashboard {
     /// Cached role pool for the current user — the switchable roles shown in
     /// the composer role dropdown.
     selected_user_roles: Vec<Role>,
-    /// Whether a self-update is available or in progress.
-    /// Controls button visibility/disabled state.
-    update_status: UpdateStatus,
-    /// How this binary was installed — selects the self-update strategy and
-    /// whether the periodic crates.io registry check runs.
-    update_mode: UpdateMode,
-    /// Latest published stable version from the last registry check (registry
-    /// mode only). `Some(v)` when a strictly newer version is available —
-    /// drives the tooltip ("Update MahBot to v0.4.0").
-    registry_latest: Option<semver::Version>,
     /// True when a genuine window close was requested while the update was in
     /// its finalizing window (daemon shut down; checkpoint + spawn + exit
     /// pending). Only a user close (`CloseRequested`) sets this — the update's
@@ -580,7 +549,7 @@ pub struct Dashboard {
 
 impl Dashboard {
     #[must_use]
-    pub fn loading(update_mode: UpdateMode) -> Self {
+    pub fn loading() -> Self {
         Self {
             ready: false,
             boot_error: None,
@@ -594,18 +563,6 @@ impl Dashboard {
             selected_user_name: None,
             selected_user_role: None,
             selected_user_roles: Vec::new(),
-            update_status: if update_mode == UpdateMode::LocalCheckout
-                && crate::self_update::is_update_available()
-            {
-                UpdateStatus::Available
-            } else {
-                // Registry mode: the button appears only when the registry
-                // check finds a strictly newer version (the boot-time status is
-                // boot-immutable Unavailable until `RegistryUpdateResult`).
-                UpdateStatus::Unavailable
-            },
-            update_mode,
-            registry_latest: None,
             exit_requested_during_update: false,
             draining: false,
             show_update_confirm: false,
@@ -708,16 +665,14 @@ impl Dashboard {
 
     fn save_and_exit(&self) -> Task<Message> {
         self.persist_window_state();
-        if self.update_status == UpdateStatus::InProgress
-            && crate::self_update::update_is_finalizing()
-        {
+        if crate::self_update::update_in_progress() && crate::self_update::update_is_finalizing() {
             // The update path has shut down the daemon and owns the exit:
             // checkpoint (execute_update step 11), lock release, spawn, exit(0).
             // Exiting here would drop the iced runtime and abort that sequence
             // mid-checkpoint, leaving the daemon down without a replacement —
             // so wait instead. A close requested meanwhile is recorded in
             // Message::CloseRequested; if the update fails, UpdateResult
-            // re-enters this path (status back to Available, flag cleared)
+            // re-enters this path (in-progress cleared, flag cleared)
             // and honors the close.
             return Task::none();
         }
@@ -1148,7 +1103,7 @@ impl Dashboard {
                 self.apply_boot_workspaces(workspaces, restored_name.as_deref().unwrap_or(""))
             }
             Message::CloseRequested(_) => {
-                if self.update_status == UpdateStatus::InProgress
+                if crate::self_update::update_in_progress()
                     && crate::self_update::update_is_finalizing()
                 {
                     // The update owns the exit (its own drain + checkpoint +
@@ -1177,11 +1132,11 @@ impl Dashboard {
                 // Restart toast: only when the update build/install has
                 // finished and finalize is shutting the service down — a
                 // plain window close or signal during a mid-build update
-                // (InProgress but not yet finalizing) must not show a false
+                // (in-flight but not yet finalizing) must not show a false
                 // "restarting" toast. `!self.draining` is defensive
                 // single-emission protection.
                 if !self.draining
-                    && self.update_status == UpdateStatus::InProgress
+                    && crate::self_update::update_in_progress()
                     && crate::self_update::update_is_finalizing()
                 {
                     self.toasts.push(Toast::new(
@@ -1341,18 +1296,21 @@ impl Dashboard {
             Message::EscapePressed => self.process_escape(),
             Message::UpdateBot => {
                 // Only opens the confirmation modal — the build/install
-                // starts on `ConfirmUpdate`.
-                if self.update_status == UpdateStatus::Available {
+                // starts on `ConfirmUpdate`. Availability is read from the
+                // shared cache, so a Telegram-initiated update disables the
+                // button here too.
+                let availability = crate::self_update::update_availability();
+                if availability.available && !availability.in_progress {
                     self.show_update_confirm = true;
                 }
                 Task::none()
             }
             Message::ConfirmUpdate => {
                 self.show_update_confirm = false;
-                if self.update_status != UpdateStatus::Available {
+                let availability = crate::self_update::update_availability();
+                if !availability.available || availability.in_progress {
                     return Task::none();
                 }
-                self.update_status = UpdateStatus::InProgress;
                 // Save window state before update (synchronous).
                 self.persist_window_state();
                 // Transient confirmation that the build/install has kicked off —
@@ -1364,10 +1322,21 @@ impl Dashboard {
                 ));
                 Task::perform(
                     async {
-                        crate::self_update::execute_update()
-                            .await
-                            .map_err(|e| format!("{e:#}"))
-                            .map(|()| "ok".to_string())
+                        match crate::self_update::execute_update().await {
+                            Ok(()) => Ok("ok".to_string()),
+                            Err(e) => {
+                                // Report to the first admin (Telegram) as well as
+                                // the GUI toast, preserving the prior behavior
+                                // where the update path notified on failure.
+                                // `execute_update` no longer notifies; each caller
+                                // is the single failure reporter.
+                                let msg = format!("❌ Update failed:\n{e:#}");
+                                let target =
+                                    crate::self_update::resolve_admin_telegram_target().await;
+                                crate::self_update::notify_admin(&msg, target.as_deref()).await;
+                                Err(msg)
+                            }
+                        }
                     },
                     Message::UpdateResult,
                 )
@@ -1380,9 +1349,10 @@ impl Dashboard {
                 // execute_update() calls exit(0) on success, so we never
                 // actually reach this branch for the Ok case. The update
                 // toasts (start + restart) are the success signals; the
-                // window closing is the final confirmation.
+                // window closing is the final confirmation. On failure
+                // `execute_update` already cleared the shared in-progress
+                // flag, so the exit guards below no longer wait.
                 if let Err(err) = result {
-                    self.update_status = UpdateStatus::Available;
                     self.toasts
                         .push(Toast::from_toast_msg(&ToastMessage::Error(err)));
                     if self.exit_requested_during_update {
@@ -1391,54 +1361,6 @@ impl Dashboard {
                         // checkpoint.
                         self.exit_requested_during_update = false;
                         return self.save_and_exit();
-                    }
-                }
-                Task::none()
-            }
-            Message::RegistryUpdateCheck => {
-                // The subscription only emits in registry mode on non-Windows
-                // (see `subscription()`), so no platform/mode guard is needed
-                // in the handler. Skip the HTTP check while an update is in
-                // flight — the result would be ignored by the InProgress guard
-                // below, so a long cargo install (10–60 min) would otherwise
-                // waste a request per tick.
-                if self.update_status == UpdateStatus::InProgress {
-                    return Task::none();
-                }
-                Task::perform(
-                    async {
-                        crate::self_update::check_registry_update()
-                            .await
-                            .map_err(|e| format!("{e:#}"))
-                    },
-                    Message::RegistryUpdateResult,
-                )
-            }
-            Message::RegistryUpdateResult(result) => {
-                // Never clobber an in-flight update: the 10-min subscription
-                // keeps ticking during a cargo install (10–60 min), and
-                // flipping the status mid-update would re-enable the button
-                // (or hide it on a network blip) and break the
-                // window-close-during-finalize guard (`save_and_exit` /
-                // CloseRequested gate on InProgress && update_is_finalizing()).
-                if self.update_status == UpdateStatus::InProgress {
-                    return Task::none();
-                }
-                match result {
-                    Ok(Some(version)) => {
-                        // Strictly newer stable version published — show the button.
-                        self.registry_latest = Some(version);
-                        self.update_status = UpdateStatus::Available;
-                    }
-                    Ok(None) => {
-                        // Up to date — keep the button hidden.
-                        self.registry_latest = None;
-                        self.update_status = UpdateStatus::Unavailable;
-                    }
-                    Err(_) => {
-                        // Network failure — silently tolerated; the next 10-min
-                        // tick retries. Keep the last-known state so a transient
-                        // blip never hides a previously discovered update.
                     }
                 }
                 Task::none()
@@ -2097,16 +2019,6 @@ impl Dashboard {
             iced::Subscription::run(shutdown_subscription),
             // TTS download progress subscription (always active while ready).
             iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
-            // Registry-mode crates.io availability check: immediate first tick,
-            // then every 10 minutes. Only active in registry mode on non-Windows
-            // (the running .exe cannot be replaced there). Local-checkout mode
-            // keeps the boot-time `is_update_available()` probe and never runs
-            // this subscription.
-            if self.update_mode == UpdateMode::Registry && !cfg!(windows) {
-                iced::Subscription::run(registry_update_subscription)
-            } else {
-                iced::Subscription::none()
-            },
             // Diff modal subscription (keyboard shortcuts, auto-refresh).
             // Only active when the modal is open to avoid intercepting
             // global keyboard shortcuts unnecessarily.
@@ -2117,21 +2029,6 @@ impl Dashboard {
             },
         ])
     }
-}
-
-/// Registry-mode periodic crates.io availability check: emits an immediate
-/// first tick, then one every 10 minutes.
-///
-/// The stream is only wired up in [`Dashboard::subscription`] for registry
-/// mode on non-Windows — the check itself never runs on Windows.
-fn registry_update_subscription() -> impl futures_util::Stream<Item = Message> {
-    use iced::futures::channel::mpsc;
-    iced::stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
-        loop {
-            let _ = output.try_send(Message::RegistryUpdateCheck);
-            tokio::time::sleep(Duration::from_mins(10)).await;
-        }
-    })
 }
 
 /// Subscription that emits [`Message::Shutdown`] when the global shutdown
@@ -2414,26 +2311,26 @@ impl Dashboard {
     /// Render the self-update button in the footer bar.
     /// Returns `None` when self-update is not available on this installation.
     ///
-    /// No Windows gate is needed here: in registry mode on Windows the status
-    /// can never become [`UpdateStatus::Available`] — the subscription that
-    /// drives the check is only wired for non-Windows, [`check_registry_update`]
-    /// itself returns `Ok(None)` on Windows, and [`execute_registry_update`]
-    /// bails out at its entry point.
-    fn render_update_button(&self) -> Option<Element<'_, Message>> {
-        let (update_color, tooltip_text, clickable) = match self.update_status {
-            UpdateStatus::Unavailable => return None,
-            UpdateStatus::Available => {
-                let tooltip = if self.update_mode == UpdateMode::Registry {
-                    match &self.registry_latest {
-                        Some(v) => format!("Update MahBot to v{v}"),
-                        None => "Update MahBot".to_string(),
-                    }
-                } else {
-                    "Update MahBot".to_string()
-                };
-                (theme::ACCENT, tooltip, true)
-            }
-            UpdateStatus::InProgress => (theme::TEXT_FAINT, "Updating…".to_string(), false),
+    /// Visibility is driven entirely by the shared availability cache — no
+    /// Windows gate is needed here. Registry mode on Windows never discovers
+    /// an update (the crates.io check returns `Ok(None)`), and
+    /// [`execute_registry_update`] bails at its entry point, so the cached
+    /// `available` stays false.
+    fn render_update_button() -> Option<Element<'static, Message>> {
+        let availability = crate::self_update::update_availability();
+        // Show the button while an update is in flight even if `available` was
+        // transiently clobbered, so "Updating…" is never hidden mid-update.
+        if !availability.available && !availability.in_progress {
+            return None;
+        }
+        let (update_color, tooltip_text, clickable) = if availability.in_progress {
+            (theme::TEXT_FAINT, "Updating…".to_string(), false)
+        } else {
+            let tooltip = match crate::self_update::update_latest() {
+                Some(v) => format!("Update MahBot to v{v}"),
+                None => "Update MahBot".to_string(),
+            };
+            (theme::ACCENT, tooltip, true)
         };
         let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
             .size(24)
@@ -2786,7 +2683,7 @@ impl Dashboard {
     fn footer_view(&self) -> Element<'_, Message> {
         let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(3);
 
-        if let Some(el) = self.render_update_button() {
+        if let Some(el) = Self::render_update_button() {
             left_elements.push(el);
         }
 

@@ -386,6 +386,9 @@ pub enum BotCommand {
     MaintenanceOn,
     /// `/maintenance_off` — disable the workspace maintainer (admin, menu form).
     MaintenanceOff,
+    /// `/update` — run a self-update and restart the daemon (admin, shown only
+    /// when the shared availability cache confirms an update is available).
+    Update,
     /// `/role_name` — switch the user's active role (pool-gated).
     SwitchRole(Role),
 }
@@ -411,6 +414,7 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
         "/maintenance" => Some(BotCommand::Maintenance),
         "/maintenance_on" => Some(BotCommand::MaintenanceOn),
         "/maintenance_off" => Some(BotCommand::MaintenanceOff),
+        "/update" => Some(BotCommand::Update),
         other => {
             let name = other.strip_prefix('/')?;
             Role::iter()
@@ -1548,6 +1552,11 @@ mod tests {
             ("/maintenance_off", Some(MaintenanceOff)),
             ("/Maintenance_Off", Some(MaintenanceOff)),
             ("/maintenance_off foo", Some(MaintenanceOff)),
+            // /update
+            ("/update", Some(Update)),
+            ("/UPDATE", Some(Update)),
+            ("/update foo", Some(Update)),
+            ("  /update  ", Some(Update)),
             // Role-switch commands: each pool role is a direct command
             ("/manager", Some(SwitchRole(Role::Manager))),
             ("/engineer", Some(SwitchRole(Role::Engineer))),
@@ -1576,6 +1585,8 @@ mod tests {
             ("/boardx", None),
             ("/maintenance_onn", None),
             ("/maintenance_o", None),
+            ("/updatex", None),
+            ("/updatee", None),
             ("/engineerr", None),
             ("/managr", None),
             ("/artiste", None),

@@ -238,6 +238,17 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::search_engine::init_all_engines(),
     );
 
+    // Periodic refresh of the shared update-availability cache. This is the
+    // single writer of the cache: both the GUI update button and the Telegram
+    // `/update` menu read the cached state, so the two surfaces cannot diverge.
+    // Ticks immediately, then every 10 minutes.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "update-availability",
+        mahbot::self_update::run_update_availability_refresh(),
+    );
+
     // Browser daemon health watchdog: classifies chrome-use health from the
     // daemon-free status and auto-restarts with bounded backoff when it is
     // down; wedges surface on real browser calls (fail-fast) and wake this
@@ -529,9 +540,6 @@ fn main() -> Result<()> {
     // the root (they exit before this point).
     mahbot::temp::init_temp_root()?;
 
-    // Detect self-update availability mode before any async work.
-    let update_mode = mahbot::self_update::update_mode();
-
     // Resolve storage root before config init, so we can acquire the lock.
     let storage_root = mahbot::config::default_config_dir()?;
 
@@ -545,7 +553,7 @@ fn main() -> Result<()> {
     iced::application(
         move || {
             (
-                Dashboard::loading(update_mode),
+                Dashboard::loading(),
                 iced::Task::perform(bootstrap_mahbot_safe(), DashboardMessage::Boot),
             )
         },
@@ -665,6 +673,11 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
         }
         // Role-switch commands: pool-gated.
         BotCommand::SwitchRole(role) => handle_role_switch(msg, role).await,
+        // Global admin command: `/update` has its own dispatch path (it is
+        // workspace-independent and must not go through `handle_admin_command`,
+        // which requires a selected shared workspace). The handler applies its
+        // own admin gate + availability pre-check.
+        BotCommand::Update => mahbot::self_update::handle_update_command(msg).await,
         // Admin-gated commands: denial for non-admin users.
         BotCommand::Board
         | BotCommand::Archive
@@ -676,11 +689,7 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
             if mahbot::users::is_admin(&msg.user_name).await {
                 handle_admin_command(msg, cmd).await;
             } else {
-                send_telegram_reply(
-                    msg,
-                    "This command is only available to admin users.".to_string(),
-                )
-                .await;
+                send_telegram_reply(msg, mahbot::self_update::ADMIN_ONLY_CMD_MSG.to_string()).await;
             }
         }
     }
@@ -690,7 +699,7 @@ async fn handle_bot_command(msg: &ChannelMessage) -> bool {
 /// Send a plain-text reply directly on the Telegram channel (no router
 /// broadcast/persist — used for command responses, not agent replies).
 async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
-    let _ = mahbot::channels::telegram::send_direct(&msg.reply_target, content, None).await;
+    mahbot::channels::telegram::send_reply(&msg.reply_target, &content).await;
 }
 
 /// Handle a role-switch command (`/role_name`) — pool-gated, persists the

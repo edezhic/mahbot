@@ -34,6 +34,8 @@ pub const UNPAUSE_COMMAND_DESC: &str = "Resume the workspace pipeline";
 pub const MAINTENANCE_ON_COMMAND_DESC: &str = "Enable workspace maintenance";
 /// Description for the `/maintenance_off` command (admin, menu form).
 pub const MAINTENANCE_OFF_COMMAND_DESC: &str = "Disable workspace maintenance";
+/// Description for the `/update` command (admin, menu form).
+pub const UPDATE_COMMAND_DESC: &str = "Update MahBot to the latest version";
 
 // ── Action prefixes (__act__) ───────────────────────────────────────
 
@@ -2404,6 +2406,13 @@ pub async fn send_direct(
     channel.send(&reply).await
 }
 
+/// Send a plain-text message directly via the registered Telegram channel,
+/// ignoring transport/channel errors (best-effort). Used for command replies
+/// and notifications where a send failure should not fail the caller.
+pub async fn send_reply(recipient: &str, content: &str) {
+    let _ = send_direct(recipient, content.to_string(), None).await;
+}
+
 /// Mirror a local user's message to their Telegram chats as a blockquote, so conversation history is readable from both surfaces.
 ///
 /// This should be called before enrichment to preserve the original
@@ -2581,6 +2590,15 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     if crate::users::is_admin(user_name).await {
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
         entries.push(("archive".to_string(), ARCHIVE_COMMAND_DESC.to_string()));
+
+        // `/update` is global (any full-permission admin) and shown only when
+        // the shared availability cache confirms an update — always in
+        // local-checkout mode, registry mode only when a strictly newer stable
+        // version exists. The menu reflects the cached state, never a network
+        // call per refresh.
+        if crate::self_update::should_show_update(crate::self_update::update_availability(), true) {
+            entries.push(("update".to_string(), UPDATE_COMMAND_DESC.to_string()));
+        }
 
         // Workspace-state entries follow the selected shared workspace; a
         // personal workspace (or lookup failure) omits both pairs.
