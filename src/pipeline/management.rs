@@ -16,9 +16,9 @@
 //!   not running re-dispatches its stage (development/diagnostics/review/qa/sanitation).
 //!
 //! The staged pipeline is `InDiagnostics → InReview → InQa → InSanitation →
-//! Done`. Reviewer and QA phases share a single `PollPhase::VerifierCheck`
-//! variant with per-phase configuration carried in `VerifierInfo` constants
-//! (`REVIEWER_VI`, `QA_VI`).
+//! Done`. Reviewer and QA phases share the `dispatch_for_phase` entry that
+//! selects `REVIEWER_VI`/`QA_VI` (from the `VerifierInfo` constants) for the
+//! active verifier role.
 //!
 //! The Sanitation phase (sanitation.md agent prompt, Role::Sanitation) inspects
 //! new/untracked files before the commit-to-Done step. Garbage artifacts cause a
@@ -937,6 +937,72 @@ pub async fn run_management() {
     }
 }
 
+/// The resolved dispatch for an occupied ticket phase: the agent dispatcher to
+/// run plus the human-readable label used in dispatch logs.
+///
+/// A uniform `run` signature reconciles the asymmetric `resumed` parameter
+/// across the dispatch functions (analysts and diagnostics have no resume
+/// semantics and ignore the flag). The closures are capture-free so they
+/// coerce to function pointers, keeping the map a plain data value.
+#[derive(Clone, Copy, Debug)]
+struct DispatchAction {
+    log_label: &'static str,
+    run: fn(Arc<Ticket>, Workspace, bool) -> BoxFuture<'static, ()>,
+}
+
+/// Choose the agent dispatcher for a ticket phase.
+///
+/// This is the single authoritative phase → dispatch selection. Both the live
+/// dispatch path ([`spawn_dispatch`]) and the boot-resume path
+/// ([`resume_implementation_job`]) route through it, so a new occupied stage
+/// can no longer silently complete the implementation job in one path while
+/// being compile-enforced in another: the match names every [`TicketPhase`]
+/// variant and has no fallback wildcard.
+///
+/// The six dispatchable phases are `Analysis` (backlog analysts, claimed by
+/// [`run_claim_pipeline`]) plus the five pipeline-occupied stages
+/// ([`TicketPhase::is_pipeline_occupied`]). Every other phase returns `None`,
+/// and the caller decides how to handle a dispatch-less ticket (in practice
+/// completing the orphaned implementation job).
+///
+/// The ticket occupies its phase while dispatched, so the live path's pre-flight
+/// expected-phase re-check ([`spawn_dispatch`]) is simply the map key — the map
+/// needs no separate expected-phase field.
+fn dispatch_for_phase(phase: TicketPhase) -> Option<DispatchAction> {
+    match phase {
+        TicketPhase::Analysis => Some(DispatchAction {
+            log_label: "Analyst",
+            run: |ticket, ws, _| Box::pin(dispatch_backlog_analysts(ticket, ws)),
+        }),
+        TicketPhase::InDevelopment => Some(DispatchAction {
+            log_label: "Engineer",
+            run: |ticket, ws, resumed| dispatch_engineer(ticket, ws, resumed),
+        }),
+        TicketPhase::InDiagnostics => Some(DispatchAction {
+            log_label: "Diagnostics",
+            run: |ticket, ws, _| Box::pin(dispatch_diagnostics(ticket, ws)),
+        }),
+        TicketPhase::InReview => Some(DispatchAction {
+            log_label: "Reviewers",
+            run: |ticket, ws, resumed| dispatch_verifiers(ticket, ws, REVIEWER_VI, resumed),
+        }),
+        TicketPhase::InQa => Some(DispatchAction {
+            log_label: "QA",
+            run: |ticket, ws, resumed| dispatch_verifiers(ticket, ws, QA_VI, resumed),
+        }),
+        TicketPhase::InSanitation => Some(DispatchAction {
+            log_label: "Sanitation",
+            run: |ticket, ws, resumed| Box::pin(dispatch_sanitation(ticket, ws, resumed)),
+        }),
+        TicketPhase::Backlog
+        | TicketPhase::Planning
+        | TicketPhase::ReadyForDevelopment
+        | TicketPhase::Done
+        | TicketPhase::Cancelled
+        | TicketPhase::Failed => None,
+    }
+}
+
 /// Shared dispatch helper: log the ticket+workspace, then spawn the phase
 /// dispatcher in a background task.
 ///
@@ -952,16 +1018,28 @@ pub async fn run_management() {
 /// [`FutureExt::catch_unwind`](futures_util::FutureExt::catch_unwind) to catch
 /// panics.  On panic the ticket transitions to [`TicketPhase::Failed`] with
 /// notification so the manager can investigate.
-fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
-    let phase_info = phase.info();
-    let expected_phase = phase_info.expected_phase;
+fn spawn_dispatch(phase: TicketPhase, ticket: Ticket, ws: Workspace) {
+    // Resolve the dispatcher through the single authoritative phase→dispatch
+    // map. Callers only pass dispatchable phases (the claim pipeline and the
+    // implementation-iteration loop), so a `None` here is a caller bug.
+    let Some(action) = dispatch_for_phase(phase) else {
+        error!(
+            ticket = %ticket.id,
+            phase = %phase,
+            "spawn_dispatch called for a non-dispatchable phase — ignoring",
+        );
+        return;
+    };
+    // The ticket occupies `phase` while dispatched, so the pre-flight
+    // expected-phase re-check is just `phase` (see [`dispatch_for_phase`]).
+    let expected_phase = phase;
 
     info!(
         ticket = %ticket.id,
         title = %ticket.title,
         workspace = %ws.name,
         "Dispatching {} ticket",
-        phase_info.log_label,
+        action.log_label,
     );
 
     // Cancel any stale agents for this ticket before dispatching new ones.
@@ -975,14 +1053,6 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
 
     tokio::spawn(async move {
         // ── Pre-flight guard checks ──
-        //
-        // Adding a new PollPhase variant requires adding a row in
-        // PollPhase::info() which carries the log_label field (enforced by the
-        // single match in info()). The bounce breaker is enforced at the bounce
-        // sites (review/QA in process_verifier_verdicts, sanitation/verifier
-        // non-success in bounce_to_development), not pre-flight. The engineer
-        // hard-failure path is pause-only (workspace pause + implementation freeze),
-        // never a bounce.
         //
         // The post-agent `guard_job_phase` check in each dispatch function is
         // a separate concern (race-condition guard) and is preserved there.
@@ -998,17 +1068,10 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
         //     closure — it is not wrapped in AssertUnwindSafe, so panic recovery
         //     always has a valid reference for error reporting.
         //   - `ws` is moved in and consumed; no shared state remains.
-        let result = std::panic::AssertUnwindSafe(async move {
-            match phase {
-                PollPhase::BacklogAnalysis => dispatch_backlog_analysts(ticket, ws).await,
-                PollPhase::EngineerDevelopment => dispatch_engineer(ticket, ws, false).await,
-                PollPhase::SanitationCheck => dispatch_sanitation(ticket, ws, false).await,
-                PollPhase::DiagnosticsCheck => dispatch_diagnostics(ticket, ws).await,
-                PollPhase::VerifierCheck(vi) => dispatch_verifiers(ticket, ws, vi, false).await,
-            }
-        })
-        .catch_unwind()
-        .await;
+        let result =
+            std::panic::AssertUnwindSafe(async move { (action.run)(ticket, ws, false).await })
+                .catch_unwind()
+                .await;
 
         if let Err(payload) = result {
             // Panic payloads can embed credential-bearing content (paths, env,
@@ -1058,10 +1121,11 @@ fn spawn_dispatch(phase: PollPhase, ticket: Ticket, ws: Workspace) {
     });
 }
 
-/// Verifier-specific metadata, embedded directly in the [`PollPhase::VerifierCheck`]
-/// variant and used as the parameter to [`dispatch_verifiers`]. Carries all
-/// information needed for dispatch (role, prompt paths, phase lifecycle) so
-/// no round-trip through [`PollPhase::info()`] is required.
+/// Verifier-specific metadata, selected inside [`dispatch_for_phase`] for the
+/// InReview/InQa phases and used as the parameter to [`dispatch_verifiers`].
+/// Carries all
+/// information needed for dispatch (role, prompt paths, phase lifecycle) so it
+/// is carried directly by the dispatch map without a separate metadata lookup.
 #[derive(Copy, Clone)]
 struct VerifierInfo {
     role: Role,
@@ -1151,19 +1215,19 @@ impl PollPhaseInfo {
     }
 }
 
-/// A single poll phase: maps a `from → to` ticket transition to the agent
-/// that handles it.
+/// A single claim phase: maps a `from → to` ticket transition to the agent
+/// dispatcher that runs after the atomic claim.
 ///
-/// Phase metadata lives in [`PollPhase::info()`] — a single match expression
-/// that returns all phase-specific data. The `VerifierCheck` variant carries
-/// its `VerifierInfo` inline (so reviewer and QA phases share one variant).
+/// Poll phases are exclusively the claim-transition phases (the only two that
+/// use an atomic source→target claim in [`run_claim_pipeline`]). The
+/// implementation stages (InDevelopment → InSanitation) are dispatched from the
+/// implementation-iteration loop via [`spawn_dispatch`], and the phase → agent
+/// selection for those lives solely in [`dispatch_for_phase`]. Claim metadata
+/// lives in [`PollPhase::info()`] — one arm per phase.
 #[derive(Copy, Clone)]
 enum PollPhase {
     BacklogAnalysis,
     EngineerDevelopment,
-    SanitationCheck,
-    DiagnosticsCheck,
-    VerifierCheck(VerifierInfo),
 }
 
 impl PollPhase {
@@ -1181,14 +1245,6 @@ impl PollPhase {
                 pipeline_check: PipelineCheck::Enforce,
                 ..PollPhaseInfo::new(TicketPhase::InDevelopment, "Engineer")
             },
-            Self::SanitationCheck => PollPhaseInfo {
-                // SanitationCheck is excluded from CLAIM_PHASES since the
-                // InQa→InSanitation handoff happens inside the QA verifier
-                // finalizer (immediate next-stage dispatch), not a claim.
-                ..PollPhaseInfo::new(TicketPhase::InSanitation, "Sanitation")
-            },
-            Self::DiagnosticsCheck => PollPhaseInfo::new(TicketPhase::InDiagnostics, "Diagnostics"),
-            Self::VerifierCheck(vi) => PollPhaseInfo::new(vi.active_phase, vi.log_label),
         }
     }
 }
@@ -1197,14 +1253,14 @@ impl PollPhase {
 ///
 /// Each tuple is `(source_phase, poll_phase)` — the `source_phase` is the
 /// expected current phase of the ticket before claiming, and `poll_phase`
-/// encodes the target phase and dispatch metadata. Encoding the source phase
+/// encodes the target phase and claim metadata. Encoding the source phase
 /// in the tuple rather than inside [`PollPhaseInfo`] eliminates a field with
 /// dual semantics (it was metadata-only for non-claim phases).
 ///
-/// DiagnosticsCheck and SanitationCheck are intentionally excluded — they
-/// keep the ticket in InDiagnostics/InSanitation while running and guard
-/// re-dispatch via the implementation's in-flight roster marker and pre-condition
-/// checks respectively. Intermediate stage handoffs (diagnostics→review,
+/// The implementation stages (InDiagnostics, InSanitation) are excluded — they
+/// keep the ticket in phase while running and guard re-dispatch via the
+/// implementation's in-flight roster marker and pre-condition checks
+/// respectively. Intermediate stage handoffs (diagnostics→review,
 /// review→qa, qa→sanitation) happen inside the implementation dispatch finalizers,
 /// not via separate claims.
 ///
@@ -1379,32 +1435,22 @@ async fn process_single_workspace(ws: Workspace) {
         {
             continue;
         }
-        match ticket.phase {
-            TicketPhase::InDevelopment => {
-                spawn_dispatch(PollPhase::EngineerDevelopment, ticket, ws.clone());
-            }
-            TicketPhase::InDiagnostics => {
-                spawn_dispatch(PollPhase::DiagnosticsCheck, ticket, ws.clone());
-            }
-            TicketPhase::InReview => {
-                spawn_dispatch(PollPhase::VerifierCheck(REVIEWER_VI), ticket, ws.clone());
-            }
-            TicketPhase::InQa => {
-                spawn_dispatch(PollPhase::VerifierCheck(QA_VI), ticket, ws.clone());
-            }
-            TicketPhase::InSanitation => {
-                spawn_dispatch(PollPhase::SanitationCheck, ticket, ws.clone());
-            }
-            other => {
-                warn!(
-                    ticket = %implementation.ticket_id,
-                    job = %implementation.id,
-                    phase = %other,
-                    "Unknown implementation phase — completing implementation",
-                );
-                let _ = crate::jobs::complete_ticket_job(conn, &implementation.id).await;
-            }
+        // An implementation job owns exactly the five pipeline-occupied stages.
+        // If the ticket sits in any other phase the job is orphaned (data
+        // integrity violation) — complete it rather than dispatching the wrong
+        // stage. The phase → dispatcher selection happens inside spawn_dispatch
+        // via the single dispatch_for_phase map.
+        if !ticket.phase.is_pipeline_occupied() {
+            warn!(
+                ticket = %implementation.ticket_id,
+                job = %implementation.id,
+                phase = %ticket.phase,
+                "Implementation ticket not in a pipeline-occupied phase — completing implementation",
+            );
+            let _ = crate::jobs::complete_ticket_job(conn, &implementation.id).await;
+            continue;
         }
+        spawn_dispatch(ticket.phase, ticket, ws.clone());
     }
 
     // 3. Analysis re-drive — a frozen analysis round (paused mid-round then
@@ -1597,22 +1643,17 @@ async fn pickup_claim(ws: &Workspace) -> Option<(i64, bool)> {
 ///   contexts; a manual unpause on them (or the same-round stale copy after
 ///   a pending-pickup claim) must not re-enable new-work claims.
 ///
+/// Both claim phases are new-work claims, so the gate is phase-agnostic.
 /// Later-phase stage advances (diagnostics→review→qa→sanitation) happen
 /// inside the implementation dispatch finalizers, not via separate claims —
 /// a paused workspace additionally freezes those finalizers (no stage
 /// advances) until the workspace is unpaused.
-fn blocks_claim(ws: &Workspace, phase: PollPhase) -> bool {
+fn blocks_claim(ws: &Workspace) -> bool {
     // A paused workspace freezes the entire occupied pipeline: no claim
     // advances while paused (resume re-arms the poll on unpause). The
-    // discovery-readiness gate still applies only to new-work claims.
+    // discovery-readiness gate applies to every new-work claim.
     if ws.paused {
         return true;
-    }
-    if !matches!(
-        phase,
-        PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
-    ) {
-        return false;
     }
     ws.status != WorkspaceStatus::Ready
 }
@@ -1634,7 +1675,7 @@ fn blocks_claim(ws: &Workspace, phase: PollPhase) -> bool {
 async fn run_claim_pipeline(ws: &Workspace) {
     let board = board();
     for &(source, phase) in CLAIM_PHASES {
-        if blocks_claim(ws, phase) {
+        if blocks_claim(ws) {
             continue;
         }
         let info = phase.info();
@@ -1672,7 +1713,7 @@ async fn run_claim_pipeline(ws: &Workspace) {
                 break;
             }
         };
-        spawn_dispatch(phase, ticket, ws.clone());
+        spawn_dispatch(ticket.phase, ticket, ws.clone());
     }
 }
 
@@ -1853,7 +1894,7 @@ async fn guard_stage(
 
 /// Shared engineer post-run tail: phase/drain guards, failure handling, pause,
 /// transition, and job terminalization. Diagnostics are dispatched by the poll
-/// loop as a separate `PollPhase::DiagnosticsCheck` — the success path only
+/// loop as a separate `TicketPhase::InDiagnostics` — the success path only
 /// transitions to InDiagnostics. The guards live in [`guard_stage`];
 /// response `None` past the guards is a real failure or user cancel, delegated
 /// to [`handle_engineer_failure`]. `resumed` selects the log strings.
@@ -2826,7 +2867,8 @@ async fn finalize_sanitation_stage(
 
 /// Run the sanitation agent to inspect new/untracked files in the workspace.
 ///
-/// Called by [`PollPhase::SanitationCheck`] via [`spawn_dispatch`]. Runs a
+/// Called by [`spawn_dispatch`] (for `TicketPhase::InSanitation`, via the
+/// [`dispatch_for_phase`] map). Runs a
 /// single sanitation agent with tools to inspect files and determine whether
 /// they are legitimate project files or intermediate garbage.
 ///
@@ -3249,7 +3291,8 @@ async fn conclude_diagnostics_failure(
 
 /// Run diagnostics commands after the engineer completes development.
 ///
-/// Called by [`PollPhase::DiagnosticsCheck`] via [`spawn_dispatch`].
+/// Called by [`spawn_dispatch`] (for `TicketPhase::InDiagnostics`, via the
+/// [`dispatch_for_phase`] map).
 /// Uses [`BoardStore::claim_diagnostics`] plus a job-bound roster in-flight
 /// marker to prevent
 /// double-dispatch. Unlike the pipeline-phase dispatchers (which are dispatched
@@ -5235,19 +5278,24 @@ async fn resume_analysis_job(job_id: String, ticket: Ticket, ws: Workspace) {
 /// [`ResumableJob::TicketImplementation`] variant (kind), never from the phase —
 /// implementation owns exactly the five pipeline-occupied stages.
 async fn resume_implementation_job(job_id: String, ticket: Ticket, ws: Workspace) {
-    match ticket.phase {
-        TicketPhase::InDevelopment => dispatch_engineer(Arc::new(ticket), ws, true).await,
-        TicketPhase::InDiagnostics => dispatch_diagnostics(Arc::new(ticket), ws).await,
-        TicketPhase::InReview => {
-            dispatch_verifiers(Arc::new(ticket), ws, REVIEWER_VI, true).await;
-        }
-        TicketPhase::InQa => dispatch_verifiers(Arc::new(ticket), ws, QA_VI, true).await,
-        TicketPhase::InSanitation => dispatch_sanitation(Arc::new(ticket), ws, true).await,
-        other => {
-            warn!(phase = %other, job = %job_id, "Unknown implementation phase on resume — completing job");
-            let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
-        }
+    // An implementation job owns exactly the five pipeline-occupied stages. If
+    // the ticket sits in any other phase the job is orphaned (data-integrity
+    // violation) — complete it rather than dispatching the wrong stage.
+    if !ticket.phase.is_pipeline_occupied() {
+        warn!(
+            phase = %ticket.phase,
+            job = %job_id,
+            "Unknown implementation phase on resume — completing job",
+        );
+        let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
+        return;
     }
+    // Direct unguarded call (resumed = true): a dispatch panic on resume must
+    // leave the ticket occupied for a later retry, not fail it — handled by the
+    // caller's recover_from_restart re-arm, not the live wrapper's panic→Failed.
+    let action =
+        dispatch_for_phase(ticket.phase).expect("pipeline-occupied phase always has a dispatch");
+    (action.run)(Arc::new(ticket), ws, true).await;
 }
 
 /// Resume an analysis round: re-run not-done roster slots, re-evaluate

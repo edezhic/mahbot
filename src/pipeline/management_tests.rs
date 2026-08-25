@@ -191,7 +191,7 @@ fn install_synthesis_test_seams(
 ///
 /// Serialized with the reset_analysis_tickets tests (shared global board — a
 /// concurrent boot reset would clobber the fixture phases).
-
+///
 /// The stage-finalization choke point treats a phase-guard miss (ticket moved
 /// externally while the stage was finishing) as a first-class, expected
 /// outcome: the whole round is rolled back silently — nothing is written, no
@@ -506,7 +506,7 @@ async fn dispatch_panic_during_drain_skips_failed_transition() {
     )
     .await;
     let ticket = expect_ticket(board(), &ctrl_id).await;
-    spawn_dispatch(PollPhase::EngineerDevelopment, ticket, ws_ctrl);
+    spawn_dispatch(TicketPhase::InDevelopment, ticket, ws_ctrl);
     // The dispatch task is fire-and-forget — poll for the Failed transition.
     let mut reached_failed = false;
     for _ in 0..50 {
@@ -536,7 +536,7 @@ async fn dispatch_panic_during_drain_skips_failed_transition() {
     )
     .await;
     let ticket = expect_ticket(board(), &drain_id).await;
-    spawn_dispatch(PollPhase::EngineerDevelopment, ticket, ws_drain);
+    spawn_dispatch(TicketPhase::InDevelopment, ticket, ws_drain);
     // Wait for the provider to fire (the drain flag flips synchronously with
     // the panic; the unwind + guard are synchronous from there).
     let mut fired = false;
@@ -632,9 +632,7 @@ async fn eleventh_bounce_fails_ticket() {
 // ── Claim gate: automatic claims blocked while paused or not Ready ──
 
 /// The claim gate ([`blocks_claim`]) must block the automatic pickup of
-/// *new* work (BacklogAnalysis, EngineerDevelopment) when the workspace is
-/// paused **or** not Ready, and freeze the entire occupied implementation when the
-/// workspace is paused. Two gates:
+/// *new* work when the workspace is paused **or** not Ready. Two gates:
 ///
 /// * **Pause gate** — a paused Ready workspace blocks ALL claims (the implementation
 ///   is frozen; unpause re-arms the poll) — pause is a real freeze, not just
@@ -643,61 +641,46 @@ async fn eleventh_bounce_fails_ticket() {
 ///   blocks new-work claims even when unpaused: its contexts are missing or
 ///   stale, so a manual unpause must not re-enable development work.
 ///
-/// Asserted against [`CLAIM_PHASES`] — the only phases the gate predicate is
-/// ever consulted for in production — so the test cannot drift from the
-/// claim pipeline's real surface (SanitationCheck/DiagnosticsCheck never
-/// flow through the claim loop and are deliberately absent).
+/// Both claim phases are new-work claims, so [`blocks_claim`] is
+/// phase-agnostic — the gate reduces to a single check.
 #[test]
-fn blocks_claim_gate_matrix() {
-    for &(source, phase) in CLAIM_PHASES {
-        let new_work = matches!(
-            phase,
-            PollPhase::BacklogAnalysis | PollPhase::EngineerDevelopment
-        );
-        // Pause gate: a paused Ready workspace freezes every claim.
-        let paused = Workspace {
-            status: WorkspaceStatus::Ready,
-            paused: true,
-            ..Default::default()
-        };
-        assert!(
-            blocks_claim(&paused, phase),
-            "pause gate mismatch for {} ({} → {}) — a paused workspace must freeze the implementation",
-            phase.info().log_label,
-            source.as_ref(),
-            phase.info().expected_phase.as_ref(),
-        );
-        // Baseline: a Ready + unpaused workspace runs everything.
-        let ready = Workspace {
-            status: WorkspaceStatus::Ready,
+fn blocks_claim_gate() {
+    // Pause gate: a paused Ready workspace freezes every claim.
+    let paused = Workspace {
+        status: WorkspaceStatus::Ready,
+        paused: true,
+        ..Default::default()
+    };
+    assert!(
+        blocks_claim(&paused),
+        "a paused Ready workspace must freeze the implementation"
+    );
+    // Baseline: a Ready + unpaused workspace runs everything.
+    let ready = Workspace {
+        status: WorkspaceStatus::Ready,
+        paused: false,
+        ..Default::default()
+    };
+    assert!(
+        !blocks_claim(&ready),
+        "claims must run when Ready and unpaused"
+    );
+    // Status gate: non-Ready + unpaused still blocks new work (missing or
+    // stale contexts).
+    for status in [
+        WorkspaceStatus::Pending,
+        WorkspaceStatus::Analyzing,
+        WorkspaceStatus::Failed,
+    ] {
+        let not_ready = Workspace {
+            status,
             paused: false,
             ..Default::default()
         };
         assert!(
-            !blocks_claim(&ready, phase),
-            "{} must run when Ready and unpaused",
-            phase.info().log_label,
+            blocks_claim(&not_ready),
+            "status gate mismatch for {status}",
         );
-        // Status gate: non-Ready + unpaused still blocks new work (missing or
-        // stale contexts) but lets later phases through.
-        for status in [
-            WorkspaceStatus::Pending,
-            WorkspaceStatus::Analyzing,
-            WorkspaceStatus::Failed,
-        ] {
-            let not_ready = Workspace {
-                status,
-                paused: false,
-                ..Default::default()
-            };
-            assert_eq!(
-                blocks_claim(&not_ready, phase),
-                new_work,
-                "status gate mismatch for {} ({})",
-                phase.info().log_label,
-                status,
-            );
-        }
     }
 }
 
@@ -769,7 +752,8 @@ async fn pipeline_pause_freeze_fail_open_on_struct_only_workspace() {
 /// the automatic claims on the next pipeline run.
 ///
 /// Later-phase claims (review/QA) are not part of the gate — covered by
-/// [`blocks_claim_gate_matrix`]; this test exercises the real
+/// [`blocks_claim_gate`] (which asserts the phase-agnostic gate); this
+/// test exercises the real
 /// [`run_claim_pipeline`] path for the two gated phases.
 ///
 /// Serialized with the reset_inflight tests: `run_claim_pipeline` claims
@@ -1607,7 +1591,7 @@ fn engineer_finalize_test_agent(ws: &Workspace, ticket: &Ticket, suffix: &str) -
 /// the workspace and freezes the implementation in place (the ticket stays in
 /// InDevelopment), and records the concrete error as a SYSTEM-role comment so
 /// the Manager notification and the resumed engineer's feedback surface it.
-
+///
 /// A GENUINE user-initiated cancellation of the engineer (via the user-stop
 /// signal) keeps today's semantics: ticket Failed + workspace paused, never
 /// auto-re-queued (no bounce). Distinct from an internal (code-driven)
@@ -2420,7 +2404,7 @@ async fn pickup_claim_claims_when_provider_configured() {
             .await
             .expect("fetch")
             .expect("exists");
-        assert_eq!(stored.status, WorkspaceStatus::Analyzing, "{}", status_msg);
+        assert_eq!(stored.status, WorkspaceStatus::Analyzing, "{status_msg}");
         assert!(
             stored.paused,
             "the claim must set the analysis pause (blocks pipeline claims while discovery runs)"
