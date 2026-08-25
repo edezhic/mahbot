@@ -361,7 +361,7 @@ async fn advance_to_next_stage_refreshes_ticket_phase_for_next_dispatch() {
         &ws,
         "job_advance_phase",
         conn,
-        None,
+        false,
         |_| {},
         move |ticket_arc, _ws| {
             let tx = tx.clone();
@@ -411,7 +411,7 @@ async fn advance_to_next_stage_freeze_does_not_dispatch() {
         &ws,
         "job_adv_freeze",
         conn,
-        None,
+        false,
         |_| {},
         move |_ticket_arc, _ws| {
             let tx = tx.clone();

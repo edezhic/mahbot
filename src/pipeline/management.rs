@@ -82,17 +82,6 @@ const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 /// 11th bounce fails). Enforced by the unified validation-failure bounce path.
 const MAX_BOUNCES: usize = 10;
 
-/// Implementation stage identifiers: human-readable stage-label strings used
-/// by the advance/sync handoff and [`verifier_success_stage`]. One
-/// implementation job owns a ticket's entire occupied pipeline; each stage is
-/// a dispatch unit on the SAME implementation job. The stage is no longer
-/// stored on `ticket_jobs`.
-const IMPLEMENTATION_STAGE_DEVELOPMENT: &str = "development";
-const IMPLEMENTATION_STAGE_DIAGNOSTICS: &str = "diagnostics";
-const IMPLEMENTATION_STAGE_REVIEW: &str = "review";
-const IMPLEMENTATION_STAGE_QA: &str = "qa";
-const IMPLEMENTATION_STAGE_SANITATION: &str = "sanitation";
-
 /// Returns the global [`BoardStore`] singleton.
 #[inline]
 fn board() -> &'static BoardStore {
@@ -1949,7 +1938,7 @@ async fn finalize_engineer_stage(
             ws,
             job_id,
             conn,
-            Some(IMPLEMENTATION_STAGE_DIAGNOSTICS),
+            true,
             |_| {},
             |ticket_arc, ws| dispatch_diagnostics(ticket_arc, ws).boxed(),
         )
@@ -2278,14 +2267,7 @@ fn dispatch_engineer(
         let conn = &crate::session::store().conn;
         // Sync the implementation's dispatch task for boot resume; the ticket
         // phase is the authoritative stage.
-        sync_implementation(
-            conn,
-            &job_id,
-            &ticket.id,
-            IMPLEMENTATION_STAGE_DEVELOPMENT,
-            Some(&message),
-        )
-        .await;
+        sync_implementation_task(conn, &job_id, &ticket.id, &message).await;
 
         run_stage_agent(
             &ticket,
@@ -2893,14 +2875,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, resumed: bool) 
             {
                 warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation skip comment");
             }
-            sync_implementation(
-                &crate::session::store().conn,
-                &job_id,
-                &ticket.id,
-                IMPLEMENTATION_STAGE_SANITATION,
-                None,
-            )
-            .await;
+            clear_implementation_roster(&crate::session::store().conn, &job_id, &ticket.id).await;
             let Some(porcelain) = ensure_git_or_done_and_get_status(
                 &ticket,
                 &ws,
@@ -2945,14 +2920,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, resumed: bool) 
         return;
     };
     let conn = &crate::session::store().conn;
-    sync_implementation(
-        conn,
-        &job_id,
-        &ticket.id,
-        IMPLEMENTATION_STAGE_SANITATION,
-        Some(&prompt),
-    )
-    .await;
+    sync_implementation_task(conn, &job_id, &ticket.id, &prompt).await;
 
     run_stage_agent(
         &ticket,
@@ -3003,14 +2971,7 @@ async fn process_sanitation_verdict(
             warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation pass comment");
         }
         let conn = &crate::session::store().conn;
-        sync_implementation(
-            conn,
-            job_id,
-            &ticket.id,
-            IMPLEMENTATION_STAGE_SANITATION,
-            None,
-        )
-        .await;
+        clear_implementation_roster(conn, job_id, &ticket.id).await;
         // Commit the changes and transition to Done (the implementation is
         // terminalized by the commit path).
         let Some(porcelain) =
@@ -3140,44 +3101,40 @@ async fn run_diagnostics_commands(diag: &DiagnosticsCommands, ws: &Workspace) ->
     (comment.trim_start_matches('\n').to_string(), all_passed)
 }
 
-/// Sync the implementation's per-stage effects at a stage handoff: `Some(task)`
-/// writes the stored dispatch task (at dispatch time, before the stage agent
-/// runs); `None` clears the prior stage's running-agent roster rows (at
-/// stage-completion handoff). No stage is written as a stored mirror — the
-/// ticket phase is the only stored representation. Failures log and continue —
-/// the implementation sync is best-effort; the next dispatch re-syncs.
-async fn sync_implementation(
+/// Write the implementation's stored dispatch task at dispatch time (before the
+/// stage agent runs) for boot resume. No stage is written as a stored mirror —
+/// the ticket phase is the only stored representation. Best-effort: failures log
+/// and continue — the next dispatch re-syncs.
+async fn sync_implementation_task(
     conn: &crate::db::Connection,
     job_id: &str,
     ticket_id: &str,
-    stage: &str,
-    task: Option<&str>,
+    task: &str,
 ) {
-    match task {
-        Some(task) => {
-            if let Err(e) = crate::jobs::update_implementation_job_task(conn, job_id, task).await {
-                warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to sync implementation task");
-            }
-        }
-        None => {
-            if let Err(e) = crate::jobs::clear_launched_agents_for_job(conn, job_id).await {
-                warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to clear running agents on stage handoff to {stage}");
-            }
-        }
+    if let Err(e) = crate::jobs::update_implementation_job_task(conn, job_id, task).await {
+        warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to sync implementation task");
     }
 }
 
-/// Unified "advance the implementation to the next stage and immediately
-/// dispatch the next stage's agent(s) in the same finalizer" epilogue. The
-/// single-owner pipeline invariant holds: each stage handoff dispatches the next
+/// Clear the prior stage's running-agent roster rows at a stage-completion
+/// handoff, unblocking re-dispatch. Best-effort: failures log and continue — the
+/// next dispatch re-syncs.
+async fn clear_implementation_roster(conn: &crate::db::Connection, job_id: &str, ticket_id: &str) {
+    if let Err(e) = crate::jobs::clear_launched_agents_for_job(conn, job_id).await {
+        warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to clear running agents on stage handoff");
+    }
+}
+
+/// Advance the implementation to the next stage and dispatch it in the same
+/// finalizer — the single-owner invariant: each stage handoff dispatches the next
 /// stage directly, so the implementation never waits on a separate poll tick.
 ///
-/// `sync` is `Some(stage)` when the stage handoff sync must run before dispatch
-/// (roster-clear on task=None, task write on task=Some); `None` on the
-/// validation-failure bounce path, where the re-dispatched engineer writes the
-/// dispatch task itself. No stage is written as a stored mirror — `sync` carries only
-/// the stage label for the handoff. The
-/// per-site `log` runs after the sync and before the spawn so the message stays
+/// `clear_roster` is `true` when the prior stage's running-agent roster rows must
+/// be cleared before the next stage dispatches (the normal stage-handoff path);
+/// `false` on the validation-failure bounce path, where the re-dispatched engineer
+/// writes its own dispatch task and roster row. No stage is written as a stored
+/// mirror — the ticket phase is the only stored representation. The per-site `log`
+/// runs after the roster-clear and before the spawn so the message stays
 /// byte-identical per caller; callers that do not log pass a no-op.
 /// `dispatch_next` builds the correct next-dispatch future:
 /// `dispatch_diagnostics`, `dispatch_verifiers(.., QA_VI, ..)`,
@@ -3187,7 +3144,7 @@ async fn advance_to_next_stage(
     ws: &Workspace,
     job_id: &str,
     conn: &crate::db::Connection,
-    sync: Option<&str>,
+    clear_roster: bool,
     log: impl FnOnce(&Ticket),
     dispatch_next: impl FnOnce(Arc<Ticket>, Workspace) -> BoxFuture<'static, ()> + Send + 'static,
 ) {
@@ -3196,8 +3153,8 @@ async fn advance_to_next_stage(
     if pipeline_pause_freeze(ticket, job_id).await {
         return;
     }
-    if let Some(stage) = sync {
-        sync_implementation(conn, job_id, &ticket.id, stage, None).await;
+    if clear_roster {
+        clear_implementation_roster(conn, job_id, &ticket.id).await;
     }
     log(ticket);
     // Refresh the ticket for the next-stage dispatch: the just-written
@@ -3255,7 +3212,7 @@ async fn conclude_diagnostics_success(
         ws,
         job_id,
         conn,
-        Some(IMPLEMENTATION_STAGE_REVIEW),
+        true,
         |_| {},
         |ticket_arc, ws| dispatch_verifiers(ticket_arc, ws, REVIEWER_VI, false),
     )
@@ -3362,8 +3319,9 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
             // Run commands sequentially in the prescribed order.
             let (comment, all_passed) = run_diagnostics_commands(&cmds, &ws).await;
 
-            // Post-run check: verify ticket hasn't been moved externally while
-            // diagnostics commands ran.
+            // Post-run check: if the ticket moved externally while diagnostics
+            // commands ran, clear the roster only (not complete the job) so the
+            // re-dispatch on the same implementation is unblocked.
             if guard_job_phase(&ticket.id, TicketPhase::InDiagnostics, &job_id, true).await {
                 return;
             }
@@ -4987,8 +4945,8 @@ async fn bounce_to_development(
             // Re-fetch the ticket fresh (with comments) so the re-dispatched
             // engineer sees the just-written failure/joint comment — a stale clone
             // would render implement.md instead of the bounce_feedback prompt.
-            // dispatch_engineer's sync_implementation writes the dispatch task,
-            // so no sync is needed here (a duplicate write would follow).
+            // Clear-roster sync is skipped: dispatch_engineer writes its own dispatch task
+            // and its roster row becomes the live guard for the re-dispatch.
             let fresh = crate::pipeline::board::store()
                 .get_ticket(&ticket.id)
                 .await
@@ -5000,7 +4958,7 @@ async fn bounce_to_development(
                 ws,
                 implementation_job_id,
                 conn,
-                None,
+                false,
                 |t| {
                     info!(
                         ticket = %t.id,
@@ -5109,7 +5067,6 @@ async fn process_verifier_verdicts(
             return false;
         }
         let conn = &crate::session::store().conn;
-        let next_stage = verifier_success_stage(verifier.role);
         // The implementation dispatches the next stage in the same finalizer: QA
         // after review, sanitation after QA.
         advance_to_next_stage(
@@ -5117,7 +5074,7 @@ async fn process_verifier_verdicts(
             ws,
             job_id,
             conn,
-            Some(next_stage),
+            true,
             |t| {
                 info!(
                     ticket = %t.id,
@@ -5155,14 +5112,6 @@ async fn process_verifier_verdicts(
     )
     .await;
     matches!(outcome, FinalizeOutcome::Applied)
-}
-
-/// Map a verifier role to the implementation stage that follows a successful pass.
-fn verifier_success_stage(role: Role) -> &'static str {
-    match role {
-        Role::Reviewer => IMPLEMENTATION_STAGE_QA,
-        _ => IMPLEMENTATION_STAGE_SANITATION,
-    }
 }
 
 /// Decide whether the reviewer pass may be skipped for a ticket.
@@ -5483,7 +5432,7 @@ async fn dispatch_verifiers_impl(
                         &ws,
                         &job_id,
                         conn,
-                        Some(IMPLEMENTATION_STAGE_QA),
+                        true,
                         |_| {},
                         |ticket_arc, ws| dispatch_verifiers(ticket_arc, ws, QA_VI, false),
                     )
@@ -5537,12 +5486,7 @@ async fn dispatch_verifiers_impl(
         return;
     };
     let conn = &crate::session::store().conn;
-    let stage = if is_reviewer {
-        IMPLEMENTATION_STAGE_REVIEW
-    } else {
-        IMPLEMENTATION_STAGE_QA
-    };
-    sync_implementation(conn, &job_id, &ticket.id, stage, Some(&prompt)).await;
+    sync_implementation_task(conn, &job_id, &ticket.id, &prompt).await;
 
     let slots = build_agent_slots(
         &ticket.id,
