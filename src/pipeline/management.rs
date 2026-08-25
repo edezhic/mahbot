@@ -10,7 +10,7 @@
 //! dispatch-finalizer (no separate poll tick).
 //!
 //! Poll phases — claims + implementation dispatch:
-//! - Backlog → spawn Analyst agents (3 parallel; escalates to 5 on unanimous blockers)
+//! - Backlog → spawn Analyst agents (3 parallel; escalates to 5 on blockers)
 //! - ReadyForDevelopment → spawn Engineer agent (creates the implementation)
 //! - Implementation iteration: an occupied implementation job whose stage agent is
 //!   not running re-dispatches its stage (development/diagnostics/review/qa/sanitation).
@@ -3398,7 +3398,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace) {
 
 /// Result from a single parallel verifier agent.
 ///
-/// Three mutually-exclusive states — the type system guarantees
+/// Four mutually-exclusive states — the type system guarantees
 /// that "no response" and "parse failure" cannot be confused.
 #[derive(Clone)]
 pub(crate) enum ParallelVerdict {
@@ -3413,6 +3413,18 @@ pub(crate) enum ParallelVerdict {
     ParseFailed(crate::retry::RetryExhausted),
     /// Agent produced a successfully-parsed verdict.
     Verdict(crate::Verdict),
+    /// Agent produced a blocker-verification verdict (analysis escalation).
+    BlockerVerification(crate::BlockerVerificationVerdict),
+}
+
+/// Structured-extraction behavior for a parallel round member.
+#[derive(Clone)]
+enum ExtractionMode {
+    /// Standard score+issues verdict (analysis base, review, QA).
+    ScoreVerdict,
+    /// Per-blocker verification (analysis escalation). Carries the aggregated
+    /// blocker list for fail-closed index/coverage validation.
+    BlockerVerification { blockers: std::sync::Arc<[String]> },
 }
 
 /// Reject verdict scores outside [0,10] — a garbage score must never pass any
@@ -3424,6 +3436,52 @@ fn validate_verdict_score(v: &crate::Verdict) -> Result<(), String> {
     } else {
         Err(format!("verdict score {} out of range [0,10]", v.score))
     }
+}
+
+/// Validate a blocker-verification verdict: non-empty, exact coverage of the
+/// injected blocker list (one item per index, in range, no duplicates), a
+/// non-empty `reasoning`, and a non-empty `sharpened_text` when the disposition
+/// is `Sharpened`.
+fn validate_blocker_verification(
+    v: &crate::BlockerVerificationVerdict,
+    blockers: &[String],
+) -> Result<(), String> {
+    if v.verdicts.is_empty() {
+        return Err("blocker verification returned no verdicts".to_string());
+    }
+    if v.verdicts.len() != blockers.len() {
+        return Err(format!(
+            "blocker verification returned {} verdicts for {} blockers",
+            v.verdicts.len(),
+            blockers.len()
+        ));
+    }
+    let mut seen = vec![false; blockers.len()];
+    for item in &v.verdicts {
+        if item.index >= blockers.len() {
+            return Err(format!("blocker index {} out of range", item.index));
+        }
+        if seen[item.index] {
+            return Err(format!("duplicate blocker index {}", item.index));
+        }
+        seen[item.index] = true;
+        if item.reasoning.trim().is_empty() {
+            return Err(format!("blocker {} missing reasoning", item.index));
+        }
+        if item.verdict == crate::BlockerDisposition::Sharpened
+            && item
+                .sharpened_text
+                .as_deref()
+                .map_or("", str::trim)
+                .is_empty()
+        {
+            return Err(format!(
+                "sharpened blocker {} requires sharpened_text",
+                item.index
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Human-readable stage name for a parallel-verdict role (used in the joint
@@ -3492,6 +3550,10 @@ async fn build_round_joint_comment(
                     dump: crate::util::scrub_credentials(&raw_response_dump_section(f)),
                 });
             }
+            ParallelVerdict::BlockerVerification(_) => {
+                // Escalation verdicts are not score+issues members; they are
+                // aggregated into the blocker-verification report.
+            }
         }
     }
     let round = crate::pipeline::joint_verdict::JointRound {
@@ -3540,6 +3602,11 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
         Role::Qa => load_prompt_sections("qa_angles.md"),
         _ => Vec::new(),
     }
+}
+
+/// Load the three base ticket-analysis angle sections for Backlog analysts.
+fn load_ticket_analysis_angles() -> Vec<String> {
+    load_prompt_sections("analyze/ticket_angles.md")
 }
 
 async fn checkpoint_parallel_outcomes(
@@ -3605,16 +3672,18 @@ fn assemble_parallel_results(
 ///
 /// Agents with empty responses get [`ParallelVerdict::NoResponse`]; agents that
 /// respond but fail to parse get [`ParallelVerdict::ParseFailed`]; successful
-/// agents get [`ParallelVerdict::Verdict`]. All extraction attempts run
-/// concurrently (leader-staggered: the first member starts immediately, the
-/// rest after its first LLM call so they hit its cached prefix; skipped on
-/// boot resume).
+/// agents get [`ParallelVerdict::Verdict`] (or
+/// [`ParallelVerdict::BlockerVerification`] for the escalation extraction mode).
+/// All extraction attempts run concurrently (leader-staggered: the first
+/// member starts immediately, the rest after its first LLM call so they hit its
+/// cached prefix; skipped on boot resume).
 #[expect(clippy::too_many_arguments)] // expected_phase is the live phase the round must match
 async fn run_parallel_agents(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
     role: Role,
     extraction_prompt: &str,
+    extract_mode: ExtractionMode,
     job_id: &str,
     slots: &[AgentSlot],
     resume: bool,
@@ -3646,6 +3715,7 @@ async fn run_parallel_agents(
                 let ticket = Arc::clone(ticket);
                 let ws = ws.clone();
                 let extraction_prompt = extraction_prompt.to_string();
+                let extract_mode = extract_mode.clone();
                 let agent_id = slot.agent_id.clone();
                 let task = slot.task.clone();
                 move |round: crate::agent::RoundOpts| async move {
@@ -3729,15 +3799,32 @@ async fn run_parallel_agents(
                         // failure the RetryExhausted (carrying the last-attempt raw
                         // text) flows into ParallelVerdict::ParseFailed for the ticket
                         // comment.
-                        let verdict = agent
-                            .extract_verdict::<crate::Verdict>(
-                                &extraction_prompt,
-                                Some(&validate_verdict_score),
-                                None,
-                            )
-                            .await;
+                        let verdict = match &extract_mode {
+                            ExtractionMode::ScoreVerdict => agent
+                                .extract_verdict::<crate::Verdict>(
+                                    &extraction_prompt,
+                                    Some(&validate_verdict_score),
+                                    None,
+                                )
+                                .await
+                                .map(ParallelVerdict::Verdict),
+                            ExtractionMode::BlockerVerification { blockers } => {
+                                let blockers = std::sync::Arc::clone(blockers);
+                                let validator = move |v: &crate::BlockerVerificationVerdict| {
+                                    validate_blocker_verification(v, &blockers)
+                                };
+                                agent
+                                    .extract_verdict::<crate::BlockerVerificationVerdict>(
+                                        &extraction_prompt,
+                                        Some(&validator),
+                                        None,
+                                    )
+                                    .await
+                                    .map(ParallelVerdict::BlockerVerification)
+                            }
+                        };
                         match verdict {
-                            Ok(v) => ParallelVerdict::Verdict(v),
+                            Ok(v) => v,
                             Err(e) => ParallelVerdict::ParseFailed(e),
                         }
                     }
@@ -3811,9 +3898,11 @@ fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
 // ── Ticket-analysis job roster (durable round record) ─────────────────
 
 /// One roster slot of a ticket_analysis round. Roster rows ARE the round record:
-/// dispatched_count = roster size; escalation appends slots 3,4 (re-evaluated
-/// only when roster size == 3); replay re-runs missing agents FIRST, then
-/// re-processes when all outcomes present.
+/// dispatched_count = roster size; escalation appends slots 3,4 when the base
+/// round aggregated blockers (the new verdicts re-evaluate each flagged blocker);
+/// replay re-runs missing agents FIRST, then re-processes when all outcomes
+/// present.
+#[derive(Clone)]
 struct AgentSlot {
     /// Dispatch slot index (0-based; escalation continues at 3, 4).
     idx: i64,
@@ -3827,7 +3916,7 @@ struct AgentSlot {
 }
 
 /// Serialize a [`ParallelVerdict`] into the agents.outcome column. Tagged JSON
-/// keeps the three variants distinct so replay reconstruction is exact.
+/// keeps the variants distinct so replay reconstruction is exact.
 fn serialize_verdict_outcome(result: &ParallelVerdict) -> String {
     match result {
         ParallelVerdict::Verdict(v) => serde_json::json!({ "verdict": v }).to_string(),
@@ -3836,6 +3925,9 @@ fn serialize_verdict_outcome(result: &ParallelVerdict) -> String {
         }
         ParallelVerdict::ParseFailed(f) => {
             serde_json::json!({ "parse_failed": raw_response_dump_section(f) }).to_string()
+        }
+        ParallelVerdict::BlockerVerification(v) => {
+            serde_json::json!({ "blocker_verification": v }).to_string()
         }
     }
 }
@@ -3857,6 +3949,13 @@ fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
         ParallelVerdict::NoResponse(r.to_string())
     } else if let Some(p) = v.get("parse_failed").and_then(serde_json::Value::as_str) {
         ParallelVerdict::NoResponse(p.to_string())
+    } else if let Some(v) = v.get("blocker_verification") {
+        match serde_json::from_value(v.clone()) {
+            Ok(bv) => ParallelVerdict::BlockerVerification(bv),
+            Err(_) => {
+                ParallelVerdict::NoResponse("unreadable stored blocker verification".to_string())
+            }
+        }
     } else {
         ParallelVerdict::NoResponse("unrecognized stored outcome".to_string())
     }
@@ -3886,8 +3985,8 @@ fn agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
 /// canonical angle-cycling rule shared by [`spawn_ticket_analysis_round`] and
 /// [`append_ticket_analysis_slots`].
 ///
-/// `angles` are the per-agent angle supplements from [`load_verifier_angles`]
-/// (empty for non-verifier roles → the shared prompt is used untouched).
+/// `angles` are the per-agent angle supplements supplied by the caller
+/// (empty → the shared prompt is used untouched).
 /// `slot_count` is the TOTAL number of slots in the job; `global_idx` is the
 /// slot's index within the job (base round: `i`; escalation: `roster_len + k`).
 ///
@@ -3895,7 +3994,9 @@ fn agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
 /// - `slot_count == 1` (single-agent round, e.g. QA's lone tester) →
 ///   concatenate ALL angle sections;
 /// - otherwise → `prompt` + the angle section selected by
-///   `global_idx % angles.len()` (defensive cycling; reviewers max at 4).
+///   `global_idx % angles.len()` (defensive cycling — the ticket base round has
+///   exactly 3 angles for its 3 slots; reviewer/QA rounds dispatch at most 4
+///   slots against their own angle lists).
 ///
 /// KV-cache discipline: the variation is limited to the user message — model,
 /// reasoning effort, and tools stay identical across agents.
@@ -3920,27 +4021,28 @@ fn agent_slot_task(
 ///
 /// `start_idx` is the slot's global starting index within the job — 0 for a
 /// fresh round, `roster_len` for an escalation batch. `slot_count` is the
-/// TOTAL number of slots in the job (used by the angle rule so escalation is
-/// continuous with the base-round slots); `count` is the size of this batch.
-/// Shared by [`spawn_ticket_analysis_round`], [`append_ticket_analysis_slots`],
-/// and the verifier dispatch so the id/task rules cannot drift.
+/// TOTAL number of slots in the job (used by the angle-cycling rule so the
+/// angle selection stays continuous when a batch carries angles); `count` is
+/// the size of this batch. Shared by [`spawn_ticket_analysis_round`],
+/// [`append_ticket_analysis_slots`], and the verifier dispatch so the id/task
+/// rules cannot drift.
 #[must_use]
 fn build_agent_slots(
     ticket_id: &str,
     role: Role,
     prompt: &str,
+    angles: &[String],
     slot_count: usize,
     start_idx: i64,
     count: usize,
 ) -> Vec<AgentSlot> {
     let suffix = crate::generate_suffix();
-    let angles = load_verifier_angles(role);
     let mut slots = Vec::with_capacity(count);
     let global_start = usize::try_from(start_idx).unwrap_or(usize::MAX);
     for k in 0..count {
         let idx = start_idx + i64::try_from(k).unwrap_or(i64::MAX);
         let agent_id = agent_id(ticket_id, idx, &suffix, role);
-        let task = agent_slot_task(prompt, &angles, slot_count, global_start + k);
+        let task = agent_slot_task(prompt, angles, slot_count, global_start + k);
         slots.push(AgentSlot {
             idx,
             agent_id,
@@ -3964,7 +4066,15 @@ async fn spawn_ticket_analysis_round(
     count: usize,
 ) -> anyhow::Result<(String, Vec<AgentSlot>)> {
     let job_id = crate::generate_id();
-    let slots = build_agent_slots(&ticket.id, role, prompt, count, 0, count);
+    let slots = build_agent_slots(
+        &ticket.id,
+        role,
+        prompt,
+        &load_ticket_analysis_angles(),
+        count,
+        0,
+        count,
+    );
     let agents: Vec<crate::jobs::NewAgent> = slots
         .iter()
         .map(|s| crate::jobs::NewAgent {
@@ -3992,7 +4102,9 @@ async fn spawn_ticket_analysis_round(
     Ok((job_id, slots))
 }
 
-/// Append escalation slots (3, 4) to an existing ticket_analysis job.
+/// Append escalation slots (3, 4) to an existing ticket_analysis job. Escalation
+/// slots are purely blocker-verification focused and deliberately inherit NO
+/// base angle supplement (`&[]`).
 async fn append_ticket_analysis_slots(
     ticket: &Ticket,
     job_id: &str,
@@ -4003,11 +4115,9 @@ async fn append_ticket_analysis_slots(
     let roster = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
     let roster_len = roster.len();
     let next_idx = i64::try_from(roster_len).unwrap_or(i64::MAX);
-    // The angle rule sees the job as a whole: slot_count is the TOTAL roster
-    // size (base + escalation) and the global index (roster_len + k) keeps
-    // angle selection continuous with the base-round slots.
-    let slot_count = roster_len + count;
-    let slots = build_agent_slots(&ticket.id, role, prompt, slot_count, next_idx, count);
+    // Escalation slots carry no angles, so `slot_count` is irrelevant to the
+    // angle rule — pass the batch size.
+    let slots = build_agent_slots(&ticket.id, role, prompt, &[], count, next_idx, count);
     for slot in &slots {
         crate::session::store()
             .conn
@@ -4045,88 +4155,104 @@ async fn load_ticket_analysis_slots(job_id: &str) -> anyhow::Result<Vec<AgentSlo
 
 /// Round-ness of a per-run analysis job. `Base` is the initial
 /// [`ANALYSIS_BASE_ROSTER_SIZE`]-slot dispatch; `Escalation` is the +2 batch
-/// appended when every base analyst flags blockers. Round-ness is computed
-/// ONCE at the dispatch/resume boundary and threaded into the escalation gate —
-/// never reconstructed from roster length.
+/// appended when the base round aggregated blockers. Round-ness is threaded
+/// from the dispatch boundary into the escalation gate; the boot-resume path
+/// reconstructs it from the roster (any slot idx >= `ANALYSIS_BASE_ROSTER_SIZE`
+/// means the round already escalated).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalysisRoundKind {
     Base,
     Escalation,
 }
 
-/// Escalate a unanimous-blocker analysis round with 2 extra analysts on the
-/// SAME job, extending `results`. Returns false when the ticket left the
-/// Analysis phase — the job was already completed; the caller must return.
+/// Escalate a base analysis round that flagged blockers: run 2 blocker-
+/// verification analysts on the SAME job, extending `results`. Returns false
+/// when the ticket left the Analysis phase — the job was already completed; the
+/// caller must return.
 ///
-/// Roster gate: escalation is re-evaluated only for a `Base` round — an
-/// `Escalation` round never re-escalates. On resume this guards against
-/// re-escalation after a crash between the base round and the escalation
-/// batch. Skipped during the graceful drain — no new jobs are spawned while
-/// draining.
+/// When the aggregated blocker list is empty no escalation is dispatched and the
+/// round proceeds fail-open (planning) unchanged. Skipped during the graceful
+/// drain — no new jobs are spawned while draining.
 #[must_use]
-#[expect(clippy::too_many_arguments)]
 async fn maybe_escalate_analysis(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
     job_id: &str,
-    extraction_prompt: &str,
-    task: &str,
-    resume: bool,
-    round_kind: AnalysisRoundKind,
+    resumed: bool,
     results: &mut Vec<ParallelVerdict>,
 ) -> bool {
-    if round_kind == AnalysisRoundKind::Base
-        && crate::pipeline::joint_verdict::analysis_escalation_needed(
-            results,
-            ANALYSIS_BASE_ROSTER_SIZE,
-        )
-        && !crate::shutdown::aborting()
-    {
-        // Re-check the phase before spending the second batch — the ticket
-        // may have been moved externally while the first batch ran.
-        if guard_job_phase(&ticket.id, TicketPhase::Analysis, job_id, false).await {
-            return false;
-        }
-        if resume {
-            info!(ticket = %ticket.id, job = %job_id, "Resume: escalating with 2 additional analysts");
-        } else {
-            info!(ticket = %ticket.id, "All analysts flagged blockers — escalating with 2 additional analysts");
-        }
-        let extra_slots = match append_ticket_analysis_slots(ticket, job_id, Role::Analyst, task, 2)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                if resume {
-                    warn!(job = %job_id, error = %e, "Resume: escalation slot append failed — proceeding");
-                } else {
-                    warn!(ticket = %ticket.id, error = %e, "Failed to append escalation slots — proceeding with base round");
-                }
-                Vec::new()
-            }
-        };
-        let extra = if extra_slots.is_empty() {
-            Vec::new()
-        } else {
-            run_parallel_agents(
-                ticket,
-                ws,
-                Role::Analyst,
-                extraction_prompt,
-                job_id,
-                &extra_slots,
-                resume,
-                TicketPhase::Analysis,
-            )
-            .await
-        };
-        results.extend(extra);
+    let blockers = aggregate_blockers(results);
+    if blockers.is_empty() {
+        return true;
     }
+    if crate::shutdown::aborting() {
+        return true;
+    }
+    if guard_job_phase(&ticket.id, TicketPhase::Analysis, job_id, false).await {
+        return false;
+    }
+    if resumed {
+        info!(
+            ticket = %ticket.id,
+            job = %job_id,
+            blockers = blockers.len(),
+            "Resume: escalating with 2 additional blocker-verification analysts",
+        );
+    } else {
+        info!(
+            ticket = %ticket.id,
+            blockers = blockers.len(),
+            "Base analysis flagged blockers — escalating with 2 additional analysts",
+        );
+    }
+    let escalation_task = substitute(
+        &load_prompt("analyze/blocker_verification.md"),
+        &[("{{blockers}}", &format_blocker_list(&blockers))],
+    );
+    let extra_slots = match append_ticket_analysis_slots(
+        ticket,
+        job_id,
+        Role::Analyst,
+        &escalation_task,
+        2,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            if resumed {
+                warn!(job = %job_id, error = %e, "Resume: escalation slot append failed — proceeding");
+            } else {
+                warn!(ticket = %ticket.id, error = %e, "Failed to append escalation slots — proceeding with base round");
+            }
+            Vec::new()
+        }
+    };
+    if extra_slots.is_empty() {
+        return true;
+    }
+    let extraction_prompt = load_prompt("extraction/blocker_verification.md");
+    let blockers_arc = std::sync::Arc::<[String]>::from(blockers);
+    let extra = run_parallel_agents(
+        ticket,
+        ws,
+        Role::Analyst,
+        &extraction_prompt,
+        ExtractionMode::BlockerVerification {
+            blockers: blockers_arc,
+        },
+        job_id,
+        &extra_slots,
+        resumed,
+        TicketPhase::Analysis,
+    )
+    .await;
+    results.extend(extra);
     true
 }
 
 /// Spawn 3 parallel analyst agents (base) to research a backlog ticket,
-/// escalating to 5 when every dispatched analyst flags blockers. One joint
+/// escalating to 5 when the base round aggregates blockers. One joint
 /// comment (role = stage name "Analysis") replaces the per-agent comments and
 /// the system summary; the ticket then transitions to Planning:
 /// - Planning (notify) when ALL analysts pass (≥ `ANALYST_PASS_THRESHOLD`/10)
@@ -4185,27 +4311,22 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace) {
         &ws,
         &job_id,
         &slots,
-        &message,
         false,
         AnalysisRoundKind::Base,
     )
     .await;
 }
 
-/// Run an analysis round: parallel analysts, unanimous-blocker escalation,
-/// then verdict finalization. Shared by fresh dispatch and boot resume so the
-/// post-round tail stays in lockstep.
-///
-/// `task` is the message the agents were dispatched with — on fresh dispatch
-/// the in-memory prompt, on resume re-read from `jobs.task`. Equal by
-/// construction of [`crate::jobs::spawn_job`] (it stores the message as
-/// `jobs.task`); if that ever changes, the resume path silently diverges.
+/// Run an analysis round: parallel analysts, optional blocker-verification
+/// escalation, then verdict finalization. Shared by fresh dispatch and boot
+/// resume so the post-round tail stays in lockstep.
 ///
 /// Analysis stays fail-open — the ticket always advances to Planning, the
-/// Manager decides. Escalation is re-evaluated ONLY for a `Base` round (see
-/// [`maybe_escalate_analysis`]): on resume this guards against re-escalation
-/// after a crash between the base round and the escalation batch. The drain
-/// guard mirrors the fresh dispatch path.
+/// Manager decides. The `Base` branch runs the score+issues round and may
+/// escalate; the `Escalation` branch re-verifies the base round's aggregated
+/// blockers (boot-resume only — escalation is appended within the `Base`
+/// branch, never dispatched fresh). The drain guard mirrors the fresh dispatch
+/// path.
 ///
 /// Early-returns (without finalizing) when the ticket left the Analysis phase
 /// — both callers end with this call, so nothing may follow it.
@@ -4214,37 +4335,64 @@ async fn run_analysis_round(
     ws: &Workspace,
     job_id: &str,
     slots: &[AgentSlot],
-    task: &str,
     resumed: bool,
     round_kind: AnalysisRoundKind,
 ) {
-    let extraction_prompt = load_prompt("extraction/analyst.md");
-    let mut results = run_parallel_agents(
-        ticket,
-        ws,
-        Role::Analyst,
-        &extraction_prompt,
-        job_id,
-        slots,
-        resumed,
-        TicketPhase::Analysis,
-    )
-    .await;
-    if !maybe_escalate_analysis(
-        ticket,
-        ws,
-        job_id,
-        &extraction_prompt,
-        task,
-        resumed,
-        round_kind,
-        &mut results,
-    )
-    .await
-    {
-        return;
+    match round_kind {
+        AnalysisRoundKind::Base => {
+            let extraction_prompt = load_prompt("extraction/analyst.md");
+            let mut results = run_parallel_agents(
+                ticket,
+                ws,
+                Role::Analyst,
+                &extraction_prompt,
+                ExtractionMode::ScoreVerdict,
+                job_id,
+                slots,
+                resumed,
+                TicketPhase::Analysis,
+            )
+            .await;
+            // The base outcomes precede any escalation batch appended below.
+            let base_count = results.len();
+            if !maybe_escalate_analysis(ticket, ws, job_id, resumed, &mut results).await {
+                return;
+            }
+            let (base_results, escalation_results) = results.split_at(base_count);
+            finalize_analysis_round(ws, ticket, base_results, escalation_results, job_id).await;
+        }
+        AnalysisRoundKind::Escalation => {
+            // Base slots are checkpointed (Done/Failed) when escalation is
+            // appended, so only the escalation slots remain to run. Recover the
+            // base outcomes to rebuild the blocker universe (for extraction
+            // validation and the final report), then run the escalation batch
+            // under the blocker-verification extraction.
+            let base_results = base_outcome_results(slots);
+            let blockers = aggregate_blockers(&base_results);
+            let base_roster = i64::try_from(ANALYSIS_BASE_ROSTER_SIZE).unwrap_or(i64::MAX);
+            let escalation_slots: Vec<AgentSlot> = slots
+                .iter()
+                .filter(|s| s.idx >= base_roster)
+                .cloned()
+                .collect();
+            let extraction_prompt = load_prompt("extraction/blocker_verification.md");
+            let escalation_results = run_parallel_agents(
+                ticket,
+                ws,
+                Role::Analyst,
+                &extraction_prompt,
+                ExtractionMode::BlockerVerification {
+                    blockers: std::sync::Arc::from(blockers),
+                },
+                job_id,
+                &escalation_slots,
+                resumed,
+                TicketPhase::Analysis,
+            )
+            .await;
+            finalize_analysis_round(ws, ticket, &base_results, &escalation_results, job_id).await;
+        }
     }
-    finalize_analysis_round(ws, ticket, &results, job_id).await;
 }
 
 /// Evaluate analyst verdicts and transition the ticket:
@@ -4257,18 +4405,26 @@ async fn run_analysis_round(
 ///
 /// See the "Parallel agent helpers (shared)" section for why this is separate
 /// from [`process_verifier_verdicts`].
-async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[ParallelVerdict]) {
-    let nonempty_count = results
+async fn process_analyst_verdicts(
+    ws: &Workspace,
+    ticket: &Ticket,
+    base_results: &[ParallelVerdict],
+    escalation_results: &[ParallelVerdict],
+) {
+    // `base_results` are the score+issues outcomes of the base round; the
+    // readiness summary reflects only them. `escalation_results` carry the
+    // blocker-verification round (or its failures) and drive the report below.
+    let nonempty_count = base_results
         .iter()
         .filter(|r| !matches!(r, ParallelVerdict::NoResponse(_)))
         .count();
-    let dispatched = results.len();
+    let dispatched = base_results.len();
     let mut lgtm = 0usize;
     let mut minor_issues = 0usize;
     let mut potential_blockers = 0usize;
     let mut missing_analysis = 0usize;
 
-    for r in results {
+    for r in base_results {
         match r {
             ParallelVerdict::Verdict(v)
                 if v.score >= ANALYST_PASS_THRESHOLD && v.issues_detected.is_empty() =>
@@ -4280,6 +4436,8 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
             ParallelVerdict::NoResponse(_) | ParallelVerdict::ParseFailed(_) => {
                 missing_analysis += 1;
             }
+            // Escalation outcomes are passed separately.
+            ParallelVerdict::BlockerVerification(_) => unreachable!(),
         }
     }
 
@@ -4310,9 +4468,9 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
     // lock (the comment+transition transaction serializes all board writes).
     // Always written — the audit trail needs a per-round stage comment even
     // on fully clean rounds.
-    let joint_comment = build_round_joint_comment(
+    let mut joint_comment = build_round_joint_comment(
         stage_name(Role::Analyst),
-        results,
+        base_results,
         ANALYST_PASS_THRESHOLD,
         Role::Analyst,
         &summary,
@@ -4321,6 +4479,10 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
         &ticket.title,
     )
     .await;
+
+    // The escalation round verifies the base flag: surface only the current,
+    // actionable blocker list (confirmed + sharpened; refuted dropped).
+    append_escalation_report(&mut joint_comment, base_results, escalation_results);
 
     if !matches!(
         with_comment_and_transition(
@@ -4374,7 +4536,8 @@ async fn process_analyst_verdicts(ws: &Workspace, ticket: &Ticket, results: &[Pa
 async fn finalize_analysis_round(
     ws: &Workspace,
     ticket: &Ticket,
-    results: &[ParallelVerdict],
+    base_results: &[ParallelVerdict],
+    escalation_results: &[ParallelVerdict],
     job_id: &str,
 ) {
     if guard_job_phase(&ticket.id, TicketPhase::Analysis, job_id, false).await {
@@ -4390,7 +4553,7 @@ async fn finalize_analysis_round(
     if analysis_pause_freeze(ticket, job_id).await {
         return;
     }
-    process_analyst_verdicts(ws, ticket, results).await;
+    process_analyst_verdicts(ws, ticket, base_results, escalation_results).await;
     if crate::shutdown::aborting() {
         return;
     }
@@ -4432,6 +4595,165 @@ fn format_analyst_summary(
     .join(", ");
 
     format!("{total} analysts reviewed this ticket. {description}.")
+}
+
+/// Normalize a blocker string for dedup: trim, casefold, collapse whitespace.
+fn normalize_blocker(raw: &str) -> String {
+    raw.trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Aggregate the base round's blockers: the UNION of `issues_detected` from
+/// sub-threshold (`< ANALYST_PASS_THRESHOLD`) verdicts, deduplicated by
+/// normalized text. Empty when no base analyst flagged a blocker.
+fn aggregate_blockers(results: &[ParallelVerdict]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in results {
+        if let ParallelVerdict::Verdict(v) = r
+            && v.score < ANALYST_PASS_THRESHOLD
+        {
+            for issue in &v.issues_detected {
+                if seen.insert(normalize_blocker(issue)) {
+                    out.push(issue.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Apply the escalation agents' verdicts to the blocker list. A blocker is
+/// dropped only when EVERY verifying agent refutes it; otherwise `Sharpened`
+/// replaces the text (first sharpened text wins) and everything else is kept.
+///
+/// Callers pass verdicts that [`validate_blocker_verification`] already ensured
+/// are in-range and cover every blocker; an out-of-range index would be a
+/// corruption bug and panics loudly rather than silently dropping a blocker.
+fn apply_blocker_verification(
+    blockers: &[String],
+    verdicts: &[&crate::BlockerVerificationVerdict],
+) -> Vec<String> {
+    let mut judged = vec![0usize; blockers.len()];
+    let mut refuted = vec![0usize; blockers.len()];
+    let mut sharpened: Vec<Option<String>> = vec![None; blockers.len()];
+    for round in verdicts {
+        for item in &round.verdicts {
+            judged[item.index] += 1;
+            match item.verdict {
+                crate::BlockerDisposition::Refuted => refuted[item.index] += 1,
+                crate::BlockerDisposition::Sharpened => {
+                    if sharpened[item.index].is_none() {
+                        sharpened[item.index].clone_from(&item.sharpened_text);
+                    }
+                }
+                crate::BlockerDisposition::Confirmed => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (i, blocker) in blockers.iter().enumerate() {
+        let all_refuted = judged[i] > 0 && refuted[i] == judged[i];
+        if all_refuted {
+            continue;
+        }
+        out.push(sharpened[i].clone().unwrap_or_else(|| blocker.clone()));
+    }
+    out
+}
+
+/// Number the blocker list for the escalation prompt `{{blockers}}` template.
+/// Indices are 0-based to match the `index` field the extraction schema asks
+/// the verifier to report back.
+fn format_blocker_list(blockers: &[String]) -> String {
+    blockers
+        .iter()
+        .enumerate()
+        .map(|(i, b)| format!("{i}. {b}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Recover the base-verdict outcomes for a job roster (slots with
+/// idx < ANALYSIS_BASE_ROSTER_SIZE that carry a persisted outcome — Done or
+/// Failed; escalation is only appended after the base round is checkpointed) —
+/// used to rebuild the escalation blocker universe on the boot-resume path.
+fn base_outcome_results(slots: &[AgentSlot]) -> Vec<ParallelVerdict> {
+    let base_roster = i64::try_from(ANALYSIS_BASE_ROSTER_SIZE).unwrap_or(i64::MAX);
+    slots
+        .iter()
+        .filter(|s| s.idx < base_roster)
+        .filter_map(|s| s.outcome.as_deref().map(deserialize_verdict_outcome))
+        .collect()
+}
+
+/// Render the escalation round's verification outcome: the current, actionable
+/// blocker list (confirmed + sharpened; refuted dropped).
+fn format_blocker_verification_report(blockers: &[String], final_blockers: &[String]) -> String {
+    let mut out = String::from("\n\n### Blocker verification\n");
+    if final_blockers.is_empty() {
+        out.push_str(
+            "All flagged blockers were refuted by the verification round — no blockers remain.",
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "{} of {} flagged blocker(s) survived verification. Remaining actionable blockers:",
+            final_blockers.len(),
+            blockers.len(),
+        );
+        for (i, b) in final_blockers.iter().enumerate() {
+            let _ = write!(out, "\n{}. {b}", i + 1);
+        }
+    }
+    out
+}
+
+/// Append the escalation round's verdict to the joint comment: surface only the
+/// current, actionable blocker list (confirmed + sharpened; refuted dropped).
+/// If every escalation agent failed to produce a valid verdict, note that the
+/// base-round blockers remain unverified; if only some failed, note the
+/// non-participation alongside the partial verdict set.
+fn append_escalation_report(
+    joint_comment: &mut String,
+    base_results: &[ParallelVerdict],
+    escalation_results: &[ParallelVerdict],
+) {
+    let verification: Vec<&crate::BlockerVerificationVerdict> = escalation_results
+        .iter()
+        .filter_map(|r| match r {
+            ParallelVerdict::BlockerVerification(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+    let dispatched = escalation_results.len();
+    let succeeded = verification.len();
+    if succeeded == 0 {
+        if dispatched > 0 {
+            joint_comment.push_str(
+                "\n\n### Blocker verification\n\
+                 The verification round could not produce a verdict — the base-round \
+                 blockers remain unverified.",
+            );
+        }
+        return;
+    }
+    let blockers = aggregate_blockers(base_results);
+    let final_blockers = apply_blocker_verification(&blockers, &verification);
+    joint_comment.push_str(&format_blocker_verification_report(
+        &blockers,
+        &final_blockers,
+    ));
+    if succeeded < dispatched {
+        let _ = write!(
+            joint_comment,
+            "\n\nNote: only {succeeded} of {dispatched} verifier(s) returned a verdict; the \
+             failed verifier(s) did not participate."
+        );
+    }
 }
 
 // ── Bounce breaker sibling drain ──────────────────────────────
@@ -4931,8 +5253,9 @@ async fn resume_implementation_job(job_id: String, ticket: Ticket, ws: Workspace
 /// Resume an analysis round: re-run not-done roster slots, re-evaluate
 /// escalation only for a `Base` round (round-kind inferred from the loaded
 /// roster: any slot idx >= ANALYSIS_BASE_ROSTER_SIZE means the round already
-/// escalated), then re-process verdicts through the existing
-/// process_analyst_verdicts.
+/// escalated), then re-process verdicts through [`process_analyst_verdicts`].
+/// An `Escalation` round re-runs its remaining slots under the
+/// blocker-verification extraction (never the base score+issues extractor).
 async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     if guard_job_phase(&ticket.id, TicketPhase::Analysis, job_id, false).await {
         return;
@@ -4946,7 +5269,6 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
         return;
     };
     let ticket_arc = Arc::new(ticket);
-    let task = job_task(job_id).await;
     let round_kind = if slots
         .iter()
         .any(|s| s.idx >= i64::try_from(ANALYSIS_BASE_ROSTER_SIZE).unwrap_or(i64::MAX))
@@ -4955,7 +5277,7 @@ async fn resume_analysis_round(job_id: &str, ticket: Ticket, ws: Workspace) {
     } else {
         AnalysisRoundKind::Base
     };
-    run_analysis_round(&ticket_arc, &ws, job_id, &slots, &task, true, round_kind).await;
+    run_analysis_round(&ticket_arc, &ws, job_id, &slots, true, round_kind).await;
 }
 
 /// Stage all changes and record the ticket's reviewed base (HEAD + index tree)
@@ -5007,21 +5329,6 @@ async fn record_reviewed_base_after_review(
             }
         }
     }
-}
-
-/// Read a job's stored task (the FINAL rendered prompt template).
-async fn job_task(job_id: &str) -> String {
-    crate::session::store()
-        .conn
-        .query_optional(
-            "SELECT task FROM jobs WHERE id = ?1",
-            crate::db::params![job_id],
-            |row| row.get::<String>(0),
-        )
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
 }
 
 /// Finalize a verifier round (review/QA) — shared by fresh dispatch and boot
@@ -5189,7 +5496,15 @@ async fn dispatch_verifiers_impl(
     };
     sync_implementation(conn, &job_id, &ticket.id, stage, Some(&prompt)).await;
 
-    let slots = build_agent_slots(&ticket.id, vi.role, &prompt, count, 0, count);
+    let slots = build_agent_slots(
+        &ticket.id,
+        vi.role,
+        &prompt,
+        &load_verifier_angles(vi.role),
+        count,
+        0,
+        count,
+    );
     // Write the launched roster rows so the re-dispatch guard blocks and
     // mid-run comments route to the verifier agents. The `agents.kind` labels
     // the round; analysis's own roster rows are written at spawn time.
@@ -5217,6 +5532,7 @@ async fn dispatch_verifiers_impl(
         &ws,
         vi.role,
         &extraction_prompt,
+        ExtractionMode::ScoreVerdict,
         &job_id,
         &slots,
         resumed,

@@ -789,6 +789,36 @@ pub(crate) struct Verdict {
     pub issues_detected: Vec<String>,
 }
 
+/// Disposition of a single aggregated blocker after the escalation round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BlockerDisposition {
+    Confirmed,
+    Refuted,
+    Sharpened,
+}
+
+/// One blocker's verification verdict from an escalation analyst.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct BlockerVerificationItem {
+    /// 0-based index of the blocker in the injected list.
+    pub index: usize,
+    /// Disposition of the blocker.
+    pub verdict: BlockerDisposition,
+    /// Evidence-backed justification (required).
+    pub reasoning: String,
+    /// Replacement text when the verdict is `Sharpened`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharpened_text: Option<String>,
+}
+
+/// Result of one escalation analyst verifying the aggregated blocker list.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct BlockerVerificationVerdict {
+    /// One item per injected blocker (coverage validated).
+    pub verdicts: Vec<BlockerVerificationItem>,
+}
+
 /// Deserialize a verdict score, self-healing common model emissions:
 /// - [0,10] values pass through; fractional values floor (8.5 → 8).
 /// - [11,100] divides by 10 then floors (85 → 8, 11 → 1, 100 → 10).

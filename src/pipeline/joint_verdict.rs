@@ -341,25 +341,6 @@ pub(crate) fn review_agent_count(base: usize, priority: i64) -> usize {
     if priority == 0 { base.max(3) } else { base }
 }
 
-/// Whether a second batch of analysts is needed: the base dispatch (the
-/// actually-dispatched count, passed by the caller) all produced verdicts AND
-/// every one flagged blockers (score below the analyst pass threshold —
-/// unanimous blocker escalation).
-#[must_use]
-pub(crate) fn analysis_escalation_needed(
-    results: &[crate::pipeline::management::ParallelVerdict],
-    dispatched: usize,
-) -> bool {
-    results.len() == dispatched
-        && results.iter().all(|r| {
-            matches!(
-                r,
-                crate::pipeline::management::ParallelVerdict::Verdict(v)
-                    if v.score < crate::pipeline::management::ANALYST_PASS_THRESHOLD
-            )
-        })
-}
-
 #[cfg(test)]
 #[path = "joint_verdict_tests.rs"]
 mod tests;

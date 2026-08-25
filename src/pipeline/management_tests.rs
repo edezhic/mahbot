@@ -306,6 +306,7 @@ async fn parallel_round_phase_gate_bail_unregisters_router() {
         &ws,
         Role::Analyst,
         "extract",
+        ExtractionMode::ScoreVerdict,
         "pg_bail_job",
         &slots,
         false,
@@ -924,7 +925,7 @@ async fn process_analyst_verdicts_cases() {
 
         let ticket = expect_ticket(board(), &ticket_id).await;
 
-        process_analyst_verdicts(&ws, &ticket, &case.results).await;
+        process_analyst_verdicts(&ws, &ticket, &case.results, &[]).await;
 
         let phase = expect_ticket_phase(board(), &ticket_id).await;
         assert_eq!(
@@ -989,7 +990,7 @@ async fn analyst_round_fails_open_with_fallback_comment() {
         analyst_verdict(3, &["Missing data"]),
     ];
     let ticket = expect_ticket(board(), &ticket_id).await;
-    process_analyst_verdicts(&ws, &ticket, &results).await;
+    process_analyst_verdicts(&ws, &ticket, &results, &[]).await;
 
     let phase = expect_ticket_phase(board(), &ticket_id).await;
     assert_eq!(phase, TicketPhase::Planning, "fail-open must advance");
@@ -1010,6 +1011,145 @@ async fn analyst_round_fails_open_with_fallback_comment() {
     assert!(
         joint.content.contains("Missing data"),
         "deterministic issues must render: {}",
+        joint.content,
+    );
+}
+
+// ── process_analyst_verdicts — blocker verification escalation ────────
+
+/// The escalation round verifies only the base round's aggregated blockers:
+/// the joint comment's summary reflects the base analysts only (escaped
+/// escalation failures are never counted), and a verified escalation appends an
+/// actionable blocker list (confirmed + sharpened; refuted dropped).
+///
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
+/// concurrent boot reset would clobber the fixture phases).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn process_analyst_verdicts_escalation_round() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
+
+    // Base round: one analyst flags a blocker, two pass. Escalation round:
+    // one agent confirms blocker 0 and sharpens blocker 1; the other confirms
+    // blocker 0 and refutes blocker 1.
+    let base_results = vec![
+        analyst_verdict(6, &["Missing data", "Undefined scope"]),
+        analyst_verdict(9, &[]),
+        analyst_verdict(8, &[]),
+    ];
+    let confirmed = crate::BlockerVerificationItem {
+        index: 0,
+        verdict: crate::BlockerDisposition::Confirmed,
+        reasoning: "real".into(),
+        sharpened_text: None,
+    };
+    let sharpened_item = |text: &str| crate::BlockerVerificationItem {
+        index: 1,
+        verdict: crate::BlockerDisposition::Sharpened,
+        reasoning: "imprecise".into(),
+        sharpened_text: Some(text.into()),
+    };
+    let refuted = crate::BlockerVerificationItem {
+        index: 1,
+        verdict: crate::BlockerDisposition::Refuted,
+        reasoning: "not a blocker".into(),
+        sharpened_text: None,
+    };
+    let escalation_results = vec![
+        ParallelVerdict::BlockerVerification(crate::BlockerVerificationVerdict {
+            verdicts: vec![confirmed.clone(), sharpened_item("Scope precisely defined")],
+        }),
+        ParallelVerdict::BlockerVerification(crate::BlockerVerificationVerdict {
+            verdicts: vec![confirmed, refuted],
+        }),
+    ];
+
+    let ws = test_ws_named("/tmp/test", "an_escalation");
+    let ticket_id = make_ticket(board(), &ws, "Escalation Round", TicketPhase::Analysis).await;
+    let ticket = expect_ticket(board(), &ticket_id).await;
+
+    process_analyst_verdicts(&ws, &ticket, &base_results, &escalation_results).await;
+
+    let phase = expect_ticket_phase(board(), &ticket_id).await;
+    assert_eq!(phase, TicketPhase::Planning, "fail-open must advance");
+
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    let joint = comments
+        .iter()
+        .find(|c| c.role == stage_name(Role::Analyst))
+        .expect("joint comment written");
+    // Base summary counts only the 3 base analysts, never the escalation batch.
+    assert!(
+        joint.content.contains("3 analysts reviewed this ticket"),
+        "base summary must ignore escalation outcomes: {}",
+        joint.content,
+    );
+    // Verified report surfaces the actionable blockers: confirmed kept,
+    // sharpened replaces, refuted dropped.
+    assert!(
+        joint.content.contains("### Blocker verification"),
+        "verification report expected: {}",
+        joint.content,
+    );
+    assert!(
+        joint.content.contains("Scope precisely defined"),
+        "sharpened blocker must replace the original: {}",
+        joint.content,
+    );
+}
+
+/// When the escalation batch runs but every agent fails to produce a valid
+/// verification verdict, the round stays fail-open: the base summary is
+/// unaffected (the failures are never counted as base analysts) and the joint
+/// comment notes the incomplete verification.
+///
+/// Serialized with the reset_analysis_tickets tests (shared global board — a
+/// concurrent boot reset would clobber the fixture phases).
+#[tokio::test]
+#[serial_test::serial(reset_inflight)]
+#[expect(clippy::await_holding_lock)] // deliberate: install_synthesis_test_seams holds the lock
+async fn process_analyst_verdicts_escalation_missing_verification() {
+    init_management_test_stores().await;
+    let (_lock, _policy_guard, _provider_guard) =
+        install_synthesis_test_seams(crate::util::test::FakeProvider::new());
+
+    let base_results = vec![
+        analyst_verdict(6, &["Missing data"]),
+        analyst_verdict(9, &[]),
+    ];
+    let escalation_results = vec![no_verdict(), no_verdict()];
+
+    let ws = test_ws_named("/tmp/test", "an_esc_missing");
+    let ticket_id = make_ticket(board(), &ws, "Escalation Missing", TicketPhase::Analysis).await;
+    let ticket = expect_ticket(board(), &ticket_id).await;
+
+    process_analyst_verdicts(&ws, &ticket, &base_results, &escalation_results).await;
+
+    let phase = expect_ticket_phase(board(), &ticket_id).await;
+    assert_eq!(phase, TicketPhase::Planning, "fail-open must advance");
+
+    let comments = board()
+        .get_comments(&ticket_id)
+        .await
+        .expect("get comments");
+    let joint = comments
+        .iter()
+        .find(|c| c.role == stage_name(Role::Analyst))
+        .expect("joint comment written");
+    assert!(
+        joint.content.contains("2 analysts reviewed this ticket"),
+        "base summary must ignore escalation outcomes: {}",
+        joint.content,
+    );
+    assert!(
+        joint.content.contains("could not produce a verdict"),
+        "incomplete verification must be noted: {}",
         joint.content,
     );
 }
@@ -2368,4 +2508,198 @@ async fn pickup_claim_is_atomic_against_db_state() {
         WorkspaceStatus::Analyzing,
         "already-claimed row stays analyzing (single claim)"
     );
+}
+
+// ── analysis escalation helpers — pure helpers ─────────────────────
+
+#[test]
+fn aggregate_blockers_subthreshold_only_dedup() {
+    let results = vec![
+        // Sub-threshold: its issues are included, deduped by normalized text.
+        analyst_verdict(6, &["Missing data", "   Missing   DATA "]),
+        // >= threshold: issues ignored.
+        analyst_verdict(8, &["Minor issue"]),
+        analyst_verdict(7, &["Boundary case"]),
+        analyst_verdict(3, &["No API contract", "Unclear scope"]),
+    ];
+    let blockers = aggregate_blockers(&results);
+    assert_eq!(
+        blockers,
+        vec!["Missing data", "No API contract", "Unclear scope"],
+    );
+}
+
+#[test]
+fn aggregate_blockers_empty_when_no_subthreshold_issues() {
+    assert!(
+        aggregate_blockers(&[analyst_verdict(8, &["Minor"]), analyst_verdict(10, &[])]).is_empty()
+    );
+}
+
+#[test]
+fn apply_blocker_verification_confirmed_refuted_sharpened_mixed() {
+    let blockers = vec!["Blocker A".into(), "Blocker B".into(), "Blocker C".into()];
+    let item = |index: usize, verdict: crate::BlockerDisposition, sharpened: Option<&str>| {
+        crate::BlockerVerificationItem {
+            index,
+            verdict,
+            reasoning: "evidence".into(),
+            sharpened_text: sharpened.map(str::to_string),
+        }
+    };
+    let round = |items| crate::BlockerVerificationVerdict { verdicts: items };
+
+    let r1 = round(vec![
+        item(0, crate::BlockerDisposition::Confirmed, None),
+        item(1, crate::BlockerDisposition::Refuted, None),
+        item(2, crate::BlockerDisposition::Sharpened, Some("C precise")),
+    ]);
+    let r2 = round(vec![
+        item(0, crate::BlockerDisposition::Confirmed, None),
+        item(1, crate::BlockerDisposition::Refuted, None),
+        item(2, crate::BlockerDisposition::Confirmed, None),
+    ]);
+    let out = apply_blocker_verification(&blockers, &[&r1, &r2]);
+    // B dropped (every agent refuted); C sharpened with the first sharpened text.
+    assert_eq!(out, vec!["Blocker A", "C precise"]);
+}
+
+#[test]
+fn apply_blocker_verification_partial_refutation_kept() {
+    let blockers = vec!["Only A".into(), "Only B".into()];
+    // Both verifiers cover every blocker (as `validate_blocker_verification`
+    // guarantees). A is refuted by one and confirmed by the other → kept (not
+    // unanimously refuted); B is refuted by both → dropped.
+    let r1 = crate::BlockerVerificationVerdict {
+        verdicts: vec![
+            crate::BlockerVerificationItem {
+                index: 0,
+                verdict: crate::BlockerDisposition::Refuted,
+                reasoning: "not a blocker".into(),
+                sharpened_text: None,
+            },
+            crate::BlockerVerificationItem {
+                index: 1,
+                verdict: crate::BlockerDisposition::Refuted,
+                reasoning: "not a blocker".into(),
+                sharpened_text: None,
+            },
+        ],
+    };
+    let r2 = crate::BlockerVerificationVerdict {
+        verdicts: vec![
+            crate::BlockerVerificationItem {
+                index: 0,
+                verdict: crate::BlockerDisposition::Confirmed,
+                reasoning: "evidence".into(),
+                sharpened_text: None,
+            },
+            crate::BlockerVerificationItem {
+                index: 1,
+                verdict: crate::BlockerDisposition::Refuted,
+                reasoning: "not a blocker".into(),
+                sharpened_text: None,
+            },
+        ],
+    };
+    let out = apply_blocker_verification(&blockers, &[&r1, &r2]);
+    assert_eq!(out, vec!["Only A"]);
+}
+
+#[test]
+fn blocker_verification_outcome_round_trips() {
+    let verdict = crate::BlockerVerificationVerdict {
+        verdicts: vec![
+            crate::BlockerVerificationItem {
+                index: 1,
+                verdict: crate::BlockerDisposition::Sharpened,
+                reasoning: "imprecise".into(),
+                sharpened_text: Some("precise blocker".into()),
+            },
+            crate::BlockerVerificationItem {
+                index: 0,
+                verdict: crate::BlockerDisposition::Confirmed,
+                reasoning: "real".into(),
+                sharpened_text: None,
+            },
+        ],
+    };
+    let serialized = serialize_verdict_outcome(&ParallelVerdict::BlockerVerification(verdict));
+    let round_tripped = deserialize_verdict_outcome(&serialized);
+    let ParallelVerdict::BlockerVerification(v) = round_tripped else {
+        panic!("expected a blocker-verification verdict");
+    };
+    assert_eq!(v.verdicts.len(), 2);
+    let sharpened = v.verdicts.iter().find(|it| it.index == 1).unwrap();
+    assert_eq!(sharpened.verdict, crate::BlockerDisposition::Sharpened);
+    assert_eq!(sharpened.sharpened_text.as_deref(), Some("precise blocker"));
+    let confirmed = v.verdicts.iter().find(|it| it.index == 0).unwrap();
+    assert_eq!(confirmed.verdict, crate::BlockerDisposition::Confirmed);
+    assert_eq!(confirmed.reasoning, "real");
+}
+
+#[test]
+fn validate_blocker_verification_coverage_and_sharpened() {
+    let blockers = vec!["A".into(), "B".into()];
+    let item = |index: usize, verdict: crate::BlockerDisposition, sharpened: Option<&str>| {
+        crate::BlockerVerificationItem {
+            index,
+            verdict,
+            reasoning: "evidence".into(),
+            sharpened_text: sharpened.map(str::to_string),
+        }
+    };
+
+    let ok = crate::BlockerVerificationVerdict {
+        verdicts: vec![
+            item(0, crate::BlockerDisposition::Confirmed, None),
+            item(1, crate::BlockerDisposition::Sharpened, Some("B precise")),
+        ],
+    };
+    assert!(validate_blocker_verification(&ok, &blockers).is_ok());
+
+    let empty = crate::BlockerVerificationVerdict { verdicts: vec![] };
+    assert!(validate_blocker_verification(&empty, &blockers).is_err());
+
+    let short = crate::BlockerVerificationVerdict {
+        verdicts: vec![item(0, crate::BlockerDisposition::Confirmed, None)],
+    };
+    assert!(validate_blocker_verification(&short, &blockers).is_err());
+
+    let out_of_range = crate::BlockerVerificationVerdict {
+        verdicts: vec![
+            item(2, crate::BlockerDisposition::Confirmed, None),
+            item(1, crate::BlockerDisposition::Confirmed, None),
+        ],
+    };
+    assert!(validate_blocker_verification(&out_of_range, &blockers).is_err());
+
+    let duplicate = crate::BlockerVerificationVerdict {
+        verdicts: vec![
+            item(0, crate::BlockerDisposition::Confirmed, None),
+            item(0, crate::BlockerDisposition::Confirmed, None),
+        ],
+    };
+    assert!(validate_blocker_verification(&duplicate, &blockers).is_err());
+
+    let no_sharpened_text = crate::BlockerVerificationVerdict {
+        verdicts: vec![
+            item(0, crate::BlockerDisposition::Sharpened, None),
+            item(1, crate::BlockerDisposition::Confirmed, None),
+        ],
+    };
+    assert!(validate_blocker_verification(&no_sharpened_text, &blockers).is_err());
+
+    let empty_reasoning = crate::BlockerVerificationVerdict {
+        verdicts: vec![
+            crate::BlockerVerificationItem {
+                index: 0,
+                verdict: crate::BlockerDisposition::Confirmed,
+                reasoning: "   ".into(),
+                sharpened_text: None,
+            },
+            item(1, crate::BlockerDisposition::Confirmed, None),
+        ],
+    };
+    assert!(validate_blocker_verification(&empty_reasoning, &blockers).is_err());
 }

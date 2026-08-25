@@ -830,38 +830,3 @@ fn review_agent_count_adjustments() {
     assert_eq!(review_agent_count(3, 0), 3, "P0 floor 3");
     assert_eq!(review_agent_count(4, 0), 4, "P0 with base 4");
 }
-
-#[test]
-fn analysis_escalation_trigger() {
-    use crate::pipeline::management::ParallelVerdict;
-    let v = |score: u8| {
-        ParallelVerdict::Verdict(crate::Verdict {
-            score,
-            issues_detected: vec![],
-        })
-    };
-
-    // All dispatched analysts flagged blockers → escalate.
-    assert!(analysis_escalation_needed(&[v(3), v(5), v(6)], 3));
-    // Any analyst passing → no escalation.
-    assert!(!analysis_escalation_needed(&[v(3), v(7), v(6)], 3));
-    assert!(!analysis_escalation_needed(&[v(3), v(10), v(6)], 3));
-    // A no-response analyst breaks unanimity → no escalation.
-    assert!(!analysis_escalation_needed(
-        &[
-            v(3),
-            ParallelVerdict::NoResponse("no response".into()),
-            v(5),
-        ],
-        3,
-    ));
-    // Empty / single rounds never escalate (only the base dispatch can).
-    assert!(!analysis_escalation_needed(&[], 3));
-    assert!(!analysis_escalation_needed(&[v(3)], 3));
-    // Dispatched count drives the comparison (not a hard-coded 3).
-    assert!(!analysis_escalation_needed(&[v(3), v(5), v(6)], 5));
-    assert!(analysis_escalation_needed(
-        &[v(3), v(5), v(6), v(4), v(2)],
-        5
-    ));
-}
