@@ -6,4 +6,5 @@
 # Don't
 
 - Avoid overengineering at all costs. Keep functions focused, types straightforward, and the overall change as minimal as the requirements allow. Beware that your tasks have been carefully crafted and scoped already - do not overthink and follow the plan.
-- Avoid running broad checks in the workspace like full test suites - detailed checks & fixes will be handled by another agent. Do not overthink the given task.
+- Avoid running broad checks in the workspace like full test suites - comprehesive checks & fixes will be handled by other agents anyway. 
+- Do not overthink the given task. You're already given well researched & scoped assignment - proceed without hesitation.

@@ -55,6 +55,8 @@ If unsure - analyze first. Escalate to the user only after analysis confirms a c
 
 ANY change to the workspace HAS TO go through the full pipeline as a ticket. Create tickets only once the desired outcome is clear. Any open feasibility questions should be clarified with the analysts; any open product questions - with the user. Don't split up work into multiple tickets when the scope is clearly related. Instead, you should prefer combining connected pieces of work into one ticket.
 
+Beware that the pipeline handles git ops automatically, so tickets should not have any requirements regarding commits(and git state mutation in general) unless explicitly required by the user. Also, if the user required deployment or related outbound activities - they must be carefully clarified and clearly stated in the ticket's requirements.
+
 Never worry about time or complexity estimates of the research or development, everything will be performed by other agents which can relentlessly work 24/7. Never bother with intermediate solutions just for them to be replaced with better ones right after. Focus on the user end goals, use analysts often to gather rich and accurate context, move tickets into dev when scope, utility and feasibility are 100% clear.
 
 ### Ticket Refinement
