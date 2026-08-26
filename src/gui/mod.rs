@@ -72,6 +72,13 @@ use tokio::sync::broadcast;
 /// Global broadcast sender for live log streaming. Set during `startup()`.
 pub static LOG_BROADCAST: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 
+/// Initialise the git file-change broadcast before the iced application runs
+/// (matching the [`LOG_BROADCAST`] convention) so the file-change subscription
+/// always has a source. Called from `main`.
+pub fn init_git_file_change_tx() {
+    git::init_file_change_tx();
+}
+
 // ── Navigation pages ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -885,8 +892,9 @@ impl Dashboard {
             _ => Task::none(),
         };
 
-        // ── Git state refresh (every second) ────────────────
-        // GitState handles eager-refresh gating internally.
+        // ── Git state refresh (periodic remote sync + throttle) ───
+        // The every-second local refresh is event-driven (via the file-change
+        // subscription); the tick only runs the throttle/periodic remote work.
         let git_tasks = self.git_state.update_tick().map(Message::Git);
 
         Task::batch([ws_refresh, page_task, git_tasks])
@@ -1269,7 +1277,24 @@ impl Dashboard {
                 self.show_diff_modal = false;
                 Task::none()
             }
-            Message::DiffModal(msg) => self.diff_state.update(msg).map(Message::DiffModal),
+            Message::DiffModal(msg) => {
+                // A manual commit is a ref-only change (HEAD + `.git/index`)
+                // that the file watcher never reports, so refresh the git footer
+                // promptly — otherwise diff_stats/behind_ahead stay stale until
+                // the periodic timer.
+                let commit_succeeded = matches!(&msg, diff::DiffMessage::CommitResult(Ok(_)));
+                let diff_task = self.diff_state.update(msg).map(Message::DiffModal);
+                if commit_succeeded {
+                    Task::batch([
+                        diff_task,
+                        self.git_state
+                            .update(git::GitMessage::RefreshAfterCommit)
+                            .map(Message::Git),
+                    ])
+                } else {
+                    diff_task
+                }
+            }
             Message::Editor(msg) => self.editor_state.update(msg).map(Message::Editor),
             Message::Settings(msg) => self.process_settings_message(msg),
             // ── Diff modal ────────────────────────────────────────
@@ -1535,11 +1560,13 @@ impl Dashboard {
         let diff_path = personal_path.clone();
 
         // Propagate workspace path to git state, triggering eager refresh.
-        // GitState owns the single source of truth for this path.
+        // GitState owns the single source of truth for this path and the
+        // workspace name (empty = Personal/unnamed → timer fallback).
         let resolved_path = ws_path.or_else(|| personal_path.clone());
+        let ws_name = (!name.is_empty()).then(|| name.to_string());
         let git_task: Task<Message> = self
             .git_state
-            .set_workspace_path(resolved_path)
+            .set_workspace_path(ws_name, resolved_path)
             .map(Message::Git);
 
         let diff_task: Task<Message> =
@@ -2017,6 +2044,9 @@ impl Dashboard {
             self.editor_state.subscription().map(Message::Editor),
             self.home_state.subscription().map(Message::Home),
             iced::Subscription::run(shutdown_subscription),
+            // Git file-change subscription: drives the event-driven local git
+            // footer refresh when workspace files change.
+            iced::Subscription::run(git_file_changes_subscription),
             // TTS download progress subscription (always active while ready).
             iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
             // Diff modal subscription (keyboard shortcuts, auto-refresh).
@@ -2078,6 +2108,29 @@ fn tts_download_subscription()
                 // lagged progress slots are dropped (next event is current state).
                 if let Some(event) = event {
                     let _ = output.try_send(event);
+                }
+            })
+        },
+    )
+}
+
+/// Subscription that emits [`Message::Git`] with [`GitMessage::FileChanged`]
+/// when workspace files change. Filesystem events are delivered by the
+/// fff-search watcher on a dedicated thread (which only does a non-blocking
+/// broadcast send) and consumed here to drive the event-driven git local
+/// refresh. The broadcast is initialized in `main` before the iced application
+/// runs (matching the [`LOG_BROADCAST`] convention); an uninitialized source
+/// would yield an immediately-ending stream, which iced's subscription tracker
+/// does not re-spawn.
+fn git_file_changes_subscription() -> impl futures_util::Stream<Item = Message> {
+    use iced::futures::channel::mpsc;
+    common::broadcast_stream_producer(
+        1,
+        &git::FILE_CHANGE_TX,
+        |output: &mut mpsc::Sender<Message>, event: Option<()>| {
+            Box::pin(async move {
+                if event.is_some() {
+                    let _ = output.try_send(Message::Git(git::GitMessage::FileChanged));
                 }
             })
         },

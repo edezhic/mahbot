@@ -550,6 +550,11 @@ fn main() -> Result<()> {
     // Read persisted window state (sync, before Iced runtime starts).
     let window_state = mahbot::gui::read_window_state();
 
+    // Initialise the git file-change broadcast before the iced application
+    // runs (matching LOG_BROADCAST), so the file-change subscription always
+    // has a source — an uninitialized one would end the subscription stream.
+    mahbot::gui::init_git_file_change_tx();
+
     iced::application(
         move || {
             (

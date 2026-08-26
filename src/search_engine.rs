@@ -326,6 +326,12 @@ pub(crate) async fn resolve_engine(
 
 // ── Lookup helpers for tools ───────────────────────────────────────────────
 
+#[must_use]
+pub(crate) fn get_engine_by_name(name: &str) -> Option<Arc<SearchEngineEntry>> {
+    let reg = REGISTRY.get()?.read().ok()?;
+    reg.get(name).cloned()
+}
+
 /// Get a workspace's search engine entry without creating one.
 ///
 /// Unlike [`get_or_init_engine`], this returns `None` if the engine hasn't
@@ -336,8 +342,7 @@ pub(crate) async fn resolve_engine(
 /// creation as a side effect.
 #[must_use]
 pub(crate) fn get_engine_if_exists(ws: &Workspace) -> Option<Arc<SearchEngineEntry>> {
-    let reg = REGISTRY.get()?.read().ok()?;
-    reg.get(&ws.name).cloned()
+    get_engine_by_name(&ws.name)
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────

@@ -13,7 +13,42 @@ use super::theme;
 use iced::widget::{Column, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length, Task};
 
+use fff_search::{Error as FffError, WatchId, WatchOptions};
+
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+/// Broadcast for workspace file-change events. The fff-search watcher callback
+/// sends here (non-blocking) from its dedicated thread; the iced
+/// [`super::common::broadcast_stream_producer`] subscription consumes it and
+/// emits [`GitMessage::FileChanged`]. Capacity is generous so a burst of events
+/// never blocks the sender.
+pub(super) static FILE_CHANGE_TX: OnceLock<tokio::sync::broadcast::Sender<()>> = OnceLock::new();
+
+/// Initialise the git file-change broadcast. Called from [`crate::gui::init_git_file_change_tx`]
+/// in `main` before the iced application runs — the subscription producer uses
+/// `FILE_CHANGE_TX.get()` and a missing source yields an immediately-ending
+/// stream, which iced's subscription tracker does not re-spawn.
+pub(super) fn init_file_change_tx() {
+    let _ = FILE_CHANGE_TX.set(tokio::sync::broadcast::channel(64).0);
+}
+
+fn file_change_tx() -> &'static tokio::sync::broadcast::Sender<()> {
+    FILE_CHANGE_TX.get_or_init(|| tokio::sync::broadcast::channel(64).0)
+}
+
+/// Minimum interval between event-driven local git refreshes (diff stats +
+/// branch). Coalesces bursts of file-change events into at most one git
+/// subprocess batch per interval.
+const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Interval between periodic remote syncs (behind/ahead + `git fetch`).
+const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Non-blocking retry window for registering the file-change watch while the
+/// watcher is not ready (initial scan) or the engine is not yet created.
+const WATCH_RETRY_WINDOW: Duration = Duration::from_secs(30);
 
 /// Git state owned by the Dashboard.
 ///
@@ -47,13 +82,37 @@ pub struct GitState {
     new_branch_name: String,
 
     // ── Refresh state ───────────────────────────────────────────
-    /// Whether git state was eagerly refreshed recently — skip the next
-    /// Tick-based refresh to avoid double-firing after workspace switch.
-    refresh_eagerly: bool,
-    /// Monotonic generation for git refreshes. Each refresh batch captures
-    /// the current value and results are only applied while it is current,
-    /// so stale/out-of-order results never overwrite newer state.
-    refresh_generation: u64,
+    /// Workspace name for the currently selected workspace, used to resolve the
+    /// per-workspace [`SharedFilePicker`](fff_search::SharedFilePicker) watch
+    /// by name (the registry is keyed by workspace name, not path). `None` for
+    /// Personal/unnamed workspaces, which fall back to the timer.
+    workspace_name: Option<String>,
+    /// Generation for local refreshes (diff stats + current branch). Each
+    /// local refresh captures the current value and only applies while it is
+    /// current, so stale/out-of-order results never overwrite newer state.
+    local_generation: u64,
+    /// Generation for remote refreshes (behind/ahead + fetch). Independent of
+    /// [`Self::local_generation`] so a long-running fetch is not invalidated by
+    /// a concurrent event-driven local refresh.
+    remote_generation: u64,
+    /// When the last event-driven local refresh ran — the throttle gate for
+    /// coalescing bursts of file-change events.
+    last_local_refresh: Option<Instant>,
+    /// A file-change event arrived during the throttle window and a local
+    /// refresh is still owed; fired by the next tick once the window elapses.
+    local_refresh_pending: bool,
+    /// When the last remote sync (behind/ahead + fetch) ran. Only updated by an
+    /// actual remote sync — a workspace switch alone does not defer the timer.
+    last_remote_refresh: Option<Instant>,
+    /// The active file-change watch subscription id. `Some` only when a watch
+    /// was successfully registered on the current workspace's picker.
+    watch_id: Option<WatchId>,
+    /// Registration of the file-change watch failed (watcher not ready, or the
+    /// engine not created yet) — retried non-blocking on each tick.
+    watch_pending: bool,
+    /// Bounded window for [`Self::watch_pending`] retries; after it elapses the
+    /// watch is abandoned in favour of the timer fallback.
+    watch_retry_deadline: Option<Instant>,
 }
 
 /// Messages for the git sub-state.
@@ -75,8 +134,17 @@ pub enum GitMessage {
     /// Result of `run_git_behind_ahead`. `Ok((0, 0))` is a genuine
     /// clean/no-upstream state (hides the sync button); `Err` keeps the
     /// last-known-good counts. Same generation semantics as
-    /// [`GitMessage::DiffStats`].
+    /// [`GitMessage::DiffStats`] but against [`GitState::remote_generation`].
     BehindAhead(u64, Result<(usize, usize), String>),
+
+    // ── Event-driven refresh ────────────────────────────────────
+    /// A workspace file-change event arrived from the fff-search watcher. The
+    /// local git refresh (diff stats + branch) is throttled/coalesced here.
+    FileChanged,
+    /// A manual commit completed (diff modal). A commit is a ref-only change
+    /// (HEAD + `.git/index`) that the file watcher never reports, so the footer
+    /// is refreshed promptly.
+    RefreshAfterCommit,
 
     // ── Branch listing ──────────────────────────────────────────
     /// Result of listing local branches.
@@ -132,8 +200,15 @@ impl GitState {
             syncing: false,
             branch_error: None,
             new_branch_name: String::new(),
-            refresh_eagerly: false,
-            refresh_generation: 0,
+            workspace_name: None,
+            local_generation: 0,
+            remote_generation: 0,
+            last_local_refresh: None,
+            local_refresh_pending: false,
+            last_remote_refresh: None,
+            watch_id: None,
+            watch_pending: false,
+            watch_retry_deadline: None,
         }
     }
 
@@ -179,10 +254,11 @@ impl GitState {
     // ── State mutators (called from Dashboard during workspace switch) ──
 
     /// Clear all cached git info (diff stats, branch, behind/ahead, modal).
-    /// Does **not** clear `workspace_path` or `refresh_eagerly` — those are
-    /// managed explicitly by [`Self::set_workspace_path`] / [`Self::update_tick`].
-    /// Bumps `refresh_generation` so refresh results still in flight for the
-    /// previous state are discarded as stale.
+    /// Does **not** clear `workspace_path`, `workspace_name`, the watch state,
+    /// or the refresh throttle/timer state — those are managed explicitly by
+    /// [`Self::set_workspace_path`] / [`Self::update_tick`]. Bumps both
+    /// generations so refresh results still in flight for the previous state
+    /// are discarded as stale.
     pub fn clear(&mut self) {
         self.diff_stats = None;
         self.current_branch = None;
@@ -193,30 +269,51 @@ impl GitState {
         self.show_branch_modal = false;
         self.new_branch_name.clear();
         self.syncing = false;
-        self.refresh_generation += 1;
-        // Keep workspace_path — it's set explicitly via set_workspace_path.
-        // Keep refresh_eagerly — it's managed by set_workspace_path / tick.
+        self.local_generation += 1;
+        self.remote_generation += 1;
     }
 
-    /// Set the workspace filesystem path and trigger an eager refresh
-    /// of git info (diff stats, branch, behind/ahead). Clears all
-    /// cached state first.
+    /// Set the workspace name and filesystem path, and trigger an eager refresh
+    /// of git info (diff stats, branch, behind/ahead for the new workspace).
+    /// Clears all cached state first and re-registers the file-change watch for
+    /// the new workspace (best-effort; retried by the tick if the watcher is
+    /// not ready yet).
     ///
-    /// After this call the next [`Self::update_tick`] is skipped (via
-    /// `refresh_eagerly`) to avoid double-refreshing.
+    /// `name` is `None` for Personal/unnamed workspaces, which have no search
+    /// engine subscribe to and therefore fall back to the periodic timer.
     ///
     /// Returns a batch of [`Task`]s that produce [`GitMessage`] results
     /// when the async operations complete.
-    pub fn set_workspace_path(&mut self, path: Option<String>) -> Task<GitMessage> {
-        // clear() bumps refresh_generation — results still in flight from the
+    pub fn set_workspace_path(
+        &mut self,
+        name: Option<String>,
+        path: Option<String>,
+    ) -> Task<GitMessage> {
+        // Unwatch the previous workspace's watch before switching the name.
+        self.unwatch_current();
+        // clear() bumps both generations — results still in flight from the
         // previous workspace are discarded as stale.
         self.clear();
+        self.workspace_name = name.filter(|n| !n.is_empty());
         self.workspace_path = path.map(PathBuf::from);
-        // Signal the next tick to skip — the refresh tasks spawned below
-        // already cover the initial load.
-        self.refresh_eagerly = true;
+        // Reset the local throttle for the new workspace (nothing refreshed yet).
+        self.last_local_refresh = None;
+        self.local_refresh_pending = false;
+        self.watch_pending = false;
+        self.watch_retry_deadline = None;
+        // Register the file-change watch (best-effort, retried on tick).
+        self.try_register_watch();
         match &self.workspace_path {
-            Some(p) => Self::refresh_inner(p.clone(), self.refresh_generation),
+            Some(p) => {
+                // Mark the local throttle as just-refreshed so a watcher echo of
+                // the eager refresh does not double-fire. The remote timer is NOT
+                // reset here — a switch alone must not defer the periodic fetch.
+                self.last_local_refresh = Some(Instant::now());
+                Task::batch([
+                    Self::refresh_local(p.clone(), self.local_generation),
+                    Self::refresh_remote(p.clone(), self.remote_generation, false),
+                ])
+            }
             None => Task::none(),
         }
     }
@@ -232,7 +329,7 @@ impl GitState {
                 // Only apply current-generation successes — a transient git
                 // failure (`Err`) keeps the last-known-good value so the
                 // footer controls don't flicker.
-                if generation == self.refresh_generation
+                if generation == self.local_generation
                     && let Ok(stats) = result
                 {
                     self.diff_stats = Some(stats);
@@ -240,7 +337,7 @@ impl GitState {
                 Task::none()
             }
             GitMessage::CurrentBranch(generation, result) => {
-                if generation == self.refresh_generation
+                if generation == self.local_generation
                     && let Ok(branch) = result
                 {
                     self.current_branch = Some(branch);
@@ -248,7 +345,7 @@ impl GitState {
                 Task::none()
             }
             GitMessage::BehindAhead(generation, result) => {
-                if generation == self.refresh_generation
+                if generation == self.remote_generation
                     && let Ok(ba) = result
                 {
                     // Genuine clean/no-upstream state hides the sync button.
@@ -256,6 +353,12 @@ impl GitState {
                 }
                 Task::none()
             }
+
+            // ── Event-driven local refresh ───────────────────────
+            GitMessage::FileChanged => self.on_file_changed(),
+            // A manual commit is a ref-only change the watcher never reports,
+            // so refresh the footer promptly (same as other git operations).
+            GitMessage::RefreshAfterCommit => self.refresh_after_git_op(),
 
             // ── Branch listing result ───────────────────────────
             GitMessage::ListBranches(result) => {
@@ -321,12 +424,19 @@ impl GitState {
                 self.syncing = false;
                 match result {
                     Ok(output) => {
+                        // A sync (pull/push) moved refs and possibly files, so
+                        // refresh promptly — the watcher is silent to ref-only
+                        // changes.
+                        let refresh = self.refresh_after_git_op();
                         let msg = if output.trim().is_empty() {
                             "Already up-to-date".to_string()
                         } else {
                             format!("Sync completed:\n{output}")
                         };
-                        Task::done(GitMessage::Toast(super::ToastMessage::SuccessMsg(msg)))
+                        Task::batch([
+                            Task::done(GitMessage::Toast(super::ToastMessage::SuccessMsg(msg))),
+                            refresh,
+                        ])
                     }
                     Err(e) => Task::done(GitMessage::Toast(super::ToastMessage::Error(format!(
                         "Sync failed: {e}"
@@ -411,9 +521,15 @@ impl GitState {
         match result {
             Ok(()) => {
                 self.show_branch_modal = false;
-                Task::done(GitMessage::Toast(super::ToastMessage::SuccessMsg(
-                    success_msg.to_string(),
-                )))
+                // A branch switch/create moved refs and possibly files, so
+                // refresh promptly — the watcher is silent to ref-only changes.
+                let refresh = self.refresh_after_git_op();
+                Task::batch([
+                    Task::done(GitMessage::Toast(super::ToastMessage::SuccessMsg(
+                        success_msg.to_string(),
+                    ))),
+                    refresh,
+                ])
             }
             Err(e) => {
                 self.branch_error = Some(e);
@@ -425,26 +541,61 @@ impl GitState {
     // ── Tick ──────────────────────────────────────────────────────
 
     /// Called every second from the Dashboard's [`super::Message::Tick`]
-    /// handler. Refreshes git info (diff stats, branch, behind/ahead)
-    /// if not gated by an eager refresh (see [`Self::set_workspace_path`]).
+    /// handler.
+    ///
+    /// Fires a coalesced event-driven local refresh when its throttle window
+    /// has elapsed, and runs the periodic remote sync (behind/ahead + `git
+    /// fetch`) every [`REMOTE_REFRESH_INTERVAL`]. The periodic timer also
+    /// refreshes the local footer — it is the recovery path for ref-only/
+    /// commit-only changes (a bare commit, fetch, push or `checkout -c` from
+    /// HEAD) that produce no file-change event, so it runs for every workspace,
+    /// watched or not.
     pub fn update_tick(&mut self) -> Task<GitMessage> {
-        // Skip if an eager refresh was just triggered (e.g. after
-        // workspace switch) to avoid 6 subprocess calls in <1 second.
-        if self.refresh_eagerly {
-            self.refresh_eagerly = false;
-            return Task::none();
+        let now = Instant::now();
+        let mut tasks: Vec<Task<GitMessage>> = Vec::new();
+
+        // Retry a watch registration that failed (watcher not ready, or the
+        // engine not created yet) — non-blocking, within a bounded window.
+        if self.watch_pending {
+            if self.watch_retry_deadline.is_some_and(|d| now < d) {
+                self.try_register_watch();
+            } else {
+                self.watch_pending = false;
+                self.watch_retry_deadline = None;
+            }
         }
 
-        // Use the stored workspace path.
-        match &self.workspace_path {
-            Some(p) => {
-                // Bump the generation so results still in flight from the
-                // previous tick are discarded when they arrive out of order.
-                self.refresh_generation += 1;
-                Self::refresh_inner(p.clone(), self.refresh_generation)
+        // Periodic remote sync (behind/ahead + fetch). The timer also refreshes
+        // the local footer (diff stats + branch) so ref-only/commit-only changes
+        // that never reach the file watcher still surface here, for every
+        // workspace. Clearing an owed event-driven refresh avoids a redundant
+        // local refresh later in this same tick.
+        if self
+            .last_remote_refresh
+            .is_none_or(|t| now.duration_since(t) >= REMOTE_REFRESH_INTERVAL)
+        {
+            self.last_remote_refresh = Some(now);
+            self.local_generation += 1;
+            self.remote_generation += 1;
+            self.last_local_refresh = Some(now);
+            self.local_refresh_pending = false;
+            if let Some(path) = self.workspace_path.clone() {
+                tasks.push(Self::refresh_local(path.clone(), self.local_generation));
+                tasks.push(Self::refresh_remote(path, self.remote_generation, true));
             }
-            None => Task::none(),
         }
+
+        // Fire a coalesced event-driven local refresh once its throttle window
+        // elapses — the periodic refresh above only runs every
+        // [`REMOTE_REFRESH_INTERVAL`], not every tick, so an owed file-change
+        // refresh is honoured here.
+        if self.local_refresh_pending
+            && let Some(task) = self.fire_local_refresh(now)
+        {
+            tasks.push(task);
+        }
+
+        Task::batch(tasks)
     }
 
     // ── View ──────────────────────────────────────────────────────
@@ -547,12 +698,12 @@ async fn with_ws_path<T>(
 }
 
 impl GitState {
-    /// Spawn three parallel async tasks to refresh diff stats, current
-    /// branch, and behind/ahead counts. Results carry `generation` and are applied
-    /// by [`Self::update`] only while the generation is current — stale or
+    /// Spawn two parallel async tasks to refresh the local working-tree state
+    /// (diff stats + current branch). Results carry `generation` and are applied
+    /// by [`Self::update`] only while the local generation is current — stale or
     /// out-of-order results are dropped. Transient git failures surface as
     /// `Err` and leave the cached last-known-good values untouched.
-    fn refresh_inner(path: PathBuf, generation: u64) -> Task<GitMessage> {
+    fn refresh_local(path: PathBuf, generation: u64) -> Task<GitMessage> {
         if !crate::git::commands::is_git_repo(&path) {
             return Task::none();
         }
@@ -569,7 +720,7 @@ impl GitState {
         );
 
         // Current branch
-        let branch_path = path.clone();
+        let branch_path = path;
         let branch_task = Task::perform(
             async move {
                 crate::git::commands::run_git_current_branch(&branch_path)
@@ -579,18 +730,157 @@ impl GitState {
             move |res| GitMessage::CurrentBranch(generation, res),
         );
 
-        // Behind/ahead
-        let ahead_path = path;
-        let ahead_task = Task::perform(
+        Task::batch([stats_task, branch_task])
+    }
+
+    /// Spawn a remote refresh: best-effort `git fetch` (when `fetch` is set)
+    /// followed by behind/ahead. `fetch=false` compares against the locally
+    /// available remote ref; `fetch=true` first updates them so behind/ahead
+    /// reflects upstream state. A fetch failure (offline/timeout/no remote) is
+    /// logged at debug level and behind/ahead is still computed against local
+    /// refs.
+    fn refresh_remote(path: PathBuf, generation: u64, fetch: bool) -> Task<GitMessage> {
+        if !crate::git::commands::is_git_repo(&path) {
+            return Task::none();
+        }
+        Task::perform(
             async move {
-                crate::git::commands::run_git_behind_ahead(&ahead_path)
+                if fetch {
+                    if let Err(e) = crate::git::commands::run_git_fetch(&path).await {
+                        tracing::debug!(error = %e, path = %path.display(), "git fetch failed");
+                    }
+                }
+                crate::git::commands::run_git_behind_ahead(&path)
                     .await
                     .map_err(|e| e.to_string())
             },
             move |res| GitMessage::BehindAhead(generation, res),
-        );
+        )
+    }
 
-        Task::batch([stats_task, branch_task, ahead_task])
+    /// Handle a workspace file-change event: coalesce bursts into at most one
+    /// local refresh per [`LOCAL_REFRESH_MIN_INTERVAL`]. If the throttle window
+    /// has elapsed, refresh now; otherwise mark the refresh as owed and let the
+    /// next tick fire it.
+    fn on_file_changed(&mut self) -> Task<GitMessage> {
+        let now = Instant::now();
+        match self.fire_local_refresh(now) {
+            Some(task) => task,
+            None if self.workspace_path.is_some() => {
+                // The throttle window has not elapsed — mark the refresh as owed
+                // and let the next tick fire it (after the window elapses).
+                self.local_refresh_pending = true;
+                Task::none()
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// Fire an event-driven local refresh if the local-refresh throttle window
+    /// has elapsed: record the throttle, clear any owed refresh, bump the local
+    /// generation, and spawn the refresh task. Returns [`None`] when the window
+    /// has not elapsed (or there is no workspace path), leaving any owed refresh
+    /// pending for a later tick.
+    fn fire_local_refresh(&mut self, now: Instant) -> Option<Task<GitMessage>> {
+        if self
+            .last_local_refresh
+            .is_none_or(|t| now.duration_since(t) >= LOCAL_REFRESH_MIN_INTERVAL)
+        {
+            // Only advance the throttle/generation when there is a workspace to
+            // refresh — a path-less refresh would otherwise consume the throttle
+            // window for nothing.
+            let path = self.workspace_path.clone()?;
+            self.last_local_refresh = Some(now);
+            self.local_refresh_pending = false;
+            self.local_generation += 1;
+            Some(Self::refresh_local(path, self.local_generation))
+        } else {
+            None
+        }
+    }
+
+    /// Refresh local + remote state promptly after a git operation (sync,
+    /// branch switch/create). The watcher is silent to ref-only changes, so
+    /// these paths must refresh explicitly. Marks the local throttle as
+    /// just-refreshed so the watcher's echo of the operation coalesces.
+    fn refresh_after_git_op(&mut self) -> Task<GitMessage> {
+        let Some(path) = self.workspace_path.clone() else {
+            return Task::none();
+        };
+        let now = Instant::now();
+        self.local_generation += 1;
+        self.remote_generation += 1;
+        self.last_local_refresh = Some(now);
+        self.local_refresh_pending = false;
+        Task::batch([
+            Self::refresh_local(path.clone(), self.local_generation),
+            Self::refresh_remote(path, self.remote_generation, false),
+        ])
+    }
+
+    /// Unwatch the current file-change subscription, if any, resolving the
+    /// picker by workspace name. The engine may be gone (workspace deleted) —
+    /// then there is nothing to unwatch (the picker drops its watch registry).
+    fn unwatch_current(&mut self) {
+        let Some(name) = self.workspace_name.clone() else {
+            return;
+        };
+        let Some(id) = self.watch_id.take() else {
+            return;
+        };
+        if let Some(entry) = crate::search_engine::get_engine_by_name(&name) {
+            let _ = entry.picker.unwatch(id);
+        }
+    }
+
+    /// Register the file-change watch on the current workspace's picker. Reuses
+    /// an existing engine — never creates one as a side effect. A `WatcherNotReady`
+    /// (initial scan) or missing engine sets [`Self::watch_pending`] so the tick
+    /// retries non-blocking within a bounded window; any other failure falls back
+    /// to the timer.
+    fn try_register_watch(&mut self) {
+        self.watch_pending = false;
+
+        let (Some(name), Some(_path)) = (&self.workspace_name, &self.workspace_path) else {
+            // Personal/unnamed or no filesystem path — timer fallback.
+            return;
+        };
+        let Some(entry) = crate::search_engine::get_engine_by_name(name) else {
+            // Engine not created yet; retry once it appears (eager scan/search).
+            // Anchor the retry deadline only on the first failure so the window
+            // is actually bounded.
+            self.watch_pending = true;
+            if self.watch_retry_deadline.is_none() {
+                self.watch_retry_deadline = Some(Instant::now() + WATCH_RETRY_WINDOW);
+            }
+            return;
+        };
+
+        let picker = entry.picker.clone();
+        // The callback runs on the watcher's dedicated thread and must only do
+        // a non-blocking send — never lock the picker (deadlock). An empty
+        // pattern watches the whole tree (the watcher already excludes `.git`,
+        // gitignored paths, and Access events, so git status/index self-trigger
+        // loops cannot occur).
+        let tx = file_change_tx().clone();
+        match picker.watch("", WatchOptions::default(), move |_id, _events| {
+            let _ = tx.send(());
+        }) {
+            Ok(id) => {
+                self.watch_id = Some(id);
+                self.watch_retry_deadline = None;
+            }
+            Err(FffError::WatcherNotReady) => {
+                self.watch_pending = true;
+                if self.watch_retry_deadline.is_none() {
+                    self.watch_retry_deadline = Some(Instant::now() + WATCH_RETRY_WINDOW);
+                }
+            }
+            Err(_) => {
+                // WatcherDisabled or another error — rely on the timer fallback.
+                self.watch_retry_deadline = None;
+            }
+        }
     }
 }
 
@@ -600,7 +890,8 @@ mod tests {
 
     fn state_with_gen(generation: u64) -> GitState {
         let mut s = GitState::new();
-        s.refresh_generation = generation;
+        s.local_generation = generation;
+        s.remote_generation = generation;
         s
     }
 
@@ -658,8 +949,119 @@ mod tests {
         let mut s = state_with_gen(3);
         let _ = s.update(GitMessage::DiffStats(3, Ok((3, 1))));
         let _ = s.update(GitMessage::CurrentBranch(3, Ok("main".into())));
-        s.clear(); // bumps the generation — in-flight results become stale
+        s.clear(); // bumps both generations — in-flight results become stale
         let _ = s.update(GitMessage::DiffStats(3, Ok((7, 7))));
         assert_eq!(s.diff_stats(), None);
+    }
+
+    // ── Event-driven local refresh throttle ──────────────────────
+
+    #[test]
+    fn test_file_changed_coalesces_burst_within_window() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        // First event: the throttle window has no prior refresh → refresh now.
+        let _ = s.on_file_changed();
+        let first_gen = s.local_generation;
+        assert!(!s.local_refresh_pending);
+        // Second event immediately after: coalesced into a pending refresh.
+        let _ = s.on_file_changed();
+        assert!(s.local_refresh_pending);
+        assert_eq!(
+            s.local_generation, first_gen,
+            "no new refresh within window"
+        );
+    }
+
+    #[test]
+    fn test_file_changed_fires_when_throttle_elapsed() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        s.last_local_refresh = Some(Instant::now() - Duration::from_secs(2));
+        let before = s.local_generation;
+        let _ = s.on_file_changed();
+        assert!(!s.local_refresh_pending);
+        assert_eq!(s.local_generation, before + 1);
+    }
+
+    #[test]
+    fn test_file_changed_no_path_is_noop() {
+        let mut s = GitState::new();
+        s.workspace_path = None;
+        let before = s.local_generation;
+        let _ = s.on_file_changed();
+        // No workspace path — the refresh is a no-op: no owed refresh, no
+        // generation bump, and the throttle window is not consumed.
+        assert!(!s.local_refresh_pending);
+        assert_eq!(s.local_generation, before);
+    }
+
+    // ── Periodic remote sync and timer fallback ──────────────────
+
+    #[test]
+    fn test_update_tick_runs_remote_sync_no_watch_fallback() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        // No watch and no prior remote sync → the timer runs a full refresh.
+        let before_local = s.local_generation;
+        let before_remote = s.remote_generation;
+        let _ = s.update_tick();
+        assert_eq!(s.local_generation, before_local + 1);
+        assert_eq!(s.remote_generation, before_remote + 1);
+        assert!(s.last_remote_refresh.is_some());
+    }
+
+    #[test]
+    fn test_update_tick_watched_runs_full_refresh_on_timer() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        // Simulate an active watch: no pending local refresh and no prior
+        // remote sync.
+        s.watch_id = Some(WatchId(1));
+        let before_local = s.local_generation;
+        let before_remote = s.remote_generation;
+        let _ = s.update_tick();
+        // The periodic timer is the recovery path for ref-only/commit-only
+        // changes (which produce no file-change event), so it refreshes local
+        // (diff stats + branch) and remote (behind/ahead + fetch) even for a
+        // watched workspace. The generation bumps prove both the local and
+        // remote refresh paths were entered — a regression that ran only remote
+        // for a watched workspace would leave `local_generation` untouched.
+        assert_eq!(s.local_generation, before_local + 1);
+        assert_eq!(s.remote_generation, before_remote + 1);
+    }
+
+    #[test]
+    fn test_update_tick_fires_pending_local_after_window() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        s.watch_id = Some(WatchId(1));
+        s.local_refresh_pending = true;
+        s.last_local_refresh = Some(Instant::now() - Duration::from_secs(2));
+        // A recent remote sync keeps the periodic branch quiet this tick, so
+        // only the owed event-driven local refresh fires.
+        s.last_remote_refresh = Some(Instant::now());
+        let before_local = s.local_generation;
+        let before_remote = s.remote_generation;
+        let _ = s.update_tick();
+        assert!(!s.local_refresh_pending);
+        assert_eq!(s.local_generation, before_local + 1);
+        assert_eq!(s.remote_generation, before_remote);
+    }
+
+    #[test]
+    fn test_refresh_after_commit_refreshes_footer() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        s.local_refresh_pending = true;
+        let before_local = s.local_generation;
+        let before_remote = s.remote_generation;
+        let _ = s.update(GitMessage::RefreshAfterCommit);
+        // A commit is a ref-only change — the footer refreshes promptly (local +
+        // behind/ahead) and the owed file-change refresh is superseded.
+        assert!(s.last_local_refresh.is_some());
+        assert!(!s.local_refresh_pending);
+        assert_eq!(s.local_generation, before_local + 1);
+        assert_eq!(s.remote_generation, before_remote + 1);
     }
 }

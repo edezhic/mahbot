@@ -6,6 +6,10 @@
 use anyhow::Context;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tracing::warn;
 
 use crate::tools::shell::apply_safe_env;
@@ -34,8 +38,8 @@ impl CommitInfo {
 /// Maximum size (1 MiB) for reading untracked files in [`run_git_diff_stats`]
 /// and the diff page's untracked-file display.
 ///
-/// Files larger than this are skipped to avoid UI lag on the periodic
-/// refreshes (dashboard tick every second, diff page every 5 seconds).
+/// Files larger than this are skipped to avoid UI lag on the event-driven git
+/// footer refresh and the diff page.
 pub(crate) const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
 
 /// Classification of an untracked file read for diff display / line counting.
@@ -211,7 +215,8 @@ fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
 /// variables like `SSH_AUTH_SOCK` and `GIT_SSH_COMMAND` are **not**
 /// inherited. This is consistent with the shell tool's behavior — use
 /// SSH config (`~/.ssh/config`) for SSH-based git remotes rather than
-/// environment variables.
+/// environment variables. ([`run_git_fetch`] is the one exception: it
+/// restores `SSH_AUTH_SOCK` so SSH-agent remotes still work.)
 pub(crate) async fn run_git_output(
     repo_path: &Path,
     args: &[&str],
@@ -596,13 +601,111 @@ pub async fn run_git_behind_ahead(repo_path: &Path) -> anyhow::Result<(usize, us
     }
 }
 
+/// Hard timeout for a single `git fetch` — an unreachable/slow remote must not
+/// hang the periodic remote sync indefinitely.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Single-flight guard for [`run_git_fetch`]: at most one fetch runs at a time
+/// so concurrent fetches cannot overlap/contend on the same ref locks.
+static FETCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard that clears [`FETCH_IN_FLIGHT`] when the fetch task finishes
+/// (including on error/timeout/cancellation).
+struct FetchInFlightGuard;
+impl Drop for FetchInFlightGuard {
+    fn drop(&mut self) {
+        FETCH_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Run `git fetch` so upstream refs are refreshed before behind/ahead is
+/// computed (a fetch-free comparison only sees the last-fetched remote state).
+///
+/// The subprocess environment is sanitized (see [`git_command`]), then
+/// `GIT_TERMINAL_PROMPT=0` prevents git/credential helpers from popping an
+/// interactive (osxkeychain) prompt for a credential-less remote, and
+/// `SSH_AUTH_SOCK` is restored (if present) so SSH-agent remotes still work —
+/// the sanitized base drops it, and with it dropped behind/ahead would be
+/// limited to the locally-available remote ref. The fetch is time-boxed by
+/// [`FETCH_TIMEOUT`] and single-flight guarded.
+///
+/// On timeout the direct `git` child is killed and reaped; a remote helper it
+/// spawned (e.g. `git-remote-https`) is not signalled directly but terminates
+/// when its communication pipe closes, so it cannot hold the fetch open past
+/// the timeout.
+///
+/// Returns the fetch stdout; callers most often discard it and only log a
+/// failure (the subsequent behind/ahead read still works against local refs).
+pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
+    // Single-flight: if a fetch is already running, skip this one rather than
+    // queueing it (it would only contend on the same ref locks).
+    if FETCH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return Ok(String::new());
+    }
+    let _guard = FetchInFlightGuard;
+
+    let mut cmd = git_command(Some(repo_path));
+    cmd.arg("fetch").arg("--quiet").current_dir(repo_path);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Restore the SSH agent socket for SSH remotes (dropped by apply_safe_env).
+    if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
+        cmd.env("SSH_AUTH_SOCK", sock);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // Kill the child if this task is cancelled (e.g. on shutdown) so a running
+    // fetch cannot outlive the runtime and orphan.
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().context("Failed to spawn git fetch")?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+
+    // Wait for the child while draining its pipes concurrently, all inside the
+    // timeout — a slow/unreachable remote (or a subprocess that outlives git
+    // holding the pipes) cannot hang the periodic sync. On timeout, kill and
+    // reap so the process does not linger as a zombie.
+    let wait = child.wait();
+    let read_stdout = async {
+        if let Some(out) = &mut stdout {
+            let _ = out.read_to_end(&mut stdout_buf).await;
+        }
+    };
+    let read_stderr = async {
+        if let Some(err) = &mut stderr {
+            let _ = err.read_to_end(&mut stderr_buf).await;
+        }
+    };
+
+    let status = if let Ok(res) = tokio::time::timeout(FETCH_TIMEOUT, async {
+        tokio::join!(wait, read_stdout, read_stderr).0
+    })
+    .await
+    {
+        res.context("git fetch wait failed")?
+    } else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        anyhow::bail!("git fetch timed out after {}s", FETCH_TIMEOUT.as_secs());
+    };
+
+    if !status.success() {
+        anyhow::bail!("git fetch failed: {}", String::from_utf8_lossy(&stderr_buf));
+    }
+
+    Ok(String::from_utf8_lossy(&stdout_buf).to_string())
+}
+
 /// Run `git diff --numstat HEAD` and return the total added/removed lines.
 ///
 /// Also counts lines from untracked (new) files, since `git diff HEAD` only
 /// considers tracked files. Untracked files larger than
 /// [`MAX_UNTRACKED_SIZE`] or detected as binary are silently skipped to
-/// avoid UI lag (this function runs on the every-second dashboard refresh
-/// tick).
+/// avoid UI lag (this function runs on the event-driven git footer refresh,
+/// triggered by workspace file changes).
 ///
 /// Delegates to `parse_numstat` for tracked file diffs and
 /// `parse_untracked_from_porcelain` for untracked file enumeration.
