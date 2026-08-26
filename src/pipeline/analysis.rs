@@ -3,18 +3,30 @@
 use std::sync::Arc;
 
 use crate::pipeline::board::Ticket;
-use crate::prompt::{load_prompt, substitute};
+use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::{Role, Workspace};
 
 use super::{
-    ANALYST_PASS_THRESHOLD, AgentSlot, BoardStore, DEFAULT_PARALLEL_AGENT_COUNT, ExtractionMode,
-    FinalizeOutcome, ParallelVerdict, TicketPhase, TransitionCtx, Write, build_agent_slots,
-    build_round_joint_comment, guard_job_phase, info, insert_round_slots, is_ticket_in_phase,
-    load_ticket_analysis_angles, pause_freezing, reset_phase_attempt, run_parallel_agents,
-    stage_name, warn, with_comment_and_transition,
+    AgentSlot, BoardStore, ExtractionMode, FinalizeOutcome, ParallelVerdict, TicketPhase,
+    TransitionCtx, Write, build_agent_slots, build_round_joint_comment, guard_job_phase, info,
+    insert_round_slots, is_ticket_in_phase, pause_freezing, reset_phase_attempt,
+    run_parallel_agents, stage_name, warn, with_comment_and_transition,
 };
 
-pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String, _resumed: bool) {
+/// Default number of parallel analyst agents per round. Reviewers use a
+/// calibrated dynamic count (see [`crate::pipeline::verdict::review_agent_count`]);
+/// QA runs a single tester (see [`qa::QA_PARALLEL_AGENT_COUNT`]).
+const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
+
+/// Minimum acceptable verification score (0-10) for analyst verdicts.
+const ANALYST_PASS_THRESHOLD: u8 = 7;
+
+/// Load the three base ticket-analysis angle sections for Backlog analysts.
+fn load_ticket_analysis_angles() -> Vec<String> {
+    load_prompt_sections("analyze/ticket_angles.md")
+}
+
+pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
         let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
         return;
@@ -236,7 +248,6 @@ async fn maybe_escalate_analysis(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
     job_id: &str,
-    _resumed: bool,
     results: &mut Vec<ParallelVerdict>,
     paused: &mut bool,
 ) -> bool {
@@ -281,7 +292,6 @@ async fn maybe_escalate_analysis(
         },
         job_id,
         &extra_slots,
-        false,
         TicketPhase::Analysis,
     )
     .await;
@@ -302,7 +312,7 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
 
     let slots =
         ensure_analysis_slots(&ticket, job_id, &message, DEFAULT_PARALLEL_AGENT_COUNT).await;
-    run_analysis_round(&ticket, &ws, job_id, &slots, false).await;
+    run_analysis_round(&ticket, &ws, job_id, &slots).await;
 }
 
 /// Run an analysis round: parallel analysts, optional blocker-verification
@@ -312,7 +322,6 @@ async fn run_analysis_round(
     ws: &Workspace,
     job_id: &str,
     slots: &[AgentSlot],
-    resumed: bool,
 ) {
     let extraction_prompt = load_prompt("extraction/analyst.md");
     let (base_results, base_paused) = run_parallel_agents(
@@ -323,7 +332,6 @@ async fn run_analysis_round(
         ExtractionMode::ScoreVerdict,
         job_id,
         slots,
-        resumed,
         TicketPhase::Analysis,
     )
     .await;
@@ -334,7 +342,7 @@ async fn run_analysis_round(
     let base_count = base_results.len();
     let mut results = base_results;
     let mut paused = false;
-    if !maybe_escalate_analysis(ticket, ws, job_id, resumed, &mut results, &mut paused).await {
+    if !maybe_escalate_analysis(ticket, ws, job_id, &mut results, &mut paused).await {
         return;
     }
     if paused {

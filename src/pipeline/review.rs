@@ -7,24 +7,74 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::Workspace;
 use crate::git::commands::{
     has_unstaged_changes, run_git_add_all, run_git_diff_stats, run_git_head, run_git_status,
     run_git_write_tree,
 };
 use crate::pipeline::board::Ticket;
+use crate::{Role, Workspace};
 
 use super::{
-    ParallelVerdict, REVIEWER_VI, TicketPhase, debug, dispatch_verifiers, info, is_ticket_in_phase,
-    warn,
+    ParallelVerdict, REVIEWER_VI, SYSTEM_ROLE, TicketPhase, TransitionCtx, VerifierInfo,
+    comment_and_transition, debug, dispatch_verifiers, info, is_ticket_in_phase, warn,
 };
 
-pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String, resumed: bool) {
+pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if !is_ticket_in_phase(&ticket.id, TicketPhase::InReview).await {
         let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
         return;
     }
-    dispatch_verifiers(ticket, ws, REVIEWER_VI, job_id, resumed).await;
+    dispatch_verifiers(ticket, ws, REVIEWER_VI, job_id).await;
+}
+
+/// Whether git is usable for a reviewer round (reviewer-only: QA never skips
+/// review or records a reviewed base).
+pub(crate) async fn git_available_for_review(ws: &Workspace, vi: VerifierInfo) -> bool {
+    vi.role == Role::Reviewer
+        && crate::git::commands::git_is_installed().await
+        && crate::git::commands::is_git_repo(ws.as_path())
+}
+
+/// Handle the reviewer-only skip-review path (content identical to the recorded
+/// base). Returns `true` when the skip was applied — the caller must return
+/// immediately; `false` means the review should proceed normally.
+pub(crate) async fn maybe_skip_review(
+    ticket: &Ticket,
+    ws: &Workspace,
+    vi: VerifierInfo,
+    job_id: &str,
+) -> bool {
+    if !git_available_for_review(ws, vi).await {
+        return false;
+    }
+    let repo_path = ws.as_path();
+    match compute_review_skip(ticket, repo_path).await {
+        Ok(true) => {
+            info!(
+                ticket = %ticket.id,
+                "Content identical to reviewed base — skipping reviewer dispatch",
+            );
+            let _ = comment_and_transition(
+                TransitionCtx::buffered(ticket, vi.active_phase, TicketPhase::InQa, vi.log_label),
+                SYSTEM_ROLE,
+                "Content is identical to the reviewed base recorded for this ticket \
+                 (same HEAD commit and index tree, no working-tree changes). \
+                 Skipping reviewer dispatch.",
+            )
+            .await;
+            let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Git status check failed for skip-review — proceeding with normal review",
+            );
+            false
+        }
+    }
 }
 
 /// Decide whether the reviewer pass may be skipped for a ticket.

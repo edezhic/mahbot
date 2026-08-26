@@ -14,7 +14,7 @@ use super::{
     run_stage_agent, sync_phase_job_task, warn,
 };
 
-pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String, _resumed: bool) {
+pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if !is_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
         let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
         return;
@@ -52,15 +52,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     let message = engineer_work_message(&ticket);
     let conn = &crate::session::store().conn;
     sync_phase_job_task(conn, job_id, &message).await;
-    run_stage_agent(
-        &ticket,
-        &ws,
-        job_id,
-        &message,
-        false,
-        StageRunKind::Engineer,
-    )
-    .await;
+    run_stage_agent(&ticket, &ws, job_id, &message, StageRunKind::Engineer).await;
 }
 
 /// Extract a concise structured summary of the engineer's work for the ticket
@@ -176,7 +168,6 @@ pub(crate) async fn finalize_engineer_stage(
     response: Option<&str>,
     job_id: &str,
     ws: &Workspace,
-    resumed: bool,
     paused: bool,
 ) {
     if guard_stage(
@@ -184,7 +175,6 @@ pub(crate) async fn finalize_engineer_stage(
         TicketPhase::InDevelopment,
         "Engineer",
         response,
-        resumed,
         job_id,
     )
     .await
@@ -205,11 +195,7 @@ pub(crate) async fn finalize_engineer_stage(
             ),
             Role::Engineer.as_str(),
             &comment_text,
-            if resumed {
-                "Resumed engineer finished — transitioned ticket"
-            } else {
-                "Engineer finished — transitioned ticket"
-            },
+            "Engineer finished — transitioned ticket",
         )
         .await;
         let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
@@ -218,7 +204,7 @@ pub(crate) async fn finalize_engineer_stage(
 
     // Past the guards above, response None here is a real failure or a user
     // cancel — classify, pause, and freeze/fail.
-    handle_engineer_failure(ticket, agent, job_id, ws, resumed, paused).await;
+    handle_engineer_failure(ticket, agent, job_id, ws, paused).await;
 }
 
 /// Handle the engineer failure tail (response `None` past the guards).
@@ -227,7 +213,6 @@ async fn handle_engineer_failure(
     agent: &Agent,
     job_id: &str,
     ws: &Workspace,
-    resumed: bool,
     paused: bool,
 ) {
     let cancelled_by_user = agent.is_cancelled_by_user();
@@ -291,11 +276,7 @@ async fn handle_engineer_failure(
             ),
             SYSTEM_ROLE,
             &comment_text,
-            if resumed {
-                "Resumed engineer cancelled — transitioned ticket"
-            } else {
-                "Engineer cancelled — transitioned ticket"
-            },
+            "Engineer cancelled — transitioned ticket",
         )
         .await;
         let _ = crate::jobs::complete_ticket_job(conn, job_id).await;

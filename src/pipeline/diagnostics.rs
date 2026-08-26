@@ -13,7 +13,7 @@ use super::{
     comment_and_transition_or_bail, guard_job_phase, is_ticket_in_phase, reset_phase_attempt, warn,
 };
 
-pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String, _resumed: bool) {
+pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if !is_ticket_in_phase(&ticket.id, TicketPhase::InDiagnostics).await {
         let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
         return;

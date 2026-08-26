@@ -1,13 +1,18 @@
 //! Core pipeline flow tests — the job-per-phase single-puller orchestration,
 //! claims, bounce/reset failure semantics, and the phase machine.
 //!
-//! These exercise the deterministic store + orchestrator paths without invoking
-//! agent LLM rounds. Global-DB tests are serialized behind [`TEST_LOCK`] because
+//! The deterministic store + orchestrator tests exercise claim/bounce/reset and
+//! phase classification without agent rounds. The end-to-end behavioral-oracle
+//! tests drive the real phase bodies (analysis / development / diagnostics /
+//! review / QA / sanitation) and the puller through a scripted
+//! [`FakeProvider`](crate::util::test::FakeProvider), so they are isolated from
+//! the live model. Global-DB tests are serialized behind [`TEST_LOCK`] because
 //! every global store shares one test root; isolated-store tests run freely.
 
 use crate::pipeline::board::{BoardStore, PipelineCheck, TicketPhase};
 use crate::util::test::{
-    create_test_workspace, expect_ticket, init_management_test_stores, make_ticket,
+    create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
+    make_ticket,
 };
 use crate::{Workspace, WorkspaceStatus};
 
@@ -520,4 +525,1003 @@ async fn reset_phase_attempt_analysis_does_not_pause() {
         !ws_row.paused,
         "analysis reset must NOT pause the workspace",
     );
+}
+
+// ── End-to-end behavioral-oracle helpers ────────────────────────────────
+
+/// Create a phase job row without spawning a body — the test drives the phase
+/// body directly so the provider script is consumed deterministically.
+async fn spawn_phase_job(
+    job_id: &str,
+    ws: &Workspace,
+    ticket_id: &str,
+    phase: TicketPhase,
+    role: crate::Role,
+    task: &str,
+) {
+    crate::jobs::spawn_job(
+        &crate::session::store().conn,
+        job_id,
+        task,
+        &ws.name,
+        "",
+        "",
+        role,
+        &[],
+        &crate::jobs::SpawnChild::Phase {
+            phase,
+            ticket_id: ticket_id.to_string(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Find the launched phase job for a ticket, if present.
+async fn expect_phase_job(
+    store: &BoardStore,
+    id: &str,
+    phase: TicketPhase,
+) -> Option<crate::jobs::TicketJobRow> {
+    crate::jobs::find_phase_job(&store.conn, id, phase)
+        .await
+        .unwrap()
+}
+
+/// A scripted FakeProvider that yields `count` clean verifier pairs: each
+/// agent produces a turn response then a clean `{"score":10,"issues":[]}`
+/// verdict.
+fn fake_clean_verifiers(count: usize) -> crate::util::test::FakeProvider {
+    let mut fake = crate::util::test::FakeProvider::new();
+    for _ in 0..count {
+        fake = fake
+            .ok("verifier check ok")
+            .ok(r#"{"score":10,"issues":[]}"#);
+    }
+    fake
+}
+
+/// Poll (tightly) until an agent for `ticket_id` is registered in the global
+/// registry, or panic after `timeout`.
+async fn wait_for_agent_registered(ticket_id: &str, timeout: std::time::Duration) {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if crate::agent::registry::AGENT_REGISTRY.has_agents_for_ticket(ticket_id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("agent must register within the timeout");
+}
+
+/// Assert the workspace row's `paused` column equals `expected`.
+async fn assert_workspace_paused(ws: &Workspace, expected: bool) {
+    let ws_row = crate::workspace::store()
+        .get_by_name(&ws.name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ws_row.paused, expected,
+        "workspace {} paused={} expected {expected}",
+        ws.name, ws_row.paused,
+    );
+}
+
+/// Age a ticket's `created_at` past the Backlog claim grace so the puller will
+/// claim it.
+async fn age_ticket_past_grace(store: &BoardStore, id: &str) {
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+    store
+        .conn
+        .execute(
+            "UPDATE tickets SET created_at = ?1 WHERE id = ?2",
+            crate::db::params![past, id.to_string()],
+        )
+        .await
+        .unwrap();
+}
+
+// ── 1. Full pipeline lifecycle ──────────────────────────────────────────
+
+/// Drive a Backlog→Done lifecycle through the real phase bodies and the
+/// per-phase puller claims: analysis → planning → rfd → development →
+/// diagnostics (skipped) → review (skip-reviewed) → QA → sanitation (dirty
+/// commit).
+
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_commit() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "lifecycle_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "Lifecycle", TicketPhase::Backlog).await;
+    age_ticket_past_grace(store, &id).await;
+
+    // Puller claim Backlog → Analysis.
+    super::run_claim_pipeline(&ws).await;
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Analysis,
+        "aged backlog ticket must be claimed into Analysis",
+    );
+
+    // Analysis: 3 clean analysts → Planning, job deleted.
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("analyst one")
+            .ok(r#"{"score":8,"issues":[]}"#)
+            .ok("analyst two")
+            .ok(r#"{"score":8,"issues":[]}"#)
+            .ok("analyst three")
+            .ok(r#"{"score":8,"issues":[]}"#);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::analysis::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+    assert_eq!(expect_ticket_phase(store, &id).await, TicketPhase::Planning);
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::Analysis)
+            .await
+            .is_none(),
+        "a completed analysis round deletes the phase job",
+    );
+
+    // Manual Planning → ReadyForDevelopment, then puller claim RFD → InDevelopment.
+    store
+        .transition_to(
+            &id,
+            Some(TicketPhase::Planning),
+            TicketPhase::ReadyForDevelopment,
+        )
+        .await
+        .unwrap();
+    super::run_claim_pipeline(&ws).await;
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::InDevelopment,
+    );
+
+    // Engineer: 2 responses → InDevelopment → InDiagnostics.
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InDevelopment,
+        crate::Role::Engineer,
+        "implement",
+    )
+    .await;
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("implemented the ticket")
+            .ok(r#"{"items":["did the thing"],"summary":"done"}"#);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::development::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::InDiagnostics,
+    );
+
+    // Diagnostics: no commands configured → skipped, no provider calls.
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InDiagnostics,
+        crate::Role::Engineer,
+        "diagnostics",
+    )
+    .await;
+    super::diagnostics::run(
+        std::sync::Arc::new(expect_ticket(store, &id).await),
+        ws.clone(),
+        job_id.clone(),
+    )
+    .await;
+    assert_eq!(expect_ticket_phase(store, &id).await, TicketPhase::InReview);
+
+    // Record the reviewed base so the reviewer pass is skipped (content-identical).
+    let head = crate::git::commands::run_git_head(repo_path.as_path())
+        .await
+        .ok();
+    let tree = crate::git::commands::run_git_write_tree(repo_path.as_path())
+        .await
+        .ok();
+    store
+        .set_reviewed_base(&id, head.as_deref(), tree.as_deref())
+        .await
+        .unwrap();
+
+    // Review: content identical → skip reviewer dispatch (no provider calls).
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InReview,
+        crate::Role::Reviewer,
+        "review",
+    )
+    .await;
+    super::review::run(
+        std::sync::Arc::new(expect_ticket(store, &id).await),
+        ws.clone(),
+        job_id.clone(),
+    )
+    .await;
+    assert_eq!(expect_ticket_phase(store, &id).await, TicketPhase::InQa);
+
+    // QA: 1 tester, clean verdict → InSanitation.
+    let job_id = crate::generate_id();
+    spawn_phase_job(&job_id, &ws, &id, TicketPhase::InQa, crate::Role::Qa, "qa").await;
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = fake_clean_verifiers(1);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::qa::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::InSanitation
+    );
+
+    // Dirty the working tree, sanitation inspects and commits → Done.
+    let base_head = crate::git::commands::run_git_head(repo_path.as_path())
+        .await
+        .unwrap();
+    std::fs::write(repo_path.join("unexpected.txt"), b"x\n").unwrap();
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InSanitation,
+        crate::Role::Sanitation,
+        "sanitation",
+    )
+    .await;
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("sanitation inspected")
+            .ok(r#"{"pass":true,"garbage_files":[],"rationale":"clean"}"#);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::sanitation::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+    assert_eq!(expect_ticket_phase(store, &id).await, TicketPhase::Done);
+
+    let new_head = crate::git::commands::run_git_head(repo_path.as_path())
+        .await
+        .unwrap();
+    assert_ne!(
+        base_head, new_head,
+        "a dirty-tree sanitation round must create a new commit",
+    );
+
+    drop(repo_dir);
+}
+
+// ── 2. Analysis escalation + blocker verification ───────────────────────
+
+/// A base analysis round that flags a shared blocker escalates to 2
+/// blocker-verification analysts; when both refute the blocker the ticket
+/// still advances to Planning and the joint comment records the verification.
+
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn analysis_escalation_and_blocker_verification() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/escalation_ws", "escalation_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "Escalation", TicketPhase::Analysis).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // 3 base analysts: 2 flag the SAME blocker, 1 passes clean. Then 2
+        // escalation verifiers both refute it. The base joint-comment synthesis
+        // falls back deterministically (3 scripted invalid responses).
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("analyst one")
+            .ok(r#"{"score":5,"issues":["missing error handling"]}"#)
+            .ok("analyst two")
+            .ok(r#"{"score":5,"issues":["missing error handling"]}"#)
+            .ok("analyst three")
+            .ok(r#"{"score":8,"issues":[]}"#)
+            .ok("{}")
+            .ok("{}")
+            .ok("{}")
+            .ok("verifier one")
+            .ok(r#"{"verdicts":[{"index":0,"verdict":"refuted","reasoning":"handled"}]}"#)
+            .ok("verifier two")
+            .ok(r#"{"verdicts":[{"index":0,"verdict":"refuted","reasoning":"handled"}]}"#);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::analysis::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Planning,
+        "escalation round must still advance to Planning (fail-open)",
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::Analysis)
+            .await
+            .is_none(),
+    );
+    let comments = store.get_comments(&id).await.unwrap();
+    let analysis_comment = comments
+        .iter()
+        .find(|c| c.role == "Analysis")
+        .expect("an analysis joint comment must exist");
+    assert!(
+        analysis_comment.content.contains("Blocker verification"),
+        "the joint comment must record the blocker-verification round",
+    );
+}
+
+// ── 3. Reviewer/QA dynamic count calibration ────────────────────────────
+
+/// The reviewer-count churn bands and P0 floor are product behavior; the QA
+/// verifier count is a single tester. These are asserted deterministically
+/// without an agent round (real churn is measured for at least one band).
+
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn review_qa_dynamic_count_calibration() {
+    use crate::pipeline::verdict::{
+        DEFAULT_REVIEW_COUNT_HIGH_CHURN, DEFAULT_REVIEW_COUNT_LOW_CHURN,
+        DEFAULT_REVIEW_COUNT_TINY_CHURN, review_agent_count, review_base_from_signals,
+    };
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "calib_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "Calib", TicketPhase::InReview).await;
+
+    let (tiny, low, high) = (
+        DEFAULT_REVIEW_COUNT_TINY_CHURN,
+        DEFAULT_REVIEW_COUNT_LOW_CHURN,
+        DEFAULT_REVIEW_COUNT_HIGH_CHURN,
+    );
+    assert_eq!(review_base_from_signals(50, tiny, low, high), 1);
+    assert_eq!(review_base_from_signals(tiny, tiny, low, high), 2);
+    assert_eq!(review_base_from_signals(low, tiny, low, high), 2);
+    assert_eq!(review_base_from_signals(low + 1, tiny, low, high), 3);
+    assert_eq!(review_base_from_signals(high, tiny, low, high), 3);
+    assert_eq!(review_base_from_signals(high + 1, tiny, low, high), 4);
+    // P0 floor: priority-0 tickets never drop below 2 reviewers.
+    assert_eq!(review_agent_count(1, 0), 2);
+    assert_eq!(review_agent_count(2, 0), 2);
+    assert_eq!(review_agent_count(4, 0), 4);
+    assert_eq!(review_agent_count(1, 5), 1);
+
+    // `compute_reviewer_count` reads real working-tree churn: a 3000+-line
+    // untracked file yields the `> high` band (4 reviewers).
+    std::fs::write(repo_path.join("big.txt"), "x\n".repeat(3000)).unwrap();
+    let ticket = expect_ticket(store, &id).await;
+    let count = crate::pipeline::review::compute_reviewer_count(&ticket, repo_path.as_path()).await;
+    assert_eq!(count, 4, "churn > 2000 must calibrate to 4 reviewers");
+
+    // QA runs exactly one tester per round.
+    assert_eq!(crate::pipeline::qa::QA_PARALLEL_AGENT_COUNT, 1);
+
+    // A clean QA round uses exactly 1 verifier (2 responses) → InSanitation.
+    drop(repo_dir);
+    let ws2 = create_test_workspace("/tmp/qa_calib_ws", "qa_calib_ws").await;
+    crate::workspace::store()
+        .set_status(&ws2.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let qa_id = make_ticket(store, &ws2, "QaCalib", TicketPhase::InQa).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws2,
+        &qa_id,
+        TicketPhase::InQa,
+        crate::Role::Qa,
+        "qa",
+    )
+    .await;
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = fake_clean_verifiers(1);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::qa::run(
+            std::sync::Arc::new(expect_ticket(store, &qa_id).await),
+            ws2.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+    assert_eq!(
+        expect_ticket_phase(store, &qa_id).await,
+        TicketPhase::InSanitation
+    );
+}
+
+// ── 4. Bounce breaker trips terminal and drains RFD siblings ────────────
+
+/// When the reviewer bounce budget is exhausted the ticket trips to Failed
+/// (terminal), the phase job is deleted, RFD siblings are drained to Planning,
+/// and the workspace is NOT paused (a bounce is not a technical failure).
+
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn bounce_breaker_fails_terminal_and_drains_rfd_without_pausing() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "bounce_trip_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "Trip", TicketPhase::InReview).await;
+    let sibling = make_ticket(store, &ws, "Sibling", TicketPhase::ReadyForDevelopment).await;
+
+    // Seed the bounce budget at the exhaustion threshold (MAX_BOUNCES = 10).
+    store
+        .conn
+        .execute(
+            "UPDATE tickets SET bounce_count = ?1 WHERE id = ?2",
+            crate::db::params![10i64, id.clone()],
+        )
+        .await
+        .unwrap();
+
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InReview,
+        crate::Role::Reviewer,
+        "review",
+    )
+    .await;
+
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Zero-change repo → reviewer count 1 → a single sub-threshold verdict
+        // trips the breaker (only the agent-turn + extraction are consumed).
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("reviewer checked")
+            .ok(r#"{"score":5,"issues":["bug"]}"#);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::review::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+
+    let ticket = expect_ticket(store, &id).await;
+    assert_eq!(ticket.phase, TicketPhase::Failed);
+    assert_eq!(
+        ticket.bounce_count, 10,
+        "terminal trip must not consume further bounce budget"
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::InReview)
+            .await
+            .is_none(),
+    );
+    assert_eq!(
+        expect_ticket_phase(store, &sibling).await,
+        TicketPhase::Planning,
+        "breaker trip must drain ReadyForDevelopment siblings to Planning",
+    );
+    assert_workspace_paused(&ws, false).await;
+
+    drop(repo_dir);
+}
+
+// ── 5. Hard-failure cleanup + puller re-drive + engineer session stability ──
+
+/// A hard technical failure (no usable output) resets the attempt: the phase
+/// job is destroyed, the workspace pause policy is honoured by phase, and the
+/// puller re-creates a fresh job. The engineer session pin survives the round
+/// job's deletion so the accumulated session is preserved across resets.
+
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/reset_round_ws", "reset_round_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+
+    // ── Analysis hard technical failure ──
+    let aid = make_ticket(store, &ws, "HardAnalysis", TicketPhase::Analysis).await;
+    let ajob = crate::generate_id();
+    spawn_phase_job(
+        &ajob,
+        &ws,
+        &aid,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Every analyst turn + every extraction attempt fails to produce a
+        // verdict → `extracted_count == 0` → reset for a fresh attempt.
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json");
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::analysis::run(
+            std::sync::Arc::new(expect_ticket(store, &aid).await),
+            ws.clone(),
+            ajob.clone(),
+        )
+        .await;
+    }
+    assert_eq!(
+        expect_ticket_phase(store, &aid).await,
+        TicketPhase::Analysis,
+        "a hard analysis failure must stay in Analysis",
+    );
+    assert!(
+        expect_phase_job(store, &aid, TicketPhase::Analysis)
+            .await
+            .is_none(),
+        "a hard analysis failure must destroy the phase job",
+    );
+    assert_workspace_paused(&ws, false).await;
+    {
+        let comments = store.get_comments(&aid).await.unwrap();
+        assert!(
+            comments
+                .iter()
+                .any(|c| c.content.contains("resetting for a fresh attempt")),
+            "the reset must leave an explanatory comment",
+        );
+    }
+
+    // The puller re-creates a fresh Analysis job and re-drives it to completion
+    // (so no lingering phase-body task consumes the next provider script).
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = fake_clean_verifiers(3);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::dispatch_working_phases(&ws).await;
+        assert!(
+            expect_phase_job(store, &aid, TicketPhase::Analysis)
+                .await
+                .is_some(),
+            "the puller must re-create a fresh Analysis job after a reset",
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if expect_ticket_phase(store, &aid).await == TicketPhase::Planning
+                    && expect_phase_job(store, &aid, TicketPhase::Analysis)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the re-created analysis round must re-drive to Planning");
+    }
+
+    // ── Implementation-phase hard failure pauses + preserves the engine pin ──
+    let eid = make_ticket(store, &ws, "HardDev", TicketPhase::InDevelopment).await;
+    let ejob = crate::generate_id();
+    spawn_phase_job(
+        &ejob,
+        &ws,
+        &eid,
+        TicketPhase::InDevelopment,
+        crate::Role::Engineer,
+        "dev",
+    )
+    .await;
+    let pin_id = crate::jobs::engineer_session_pin_id(&eid);
+    // Seed the engineer's stable session anchor; a hard-failure reset must
+    // preserve it across the round job's deletion.
+    crate::jobs::upsert_engineer_session_pin(
+        &crate::session::store().conn,
+        &eid,
+        "implement",
+        crate::jobs::RowStatus::Launched,
+    )
+    .await
+    .unwrap();
+    super::reset_phase_attempt(
+        &expect_ticket(store, &eid).await,
+        TicketPhase::InDevelopment,
+        &ejob,
+        "test hard failure",
+        "engineer attempt reset",
+    )
+    .await;
+    assert_eq!(
+        expect_ticket_phase(store, &eid).await,
+        TicketPhase::InDevelopment,
+        "an engineer hard failure must leave the ticket in InDevelopment",
+    );
+    assert!(
+        expect_phase_job(store, &eid, TicketPhase::InDevelopment)
+            .await
+            .is_none(),
+    );
+    assert_workspace_paused(&ws, true).await;
+    let pin_row = crate::session::store()
+        .conn
+        .query_optional(
+            "SELECT 1 FROM agents WHERE agent_id = ?1 AND job_id IS NULL",
+            crate::db::params![pin_id.clone()],
+            |_| Ok::<_, std::convert::Infallible>(()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        pin_row.is_some(),
+        "the engineer session pin must survive the round job's deletion",
+    );
+
+    // The puller re-creates a fresh InDevelopment job on a paused workspace and
+    // re-drives it (the re-created body consumes this script).
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("implemented")
+            .ok(r#"{"items":["done"],"summary":"ok"}"#);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::dispatch_working_phases(&ws).await;
+        assert!(
+            expect_phase_job(store, &eid, TicketPhase::InDevelopment)
+                .await
+                .is_some(),
+            "the puller must re-create a fresh InDevelopment job after a reset",
+        );
+        // Let the re-created body consume the script and advance the phase.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if expect_ticket_phase(store, &eid).await == TicketPhase::InDiagnostics
+                    && expect_phase_job(store, &eid, TicketPhase::InDevelopment)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the re-created development body must re-drive to InDiagnostics");
+    }
+}
+
+// ── 6. Analysis hard-failure cleanup stays in phase, no pause ────────────
+
+/// A hard analysis failure (no usable verdict from any analyst) resets the
+/// attempt without pausing the workspace or consuming the bounce budget; the
+/// ticket stays in Analysis for a fresh round.
+
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/hard_analysis_ws", "hard_analysis_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "HardAnalysis", TicketPhase::Analysis).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+
+    let before = expect_ticket(store, &id).await;
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json")
+            .ok("not json");
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::analysis::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+
+    let after = expect_ticket(store, &id).await;
+    assert_eq!(
+        after.phase,
+        TicketPhase::Analysis,
+        "ticket must stay in Analysis"
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::Analysis)
+            .await
+            .is_none(),
+    );
+    assert_workspace_paused(&ws, false).await;
+    assert_eq!(
+        after.bounce_count, before.bounce_count,
+        "a hard analysis failure must not consume bounce budget",
+    );
+    let comments = store.get_comments(&id).await.unwrap();
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.content.contains("resetting for a fresh attempt")),
+        "the reset must leave an explanatory comment",
+    );
+}
+
+// ── 7. User cancel trips the engineer to a terminal Cancelled phase ─────
+
+/// A genuine user stop of an in-flight engineer run transitions the ticket to
+/// Cancelled (terminal, never auto-requeued), deletes the phase job, and
+/// pauses the workspace.
+
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn cancel_requested_engineer_goes_to_cancelled() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/cancel_ws", "cancel_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "CancelDev", TicketPhase::InDevelopment).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InDevelopment,
+        crate::Role::Engineer,
+        "dev",
+    )
+    .await;
+
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // The engineer's first provider outcome is a tool call (empty-args read
+        // errors), keeping the agent in-flight until the test cancels it.
+        let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
+        for _ in 0..9 {
+            fake = fake.ok_tool_call("read");
+        }
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+
+        let ticket = expect_ticket(store, &id).await;
+        let handle = tokio::spawn(super::development::run(
+            std::sync::Arc::new(ticket),
+            ws.clone(),
+            job_id.clone(),
+        ));
+        wait_for_agent_registered(&id, std::time::Duration::from_secs(2)).await;
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id_user(&id);
+        handle.await.unwrap();
+    }
+
+    let ticket = expect_ticket(store, &id).await;
+    assert_eq!(
+        ticket.phase,
+        TicketPhase::Cancelled,
+        "a user cancel must move the ticket to a terminal Cancelled phase",
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::InDevelopment)
+            .await
+            .is_none(),
+    );
+    assert_workspace_paused(&ws, true).await;
+}
+
+// ── 8. Cooperative pause keeps the job and unpause does not re-pause ─────
+
+/// A cooperative workspace pause freezes an in-flight verifier at its LLM
+/// boundary: the phase job is retained, the workspace is paused, and the
+/// unpause re-drives the round to completion without re-pausing.
+
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/pause_resume_ws", "pause_resume_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "PauseQa", TicketPhase::InQa).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(&job_id, &ws, &id, TicketPhase::InQa, crate::Role::Qa, "qa").await;
+
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // The QA verifier's first outcome is a tool call (errors), holding it
+        // in-flight until the workspace pause lands.
+        let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
+        for _ in 0..9 {
+            fake = fake.ok_tool_call("read");
+        }
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+
+        let ticket = expect_ticket(store, &id).await;
+        let handle = tokio::spawn(super::qa::run(
+            std::sync::Arc::new(ticket),
+            ws.clone(),
+            job_id.clone(),
+        ));
+        wait_for_agent_registered(&id, std::time::Duration::from_secs(2)).await;
+        crate::workspace::store()
+            .set_paused(&ws.name, true)
+            .await
+            .unwrap();
+        handle.await.unwrap();
+
+        assert!(
+            expect_phase_job(store, &id, TicketPhase::InQa)
+                .await
+                .is_some(),
+            "a cooperative pause must retain the phase job for the unpause re-drive",
+        );
+        assert_workspace_paused(&ws, true).await;
+    }
+
+    // Resume and re-drive the same round with a clean script: it completes to
+    // InSanitation and does NOT re-pause the workspace.
+    crate::workspace::store()
+        .set_paused(&ws.name, false)
+        .await
+        .unwrap();
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = fake_clean_verifiers(1);
+        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        super::qa::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::InSanitation,
+        "the unpause re-drive must complete the QA round",
+    );
+    assert_workspace_paused(&ws, false).await;
 }

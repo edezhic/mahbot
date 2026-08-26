@@ -28,7 +28,7 @@ use std::sync::Arc;
 use crate::jobs::RowStatus;
 use crate::pipeline::board::Ticket;
 use crate::retry::RetryExhausted;
-use crate::util::scrub_credentials;
+use crate::util::{panic_message, scrub_credentials};
 use crate::{
     BlockerVerificationVerdict, ChatMessage, ChatRequest, ChatRequestMeta, Role, Verdict, Workspace,
 };
@@ -432,6 +432,66 @@ pub(crate) struct AgentSlot {
     pub outcome: Option<String>,
 }
 
+/// Map a panicked round member's [`tokio::task::JoinError`] to a contained
+/// [`ParallelVerdict::NoResponse`] (round continues fail-open).
+pub(crate) fn round_member_failed(e: tokio::task::JoinError) -> ParallelVerdict {
+    let reason = scrub_credentials(&panic_message(&*e.into_panic()));
+    tracing::warn!(%reason, "round member task failed");
+    ParallelVerdict::NoResponse(reason)
+}
+
+/// Validate a verdict score is within [0, 10].
+pub(crate) fn validate_verdict_score(v: &Verdict) -> Result<(), String> {
+    if v.score <= 10 {
+        Ok(())
+    } else {
+        Err(format!("verdict score {} out of range [0,10]", v.score))
+    }
+}
+
+/// Validate a blocker-verification verdict.
+pub(crate) fn validate_blocker_verification(
+    v: &BlockerVerificationVerdict,
+    blockers: &[String],
+) -> Result<(), String> {
+    if v.verdicts.is_empty() {
+        return Err("blocker verification returned no verdicts".to_string());
+    }
+    if v.verdicts.len() != blockers.len() {
+        return Err(format!(
+            "blocker verification returned {} verdicts for {} blockers",
+            v.verdicts.len(),
+            blockers.len()
+        ));
+    }
+    let mut seen = vec![false; blockers.len()];
+    for item in &v.verdicts {
+        if item.index >= blockers.len() {
+            return Err(format!("blocker index {} out of range", item.index));
+        }
+        if seen[item.index] {
+            return Err(format!("duplicate blocker index {}", item.index));
+        }
+        seen[item.index] = true;
+        if item.reasoning.trim().is_empty() {
+            return Err(format!("blocker {} missing reasoning", item.index));
+        }
+        if item.verdict == crate::BlockerDisposition::Sharpened
+            && item
+                .sharpened_text
+                .as_deref()
+                .map_or("", str::trim)
+                .is_empty()
+        {
+            return Err(format!(
+                "sharpened blocker {} requires sharpened_text",
+                item.index
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Serialize a [`ParallelVerdict`] into the agents.outcome column.
 #[must_use]
 pub(crate) fn serialize_verdict_outcome(result: &ParallelVerdict) -> String {
@@ -541,11 +601,11 @@ pub(crate) async fn build_round_joint_comment(
 // ── Verifier round processing (review / QA) ─────────────────────────────
 
 /// Minimum acceptable verification score (0-10) for review and QA phases.
-pub(crate) const REVIEW_QA_THRESHOLD: u8 = 9;
+const REVIEW_QA_THRESHOLD: u8 = 9;
 
 /// Check whether a review or QA verdict passes (score at or above threshold).
 #[must_use]
-pub(crate) fn verdict_passes(verdict: &crate::Verdict) -> bool {
+fn verdict_passes(verdict: &crate::Verdict) -> bool {
     verdict.score >= REVIEW_QA_THRESHOLD
 }
 
@@ -669,7 +729,7 @@ pub(crate) async fn process_verifier_verdicts(
 /// Apply the clean-pass outcome of a verifier round: write the joint comment,
 /// transition the ticket to its next phase, and delete the phase job. Returns
 /// `false` if the transition was not applied (phase moved concurrently).
-pub(crate) async fn apply_clean_verifier_round(
+async fn apply_clean_verifier_round(
     ticket: &Ticket,
     verifier: VerifierInfo,
     joint_comment: &str,

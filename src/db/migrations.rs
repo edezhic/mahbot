@@ -278,7 +278,7 @@ pub(crate) async fn run_domain_migrations(conn: &crate::db::Connection) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{column_exists, run_pending_migrations};
+    use crate::db::{column_exists, params, run_pending_migrations, table_exists};
 
     async fn applied_ids(conn: &crate::db::Connection) -> Vec<String> {
         conn.query("SELECT id FROM schema_migrations ORDER BY id", ())
@@ -287,6 +287,16 @@ mod tests {
             .into_iter()
             .map(|row| row.get::<String>(0).expect("id column"))
             .collect()
+    }
+
+    fn assert_migrations_applied(ids: &[String], migrations: &[Migration], scope: &str) {
+        for migration in migrations {
+            assert!(
+                ids.iter().any(|id| id.as_str() == migration.id),
+                "missing {scope} migration {}",
+                migration.id
+            );
+        }
     }
 
     // ── Board DROP COLUMN migrations (the inverse guard direction) ──────
@@ -435,6 +445,330 @@ mod tests {
                 "004_drop_tickets_review_base_count",
             ],
             "all recorded as applied even though the DDL was skipped"
+        );
+    }
+
+    // ── Job-per-phase rework (consolidate_002..007) ─────────────────────
+
+    /// Pre-refactor consolidated schema (before the job-per-phase rework): the
+    /// rework columns are absent, the old `ticket_stage_jobs` child table still
+    /// exists, and `jobs` still carries `paused_frozen`. `session_metadata`
+    /// omits `token_length`/`message_count` so migrations 001/002 actually fire
+    /// (the ALTER + one-time backfill path); `sessions` is present for the 002
+    /// backfill UPDATE.
+    const PRE_REFACTOR_CONSOLIDATED_SCHEMA: &str = "CREATE TABLE tickets (\
+         id TEXT PRIMARY KEY, title TEXT NOT NULL, pipeline_reservation INTEGER, \
+         assigned_to TEXT, review_base_count INTEGER, \
+         phase TEXT NOT NULL DEFAULT 'backlog', \
+         is_archived INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL); \
+         CREATE TABLE jobs (\
+         id TEXT PRIMARY KEY, kind TEXT NOT NULL, role TEXT NOT NULL DEFAULT '', \
+         workspace_name TEXT NOT NULL, task TEXT NOT NULL DEFAULT '', \
+         user_name TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', \
+         retry_count INTEGER NOT NULL DEFAULT 0, \
+         status TEXT NOT NULL DEFAULT 'launched', paused_frozen INTEGER, \
+         created_at TEXT NOT NULL, updated_at TEXT NOT NULL); \
+         CREATE TABLE ticket_stage_jobs (\
+         id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE, \
+         ticket_id TEXT, stage TEXT, phase TEXT, round INTEGER, review_base TEXT, \
+         created_at TEXT, updated_at TEXT); \
+         CREATE TABLE sessions (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
+         role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL); \
+         CREATE TABLE session_metadata (\
+         agent_id TEXT PRIMARY KEY, last_activity TEXT NOT NULL, channel TEXT, \
+         user_name TEXT, workspace_name TEXT, role TEXT, active_models TEXT);";
+
+    #[tokio::test]
+    async fn consolidate_migrations_converge_on_fresh_db() {
+        // Fresh consolidated store: no legacy per-store files, so the import
+        // only records its tracking id. The job-per-phase migrations must
+        // converge to the current jobs shape (ticket_id present,
+        // paused_frozen/ticket_jobs/ticket_stage_jobs absent, phase index
+        // present) purely from the consolidated schema.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_consolidated_store(tmp.path())
+            .await
+            .expect("open fresh consolidated store");
+
+        assert!(
+            column_exists(&conn, "jobs", "ticket_id").await.unwrap(),
+            "job-per-phase jobs has ticket_id"
+        );
+        assert!(
+            !table_exists(&conn, "ticket_jobs").await.unwrap(),
+            "job-per-phase jobs has no ticket_jobs child table"
+        );
+        assert!(
+            !table_exists(&conn, "ticket_stage_jobs").await.unwrap(),
+            "job-per-phase jobs has no ticket_stage_jobs child table"
+        );
+        assert!(
+            !column_exists(&conn, "jobs", "paused_frozen").await.unwrap(),
+            "job-per-phase jobs has no paused_frozen column"
+        );
+        assert_eq!(
+            conn.query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_jobs_phase_ticket'",
+                (),
+            )
+            .await
+            .unwrap()
+            .len(),
+            1,
+            "idx_jobs_phase_ticket index exists"
+        );
+
+        let ids = applied_ids(&conn).await;
+        assert_migrations_applied(&ids, BOARD_MIGRATIONS, "board");
+        assert_migrations_applied(&ids, SESSION_MIGRATIONS, "session");
+        assert!(
+            ids.iter()
+                .any(|id| id.as_str() == "consolidate_001_import_domain_stores"),
+            "consolidation import recorded as applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidate_migrations_converge_on_upgraded_pre_refactor_db() {
+        // Upgrade-in-place: a pre-refactor core.db already holds the old
+        // ticket_stage_jobs child table, `jobs.paused_frozen`, and no
+        // `jobs.ticket_id`. `run_domain_migrations` must converge it to the
+        // job-per-phase shape and discard the old ticket job kinds. The import
+        // (consolidate_001) is a separate store-open concern (Test 2), so the
+        // domain runner does not record it here — only the board/session ids.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &tmp.path().join("core.db"),
+            PRE_REFACTOR_CONSOLIDATED_SCHEMA,
+        )
+        .await
+        .expect("open pre-refactor consolidated store");
+
+        let now = crate::db::now();
+        for (id, kind) in [
+            ("job_analysis", "ticket_analysis"),
+            ("job_implementation", "ticket_implementation"),
+            ("job_stage", "ticket_stage"),
+            ("job_research", "research"),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, \
+                 channel, retry_count, status, paused_frozen, created_at, updated_at) \
+                 VALUES (?1, ?2, '', 'ws', '', '', '', 0, 'launched', NULL, ?3, ?3)",
+                params![id, kind, now.clone()],
+            )
+            .await
+            .expect("insert legacy job");
+        }
+        // A pre-rework child row referencing the implementation job; it must
+        // disappear with the child table once consolidate_004/005 run.
+        conn.execute(
+            "INSERT INTO ticket_stage_jobs \
+             (id, ticket_id, stage, phase, round, review_base, created_at, updated_at) \
+             VALUES (?1, 'T1', 'implementation', 'in_development', 1, 'head', ?2, ?2)",
+            params!["job_implementation", now],
+        )
+        .await
+        .expect("insert child job row");
+
+        crate::db::migrations::run_domain_migrations(&conn)
+            .await
+            .expect("run consolidated migrations");
+
+        assert!(
+            column_exists(&conn, "jobs", "ticket_id").await.unwrap(),
+            "jobs.ticket_id added"
+        );
+        assert!(
+            !column_exists(&conn, "jobs", "paused_frozen").await.unwrap(),
+            "jobs.paused_frozen dropped"
+        );
+        assert!(
+            !table_exists(&conn, "ticket_jobs").await.unwrap(),
+            "ticket_jobs child table dropped"
+        );
+        assert!(
+            !table_exists(&conn, "ticket_stage_jobs").await.unwrap(),
+            "ticket_stage_jobs child table dropped"
+        );
+
+        let old_kinds = conn
+            .query(
+                "SELECT count(*) FROM jobs \
+                 WHERE kind IN ('ticket_analysis', 'ticket_implementation', 'ticket_stage')",
+                (),
+            )
+            .await
+            .unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(old_kinds, 0, "legacy ticket job kinds discarded");
+        let research = conn
+            .query("SELECT count(*) FROM jobs WHERE kind = 'research'", ())
+            .await
+            .unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(research, 1, "non-ticket job survives");
+        assert_eq!(
+            conn.query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_jobs_phase_ticket'",
+                (),
+            )
+            .await
+            .unwrap()
+            .len(),
+            1,
+            "idx_jobs_phase_ticket index exists"
+        );
+
+        let ids = applied_ids(&conn).await;
+        assert_migrations_applied(&ids, BOARD_MIGRATIONS, "board");
+        assert_migrations_applied(&ids, SESSION_MIGRATIONS, "session");
+    }
+
+    // ── Legacy-consolidation import path (consolidate_001) ──────────────
+
+    /// Minimal old board schema: `tickets` with the NOT NULL columns the
+    /// consolidated schema requires so the import's verbatim copy succeeds.
+    const LEGACY_BOARD_SCHEMA: &str = "CREATE TABLE tickets (\
+         id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, \
+         phase TEXT NOT NULL DEFAULT 'backlog', workspace_name TEXT NOT NULL, \
+         is_archived INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, \
+         updated_at TEXT NOT NULL);";
+
+    /// Minimal old sessions schema: `jobs` with the pre-rework columns
+    /// (including `paused_frozen`, no `ticket_id`) plus the to-be-dropped
+    /// `ticket_jobs` child table.
+    const LEGACY_SESSIONS_SCHEMA: &str = "CREATE TABLE jobs (\
+         id TEXT PRIMARY KEY, kind TEXT NOT NULL, role TEXT NOT NULL DEFAULT '', \
+         workspace_name TEXT NOT NULL, task TEXT NOT NULL DEFAULT '', \
+         user_name TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', \
+         retry_count INTEGER NOT NULL DEFAULT 0, \
+         status TEXT NOT NULL DEFAULT 'launched', paused_frozen INTEGER, \
+         created_at TEXT NOT NULL, updated_at TEXT NOT NULL); \
+         CREATE TABLE ticket_jobs (\
+         id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE, \
+         ticket_id TEXT, stage TEXT, phase TEXT, round INTEGER, review_base TEXT, \
+         created_at TEXT, updated_at TEXT); \
+         CREATE TABLE agents (\
+         job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE, agent_id TEXT NOT NULL, \
+         kind TEXT NOT NULL, idx INTEGER, status TEXT NOT NULL DEFAULT 'launched', \
+         outcome TEXT, task TEXT NOT NULL, PRIMARY KEY (job_id, agent_id)); \
+         CREATE TABLE sessions (\
+         id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
+         role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL); \
+         CREATE TABLE session_metadata (\
+         agent_id TEXT PRIMARY KEY, last_activity TEXT NOT NULL, channel TEXT, \
+         user_name TEXT, workspace_name TEXT, role TEXT, active_models TEXT, \
+         token_length INTEGER, message_count INTEGER NOT NULL DEFAULT 0);";
+
+    #[tokio::test]
+    async fn legacy_consolidation_import_discards_old_jobs_and_drops_child_tables() {
+        // The one-time consolidation import must discard the pre-rework ticket
+        // job kinds (re-run DELETE after the bulk load), leave non-ticket jobs,
+        // copy the ticket, and DROP (not import) the removed child tables.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let board_path = crate::db::legacy_store_db_path(root, "board");
+        let sessions_path = crate::db::legacy_store_db_path(root, "sessions");
+
+        {
+            let board = crate::db::open_with_schema(&board_path, LEGACY_BOARD_SCHEMA)
+                .await
+                .expect("open legacy board store");
+            board
+                .execute(
+                    "INSERT INTO tickets (id, title, description, phase, workspace_name, \
+                 is_archived, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
+                    params![
+                        "T1",
+                        "Legacy ticket",
+                        "legacy description",
+                        "in_development",
+                        "ws",
+                        crate::db::now(),
+                    ],
+                )
+                .await
+                .expect("seed legacy ticket");
+        }
+        {
+            let sessions = crate::db::open_with_schema(&sessions_path, LEGACY_SESSIONS_SCHEMA)
+                .await
+                .expect("open legacy sessions store");
+            let now = crate::db::now();
+            for (id, kind) in [
+                ("job_analysis", "ticket_analysis"),
+                ("job_implementation", "ticket_implementation"),
+                ("job_research", "research"),
+            ] {
+                sessions
+                    .execute(
+                        "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, \
+                         channel, retry_count, status, paused_frozen, created_at, updated_at) \
+                         VALUES (?1, ?2, '', 'ws', '', '', '', 0, 'launched', NULL, ?3, ?3)",
+                        params![id, kind, now.clone()],
+                    )
+                    .await
+                    .expect("insert legacy job");
+            }
+            sessions
+                .execute(
+                    "INSERT INTO ticket_jobs \
+                     (id, ticket_id, stage, phase, round, review_base, created_at, updated_at) \
+                     VALUES (?1, 'T1', 'implementation', 'in_development', 1, 'head', ?2, ?2)",
+                    params!["job_implementation", now],
+                )
+                .await
+                .expect("insert legacy child job row");
+        }
+        // Both legacy connections are dropped before opening the consolidated
+        // store (single-file turso; the import reads them read-only).
+
+        let conn = crate::db::open_consolidated_store(root)
+            .await
+            .expect("open consolidated store over legacy files");
+
+        assert!(
+            !table_exists(&conn, "ticket_jobs").await.unwrap(),
+            "ticket_jobs child table dropped, not imported"
+        );
+        assert!(
+            !table_exists(&conn, "ticket_stage_jobs").await.unwrap(),
+            "ticket_stage_jobs child table dropped, not imported"
+        );
+        let old_kinds = conn
+            .query(
+                "SELECT count(*) FROM jobs \
+                 WHERE kind IN ('ticket_analysis', 'ticket_implementation')",
+                (),
+            )
+            .await
+            .unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(old_kinds, 0, "legacy ticket job kinds discarded on import");
+        let research = conn
+            .query("SELECT count(*) FROM jobs WHERE kind = 'research'", ())
+            .await
+            .unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(research, 1, "non-ticket job survives the import");
+        let t1 = conn
+            .query("SELECT count(*) FROM tickets WHERE id = 'T1'", ())
+            .await
+            .unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(t1, 1, "legacy ticket imported");
+        let violations = conn.query("PRAGMA foreign_key_check", ()).await.unwrap();
+        assert!(
+            violations.is_empty(),
+            "no orphans introduced by the drop-not-imported child table"
         );
     }
 }

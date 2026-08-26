@@ -34,7 +34,6 @@ pub(crate) mod verdict;
 
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -50,14 +49,14 @@ use crate::pipeline::board::{BoardStore, Ticket, TicketPhase};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::session::manager_agent_id;
 use crate::util::UnwrapPoison;
-use crate::util::panic_message;
 use crate::{Role, Workspace, WorkspaceStatus};
 
 pub(crate) use chronicle::TransitionOrigin;
 pub(crate) use verdict::stage_name;
 pub(crate) use verdict::{
     AgentSlot, ExtractionMode, ParallelVerdict, build_round_joint_comment,
-    deserialize_verdict_outcome, process_verifier_verdicts, serialize_verdict_outcome,
+    deserialize_verdict_outcome, process_verifier_verdicts, round_member_failed,
+    serialize_verdict_outcome, validate_blocker_verification, validate_verdict_score,
 };
 pub(crate) use verdict::{QA_VI, REVIEWER_VI, VerifierInfo};
 
@@ -439,12 +438,12 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
     let log_job_id = job_id.clone();
     let guard_job = job_id.clone();
     let run: futures_util::future::BoxFuture<'static, ()> = match phase {
-        TicketPhase::Analysis => Box::pin(analysis::run(ticket, ws, job_id, false)),
-        TicketPhase::InDevelopment => Box::pin(development::run(ticket, ws, job_id, false)),
-        TicketPhase::InDiagnostics => Box::pin(diagnostics::run(ticket, ws, job_id, false)),
-        TicketPhase::InReview => Box::pin(review::run(ticket, ws, job_id, false)),
-        TicketPhase::InQa => Box::pin(qa::run(ticket, ws, job_id, false)),
-        TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id, false)),
+        TicketPhase::Analysis => Box::pin(analysis::run(ticket, ws, job_id)),
+        TicketPhase::InDevelopment => Box::pin(development::run(ticket, ws, job_id)),
+        TicketPhase::InDiagnostics => Box::pin(diagnostics::run(ticket, ws, job_id)),
+        TicketPhase::InReview => Box::pin(review::run(ticket, ws, job_id)),
+        TicketPhase::InQa => Box::pin(qa::run(ticket, ws, job_id)),
+        TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id)),
         _ => {
             error!(phase = %phase, "spawn_phase_body called for a non-working phase");
             return;
@@ -528,33 +527,12 @@ async fn run_claim_pipeline(ws: &Workspace) {
 
 // ── Shared phase-module constants ───────────────────────────────────────
 
-/// Default number of parallel analyst agents per round. Reviewers use a
-/// calibrated dynamic count (see [`crate::pipeline::verdict::review_agent_count`]);
-/// QA runs a single tester (see [`qa::QA_PARALLEL_AGENT_COUNT`]).
-const DEFAULT_PARALLEL_AGENT_COUNT: usize = 3;
-
-/// Minimum acceptable verification score (0-10) for analyst verdicts.
-pub(crate) const ANALYST_PASS_THRESHOLD: u8 = 7;
-
 /// Neutral reason for a phase-gate bail (transients are not misattributed).
 const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 
 /// Maximum tolerated validation-phase bounces before the ticket fails (the
 /// 11th bounce fails). Enforced by the unified validation-failure bounce path.
 const MAX_BOUNCES: usize = 10;
-
-/// Returns `true` for the implementation phases (the five non-Analysis working
-/// phases) — only these may auto-pause the workspace on a hard failure.
-fn is_implementation_phase(phase: TicketPhase) -> bool {
-    matches!(
-        phase,
-        TicketPhase::InDevelopment
-            | TicketPhase::InDiagnostics
-            | TicketPhase::InReview
-            | TicketPhase::InQa
-            | TicketPhase::InSanitation
-    )
-}
 
 // ── Transition + notification helpers (shared by the phase modules) ─────
 
@@ -868,7 +846,7 @@ pub(crate) async fn reset_phase_attempt(
     comment: &str,
 ) {
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
-    let pause_note = if is_implementation_phase(phase) {
+    let pause_note = if phase.is_pipeline_occupied() {
         pause_workspace_on_failure(ticket, reason).await
     } else {
         String::new()
@@ -1143,7 +1121,6 @@ async fn run_parallel_agents(
     extract_mode: ExtractionMode,
     job_id: &str,
     slots: &[AgentSlot],
-    resume: bool,
     expected_phase: TicketPhase,
 ) -> (Vec<ParallelVerdict>, bool) {
     let launched: Vec<&AgentSlot> = slots
@@ -1177,18 +1154,16 @@ async fn run_parallel_agents(
                             false,
                         );
                     }
-                    let has_session =
-                        resume && crate::session::store().has_content(&agent_id).await;
                     let (agent, response) = run_agent(
                         agent_id.clone(),
                         role,
                         &ws,
                         Some(&ticket),
-                        if has_session { "" } else { &task },
+                        &task,
                         String::new(),
                         String::new(),
                         Some(rx),
-                        resume,
+                        false,
                         Some(round),
                         None,
                         None,
@@ -1250,7 +1225,7 @@ async fn run_parallel_agents(
                 }
             })
             .collect();
-        let handles = crate::agent::spawn_staggered_round(members, resume).await;
+        let handles = crate::agent::spawn_staggered_round(members, false).await;
         let mut run_results: Vec<ParallelVerdict> = Vec::with_capacity(handles.len());
         let mut paused = false;
         for handle in handles {
@@ -1266,14 +1241,6 @@ async fn run_parallel_agents(
         let by_agent = checkpoint_parallel_outcomes(job_id, &launched, &run_results).await;
         (assemble_parallel_results(slots, &by_agent), paused)
     }
-}
-
-/// Map a panicked round member's [`tokio::task::JoinError`] to a contained
-/// [`ParallelVerdict::NoResponse`] (round continues fail-open).
-fn round_member_failed(e: tokio::task::JoinError) -> ParallelVerdict {
-    let reason = crate::util::scrub_credentials(&panic_message(&*e.into_panic()));
-    tracing::warn!(%reason, "round member task failed");
-    ParallelVerdict::NoResponse(reason)
 }
 
 /// Build the raw-response dump section for a verdict-extraction failure comment.
@@ -1297,58 +1264,6 @@ pub(crate) fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) 
     }
 }
 
-/// Validate a verdict score is within [0, 10].
-fn validate_verdict_score(v: &crate::Verdict) -> Result<(), String> {
-    if v.score <= 10 {
-        Ok(())
-    } else {
-        Err(format!("verdict score {} out of range [0,10]", v.score))
-    }
-}
-
-/// Validate a blocker-verification verdict.
-fn validate_blocker_verification(
-    v: &crate::BlockerVerificationVerdict,
-    blockers: &[String],
-) -> Result<(), String> {
-    if v.verdicts.is_empty() {
-        return Err("blocker verification returned no verdicts".to_string());
-    }
-    if v.verdicts.len() != blockers.len() {
-        return Err(format!(
-            "blocker verification returned {} verdicts for {} blockers",
-            v.verdicts.len(),
-            blockers.len()
-        ));
-    }
-    let mut seen = vec![false; blockers.len()];
-    for item in &v.verdicts {
-        if item.index >= blockers.len() {
-            return Err(format!("blocker index {} out of range", item.index));
-        }
-        if seen[item.index] {
-            return Err(format!("duplicate blocker index {}", item.index));
-        }
-        seen[item.index] = true;
-        if item.reasoning.trim().is_empty() {
-            return Err(format!("blocker {} missing reasoning", item.index));
-        }
-        if item.verdict == crate::BlockerDisposition::Sharpened
-            && item
-                .sharpened_text
-                .as_deref()
-                .map_or("", str::trim)
-                .is_empty()
-        {
-            return Err(format!(
-                "sharpened blocker {} requires sharpened_text",
-                item.index
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Load per-agent angle supplements for a verifier role.
 fn load_verifier_angles(role: Role) -> Vec<String> {
     match role {
@@ -1356,11 +1271,6 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
         Role::Qa => load_prompt_sections("qa_angles.md"),
         _ => Vec::new(),
     }
-}
-
-/// Load the three base ticket-analysis angle sections for Backlog analysts.
-fn load_ticket_analysis_angles() -> Vec<String> {
-    load_prompt_sections("analyze/ticket_angles.md")
 }
 
 // ── Single-agent stage rounds (engineer / sanitation) ───────────────────
@@ -1400,9 +1310,9 @@ async fn run_single_agent(
 }
 
 /// Drain-cut guard for the single-agent stage-round finalizers.
-fn stage_drain_cut(ticket_id: &str, label: &str, response: Option<&str>, resumed: bool) -> bool {
+fn stage_drain_cut(ticket_id: &str, label: &str, response: Option<&str>) -> bool {
     let drain_cut = response.is_none() && crate::shutdown::aborting();
-    if drain_cut && !resumed {
+    if drain_cut {
         info!(
             ticket = %ticket_id,
             "{label} round cut short by drain — job stays launched for boot resume",
@@ -1417,13 +1327,12 @@ async fn guard_stage(
     phase: TicketPhase,
     label: &str,
     response: Option<&str>,
-    resumed: bool,
     job_id: &str,
 ) -> bool {
     if guard_job_phase(ticket_id, phase, job_id).await {
         return true;
     }
-    if stage_drain_cut(ticket_id, label, response, resumed) {
+    if stage_drain_cut(ticket_id, label, response) {
         return true;
     }
     false
@@ -1431,13 +1340,11 @@ async fn guard_stage(
 
 /// Run the stage-agent round tail shared by fresh dispatch. The NULL-seat
 /// anchor preserves the accumulated engineer session across round-job deletion.
-#[expect(clippy::too_many_lines)]
 async fn run_stage_agent(
     ticket: &Ticket,
     ws: &Workspace,
     job_id: &str,
     task: &str,
-    resumed: bool,
     kind: StageRunKind,
 ) {
     match kind {
@@ -1490,9 +1397,6 @@ async fn run_stage_agent(
         &agent_id,
         agent_kind,
         match kind {
-            StageRunKind::Engineer if resumed => {
-                "Failed to register running engineer — comments may not route"
-            }
             StageRunKind::Engineer => {
                 "Failed to register running engineer — stale agent already cancelled at dispatch, proceeding without roster registration"
             }
@@ -1503,12 +1407,7 @@ async fn run_stage_agent(
     )
     .await;
 
-    let has_session = resumed && crate::session::store().has_content(&agent_id).await;
-    let message = if has_session {
-        String::new()
-    } else {
-        task.to_string()
-    };
+    let message = task.to_string();
     let (agent, response) = run_single_agent(
         agent_id,
         match kind {
@@ -1519,7 +1418,7 @@ async fn run_stage_agent(
         ticket,
         &message,
         incoming_rx,
-        resumed,
+        false,
     )
     .await;
 
@@ -1531,28 +1430,11 @@ async fn run_stage_agent(
 
     match kind {
         StageRunKind::Engineer => {
-            finalize_engineer_stage(
-                ticket,
-                &agent,
-                response.as_deref(),
-                job_id,
-                ws,
-                resumed,
-                paused,
-            )
-            .await;
+            finalize_engineer_stage(ticket, &agent, response.as_deref(), job_id, ws, paused).await;
         }
         StageRunKind::Sanitation => {
-            finalize_sanitation_stage(
-                ticket,
-                &agent,
-                response.as_deref(),
-                job_id,
-                resumed,
-                ws,
-                paused,
-            )
-            .await;
+            finalize_sanitation_stage(ticket, &agent, response.as_deref(), job_id, ws, paused)
+                .await;
         }
     }
 }
@@ -1715,17 +1597,14 @@ async fn finalize_verifier_round(
     vi: VerifierInfo,
     results: &[ParallelVerdict],
     job_id: &str,
-    resumed: bool,
     is_reviewer: bool,
 ) {
     let transitioned = process_verifier_verdicts(ws, ticket, results, vi, job_id).await;
     if !transitioned && crate::shutdown::aborting() {
-        let cut_short = if resumed {
-            "Resumed verifier round cut short by drain — job stays launched for boot resume"
-        } else {
-            "Verifier round cut short by drain — job stays launched for boot resume"
-        };
-        info!(ticket = %ticket.id, "{cut_short}");
+        info!(
+            ticket = %ticket.id,
+            "Verifier round cut short by drain — job stays launched for boot resume",
+        );
         return;
     }
 
@@ -1735,29 +1614,13 @@ async fn finalize_verifier_round(
         review::record_reviewed_base_after_review(
             ws.as_path(),
             &ticket.id,
-            git_available_for_review(ws, vi).await,
+            review::git_available_for_review(ws, vi).await,
             transitioned,
             results,
-            if resumed { "Resume: " } else { "" },
+            "",
         )
         .await;
     }
-}
-
-/// Git availability + reviewer identity shared by the verifier pair.
-async fn verifier_git_state(ws: &Workspace, vi: VerifierInfo) -> (bool, &Path, bool) {
-    let is_reviewer = vi.role == Role::Reviewer;
-    let repo_path = ws.as_path();
-    let git_available = git_available_for_review(ws, vi).await;
-    (is_reviewer, repo_path, git_available)
-}
-
-/// Whether git is usable for a reviewer round (reviewer-only: QA never skips
-/// review or records a reviewed base).
-async fn git_available_for_review(ws: &Workspace, vi: VerifierInfo) -> bool {
-    vi.role == Role::Reviewer
-        && crate::git::commands::git_is_installed().await
-        && crate::git::commands::is_git_repo(ws.as_path())
 }
 
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
@@ -1766,10 +1629,9 @@ fn dispatch_verifiers(
     ws: Workspace,
     vi: VerifierInfo,
     job_id: String,
-    resumed: bool,
 ) -> BoxFuture<'static, ()> {
     Box::pin(async move {
-        dispatch_verifiers_impl(ticket, ws, vi, job_id, resumed).await;
+        dispatch_verifiers_impl(ticket, ws, vi, job_id).await;
     })
 }
 
@@ -1779,43 +1641,10 @@ async fn dispatch_verifiers_impl(
     ws: Workspace,
     vi: VerifierInfo,
     job_id: String,
-    resumed: bool,
 ) {
-    let (is_reviewer, repo_path, git_available) = verifier_git_state(&ws, vi).await;
-
-    if git_available {
-        match review::compute_review_skip(&ticket, repo_path).await {
-            Ok(true) => {
-                info!(
-                    ticket = %ticket.id,
-                    "Content identical to reviewed base — skipping reviewer dispatch",
-                );
-                let _ = comment_and_transition(
-                    TransitionCtx::buffered(
-                        &ticket,
-                        vi.active_phase,
-                        TicketPhase::InQa,
-                        vi.log_label,
-                    ),
-                    SYSTEM_ROLE,
-                    "Content is identical to the reviewed base recorded for this ticket \
-                     (same HEAD commit and index tree, no working-tree changes). \
-                     Skipping reviewer dispatch.",
-                )
-                .await;
-                let _ =
-                    crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
-                return;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                warn!(
-                    ticket = %ticket.id,
-                    error = %e,
-                    "Git status check failed for skip-review — proceeding with normal review",
-                );
-            }
-        }
+    let is_reviewer = vi.role == Role::Reviewer;
+    if review::maybe_skip_review(&ticket, &ws, vi, &job_id).await {
+        return;
     }
 
     let engineer_response = ticket
@@ -1832,6 +1661,7 @@ async fn dispatch_verifiers_impl(
     );
 
     let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
+    let repo_path = ws.as_path();
     let count = if is_reviewer {
         review::compute_reviewer_count(&ticket, repo_path).await
     } else {
@@ -1867,7 +1697,6 @@ async fn dispatch_verifiers_impl(
         ExtractionMode::ScoreVerdict,
         &job_id,
         &slots,
-        resumed,
         vi.active_phase,
     )
     .await;
@@ -1884,7 +1713,7 @@ async fn dispatch_verifiers_impl(
         return;
     }
 
-    finalize_verifier_round(&ws, &ticket, vi, &results, &job_id, resumed, is_reviewer).await;
+    finalize_verifier_round(&ws, &ticket, vi, &results, &job_id, is_reviewer).await;
 }
 
 /// Determine whether to notify immediately or buffer the Done transition.

@@ -15,7 +15,7 @@ use super::{
     run_stage_agent, sync_phase_job_task, warn, with_comment_and_transition,
 };
 
-pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String, _resumed: bool) {
+pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
         let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
         return;
@@ -254,7 +254,6 @@ pub(crate) async fn finalize_sanitation_stage(
     agent: &Agent,
     response: Option<&str>,
     job_id: &str,
-    resumed: bool,
     ws: &Workspace,
     paused: bool,
 ) {
@@ -263,7 +262,6 @@ pub(crate) async fn finalize_sanitation_stage(
         TicketPhase::InSanitation,
         "Sanitation",
         response,
-        resumed,
         job_id,
     )
     .await
@@ -276,16 +274,15 @@ pub(crate) async fn finalize_sanitation_stage(
         pause_freezing(ticket, job_id).await;
         return;
     }
-    let resumed_suffix = if resumed { " (resumed)" } else { "" };
     if response.is_none() {
         warn!(
             ticket = %ticket.id,
-            "Sanitation agent returned no output{resumed_suffix} — bouncing to development"
+            "Sanitation agent returned no output — bouncing to development"
         );
         finalize_sanitation_failure(
             ticket,
             job_id,
-            format!("agent returned no output{resumed_suffix}"),
+            "agent returned no output".to_string(),
             None,
             ws,
         )
@@ -305,12 +302,12 @@ pub(crate) async fn finalize_sanitation_stage(
             warn!(
                 ticket = %ticket.id,
                 error = %failure,
-                "Failed to extract sanitation verdict{resumed_suffix} — bouncing to development"
+                "Failed to extract sanitation verdict — bouncing to development"
             );
             finalize_sanitation_failure(
                 ticket,
                 job_id,
-                format!("verdict extraction error{resumed_suffix}: {failure}"),
+                format!("verdict extraction error: {failure}"),
                 Some(&failure),
                 ws,
             )
@@ -386,15 +383,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     let conn = &crate::session::store().conn;
     sync_phase_job_task(conn, job_id, &prompt).await;
 
-    run_stage_agent(
-        &ticket,
-        &ws,
-        job_id,
-        &prompt,
-        false,
-        StageRunKind::Sanitation,
-    )
-    .await;
+    run_stage_agent(&ticket, &ws, job_id, &prompt, StageRunKind::Sanitation).await;
 }
 
 /// Process the result of a sanitation agent inspection.
