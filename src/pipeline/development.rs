@@ -22,20 +22,27 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     dispatch_engineer(ticket, ws, &job_id).await;
 }
 
-/// Build the engineer's work prompt: the outstanding feedback comments from
-/// all roles since the last Engineer comment, or the plain implement prompt
-/// when there is none.
+/// Build the engineer's work prompt: comments that arrived after the
+/// engineer's last comment are bounce feedback to address, otherwise fall
+/// back to the plain implement prompt.
+///
+/// On a first InDevelopment dispatch there is no prior engineer comment, so
+/// there is no post-round feedback — pre-existing comments are baseline
+/// context already injected via the `<current-ticket>` block.
 fn engineer_work_message(ticket: &Ticket) -> String {
-    let last_eng_pos = ticket
-        .comments
-        .iter()
-        .rposition(|c| c.role == Role::Engineer.as_str());
     let feedback: Vec<&str> = ticket
         .comments
         .iter()
-        .skip(last_eng_pos.map_or(0, |i| i + 1))
-        .map(|c| c.content.as_str())
-        .collect();
+        .rposition(|c| c.role == Role::Engineer.as_str())
+        .map(|i| {
+            ticket
+                .comments
+                .iter()
+                .skip(i + 1)
+                .map(|c| c.content.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
 
     if feedback.is_empty() {
         load_prompt("implement.md")
