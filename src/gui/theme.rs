@@ -231,7 +231,7 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
 }
 
 // ── Ticket phase colors ───────────────────────────────────────────
-// 16 TicketPhase variants, exhaustively matched — no catch-all.
+// All TicketPhase variants exhaustively matched — no catch-all.
 
 #[must_use]
 pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
