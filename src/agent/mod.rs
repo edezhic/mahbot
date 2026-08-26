@@ -924,7 +924,7 @@ impl Agent {
             None => {
                 let reason = format!("Unknown tool: {tool_name}");
                 let duration = start.elapsed();
-                tracing::info!(
+                tracing::debug!(
                     tool = %tool_name,
                     duration_ms = duration.as_millis(),
                     success = false,

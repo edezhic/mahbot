@@ -54,7 +54,6 @@ pub(crate) struct JointVerdict<'a> {
 
 /// One failed agent (no response / parse failure) with its rendered dump.
 pub(crate) struct JointFailure {
-    pub agent_index: usize,
     pub dump: String,
 }
 
@@ -262,23 +261,17 @@ pub(crate) fn render_joint_comment(
     // First-accepted LLM summary or explicit marker.
     match outcome {
         crate::consensus::RepairOutcome::Repaired { output, .. } => {
-            out.push_str("\n\n### Summary");
             let summary = output.summary.trim();
-            if summary.is_empty() {
-                out.push_str("\nLLM summary unavailable — deterministic member render.");
-            } else {
+            if !summary.is_empty() {
+                out.push_str("\n\n### Summary");
                 let _ = write!(out, "\n{summary}");
             }
         }
         crate::consensus::RepairOutcome::Fallback => {
             if has_issues {
-                // Neutral marker: the grouping pass either failed or was
+                // the grouping pass either failed or was
                 // deliberately skipped (single-verdict verifier round) — both
                 // reduce to the deterministic per-agent dump.
-                let _ = write!(
-                    out,
-                    "\n\n### Summary\nNo LLM grouping — deterministic member dump only."
-                );
             } else {
                 // No issues existed to merge — the synthesis pass was
                 // deliberately skipped, so the summary must not imply it
@@ -290,16 +283,10 @@ pub(crate) fn render_joint_comment(
                         .verdicts
                         .iter()
                         .all(|v| v.verdict.score >= round.threshold);
-                let summary = if clean {
-                    format!(
-                        "\n\n### Summary\nNo issues found — all {} agents passed clean.",
-                        round.n_valid()
-                    )
-                } else if round.n_valid() > 0 {
-                    "\n\n### Summary\nNo issues found by the responding agents.".to_string()
+                let summary = if clean || round.n_valid() > 0 {
+                    "\n\n### Summary\nNo issues found.".to_string()
                 } else {
-                    "\n\n### Summary\nNo issues to merge — no agents produced a verdict."
-                        .to_string()
+                    "\n\n### Summary\nNo issues to merge — no agent produced a verdict.".to_string()
                 };
                 out.push_str(&summary);
             }
@@ -308,9 +295,9 @@ pub(crate) fn render_joint_comment(
 
     // Raw-dump appendix for failed agents.
     if !round.failures.is_empty() {
-        out.push_str("\n\n### Agent failures");
+        out.push_str("\n\n### Plain verifier responses");
         for f in &round.failures {
-            let _ = write!(out, "\n- Agent {}: {}", f.agent_index + 1, f.dump);
+            let _ = write!(out, "\n- {}\n", f.dump);
         }
     }
 
@@ -561,13 +548,11 @@ pub(crate) async fn build_round_joint_comment(
             }
             ParallelVerdict::NoResponse(reason) => {
                 failures.push(JointFailure {
-                    agent_index: i,
                     dump: reason.clone(),
                 });
             }
             ParallelVerdict::ParseFailed(f) => {
                 failures.push(JointFailure {
-                    agent_index: i,
                     dump: scrub_credentials(&raw_response_dump_section(f)),
                 });
             }

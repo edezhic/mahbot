@@ -88,7 +88,7 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
         );
         return crate::util::scrub_credentials(raw);
     }
-    let mut out = String::from("Implemented / fixed / executed:");
+    let mut out = String::new();
     for item in items {
         let _ = write!(out, "\n- {}", item.replace('\n', " "));
     }
