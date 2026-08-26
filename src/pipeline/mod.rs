@@ -108,7 +108,7 @@ impl Drop for PhaseBodyGuard {
 
 /// The pipeline boot + poll driver. Runs boot recovery (replays pending
 /// envelopes, resumes the non-ticket resumable kinds), reclassifies stranded
-/// analyzing workspaces, then loops the single-puller poll once a second.
+/// analyzing workspaces, then loops the single-puller poll every 100 milliseconds.
 pub async fn run_management() {
     // Boot recovery scan: first statement. Replays pending envelopes and
     // returns the non-ticket jobs selected for resume (research/analyze/
@@ -183,7 +183,10 @@ pub async fn run_management() {
         }
     }
 
-    let interval = Duration::from_secs(1);
+    // 100ms cadence: claim and phase-job creation react ~10x faster than a 1s
+    // tick. Per-round work stays cheap; if DB load surfaces, cheapen the round
+    // rather than raise this interval.
+    let interval = Duration::from_millis(100);
     loop {
         // Drain-aware: break when the graceful drain begins (in-flight rounds
         // finish; no new work is spawned).
@@ -194,7 +197,7 @@ pub async fn run_management() {
     }
 }
 
-/// The poll loop: run the single-puller pass over every workspace every second.
+/// The poll loop: run the single-puller pass over every workspace every 100 milliseconds.
 pub(crate) async fn poll_round() {
     let workspaces = match crate::workspace::store().list().await {
         Ok(ws_list) => ws_list,
