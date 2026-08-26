@@ -929,6 +929,271 @@ async fn analysis_escalation_and_blocker_verification() {
     );
 }
 
+// ── 2b. Slot-resume: interrupted parallel-phase round reuses Done slots ──
+
+/// Slot-resume: an interrupted analysis round whose roster already carries a
+/// Done slot must reconstruct that slot from its stored outcome and re-run ONLY
+/// the not-Done slots with their stored tasks. A fresh rebuild (the pre-fix
+/// behavior) would re-run every slot with a new suffix and grow the roster with
+/// duplicate-idx rows; here the Done slot is provably NOT re-run (its stored
+/// verdict is reconstructed without an LLM call).
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/resume_analysis_ws", "resume_analysis_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "ResumeAnalysis", TicketPhase::Analysis).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+
+    // Seed a partially-completed round: idx 0 Done (a stored clean verdict),
+    // idx 1/2 Failed (interrupted before they produced a verdict). The stored
+    // per-slot tasks are what the resume re-runs them with.
+    let conn = &crate::session::store().conn;
+    let done_outcome =
+        super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
+            score: 8,
+            issues_detected: Vec::new(),
+        }));
+    let fail_outcome =
+        super::serialize_verdict_outcome(&super::ParallelVerdict::NoResponse("interrupted".into()));
+    let seeds = [
+        (
+            0_i64,
+            crate::jobs::RowStatus::Done,
+            Some(done_outcome.as_str()),
+        ),
+        (
+            1_i64,
+            crate::jobs::RowStatus::Failed,
+            Some(fail_outcome.as_str()),
+        ),
+        (
+            2_i64,
+            crate::jobs::RowStatus::Failed,
+            Some(fail_outcome.as_str()),
+        ),
+    ];
+    for (idx, status, outcome) in seeds {
+        let agent_id = format!("ticket_{id}_{idx}_resume_analyst");
+        conn.execute(
+            crate::jobs::AGENT_INSERT_SQL,
+            crate::jobs::agent_params(
+                &job_id,
+                &agent_id,
+                crate::jobs::AgentKind::Analyst,
+                Some(idx),
+                &format!("resume task {idx}"),
+            ),
+        )
+        .await
+        .unwrap();
+        crate::jobs::write_agent_outcome(conn, &job_id, &agent_id, status, outcome)
+            .await
+            .unwrap();
+    }
+
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Only the 2 not-Done slots are re-run: each consumes a turn response
+        // and a verdict extraction. The Done slot is reconstructed (0 calls).
+        let fake: std::sync::Arc<crate::util::test::FakeProvider> = std::sync::Arc::new(
+            crate::util::test::FakeProvider::new()
+                .ok("analyst one")
+                .ok(r#"{"score":8,"issues":[]}"#)
+                .ok("analyst two")
+                .ok(r#"{"score":8,"issues":[]}"#),
+        );
+        let fake_dyn: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _fake = crate::util::test::install_fake_provider(fake_dyn);
+        super::analysis::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+        // 2 re-run slots × (turn + verdict extraction) = 4 LLM calls; a fresh
+        // rebuild would have re-run all 3 slots (6 calls).
+        assert_eq!(
+            fake.request_fingerprints.lock().unwrap().len(),
+            4,
+            "the Done slot must be reconstructed from its stored outcome, not re-run",
+        );
+    }
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Planning,
+        "a resumed analysis round must still advance to Planning (fail-open)",
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::Analysis)
+            .await
+            .is_none(),
+        "a resumed analysis round that advances must clean up its phase job",
+    );
+}
+
+/// Slot-resume across the escalation boundary: a base round that already
+/// appended its blocker-verification slots is resumed by reconstructing the
+/// done escalation slot and re-running only the not-Done one, without
+/// re-appending (so no duplicate-idx escalation rows accumulate).
+#[serial_test::serial(provider)]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/resume_escalation_ws", "resume_escalation_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "ResumeEscalation", TicketPhase::Analysis).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+
+    let conn = &crate::session::store().conn;
+    // Base round (idx 0-2): two sub-threshold analysts flag the SAME blocker,
+    // one passes clean. Escalation (idx 3-4): idx 3 already refuted the blocker
+    // (Done); idx 4 was interrupted (Failed) and must be re-run.
+    let blocker_verdict =
+        super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
+            score: 5,
+            issues_detected: vec!["missing error handling".to_string()],
+        }));
+    let clean_verdict =
+        super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
+            score: 8,
+            issues_detected: Vec::new(),
+        }));
+    let refute_outcome = super::serialize_verdict_outcome(
+        &super::ParallelVerdict::BlockerVerification(crate::BlockerVerificationVerdict {
+            verdicts: vec![crate::BlockerVerificationItem {
+                index: 0,
+                verdict: crate::BlockerDisposition::Refuted,
+                reasoning: "handled".to_string(),
+                sharpened_text: None,
+            }],
+        }),
+    );
+    let fail_outcome =
+        super::serialize_verdict_outcome(&super::ParallelVerdict::NoResponse("interrupted".into()));
+    let seeds = [
+        (
+            0_i64,
+            crate::jobs::RowStatus::Done,
+            Some(blocker_verdict.as_str()),
+        ),
+        (
+            1_i64,
+            crate::jobs::RowStatus::Done,
+            Some(blocker_verdict.as_str()),
+        ),
+        (
+            2_i64,
+            crate::jobs::RowStatus::Done,
+            Some(clean_verdict.as_str()),
+        ),
+        (
+            3_i64,
+            crate::jobs::RowStatus::Done,
+            Some(refute_outcome.as_str()),
+        ),
+        (
+            4_i64,
+            crate::jobs::RowStatus::Failed,
+            Some(fail_outcome.as_str()),
+        ),
+    ];
+    for (idx, status, outcome) in seeds {
+        let agent_id = format!("ticket_{id}_{idx}_resume_escalation_analyst");
+        conn.execute(
+            crate::jobs::AGENT_INSERT_SQL,
+            crate::jobs::agent_params(
+                &job_id,
+                &agent_id,
+                crate::jobs::AgentKind::Analyst,
+                Some(idx),
+                &format!("escalation task {idx}"),
+            ),
+        )
+        .await
+        .unwrap();
+        crate::jobs::write_agent_outcome(conn, &job_id, &agent_id, status, outcome)
+            .await
+            .unwrap();
+    }
+
+    {
+        let _lock = crate::util::test::retry_tests_lock();
+        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // Only the not-Done escalation slot (idx 4) is re-run: turn + verdict
+        // extraction. The joint-comment synthesis falls back on the `{}`
+        // scripted responses (base verdicts carry issues, so it is not clean).
+        let fake = crate::util::test::FakeProvider::new()
+            .ok("verifier one")
+            .ok(r#"{"verdicts":[{"index":0,"verdict":"refuted","reasoning":"handled"}]}"#)
+            .ok("{}")
+            .ok("{}")
+            .ok("{}");
+        let fake = std::sync::Arc::new(fake);
+        let fake_dyn: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _fake = crate::util::test::install_fake_provider(fake_dyn);
+        super::analysis::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id.clone(),
+        )
+        .await;
+    }
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Planning,
+        "a resumed escalation round must still advance to Planning (fail-open)",
+    );
+    assert!(
+        expect_phase_job(store, &id, TicketPhase::Analysis)
+            .await
+            .is_none(),
+    );
+    let comments = store.get_comments(&id).await.unwrap();
+    let analysis_comment = comments
+        .iter()
+        .find(|c| c.role == "Analysis")
+        .expect("an analysis joint comment must exist");
+    assert!(
+        analysis_comment.content.contains("Blocker verification"),
+        "the joint comment must record the resumed blocker-verification round",
+    );
+}
+
 // ── 3. Reviewer/QA dynamic count calibration ────────────────────────────
 
 /// The reviewer-count churn bands and P0 floor are product behavior; the QA
@@ -1498,6 +1763,23 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
             "a cooperative pause must retain the phase job for the unpause re-drive",
         );
         assert_workspace_paused(&ws, true).await;
+
+        // The interrupted verifier slot is preserved in place (status 'failed'),
+        // carrying the stored task the resume re-runs it with — a fresh dispatch
+        // would have re-derived a new suffix instead.
+        let roster = crate::jobs::list_agents_for_job(&crate::session::store().conn, &job_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            roster.len(),
+            1,
+            "the pause-freeze must preserve the interrupted verifier slot (not clear it)",
+        );
+        assert_ne!(
+            roster[0].status,
+            crate::jobs::RowStatus::Launched.as_str(),
+            "the paused verifier must not remain marked launched",
+        );
     }
 
     // Resume and re-drive the same round with a clean script: it completes to

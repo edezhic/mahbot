@@ -109,9 +109,12 @@ pub(crate) struct JobRow {
     pub ticket_id: Option<String>,
 }
 
-/// A row of the `agents` table.
+/// A row of the `agents` table. Carries the slot `idx` (in addition to the
+/// status/outcome/task) so the slot-resume skeleton can reconstruct a round in
+/// place without re-deriving it from live ticket state.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentRow {
+    pub idx: Option<i64>,
     pub agent_id: String,
     pub status: String,
     pub outcome: Option<String>,
@@ -139,10 +142,11 @@ fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
 
 fn agent_row_from(row: &Row) -> anyhow::Result<AgentRow> {
     Ok(AgentRow {
-        agent_id: row.get(0)?,
-        status: row.get(1)?,
-        outcome: row.get(2)?,
-        task: row.get(3)?,
+        idx: row.get(0)?,
+        agent_id: row.get(1)?,
+        status: row.get(2)?,
+        outcome: row.get(3)?,
+        task: row.get(4)?,
     })
 }
 
@@ -618,11 +622,96 @@ pub(crate) async fn job_has_launched_agents(conn: &Connection, job_id: &str) -> 
         .is_some())
 }
 
-/// Clear a job's stale 'launched' roster rows after a crash (the previous
-/// process's agents are not running). The job row survives; the roster is
-/// rebuilt on resume dispatch. Used at boot for phase jobs so a stale
-/// mid-execution marker does not block the puller's re-dispatch gate on a
-/// later unpause.
+// ── Slot-resume skeleton (shared by the pipeline parallel phases + AnalyzeTool) ──
+//
+// An interrupted phase/analyze round is resumable from its roster: already-Done
+// slots are reconstructed from their stored `outcome` (per-consumer hook),
+// not-Done slots are re-run with their stored per-slot `task`. This module owns
+// the shared partition/discriminator helpers so the two consumers never
+// re-implement the split.
+
+/// The slot-resume partition of a job's roster: Done slots (reconstructable
+/// from their stored outcome) vs not-Done slots (re-run with their stored
+/// task). Refers into the input [`AgentRow`]s — the caller owns the lifetime.
+#[derive(Debug)]
+pub(crate) struct SlotResume<'a> {
+    pub done: Vec<&'a AgentRow>,
+    pub not_done: Vec<&'a AgentRow>,
+}
+
+/// Partition a roster into Done and not-Done slots for a slot-resume.
+/// A slot is Done iff its stored status is `done`; every other status
+/// (`launched`/`failed`) is not-Done and must be re-run, with its stored
+/// task, on resume. The per-consumer restorer turns a Done slot's stored
+/// `outcome` back into the consumer's artifact (pipeline: deserialize the
+/// verdict; AnalyzeTool: re-extract from the raw response).
+#[must_use]
+pub(crate) fn split_slot_resume(roster: &[AgentRow]) -> SlotResume<'_> {
+    let mut done = Vec::new();
+    let mut not_done = Vec::new();
+    for row in roster {
+        if row.status == RowStatus::Done.as_str() {
+            done.push(row);
+        } else {
+            not_done.push(row);
+        }
+    }
+    SlotResume { done, not_done }
+}
+
+/// Mark a phase job's stale `launched` roster rows as `failed` so the
+/// re-dispatch guard sees no running agents while the rows — and their stored
+/// per-slot tasks — survive for a slot-resume. Unlike
+/// [`clear_launched_agents_for_job`] this preserves the not-Done slots instead
+/// of discarding them. Used on pause-freeze and boot recovery for phase jobs.
+pub(crate) async fn interrupt_phase_job_roster(conn: &Connection, job_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agents SET status = 'failed' WHERE job_id = ?1 AND status = 'launched'",
+        params![job_id],
+    )
+    .await
+    .context("mark interrupted phase roster rows failed")?;
+    Ok(())
+}
+
+/// Re-arm a resumed round's not-Done roster slots as `launched` so the
+/// `job_has_launched_agents` running-signal blocks a concurrent re-drive and
+/// the Running Agents view lists the in-flight members. Also touches the job's
+/// `updated_at` so a long-running resumed round is not sweep-purged (the 8h
+/// purge keys off `jobs.updated_at`). The stored `idx`/`task` are preserved.
+pub(crate) async fn rearm_roster_launched(
+    conn: &Connection,
+    job_id: &str,
+    agent_ids: &[String],
+) -> Result<()> {
+    if agent_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = db::sql_in_placeholders(agent_ids.len());
+    let mut params: Vec<Value> = vec![job_id.into()];
+    params.extend(agent_ids.iter().map(|id| Value::from(id.as_str())));
+    conn.execute(
+        &format!(
+            "UPDATE agents SET status = 'launched' WHERE job_id = ?1 AND agent_id IN ({placeholders})"
+        ),
+        params,
+    )
+    .await
+    .context("re-arm resumed roster slots as launched")?;
+    conn.execute(
+        "UPDATE jobs SET updated_at = ?2 WHERE id = ?1",
+        params![job_id, db::now()],
+    )
+    .await
+    .context("touch job updated_at on slot resume")?;
+    Ok(())
+}
+
+/// Clear a job's stale 'launched' roster rows after a stage-completion handoff
+/// (the previous phase's in-flight agents are no longer running). The job row
+/// survives. For an interrupted PARALLEL phase round the task-preserving
+/// [`interrupt_phase_job_roster`] is used instead so the not-Done slots'
+/// stored tasks survive for a slot-resume.
 pub(crate) async fn clear_launched_agents_for_job(conn: &Connection, job_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM agents WHERE job_id = ?1 AND status = 'launched'",
@@ -746,7 +835,7 @@ pub(crate) async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
 pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Result<Vec<AgentRow>> {
     let rows = conn
         .query(
-            "SELECT agent_id, status, outcome, task \
+            "SELECT idx, agent_id, status, outcome, task \
              FROM agents WHERE job_id = ?1 ORDER BY idx",
             params![job_id],
         )
@@ -1151,14 +1240,16 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             "analysis" | "in_development" | "in_diagnostics" | "in_review" | "in_qa"
             | "in_sanitation" => {
                 // A ticket phase job interrupted by a crash: any 'launched'
-                // roster rows from the previous process are stale and must be
-                // cleared so the puller re-dispatches a fresh phase run.
-                if let Err(e) = clear_launched_agents_for_job(conn, &job.id).await {
+                // roster rows from the previous process are stale. They are
+                // marked 'failed' (NOT deleted) so the puller re-dispatches a
+                // slot-resume that reuses the stored per-slot tasks and
+                // already-Done outcomes rather than re-deriving a fresh round.
+                if let Err(e) = interrupt_phase_job_roster(conn, &job.id).await {
                     warn!(
                         job = %job.id,
                         ticket = %job.ticket_id.as_deref().unwrap_or("?"),
                         error = %e,
-                        "Failed to clear stale launched agents on ticket phase boot scan",
+                        "Failed to mark stale launched agents on ticket phase boot scan",
                     );
                 }
             }

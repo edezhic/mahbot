@@ -782,22 +782,22 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<Wo
 }
 
 /// Leave the phase job in place for the unpause re-drive after a cooperative
-/// pause-freeze, and clear any still-launched roster rows so the puller can
-/// re-dispatch. In the parallel verifier/analysis path the round already
-/// checkpointed its roster rows to Done/Failed, so the clear is a no-op there
-/// but the re-drive still works (those rows are no longer `launched`). The
-/// `paused` signal is typed and captured immutably at the agent's bail, so
-/// this handles even the narrow window where the workspace is resumed between
-/// the bail and this finalizer.
+/// pause-freeze, and mark any still-`launched` roster rows `failed` (via
+/// [`crate::jobs::interrupt_phase_job_roster`]) so the puller can re-dispatch:
+/// those rows carry the interrupted round's stored per-slot tasks, so they are
+/// preserved for a slot-resume rather than discarded. The `paused` signal is
+/// typed and captured immutably at the agent's bail, so this handles even the
+/// narrow window where the workspace is resumed between the bail and this
+/// finalizer.
 async fn pause_freezing(ticket: &Ticket, job_id: &str) {
     info!(
         ticket = %ticket.id,
         "Phase round paused — leaving job in place for the unpause re-drive"
     );
     if let Err(e) =
-        crate::jobs::clear_launched_agents_for_job(&crate::session::store().conn, job_id).await
+        crate::jobs::interrupt_phase_job_roster(&crate::session::store().conn, job_id).await
     {
-        warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to clear launched agents on pause-freeze");
+        warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to mark paused agents on pause-freeze");
     }
 }
 
@@ -1054,6 +1054,24 @@ fn build_agent_slots(
     slots
 }
 
+/// Build an [`AgentSlot`] from a stored roster row — the slot-resume
+/// counterpart to [`build_agent_slots`]. Reuses the durable agent id, idx, task,
+/// status and outcome so an interrupted round continues in place instead of
+/// re-deriving a fresh roster with a new suffix.
+#[must_use]
+fn agent_slot_from_roster_row(r: &crate::jobs::AgentRow) -> AgentSlot {
+    AgentSlot {
+        idx: r.idx.unwrap_or(0),
+        agent_id: r.agent_id.clone(),
+        task: r.task.clone(),
+        status: r
+            .status
+            .parse::<crate::jobs::RowStatus>()
+            .unwrap_or(crate::jobs::RowStatus::Failed),
+        outcome: r.outcome.clone(),
+    }
+}
+
 /// Write a batch of round slots as launched roster rows (with their idx) so
 /// the re-dispatch guard blocks and mid-run comments route to the agents.
 async fn insert_round_slots(job_id: &str, slots: &[AgentSlot], kind: crate::jobs::AgentKind) {
@@ -1085,7 +1103,13 @@ async fn checkpoint_parallel_outcomes(
     let mut by_agent = std::collections::HashMap::with_capacity(launched.len());
     for (slot, result) in launched.iter().zip(run_results) {
         let outcome = serialize_verdict_outcome(result);
-        let status = if matches!(result, ParallelVerdict::NoResponse(_)) {
+        // A ParseFailed member must be treated as not-Done (re-run on a resume)
+        // — it did produce a response but the extraction failed, so its stored
+        // outcome is only a diagnostic dump, not a completed verdict.
+        let status = if matches!(
+            result,
+            ParallelVerdict::NoResponse(_) | ParallelVerdict::ParseFailed(_)
+        ) {
             crate::jobs::RowStatus::Failed
         } else {
             crate::jobs::RowStatus::Done
@@ -1128,6 +1152,11 @@ fn assemble_parallel_results(
 /// Run `count` agents of the same role in parallel, then extract structured
 /// verdicts from their responses. Returns `(results, paused)` — `paused` is a
 /// typed signal that any member stopped at its pause boundary.
+///
+/// `resume` marks a slot-resume round: not-Done slots are re-run with
+/// session-continuation semantics (their stored tasks were already seeded), so
+/// the message is suppressed when the persisted session already holds the task,
+/// and the leader-stagger is skipped (the sessions have already diverged).
 #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_parallel_agents(
     ticket: &Arc<Ticket>,
@@ -1138,6 +1167,7 @@ async fn run_parallel_agents(
     job_id: &str,
     slots: &[AgentSlot],
     expected_phase: TicketPhase,
+    resume: bool,
 ) -> (Vec<ParallelVerdict>, bool) {
     let launched: Vec<&AgentSlot> = slots
         .iter()
@@ -1170,16 +1200,22 @@ async fn run_parallel_agents(
                             false,
                         );
                     }
+                    // Session-non-emptiness discriminator: a resumed slot whose
+                    // session already holds the task continues with an empty
+                    // message (no duplicate task-prompt append); a missing/empty
+                    // session dispatches fresh with the stored task.
+                    let has_session =
+                        resume && crate::session::store().has_content(&agent_id).await;
                     let (agent, response) = run_agent(
                         agent_id.clone(),
                         role,
                         &ws,
                         Some(&ticket),
-                        &task,
+                        if has_session { "" } else { &task },
                         String::new(),
                         String::new(),
                         Some(rx),
-                        false,
+                        resume,
                         Some(round),
                         None,
                         None,
@@ -1241,7 +1277,7 @@ async fn run_parallel_agents(
                 }
             })
             .collect();
-        let handles = crate::agent::spawn_staggered_round(members, false).await;
+        let handles = crate::agent::spawn_staggered_round(members, resume).await;
         let mut run_results: Vec<ParallelVerdict> = Vec::with_capacity(handles.len());
         let mut paused = false;
         for handle in handles {
@@ -1663,6 +1699,72 @@ async fn dispatch_verifiers_impl(
         return;
     }
 
+    let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
+    let conn = &crate::session::store().conn;
+
+    // Slot-resume detection: a non-empty roster marks an interrupted round —
+    // reconstruct Done slots from stored outcomes and re-run the not-Done ones
+    // with their stored tasks. An empty roster (body crashed before its first
+    // roster write) degrades to a fresh dispatch derived from the jobs.task.
+    let roster = match crate::jobs::list_agents_for_job(conn, &job_id).await {
+        Ok(roster) => roster,
+        Err(e) => {
+            // A read failure must NOT degrade to a fresh dispatch: doing so would
+            // re-derive a new-suffix roster and orphan the interrupted round's
+            // rows. Bail and let the poller re-drive (the job stays occupied,
+            // with no running agents, so re-dispatch is safe).
+            warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to read phase roster — bailing to preserve interrupted round");
+            return;
+        }
+    };
+
+    if roster.is_empty() {
+        fresh_dispatch_verifiers(ticket, ws, vi, job_id, is_reviewer).await;
+        return;
+    }
+
+    // Resume: reuse the stored roster. The stored per-slot task is the round's
+    // prompt (no re-derivation from live ticket state); the count is the roster
+    // length (recomputed churn could differ across the interruption).
+    let slots: Vec<AgentSlot> = roster.iter().map(agent_slot_from_roster_row).collect();
+    let split = crate::jobs::split_slot_resume(&roster);
+    let count = slots.len();
+    let verifier_label = if count == 1 { "verifier" } else { "verifiers" };
+    info!(
+        ticket = %ticket.id,
+        role = %vi.role.as_str(),
+        count,
+        verifier_label,
+        "Resuming {count} parallel {verifier_label} from stored roster",
+    );
+    let not_done: Vec<String> = split.not_done.iter().map(|r| r.agent_id.clone()).collect();
+    if let Err(e) = crate::jobs::rearm_roster_launched(conn, &job_id, &not_done).await {
+        warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to re-arm resumed roster slots");
+    }
+    let (results, paused) = run_parallel_agents(
+        &ticket,
+        &ws,
+        vi.role,
+        &extraction_prompt,
+        ExtractionMode::ScoreVerdict,
+        &job_id,
+        &slots,
+        vi.active_phase,
+        true,
+    )
+    .await;
+    finalize_resumed_verifier_round(ticket, ws, vi, job_id, is_reviewer, results, paused).await;
+}
+
+/// Fresh verifier dispatch (empty roster): build a new roster, sync the phase
+/// job task, and run the round.
+async fn fresh_dispatch_verifiers(
+    ticket: Arc<Ticket>,
+    ws: Workspace,
+    vi: VerifierInfo,
+    job_id: String,
+    is_reviewer: bool,
+) {
     let engineer_response = ticket
         .comments
         .iter()
@@ -1714,8 +1816,22 @@ async fn dispatch_verifiers_impl(
         &job_id,
         &slots,
         vi.active_phase,
+        false,
     )
     .await;
+    finalize_resumed_verifier_round(ticket, ws, vi, job_id, is_reviewer, results, paused).await;
+}
+
+/// Shared verifier-round tail for fresh and resumed dispatch.
+async fn finalize_resumed_verifier_round(
+    ticket: Arc<Ticket>,
+    ws: Workspace,
+    vi: VerifierInfo,
+    job_id: String,
+    is_reviewer: bool,
+    results: Vec<ParallelVerdict>,
+    paused: bool,
+) {
     if guard_job_phase(&ticket.id, vi.active_phase, &job_id).await {
         return;
     }

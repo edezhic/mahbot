@@ -313,6 +313,11 @@ async fn run_analyze_with_job(
     // AND the new ids would not match the stored roster rows).
     let (slots, pre_done) = if resume {
         let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
+        // Slot-resume skeleton: reuse the stored roster (agent ids + final
+        // tasks) — never regenerate ids (the PK would conflict AND the new ids
+        // would not match the stored roster rows) — and split Done (reconstruct
+        // from stored outcome) from not-Done (re-run with stored task).
+        let split = crate::jobs::split_slot_resume(&rows);
         let slots: Vec<AnalyzeSlot> = rows
             .iter()
             .map(|r| AnalyzeSlot {
@@ -320,10 +325,10 @@ async fn run_analyze_with_job(
                 task: r.task.clone(),
             })
             .collect();
-        let pre_done: Vec<(String, String)> = rows
-            .into_iter()
-            .filter(|r| r.status == crate::jobs::RowStatus::Done.as_str())
-            .filter_map(|r| r.outcome.map(|o| (r.agent_id, o)))
+        let pre_done: Vec<(String, String)> = split
+            .done
+            .iter()
+            .filter_map(|r| r.outcome.clone().map(|o| (r.agent_id.clone(), o)))
             .collect();
         (slots, pre_done)
     } else {
