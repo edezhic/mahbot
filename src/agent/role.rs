@@ -279,11 +279,12 @@ impl Role {
                 t
             }
             Role::Manager => {
+                let reporter = self.as_str();
                 vec![
-                    Box::new(CreateTicketTool::new("manager", ws)),
+                    Box::new(CreateTicketTool::new(reporter, ws)),
                     Box::new(UpdateTicketTool::new(ws)),
                     Box::new(ListTicketsTool::new(ws)),
-                    Box::new(GetTicketTool::new(ws)),
+                    Box::new(GetTicketTool::new(reporter, ws)),
                     Box::new(AddCommentTool::new(ws)),
                     Box::new(SearchArchivedTicketsTool::new(ws)),
                     Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Manager)),

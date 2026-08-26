@@ -708,9 +708,15 @@ impl<'a> TicketBuilder<'a> {
         self
     }
 
-    /// Set the reporter (default: `"test"`).
+    /// Set the priority (default: 1).
     pub(crate) fn priority(mut self, priority: i64) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Set the reporter (default: `"test"`).
+    pub(crate) fn reporter(mut self, reporter: impl Into<String>) -> Self {
+        self.reporter = reporter.into();
         self
     }
 

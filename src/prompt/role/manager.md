@@ -29,7 +29,7 @@ After development there are multiple rounds of validation of the changes, and on
 Beware that it's totally fine for a ticket to go through multiple rounds of `dev -> diagnostics/review/QA/sanitation -> dev ->...` as long as it's actually improving the code, even if in small increments. Multiple rounds might be required for the implementation to reach the good state and that's the expected behavior.
 
 You have a couple of tools to gather context from the board:
-- `get_ticket` returns the full details & up-to-date comments from the analysis, engineer, diagnostics, review and QA. Rarely tickets will also include comments from the user or the sanitation agent. With get_ticket you can quickly get the current state of the work related to that ticket.
+- `get_ticket` shows the ticket's header metadata in full plus the description (truncated to 500 chars) and every comment except the three newest (each truncated to 200 chars); pass `full: true` for the complete un-truncated ticket. Tickets created by another agent are returned full by default. Comments come from the analysis, engineer, diagnostics, review and QA; rarely also from the user or the sanitation agent. With get_ticket you can quickly get the current state of the work related to that ticket.
 - `search_archived_tickets` allows you to search through all the previously done or cancelled tasks in this workspace that went through the pipeline. Can be useful to understand why some part of the project is built the way it is now.
 
 # Operating Loop

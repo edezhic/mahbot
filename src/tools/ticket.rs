@@ -13,6 +13,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 
+const GET_TICKET_DESC_MAX: usize = 500;
+const GET_TICKET_COMMENT_MAX: usize = 200;
+const GET_TICKET_LAST_N_FULL: usize = 3;
+
 // ── Ticket ID resolution ─────────────────────────────────────────
 
 /// Resolve a raw ticket ID argument against the tool's bound workspace.
@@ -369,12 +373,14 @@ impl Tool for ListTicketsTool {
 // ── GetTicketTool ───────────────────────────────────────────────
 
 pub struct GetTicketTool {
+    reporter: String,
     ws_name: String,
 }
 
 impl GetTicketTool {
-    pub fn new(ws: &Workspace) -> Self {
+    pub fn new(reporter: impl Into<String>, ws: &Workspace) -> Self {
         Self {
+            reporter: reporter.into(),
             ws_name: ws.name.clone(),
         }
     }
@@ -392,6 +398,10 @@ impl Tool for GetTicketTool {
                 "ticket_id": {
                     "type": "string",
                     "description": "The ticket id"
+                },
+                "full": {
+                    "type": "boolean",
+                    "description": "Return the complete un-truncated ticket. Default false."
                 }
             }),
             &["ticket_id"],
@@ -410,12 +420,22 @@ impl Tool for GetTicketTool {
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let ticket_id = resolve_ticket_id(&self.ws_name, super::get_str(&args, "ticket_id")?)?;
+        let full = super::get_bool(&args, "full", false);
 
         let store = board_store();
 
-        match store.get_ticket(&ticket_id).await? {
-            Some(ticket) => Ok(ticket.detailed_display()),
-            None => anyhow::bail!("Ticket {ticket_id} not found"),
+        let Some(ticket) = store.get_ticket(&ticket_id).await? else {
+            anyhow::bail!("Ticket {ticket_id} not found");
+        };
+
+        if full || ticket.reporter != self.reporter {
+            Ok(ticket.detailed_display())
+        } else {
+            Ok(ticket.detailed_display_limited(
+                GET_TICKET_DESC_MAX,
+                GET_TICKET_COMMENT_MAX,
+                GET_TICKET_LAST_N_FULL,
+            ))
         }
     }
 }
@@ -500,6 +520,14 @@ mod tests {
     use crate::util::test::make_ticket;
     use crate::workspace::test_ws;
     use serde_json::json;
+
+    fn comment(role: &str, content: &str, ts: &str) -> crate::pipeline::board::TicketComment {
+        crate::pipeline::board::TicketComment {
+            role: role.to_string(),
+            content: content.to_string(),
+            created_at: ts.to_string(),
+        }
+    }
 
     #[tokio::test]
     async fn test_create_ticket_tool() {
@@ -678,8 +706,8 @@ mod tests {
         let ticket = crate::util::test::expect_ticket(store, &id).await;
         let expected = ticket.detailed_display();
 
-        let tool = GetTicketTool::new(&ws);
-        let args = json!({"ticket_id": id});
+        let tool = GetTicketTool::new("manager", &ws);
+        let args = json!({"ticket_id": id, "full": true});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert_eq!(
             result, expected,
@@ -973,15 +1001,15 @@ mod tests {
 
         // Bare numeric ID resolves against the bound workspace.
         let seq = id.strip_prefix("ws-").expect("prefixed id");
-        let result = GetTicketTool::new(&ws)
-            .execute(&ws, json!({"ticket_id": seq}))
+        let result = GetTicketTool::new("manager", &ws)
+            .execute(&ws, json!({"ticket_id": seq, "full": true}))
             .await
             .expect("bare number should resolve");
         assert_eq!(result, expected);
 
         // A tool bound to another workspace rejects the foreign ticket.
         let foreign = test_ws("/other");
-        let err = GetTicketTool::new(&foreign)
+        let err = GetTicketTool::new("manager", &foreign)
             .execute(&foreign, json!({"ticket_id": id}))
             .await
             .unwrap_err();
@@ -989,5 +1017,179 @@ mod tests {
             format!("{err}").contains("different workspace"),
             "foreign ticket should be rejected: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_detailed_display_limited_truncates_description_and_non_tail_comments() {
+        crate::util::test::init_test_stores().await;
+
+        let store = board_store();
+        let ws = test_ws("/ws");
+        let long_desc = "x".repeat(600);
+        let id = TicketBuilder::new(store, &ws)
+            .title("Limited")
+            .desc(&long_desc)
+            .create()
+            .await
+            .expect("create");
+
+        let mut ticket = crate::util::test::expect_ticket(store, &id).await;
+        ticket.comments = vec![
+            comment("engineer", &"a".repeat(300), "2026-01-01T00:00:00Z"),
+            comment("qa", &"b".repeat(250), "2026-01-02T00:00:00Z"),
+            comment("reviewer", &"c".repeat(150), "2026-01-03T00:00:00Z"),
+            comment("manager", &"d".repeat(100), "2026-01-04T00:00:00Z"),
+            comment("assistant", &"e".repeat(80), "2026-01-05T00:00:00Z"),
+        ];
+
+        let out = ticket.detailed_display_limited(500, 200, 3);
+
+        // (a) description capped at 500 chars + ellipsis
+        assert!(out.contains(&format!("Description: {}…", "x".repeat(500))));
+        assert!(
+            !out.contains(&long_desc),
+            "full description must not appear"
+        );
+        // (d) header metadata never truncated
+        assert!(out.contains(&format!("Ticket: {}", ticket.id)));
+        assert!(out.contains("Title: Limited"));
+        assert!(out.contains("Reporter: test"));
+        assert!(out.contains("Priority: P1"));
+        // (b) comments older than the last three capped at 200 chars + ellipsis
+        assert!(out.contains(&format!(
+            "[engineer] (2026-01-01T00:00:00): {}…",
+            "a".repeat(200)
+        )));
+        assert!(out.contains(&format!("[qa] (2026-01-02T00:00:00): {}…", "b".repeat(200))));
+        // (c) last three comments shown in full
+        assert!(out.contains(&format!(
+            "[reviewer] (2026-01-03T00:00:00): {}",
+            "c".repeat(150)
+        )));
+        assert!(out.contains(&format!(
+            "[manager] (2026-01-04T00:00:00): {}",
+            "d".repeat(100)
+        )));
+        assert!(out.contains(&format!(
+            "[assistant] (2026-01-05T00:00:00): {}",
+            "e".repeat(80)
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_detailed_display_limited_three_or_fewer_comments_all_full() {
+        crate::util::test::init_test_stores().await;
+
+        let store = board_store();
+        let ws = test_ws("/ws");
+        let id = TicketBuilder::new(store, &ws)
+            .title("FewComments")
+            .desc("short desc")
+            .create()
+            .await
+            .expect("create");
+
+        let mut ticket = crate::util::test::expect_ticket(store, &id).await;
+        ticket.comments = vec![
+            comment("engineer", &"a".repeat(300), "2026-01-01T00:00:00Z"),
+            comment("qa", &"b".repeat(250), "2026-01-02T00:00:00Z"),
+            comment("reviewer", &"c".repeat(150), "2026-01-03T00:00:00Z"),
+        ];
+
+        let out = ticket.detailed_display_limited(500, 200, 3);
+        assert!(out.contains(&"a".repeat(300)));
+        assert!(out.contains(&"b".repeat(250)));
+        assert!(out.contains(&"c".repeat(150)));
+        assert!(
+            !out.contains('…'),
+            "with ≤3 comments none should be truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_ticket_default_truncated_for_same_agent() {
+        crate::util::test::init_test_stores().await;
+
+        let store = board_store();
+        let ws = test_ws("/ws");
+        let long_desc = "y".repeat(600);
+        let id = TicketBuilder::new(store, &ws)
+            .title("SameAgent")
+            .reporter("manager")
+            .desc(&long_desc)
+            .create()
+            .await
+            .expect("create");
+
+        let tool = GetTicketTool::new("manager", &ws);
+        let result = tool
+            .execute(&ws, json!({"ticket_id": id}))
+            .await
+            .expect("execute");
+        assert!(
+            result.contains(&format!("Description: {}…", "y".repeat(500))),
+            "same-agent default view must truncate the description"
+        );
+        assert!(!result.contains(&long_desc));
+    }
+
+    #[tokio::test]
+    async fn test_get_ticket_full_output_for_different_creator() {
+        crate::util::test::init_test_stores().await;
+
+        let store = board_store();
+        let ws = test_ws("/ws");
+        let long_desc = "z".repeat(600);
+        let id = TicketBuilder::new(store, &ws)
+            .title("OtherAgent")
+            .reporter("maintainer")
+            .desc(&long_desc)
+            .create()
+            .await
+            .expect("create");
+
+        let ticket = crate::util::test::expect_ticket(store, &id).await;
+        let expected = ticket.detailed_display();
+
+        let tool = GetTicketTool::new("manager", &ws);
+        let result = tool
+            .execute(&ws, json!({"ticket_id": id}))
+            .await
+            .expect("execute");
+        assert_eq!(
+            result, expected,
+            "a different creator must produce the full un-truncated ticket"
+        );
+        assert!(result.contains(&long_desc));
+    }
+
+    #[tokio::test]
+    async fn test_get_ticket_full_flag_returns_complete() {
+        crate::util::test::init_test_stores().await;
+
+        let store = board_store();
+        let ws = test_ws("/ws");
+        let long_desc = "w".repeat(600);
+        let id = TicketBuilder::new(store, &ws)
+            .title("FullFlag")
+            .reporter("manager")
+            .desc(&long_desc)
+            .create()
+            .await
+            .expect("create");
+
+        let ticket = crate::util::test::expect_ticket(store, &id).await;
+        let expected = ticket.detailed_display();
+
+        let tool = GetTicketTool::new("manager", &ws);
+        let result = tool
+            .execute(&ws, json!({"ticket_id": id, "full": true}))
+            .await
+            .expect("execute");
+        assert_eq!(
+            result, expected,
+            "full=true must return the complete ticket"
+        );
+        assert!(result.contains(&long_desc));
     }
 }

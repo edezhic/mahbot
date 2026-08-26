@@ -366,7 +366,8 @@ impl Ticket {
     /// The returned string can be arbitrarily large (unbounded descriptions
     /// and comments). Callers that need truncation should apply their own
     /// limits (see `GetTicketTool::preserve_full_output` for an example that
-    /// disables the default 5 KB truncation).
+    /// disables the default 5 KB truncation). `GetTicketTool` uses
+    /// [`Self::detailed_display_limited`] for its default truncated view.
     ///
     /// ## Changing this output
     ///
@@ -377,6 +378,37 @@ impl Ticket {
     /// to prevent silent divergence.
     #[must_use]
     pub fn detailed_display(&self) -> String {
+        let mut out = self.header(&self.description);
+        out.push_str(&self.format_comments());
+        out
+    }
+
+    /// Return a truncated version of [`Self::detailed_display`] for agent-facing
+    /// output where the caller only needs the ticket's latest state.
+    ///
+    /// The description value is capped at `desc_max_chars` characters (a trailing
+    /// `…` is appended when it exceeds the cap) and each comment's content is
+    /// capped at `comment_max_chars` characters, EXCEPT the newest `last_n_full`
+    /// comments which are always shown in full. Header metadata (id, title, phase,
+    /// priority, reporter, workspace, dates, supersede/prerequisite links,
+    /// archived flag) is never truncated.
+    #[must_use]
+    pub(crate) fn detailed_display_limited(
+        &self,
+        desc_max_chars: usize,
+        comment_max_chars: usize,
+        last_n_full: usize,
+    ) -> String {
+        let description = crate::util::truncate(&self.description, desc_max_chars);
+        let mut out = self.header(&description);
+        out.push_str(&self.format_comments_limited(comment_max_chars, last_n_full));
+        out
+    }
+
+    /// Build the shared header of [`Self::detailed_display`] and
+    /// [`Self::detailed_display_limited`], rendering `description` verbatim.
+    #[must_use]
+    fn header(&self, description: &str) -> String {
         let mut out = format!(
             "Ticket: {id}\n\
              Title: {title}\n\
@@ -389,7 +421,7 @@ impl Ticket {
              Priority: P{priority}\n",
             id = self.id,
             title = self.title,
-            description = self.description,
+            description = description,
             phase = self.phase,
             reporter = self.reporter,
             workspace = self.workspace_name,
@@ -409,7 +441,6 @@ impl Ticket {
         if self.is_archived {
             out.push_str("Archived: yes\n");
         }
-        out.push_str(&self.format_comments());
         out
     }
 
@@ -418,9 +449,6 @@ impl Ticket {
     /// Returns a string starting with `"Comments:"` followed by one line per
     /// comment in the format `"\n  [{role}] ({timestamp}): {content}"`, or
     /// `"Comments:\n  (no comments)"` if the comment list is empty.
-    ///
-    /// Timestamps are truncated to seconds (`[..19]` of the RFC 3339 string),
-    /// with a defensive `min()` guard against abnormally short strings.
     #[must_use]
     fn format_comments(&self) -> String {
         let mut s = String::from("Comments:");
@@ -428,12 +456,43 @@ impl Ticket {
             s.push_str("\n  (no comments)");
         } else {
             for c in &self.comments {
-                let end = 19.min(c.created_at.len());
-                let ts = &c.created_at[..end];
-                let _ = write!(s, "\n  [{}] ({}): {}", c.role, ts, c.content);
+                s.push_str(&Self::comment_line(c, &c.content));
             }
         }
         s
+    }
+
+    /// Like [`Self::format_comments`], but caps each comment's content at
+    /// `max_chars` characters (appending `…` when truncated) except for the
+    /// newest `last_n_full` comments, which are shown in full.
+    #[must_use]
+    fn format_comments_limited(&self, max_chars: usize, last_n_full: usize) -> String {
+        let mut s = String::from("Comments:");
+        if self.comments.is_empty() {
+            s.push_str("\n  (no comments)");
+        } else {
+            let n = self.comments.len();
+            for (i, c) in self.comments.iter().enumerate() {
+                let content = if i + last_n_full < n {
+                    crate::util::truncate(&c.content, max_chars)
+                } else {
+                    c.content.clone()
+                };
+                s.push_str(&Self::comment_line(c, &content));
+            }
+        }
+        s
+    }
+
+    /// Format a single comment line: `"\n  [{role}] ({timestamp}): {content}"`.
+    ///
+    /// Timestamps are truncated to seconds (`[..19]` of the RFC 3339 string),
+    /// with a defensive `min()` guard against abnormally short strings.
+    #[must_use]
+    fn comment_line(c: &TicketComment, content: &str) -> String {
+        let end = 19.min(c.created_at.len());
+        let ts = &c.created_at[..end];
+        format!("\n  [{}] ({}): {}", c.role, ts, content)
     }
 }
 /// Lowercase snake_case strings matching the DB column values — no schema
