@@ -1438,7 +1438,6 @@ pub(crate) fn is_corruption_class(e: &anyhow::Error) -> bool {
 /// as new strings surface; do **not** fold these into the fail-closed
 /// corruption path.
 fn is_schema_mismatch(e: &anyhow::Error) -> bool {
-    let lower = format!("{e:#}").to_lowercase();
     const DDL_SHAPE: [&str; 8] = [
         "no such column",
         "no such table",
@@ -1449,6 +1448,7 @@ fn is_schema_mismatch(e: &anyhow::Error) -> bool {
         "syntax error",
         "parse error",
     ];
+    let lower = format!("{e:#}").to_lowercase();
     DDL_SHAPE.iter().any(|k| lower.contains(k))
 }
 
