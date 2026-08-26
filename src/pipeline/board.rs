@@ -971,12 +971,10 @@ impl BoardStore {
     /// with lower priority (higher urgency) are claimed first, then the oldest
     /// ticket (earliest created_at) is claimed first.
     ///
-    /// Note: the mid-execution re-dispatch guard (the historical `assigned_to
-    /// IS NULL` clause) is enforced by the caller via
-    /// [`crate::jobs::ticket_has_active_agents`] — the claim SELECT is kept to
-    /// the tickets table, and the agents roster is a separate logical table.
-    /// The claim source phases (Backlog, ReadyForDevelopment)
-    /// have no running agent.
+    /// Note: the claim SELECT is kept to the tickets table, and the agents
+    /// roster is a separate logical table checked by the caller (via the
+    /// phase-job + launched-roster guard). The claim source phases
+    /// (Backlog, ReadyForDevelopment) have no running agent.
     pub(crate) async fn claim_ticket_in_workspace(
         &self,
         current_phase: TicketPhase,

@@ -428,29 +428,45 @@ fn phase_task(ticket: &Ticket, phase: TicketPhase) -> (String, Role) {
     }
 }
 
+/// Re-fetch the ticket with comments so a phase body's work message and
+/// `<current-ticket>` context render the live comment thread — including
+/// bounce feedback added after the last stage round. The poll loop lists
+/// tickets with `LoadComments::No` to stay cheap, so the body must refresh
+/// before it builds its prompt. Falls back to the poll copy on a read failure
+/// or concurrent delete so a phase body is never dropped.
+async fn ticket_with_comments(ticket: Arc<Ticket>) -> Arc<Ticket> {
+    match board().get_ticket(&ticket.id).await {
+        Ok(Some(fresh)) => Arc::new(fresh),
+        Ok(None) | Err(_) => ticket,
+    }
+}
+
 /// Spawn the phase body for a phase job in a detached, panic-safe task. The
 /// caller has already claimed the spawn slot in [`PHASE_BODIES_RUNNING`]; the
 /// RAII guard releases it on every exit path (completion, panic, cancellation).
 fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
-    // A clone for the panic handler: the phase body consumed `ticket`/`ws`, so
-    // a crash-failure cleanup still has the ticket identity to comment/pause.
-    let panic_ticket = Arc::clone(&ticket);
     let log_job_id = job_id.clone();
     let guard_job = job_id.clone();
-    let run: futures_util::future::BoxFuture<'static, ()> = match phase {
-        TicketPhase::Analysis => Box::pin(analysis::run(ticket, ws, job_id)),
-        TicketPhase::InDevelopment => Box::pin(development::run(ticket, ws, job_id)),
-        TicketPhase::InDiagnostics => Box::pin(diagnostics::run(ticket, ws, job_id)),
-        TicketPhase::InReview => Box::pin(review::run(ticket, ws, job_id)),
-        TicketPhase::InQa => Box::pin(qa::run(ticket, ws, job_id)),
-        TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id)),
-        _ => {
-            error!(phase = %phase, "spawn_phase_body called for a non-working phase");
-            return;
-        }
-    };
     tokio::spawn(async move {
         let _guard = PhaseBodyGuard(guard_job);
+        // Refresh with comments inside the task so the body's work message and
+        // `<current-ticket>` block see the real comment thread (bounce feedback
+        // is a ticket comment). The panic clone comes from the refreshed ticket
+        // too, so crash-failure cleanup has the same freshest identity.
+        let ticket = ticket_with_comments(ticket).await;
+        let panic_ticket = Arc::clone(&ticket);
+        let run: futures_util::future::BoxFuture<'static, ()> = match phase {
+            TicketPhase::Analysis => Box::pin(analysis::run(ticket, ws, job_id)),
+            TicketPhase::InDevelopment => Box::pin(development::run(ticket, ws, job_id)),
+            TicketPhase::InDiagnostics => Box::pin(diagnostics::run(ticket, ws, job_id)),
+            TicketPhase::InReview => Box::pin(review::run(ticket, ws, job_id)),
+            TicketPhase::InQa => Box::pin(qa::run(ticket, ws, job_id)),
+            TicketPhase::InSanitation => Box::pin(sanitation::run(ticket, ws, job_id)),
+            _ => {
+                error!(phase = %phase, "spawn_phase_body called for a non-working phase");
+                return;
+            }
+        };
         if futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run))
             .await
             .is_ok()
@@ -458,9 +474,6 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
             return;
         }
         error!(phase = %phase, job = %log_job_id, "Phase body panicked — resetting for a fresh attempt");
-        // Hard technical failure: cancel any orphaned ticket agents, leave an
-        // explanatory comment, pause the workspace for the implementation
-        // phases, and delete the phase job so the puller creates a fresh one.
         let comment = format!(
             "Pipeline phase {phase} crashed: the phase body panicked. The ticket is reset for a fresh attempt."
         );

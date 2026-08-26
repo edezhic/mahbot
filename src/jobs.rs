@@ -605,15 +605,6 @@ pub(crate) async fn list_running_agents_for_ticket(
     Ok(out)
 }
 
-/// True when a ticket has any currently-running agent (`status='launched'`
-/// roster row for the ticket's working-phase jobs). Drives the re-dispatch
-/// guard.
-pub(crate) async fn ticket_has_active_agents(conn: &Connection, ticket_id: &str) -> Result<bool> {
-    Ok(!list_running_agents_for_ticket(conn, ticket_id)
-        .await?
-        .is_empty())
-}
-
 /// True when a job has any currently-running agent (`status='launched'` roster
 /// row). Drives the implementation-iteration re-dispatch guard.
 pub(crate) async fn job_has_launched_agents(conn: &Connection, job_id: &str) -> Result<bool> {
