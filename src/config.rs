@@ -1,4 +1,4 @@
-//! Configuration system with three independent resolution chains.
+//! Configuration system with two independent resolution chains.
 //!
 //! # Architecture overview
 //!
@@ -9,22 +9,23 @@
 //!
 //! At startup, [`load_or_init`] seeds `ConfigData::STRUCT_FIELDS_DEFAULT` into the
 //! global [`CONFIG`]. Then [`reload_from_db`] overlays persisted values from the
-//! three database tables on top of those defaults.
+//! two config tables on top of those defaults.
 //!
 //! # Resolution chains
 //!
-//! The configuration system has three independent resolution chains. They are
-//! **independent** — a KV entry in Chain 1 cannot override a model slot in
-//! Chain 2, and a slot entry in Chain 2 cannot override a per-model routing
-//! in Chain 3. Each chain applies to different fields.
+//! The configuration system has two independent resolution chains. They are
+//! **independent** — an entry in the `config_kv` chain cannot override a
+//! per-model routing entry in the `config_model_routing` chain, and vice versa.
+//! Each chain applies to different fields.
 //!
-//! ## Chain 1: KV-overridable string fields
+//! ## Chain 1: KV-backed string fields and model slots
 //!
 //! `config_kv` table → hardcoded default (`const` in this module)
 //!
-//! The fields listed in the `string_config_fields!` invocation
-//! belong to this chain. Their accessor methods (generated on [`ConfigReload`])
-//! each follow a per-field annotation:
+//! Both the fields listed in the `string_config_fields!` invocation and the three
+//! model slots (`manager_model`, `worker_model`, `video_transcription_model`)
+//! live in the `config_kv` table. Their accessor methods (generated on
+//! [`ConfigReload`]) each follow a per-field annotation:
 //!
 //! * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
 //! * `or(DEFAULT)` — returns `String`, falls back to a compile-time constant
@@ -53,24 +54,20 @@
 //! use `DEFAULT_PROVIDER_ENDPOINT` + `provider_key` regardless of the
 //! custom chat endpoint.
 //!
-//! ## Chain 2: Three model slots
+//! ### Model slots
 //!
-//! `config_kv` table → hardcoded slot default (`const` in this module)
-//!
-//! The three model slots — `manager_model`, `worker_model`,
-//! `video_transcription_model` — are ordinary Chain 1 fields.
-//! [`ConfigReload::role_model`] maps every role onto exactly one slot:
+//! The three model slots share the `config_kv` storage of the ordinary fields
+//! above, but [`ConfigReload::role_model`] maps every role onto exactly one of
+//! them:
 //!
 //! > Manager group (`Role::Manager`, `Role::Assistant`, `Role::Discovery`,
 //! > `Role::Engineer`) → manager slot; every other role (Artist, Analyst,
 //! > Coder, QA, Reviewer, Maintainer, Sanitation) → worker slot. The
 //! > video-transcription slot backs only video transcription — no role uses it.
 //!
-//! Unset slots fall back to their `DEFAULT_*_MODEL` constant. Historical
-//! per-role overrides are no longer used — legacy rows are inert ghosts if
-//! present.
+//! Unset slots fall back to their `DEFAULT_*_MODEL` constant.
 //!
-//! ## Chain 3: Per-model provider routing
+//! ## Chain 2: Per-model provider routing
 //!
 //! `config_model_routing` table → `None` defaults
 //!
@@ -96,17 +93,16 @@
 //! lazily purged on reload: [`reload_from_db`] logs each unknown key at
 //! `debug`, then best-effort deletes garbage rows (debug on success, warn
 //! on transient failure without failing boot) while the two intentional
-//! shared namespaces `nightly_discovery_last_pass_at`
-//! (`src/workspace.rs:1572`) and `telegram_role_pin:*`
-//! (`src/channels/telegram.rs:515`) are left untouched. Downgrade
-//! resurrection is therefore lost — under the previous ghost policy orphans
-//! were retained and would re-appear on downgrade, now they are deleted on
-//! first reboot. New orphans cannot be created via the settings path because
+//! shared namespaces `crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY`
+//! and `crate::channels::telegram::ROLE_PIN_KV_PREFIX` are left untouched.
+//! Downgrade resurrection is therefore lost — under the previous ghost policy
+//! orphans were retained and would re-appear on downgrade, now they are deleted
+//! on first reboot. New orphans cannot be created via the settings path because
 //! [`write_kv_and_update_config`] rejects unknown keys before any DB write.
 //!
 //! # See also
 //!
-//! * [`crate::config_db`] — database persistence for all three chains.
+//! * [`crate::config_db`] — database persistence for both chains.
 //! * [`crate::agent::role`] — [`crate::agent::role::RoleInfo`] definitions with per-role defaults.
 //! * [`crate::providers::compatible`] — where `None` routing fields are resolved
 //!   at the provider layer.
