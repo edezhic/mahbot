@@ -99,6 +99,10 @@ crate::define_store! {
     expect = "SESSIONS not initialized — call init_all_stores() first",
 }
 
+/// Fresh-DB shape of the sessions/jobs tables. `CREATE TABLE IF NOT EXISTS`
+/// does not add columns to an existing table — indexes that mention a
+/// newly-added column (e.g. `jobs.ticket_id`) run after migrations; see
+/// [`crate::db::open_consolidated_store`].
 pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id    TEXT NOT NULL,
@@ -139,6 +143,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
 -- One phase job per ticket, per phase (the single-puller dispatch authority).
+-- Applied AFTER migrations by `open_consolidated_store` (tables → ALTER →
+-- indexes). `CREATE TABLE IF NOT EXISTS jobs` does not add `ticket_id` to an
+-- existing jobs table; running this index in the pre-migration SCHEMA batch
+-- failed with `no such column: ticket_id` and quarantined live stores.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_phase_ticket ON jobs(kind, ticket_id) WHERE ticket_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS agents (

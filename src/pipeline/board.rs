@@ -49,6 +49,9 @@ pub async fn run_archive_cancelled_loop() {
     }
 }
 
+/// Fresh-DB shape of the board tables. Indexes in this string run after
+/// migrations (`open_consolidated_store`); `CREATE TABLE IF NOT EXISTS` does
+/// not add columns to an existing `tickets` table.
 pub(crate) const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS tickets (
     id              TEXT PRIMARY KEY,
@@ -87,12 +90,14 @@ CREATE TABLE IF NOT EXISTS ticket_counters (
     next_id        INTEGER NOT NULL DEFAULT 1
 );
 -- The `idx_tickets_title_fts` FTS index is declared HERE (not only via the
--- tokenizer-checking `ensure_fts_index` in `after_open`) so the consolidated
--- schema creates it BEFORE the one-time import populates `tickets`: once the
--- index exists, the bulk INSERTs maintain it, so imported tickets are
--- FTS-searchable immediately. (turso's `CREATE INDEX ... USING fts` does NOT
--- backfill pre-existing rows.) `ensure_fts_index` still runs later to
--- tokenizer-migrate the index; its DDL must match this one — keep in sync.
+-- tokenizer-checking `ensure_fts_index` in `after_open`) so it exists BEFORE
+-- the one-time import populates `tickets`: once the index exists, the bulk
+-- INSERTs maintain it, so imported tickets are FTS-searchable immediately.
+-- (turso's `CREATE INDEX ... USING fts` does NOT backfill pre-existing rows.)
+-- `open_consolidated_store` applies CREATE INDEX after migrations and before
+-- import; do not move this into the pre-migration batch. `ensure_fts_index`
+-- still runs later to tokenizer-migrate the index; its DDL must match this
+-- one — keep in sync.
 CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
 USING fts (title) WITH (tokenizer = 'ngram');
 -- The `idx_tickets_board_active` composite index serves the board query in

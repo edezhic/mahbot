@@ -10,6 +10,18 @@
 //! SCHEMA already contains the migrated shape — an existence guard so the
 //! wipe-and-recreate path records it as applied instead of failing with a
 //! duplicate-column error.
+//!
+//! # SCHEMA vs migrations (do not invert)
+//!
+//! Boot applies CREATE TABLE, then these migrations, then SCHEMA's CREATE
+//! INDEX statements (`open_consolidated_store`). `CREATE TABLE IF NOT EXISTS`
+//! never adds columns to an existing table. A new column therefore needs
+//! **both** a CREATE TABLE edit in SCHEMA **and** an `ALTER TABLE … ADD
+//! COLUMN` migration. Indexes that mention the new column belong in SCHEMA
+//! (they run after this list) and/or a later migration — never in a DDL
+//! batch that runs before the ALTER. A SCHEMA-before-migration index on a
+//! newly added column quarantined live stores (`no such column` classified
+//! as corruption).
 
 use crate::db::{Migration, MigrationGuard};
 
@@ -145,6 +157,11 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
     // carry `ticket_id` directly; the `ticket_jobs` child table and
     // `jobs.paused_frozen` are removed. Old ticket_analysis/ticket_implementation
     // rows are discarded on upgrade (no backward compatibility).
+    // `ticket_id` must be ALTERed onto existing jobs tables before SCHEMA's
+    // `idx_jobs_phase_ticket` runs. Do not delete this migration; do not move
+    // that unique index into a pre-migration SCHEMA batch — that combination
+    // quarantined live stores (`no such column: ticket_id` classified as
+    // corruption).
     Migration {
         id: "consolidate_003_jobs_ticket_id",
         sql: "ALTER TABLE jobs ADD COLUMN ticket_id TEXT REFERENCES tickets(id)",
@@ -177,6 +194,10 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
               ON jobs(kind, ticket_id) WHERE ticket_id IS NOT NULL",
         guard: None,
     },
+    // Duplicate of the SCHEMA index (IF NOT EXISTS). Kept so a store that
+    // opened between consolidate_003 and the post-migration SCHEMA pass
+    // still gets the index on the next boot; SCHEMA apply is the canonical
+    // path for fresh files.
 ];
 
 /// Migrations for the board store (applied in the consolidated domain
@@ -626,6 +647,87 @@ mod tests {
         let ids = applied_ids(&conn).await;
         assert_migrations_applied(&ids, BOARD_MIGRATIONS, "board");
         assert_migrations_applied(&ids, SESSION_MIGRATIONS, "session");
+    }
+
+    /// Production boot path: a pre-job-per-phase `core.db` (jobs has no
+    /// `ticket_id`) must upgrade through `open_consolidated_store` — tables,
+    /// then ALTER, then SCHEMA indexes — without quarantining. This is the
+    /// incident that a single pre-migration `execute_batch` of SCHEMA caused.
+    #[tokio::test]
+    async fn open_consolidated_store_upgrades_jobs_without_ticket_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let db_path = crate::db::store_db_path(root, "core");
+        let pre = "CREATE TABLE tickets (\
+             id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, \
+             phase TEXT NOT NULL DEFAULT 'backlog', workspace_name TEXT NOT NULL, \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, \
+             prerequisites TEXT NOT NULL DEFAULT '[]', \
+             reporter TEXT NOT NULL DEFAULT '', \
+             is_archived INTEGER NOT NULL DEFAULT 0, \
+             priority INTEGER NOT NULL DEFAULT 1, \
+             bounce_count INTEGER NOT NULL DEFAULT 0); \
+             CREATE TABLE jobs (\
+             id TEXT PRIMARY KEY, kind TEXT NOT NULL, role TEXT NOT NULL DEFAULT '', \
+             workspace_name TEXT NOT NULL, task TEXT NOT NULL DEFAULT '', \
+             user_name TEXT NOT NULL DEFAULT '', channel TEXT NOT NULL DEFAULT '', \
+             retry_count INTEGER NOT NULL DEFAULT 0, \
+             status TEXT NOT NULL DEFAULT 'launched', \
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL);";
+        {
+            let conn = crate::db::open_with_schema(&db_path, pre)
+                .await
+                .expect("open pre-job-per-phase core.db");
+            let now = crate::db::now();
+            conn.execute(
+                "INSERT INTO tickets (id, title, description, phase, workspace_name, \
+                 created_at, updated_at) VALUES (?1, ?2, ?3, 'backlog', 'ws', ?4, ?4)",
+                params!["T1", "kept", "desc", now.clone()],
+            )
+            .await
+            .expect("seed ticket");
+            conn.execute(
+                "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, \
+                 channel, retry_count, status, created_at, updated_at) \
+                 VALUES (?1, 'research', '', 'ws', '', '', '', 0, 'launched', ?2, ?2)",
+                params!["job_research", now],
+            )
+            .await
+            .expect("seed job");
+        }
+
+        let conn = crate::db::open_consolidated_store(root)
+            .await
+            .expect("upgrade must succeed; schema-mismatch must not fail boot");
+
+        assert!(
+            column_exists(&conn, "jobs", "ticket_id").await.unwrap(),
+            "migration must add ticket_id before SCHEMA creates the unique index"
+        );
+        assert_eq!(
+            conn.query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_jobs_phase_ticket'",
+                (),
+            )
+            .await
+            .unwrap()
+            .len(),
+            1,
+            "idx_jobs_phase_ticket exists after the post-migration SCHEMA pass"
+        );
+        let tickets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tickets", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(tickets, 1, "pre-upgrade rows must survive");
+        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
+        assert!(
+            !quarantined,
+            "upgrade-in-place must not quarantine the live family"
+        );
     }
 
     // ── Legacy-consolidation import path (consolidate_001) ──────────────

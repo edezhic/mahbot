@@ -1312,11 +1312,24 @@ pub(crate) async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Re
         .await
         .context("Failed to enable foreign key enforcement")?;
 
-    conn.execute_batch(schema)
-        .await
-        .context(format!("Failed to run schema {schema}"))?;
+    // Never embed the DDL in the error: a multi-kilobyte schema string hides
+    // the engine's actual reason (e.g. `no such column: ticket_id`) and was
+    // how a quarantine of a readable store went undiagnosed.
+    execute_schema_ddl(&conn, schema).await?;
 
     Ok(conn)
+}
+
+/// Run a SCHEMA batch. The source Turso error is the context's cause — do not
+/// interpolate `sql` into the message (see [`open_with_schema`]).
+async fn execute_schema_ddl(conn: &Connection, sql: &str) -> anyhow::Result<()> {
+    if sql.trim().is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch(sql)
+        .await
+        .context("Failed to run schema DDL")?;
+    Ok(())
 }
 
 /// Resolve a logical store name to its physical database file path.
@@ -1394,7 +1407,15 @@ fn has_resource_signal(lower: &str) -> bool {
 /// string at boot could trigger a recreate the matrix does not justify.
 /// Accepted trade-off — genuine corruption must not pass as an actionable
 /// signal; reclassify new strings as they surface.
+///
+/// Schema-mismatch / DDL-shape errors are **never** corruption — they are a
+/// code bug (SCHEMA ran before a migration added a column, a typo, …). Those
+/// must fail boot with the store intact; quarantining them destroyed readable
+/// installs. See [`is_schema_mismatch`].
 pub(crate) fn is_corruption_class(e: &anyhow::Error) -> bool {
+    if is_schema_mismatch(e) {
+        return false;
+    }
     let msg = format!("{e:#}");
     if msg.contains("Database integrity check failed") {
         return true;
@@ -1405,6 +1426,30 @@ pub(crate) fn is_corruption_class(e: &anyhow::Error) -> bool {
         || lower.contains("locked")
         || lower.contains("i/o error")
         || lower.contains("no such file"))
+}
+
+/// True when a SCHEMA/`execute_batch` failure is a DDL shape error, not
+/// page-level damage.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table even when the
+/// live columns differ from SCHEMA. A later `CREATE INDEX … ON t(new_col)`
+/// then fails with `no such column` — that is an upgrade-ordering bug, not
+/// an unreadable file. Keep this list in lockstep with Turso/SQLite wording
+/// as new strings surface; do **not** fold these into the fail-closed
+/// corruption path.
+fn is_schema_mismatch(e: &anyhow::Error) -> bool {
+    let lower = format!("{e:#}").to_lowercase();
+    const DDL_SHAPE: [&str; 8] = [
+        "no such column",
+        "no such table",
+        "no such index",
+        "has no column",
+        "duplicate column",
+        "already exists",
+        "syntax error",
+        "parse error",
+    ];
+    DDL_SHAPE.iter().any(|k| lower.contains(k))
 }
 
 /// True when a heal-phase failure is an actionable resource/permission
@@ -1587,9 +1632,16 @@ pub(crate) async fn open_store(
 /// config, chat_history), which now share one file.
 ///
 /// Built at runtime because Rust `concat!` only accepts string literals, not
-/// the per-module `SCHEMA` constants. Every `CREATE TABLE`/`CREATE INDEX` is
-/// `IF NOT EXISTS`, so rebuilding the schema on an existing consolidated file
-/// is a no-op.
+/// the per-module `SCHEMA` constants.
+///
+/// # `CREATE TABLE IF NOT EXISTS` does not reshape existing tables
+///
+/// `IF NOT EXISTS` is a no-op when the table is already present, even if
+/// SCHEMA declares extra columns. Indexes in SCHEMA that mention those
+/// columns must not run until migrations have `ALTER TABLE … ADD COLUMN`.
+/// [`open_consolidated_store`] enforces that by applying CREATE TABLE first,
+/// then migrations, then the remaining DDL. Do not "simplify" this back to a
+/// single pre-migration `execute_batch` of the full SCHEMA.
 fn consolidated_schema() -> String {
     let mut s = String::with_capacity(2048);
     s.push_str(crate::pipeline::board::SCHEMA);
@@ -1601,19 +1653,134 @@ fn consolidated_schema() -> String {
     s
 }
 
+/// Split a SCHEMA batch into CREATE TABLE statements vs everything else
+/// (CREATE INDEX, …).
+///
+/// Statement boundaries are `;` outside strings and `--` comments. Leading
+/// `--` comments on a statement travel with it so FTS/index documentation
+/// stays attached to the index, not the preceding table.
+fn split_schema_table_ddl(schema: &str) -> (String, String) {
+    let mut tables = String::new();
+    let mut rest = String::new();
+    for stmt in split_sql_statements(schema) {
+        let target = if is_create_table_ddl(&stmt) {
+            &mut tables
+        } else {
+            &mut rest
+        };
+        if !target.is_empty() {
+            target.push('\n');
+        }
+        target.push_str(&stmt);
+        target.push(';');
+    }
+    (tables, rest)
+}
+
+/// Split `sql` on `;` that are not inside single-quoted strings or `--` line
+/// comments.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_string {
+            cur.push(c);
+            if c == '\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    cur.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                cur.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        if c == '\'' {
+            in_string = true;
+            cur.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ';' {
+            let stmt = cur.trim();
+            if !stmt.is_empty() {
+                out.push(stmt.to_string());
+            }
+            cur.clear();
+            i += 1;
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    let stmt = cur.trim();
+    if !stmt.is_empty() {
+        out.push(stmt.to_string());
+    }
+    out
+}
+
+/// True when `stmt` is `CREATE TABLE` after skipping leading `--` comments.
+fn is_create_table_ddl(stmt: &str) -> bool {
+    let mut rest = stmt.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, t)| t).trim_start();
+            continue;
+        }
+        break;
+    }
+    rest.len() >= 12 && rest[..12].eq_ignore_ascii_case("create table")
+}
+
 /// Open (or create) the single consolidated domain database file.
 ///
 /// This is the canonical open for the 6 domain stores: it opens the one
 /// consolidated file ([`store_db_path`] mapping all domain names to
-/// [`CONSOLIDATED_DB_NAME`]), runs the consolidated schema, applies the
-/// consolidated migration list (board + sessions, ids NOT renumbered) via a
-/// single `run_pending_migrations` pass, and runs the one-time consolidation
-/// import when legacy per-store files are present. It does NOT run the
-/// per-store post-open hooks (tickets FTS index, admin-user seed) — those are
+/// [`CONSOLIDATED_DB_NAME`]), applies SCHEMA in two DDL passes around the
+/// consolidated migration list, and runs the one-time consolidation import
+/// when legacy per-store files are present. It does NOT run the per-store
+/// post-open hooks (tickets FTS index, admin-user seed) — those are
 /// idempotent and run in [`init_all_stores`] (production) and each store's
 /// `open` (isolated tests).
 ///
-/// # Migration ordering (an explicit decision)
+/// # Boot DDL order (do not collapse)
+///
+/// 1. **CREATE TABLE IF NOT EXISTS** — safe on an existing file (no-op when
+///    the table is already there; does **not** add columns).
+/// 2. **Migrations** — `ALTER TABLE … ADD COLUMN` / data resets / guarded
+///    drops. This is the only path that reshapes an old table.
+/// 3. **Remaining SCHEMA DDL** (CREATE INDEX, …) — now legal even when an
+///    index mentions a column that SCHEMA's CREATE TABLE added in this
+///    version, because step 2 has run.
+/// 4. **Consolidation import** — FTS/board indexes from step 3 already exist,
+///    so bulk INSERTs maintain them.
+///
+/// Putting step 3 before step 2 quarantined live stores: SCHEMA gained
+/// `CREATE UNIQUE INDEX … ON jobs(kind, ticket_id)` while `ticket_id` was
+/// only added by `consolidate_003`. `CREATE TABLE IF NOT EXISTS jobs` left
+/// the old table unchanged; the index failed with `no such column`; that
+/// was classified as corruption and the family was recreated empty.
+///
+/// When adding a column: put it on the CREATE TABLE in SCHEMA **and** add an
+/// `ALTER TABLE … ADD COLUMN` migration with a `ColumnExists` guard. Put
+/// indexes that mention the new column in SCHEMA (they run at step 3) and/or
+/// in a later migration. Never rely on CREATE TABLE IF NOT EXISTS to upgrade
+/// an existing table.
+///
+/// # Migration vs import ordering
 ///
 /// [`crate::db::migrations::run_domain_migrations`] runs **before** the one-time
 /// import. This is deliberate: the merged board+sessions history includes two
@@ -1634,16 +1801,25 @@ fn consolidated_schema() -> String {
 /// isolation never leaks a connection across roots.
 pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Connection> {
     let schema = consolidated_schema();
+    let (tables, rest) = split_schema_table_ddl(&schema);
     // `CONSOLIDATED_DB_NAME` maps (via store_db_path) to the one consolidated
     // file; the boot-diagnosis heal path keys off that same path, so a
     // pre-flight diagnosis set for the consolidated file is consumed here.
-    let conn = open_store(root, CONSOLIDATED_DB_NAME, &schema).await?;
+    // Heal/recreate inside `open_store` sees tables-only DDL: a fresh
+    // recreate gets current CREATE TABLE (full column set), then we migrate
+    // and apply indexes below.
+    let conn = open_store(root, CONSOLIDATED_DB_NAME, &tables).await?;
 
     // Single consolidated migration runner: board + sessions migrations, ids
     // preserved (never renumbered — two of them are unguarded one-time data
     // resets that must not re-fire if renumbered). The unified
     // `schema_migrations` table holds all of them.
     crate::db::migrations::run_domain_migrations(&conn).await?;
+
+    // Indexes and other non-table SCHEMA DDL. Failure here is a code bug
+    // (or a unique-index conflict on migrated rows): fail boot, never
+    // quarantine — the tables and data are already open.
+    execute_schema_ddl(&conn, &rest).await?;
 
     // One-time consolidation import from legacy per-store files.
     run_consolidation_import_if_pending(&conn, root).await?;
@@ -2150,9 +2326,10 @@ async fn retry_after_coordination_panic(
         Ok(Err(e)) => {
             // Actionable resource conditions (ENOSPC/EMFILE/permission) must
             // never quarantine the family — the main DB is intact here, so
-            // propagate the signal; anything else (busy after retries, I/O,
-            // unreadable, corruption) recreates.
-            if is_actionable_signal(&e) {
+            // propagate the signal. Schema-mismatch is the same class: the
+            // main DB was readable enough to run DDL; recreating it would
+            // discard user data because of a code bug.
+            if is_actionable_signal(&e) || is_schema_mismatch(&e) {
                 return Err(e);
             }
             recreate_after_failed_heal(db_path, name, schema, &e).await
@@ -2190,7 +2367,8 @@ async fn open_and_repair(db_path: &Path, name: &str, schema: &str) -> anyhow::Re
         Err(e) if is_corruption_class(&e) => {
             // Schema application choked on a corrupt table (e.g. CREATE INDEX
             // scans it and hits "Invalid page type") — unreadable table,
-            // recreate justified.
+            // recreate justified. Schema-mismatch (`no such column`, …) is
+            // excluded from [`is_corruption_class`]: fail boot, keep the file.
             return recreate_after_failed_heal(db_path, name, schema, &e).await;
         }
         Err(e) => return Err(e),
@@ -3357,6 +3535,121 @@ mod tests {
         assert!(
             !fam.enable_multiprocess_wal,
             "family reads must disable multiprocess_wal (snapshot semantics)"
+        );
+    }
+
+    #[test]
+    fn schema_mismatch_is_not_corruption() {
+        for msg in [
+            "no such column: ticket_id",
+            "no such table: jobs",
+            "no such index: idx_jobs_phase_ticket",
+            "table jobs has no column named ticket_id",
+            "duplicate column name: ticket_id",
+            "index idx_jobs_phase_ticket already exists",
+            "syntax error",
+            "parse error at line 1",
+        ] {
+            let e = anyhow::anyhow!("{msg}");
+            assert!(is_schema_mismatch(&e), "mismatch: {msg}");
+            assert!(
+                !is_corruption_class(&e),
+                "schema-mismatch must not quarantine: {msg}"
+            );
+            let wrapped = e.context("Failed to run schema DDL");
+            assert!(
+                !is_corruption_class(&wrapped),
+                "wrapped schema-mismatch must not quarantine: {msg}"
+            );
+        }
+        let page = anyhow::anyhow!("Invalid page type");
+        assert!(!is_schema_mismatch(&page));
+        assert!(
+            is_corruption_class(&page),
+            "page-level damage stays corruption-class"
+        );
+    }
+
+    #[test]
+    fn split_schema_table_ddl_keeps_indexes_out_of_the_table_pass() {
+        let schema = consolidated_schema();
+        let (tables, rest) = split_schema_table_ddl(&schema);
+        assert!(
+            tables.to_lowercase().contains("create table") && tables.contains("tickets"),
+            "tickets CREATE TABLE belongs in the table pass"
+        );
+        assert!(
+            tables.to_lowercase().contains("create table") && tables.contains("jobs"),
+            "jobs CREATE TABLE belongs in the table pass"
+        );
+        assert!(
+            !tables.to_lowercase().contains("create unique index")
+                && !tables.to_lowercase().contains("create index"),
+            "no CREATE INDEX in the table pass: {tables}"
+        );
+        assert!(
+            rest.contains("idx_jobs_phase_ticket"),
+            "jobs unique index must run after migrations, not with CREATE TABLE"
+        );
+        assert!(
+            rest.contains("idx_tickets_title_fts"),
+            "FTS index is post-table DDL (still before consolidation import)"
+        );
+        // `--` comments with semicolons must not split statements.
+        let commented = "-- note: do not run this; it is a comment\n\
+             CREATE TABLE IF NOT EXISTS t (id INTEGER);\n\
+             -- index on id; applied after migrations\n\
+             CREATE INDEX IF NOT EXISTS idx_t ON t(id);";
+        let (t, r) = split_schema_table_ddl(commented);
+        assert!(t.to_lowercase().contains("create table"));
+        assert!(r.to_lowercase().contains("create index"));
+        assert!(!t.to_lowercase().contains("create index"));
+    }
+
+    /// An existing, readable store whose SCHEMA batch indexes a column the
+    /// live table does not have must fail boot — never quarantine. This is
+    /// the job-per-phase incident in miniature.
+    #[tokio::test]
+    async fn schema_mismatch_does_not_quarantine_existing_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let db_path = store_db_path(root, "board");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let _conn = open_with_schema(
+                &db_path,
+                "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY);",
+            )
+            .await
+            .unwrap();
+        }
+        crate::db::wal_guard::set_boot_diagnosis(
+            &db_path,
+            crate::db::wal_guard::BootDiagnosis::Healthy,
+        );
+        let err = open_store(
+            root,
+            "board",
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY);\
+             CREATE INDEX IF NOT EXISTS idx_t_missing ON t(missing_col);",
+        )
+        .await
+        .expect_err("schema mismatch must fail boot, not succeed");
+        assert!(
+            is_schema_mismatch(&err) || format!("{err:#}").to_lowercase().contains("no such"),
+            "expected a DDL-shape error, got: {err:#}"
+        );
+        let quarantined = std::fs::read_dir(db_path.parent().unwrap())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains("quarantine-"));
+        assert!(
+            !quarantined,
+            "readable store must not be quarantined on schema mismatch"
+        );
+        assert!(
+            db_path.exists(),
+            "original main file must still be at the live path"
         );
     }
 
