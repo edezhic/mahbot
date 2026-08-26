@@ -366,6 +366,7 @@ impl Agent {
             cancel_token,
             user_stop,
             pause_stop,
+            paused_frozen: std::sync::atomic::AtomicBool::new(false),
             ticket,
             generation,
             tool_stats: std::sync::Mutex::new(Vec::new()),
@@ -514,6 +515,16 @@ impl Agent {
         self.pause_stop.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// IMMUTABLE bail-time snapshot of whether this agent's run was stopped by
+    /// a cooperative workspace-pause freeze. Set once at the LLM-round boundary
+    /// (never cleared), so a pipeline finalizer can distinguish a frozen run
+    /// from a technical failure even if the workspace is resumed before the
+    /// finalizer reads it.
+    #[must_use]
+    pub fn is_paused_frozen(&self) -> bool {
+        self.paused_frozen.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Human-readable failure reason with the same global-token-first ordering
     /// as [`failure_classification`]: shutdown cancels every per-agent token,
     /// so the global token must be checked before a user cancel is reported.
@@ -608,6 +619,20 @@ impl Agent {
             loop {
                 if self.cancel_token.is_cancelled() {
                     anyhow::bail!("Agent cancelled by user");
+                }
+                // Cooperative workspace-pause (strict freeze): the current LLM
+                // round ends at this boundary — no new LLM call starts. The
+                // pause does NOT fire the per-agent cancel token, so the round
+                // that was already in flight completes and commits first. The
+                // phase finalizer treats the frozen agent as a no-op (the job
+                // stays in place for the unpause re-drive).
+                if self.is_cancelled_by_pause() {
+                    // Record the freeze IMMUTABLY at the bail so a later
+                    // unpause (which clears the live pause_stop) cannot turn a
+                    // frozen run into a misclassified hard failure.
+                    self.paused_frozen
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    anyhow::bail!("Agent frozen by workspace pause — resumes at unpause");
                 }
                 // Shutdown/drain: checked at tool-round top (after the previous
                 // tool group's commit) so the CURRENT tool group completes —
@@ -2022,8 +2047,12 @@ pub(crate) async fn run_agent(
                 // token fires before `shutdown_all()` cancels per-agent tokens, so
                 // either path resolves to classification "shutdown". Log at debug
                 // level to avoid misleading ERROR noise on clean shutdown. The
-                // graceful drain maps to classification "drain" — same treatment.
-                if classification == "shutdown" || classification == "drain" {
+                // graceful drain and a cooperative pause-freeze map to
+                // "drain"/"pause" — same treatment.
+                if classification == "shutdown"
+                    || classification == "drain"
+                    || classification == "pause"
+                {
                     tracing::debug!(
                         agent_id = %agent.agent_id,
                         workspace = %ws.name,
@@ -2124,6 +2153,11 @@ fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'sta
         "drain"
     } else if crate::shutdown::shutdown_token().is_cancelled() {
         "shutdown"
+    } else if agent.is_paused_frozen() {
+        // A strictly-frozen (paused-workspace) run — not a failure. The
+        // immutable bail-time snapshot (not the live pause_stop, which an
+        // unpause can clear) is authoritative.
+        "pause"
     } else if agent.is_cancelled_by_user() {
         "cancelled"
     } else if agent.is_cancelled() {
@@ -2197,6 +2231,7 @@ mod tests {
             cancel_token: CancellationToken::new(),
             user_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pause_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused_frozen: std::sync::atomic::AtomicBool::new(false),
             ticket: None,
             generation: 0,
             tool_stats: std::sync::Mutex::new(Vec::new()),

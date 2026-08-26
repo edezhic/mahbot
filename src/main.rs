@@ -63,7 +63,7 @@ async fn bootstrap_mahbot() -> Result<()> {
     let _ = mahbot::gui::LOG_BROADCAST.set(log_broadcast);
 
     mahbot::search_engine::init_global(); // sync — no I/O
-    mahbot::pipeline::ticket_buffer::init_global(); // sync — no I/O
+    mahbot::pipeline::chronicle::init_global(); // sync — no I/O
     mahbot::agent::message_router::init_global()?;
     mahbot::audio::voice::init_global()?;
     mahbot::audio::tts::init_global()?;
@@ -287,7 +287,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &mut tasks,
         &shutdown_token,
         "management",
-        mahbot::pipeline::management::run_management(),
+        mahbot::pipeline::run_management(),
     );
 
     // Listen for SIGTERM/SIGINT and drive the two-signal drain protocol.
@@ -318,14 +318,14 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     });
 
     // Drain-watch: while the drain flag is set, poll the agent registry AND
-    // the non-agent call registry. Drain-cut ticket_analysis/analyze rounds
-    // intentionally leave their jobs status='launched' for boot resume,
-    // so a jobs-table count cannot reach zero in the common
-    // drain — and even research jobs, which DO terminalize mid-drain via the
-    // partial-report path, tell us nothing about cut rounds — so the
-    // registries are the authoritative in-flight signal (orchestrator-only
-    // LLM calls — analyze consolidation, research synthesis — are tracked in
-    // NON_AGENT_CALLS; the research orchestrator holds a whole-run guard).
+    // the non-agent call registry. Drain-cut phase jobs intentionally leave
+    // their jobs status='launched' for the puller to re-drive at boot, so a
+    // jobs-table count cannot reach zero in the common drain — and even
+    // research jobs, which DO terminalize mid-drain via the partial-report
+    // path, tell us nothing about cut rounds — so the registries are the
+    // authoritative in-flight signal (orchestrator-only LLM calls — analysis
+    // consolidation, research synthesis — are tracked in NON_AGENT_CALLS; the
+    // research orchestrator holds a whole-run guard).
     // Clean exit when both empty; force-cancel stragglers at the 10-minute
     // cap (in-flight ops with >10 min remaining budget are guaranteed-aborted
     // and boot-resume via status='launched').

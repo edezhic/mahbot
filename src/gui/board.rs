@@ -732,7 +732,7 @@ impl BoardState {
                         // cancels don't go through here; shutdown and
                         // already-paused are handled inside the helper.
                         if phase == TicketPhase::Cancelled && agent_in_flight(&ticket).await {
-                            let notice = crate::pipeline::management::pause_workspace_on_failure(
+                            let notice = crate::pipeline::pause_workspace_on_failure(
                                 &ticket,
                                 "user cancelled the ticket while an agent was running",
                             )
@@ -769,12 +769,12 @@ impl BoardState {
                         // transition was a no-op and a self-transition entry
                         // would be a bogus hop.
                         if source != phase && applied {
-                            crate::pipeline::ticket_buffer::push(
+                            crate::pipeline::chronicle::push(
                                 &ticket.workspace_name,
                                 &ticket_id,
                                 source,
                                 phase,
-                                crate::pipeline::ticket_buffer::TransitionOrigin::User,
+                                crate::pipeline::chronicle::TransitionOrigin::User,
                             );
                         }
                         Ok(())

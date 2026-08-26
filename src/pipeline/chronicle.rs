@@ -65,7 +65,7 @@ pub fn init_global() {
 fn buffer() -> &'static Mutex<HashMap<String, VecDeque<Entry>>> {
     TICKET_BUFFER
         .get()
-        .expect("ticket_buffer not initialized — call init_global() first")
+        .expect("chronicle not initialized — call init_global() first")
 }
 
 /// Push a non-critical ticket transition into the buffer.

@@ -1718,9 +1718,9 @@ async fn run_consolidation_import_if_pending(conn: &Connection, root: &Path) -> 
 /// database, preserving the AUTOINCREMENT watermark (`sqlite_sequence`).
 ///
 /// *FK handling*: FK enforcement is OFF during the bulk load (children may be
-/// copied before their parents, and the target schema's new FK on
-/// `ticket_jobs.ticket_id` must not fire mid-copy). It is restored to ON and
-/// validated with `PRAGMA foreign_key_check` afterwards.
+/// copied before their parents, and the target schema's FKs must not fire
+/// mid-copy). It is restored to ON and validated with
+/// `PRAGMA foreign_key_check` afterwards.
 async fn import_legacy_stores(conn: &Connection, root: &Path) -> anyhow::Result<()> {
     conn.execute("PRAGMA foreign_keys = OFF;", ())
         .await
@@ -1733,12 +1733,23 @@ async fn import_legacy_stores(conn: &Connection, root: &Path) -> anyhow::Result<
         .context("Failed to re-enable FK enforcement after consolidation import")?;
     result?;
 
-    // Validate referential integrity: the newly-added FK
-    // (ticket_jobs.ticket_id -> tickets.id) and the existing jobs/tickets
-    // cascades must hold on the migrated data. Validation REPORTS (does not
-    // fail) — the one-time migration must preserve all data even if a legacy
-    // store carried orphan child rows (they remain soft references; FK
-    // enforcement applies only to subsequent writes).
+    // Discard pre-rework ticket jobs that the legacy import just rolled in.
+    // `consolidate_004_discard_old_ticket_jobs` runs during `run_domain_migrations`
+    // (before this import), so on the fresh->legacy-import path its DELETE hits
+    // an empty table; re-running it here guarantees nothing old is preserved
+    // (the ticket's "no backward compatibility" requirement).
+    conn.execute(
+        "DELETE FROM jobs WHERE kind IN ('ticket_analysis', 'ticket_implementation')",
+        (),
+    )
+    .await
+    .context("Failed to discard legacy ticket jobs after consolidation import")?;
+
+    // Validate referential integrity: the existing jobs/tickets cascades must
+    // hold on the migrated data. Validation REPORTS (does not fail) — the
+    // one-time migration must preserve all data even if a legacy store carried
+    // orphan child rows (they remain soft references; FK enforcement applies
+    // only to subsequent writes).
     let violations = conn
         .query("PRAGMA foreign_key_check", ())
         .await
@@ -1746,9 +1757,8 @@ async fn import_legacy_stores(conn: &Connection, root: &Path) -> anyhow::Result<
     if !violations.is_empty() {
         tracing::warn!(
             count = violations.len(),
-            "consolidation import found orphan rows violating the new FK \
-             (ticket_jobs.ticket_id -> tickets.id); preserving them as soft references \
-             (future writes still enforce the FK)",
+            "consolidation import found orphan rows violating the new FKs; \
+             preserving them as soft references (future writes still enforce the FK)",
         );
     }
     Ok(())
@@ -1773,8 +1783,9 @@ async fn import_legacy_stores_inner(conn: &Connection, root: &Path) -> anyhow::R
 /// experimental feature set as the daemon so the WAL/`.tshm` coordination is
 /// read correctly. Turso internals (`sqlite_%`, `__turso_internal_%`) are never
 /// copied — the consolidated schema recreates them. A source table that has no
-/// matching target table (schema drift) is skipped; a renamed table
-/// (`ticket_stage_jobs` → `ticket_jobs`) is mapped via [`consolidate_table_name`].
+/// matching target table (schema drift) is skipped; the removed rework-child
+/// tables (`ticket_jobs`, `ticket_stage_jobs`) fall through to `None` and are
+/// dropped rather than imported.
 async fn import_one_legacy_store(
     conn: &Connection,
     store_name: &str,
@@ -1836,23 +1847,19 @@ async fn import_one_legacy_store(
 /// Map a legacy source table name to its consolidated target name. Returns
 /// `None` for tables that have no consolidated counterpart (schema drift).
 ///
-/// The only rename across the consolidation is the sessions store's
-/// `ticket_stage_jobs` → `ticket_jobs` (the pre-rework child table name).
+/// There are no renames across the consolidation — every legacy table either
+/// keeps its name or maps to `None`.
 ///
 /// **Dormant legacy tables are deliberately dropped** (mapped to `None`): the
 /// consolidated SCHEMA never recreates them and no production code reads them.
-/// The one such table is `config_role` — historically created for the
-/// (removed) per-role config override rows; it has no code references and is
-/// not part of [`crate::config_db::SCHEMA`], so its rows are not carried
-/// forward. The consolidated `schema_migrations`/fresh-install probe paths do
-/// not depend on it.
+/// These include `config_role` — historically created for the (removed)
+/// per-role config override rows (no code references, not part of
+/// [`crate::config_db::SCHEMA`]) — and the old `ticket_jobs` child table, which
+/// the job-per-phase model removed (it stores `ticket_id` directly on `jobs`).
+/// The consolidated `schema_migrations`/fresh-install probe paths do not depend
+/// on them.
 fn consolidate_table_name(src: &str) -> Option<&'static str> {
     match src {
-        // The rework child table ships as `ticket_jobs` in the consolidated
-        // schema; a pre-rework legacy file still calls it `ticket_stage_jobs`,
-        // and an already-migrated legacy file uses the new name — both map to
-        // the same target.
-        "ticket_stage_jobs" | "ticket_jobs" => Some("ticket_jobs"),
         // All other current user tables keep their name.
         "tickets" => Some("tickets"),
         "ticket_comments" => Some("ticket_comments"),
@@ -4258,347 +4265,6 @@ mod tests {
         assert!(
             quarantined,
             "original family must be quarantined (forensic record)"
-        );
-    }
-
-    /// The one-time consolidation import copies user tables from the legacy
-    /// per-store files into the consolidated database, renames the
-    /// pre-rework `ticket_stage_jobs` child table, drops schema-drift columns,
-    /// preserves the AUTOINCREMENT watermark, and leaves the newly-added FK
-    /// (`ticket_jobs.ticket_id -> tickets.id`) holding.
-    ///
-    /// It also pins the migration-ordering contract: the unguarded data-reset
-    /// migrations (board `003_reset_nonterminal_tickets`, sessions
-    /// `004_reset_implementation_jobs`) run on the EMPTY consolidated file, so
-    /// a pre-rework `kind='ticket_stage'` job and a non-terminal ticket phase
-    /// survive the import verbatim (never reset/deleted). And the FTS index is
-    /// created before the import, so imported tickets are FTS-searchable.
-    #[tokio::test]
-    async fn consolidation_import_copies_legacy_store_data_and_enforces_fk() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-
-        // Legacy `board.db` with a ticket (current shape).
-        let board_conn = open_with_schema(
-            &legacy_store_db_path(root, "board"),
-            crate::pipeline::board::SCHEMA,
-        )
-        .await
-        .unwrap();
-        board_conn
-            .execute(
-                "INSERT INTO tickets (id, title, description, phase, workspace_name, \
-                 created_at, updated_at) \
-                 VALUES ('t1', 'Title', 'Desc', 'analysis', 'ws1', \
-                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                (),
-            )
-            .await
-            .unwrap();
-        drop(board_conn);
-
-        // Legacy `sessions.db` with the OLD `ticket_stage_jobs` shape
-        // (has `phase`/`round` columns that the consolidated target drops).
-        let legacy_session_schema = "CREATE TABLE jobs (\
-             id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
-             status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
-             workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
-             channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
-             retry_count INTEGER NOT NULL DEFAULT 0, \
-             created_at TEXT NOT NULL, updated_at TEXT NOT NULL);\
-             CREATE TABLE ticket_stage_jobs (\
-             id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL, \
-             stage TEXT NOT NULL, phase TEXT NOT NULL, round INTEGER NOT NULL);";
-        let session_conn = open_with_schema(
-            &legacy_store_db_path(root, "sessions"),
-            legacy_session_schema,
-        )
-        .await
-        .unwrap();
-        session_conn
-            .execute(
-                "INSERT INTO jobs (id, kind, workspace_name, role, created_at, updated_at) \
-                 VALUES ('j1', 'ticket_analysis', 'ws1', 'analyst', \
-                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                (),
-            )
-            .await
-            .unwrap();
-        // A pre-rework `kind='ticket_stage'` job: the unguarded sessions
-        // migration 004 (`DELETE FROM jobs WHERE kind='ticket_stage'`) must run
-        // on the EMPTY consolidated file and never delete this imported row.
-        session_conn
-            .execute(
-                "INSERT INTO jobs (id, kind, workspace_name, role, created_at, updated_at) \
-                 VALUES ('j2', 'ticket_stage', 'ws1', 'engineer', \
-                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                (),
-            )
-            .await
-            .unwrap();
-        session_conn
-            .execute(
-                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
-                 VALUES ('j1', 't1', 'analysis', 'analysis', 1)",
-                (),
-            )
-            .await
-            .unwrap();
-        drop(session_conn);
-
-        // Legacy `config.db` with a config_kv row.
-        let config_conn = open_with_schema(
-            &legacy_store_db_path(root, "config"),
-            crate::config_db::SCHEMA,
-        )
-        .await
-        .unwrap();
-        config_conn
-            .execute(
-                "INSERT INTO config_kv (key, value) \
-                 VALUES ('provider_endpoint', 'http://localhost:1234')",
-                (),
-            )
-            .await
-            .unwrap();
-        drop(config_conn);
-
-        // Run the consolidated open (schema + migrations + one-time import).
-        let conn = open_consolidated_store(root).await.unwrap();
-
-        // Board ticket copied.
-        let ticket_phase: String = conn
-            .query_optional("SELECT phase FROM tickets WHERE id = 't1'", (), |r| {
-                r.get(0)
-            })
-            .await
-            .unwrap()
-            .expect("ticket must be imported");
-        assert_eq!(ticket_phase, "analysis", "ticket phase preserved");
-
-        // Job + renamed child row (old phase/round/stage columns dropped).
-        let job_kind: String = conn
-            .query_optional("SELECT kind FROM jobs WHERE id = 'j1'", (), |r| r.get(0))
-            .await
-            .unwrap()
-            .expect("job must be imported");
-        assert_eq!(job_kind, "ticket_analysis");
-        let tj_ticket_id: String = conn
-            .query_optional(
-                "SELECT ticket_id FROM ticket_jobs WHERE id = 'j1'",
-                (),
-                |r| r.get(0),
-            )
-            .await
-            .unwrap()
-            .expect("ticket_stage_jobs must be renamed to ticket_jobs on import");
-        assert_eq!(tj_ticket_id, "t1");
-        assert!(
-            !crate::db::column_exists(&conn, "ticket_jobs", "stage")
-                .await
-                .unwrap(),
-            "stage column must be dropped by consolidate_002 migration"
-        );
-
-        // Migration-ordering contract: the unguarded sessions migration 004
-        // (`DELETE FROM jobs WHERE kind='ticket_stage'`) ran on the EMPTY
-        // consolidated file, so the imported pre-rework `ticket_stage` job
-        // survives verbatim.
-        let stale_job_kind: String = conn
-            .query_optional("SELECT kind FROM jobs WHERE id = 'j2'", (), |r| r.get(0))
-            .await
-            .unwrap()
-            .expect("ticket_stage job must be imported");
-        assert_eq!(
-            stale_job_kind, "ticket_stage",
-            "unguarded migration 004 must not have deleted the imported data"
-        );
-
-        // config_kv copied.
-        let endpoint: String = conn
-            .query_optional(
-                "SELECT value FROM config_kv WHERE key = 'provider_endpoint'",
-                (),
-                |r| r.get(0),
-            )
-            .await
-            .unwrap()
-            .expect("config_kv must be imported");
-        assert_eq!(endpoint, "http://localhost:1234");
-
-        // The FTS index is created by the consolidated schema BEFORE the
-        // import, so the imported ticket's title is immediately FTS-searchable
-        // (turso's `CREATE INDEX ... USING fts` does not backfill pre-existing
-        // rows — the index must exist before the bulk insert, not after).
-        let fts_hits: i64 = conn
-            .query_optional(
-                "SELECT COUNT(*) FROM tickets WHERE title MATCH 'Title'",
-                (),
-                |r| r.get(0),
-            )
-            .await
-            .unwrap()
-            .unwrap_or(0);
-        assert_eq!(
-            fts_hits, 1,
-            "imported ticket must be FTS-searchable immediately"
-        );
-
-        // The newly-added FK holds (no orphan child rows).
-        let violations = conn.query("PRAGMA foreign_key_check", ()).await.unwrap();
-        assert!(
-            violations.is_empty(),
-            "imported data must satisfy ticket_jobs.ticket_id -> tickets.id"
-        );
-
-        // The consolidation migration is recorded exactly once.
-        let applied: i64 = conn
-            .query_optional(
-                "SELECT COUNT(*) FROM schema_migrations \
-                 WHERE id = 'consolidate_001_import_domain_stores'",
-                (),
-                |r| r.get(0),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(applied, 1, "consolidation import recorded once");
-    }
-
-    /// A legacy sessions.db already migrated to the rework schema (migration
-    /// 006 applied) carries a `ticket_jobs` table (not the old
-    /// `ticket_stage_jobs` name). It must be copied as-is — a missing mapping
-    /// here would silently drop the child rows during import.
-    #[tokio::test]
-    async fn consolidation_import_copies_already_migrated_ticket_jobs() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-
-        // Legacy sessions.db on the REWORK schema: `ticket_jobs` (identity name).
-        let legacy_schema = "CREATE TABLE jobs (\
-             id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
-             status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
-             workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
-             channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
-             retry_count INTEGER NOT NULL DEFAULT 0, \
-             created_at TEXT NOT NULL, updated_at TEXT NOT NULL);\
-             CREATE TABLE ticket_jobs (\
-             id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL, stage TEXT NOT NULL);";
-        let session_conn = open_with_schema(&legacy_store_db_path(root, "sessions"), legacy_schema)
-            .await
-            .unwrap();
-        session_conn
-            .execute(
-                "INSERT INTO jobs (id, kind, workspace_name, role, created_at, updated_at) \
-                 VALUES ('j1', 'ticket_analysis', 'ws1', 'analyst', \
-                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                (),
-            )
-            .await
-            .unwrap();
-        session_conn
-            .execute(
-                "INSERT INTO ticket_jobs (id, ticket_id, stage) \
-                 VALUES ('j1', 't1', 'analysis')",
-                (),
-            )
-            .await
-            .unwrap();
-        drop(session_conn);
-
-        let conn = open_consolidated_store(root).await.unwrap();
-
-        let tj_ticket_id: String = conn
-            .query_optional(
-                "SELECT ticket_id FROM ticket_jobs WHERE id = 'j1'",
-                (),
-                |r| r.get(0),
-            )
-            .await
-            .unwrap()
-            .expect("an already-migrated ticket_jobs table must be copied, not dropped");
-        assert_eq!(tj_ticket_id, "t1");
-        assert!(
-            !crate::db::column_exists(&conn, "ticket_jobs", "stage")
-                .await
-                .unwrap(),
-            "stage column must be dropped by consolidate_002 migration"
-        );
-    }
-
-    /// A legacy sessions.db with AUTOINCREMENT `sessions` rows (and a
-    /// watermark above the surviving max id) must import without hitting the
-    /// invalid `ON CONFLICT(name)` upsert on `sqlite_sequence`, and the next
-    /// auto-id must not re-issue a deleted high id.
-    #[tokio::test]
-    async fn consolidation_import_preserves_sessions_autoincrement_watermark() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-
-        let legacy_schema = "CREATE TABLE sessions (\
-             id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
-             role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);";
-        let session_conn = open_with_schema(&legacy_store_db_path(root, "sessions"), legacy_schema)
-            .await
-            .unwrap();
-        for i in 1..=3 {
-            session_conn
-                .execute(
-                    "INSERT INTO sessions (agent_id, role, content, created_at) \
-                     VALUES ('a1', 'user', ?1, '2026-01-01T00:00:00Z')",
-                    (turso::Value::Text(format!("m{i}")),),
-                )
-                .await
-                .unwrap();
-        }
-        session_conn
-            .execute(
-                "INSERT INTO sessions (id, agent_id, role, content, created_at) \
-                 VALUES (100, 'a1', 'user', 'high', '2026-01-01T00:00:00Z')",
-                (),
-            )
-            .await
-            .unwrap();
-        session_conn
-            .execute("DELETE FROM sessions WHERE id = 100", ())
-            .await
-            .unwrap();
-        let source_seq: i64 = session_conn
-            .query_row(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'sessions'",
-                (),
-                |r| r.get(0),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            source_seq, 100,
-            "source watermark must survive the deleted high id"
-        );
-        drop(session_conn);
-
-        let conn = open_consolidated_store(root)
-            .await
-            .expect("import must succeed with AUTOINCREMENT sessions rows");
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sessions", (), |r| r.get(0))
-            .await
-            .unwrap();
-        assert_eq!(count, 3, "surviving session rows must be imported");
-        conn.execute(
-            "INSERT INTO sessions (agent_id, role, content, created_at) \
-             VALUES ('a1', 'user', 'next', '2026-01-01T00:00:00Z')",
-            (),
-        )
-        .await
-        .unwrap();
-        let next_id: i64 = conn
-            .query_row("SELECT MAX(id) FROM sessions", (), |r| r.get(0))
-            .await
-            .unwrap();
-        assert_eq!(
-            next_id, 101,
-            "next auto-id must advance past the imported watermark, not re-issue 4 or 100"
         );
     }
 }

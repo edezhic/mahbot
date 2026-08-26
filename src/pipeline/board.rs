@@ -34,7 +34,7 @@ pub async fn run_archive_cancelled_loop() {
         // seats for tickets in a terminal phase — the TTL guard stops
         // protecting the accumulated engineer session once the anchor is gone
         // (idempotent, ≤5-min delay against the 8h TTL).
-        crate::jobs::purge_terminal_engineer_session_pins().await;
+        crate::jobs::purge_terminal_session_pins().await;
 
         let Some(board) = BOARD.get() else {
             warn!("Archive cancelled loop: board not initialized");
@@ -163,17 +163,13 @@ crate::columns! {
 /// pre-development threshold (Analysis + Planning + ReadyForDevelopment) and is no longer
 /// directly suppressed by this constant.
 ///
-/// Occupancy is owned by the implementation job (jobs kind='ticket_implementation') — a
-/// ticket in any of these phases always has a live implementation job, and the
-/// implementation is the single authority that advances the ticket through the
-/// pipeline. `tickets.phase` is the displayed state of the implementation job
-/// as it advances, and is also an input gate for the claim step (Backlog →
-/// Analysis, ReadyForDevelopment → InDevelopment) — not a pure mirror.
-///
-/// [`BoardStore::reset_analysis_tickets`] (via [`BoardStore::RESET_ANALYSIS_TRANSITIONS`])
-/// only resets Analysis → Backlog — the implementation-protected occupied phases
-/// (InDevelopment, InDiagnostics, InSanitation, InReview, InQa) are NOT reset
-/// (a resumed implementation job keeps them in phase).
+/// Occupancy is owned by the phase job (a short-lived job whose `kind` is the
+/// ticket's current phase) — a ticket in any of these phases always has a
+/// live phase job, and that job is the single authority that runs the stage
+/// then advances the ticket to the next phase. `tickets.phase` is both the
+/// displayed pipeline state and the input gate for the claim step
+/// (Backlog → Analysis, ReadyForDevelopment → InDevelopment) — not a mirror
+/// of a long-lived job.
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
@@ -474,7 +470,7 @@ impl TicketPhase {
     }
 
     /// Returns `true` for terminal phases (`Done`, `Cancelled`, `Failed`) — a
-    /// ticket in one of these can no longer be claimed, so the implementation job is
+    /// ticket in one of these can no longer be claimed, so its phase job is
     /// finished.
     ///
     /// Delegates to [`TERMINAL_PHASES`] so the terminal set is authoritative
@@ -487,10 +483,9 @@ impl TicketPhase {
     /// Returns `true` if the ticket is in a pipeline-occupied phase.
     ///
     /// Tickets in these phases occupy the dev/review/QA pipeline — only one
-    /// ticket per workspace may be in the pipeline at a time. These phases
-    /// have an agent actively working on the ticket (development,
-    /// diagnostics, review, QA, sanitation) and are owned by the implementation job.
-    /// The automated
+    /// ticket per workspace may be in the pipeline at a time. Each phase is
+    /// owned by its own short-lived phase job (development, diagnostics,
+    /// review, QA, sanitation). The automated
     /// create-ticket tool (when superseding an existing ticket) and the
     /// update-ticket tool refuse to modify tickets in any of these phases to
     /// prevent race conditions during phase transitions. `add_comment` is the
@@ -608,14 +603,6 @@ impl PreparedUpdate {
         let rows = tx.execute(&self.sql, self.params).await?;
         Ok(rows > 0)
     }
-}
-
-/// A single reset transition: when a ticket in `from` phase is found on startup,
-/// it is rolled back to `to` phase.
-#[derive(Debug, Clone, Copy)]
-struct ResetTransition {
-    from: TicketPhase,
-    to: TicketPhase,
 }
 
 /// Controls whether the pipeline-occupancy check is enforced when claiming tickets.
@@ -893,7 +880,7 @@ impl BoardStore {
         // cancelled unnecessarily but will be re-registered on re-dispatch.
         crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
 
-        // No ticket_buffer push for the cancellation: supersede is only reachable
+        // No chronicle push for the cancellation: supersede is only reachable
         // through agent tools (Manager or Maintainer CreateTicketTool) and agent
         // actions are intentionally silent — the GUI board path is the user
         // surface that notifies the Manager.
@@ -1237,8 +1224,7 @@ impl BoardStore {
         if target_phase.is_terminal()
             && let Some(session) = crate::session::SESSIONS.get()
         {
-            let _ =
-                crate::jobs::complete_implementation_job_for_ticket(&session.conn, ticket_id).await;
+            let _ = crate::jobs::complete_ticket_phase_jobs(&session.conn, ticket_id).await;
         }
         Ok(())
     }
@@ -1281,7 +1267,7 @@ impl BoardStore {
     /// ticket — it only bumps `updated_at` and cancels any stale agents
     /// registered on the ticket (safety-in-depth against a stale dispatch).
     /// The single-occupant in-flight marker is enforced by the CALLER via the
-    /// implementation job's `agents` roster (status='launched').
+    /// phase job's `agents` roster (status='launched').
     ///
     /// Guards the TOCTOU race between the poll listing pre-filter and the
     /// subsequent claim: only when the ticket is still in
@@ -1383,76 +1369,6 @@ impl BoardStore {
                 "ticket {ticket_id} not found — bounce counter not incremented"
             )),
         }
-    }
-
-    /// Crash/restart reset transition. Boot recovery excludes implementation-owned
-    /// tickets (those with a `ticket_jobs` child row) from the reset so they resume
-    /// in place; of the remaining phases only `Analysis → Backlog` (backlog analysts
-    /// may crash mid-analysis). Analysis is intentionally NOT in
-    /// [`PIPELINE_OCCUPIED_PHASES`] — it is a pre-flight phase, not a pipeline occupant.
-    const RESET_ANALYSIS_TRANSITIONS: &[ResetTransition] = &[ResetTransition {
-        from: TicketPhase::Analysis,
-        to: TicketPhase::Backlog,
-    }];
-    /// Lookup a reset transition by `from` phase. Shared by the boot reset and
-    /// the stale-purge rollback in jobs.rs so both paths use one table.
-    pub(crate) fn reset_analysis_transition(from: TicketPhase) -> Option<TicketPhase> {
-        Self::RESET_ANALYSIS_TRANSITIONS
-            .iter()
-            .find(|t| t.from == from)
-            .map(|t| t.to)
-    }
-    /// SET clause shared by the boot reset ([`Self::reset_analysis_tickets`])
-    /// and the stale-purge rollback in jobs.rs: phase + updated_at.
-    ///
-    /// Exactly two placeholders: `?1` = target phase, `?2` = now. Call sites
-    /// append their own WHERE-bound placeholders after this clause (board.rs
-    /// binds `?3` = source phase in `WHERE phase = ?3`; jobs.rs binds `?3` =
-    /// ticket id and `?4` = source phase in `WHERE id = ?3 AND phase = ?4`).
-    ///
-    /// Interpolated via `format!` at both call sites — must never contain a
-    /// literal `{` or `}`.
-    pub(crate) const RESET_TICKET_SET_CLAUSE: &str = "phase = ?1, updated_at = ?2";
-    /// Reset Analysis in-flight tickets at boot (crash/restart recovery). Only
-    /// `Analysis → Backlog` is reset (backlog analysts may crash mid-work); the
-    /// implementation-protected occupied phases (InDevelopment, InDiagnostics,
-    /// InReview, InQa, InSanitation) are NOT reset — a resumed implementation job
-    /// keeps them in phase instead of re-claiming.
-    ///
-    /// `exclude_ticket_ids`: tickets with a RESUMED active job at boot must be
-    /// skipped — resetting them would re-claim via the poll loop while the resumed
-    /// agent runs (duplicate work/conflicting verdicts). Empty excludes nothing.
-    pub async fn reset_analysis_tickets(&self, exclude_ticket_ids: &[String]) -> Result<()> {
-        let tx = self.conn.begin_tx().await?;
-        let now = db::now();
-        for transition in Self::RESET_ANALYSIS_TRANSITIONS {
-            let mut values: Vec<db::Value> = vec![
-                db::Value::Text(transition.to.as_ref().to_string()),
-                db::Value::Text(now.clone()),
-                db::Value::Text(transition.from.as_ref().to_string()),
-            ];
-            let clause = if exclude_ticket_ids.is_empty() {
-                String::new()
-            } else {
-                // `IN ()` is invalid SQL — the empty exclusion omits the clause.
-                values.extend(
-                    exclude_ticket_ids
-                        .iter()
-                        .map(|s| db::Value::Text(s.clone())),
-                );
-                format!(
-                    " AND id NOT IN ({})",
-                    db::sql_in_placeholders(exclude_ticket_ids.len())
-                )
-            };
-            let sql = format!(
-                "UPDATE tickets SET {} WHERE phase = ?3{clause}",
-                Self::RESET_TICKET_SET_CLAUSE
-            );
-            tx.execute(&sql, values).await?;
-        }
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Shared implementation for checking if a workspace has active tickets.
@@ -2145,19 +2061,3 @@ impl BoardStore {
         Ok(candidates)
     }
 }
-
-/// Open a [`BoardStore`] in a fresh temp directory (no global CONFIG dependency).
-///
-/// Thin wrapper around [`crate::open_test_store!`] that avoids touching the 32
-/// call sites inside `self::tests`.  Delegates to the shared macro so the
-/// actual boilerplate lives in one place.
-///
-/// Internal test convenience — external modules should use the macro directly.
-#[cfg(test)]
-async fn open_test_store() -> (BoardStore, tempfile::TempDir) {
-    crate::open_test_store!(BoardStore, "board")
-}
-
-#[cfg(test)]
-#[path = "board_tests.rs"]
-mod tests;

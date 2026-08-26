@@ -1230,6 +1230,10 @@ impl WorkspaceStore {
             crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(name);
             tracing::info!(workspace = name, "Workspace pipeline paused");
         } else {
+            // Clear the cooperative pause-stop flags left on any in-flight
+            // agents so a resumed workspace does not freeze them at their next
+            // LLM round boundary.
+            crate::agent::registry::AGENT_REGISTRY.clear_workspace_pause(name);
             tracing::info!(workspace = name, "Workspace pipeline resumed");
         }
         Ok(())

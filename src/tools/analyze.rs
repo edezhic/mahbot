@@ -645,7 +645,7 @@ pub(crate) struct AnalystFindings {
 }
 
 /// Per-analyst outcome after findings extraction. Three mutually-exclusive
-/// states mirroring `management::ParallelVerdict` — the type system guarantees
+/// states mirroring `pipeline::ParallelVerdict` — the type system guarantees
 /// "no response" and "parse failure" cannot be confused.
 enum AnalystOutcome {
     /// Agent failed to produce a response (crashed, cancelled, empty output).

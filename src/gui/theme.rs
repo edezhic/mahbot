@@ -133,8 +133,8 @@ pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
 pub fn role_badge_color(role: &str) -> (Color, Color) {
     // Stage-name comment roles from the joint-verdict pipeline ("Analysis"/
     // "Review"/"QA" — the comment role is the stage name). Resolved via the
-    // shared inverse mapping so it can't drift from management::stage_name.
-    if let Some(r) = crate::pipeline::management::stage_role(role) {
+    // shared inverse mapping so it can't drift from verdict::stage_name.
+    if let Some(r) = crate::pipeline::verdict::stage_role(role) {
         return role_badge_color_for(&r);
     }
 

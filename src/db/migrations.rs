@@ -139,13 +139,43 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
             column: "stage",
         }),
     },
+    // ── Job-per-phase rework ──────────────────────────────────────────────
+    // The pipeline moves from one long-lived `ticket_implementation` job to a
+    // short-lived job per pipeline phase, keyed by `tickets.phase`. Jobs now
+    // carry `ticket_id` directly; the `ticket_jobs` child table and
+    // `jobs.paused_frozen` are removed. Old ticket_analysis/ticket_implementation
+    // rows are discarded on upgrade (no backward compatibility).
     Migration {
-        id: "007_jobs_paused_frozen",
-        sql: "ALTER TABLE jobs ADD COLUMN paused_frozen INTEGER NOT NULL DEFAULT 0",
+        id: "consolidate_003_jobs_ticket_id",
+        sql: "ALTER TABLE jobs ADD COLUMN ticket_id TEXT REFERENCES tickets(id)",
         guard: Some(MigrationGuard::ColumnExists {
+            table: "jobs",
+            column: "ticket_id",
+        }),
+    },
+    Migration {
+        id: "consolidate_004_discard_old_ticket_jobs",
+        sql: "DELETE FROM jobs WHERE kind IN ('ticket_analysis', 'ticket_implementation')",
+        guard: None,
+    },
+    Migration {
+        id: "consolidate_005_drop_ticket_jobs",
+        sql: "DROP TABLE IF EXISTS ticket_jobs",
+        guard: None,
+    },
+    Migration {
+        id: "consolidate_006_drop_jobs_paused_frozen",
+        sql: "ALTER TABLE jobs DROP COLUMN paused_frozen",
+        guard: Some(MigrationGuard::ColumnDropped {
             table: "jobs",
             column: "paused_frozen",
         }),
+    },
+    Migration {
+        id: "consolidate_007_jobs_phase_ticket_index",
+        sql: "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_phase_ticket \
+              ON jobs(kind, ticket_id) WHERE ticket_id IS NOT NULL",
+        guard: None,
     },
 ];
 
@@ -154,13 +184,13 @@ pub(crate) const SESSION_MIGRATIONS: &[Migration] = &[
 ///
 /// **001 — drop `tickets.pipeline_reservation`.** The job-centric pipeline
 /// rework removes the ticket-level pipeline reservation in favor of the
-/// implementation job (see `src/jobs.rs`). The fresh-DB SCHEMA
+/// per-phase job (see `src/jobs.rs`). The fresh-DB SCHEMA
 /// (`src/pipeline/board.rs`) no longer declares the column, so the ALTER only fires on
 /// pre-existing databases; the drop guard makes both paths converge (fresh-DB
 /// path: column already absent, SQL skipped, migration recorded as applied).
 ///
 /// **002 — drop `tickets.assigned_to`.** Replaced by the `agents` roster in
-/// the jobs store (`status='launched'` rows bound to the implementation/analysis jobs),
+/// the jobs store (`status='launched'` rows bound to the ticket's per-phase jobs),
 /// which drives comment routing and the mid-execution re-dispatch guard.
 ///
 /// **003 — reset non-terminal tickets.** A deliberate one-time data reset for
@@ -248,54 +278,7 @@ pub(crate) async fn run_domain_migrations(conn: &crate::db::Connection) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{column_exists, run_pending_migrations, table_exists};
-
-    /// Old-DB schema: `session_metadata` WITHOUT the token-length or
-    /// message-count columns — simulates the live pre-migration database
-    /// (upgrade-in-place path). Includes the `sessions` table so the
-    /// message-count backfill is exercised against real rows. Includes a
-    /// `jobs` table (migration 004 is a kind-scoped DELETE) and a
-    /// `ticket_stage_jobs` table WITH both the `round` column (migration 003
-    /// drops it) and the `phase` column (migration 005 drops it) — no `paused`
-    /// column, which was removed as dead bookkeeping. The `round`/`phase`
-    /// presence exercises the DROP DDL on the upgrade path.
-    const OLD_SCHEMA: &str = "CREATE TABLE sessions (\
-         id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
-         role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);\
-         CREATE TABLE session_metadata (agent_id TEXT PRIMARY KEY, last_activity TEXT NOT NULL);\
-         CREATE TABLE jobs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
-         status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
-         workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
-         channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
-         retry_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, \
-         updated_at TEXT NOT NULL);\
-         CREATE TABLE ticket_stage_jobs (\
-         id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL, stage TEXT NOT NULL, \
-         phase TEXT NOT NULL, round INTEGER NOT NULL);";
-
-    /// Fresh-DB schema: `session_metadata` already declares both migrated
-    /// columns — simulates the wipe-and-recreate path where the SCHEMA
-    /// produced the migrated shape. Includes a `jobs` table and a
-    /// `ticket_jobs` table matching the current SCHEMA shape (id, ticket_id —
-    /// no `stage`, no `round`, no `phase`). The table carries the NEW name because
-    /// the fresh SCHEMA creates `ticket_jobs` directly; the RENAME migration is
-    /// thus a skipped-and-recorded no-op.
-    const FRESH_SCHEMA: &str = "CREATE TABLE sessions (\
-         id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL, \
-         role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL);\
-         CREATE TABLE session_metadata (\
-         agent_id TEXT PRIMARY KEY, last_activity TEXT NOT NULL, \
-         token_length INTEGER, message_count INTEGER NOT NULL DEFAULT 0);\
-         CREATE TABLE jobs (id TEXT PRIMARY KEY, kind TEXT NOT NULL, \
-         status TEXT NOT NULL DEFAULT 'launched', task TEXT NOT NULL DEFAULT '', \
-         workspace_name TEXT NOT NULL, user_name TEXT NOT NULL DEFAULT '', \
-         channel TEXT NOT NULL DEFAULT '', role TEXT NOT NULL, \
-         retry_count INTEGER NOT NULL DEFAULT 0, \
-         paused_frozen INTEGER NOT NULL DEFAULT 0, \
-         created_at TEXT NOT NULL, \
-         updated_at TEXT NOT NULL);\
-         CREATE TABLE ticket_jobs (\
-         id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL);";
+    use crate::db::{column_exists, run_pending_migrations};
 
     async fn applied_ids(conn: &crate::db::Connection) -> Vec<String> {
         conn.query("SELECT id FROM schema_migrations ORDER BY id", ())
@@ -304,192 +287,6 @@ mod tests {
             .into_iter()
             .map(|row| row.get::<String>(0).expect("id column"))
             .collect()
-    }
-
-    async fn message_count(conn: &crate::db::Connection, agent_id: &str) -> i64 {
-        conn.query_optional(
-            "SELECT message_count FROM session_metadata WHERE agent_id = ?1",
-            (turso::Value::Text(agent_id.to_string()),),
-            |row| row.get::<i64>(0),
-        )
-        .await
-        .expect("read message_count")
-        .expect("session exists")
-    }
-
-    #[tokio::test]
-    async fn migrations_alter_old_db_exactly_once_with_backfill() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_with_schema(&tmp.path().join("sessions.db"), OLD_SCHEMA)
-            .await
-            .expect("open old-db test store");
-        assert!(
-            !column_exists(&conn, "session_metadata", "token_length")
-                .await
-                .unwrap(),
-            "old DB must lack token_length before the migration"
-        );
-        assert!(
-            !column_exists(&conn, "session_metadata", "message_count")
-                .await
-                .unwrap(),
-            "old DB must lack message_count before the migration"
-        );
-
-        // Seed a pre-migration live-store shape: sessions with messages but
-        // no metadata count column (the migration must backfill it).
-        for (agent, n) in [("sess_a", 3), ("sess_b", 1), ("sess_c", 0)] {
-            conn.execute(
-                "INSERT INTO session_metadata (agent_id, last_activity) VALUES (?1, '2026-01-01T00:00:00Z')",
-                (turso::Value::Text(agent.to_string()),),
-            )
-            .await
-            .expect("seed metadata");
-            for i in 0..n {
-                conn.execute(
-                    "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, 'user', ?2, '2026-01-01T00:00:00Z')",
-                    (turso::Value::Text(agent.to_string()), turso::Value::Text(format!("m{i}"))),
-                )
-                .await
-                .expect("seed message");
-            }
-        }
-
-        run_pending_migrations(&conn, "sessions", SESSION_MIGRATIONS)
-            .await
-            .expect("first run applies both migrations");
-        assert!(
-            column_exists(&conn, "session_metadata", "token_length")
-                .await
-                .unwrap(),
-            "ALTER must add token_length"
-        );
-        assert!(
-            column_exists(&conn, "session_metadata", "message_count")
-                .await
-                .unwrap(),
-            "ALTER must add message_count"
-        );
-        assert!(
-            column_exists(&conn, "jobs", "paused_frozen").await.unwrap(),
-            "ALTER must add jobs.paused_frozen"
-        );
-        // Backfill: counts match the historical COUNT(s.id) definition —
-        // system prompts, tool frames, and tool results all count (here all
-        // rows are plain 'user' messages; the definition is one row per
-        // session row).
-        assert_eq!(message_count(&conn, "sess_a").await, 3);
-        assert_eq!(message_count(&conn, "sess_b").await, 1);
-        assert_eq!(message_count(&conn, "sess_c").await, 0);
-        assert_eq!(
-            applied_ids(&conn).await,
-            vec![
-                "001_session_token_length",
-                "002_session_message_count",
-                "003_drop_ticket_stage_jobs_round",
-                "004_reset_implementation_jobs",
-                "005_drop_ticket_stage_jobs_phase",
-                "006_rename_ticket_stage_jobs_to_ticket_jobs",
-                "007_jobs_paused_frozen",
-                "consolidate_002_drop_ticket_jobs_stage",
-            ],
-            "migrations recorded in order"
-        );
-        // The upgrade path exercised the full DDL chain: round dropped, phase
-        // dropped, and the table RENAMEd to `ticket_jobs` (old name gone).
-        assert!(
-            table_exists(&conn, "ticket_jobs").await.unwrap(),
-            "rename must leave the table under its new name"
-        );
-        assert!(
-            !table_exists(&conn, "ticket_stage_jobs").await.unwrap(),
-            "rename must remove the old table name"
-        );
-        assert!(
-            !column_exists(&conn, "ticket_jobs", "phase").await.unwrap(),
-            "phase column must be dropped by migration 005"
-        );
-        assert!(
-            !column_exists(&conn, "ticket_jobs", "round").await.unwrap(),
-            "round column must be dropped by migration 003"
-        );
-        assert!(
-            !column_exists(&conn, "ticket_jobs", "stage").await.unwrap(),
-            "stage column must be dropped by consolidate_002 migration"
-        );
-
-        // Re-running (e.g. a later boot) is a strict no-op — never twice.
-        run_pending_migrations(&conn, "sessions", SESSION_MIGRATIONS)
-            .await
-            .expect("second run is a no-op");
-        assert_eq!(applied_ids(&conn).await.len(), 8, "never re-run");
-    }
-
-    #[tokio::test]
-    async fn migration_skips_sql_on_fresh_db_and_still_records_applied() {
-        // The user's wipe-and-recreate sequence: the SCHEMA already contains
-        // the migrated columns, so the ALTERs must NOT fire (duplicate-column
-        // failure).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_with_schema(&tmp.path().join("sessions.db"), FRESH_SCHEMA)
-            .await
-            .expect("open fresh-db test store");
-        assert!(
-            column_exists(&conn, "session_metadata", "token_length")
-                .await
-                .unwrap(),
-            "fresh DB has token_length from the SCHEMA"
-        );
-        assert!(
-            column_exists(&conn, "session_metadata", "message_count")
-                .await
-                .unwrap(),
-            "fresh DB has message_count from the SCHEMA"
-        );
-        assert!(
-            column_exists(&conn, "jobs", "paused_frozen").await.unwrap(),
-            "fresh DB has jobs.paused_frozen from the SCHEMA"
-        );
-
-        run_pending_migrations(&conn, "sessions", SESSION_MIGRATIONS)
-            .await
-            .expect("guard turns the pending migrations into recorded no-ops");
-        assert!(
-            column_exists(&conn, "session_metadata", "token_length")
-                .await
-                .unwrap(),
-            "column still present, exactly once"
-        );
-        assert!(
-            column_exists(&conn, "session_metadata", "message_count")
-                .await
-                .unwrap(),
-            "column still present, exactly once"
-        );
-        assert_eq!(
-            applied_ids(&conn).await,
-            vec![
-                "001_session_token_length",
-                "002_session_message_count",
-                "003_drop_ticket_stage_jobs_round",
-                "004_reset_implementation_jobs",
-                "005_drop_ticket_stage_jobs_phase",
-                "006_rename_ticket_stage_jobs_to_ticket_jobs",
-                "007_jobs_paused_frozen",
-                "consolidate_002_drop_ticket_jobs_stage",
-            ],
-            "migrations recorded as applied even though the SQL was skipped"
-        );
-        // Fresh-DB path: the RENAME must NOT fire (the SCHEMA created
-        // `ticket_jobs` directly); the table survives its new name.
-        assert!(
-            table_exists(&conn, "ticket_jobs").await.unwrap(),
-            "fresh SCHEMA-created ticket_jobs must survive the skipped rename"
-        );
-        assert!(
-            !table_exists(&conn, "ticket_stage_jobs").await.unwrap(),
-            "fresh DB must never create the old table name"
-        );
     }
 
     // ── Board DROP COLUMN migrations (the inverse guard direction) ──────

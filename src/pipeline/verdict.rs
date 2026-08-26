@@ -23,8 +23,20 @@
 //! explicit marker when nothing ever freezes.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
-use crate::{ChatMessage, ChatRequest, ChatRequestMeta, Role, Workspace};
+use crate::jobs::RowStatus;
+use crate::pipeline::board::Ticket;
+use crate::retry::RetryExhausted;
+use crate::util::scrub_credentials;
+use crate::{
+    BlockerVerificationVerdict, ChatMessage, ChatRequest, ChatRequestMeta, Role, Verdict, Workspace,
+};
+
+use super::{
+    FinalizeOutcome, TicketPhase, TransitionCtx, bounce_to_development, comment_and_transition,
+    info, raw_response_dump_section, reset_phase_attempt,
+};
 
 // ── Hardcoded review-count calibration defaults (no config surface) ──────
 
@@ -131,7 +143,7 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
         provider_order: routing.provider_order,
         meta: Some(ChatRequestMeta {
             purpose: "synthesis",
-            agent_id: format!("joint_verdict_{}", crate::generate_suffix()),
+            agent_id: format!("verdict_{}", crate::generate_suffix()),
             role: role.as_str().to_string(),
             workspace: ws.name.clone(),
             ticket_id: None,
@@ -354,6 +366,338 @@ pub(crate) fn review_agent_count(base: usize, priority: i64) -> usize {
     if priority == 0 { base.max(2) } else { base }
 }
 
-#[cfg(test)]
-#[path = "joint_verdict_tests.rs"]
-mod tests;
+/// Human-readable stage name for a parallel-verdict role (used in the joint
+/// comment title and the comment role).
+#[must_use]
+pub(crate) fn stage_name(role: Role) -> &'static str {
+    match role {
+        Role::Analyst => "Analysis",
+        Role::Reviewer => "Review",
+        Role::Qa => "QA",
+        // Only the three parallel-verdict roles reach this function (all call
+        // sites pass Analyst/Reviewer/Qa).
+        _ => unreachable!("stage_name called with a non-verdict role"),
+    }
+}
+
+/// Inverse of [`stage_name`]: resolve a stage-name comment role back to the
+/// verdict role (used by the GUI to color joint-comment badges).
+#[must_use]
+pub(crate) fn stage_role(name: &str) -> Option<Role> {
+    match name {
+        "Analysis" => Some(Role::Analyst),
+        "Review" => Some(Role::Reviewer),
+        "QA" => Some(Role::Qa),
+        _ => None,
+    }
+}
+
+// ── Parallel-round data shapes & joint-comment builder ──────────────────
+//
+// These are the verdict-round types the renderer above consumes, so they
+// live with it rather than in the orchestrator.
+
+/// Result from a single parallel verifier agent.
+#[derive(Clone)]
+pub(crate) enum ParallelVerdict {
+    /// Agent failed to produce any response (crashed, timed out, empty output).
+    NoResponse(String),
+    /// Agent produced a response but structured verdict extraction failed.
+    ParseFailed(RetryExhausted),
+    /// Agent produced a successfully-parsed verdict.
+    Verdict(Verdict),
+    /// Agent produced a blocker-verification verdict (analysis escalation).
+    BlockerVerification(BlockerVerificationVerdict),
+}
+
+/// Structured-extraction behavior for a parallel round member.
+#[derive(Clone)]
+pub(crate) enum ExtractionMode {
+    /// Standard score+issues verdict (analysis base, review, QA).
+    ScoreVerdict,
+    /// Blocker verification (analysis escalation).
+    BlockerVerification { blockers: Arc<[String]> },
+}
+
+/// One roster slot of a ticket phase round.
+#[derive(Clone)]
+pub(crate) struct AgentSlot {
+    /// Dispatch slot index (0-based; escalation continues at 3, 4).
+    pub idx: i64,
+    pub agent_id: String,
+    /// FINAL per-agent rendered prompt (angle appended).
+    pub task: String,
+    pub status: RowStatus,
+    /// Stored agents.outcome (tagged JSON) — set on replay of a done slot.
+    pub outcome: Option<String>,
+}
+
+/// Serialize a [`ParallelVerdict`] into the agents.outcome column.
+#[must_use]
+pub(crate) fn serialize_verdict_outcome(result: &ParallelVerdict) -> String {
+    match result {
+        ParallelVerdict::Verdict(v) => serde_json::json!({ "verdict": v }).to_string(),
+        ParallelVerdict::NoResponse(reason) => {
+            serde_json::json!({ "no_response": reason }).to_string()
+        }
+        ParallelVerdict::ParseFailed(f) => {
+            serde_json::json!({ "parse_failed": raw_response_dump_section(f) }).to_string()
+        }
+        ParallelVerdict::BlockerVerification(v) => {
+            serde_json::json!({ "blocker_verification": v }).to_string()
+        }
+    }
+}
+
+/// Reconstruct a [`ParallelVerdict`] from the agents.outcome column.
+#[must_use]
+pub(crate) fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(outcome) else {
+        return ParallelVerdict::NoResponse("unreadable stored outcome".to_string());
+    };
+    if let Some(verdict) = v.get("verdict") {
+        match serde_json::from_value(verdict.clone()) {
+            Ok(v) => ParallelVerdict::Verdict(v),
+            Err(_) => ParallelVerdict::NoResponse("unreadable stored verdict".to_string()),
+        }
+    } else if let Some(r) = v.get("no_response").and_then(serde_json::Value::as_str) {
+        ParallelVerdict::NoResponse(r.to_string())
+    } else if let Some(p) = v.get("parse_failed").and_then(serde_json::Value::as_str) {
+        ParallelVerdict::NoResponse(p.to_string())
+    } else if let Some(v) = v.get("blocker_verification") {
+        match serde_json::from_value(v.clone()) {
+            Ok(bv) => ParallelVerdict::BlockerVerification(bv),
+            Err(_) => {
+                ParallelVerdict::NoResponse("unreadable stored blocker verification".to_string())
+            }
+        }
+    } else {
+        ParallelVerdict::NoResponse("unrecognized stored outcome".to_string())
+    }
+}
+
+/// Build the joint comment for a round: deterministic merge + a single LLM
+/// synthesis pass.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn build_round_joint_comment(
+    stage: &str,
+    results: &[ParallelVerdict],
+    threshold: u8,
+    role: Role,
+    header: &str,
+    ws: &Workspace,
+    ticket_id: &str,
+    ticket_title: &str,
+) -> String {
+    let mut verdicts: Vec<JointVerdict<'_>> = Vec::new();
+    let mut failures: Vec<JointFailure> = Vec::new();
+    for (i, r) in results.iter().enumerate() {
+        match r {
+            ParallelVerdict::Verdict(v) => {
+                verdicts.push(JointVerdict {
+                    agent_index: i,
+                    verdict: v,
+                });
+            }
+            ParallelVerdict::NoResponse(reason) => {
+                failures.push(JointFailure {
+                    agent_index: i,
+                    dump: reason.clone(),
+                });
+            }
+            ParallelVerdict::ParseFailed(f) => {
+                failures.push(JointFailure {
+                    agent_index: i,
+                    dump: scrub_credentials(&raw_response_dump_section(f)),
+                });
+            }
+            ParallelVerdict::BlockerVerification(_) => {}
+        }
+    }
+    let round = JointRound {
+        stage,
+        dispatched: results.len(),
+        verdicts,
+        failures,
+        header: header.to_string(),
+        threshold,
+    };
+    let has_no_issues = round
+        .verdicts
+        .iter()
+        .all(|v| v.verdict.issues_detected.is_empty());
+    let single_verifier_verdict = matches!(role, Role::Reviewer | Role::Qa) && round.n_valid() == 1;
+    if has_no_issues || single_verifier_verdict {
+        render_joint_comment(
+            &round,
+            &crate::consensus::RepairOutcome::Fallback,
+            &crate::consensus::ItemTable::new(&issues_by_agent(&round)),
+        )
+    } else {
+        build_joint_comment(&round, role, ws, ticket_id, ticket_title).await
+    }
+}
+
+// ── Verifier round processing (review / QA) ─────────────────────────────
+
+/// Minimum acceptable verification score (0-10) for review and QA phases.
+pub(crate) const REVIEW_QA_THRESHOLD: u8 = 9;
+
+/// Check whether a review or QA verdict passes (score at or above threshold).
+#[must_use]
+pub(crate) fn verdict_passes(verdict: &crate::Verdict) -> bool {
+    verdict.score >= REVIEW_QA_THRESHOLD
+}
+
+/// Static metadata driving a verifier round (reviewer or QA).
+#[derive(Copy, Clone)]
+pub(crate) struct VerifierInfo {
+    pub(crate) role: Role,
+    /// Human-readable label used in logs and bounce-breaker messages.
+    pub(crate) log_label: &'static str,
+    /// The phase the ticket advances to when every verifier agent passes.
+    pub(crate) success_phase: TicketPhase,
+    /// The phase the verifier is actively working in.
+    pub(crate) active_phase: TicketPhase,
+    pub(crate) prompt_template: &'static str,
+    pub(crate) extraction_prompt_path: &'static str,
+}
+
+pub(crate) const REVIEWER_VI: VerifierInfo = VerifierInfo {
+    role: Role::Reviewer,
+    log_label: "Reviewers",
+    success_phase: TicketPhase::InQa,
+    active_phase: TicketPhase::InReview,
+    prompt_template: "review.md",
+    extraction_prompt_path: "extraction/reviewer.md",
+};
+
+pub(crate) const QA_VI: VerifierInfo = VerifierInfo {
+    role: Role::Qa,
+    log_label: "QA",
+    success_phase: TicketPhase::InSanitation,
+    active_phase: TicketPhase::InQa,
+    prompt_template: "qa.md",
+    extraction_prompt_path: "extraction/qa.md",
+};
+
+/// Process parallel verifier results: add the joint comment, determine
+/// pass/fail, and update ticket phase accordingly.
+pub(crate) async fn process_verifier_verdicts(
+    ws: &Workspace,
+    ticket: &Ticket,
+    results: &[ParallelVerdict],
+    verifier: VerifierInfo,
+    job_id: &str,
+) -> bool {
+    // Distinguish the two failure classes: a verifier that did NOT complete
+    // (NoResponse/ParseFailed) is a HARD TECHNICAL failure — reset the attempt
+    // (comment + delete job + pause; no bounce budget). A verifier that DID
+    // complete but found issues (a Verdict below threshold) is a rework verdict
+    // — bounce to development, consuming bounce budget.
+    let technical_failure = results.iter().any(|r| {
+        matches!(
+            r,
+            ParallelVerdict::NoResponse(_) | ParallelVerdict::ParseFailed(_)
+        )
+    });
+    let rework_failure = !technical_failure
+        && results.iter().any(|r| match r {
+            ParallelVerdict::Verdict(v) => !verdict_passes(v),
+            _ => false,
+        });
+
+    if crate::shutdown::aborting() {
+        info!(
+            ticket = %ticket.id,
+            stage = %verifier.log_label,
+            "Verifier round cut short by drain — job stays launched for boot resume",
+        );
+        return false;
+    }
+
+    if technical_failure {
+        // Hard technical failure: a verifier did not complete. Reset the
+        // attempt (the round is destroyed; the puller creates a fresh one).
+        let comment = format!(
+            "{} could not complete the round (a verifier did not respond) — resetting for a fresh attempt.",
+            verifier.log_label,
+        );
+        reset_phase_attempt(
+            ticket,
+            verifier.active_phase,
+            job_id,
+            verifier.log_label,
+            &comment,
+        )
+        .await;
+        return false;
+    }
+
+    // Build the joint comment only for the success / rework paths — the reset
+    // path above uses its own short failure comment.
+    let joint_comment = build_round_joint_comment(
+        stage_name(verifier.role),
+        results,
+        REVIEW_QA_THRESHOLD,
+        verifier.role,
+        "",
+        ws,
+        &ticket.id,
+        &ticket.title,
+    )
+    .await;
+
+    if !rework_failure {
+        return apply_clean_verifier_round(ticket, verifier, &joint_comment, job_id).await;
+    }
+
+    let outcome = bounce_to_development(
+        ticket,
+        verifier.active_phase,
+        verifier.log_label,
+        /* drains_siblings */ true,
+        stage_name(verifier.role),
+        &joint_comment,
+        job_id,
+        ws,
+    )
+    .await;
+    matches!(outcome, FinalizeOutcome::Applied)
+}
+
+/// Apply the clean-pass outcome of a verifier round: write the joint comment,
+/// transition the ticket to its next phase, and delete the phase job. Returns
+/// `false` if the transition was not applied (phase moved concurrently).
+pub(crate) async fn apply_clean_verifier_round(
+    ticket: &Ticket,
+    verifier: VerifierInfo,
+    joint_comment: &str,
+    job_id: &str,
+) -> bool {
+    if !matches!(
+        comment_and_transition(
+            TransitionCtx::buffered(
+                ticket,
+                verifier.active_phase,
+                verifier.success_phase,
+                verifier.log_label,
+            ),
+            stage_name(verifier.role),
+            joint_comment,
+        )
+        .await,
+        FinalizeOutcome::Applied
+    ) {
+        return false;
+    }
+    info!(
+        ticket = %ticket.id,
+        "{log_label}: all passed (≥ {threshold}/10)",
+        log_label = verifier.log_label,
+        threshold = REVIEW_QA_THRESHOLD,
+    );
+    // Delete the phase job; the puller creates the next phase job.
+    let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
+    true
+}

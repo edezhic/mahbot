@@ -570,8 +570,8 @@ macro_rules! open_test_store {
 /// let id = make_ticket(&store, &ws, "My Ticket", TicketPhase::Backlog).await;
 /// ```
 ///
-/// For tickets that need `.desc()`, `.prereqs()`, `.reporter()`, `.embedding()`,
-/// or `.supersede()`, use [`TicketBuilder`] directly.
+/// For tickets that need `.desc()` or `.prereqs()`, use [`TicketBuilder`]
+/// directly.
 ///
 /// # Panics
 ///
@@ -639,24 +639,6 @@ pub async fn expect_ticket_phase(store: &BoardStore, id: &str) -> TicketPhase {
         .expect("expected ticket phase to exist")
 }
 
-/// Assert that a ticket has been superseded: its phase is `Cancelled`,
-/// it has no assignee, and it is archived immediately.
-///
-/// This checks the minimum invariants set atomically by
-/// [`BoardStore::supersede_and_create`]. Individual tests MAY also assert
-/// additional fields (e.g. `superseded_by`) as needed.
-///
-/// # Panics
-///
-/// Panics if any of the assertions fail.
-pub fn assert_superseded_ticket(ticket: &Ticket) {
-    assert_eq!(ticket.phase, TicketPhase::Cancelled);
-    assert!(
-        ticket.is_archived,
-        "superseded ticket should be archived immediately"
-    );
-}
-
 /// Builder for creating test tickets with common defaults.
 ///
 /// Defaults: `desc="desc"`, `phase=Backlog`, `prerequisites=[]`, `reporter="test"`,
@@ -672,17 +654,6 @@ pub fn assert_superseded_ticket(ticket: &Ticket) {
 ///     .title("B")
 ///     .phase(TicketPhase::InDevelopment)
 ///     .prereqs(&[a_id, b_id])
-///     .create().await?;
-///
-/// // Supersede an existing ticket
-/// TicketBuilder::new(&store, &ws)
-///     .title("New title")
-///     .supersede(&old_id).await?;
-///
-/// // With embedding bytes
-/// TicketBuilder::new(&store, &ws)
-///     .title("Embedded")
-///     .embedding(&blob)
 ///     .create().await?;
 /// ```
 pub(crate) struct TicketBuilder<'a> {
@@ -738,18 +709,6 @@ impl<'a> TicketBuilder<'a> {
     }
 
     /// Set the reporter (default: `"test"`).
-    pub(crate) fn reporter(mut self, reporter: impl Into<String>) -> Self {
-        self.reporter = reporter.into();
-        self
-    }
-
-    /// Set embedding bytes (default: `None`).
-    pub(crate) fn embedding(mut self, blob: &[u8]) -> Self {
-        self.embedding = Some(blob.to_vec());
-        self
-    }
-
-    /// Set the ticket priority (default: `1`). 0 = highest urgency.
     pub(crate) fn priority(mut self, priority: i64) -> Self {
         self.priority = priority;
         self
@@ -759,12 +718,6 @@ impl<'a> TicketBuilder<'a> {
     pub(crate) async fn create(self) -> anyhow::Result<String> {
         let (store, params) = self.into_parts();
         store.create_ticket(&params).await
-    }
-
-    /// Supersede `supersede_id` with this ticket (calls `supersede_and_create`).
-    pub(crate) async fn supersede(self, supersede_id: &str) -> anyhow::Result<String> {
-        let (store, params) = self.into_parts();
-        store.supersede_and_create(supersede_id, &params).await
     }
 
     fn into_parts(self) -> (&'a BoardStore, TicketParams) {
@@ -856,12 +809,6 @@ impl<'a> JobRowBuilder<'a> {
         self
     }
 
-    /// Set `retry_count` (default: column omitted → schema default `0`).
-    pub(crate) fn retry_count(mut self, retry_count: i64) -> Self {
-        self.retry_count = Some(retry_count);
-        self
-    }
-
     /// Set `created_at` AND `updated_at` (both required, transcribed
     /// verbatim — the helper never generates timestamps internally).
     pub(crate) fn timestamps(mut self, timestamps: impl Into<String>) -> Self {
@@ -938,8 +885,8 @@ pub async fn init_test_stores() {
         // search_engine is sync — must be initialized before workspace
         crate::search_engine::init_global();
 
-        // ticket_buffer is sync — lightweight allocation, no DB I/O.
-        crate::pipeline::ticket_buffer::init_global();
+        // chronicle is sync — lightweight allocation, no DB I/O.
+        crate::pipeline::chronicle::init_global();
 
         crate::db::init_all_stores()
             .await
@@ -953,7 +900,7 @@ pub async fn init_test_stores() {
 ///
 /// Calls [`init_test_stores`] (all test DBs) then initializes the global
 /// message_router. The router is required by callers that
-/// exercise [`notify_ticket`](crate::pipeline::management::notify_ticket) which
+/// exercise the pipeline `notify_ticket` path, which
 /// enqueues notifications via [`crate::agent::message_router::route`].
 ///
 /// # Panics

@@ -736,6 +736,14 @@ pub struct Agent {
     /// stop and an internal code-driven cancellation. Used by the pipeline
     /// failure classifier to leave the ticket in its source phase for unpause.
     pause_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// IMMUTABLE bail-time snapshot of whether this agent's run was stopped at
+    /// a cooperative workspace-pause freeze — set once at the LLM-round
+    /// boundary, never cleared. Unlike the live `pause_stop` flag (set by
+    /// `cancel_by_workspace_pause`, cleared on unpause), this survives the
+    /// window where the agent is still registered and the workspace is resumed
+    /// between the bail and the pipeline finalizer reading it — so a frozen
+    /// run is never misrouted to the hard-failure/reset path.
+    paused_frozen: std::sync::atomic::AtomicBool,
     /// Board ticket this agent is currently working on (set for board-dispatched agents).
     ticket: Option<crate::pipeline::board::Ticket>,
     /// Generation counter from the agent registry — used in [`Drop`] for

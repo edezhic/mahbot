@@ -131,13 +131,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     user_name      TEXT NOT NULL DEFAULT '',
     channel        TEXT NOT NULL DEFAULT '',
     role           TEXT NOT NULL,
+    ticket_id      TEXT REFERENCES tickets(id),
     retry_count    INTEGER NOT NULL DEFAULT 0,
-    paused_frozen  INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
+-- One phase job per ticket, per phase (the single-puller dispatch authority).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_phase_ticket ON jobs(kind, ticket_id) WHERE ticket_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
@@ -158,11 +160,6 @@ CREATE TABLE IF NOT EXISTS pending_jobs (
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target_agent_id, created_at);
-
-CREATE TABLE IF NOT EXISTS ticket_jobs (
-    id          TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    ticket_id   TEXT NOT NULL REFERENCES tickets(id)
-);
 
 CREATE TABLE IF NOT EXISTS research_jobs (
     id    TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,

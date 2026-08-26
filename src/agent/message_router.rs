@@ -373,18 +373,6 @@ pub fn unregister_agent(agent_id: &str) {
     let mut guard = map.write().unwrap_poison();
     guard.remove(agent_id);
 }
-
-/// Test-only: whether the router currently holds an entry for `agent_id`.
-/// Distinct from [`try_route`] — an entry with a dropped receiver makes
-/// `try_route` return `false` too, so leak assertions must check the map.
-#[cfg(test)]
-pub(crate) fn router_contains(agent_id: &str) -> bool {
-    let Some(map) = ROUTER.get() else {
-        return false;
-    };
-    map.read().unwrap_poison().contains_key(agent_id)
-}
-
 /// Try to route a job to a previously registered agent.
 ///
 /// Returns `true` if the agent was found and the job was delivered.
@@ -535,7 +523,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // try_route(), or the agent's receiver was dropped.
         let message = match (role, job.kind) {
             (Role::Manager, MessageKind::UserMessage) => {
-                let drained = crate::pipeline::ticket_buffer::drain(&job.workspace_name);
+                let drained = crate::pipeline::chronicle::drain(&job.workspace_name);
                 if drained.is_empty() {
                     job.content.clone()
                 } else {

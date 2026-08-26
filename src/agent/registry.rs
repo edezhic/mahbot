@@ -459,34 +459,43 @@ impl AgentRegistry {
     }
 
     /// Cancel all agents running for a `workspace_name` as a workspace-pause
-    /// (strict freeze): sets the pause-stop flag on each matched agent AND fires
-    /// its cancel token. Distinct from [`Self::cancel_by_ticket_id_user`] (a
-    /// genuine user stop) and [`Self::cancel_by_ticket_id`] (an internal
-    /// code-driven cancellation). The pause flag lets the failure classifier
-    /// treat a frozen run as a FREEZE (leave the ticket in place for unpause),
-    /// not a failure and not a user cancel. Follows the same lock-ordering
-    /// invariant as [`cancel_matching`] (set the flag under the lock, cancel
-    /// outside it).
+    /// (strict freeze): sets the pause-stop flag on each matched agent WITHOUT
+    /// firing its cancel token, so the agent's current round finishes normally
+    /// and it stops cooperatively at the next LLM round boundary. Distinct from
+    /// [`Self::cancel_by_ticket_id_user`] (a genuine user stop) and
+    /// [`Self::cancel_by_ticket_id`] (an internal code-driven cancellation).
+    /// The pause flag lets the failure classifier treat a frozen run as a
+    /// FREEZE (leave the ticket in place for unpause), not a failure and not a
+    /// user cancel.
     ///
     /// Scoped to TICKET-parented pipeline agents (engineer, verifiers, QA,
     /// analysts, sanitation) — the managers, maintainers, and on-demand
     /// analyze/research sub-agents (all `ticket_id = None`) are intentionally
     /// left running so a pause only halts the ticket pipeline.
     pub fn cancel_by_workspace_pause(&self, workspace_name: &str) {
-        let to_cancel: Vec<String> = {
+        {
             let map = self.inner.lock().unwrap_poison();
-            let mut ids = Vec::new();
-            for (id, entry) in map.iter() {
+            for entry in map.values() {
                 if entry.handle.workspace_name == workspace_name && entry.handle.ticket_id.is_some()
                 {
                     entry.pause_stop.store(true, Ordering::SeqCst);
-                    ids.push(id.clone());
                 }
             }
-            ids
-        };
-        for agent_id in to_cancel {
-            self.cancel(&agent_id);
+        }
+        // No cancel token fired: the pause is cooperative — each agent stops at
+        // the next LLM round boundary (see the llm_loop round-top check).
+    }
+
+    /// Clear the cooperative pause-stop flag for every agent in a workspace.
+    /// Called on unpause so an agent that was mid-round when the pause fired
+    /// (and had not yet reached the LLM round boundary) does not bail "frozen"
+    /// at a boundary after the workspace has resumed.
+    pub fn clear_workspace_pause(&self, workspace_name: &str) {
+        let map = self.inner.lock().unwrap_poison();
+        for entry in map.values() {
+            if entry.handle.workspace_name == workspace_name {
+                entry.pause_stop.store(false, Ordering::SeqCst);
+            }
         }
     }
 
