@@ -111,14 +111,11 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
 }
 
 /// Build the failure comment for a failed Engineer run.
-fn engineer_failure_comment(shutdown: bool, cancelled: bool, error: Option<&str>) -> String {
+fn engineer_failure_comment(shutdown: bool, error: Option<&str>) -> String {
     if shutdown {
         return "Engineer failed: service shutting down — the run was interrupted \
                 by process shutdown."
             .to_string();
-    }
-    if cancelled {
-        return "Engineer failed: cancelled by user.".to_string();
     }
     let Some(detail) = error else {
         return load_prompt("pipeline/engineer_failed.md");
@@ -209,8 +206,8 @@ pub(crate) async fn finalize_engineer_stage(
         return;
     }
 
-    // Past the guards above, response None here is a real failure or a user
-    // cancel — classify, pause, and freeze/fail.
+    // Past the guards above, response None here is a real failure — classify,
+    // pause, and freeze/fail.
     handle_engineer_failure(ticket, agent, job_id, ws, paused).await;
 }
 
@@ -222,8 +219,6 @@ async fn handle_engineer_failure(
     ws: &Workspace,
     paused: bool,
 ) {
-    let cancelled_by_user = agent.is_cancelled_by_user();
-
     // A workspace-pause (strict freeze) is NOT a failure — leave the job in
     // place for the unpause re-drive. Uses the immutable bail-time snapshot
     // captured on the agent, so it survives a workspace-unpause race.
@@ -233,18 +228,15 @@ async fn handle_engineer_failure(
     }
 
     // A code-driven (internal) cancellation — re-dispatch, register
-    // replacement, phase transition/supersede — is NOT a genuine user stop.
-    if !cancelled_by_user && agent.is_cancelled() && !crate::shutdown::aborting() {
-        info!(ticket = %ticket.id, "Engineer run interrupted by an internal (code-driven) cancellation — leaving the ticket for the replacement run");
+    // replacement, phase transition/supersede, or the GUI cancel (whose
+    // authoritative Cancelled transition is handled by the GUI, not here) —
+    // leaves the ticket for the replacement run.
+    if agent.is_cancelled() && !crate::shutdown::aborting() {
+        info!(ticket = %ticket.id, "Engineer run interrupted by a code-driven cancellation — leaving the ticket for the replacement run");
         return;
     }
 
-    let pause_reason = if cancelled_by_user {
-        "user cancelled the agent run"
-    } else {
-        "engineer agent failure"
-    };
-    let pause_note = pause_workspace_on_failure(ticket, pause_reason).await;
+    let pause_note = pause_workspace_on_failure(ticket, "engineer agent failure").await;
 
     if crate::shutdown::aborting() {
         info!(
@@ -256,44 +248,25 @@ async fn handle_engineer_failure(
 
     let failure_comment = engineer_failure_comment(
         crate::shutdown::shutdown_token().is_cancelled(),
-        cancelled_by_user,
         agent.failure.as_deref(),
     );
     let comment_text = format!("{failure_comment}{pause_note}");
     let conn = &crate::session::store().conn;
 
-    if cancelled_by_user {
-        // User-initiated cancellation: ticket → Cancelled (terminal), workspace
-        // paused, never auto-re-queued.
-        comment_and_transition_or_bail(
-            TransitionCtx::notifying(
-                ticket,
-                TicketPhase::InDevelopment,
-                TicketPhase::Cancelled,
-                "Engineer",
-            ),
-            SYSTEM_ROLE,
-            &comment_text,
-            "Engineer cancelled — transitioned ticket",
-        )
-        .await;
-        let _ = crate::jobs::complete_ticket_job(conn, job_id).await;
-    } else {
-        // Hard failure: pause is already committed. Leave an explanatory
-        // comment and delete the phase job; the puller creates a FRESH
-        // InDevelopment attempt on unpause.
-        if let Err(e) = board()
-            .add_comment(&ticket.id, SYSTEM_ROLE, &comment_text)
-            .await
-        {
-            warn!(ticket = %ticket.id, error = %e, "Failed to comment engineer hard failure");
-        }
-        let workspace_paused = ws.paused || !pause_note.is_empty();
-        notify_engineer_pause(ws, &comment_text, workspace_paused);
-        info!(
-            ticket = %ticket.id,
-            "Engineer hard failure — workspace paused, ticket reset for a fresh development attempt"
-        );
-        let _ = crate::jobs::complete_ticket_job(conn, job_id).await;
+    // Hard failure: pause is already committed. Leave an explanatory
+    // comment and delete the phase job; the puller creates a FRESH
+    // InDevelopment attempt on unpause.
+    if let Err(e) = board()
+        .add_comment(&ticket.id, SYSTEM_ROLE, &comment_text)
+        .await
+    {
+        warn!(ticket = %ticket.id, error = %e, "Failed to comment engineer hard failure");
     }
+    let workspace_paused = ws.paused || !pause_note.is_empty();
+    notify_engineer_pause(ws, &comment_text, workspace_paused);
+    info!(
+        ticket = %ticket.id,
+        "Engineer hard failure — workspace paused, ticket reset for a fresh development attempt"
+    );
+    let _ = crate::jobs::complete_ticket_job(conn, job_id).await;
 }

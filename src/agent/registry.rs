@@ -139,15 +139,10 @@ struct AgentEntry {
     generation: u64,
     handle: AgentHandle,
     cancel_token: CancellationToken,
-    /// Whether a GENUINE user/operator stop was requested for this agent.
-    /// Set only by [`AgentRegistry::cancel_by_ticket_id_user`]; code-driven
-    /// internal cancellations (re-dispatch, register replacement, phase
-    /// transition/supersede) fire only [`Self::cancel_token`].
-    user_stop: Arc<AtomicBool>,
     /// Whether a workspace-pause (strict freeze) cancellation was requested for
     /// this agent. Set by [`AgentRegistry::cancel_by_workspace_pause`] when the
-    /// agent's workspace is paused — a FREEZE distinct from a user stop and an
-    /// internal code-driven cancellation.
+    /// agent's workspace is paused — a FREEZE distinct from a code-driven
+    /// cancellation.
     pause_stop: Arc<AtomicBool>,
     /// Live tool instrumentation for this agent (mutable across the agent's
     /// lifetime; snapshot into [`AgentHandle::current_tools`] by `list()`).
@@ -233,7 +228,6 @@ impl AgentRegistry {
         cancel_token: CancellationToken,
         parent_key: Option<ParentKey>,
         parent_label: Option<String>,
-        user_stop: Arc<AtomicBool>,
         pause_stop: Arc<AtomicBool>,
     ) -> u64 {
         let generation = NEXT_ENTRY_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -253,9 +247,8 @@ impl AgentRegistry {
             session_tokens: None,
         };
         let mut map = self.inner.lock().unwrap_poison();
-        // Replacing an old agent cancels the old token but is an INTERNAL
-        // (non-user) cancellation — the new agent is a re-dispatch/replacement,
-        // not a genuine user stop, so `old.user_stop` is deliberately never set.
+        // Replacing an old agent cancels the old token — the new agent is a
+        // re-dispatch/replacement.
         if let Some(old) = map.remove(&agent_id) {
             old.cancel_token.cancel();
         }
@@ -265,7 +258,6 @@ impl AgentRegistry {
                 generation,
                 handle,
                 cancel_token,
-                user_stop,
                 pause_stop,
                 current_tools: Vec::new(),
                 last_tool: None,
@@ -434,39 +426,14 @@ impl AgentRegistry {
         self.cancel_matching(|entry| entry.handle.ticket_id.as_deref() == Some(ticket_id));
     }
 
-    /// Cancel all agents running for a `ticket_id` as a GENUINE user/operator
-    /// stop: sets the user-stop flag on each matched agent AND fires its
-    /// cancel token. Distinct from [`Self::cancel_by_ticket_id`], which is the
-    /// code-driven/internal cancellation used by re-dispatch, phase
-    /// transitions, supersede, and claim. Follows the same lock-ordering
-    /// invariant as [`cancel_matching`] (set the flag under the lock, cancel
-    /// outside it).
-    pub fn cancel_by_ticket_id_user(&self, ticket_id: &str) {
-        let to_cancel: Vec<String> = {
-            let map = self.inner.lock().unwrap_poison();
-            let mut ids = Vec::new();
-            for (id, entry) in map.iter() {
-                if entry.handle.ticket_id.as_deref() == Some(ticket_id) {
-                    entry.user_stop.store(true, Ordering::SeqCst);
-                    ids.push(id.clone());
-                }
-            }
-            ids
-        };
-        for agent_id in to_cancel {
-            self.cancel(&agent_id);
-        }
-    }
-
     /// Cancel all agents running for a `workspace_name` as a workspace-pause
     /// (strict freeze): sets the pause-stop flag on each matched agent WITHOUT
     /// firing its cancel token, so the agent's current round finishes normally
     /// and it stops cooperatively at the next LLM round boundary. Distinct from
-    /// [`Self::cancel_by_ticket_id_user`] (a genuine user stop) and
-    /// [`Self::cancel_by_ticket_id`] (an internal code-driven cancellation).
+    /// [`Self::cancel_by_ticket_id`], a plain code-driven cancellation.
     /// The pause flag lets the failure classifier treat a frozen run as a
     /// FREEZE (leave the ticket in place for unpause), not a failure and not a
-    /// user cancel.
+    /// cancellation.
     ///
     /// Scoped to TICKET-parented pipeline agents (engineer, verifiers, QA,
     /// analysts, sanitation) — the managers, maintainers, and on-demand
@@ -786,7 +753,6 @@ mod tests {
             None,
             None,
             std::sync::Arc::new(AtomicBool::new(false)),
-            std::sync::Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -1009,7 +975,6 @@ mod tests {
             Some(ParentKey::Ticket("T-42".to_string())),
             Some("Fix login bug".to_string()),
             std::sync::Arc::new(AtomicBool::new(false)),
-            std::sync::Arc::new(AtomicBool::new(false)),
         );
         let handles = AGENT_REGISTRY.list();
         let h = handles
@@ -1101,7 +1066,6 @@ mod tests {
                 CancellationToken::new(),
                 Some(parent),
                 None,
-                std::sync::Arc::new(AtomicBool::new(false)),
                 std::sync::Arc::new(AtomicBool::new(false)),
             )
         };

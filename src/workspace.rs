@@ -548,8 +548,8 @@ impl From<anyhow::Error> for DiscoveryRunError {
 /// Classify a failed discovery agent run into the two-bucket scheme.
 ///
 /// Mirrors [`crate::agent::failure_classification`] ordering: drain/shutdown/
-/// user-cancel are treated as transient (the run was cut short, not a genuine
-/// failure — the workspace retries after restart/cooldown; a user-cancelled
+/// cancellation are treated as transient (the run was cut short, not a genuine
+/// failure — the workspace retries after restart/cooldown; a cancelled
 /// discovery deliberately returns to Pending instead of the historical
 /// terminal Failed, since cancellation is not a workspace defect). A typed
 /// [`crate::retry::RetryExhausted`] class decides provider-vs-genuine for

@@ -47,8 +47,8 @@ use crate::{Channel, ChatEvent, Role, SendMessage, Workspace};
 /// response (LLM errors, retry exhaustion, context overflow, etc.).
 /// Language-agnostic — pure emoji, no text.
 ///
-/// Not sent when the agent was explicitly cancelled by the user (/stop)
-/// or during global shutdown.
+/// Not sent when the agent was cancelled (deliberate stop) or during global
+/// shutdown.
 ///
 /// Known limitations:
 /// - Voice channel: TTS speaks this as "robot warning retry" (acceptable for now).
@@ -574,10 +574,10 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
 
         let Some(response) = response else {
             // Send emoji error only for UserMessage jobs where the agent truly
-            // failed (not cancelled by user or shutdown). Internal job kinds
+            // failed (not cancelled or shutdown). Internal job kinds
             // (TicketNotify, AnalyzeToolResult, ResearchResult) get no feedback.
             //
-            // We check both the agent-specific token (user /stop) AND the
+            // We check both the agent-specific token AND the
             // global shutdown token because during SIGTERM/SIGINT the global
             // token fires first — work() catches it and returns None, but the
             // agent-specific token may not have been cancelled yet.

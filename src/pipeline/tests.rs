@@ -1644,11 +1644,12 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
     );
 }
 
-// ── 7. User cancel trips the engineer to a terminal Cancelled phase ─────
+// ── 7. GUI cancel brings an in-flight engineer to a terminal Cancelled phase ─
 
-/// A genuine user stop of an in-flight engineer run transitions the ticket to
-/// Cancelled (terminal, never auto-requeued), deletes the phase job, and
-/// pauses the workspace.
+/// The GUI is the single cancel authority: it stops in-flight ticket agents,
+/// sets the terminal Cancelled phase (completing the phase job), and pauses the
+/// workspace. This holds even while an engineer round is in flight — the
+/// agent-side failure tail no longer drives a user cancel.
 
 #[serial_test::serial(provider)]
 #[tokio::test]
@@ -1692,7 +1693,21 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
             job_id.clone(),
         ));
         wait_for_agent_registered(&id, std::time::Duration::from_secs(2)).await;
-        crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id_user(&id);
+
+        // Reproduce the GUI cancel path: pause the workspace, stop in-flight
+        // ticket agents, then transition the ticket to the terminal Cancelled
+        // phase (which completes its phase job). The GUI path, not the agent's
+        // failure tail, is the source of the terminal state.
+        crate::pipeline::pause_workspace_on_failure(
+            &expect_ticket(store, &id).await,
+            "user cancelled a ticket in the development pipeline",
+        )
+        .await;
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&id);
+        store
+            .transition_to(&id, None, TicketPhase::Cancelled)
+            .await
+            .unwrap();
         handle.await.unwrap();
     }
 
