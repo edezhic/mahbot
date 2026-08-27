@@ -236,7 +236,7 @@ async fn handle_engineer_failure(
         return;
     }
 
-    let pause_note = pause_workspace_on_failure(ticket, "engineer agent failure").await;
+    let pause_occurred = pause_workspace_on_failure(ticket, "engineer agent failure").await;
 
     if crate::shutdown::aborting() {
         info!(
@@ -250,20 +250,20 @@ async fn handle_engineer_failure(
         crate::shutdown::shutdown_token().is_cancelled(),
         agent.failure.as_deref(),
     );
-    let comment_text = format!("{failure_comment}{pause_note}");
     let conn = &crate::session::store().conn;
 
     // Hard failure: pause is already committed. Leave an explanatory
     // comment and delete the phase job; the puller creates a FRESH
-    // InDevelopment attempt on unpause.
+    // InDevelopment attempt on unpause. The pause is silent in the ticket
+    // comment — notify_engineer_pause reports it separately.
     if let Err(e) = board()
-        .add_comment(&ticket.id, SYSTEM_ROLE, &comment_text)
+        .add_comment(&ticket.id, SYSTEM_ROLE, &failure_comment)
         .await
     {
         warn!(ticket = %ticket.id, error = %e, "Failed to comment engineer hard failure");
     }
-    let workspace_paused = ws.paused || !pause_note.is_empty();
-    notify_engineer_pause(ws, &comment_text, workspace_paused);
+    let workspace_paused = ws.paused || pause_occurred;
+    notify_engineer_pause(ws, &failure_comment, workspace_paused);
     info!(
         ticket = %ticket.id,
         "Engineer hard failure — workspace paused, ticket reset for a fresh development attempt"

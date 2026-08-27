@@ -7,11 +7,11 @@ use crate::prompt::{load_prompt, substitute};
 use crate::{Agent, Role, Workspace};
 
 use super::{
-    BoardStore, FinalizeOutcome, SYSTEM_ROLE, StageRunKind, TicketPhase, TransitionCtx, board,
-    bounce_to_development, clear_implementation_roster, comment_and_transition,
-    determine_notify_policy, error, guard_stage, info, is_ticket_in_phase,
-    list_new_or_untracked_files, pause_freezing, reset_phase_attempt, run_git_status,
-    run_stage_agent, sync_phase_job_task, warn, with_comment_and_transition,
+    BoardStore, FinalizeOutcome, StageRunKind, TicketPhase, TransitionCtx, board,
+    bounce_to_development, clear_implementation_roster, determine_notify_policy, error,
+    guard_stage, info, is_ticket_in_phase, list_new_or_untracked_files, pause_freezing,
+    reset_phase_attempt, run_git_status, run_stage_agent, sync_phase_job_task, warn,
+    with_comment_and_transition,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
@@ -22,19 +22,21 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     dispatch_sanitation(ticket, ws, &job_id).await;
 }
 
-/// Transition a ticket to Done and delete any launched phase jobs.
-async fn transition_ticket_to_done(ticket: &Ticket, source: TicketPhase, comment: &str) {
+/// Transition a ticket to Done without writing a comment row, and delete any
+/// launched phase jobs. Git-related Done cases (no git, not a repo, clean
+/// tree) use this so the fallback is silent in ticket history; `reason`
+/// preserves the specific cause in the log.
+async fn transition_ticket_to_done_no_comment(ticket: &Ticket, source: TicketPhase, reason: &str) {
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
     if matches!(
-        comment_and_transition(
+        with_comment_and_transition(
             TransitionCtx::new(ticket, source, TicketPhase::Done, notify_policy, "Finalize"),
-            SYSTEM_ROLE,
-            comment,
+            async |_tx| Ok(()),
         )
         .await,
         FinalizeOutcome::Applied
     ) {
-        info!(ticket = %ticket.id, "{comment}");
+        info!(ticket = %ticket.id, "{reason}");
         let _ = crate::jobs::complete_ticket_phase_jobs(&crate::session::store().conn, &ticket.id)
             .await;
     }
@@ -50,7 +52,7 @@ async fn ensure_git_or_done_and_get_status(
     let repo_path = ws.as_path();
 
     if !crate::git::commands::git_is_installed().await {
-        transition_ticket_to_done(
+        transition_ticket_to_done_no_comment(
             ticket,
             phase,
             "Git not installed — moving to Done without commit",
@@ -59,7 +61,7 @@ async fn ensure_git_or_done_and_get_status(
         return None;
     }
     if !crate::git::commands::is_git_repo(repo_path) {
-        transition_ticket_to_done(
+        transition_ticket_to_done_no_comment(
             ticket,
             phase,
             "Not a git repo — moving to Done without commit",
@@ -93,7 +95,7 @@ async fn finalize_ticket_with_git_status(
     let repo_path = ws.as_path();
 
     if porcelain.trim().is_empty() {
-        transition_ticket_to_done(
+        transition_ticket_to_done_no_comment(
             &ticket,
             source,
             "Clean working tree — moving to Done without commit",
@@ -128,12 +130,6 @@ async fn finalize_commit_and_transition(
     commit_info: crate::git::commands::CommitInfo,
     source: TicketPhase,
 ) {
-    let comment = format_commit_summary(
-        commit_info.short_hash(),
-        commit_info.lines_added,
-        commit_info.lines_removed,
-    );
-
     let phase_label = source.as_ref();
 
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
@@ -157,7 +153,6 @@ async fn finalize_commit_and_transition(
                     commit_info.lines_removed,
                 )
                 .await?;
-                BoardStore::add_comment_tx(tx, &ticket.id, SYSTEM_ROLE, &comment).await?;
                 Ok(())
             },
         )
@@ -167,16 +162,6 @@ async fn finalize_commit_and_transition(
         info!(ticket = %ticket.id, "Committed {}, moving to Done", commit_info.short_hash());
         let _ = crate::jobs::complete_ticket_phase_jobs(&crate::session::store().conn, &ticket.id)
             .await;
-    }
-}
-
-/// Format a commit summary line for the ticket comment history.
-fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
-    match (added, removed) {
-        (0, 0) => format!("Committed as `{short_hash}` (no changes)"),
-        (a, 0) => format!("Committed as `{short_hash}` (+{a})"),
-        (0, r) => format!("Committed as `{short_hash}` (-{r})"),
-        (a, r) => format!("Committed as `{short_hash}` (+{a}/-{r})"),
     }
 }
 
@@ -217,8 +202,7 @@ pub(crate) async fn finalize_sanitation_stage(
             TicketPhase::InSanitation,
             job_id,
             "sanitation failure",
-            "Sanitation could not complete the round (the agent did not respond) \
-             — resetting for a fresh attempt.",
+            "Sanitation could not complete the round (the agent did not respond).",
         )
         .await;
         return;
@@ -243,8 +227,7 @@ pub(crate) async fn finalize_sanitation_stage(
                 TicketPhase::InSanitation,
                 job_id,
                 "sanitation failure",
-                "Sanitation could not complete the round (the verdict could not be \
-                 extracted) — resetting for a fresh attempt.",
+                "Sanitation could not complete the round (the verdict could not be extracted).",
             )
             .await;
         }
@@ -256,25 +239,8 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     let untracked_files = match list_new_or_untracked_files(ws.as_path()).await {
         Ok(files) if files.is_empty() => {
             // No new/untracked files — skip the sanitation agent entirely and
-            // commit straight to Done (no bounce budget consumed).
-            let already_skipped = board()
-                .has_comment_containing(
-                    &ticket.id,
-                    Role::Sanitation.as_str(),
-                    "skipping sanitation agent",
-                )
-                .await
-                .unwrap_or(false);
-            if !already_skipped {
-                let comment =
-                    "🧹 No new or untracked files — skipping sanitation agent, committing to Done.";
-                if let Err(e) = board()
-                    .add_comment(&ticket.id, Role::Sanitation.as_str(), comment)
-                    .await
-                {
-                    warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation skip comment");
-                }
-            }
+            // commit straight to Done (no bounce budget consumed). The skip is
+            // silent in ticket history.
             clear_implementation_roster(&crate::session::store().conn, job_id, &ticket.id).await;
             let Some(porcelain) = ensure_git_or_done_and_get_status(
                 &ticket,

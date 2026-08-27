@@ -527,7 +527,7 @@ async fn reset_analysis_round(ticket: &Ticket, job_id: &str) {
         ticket = %ticket.id,
         "Backlog analysis produced no usable output — resetting for a fresh attempt",
     );
-    let comment = "Backlog analysis produced no usable output — resetting for a fresh attempt.";
+    let comment = "Backlog analysis produced no usable output.";
     reset_phase_attempt(
         ticket,
         TicketPhase::Analysis,

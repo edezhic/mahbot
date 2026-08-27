@@ -661,7 +661,7 @@ pub(crate) async fn process_verifier_verdicts(
         // Hard technical failure: a verifier did not complete. Reset the
         // attempt (the round is destroyed; the puller creates a fresh one).
         let comment = format!(
-            "{} could not complete the round (a verifier did not respond) — resetting for a fresh attempt.",
+            "{} could not complete the round (a verifier did not respond).",
             verifier.log_label,
         );
         reset_phase_attempt(

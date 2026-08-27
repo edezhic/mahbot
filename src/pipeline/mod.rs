@@ -476,9 +476,7 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
             return;
         }
         error!(phase = %phase, job = %log_job_id, "Phase body panicked — resetting for a fresh attempt");
-        let comment = format!(
-            "Pipeline phase {phase} crashed: the phase body panicked. The ticket is reset for a fresh attempt."
-        );
+        let comment = format!("Pipeline phase {phase} crashed: the phase body panicked.");
         reset_phase_attempt(
             &panic_ticket,
             phase,
@@ -785,7 +783,7 @@ async fn pause_freezing(ticket: &Ticket, job_id: &str) {
     }
 }
 
-/// Wording shared by the failure-comment pause note and the Manager notification.
+/// Wording for the Manager notification about a paused workspace.
 fn paused_workspace_sentence() -> &'static str {
     "all in-flight work stops and no pipeline stage advances until the workspace is resumed"
 }
@@ -794,18 +792,18 @@ fn paused_workspace_sentence() -> &'static str {
 /// tickets are not claimed and don't cascade through the pipeline failing
 /// identically one after another.
 ///
-/// Returns a notice string to append to the ticket's failure comment, or an
-/// empty string when the workspace was not paused (already paused, or the
-/// service is shutting down — a shutdown-interrupted run must never pause).
-pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) -> String {
+/// Returns `true` when this call paused the workspace, `false` when it was
+/// already paused, could not be resolved, or the service is shutting down (a
+/// shutdown-interrupted run must never pause).
+pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) -> bool {
     if crate::shutdown::aborting() {
-        return String::new();
+        return false;
     }
     let Some(ws) = resolve_ticket_workspace(ticket, "auto-pause skipped").await else {
-        return String::new();
+        return false;
     };
     if ws.paused {
-        return String::new();
+        return false;
     }
     match crate::workspace::store().set_paused(&ws.name, true).await {
         Ok(()) => {
@@ -815,10 +813,7 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
                 reason,
                 "Workspace auto-paused after failure"
             );
-            format!(
-                "\n\n⚠️ Workspace paused: {reason} — {}.",
-                paused_workspace_sentence()
-            )
+            true
         }
         Err(e) => {
             warn!(
@@ -828,7 +823,7 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
                 error = %e,
                 "Failed to auto-pause workspace after technical failure",
             );
-            String::new()
+            false
         }
     }
 }
@@ -846,16 +841,12 @@ pub(crate) async fn reset_phase_attempt(
     comment: &str,
 ) {
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
-    let pause_note = if phase.is_pipeline_occupied() {
-        pause_workspace_on_failure(ticket, reason).await
-    } else {
-        String::new()
-    };
-    let full_comment = format!("{comment}{pause_note}");
-    if let Err(e) = board()
-        .add_comment(&ticket.id, SYSTEM_ROLE, &full_comment)
-        .await
-    {
+    // The workspace pause still happens for implementation phases, but it is
+    // silent in ticket history (the caller's substantive reason is the comment).
+    if phase.is_pipeline_occupied() {
+        pause_workspace_on_failure(ticket, reason).await;
+    }
+    if let Err(e) = board().add_comment(&ticket.id, SYSTEM_ROLE, comment).await {
         warn!(ticket = %ticket.id, error = %e, "Failed to comment phase reset");
     }
     let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;

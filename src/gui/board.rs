@@ -970,20 +970,14 @@ impl BoardState {
                         // shutdown and already-paused are handled inside the
                         // helper.
                         if phase == TicketPhase::Cancelled && source.is_pipeline_occupied() {
-                            let notice = crate::pipeline::pause_workspace_on_failure(
+                            // Pause the workspace so queued development tickets
+                            // don't cascade. The pause is silent in ticket
+                            // history.
+                            crate::pipeline::pause_workspace_on_failure(
                                 &ticket,
                                 "user cancelled a ticket in the development pipeline",
                             )
                             .await;
-                            if !notice.is_empty() {
-                                let _ = board
-                                    .add_comment(
-                                        &ticket_id,
-                                        crate::agent::role::SYSTEM_ROLE,
-                                        notice.trim(),
-                                    )
-                                    .await;
-                            }
                         }
                         // This is the authoritative user-cancel signal: stop any
                         // in-flight ticket agents so their work ends promptly.

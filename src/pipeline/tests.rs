@@ -1436,9 +1436,9 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     {
         let comments = store.get_comments(&aid).await.unwrap();
         assert!(
-            comments
-                .iter()
-                .any(|c| c.content.contains("resetting for a fresh attempt")),
+            comments.iter().any(|c| c
+                .content
+                .contains("Backlog analysis produced no usable output")),
             "the reset must leave an explanatory comment",
         );
     }
@@ -1637,9 +1637,9 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
     );
     let comments = store.get_comments(&id).await.unwrap();
     assert!(
-        comments
-            .iter()
-            .any(|c| c.content.contains("resetting for a fresh attempt")),
+        comments.iter().any(|c| c
+            .content
+            .contains("Backlog analysis produced no usable output")),
         "the reset must leave an explanatory comment",
     );
 }
