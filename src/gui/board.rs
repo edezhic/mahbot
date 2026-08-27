@@ -756,6 +756,47 @@ impl BoardState {
         badge_pill(format!("P{priority}"), (bg, fg), text_size, padding)
     }
 
+    /// Bounce-count badge (icon + count + tooltip, matching the prereq indicator
+    /// style). `None` when the ticket has not bounced. Muted (id color) at or
+    /// below `BOUNCE_BADGE_WARNING_THRESHOLD`, then the prereq warning yellow.
+    fn bounce_badge<'a>(
+        bounce_count: i64,
+        icon_size: u32,
+        text_size: u32,
+    ) -> Option<Element<'a, BoardMessage>> {
+        if bounce_count <= 0 {
+            return None;
+        }
+        let count = usize::try_from(bounce_count).unwrap_or(0);
+        let color = if count > crate::pipeline::BOUNCE_BADGE_WARNING_THRESHOLD {
+            theme::STATUS_WARNING
+        } else {
+            theme::TEXT_SECONDARY
+        };
+        let indicator = row![
+            lucide::rotate_ccw::<iced::Theme, iced::Renderer>()
+                .size(icon_size)
+                .color(color),
+            text(format!("{bounce_count}")).size(text_size).color(color),
+        ]
+        .spacing(2)
+        .align_y(Alignment::Center);
+        let tooltip_text = format!(
+            "Validation bounces: {bounce_count} (max {}) — counts diagnostics/review/QA/sanitation \
+             non-success only; engineer hard-failures are pause-only and don't consume the budget",
+            crate::pipeline::MAX_BOUNCES,
+        );
+        Some(
+            tooltip(
+                indicator,
+                text(tooltip_text).size(11),
+                tooltip::Position::Top,
+            )
+            .style(theme::tooltip_style)
+            .into(),
+        )
+    }
+
     /// Compute how many of this ticket's prerequisites are still unfulfilled.
     /// A prerequisite is considered fulfilled if its ticket cannot be found in the
     /// loaded set (per manager clarification: missing = archived = fulfilled) or if
@@ -1369,6 +1410,7 @@ impl BoardState {
     }
 
     /// Render a single ticket card: clickable title, ID, phase badge, and action icons.
+    #[expect(clippy::too_many_lines)]
     pub fn render_ticket_card<'a>(&'a self, ticket: &'a Ticket) -> Element<'a, BoardMessage> {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
@@ -1382,6 +1424,10 @@ impl BoardState {
             Self::phase_badge(ticket.phase, 10, [1, 6]),
         ]
         .spacing(6);
+
+        if let Some(bounce) = Self::bounce_badge(ticket.bounce_count, 12, 10) {
+            badge_row = badge_row.push(bounce);
+        }
 
         if unfulfilled_count > 0 {
             let tooltip_text = format!("Blocked by: {}", unfulfilled_ids.join(", "));
@@ -1758,15 +1804,21 @@ impl BoardState {
             .align_y(Alignment::Center),
             text(&ticket.id).size(12).color(theme::TEXT_SECONDARY),
             Space::new().height(6),
-            row![
-                Self::priority_badge(ticket.priority, 12, [2, 8]),
-                Self::phase_badge(ticket.phase, 12, [2, 8]),
-                Space::new().width(Length::Fill),
-                icon_row,
-            ]
-            .align_y(Alignment::Center)
-            .spacing(8)
-            .padding([4, 0]),
+            {
+                let mut badges = vec![
+                    Self::priority_badge(ticket.priority, 12, [2, 8]),
+                    Self::phase_badge(ticket.phase, 12, [2, 8]),
+                ];
+                if let Some(bounce) = Self::bounce_badge(ticket.bounce_count, 14, 12) {
+                    badges.push(bounce);
+                }
+                badges.push(Space::new().width(Length::Fill).into());
+                badges.push(icon_row.into());
+                Row::from_vec(badges)
+                    .align_y(Alignment::Center)
+                    .spacing(8)
+                    .padding([4, 0])
+            },
             metadata_block,
         ]
         .spacing(4)

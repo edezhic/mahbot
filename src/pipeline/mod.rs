@@ -533,7 +533,12 @@ const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 
 /// Maximum tolerated validation-phase bounces before the ticket fails (the
 /// 11th bounce fails). Enforced by the unified validation-failure bounce path.
-const MAX_BOUNCES: usize = 10;
+pub const MAX_BOUNCES: usize = 10;
+
+/// GUI bounce-badge escalation threshold: at or below this many bounces the
+/// badge stays muted (the ticket id color); above it, the badge uses the
+/// prereq-indicator warning yellow. Halfway to the [`MAX_BOUNCES`] breaker cap.
+pub const BOUNCE_BADGE_WARNING_THRESHOLD: usize = 5;
 
 // ── Transition + notification helpers (shared by the phase modules) ─────
 
