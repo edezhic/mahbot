@@ -1611,7 +1611,15 @@ impl BoardState {
             iced::widget::stack([widgets::empty_stack_placeholder()]).into()
         };
 
-        iced::widget::stack([detail_layer, confirm_layer]).into()
+        // Stack sizes from its first child: when the details modal is closed
+        // `detail_layer` is a zero-size placeholder, so without explicit Fill
+        // sizing the confirm layer collapses to 0x0 and is invisible. Pin the
+        // stack to the full content area so the confirm dialog renders from
+        // the sidebar-card path too.
+        iced::widget::stack([detail_layer, confirm_layer])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Build the mid-pipeline cancel confirmation dialog for a ticket.
