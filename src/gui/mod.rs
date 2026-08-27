@@ -2385,6 +2385,26 @@ impl Dashboard {
             // (see `empty_stack_placeholder`): the open state is a Stack.
             return iced::widget::stack([widgets::empty_stack_placeholder()]).into();
         }
+        let build_desc = match crate::self_update::update_mode() {
+            crate::self_update::UpdateMode::LocalCheckout => {
+                "The new version is built from the local source checkout in \
+                 the background while the system keeps working — the build can \
+                 take 10–60 minutes and nothing is paused during it.\n\n\
+                 When the build finishes, current in-flight work is drained \
+                 (up to ~10 min), databases are checkpointed, and the app \
+                 restarts, automatically resuming work afterwards. The window \
+                 closing signals the restart."
+            }
+            crate::self_update::UpdateMode::Registry => {
+                "The new version is downloaded from crates.io and installed in \
+                 the background while the system keeps working — the install \
+                 can take 10–60 minutes and nothing is paused during it.\n\n\
+                 When the install finishes, current in-flight work is drained \
+                 (up to ~10 min), databases are checkpointed, and the app \
+                 restarts, automatically resuming work afterwards. The window \
+                 closing signals the restart."
+            }
+        };
         let dialog = container(
             column![
                 text("Update MahBot?")
@@ -2392,17 +2412,7 @@ impl Dashboard {
                     .color(theme::TEXT_PRIMARY)
                     .font(theme::FONT_BOLD),
                 Space::new().height(12),
-                text(
-                    "The new version is built and installed in the background \
-                     while the system keeps working — the build can take \
-                     10–60 minutes and nothing is paused during it.\n\n\
-                     When the build finishes, current in-flight work is \
-                     drained (up to ~10 min), databases are checkpointed, and \
-                     the app restarts, automatically resuming work afterwards. \
-                     The window closing signals the restart.",
-                )
-                .size(13)
-                .color(theme::TEXT_SECONDARY),
+                text(build_desc).size(13).color(theme::TEXT_SECONDARY),
                 Space::new().height(16),
                 row![
                     Space::new().width(Length::Fill),
@@ -2429,10 +2439,9 @@ impl Dashboard {
     /// Returns `None` when self-update is not available on this installation.
     ///
     /// Visibility is driven entirely by the shared availability cache — no
-    /// Windows gate is needed here. Registry mode on Windows never discovers
-    /// an update (the crates.io check returns `Ok(None)`), and
-    /// [`execute_registry_update`] bails at its entry point, so the cached
-    /// `available` stays false.
+    /// Windows gate is needed here: registry mode now discovers and installs on
+    /// all platforms (both Windows guards removed; the install goes through
+    /// install-to-temp + `self_replace`, which works with a running .exe).
     fn render_update_button() -> Option<Element<'static, Message>> {
         let availability = crate::self_update::update_availability();
         // Show the button while an update is in flight even if `available` was

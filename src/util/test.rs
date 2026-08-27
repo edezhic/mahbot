@@ -30,7 +30,7 @@ use crate::db;
 use crate::pipeline::board::{BoardStore, Ticket, TicketParams, TicketPhase};
 use crate::util::UnwrapPoison;
 use crate::workspace::test_ws_named;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 /// Shared test root directory, created once per process.
@@ -455,6 +455,17 @@ pub fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
         key: key.to_owned(),
         original,
     }
+}
+
+/// Make a file executable (0o755) on Unix; no-op on other platforms.
+pub fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// The single process-level test temp root.

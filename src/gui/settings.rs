@@ -3227,10 +3227,10 @@ impl SettingsState {
         };
         let mode_note = match mode {
             crate::self_update::UpdateMode::LocalCheckout => {
-                "Self-update rebuilds from the local source checkout."
+                "Self-update builds from the local source checkout."
             }
             crate::self_update::UpdateMode::Registry => {
-                "Self-update checks crates.io and reinstalls via cargo install."
+                "Self-update checks crates.io and installs the latest version."
             }
         };
         section(

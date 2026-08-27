@@ -1,48 +1,50 @@
-//! Self-update logic — single-instance guarding, build, binary swap, and restart.
+//! Self-update logic — single-instance guarding, install-to-temp, binary swap,
+//! cargo-bin refresh, and restart.
 //!
-//! Two update modes are supported, selected at runtime by [`update_mode`]:
+//! Two update modes are supported, selected at runtime by [`update_mode`]. Both
+//! converge on a single install-to-temp then `self_replace` flow:
 //!
-//! * **Local checkout** (the historical mode): the binary was built from a
-//!   local source checkout (`.git` present at `CARGO_MANIFEST_DIR`, or a plain
-//!   source tree with `Cargo.toml`). Update = `cargo build --release` →
-//!   [`self_replace`](https://docs.rs/self-replace) → copy to cargo install
-//!   bin → shutdown → checkpoint → restart.
-//! * **Registry** (crates.io-installed binaries): `CARGO_MANIFEST_DIR` points
-//!   into the cargo registry/git source cache (e.g. `~/.cargo/registry/src/`),
-//!   so a local rebuild would be a same-version no-op. Update = periodic
-//!   crates.io sparse-index check for a strictly newer stable version →
-//!   `cargo install <crate> --force` → shutdown → checkpoint → restart.
+//! * **Local checkout**: the binary was built from a local source checkout
+//!   (`.git` present at `CARGO_MANIFEST_DIR`, or a plain source tree with
+//!   `Cargo.toml`). Update = `cargo install --path <repo> --root <temp_install>
+//!   --locked --target-dir <temp_build>` → swap → copy to cargo bin →
+//!   shutdown → checkpoint → restart.
+//! * **Registry**: `CARGO_MANIFEST_DIR` points into the cargo registry/git
+//!   source cache (e.g. `~/.cargo/registry/src/`), so a local rebuild would be a
+//!   same-version no-op. Update = periodic crates.io sparse-index check for a
+//!   strictly newer stable version → `cargo install <crate> --root <temp_install>
+//!   --force` → swap → copy to cargo bin → shutdown → checkpoint → restart.
 //!
-//! Uses `flock()` for single-instance enforcement (kernel guarantees lock release on
-//! process death). The update flow: build/install → swap → copy to cargo install bin
-//! → shutdown agents → checkpoint all Turso databases
-//! (the last single-writer checkpoint, while the instance lock is still held) →
-//! release lock → spawn new instance from cargo bin path (or `current_exe()`
-//! fallback) → remove build artifact (guarded against deleting the spawn
-//! target, `current_exe()`, or the cargo bin path) → `exit(0)`.
+//! The running executable cannot be replaced in place on Windows, so each mode
+//! installs the freshly built binary into a temp root first, then swaps it in via
+//! `self_replace` (which rename-asides the running exe, copies the new one in,
+//! and schedules deferred deletion). This removes the previous Windows guards
+//! and the bespoke local build-swap machinery.
 //!
-//! The cargo install path resolution uses `$CARGO_HOME` if set, else
-//! `~/.cargo/bin` via `directories::UserDirs` — this ensures the
-//! self-updated binary is visible to the shell tool and the user's PATH
-//! (the shell tool's `extra_shell_path_prefixes` includes both paths when
-//! they differ, so the single resolved path is always covered).
-//!
-//! The WAL checkpoint before `exit(0)` is a clean store handoff:
-//! `std::process::exit(0)` bypasses all Rust destructors, so Turso connections
-//! are never properly closed. The TRUNCATE leaves a header-only WAL with the
-//! shared frame index reset; committed data is already fsync-durable at COMMIT.
+//! After the swap the fresh binary is also copied to the cargo install bin path
+//! (`$CARGO_HOME/bin` / `~/.cargo/bin`) so PATH invocations of `mahbot` stay
+//! fresh even when the daemon runs from a different path (e.g. the repo's
+//! `target/release`). Uses `flock()` for single-instance enforcement. The WAL
+//! checkpoint before `exit(0)` is a clean store handoff: `std::process::exit(0)`
+//! bypasses all Rust destructors, so Turso connections are never properly
+//! closed. The TRUNCATE leaves a header-only WAL with the shared frame index
+//! reset; committed data is already fsync-durable at COMMIT.
 //!
 //! ## macOS Gatekeeper safety
 //!
 //! `posix_spawn` triggers async Gatekeeper code-signing validation; deleting the
-//! spawn target during validation produces empty stderr (SIGKILL by `syspolicyd`).
-//! See `should_delete_build_artifact()` and `execute_update()` steps 13–14.
+//! spawn target during validation produces empty stderr (SIGKILL by
+//! `syspolicyd`). In the temp-root flow the spawn target is always the captured
+//! `current_exe()` (never a temp root), and the temp roots are only removed
+//! after a successful spawn, so the spawn target is never deleted in its
+//! startup window.
 
 use crate::ChannelMessage;
-use crate::util::{UnwrapPoison, is_executable};
+use crate::util::UnwrapPoison;
 use anyhow::{Context, Result, anyhow};
 #[cfg(test)]
 use directories::UserDirs;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -547,14 +549,9 @@ async fn fetch_latest_stable_version() -> Result<Option<semver::Version>> {
 /// when up to date, and `Err` on network failure (the caller retries later —
 /// never a user-visible error for a failed check).
 ///
-/// Windows: always `Ok(None)` — the running `.exe` cannot be replaced, so the
-/// registry update is not offered there. The background refresh task skips the
-/// check on Windows entirely, but the guard is kept as a safety net so a stray
-/// caller cannot discover an update that cannot be installed.
+/// Discovery runs on all platforms: an update found here is installed via the
+/// unified install-to-temp + `self_replace` flow, which works on Windows too.
 pub(crate) async fn check_registry_update() -> Result<Option<semver::Version>> {
-    if cfg!(windows) {
-        return Ok(None);
-    }
     let Some(latest) = fetch_latest_stable_version().await? else {
         return Ok(None);
     };
@@ -688,10 +685,10 @@ async fn resolve_update_admin_target() -> Option<String> {
 
 /// Execute a self-update, dispatching on the install mode:
 ///
-/// - [`UpdateMode::LocalCheckout`]: build from source, swap binary, install to
-///   cargo bin, notify admin, restart.
-/// - [`UpdateMode::Registry`]: `cargo install <crate> --force` from crates.io,
-///   notify admin, restart.
+/// - [`UpdateMode::LocalCheckout`]: build from the local checkout into a temp
+///   root, swap the binary, refresh the cargo bin copy, restart.
+/// - [`UpdateMode::Registry`]: `cargo install <crate> --force` into a temp root
+///   from crates.io, swap the binary, refresh the cargo bin copy, restart.
 ///
 /// Called from the GUI update button and the Telegram `/update` command.
 /// Only one update runs at a time — concurrent calls return an error immediately.
@@ -720,10 +717,10 @@ pub(crate) async fn execute_update() -> Result<()> {
     result
 }
 
-/// Local-checkout self-update: rebuild from the source checkout, swap the
-/// running binary, install to the cargo bin path, restart.
-///
-/// See [`execute_update`] for the concurrent-guard and exit contracts.
+/// Local-checkout self-update: build from the source checkout into a temp
+/// root via `cargo install --path`, swap the running binary, refresh the
+/// cargo bin copy, and restart. See [`execute_update`] for the
+/// concurrent-guard and exit contracts.
 async fn execute_local_update() -> Result<()> {
     // 1. Validate prerequisites.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -750,104 +747,58 @@ async fn execute_local_update() -> Result<()> {
     )
     .await;
 
-    // 4. Compute paths early (needed by copy, spawn, and cleanup below).
-    let binary_path = manifest_dir
-        .join("target")
-        .join("release")
-        .join(format!("mahbot{}", std::env::consts::EXE_SUFFIX));
+    // 4. Create temp roots for the install and the cargo build. Held in scope
+    //    for the whole update so an install/spawn failure RAII-cleans them; on
+    //    success `std::process::exit(0)` bypasses RAII, so the `after_spawn`
+    //    closure in `finalize_install` removes them explicitly. The cold
+    //    release rebuild of the heavy dep tree can be several-GB; the temp
+    //    roots land under the (pinned) system temp dir, which on macOS is the
+    //    boot volume with the repo, so no cross-volume fallback is warranted.
+    let temp_install_root =
+        tempfile::tempdir().context("Failed to create temp install root for self-update")?;
+    let temp_build_dir =
+        tempfile::tempdir().context("Failed to create temp build dir for self-update")?;
+    let install_root = temp_install_root.path().to_path_buf();
+    let build_dir = temp_build_dir.path().to_path_buf();
 
-    // Resolve the cargo install bin path. Checks `$CARGO_HOME` first, then
-    // falls back to `~/.cargo/bin` via `directories::UserDirs`. Unlike the
-    // shell tool's `extra_shell_path_prefixes` (which adds both paths as a
-    // belt-and-suspenders measure), this function returns a single path —
-    // whichever is selected is guaranteed to be present in the shell PATH
-    // since `extra_shell_path_prefixes` includes both.
-    let cargo_bin_path = resolve_cargo_bin_path();
-
-    // 5. Run cargo build.
+    // 5. Run `cargo install --path <repo> --root <temp_install> --locked
+    //    --target-dir <temp_build>` so the build never touches the repo's
+    //    `target/` (which would overwrite a running `target/release` artifact)
+    //    and the install lands in the temp root. cwd is the storage root (it is
+    //    guaranteed writable and exists, unlike the launch dir).
     run_cargo_with_timeout(
-        &["build", "--release", "--locked"],
-        manifest_dir,
-        std::time::Duration::from_mins(30),
-        "cargo build --release",
+        &[
+            OsStr::new("install"),
+            OsStr::new("--path"),
+            manifest_dir.as_os_str(),
+            OsStr::new("--root"),
+            install_root.as_os_str(),
+            OsStr::new("--locked"),
+            OsStr::new("--target-dir"),
+            build_dir.as_os_str(),
+        ],
+        &crate::config::CONFIG.global_storage_root(),
+        Duration::from_hours(1),
+        "cargo install --path --locked",
         "Build",
     )
     .await?;
 
-    // 6. self_replace — swap the running binary with the newly built one.
-    self_replace::self_replace(&binary_path)
-        .with_context(|| format!("Failed to swap binary at {}", binary_path.display()))?;
-
-    // 7. Resolve the spawn target: copy the new binary to the cargo install path
-    //    (so the shell tool's PATH resolution finds it), or use current_exe() as
-    //    fallback. The copy is skipped entirely if already running from the cargo
-    //    bin path (self_replace already updated it in-place). Non-fatal: if the
-    //    copy fails, the running process is already updated via self_replace.
-    let spawn_path = resolve_spawn_path(
-        &binary_path,
-        cargo_bin_path.as_deref(),
+    // 6. Shared tail: swap, PATH freshness, drain, checkpoint, restart.
+    let fresh_binary = temp_bin_path(&install_root);
+    finalize_install(
+        &fresh_binary,
         admin_target.as_deref(),
+        "✅ Build complete. Restarting…",
+        vec![install_root, build_dir],
     )
-    .await?;
-
-    // 8. Notify: build complete, restarting.
-    notify_admin("✅ Build complete. Restarting…", admin_target.as_deref()).await;
-
-    // 9. Notify: starting new instance (MUST be before step 10 shutdown —
-    //    Telegram channel must still be live for this notification).
-    notify_admin("🔄 Starting new instance…", admin_target.as_deref()).await;
-
-    // Resolve current_exe() now so the post-spawn cleanup closure is
-    // infallible (the original step-14 `?` propagated before the drain; with
-    // the shared tail the closure must not fail after the checkpoint).
-    let current_exe_path = std::env::current_exe().context("Failed to resolve current_exe()")?;
-
-    // 10–15. Shared finalize tail: graceful drain, checkpoint, lock release,
-    // spawn, build-artifact cleanup, exit. The artifact cleanup runs only after
-    // a successful spawn (Gatekeeper safety), then the process exits.
-    finalize_update_and_restart(&spawn_path, || {
-        // 14. Clean up the build output binary after successful spawn.
-        //     Note: never delete:
-        //     - The spawn target (prevents macOS Gatekeeper race — see step 13).
-        //     - The current_exe path (same Gatekeeper concern).
-        //     - The cargo bin path (same Gatekeeper concern, also the spawn target).
-        //     All comparisons use canonicalized paths to handle symlinks correctly.
-        let should_delete = should_delete_build_artifact(
-            &binary_path,
-            &current_exe_path,
-            cargo_bin_path.as_deref(),
-        );
-
-        if should_delete {
-            if let Err(e) = fs::remove_file(&binary_path) {
-                warn!(
-                    error = %e,
-                    path = %binary_path.display(),
-                    "Could not remove build artifact after successful spawn"
-                );
-            }
-        } else {
-            info!(
-                path = %binary_path.display(),
-                "Skipping deletion of build artifact (matches current_exe or cargo bin path)"
-            );
-        }
-    })
     .await
 }
 
-/// Registry self-update: `cargo install <crate> --force` from crates.io,
-/// then restart from the freshly installed binary.
-///
+/// Registry self-update: `cargo install <crate> --force` from crates.io into a
+/// temp root, swap the running binary, refresh the cargo bin copy, and restart.
 /// See [`execute_update`] for the concurrent-guard and exit contracts.
 async fn execute_registry_update() -> Result<()> {
-    // Registry self-update is not offered on Windows (the running .exe cannot
-    // be replaced). The GUI never shows the button there, but guard the entry
-    // point as well so a stray call cannot half-update.
-    if cfg!(windows) {
-        anyhow::bail!("Registry self-update is not supported on Windows");
-    }
-
     // Verify cargo is on PATH.
     verify_cargo_on_path("install from crates.io").await?;
 
@@ -861,44 +812,133 @@ async fn execute_registry_update() -> Result<()> {
     )
     .await;
 
-    // 3. Run `cargo install <crate> --force`. No `--locked`: the published
-    //    .crate ships a Cargo.lock, but a stale lockfile would hard-fail the
-    //    install; plain `cargo install` (per the ticket) re-resolves when the
-    //    lock is stale. 60-minute timeout — a cold registry build recompiles
-    //    the whole dependency tree (no reuse of a local target/). The cwd is
-    //    the storage root: `cargo install <crate>` needs no manifest dir, but
-    //    a writable CWD — the daemon's launch directory may be anything (or
-    //    removed).
+    // 3. Create the temp install root, held for the whole update (RAII on error;
+    //    explicit cleanup on success — see `finalize_install`).
+    let temp_install_root =
+        tempfile::tempdir().context("Failed to create temp install root for self-update")?;
+    let install_root = temp_install_root.path().to_path_buf();
+
+    // 4. Run `cargo install <crate> --root <temp_install> --force`. No
+    //    `--locked`: the published .crate ships a Cargo.lock, but a stale
+    //    lockfile would hard-fail the install; plain `cargo install`
+    //    re-resolves when the lock is stale. No `--target-dir`: cargo builds in
+    //    its own temp target dir (`CARGO_TARGET_DIR` is stripped, so a hostile
+    //    env cannot redirect it; a user `build.target-dir` config is a residual
+    //    disk edge). cwd is the storage root (it is guaranteed writable and
+    //    exists, unlike the launch dir).
     let crate_name = env!("CARGO_PKG_NAME");
-    let install_cwd = crate::config::CONFIG.global_storage_root();
     run_cargo_with_timeout(
-        &["install", crate_name, "--force"],
-        &install_cwd,
+        &[
+            OsStr::new("install"),
+            OsStr::new(crate_name),
+            OsStr::new("--root"),
+            install_root.as_os_str(),
+            OsStr::new("--force"),
+        ],
+        &crate::config::CONFIG.global_storage_root(),
         Duration::from_hours(1),
         &format!("cargo install {crate_name} --force"),
         "Update",
     )
     .await?;
 
-    // 4. Resolve the restart target: the binary `cargo install` just wrote.
-    //    Prefer `current_exe()` when the install overwrote it in place;
-    //    otherwise the cargo bin path holds the fresh copy.
-    let spawn_path = resolve_registry_spawn_path(admin_target.as_deref()).await?;
-
-    // 5. Notify: install complete, restarting.
-    notify_admin(
-        "✅ Update installed from crates.io. Restarting…",
+    // 5. Shared tail: swap, PATH freshness, drain, checkpoint, restart.
+    let fresh_binary = temp_bin_path(&install_root);
+    finalize_install(
+        &fresh_binary,
         admin_target.as_deref(),
+        "✅ Update installed from crates.io. Restarting…",
+        vec![install_root],
     )
-    .await;
+    .await
+}
 
-    // 6. Notify: starting new instance (MUST be before step 7 shutdown —
-    //    Telegram channel must still be live for this notification).
-    notify_admin("🔄 Starting new instance…", admin_target.as_deref()).await;
+/// Path to the freshly built `mahbot` binary inside a cargo install temp root.
+///
+/// `cargo install --root <install_root>` places the produced binary at
+/// `<install_root>/bin/mahbot` (`.exe` on Windows).
+fn temp_bin_path(install_root: &Path) -> PathBuf {
+    install_root
+        .join("bin")
+        .join(format!("mahbot{}", std::env::consts::EXE_SUFFIX))
+}
 
-    // 7–12. Shared finalize tail: graceful drain, checkpoint, lock release,
-    // spawn, exit. No build artifact to clean up in registry mode.
-    finalize_update_and_restart(&spawn_path, || {}).await
+/// Shared finalize tail for both update modes, after `cargo install` produced
+/// the fresh binary at `<temp_install>/bin/mahbot`.
+///
+/// 1. Validate that the fresh binary exists and is non-empty (bail otherwise —
+///    a silent empty swap would strand the daemon).
+/// 2. Capture `current_exe()` BEFORE the swap — it is always the restart
+///    target (self_replace rewrites it in place, wherever it lives).
+/// 3. Swap the running binary with the fresh one via `self_replace`. The source
+///    differs from the running exe (it lives in the temp root), which
+///    self-replace requires on Windows.
+/// 4. Notify `completion_msg` (mode-specific "build complete" / "installed").
+/// 5. Refresh the PATH-visible cargo bin copy (sourced from the freshly-swapped
+///    `current_exe`, so the manual-remediation source survives temp-root
+///    cleanup), skipping the copy when already running from the cargo bin path
+///    (`copy_to_cargo_bin`'s rename would otherwise fail on a Windows binary
+///    locked in place).
+/// 6. Notify "starting new instance" (Telegram channel must still be live).
+/// 7. Hand off to [`finalize_update_and_restart`] for the drain → checkpoint →
+///    unlock → spawn-from-`current_exe` → temp-root cleanup → exit.
+///
+/// `cleanup_paths` are the temp roots to remove after a successful spawn. On
+/// any error return the caller keeps the `TempDir` values in scope, so their
+/// RAII drops clean them up; `std::process::exit(0)` bypasses RAII, so the
+/// success path removes them in the `after_spawn` closure instead.
+async fn finalize_install(
+    fresh_binary: &Path,
+    admin_target: Option<&str>,
+    completion_msg: &str,
+    cleanup_paths: Vec<PathBuf>,
+) -> Result<()> {
+    // 1. Validate the freshly built binary.
+    let len = fs::metadata(fresh_binary)
+        .with_context(|| format!("Freshly built binary missing at {}", fresh_binary.display()))?
+        .len();
+    if len == 0 {
+        anyhow::bail!(
+            "Freshly built binary at {} is empty",
+            fresh_binary.display()
+        );
+    }
+
+    // 2. Capture the running exe before the swap — the restart target.
+    let current_exe = std::env::current_exe().context("Failed to resolve current_exe()")?;
+
+    // 3. Swap the running binary with the fresh one.
+    self_replace::self_replace(fresh_binary)
+        .with_context(|| format!("Failed to swap binary at {}", fresh_binary.display()))?;
+
+    // 4. Notify: install/build complete (swap succeeded).
+    notify_admin(completion_msg, admin_target).await;
+
+    // 5. Refresh the PATH-visible cargo bin copy (non-fatal). The source is the
+    //    freshly-swapped `current_exe` (not the temp root), so the manual
+    //    remediation in `stale_binary_notification` points at a surviving path.
+    refresh_cargo_bin(&current_exe, admin_target).await;
+
+    // 6. Notify: starting new instance (MUST be before the shutdown in
+    //    finalize_update_and_restart — the Telegram channel must still be live).
+    notify_admin("🔄 Starting new instance…", admin_target).await;
+
+    // 7. Shared finalize tail. The temp roots are removed here (after a
+    //    successful spawn) rather than by RAII: `exit(0)` bypasses destructors,
+    //    and they are never the spawn target (which is always `current_exe`),
+    //    so removal cannot race macOS Gatekeeper validation of the child.
+    finalize_update_and_restart(&current_exe, move || {
+        for path in &cleanup_paths {
+            if let Err(e) = fs::remove_dir_all(path) {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "Could not remove temp update root after successful spawn"
+                );
+            }
+        }
+    })
+    .await
 }
 
 /// Shared finalize tail for both update modes: graceful drain, final
@@ -927,13 +967,12 @@ async fn execute_registry_update() -> Result<()> {
 ///    Gatekeeper code signature validation. Spawning before `after_spawn`
 ///    guarantees the spawn target is never deleted during or before the
 ///    child's startup window.
-/// 5. Run `after_spawn` (local mode: delete the build artifact; registry mode:
-///    no-op), then `exit(0)`.
+/// 5. Run `after_spawn` (cleanup of the temp update root(s)), then `exit(0)`.
 ///
 /// `after_spawn` must not fail the update (best-effort cleanup) — a panic here
 /// would still exit the process, so it must be infallible in practice.
 async fn finalize_update_and_restart(spawn_path: &Path, after_spawn: impl FnOnce()) -> Result<()> {
-    // 10. Begin the graceful drain (local numbering; shared across modes).
+    // 1. Begin the graceful drain.
     UPDATE_FINALIZING.store(true, Ordering::SeqCst);
     crate::shutdown::drain_begin();
     while !crate::shutdown::shutdown_token().is_cancelled() {
@@ -941,14 +980,14 @@ async fn finalize_update_and_restart(spawn_path: &Path, after_spawn: impl FnOnce
     }
     crate::tools::browser::close_all_browser_sessions().await;
 
-    // 11. Checkpoint all databases BEFORE releasing the instance lock and
-    //     spawning the replacement (see doc comment above).
+    // 2. Checkpoint all databases BEFORE releasing the instance lock and
+    //    spawning the replacement (see doc comment above).
     crate::db::checkpoint::checkpoint_all_databases().await;
 
-    // 12. Release instance lock so the child process can acquire it on startup.
+    // 3. Release instance lock so the child process can acquire it on startup.
     release_instance_lock().await;
 
-    // 13. Spawn the new instance from the determined spawn path.
+    // 4. Spawn the new instance from the determined spawn path.
     if let Err(e) = spawn_new_instance_from(spawn_path) {
         // Spawn failed — the process stays alive (unless a genuine window
         // close was requested during the finalizing window, in which case the
@@ -962,10 +1001,10 @@ async fn finalize_update_and_restart(spawn_path: &Path, after_spawn: impl FnOnce
         return Err(e);
     }
 
-    // 14. Post-spawn cleanup (local mode: delete build artifact).
+    // 5. Post-spawn cleanup (remove the temp update roots).
     after_spawn();
 
-    // 15. Exit — spawn succeeded.
+    // Exit — spawn succeeded.
     std::process::exit(0);
 }
 
@@ -975,16 +1014,23 @@ async fn finalize_update_and_restart(spawn_path: &Path, after_spawn: impl FnOnce
 /// local-build and registry-install update paths (the only differences are the
 /// arguments, working directory, timeout, and user-facing labels).
 ///
-/// `args` are the cargo arguments (excluding the `cargo` binary itself),
+/// `args` are the cargo arguments (excluding the `cargo` binary itself, each
+/// as `&OsStr` so paths and flags pass through without Unicode assumption),
 /// `cwd` the working directory, `timeout` the hard deadline, `label` a
 /// short human-readable description used in logs and error messages (e.g.
-/// "cargo build --release"), and `failure_kind` the noun used in failure
-/// messages ("Build" / "Update").
+/// "cargo install --path --locked"), and `failure_kind` the noun used in
+/// failure messages ("Build" / "Update").
+///
+/// `CARGO_TARGET_DIR` is stripped so `cargo install` (registry mode, which
+/// passes no `--target-dir`) never redirects its build into an uncleaned tree;
+/// local mode passes `--target-dir` explicitly, which takes precedence, so this
+/// is purely defensive. `CARGO_HOME` is NOT stripped — the child needs it for
+/// the toolchain/registry cache.
 ///
 /// On failure the error is returned (no admin notification — the caller owns
 /// failure reporting via the single [`handle_update_command`]/GUI path).
 async fn run_cargo_with_timeout(
-    args: &[&str],
+    args: &[&OsStr],
     cwd: &Path,
     timeout: Duration,
     label: &str,
@@ -996,6 +1042,10 @@ async fn run_cargo_with_timeout(
         tokio::process::Command::new("cargo")
             .args(args)
             .current_dir(cwd)
+            // Strip any inherited CARGO_TARGET_DIR so registry-mode cargo
+            // install (no --target-dir) never redirects its build into an
+            // uncleaned tree.
+            .env_remove("CARGO_TARGET_DIR")
             // kill_on_drop: if the timeout fires, the cargo child must die
             // too rather than keep compiling in the background. For
             // `cargo install` an orphaned child could even complete and swap
@@ -1031,107 +1081,6 @@ async fn run_cargo_with_timeout(
             Ok(())
         }
     }
-}
-
-/// Resolve the restart target after a successful `cargo install --force`.
-///
-/// The freshly installed binary is the correct spawn target. `cargo install`
-/// honors `install.root` config / `--root`, so the fresh copy may overwrite
-/// `current_exe()` in place OR land at the default cargo bin path — compare
-/// modification times and spawn the newest executable. When the freshly
-/// installed binary is not the running one, the admin is notified that the
-/// old copy is left stale.
-///
-/// **Known limitation (custom install roots):** when `install.root` /
-/// `CARGO_INSTALL_ROOT` / `--root` points somewhere that is neither
-/// `current_exe()` nor the default cargo bin path (`$CARGO_HOME/bin` /
-/// `~/.cargo/bin`), the fresh binary lands at a path this function never
-/// looks at, so it falls back to `current_exe()` — no admin notification
-/// fires (the "fresh elsewhere" branch below is not taken) and the update
-/// appears to succeed while the PATH-visible binary stays stale, so the next
-/// manual start still runs the old version. Detecting the true install root
-/// would require replicating cargo's full config resolution, so this narrow
-/// case is accepted and documented rather than guessed.
-///
-/// The chosen spawn target is validated with [`is_executable`] via the shared
-/// [`executable_or_current_exe`] helper (mirroring [`resolve_spawn_path`]);
-/// if it is not executable, falls back to `current_exe()`.
-async fn resolve_registry_spawn_path(admin_target: Option<&str>) -> Result<PathBuf> {
-    let current_exe = std::env::current_exe()
-        .context("Failed to resolve current_exe() for registry update restart")?;
-
-    // `cargo install --force` overwrote the running binary in place — restart
-    // from current_exe (the common default-root case).
-    let cargo_bin = resolve_cargo_bin_path();
-    if let Some(cargo_bin) = &cargo_bin
-        && canonicalize_safe(&current_exe) == canonicalize_safe(cargo_bin)
-    {
-        info!(
-            "cargo install updated the running binary in place at `{}` — restarting from current_exe",
-            current_exe.display()
-        );
-        return Ok(current_exe);
-    }
-
-    // The fresh copy landed elsewhere (custom `--root`, `install.root` config,
-    // or a manually-moved binary). Prefer whichever of `current_exe()` and the
-    // cargo bin path is newest — the just-installed binary has the newest
-    // mtime. Notify the admin when the running copy is left stale.
-    let mtime =
-        |path: &Path| -> Option<std::time::SystemTime> { fs::metadata(path).ok()?.modified().ok() };
-    let current_mtime = mtime(&current_exe);
-    let mut spawn = current_exe.clone();
-    let mut fresh_elsewhere = false;
-
-    if let Some(cargo_bin) = &cargo_bin
-        && is_executable(cargo_bin)
-    {
-        let cargo_mtime = mtime(cargo_bin);
-        let cargo_fresher = match (cargo_mtime, current_mtime) {
-            (Some(c), Some(s)) => c > s,
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
-        if cargo_fresher {
-            spawn = cargo_bin.clone();
-            fresh_elsewhere = true;
-        }
-    }
-
-    // Validate the spawn target; on fallback the helper returns `current_exe`
-    // (or bails) — return it before the `fresh_elsewhere` admin notification,
-    // which must not fire when restarting from `current_exe` instead.
-    if !is_executable(&spawn) {
-        return executable_or_current_exe(&spawn, &current_exe, "Registry");
-    }
-
-    if fresh_elsewhere {
-        notify_admin(
-            &format!(
-                "⚠️ Update installed to `{}`. The previously running copy at `{}` \
-                 was not updated in place (different install root). \
-                 Restarting from the freshly installed binary.",
-                spawn.display(),
-                current_exe.display(),
-            ),
-            admin_target,
-        )
-        .await;
-        info!(
-            path = %spawn.display(),
-            "Restarting from freshly installed binary (running copy was stale)"
-        );
-    } else {
-        // No fresher binary at the cargo bin path: either the install
-        // overwrote `current_exe()` in place (canonical-equality check
-        // missed only if cargo bin resolution failed) or the install landed
-        // at a custom root this function cannot see (documented limitation).
-        info!(
-            path = %spawn.display(),
-            "Restarting from current_exe (no fresher binary at the cargo bin path)"
-        );
-    }
-    Ok(spawn)
 }
 
 /// Look up an admin user's Telegram reply target.
@@ -1277,6 +1226,34 @@ fn resolve_cargo_bin_path() -> Option<PathBuf> {
     Some(crate::util::cargo_bin_dir()?.join(exe_name))
 }
 
+/// Copy the freshly built binary to the PATH-visible cargo bin path, so a
+/// `mahbot` invoked from PATH runs the new version even when the daemon started
+/// from a different path (e.g. the repo's `target/release`).
+///
+/// The source is the freshly-swapped `current_exe` (the running binary after
+/// `self_replace`), which persists across the temp-root cleanup — so the manual
+/// remediation in [`copy_to_cargo_bin`] points at a surviving path.
+///
+/// Skipped when already running from the cargo bin path (self_replace already
+/// updated it in place) — copying onto it would fail the rename on a Windows
+/// binary locked in place. Non-fatal: the running binary is already updated via
+/// self_replace; failures are logged and reported to the admin inside
+/// [`copy_to_cargo_bin`].
+async fn refresh_cargo_bin(current_exe: &Path, admin_target: Option<&str>) {
+    let Some(cargo_bin) = resolve_cargo_bin_path() else {
+        warn!("No cargo bin path resolved — PATH-visible binary not refreshed");
+        return;
+    };
+    if canonicalize_safe(current_exe) == canonicalize_safe(&cargo_bin) {
+        info!(
+            "Already running from cargo bin path `{}` — skipping install copy",
+            cargo_bin.display()
+        );
+        return;
+    }
+    copy_to_cargo_bin(current_exe, &cargo_bin, admin_target).await;
+}
+
 /// Format an admin-facing notification for a copy-to-cargo-bin failure.
 ///
 /// The message tells the admin that the PATH-visible binary is stale and
@@ -1298,14 +1275,9 @@ fn stale_binary_notification(reason: &str, source: &Path, dest: &Path) -> String
 /// crashes mid-copy, the install path retains its old (stale but valid) binary.
 ///
 /// This function is intentionally non-fatal — the running process is already
-/// updated via `self_replace`. On failure, logs a warning, attempts admin
-/// notification, and returns `None` to signal the caller to fall back to
-/// `current_exe()` for spawning.
-async fn copy_to_cargo_bin(
-    source: &Path,
-    dest: &Path,
-    admin_target: Option<&str>,
-) -> Option<PathBuf> {
+/// updated via `self_replace`, so the caller doesn't need a result. On failure
+/// it logs a warning and attempts admin notification.
+async fn copy_to_cargo_bin(source: &Path, dest: &Path, admin_target: Option<&str>) {
     // Create parent directory if it doesn't exist.
     if let Some(parent) = dest.parent()
         && let Err(e) = fs::create_dir_all(parent)
@@ -1327,7 +1299,7 @@ async fn copy_to_cargo_bin(
             admin_target,
         )
         .await;
-        return None;
+        return;
     }
 
     // Write to a temp file first, then atomically rename to the target.
@@ -1352,7 +1324,7 @@ async fn copy_to_cargo_bin(
             admin_target,
         )
         .await;
-        return None;
+        return;
     }
 
     // Atomically replace the target with the temp file.
@@ -1374,29 +1346,10 @@ async fn copy_to_cargo_bin(
             admin_target,
         )
         .await;
-        return None;
+        return;
     }
 
     info!(path = %dest.display(), "Installed new binary to cargo bin path");
-    Some(dest.to_path_buf())
-}
-
-/// Determine whether the build artifact at `binary_path` can be safely deleted.
-///
-/// Returns `true` only when `binary_path` differs from both the current
-/// executable path and the cargo install path (after canonicalization).
-/// This guarantees the spawn target is never deleted, preventing the macOS
-/// Gatekeeper race (see [`execute_update`] for details).
-fn should_delete_build_artifact(
-    binary_path: &Path,
-    current_exe_path: &Path,
-    cargo_bin_path: Option<&Path>,
-) -> bool {
-    let binary_canon = canonicalize_safe(binary_path);
-    let current_exe_canon = canonicalize_safe(current_exe_path);
-    let cargo_bin_canon = cargo_bin_path.map(canonicalize_safe);
-
-    binary_canon != current_exe_canon && (cargo_bin_canon.as_ref() != Some(&binary_canon))
 }
 
 /// Canonicalize a path, falling back to the lexical path on failure.
@@ -1409,83 +1362,10 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Determine the spawn target path after a successful build and self_replace.
-///
-/// Returns the cargo bin install path if the copy succeeds, or falls back to
-/// `current_exe()` if:
-/// - No cargo bin path could be resolved (no `CARGO_HOME` or `UserDirs`).
-/// - The binary is already running from the cargo bin path (self_replace
-///   already updated it in-place).
-/// - The copy to the cargo bin path fails.
-///
-/// Validates that the chosen spawn target exists and is executable (via the
-/// shared [`executable_or_current_exe`] helper). If validation fails, falls
-/// back to `current_exe()`.
-async fn resolve_spawn_path(
-    built_binary: &Path,
-    cargo_bin: Option<&Path>,
-    admin_target: Option<&str>,
-) -> Result<PathBuf> {
-    let current_exe = std::env::current_exe()
-        .context("Failed to resolve current_exe() for spawn path resolution")?;
-
-    let candidate = if let Some(cargo_bin) = cargo_bin {
-        // If we're already running from the cargo bin path, self_replace
-        // already updated it in-place — skip the copy.
-        if canonicalize_safe(&current_exe) == canonicalize_safe(cargo_bin) {
-            info!(
-                "Already running from cargo bin path `{}` — skipping install copy",
-                cargo_bin.display()
-            );
-            cargo_bin.to_path_buf()
-        } else {
-            // Attempt the install copy; fall back to current_exe() on failure.
-            copy_to_cargo_bin(built_binary, cargo_bin, admin_target)
-                .await
-                .unwrap_or_else(|| current_exe.clone())
-        }
-    } else {
-        // No cargo bin path could be resolved (no $CARGO_HOME, no home dir).
-        current_exe.clone()
-    };
-
-    // Validate the chosen spawn target; falls back to current_exe() (or bails).
-    executable_or_current_exe(&candidate, &current_exe, "Primary")
-}
-
-/// Validate that the chosen spawn target exists and is executable, falling
-/// back to `current_exe()` (or bailing when that is not executable either).
-///
-/// `warn_label` distinguishes the two resolvers ("Registry" / "Primary").
-/// On fallback the returned path is always `current_exe` — a caller with a
-/// side effect after validation (see [`resolve_registry_spawn_path`]) must
-/// early-return rather than fall through.
-fn executable_or_current_exe(
-    candidate: &Path,
-    current_exe: &Path,
-    warn_label: &str,
-) -> Result<PathBuf> {
-    if !is_executable(candidate) {
-        warn!(
-            path = %candidate.display(),
-            "{warn_label} spawn target not executable — falling back to current_exe()"
-        );
-        if !is_executable(current_exe) {
-            anyhow::bail!(
-                "Neither cargo bin path `{}` nor current_exe `{}` is executable",
-                candidate.display(),
-                current_exe.display(),
-            );
-        }
-        return Ok(current_exe.to_path_buf());
-    }
-    Ok(candidate.to_path_buf())
-}
-
 /// Spawn the new mahbot instance as a detached child process from the given path.
 ///
-/// The `binary_path` must point to an existing, executable binary (typically the
-/// cargo install bin path or `current_exe()` as fallback).
+/// The `binary_path` must point to an existing, executable binary — always the
+/// captured `current_exe()` after the swap in the unified update flow.
 ///
 /// On Unix: null stdin/stdout, stderr → update.log. On Windows: same + `DETACHED_PROCESS | CREATE_NO_WINDOW`.
 /// On spawn failure the error is returned (no admin notification — the caller
@@ -1495,9 +1375,9 @@ fn executable_or_current_exe(
 /// ## macOS Gatekeeper safety
 ///
 /// The caller guarantees that `binary_path` is never deleted before or during
-/// the child's startup window (see deletion safety in [`execute_update`]).
-/// Deleting the spawn target while Gatekeeper is validating its code signature
-/// causes `syspolicyd` to SIGKILL the child.
+/// the child's startup window (see the temp-root cleanup rationale in
+/// [`finalize_install`]). Deleting the spawn target while Gatekeeper is
+/// validating its code signature causes `syspolicyd` to SIGKILL the child.
 fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
 
@@ -1568,17 +1448,7 @@ fn truncate_to_last_64k(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::util::lock::{lock_file_path, try_flock};
-
-    /// Make a file executable (0o755) on Unix; no-op on other platforms.
-    fn make_executable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, PermissionsExt::from_mode(0o755)).unwrap();
-        }
-        #[cfg(not(unix))]
-        let _ = path;
-    }
+    use crate::util::test::make_executable;
 
     #[test]
     fn test_truncate_to_last_64k_no_truncation() {
@@ -1879,64 +1749,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn test_is_executable_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test_exe");
-
-        // File doesn't exist — should not be executable.
-        assert!(!is_executable(&file_path));
-
-        // Create a non-executable file.
-        std::fs::write(&file_path, "content").unwrap();
-        std::fs::set_permissions(&file_path, PermissionsExt::from_mode(0o644)).unwrap();
-        assert!(
-            !is_executable(&file_path),
-            "File with mode 644 should not be executable"
-        );
-
-        // Set executable bit.
-        make_executable(&file_path);
-        assert!(
-            is_executable(&file_path),
-            "File with mode 755 should be executable"
-        );
-
-        // Also test with only owner execute bit.
-        std::fs::set_permissions(&file_path, PermissionsExt::from_mode(0o100)).unwrap();
-        assert!(
-            is_executable(&file_path),
-            "File with mode 100 should be executable"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn test_is_executable_on_windows() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test_exe.exe");
-
-        // File doesn't exist — should not be executable.
-        assert!(!is_executable(&file_path));
-
-        // Create an exe file.
-        std::fs::write(&file_path, "content").unwrap();
-        assert!(
-            is_executable(&file_path),
-            "File with .exe extension should be executable"
-        );
-
-        // Non-exe file should not be executable.
-        let txt_path = dir.path().join("test.txt");
-        std::fs::write(&txt_path, "content").unwrap();
-        assert!(
-            !is_executable(&txt_path),
-            "File with .txt extension should not be executable"
-        );
-    }
-
     #[tokio::test]
     async fn test_copy_to_cargo_bin_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -1947,10 +1759,8 @@ mod tests {
         std::fs::write(&source, "binary content").unwrap();
         make_executable(&source);
 
-        // Copy should succeed.
-        let result = copy_to_cargo_bin(&source, &dest, None).await;
-        assert!(result.is_some(), "Copy should succeed");
-        assert_eq!(result.unwrap(), dest);
+        // Copy should succeed (non-fatal, returns nothing).
+        copy_to_cargo_bin(&source, &dest, None).await;
 
         // Verify destination exists and has correct content.
         assert!(dest.is_file(), "Destination should exist");
@@ -1967,9 +1777,8 @@ mod tests {
         let source = dir.path().join("nonexistent_source");
         let dest = dir.path().join("dest_bin");
 
-        // Copy should fail gracefully.
-        let result = copy_to_cargo_bin(&source, &dest, None).await;
-        assert!(result.is_none(), "Copy should return None on failure");
+        // Copy should fail gracefully (non-fatal, returns nothing).
+        copy_to_cargo_bin(&source, &dest, None).await;
         assert!(!dest.exists(), "Destination should not be created");
     }
 
@@ -1981,127 +1790,13 @@ mod tests {
 
         std::fs::write(&source, "content").unwrap();
 
-        // Copy should create parent directories.
-        let result = copy_to_cargo_bin(&source, &dest, None).await;
-        assert!(
-            result.is_some(),
-            "Copy should create parent dirs and succeed"
-        );
+        // Copy should create parent directories (non-fatal, returns nothing).
+        copy_to_cargo_bin(&source, &dest, None).await;
         assert!(dest.is_file(), "Destination should exist");
         assert!(
             dest.parent().unwrap().is_dir(),
             "Parent directory should exist"
         );
-    }
-
-    #[test]
-    fn test_should_delete_build_artifact() {
-        let cases: &[(&str, &str, Option<&str>, bool)] = &[
-            (
-                "/usr/local/bin/mahbot",
-                "/usr/local/bin/mahbot",
-                Some("/usr/local/bin/mahbot"),
-                false,
-            ), // all same
-            (
-                "/build/target/release/mahbot",
-                "/usr/local/bin/mahbot",
-                Some("/home/user/.cargo/bin/mahbot"),
-                true,
-            ), // all different
-            (
-                "/home/user/.cargo/bin/mahbot",
-                "/home/user/dev/mahbot/target/release/mahbot",
-                Some("/home/user/.cargo/bin/mahbot"),
-                false,
-            ), // binary matches cargo
-            (
-                "/usr/local/bin/mahbot",
-                "/usr/local/bin/mahbot",
-                Some("/home/user/.cargo/bin/mahbot"),
-                false,
-            ), // binary matches current, differs from cargo
-            (
-                "/build/target/release/mahbot",
-                "/usr/local/bin/mahbot",
-                None,
-                true,
-            ), // no cargo bin, differs
-            (
-                "/usr/local/bin/mahbot",
-                "/usr/local/bin/mahbot",
-                None,
-                false,
-            ), // no cargo bin, same
-        ];
-        for &(binary, current, cargo_bin, expected) in cases {
-            assert_eq!(
-                should_delete_build_artifact(
-                    Path::new(binary),
-                    Path::new(current),
-                    cargo_bin.map(Path::new)
-                ),
-                expected,
-                "binary={binary}, current={current}, cargo_bin={cargo_bin:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_resolve_spawn_path_falls_back_to_current_exe_on_copy_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("nonexistent_source"); // doesn't exist
-        let dest = dir.path().join("install").join("mahbot");
-        let current_exe = std::env::current_exe().unwrap();
-
-        let result = resolve_spawn_path(&source, Some(dest.as_path()), None).await;
-
-        assert!(
-            result.is_ok(),
-            "Should fall back to current_exe on copy failure"
-        );
-        assert_eq!(
-            result.unwrap(),
-            current_exe,
-            "Should return current_exe when copy fails"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_spawn_path_no_cargo_bin() {
-        let source = Path::new("/tmp/nonexistent_binary");
-        let current_exe = std::env::current_exe().unwrap();
-
-        let result = resolve_spawn_path(source, None, None).await;
-
-        assert!(
-            result.is_ok(),
-            "Should return current_exe when no cargo bin path"
-        );
-        assert_eq!(result.unwrap(), current_exe);
-    }
-
-    #[tokio::test]
-    async fn test_resolve_spawn_path_copy_success() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("built_bin");
-        let dest = dir.path().join("cargo_bin").join("mahbot");
-
-        // Create an executable source binary.
-        std::fs::write(&source, "binary payload").unwrap();
-        make_executable(&source);
-
-        // On success, resolve_spawn_path should return the cargo bin path
-        // (the dest path), not current_exe().
-        let result = resolve_spawn_path(&source, Some(dest.as_path()), None).await;
-        assert!(result.is_ok(), "resolve_spawn_path should succeed");
-        let path = result.unwrap();
-        assert_eq!(
-            path, dest,
-            "Should return the cargo bin path on successful copy"
-        );
-        assert!(dest.is_file(), "Destination should exist");
-        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "binary payload");
     }
 
     #[test]

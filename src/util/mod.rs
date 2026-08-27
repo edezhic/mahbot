@@ -2420,3 +2420,66 @@ mod reference_image_tests {
         assert_eq!(decoded.dimensions(), (1, 2));
     }
 }
+
+#[cfg(test)]
+mod executable_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_exe");
+
+        // File doesn't exist — should not be executable.
+        assert!(!is_executable(&file_path));
+
+        // Create a non-executable file.
+        std::fs::write(&file_path, "content").unwrap();
+        std::fs::set_permissions(&file_path, PermissionsExt::from_mode(0o644)).unwrap();
+        assert!(
+            !is_executable(&file_path),
+            "File with mode 644 should not be executable"
+        );
+
+        // Set executable bit.
+        crate::util::test::make_executable(&file_path);
+        assert!(
+            is_executable(&file_path),
+            "File with mode 755 should be executable"
+        );
+
+        // Also test with only owner execute bit.
+        std::fs::set_permissions(&file_path, PermissionsExt::from_mode(0o100)).unwrap();
+        assert!(
+            is_executable(&file_path),
+            "File with mode 100 should be executable"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_is_executable_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_exe.exe");
+
+        // File doesn't exist — should not be executable.
+        assert!(!is_executable(&file_path));
+
+        // Create an exe file.
+        std::fs::write(&file_path, "content").unwrap();
+        assert!(
+            is_executable(&file_path),
+            "File with .exe extension should be executable"
+        );
+
+        // Non-exe file should not be executable.
+        let txt_path = dir.path().join("test.txt");
+        std::fs::write(&txt_path, "content").unwrap();
+        assert!(
+            !is_executable(&txt_path),
+            "File with .txt extension should not be executable"
+        );
+    }
+}
