@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use crate::agent::role::SANITATION_ROLE;
 use crate::pipeline::board::Ticket;
 use crate::prompt::{load_prompt, substitute};
 use crate::{Agent, Role, Workspace};
@@ -11,7 +10,7 @@ use super::{
     BoardStore, FinalizeOutcome, SYSTEM_ROLE, StageRunKind, TicketPhase, TransitionCtx, board,
     bounce_to_development, clear_implementation_roster, comment_and_transition,
     determine_notify_policy, error, guard_stage, info, is_ticket_in_phase,
-    list_new_or_untracked_files, pause_freezing, raw_response_dump_section, run_git_status,
+    list_new_or_untracked_files, pause_freezing, reset_phase_attempt, run_git_status,
     run_stage_agent, sync_phase_job_task, warn, with_comment_and_transition,
 };
 
@@ -181,76 +180,6 @@ fn format_commit_summary(short_hash: &str, added: i64, removed: i64) -> String {
     }
 }
 
-/// Record a sanitation failure: add a SANITATION_ROLE comment and clear the
-/// ticket's running roster rows.
-async fn record_sanitation_failure(
-    ticket_id: &str,
-    job_id: &str,
-    reason: impl std::fmt::Display,
-    raw_dump: Option<&crate::retry::RetryExhausted>,
-) {
-    let reason_str = match raw_dump {
-        Some(failure) => format!(
-            "{} — {reason}\n\n{}",
-            load_prompt("pipeline/sanitation_failed.md"),
-            raw_response_dump_section(failure)
-        ),
-        None => format!(
-            "{} — {reason}",
-            load_prompt("pipeline/sanitation_failed.md")
-        ),
-    };
-    if let Err(e) = crate::db::with_tx(
-        &board().conn,
-        ticket_id,
-        "record sanitation failure",
-        async |tx| {
-            BoardStore::add_comment_tx(tx, ticket_id, SANITATION_ROLE, &reason_str).await?;
-            Ok(())
-        },
-    )
-    .await
-    {
-        warn!(
-            ticket = %ticket_id,
-            error = %e,
-            "Failed to record sanitation failure (failure marker comment)",
-        );
-    }
-    if let Err(e) =
-        crate::jobs::clear_launched_agents_for_job(&crate::session::store().conn, job_id).await
-    {
-        warn!(
-            ticket = %ticket_id,
-            error = %e,
-            "Failed to clear running agents after sanitation failure",
-        );
-    }
-}
-
-/// Shared sanitation-failure tail: record the failure marker and route the
-/// non-success through the unified bounce-to-development path.
-async fn finalize_sanitation_failure(
-    ticket: &Ticket,
-    job_id: &str,
-    reason: String,
-    raw_dump: Option<&crate::retry::RetryExhausted>,
-    ws: &Workspace,
-) {
-    record_sanitation_failure(&ticket.id, job_id, reason, raw_dump).await;
-    bounce_to_development(
-        ticket,
-        TicketPhase::InSanitation,
-        "Sanitation",
-        /* drains_siblings */ true,
-        SANITATION_ROLE,
-        "",
-        job_id,
-        ws,
-    )
-    .await;
-}
-
 /// Absorb the post-run tail for the sanitation stage: phase/drain guards,
 /// response-None failure block, verdict extraction, and job terminalization.
 pub(crate) async fn finalize_sanitation_stage(
@@ -281,14 +210,15 @@ pub(crate) async fn finalize_sanitation_stage(
     if response.is_none() {
         warn!(
             ticket = %ticket.id,
-            "Sanitation agent returned no output — bouncing to development"
+            "Sanitation agent returned no output — resetting for a fresh attempt"
         );
-        finalize_sanitation_failure(
+        reset_phase_attempt(
             ticket,
+            TicketPhase::InSanitation,
             job_id,
-            "agent returned no output".to_string(),
-            None,
-            ws,
+            "sanitation failure",
+            "Sanitation could not complete the round (the agent did not respond) \
+             — resetting for a fresh attempt.",
         )
         .await;
         return;
@@ -306,14 +236,15 @@ pub(crate) async fn finalize_sanitation_stage(
             warn!(
                 ticket = %ticket.id,
                 error = %failure,
-                "Failed to extract sanitation verdict — bouncing to development"
+                "Failed to extract sanitation verdict — resetting for a fresh attempt"
             );
-            finalize_sanitation_failure(
+            reset_phase_attempt(
                 ticket,
+                TicketPhase::InSanitation,
                 job_id,
-                format!("verdict extraction error: {failure}"),
-                Some(&failure),
-                ws,
+                "sanitation failure",
+                "Sanitation could not complete the round (the verdict could not be \
+                 extracted) — resetting for a fresh attempt.",
             )
             .await;
         }
