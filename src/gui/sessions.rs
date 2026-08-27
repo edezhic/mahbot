@@ -202,16 +202,20 @@ impl SessionsState {
 
     pub(crate) fn subscription(&self) -> iced::Subscription<SessionsMessage> {
         // Emit a 1-second timer for auto-refresh when the page is active and
-        // a session is selected.
+        // a session is selected. Frame ticks are subscribed only while the
+        // selection fade is animating — an always-on frames() subscription
+        // closes a self-sustaining redraw loop (redraw → AnimTick → redraw).
+        let mut subs: Vec<iced::Subscription<SessionsMessage>> = Vec::new();
         if self.page_active && self.selected_session.is_some() {
-            iced::Subscription::batch([
-                window::frames().map(SessionsMessage::AnimTick),
+            subs.push(
                 iced::time::every(Duration::from_secs(1))
                     .map(|_| SessionsMessage::AutoRefreshMessages),
-            ])
-        } else {
-            window::frames().map(SessionsMessage::AnimTick)
+            );
         }
+        if self.selected_anim.is_animating() {
+            subs.push(window::frames().map(SessionsMessage::AnimTick));
+        }
+        iced::Subscription::batch(subs)
     }
 
     /// Notify the sessions state whether the Sessions page is currently visible.

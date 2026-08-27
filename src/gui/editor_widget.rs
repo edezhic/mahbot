@@ -2877,13 +2877,12 @@ where
                     1000 - ms_into_cycle
                 };
                 let next = now + Duration::from_millis(ms_until_toggle + 1);
+                // Schedule the next blink toggle. `request_redraw_at` is
+                // sufficient: it arms the event-loop wake-up and the resulting
+                // draw() evaluates the blink state (computed from wall-clock
+                // time in draw_cursor). Adding `request_redraw()` here would
+                // cancel this At schedule and re-arm a per-frame redraw loop.
                 shell.request_redraw_at(window::RedrawRequest::At(next));
-                // Also request an immediate redraw so draw() is called
-                // in the current frame. Iced 0.14's reactive rendering
-                // may skip draw() for undamaged widgets when only
-                // request_redraw_at was used; request_redraw ensures
-                // the cursor blink state is evaluated now.
-                shell.request_redraw();
             }
 
             _ => {}

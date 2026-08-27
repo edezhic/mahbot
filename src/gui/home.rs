@@ -998,12 +998,15 @@ impl HomeState {
             .into()
     }
 
-    #[allow(clippy::unused_self)]
     pub fn subscription(&self) -> iced::Subscription<HomeMessage> {
-        let mut subs = vec![
-            iced::Subscription::run(chat_stream_producer),
-            iced::Subscription::run(typing_tick),
-        ];
+        let mut subs = vec![iced::Subscription::run(chat_stream_producer)];
+
+        // The typing-indicator tick only advances while the user is actually
+        // typing; subscribe it only then to avoid waking the runtime at 2Hz
+        // when idle. The handler already no-ops when `self.typing` is false.
+        if self.typing {
+            subs.push(iced::Subscription::run(typing_tick));
+        }
 
         // Keyboard shortcuts: Cmd+Z → undo, Cmd+Shift+Z → redo.
         // Also track modifier changes for shift+click text selection.

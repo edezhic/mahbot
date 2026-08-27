@@ -238,13 +238,18 @@ impl LogsState {
     }
 
     pub fn subscription(&self) -> Subscription<LogMessage> {
-        let stream_sub = if self.paused || self.active_tab != LogsTab::AllLogs {
-            Subscription::none()
-        } else {
-            iced::Subscription::run(log_stream_producer)
-        };
-
-        Subscription::batch([stream_sub, window::frames().map(LogMessage::AnimTick)])
+        // Live log stream only while the All Logs tab is active and unpaused.
+        // Frame ticks are subscribed only while the fade animation is running —
+        // an always-on frames() subscription closes a self-sustaining redraw
+        // loop (redraw → AnimTick → redraw).
+        let mut subs: Vec<Subscription<LogMessage>> = Vec::new();
+        if !self.paused && self.active_tab == LogsTab::AllLogs {
+            subs.push(iced::Subscription::run(log_stream_producer));
+        }
+        if self.fade_anim.is_animating() {
+            subs.push(window::frames().map(LogMessage::AnimTick));
+        }
+        Subscription::batch(subs)
     }
 
     #[expect(clippy::too_many_lines)]
