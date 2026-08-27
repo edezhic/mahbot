@@ -123,6 +123,13 @@ const REANNOUNCE_EVERY_CHECKS: u64 = 10;
 /// the wal-guard's periodic reading stays flat at the value left by the boot
 /// pre-flight (which runs before any lock exists and is reset right after).
 /// A rising value means a daemon-side open+close path was reintroduced.
+///
+/// Tests that reach the path-based readers (via `inspect_store_at`/
+/// `inspect_store`/`diagnose_all_stores` with `StoreFds::none()`, or the
+/// `debug --db` detect/dump path) MUST be serialized under the `tshm_counter`
+/// group — otherwise they can run concurrently with the counter-asserting test
+/// `path_read_counts_open_close_and_fd_read_does_not` and perturb its exact
+/// before/after delta.
 static TSHM_OPEN_CLOSE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Current daemon-side `-tshm`/`-wal` open+close count.

@@ -1944,7 +1944,7 @@ mod tests {
     /// Serialized: `guard_panics` swaps the process-global panic hook, so
     /// guard windows must not overlap other debug tests.
     #[tokio::test]
-    #[serial_test::serial(family)]
+    #[serial_test::serial(family, tshm_counter)]
     async fn run_debug_queries_a_real_store_read_only() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let args = vec![
@@ -1989,7 +1989,11 @@ mod tests {
     /// ```
     #[ignore = "burns the full 15 s torn-frame retry backoff on a crafted artifact state; runs only when explicitly invoked"]
     #[tokio::test]
-    #[serial_test::serial(family)]
+    /// Serialized under `tshm_counter` too: this `--db` artifact path performs
+    /// path-based coordination reads that increment `TSHM_OPEN_CLOSE_COUNT`, and
+    /// that side effect persists under `--ignored` — so the key must not be
+    /// dropped later as seemingly-dead.
+    #[serial_test::serial(family, tshm_counter)]
     async fn run_debug_reports_artifact_instead_of_torn_frame() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
@@ -2071,7 +2075,11 @@ mod tests {
     /// ```
     #[ignore = "burns the full 15 s torn-frame retry backoff on a crafted artifact state; runs only when explicitly invoked"]
     #[tokio::test]
-    #[serial_test::serial(family)]
+    /// Serialized under `tshm_counter` too: this `--db all` artifact path
+    /// performs path-based coordination reads that increment
+    /// `TSHM_OPEN_CLOSE_COUNT`, and that side effect persists under
+    /// `--ignored` — so the key must not be dropped later as seemingly-dead.
+    #[serial_test::serial(family, tshm_counter)]
     async fn run_debug_all_reports_failure_summary() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let db_dir = dir.path().join("db");
@@ -2167,7 +2175,7 @@ mod tests {
     /// Serialized: `guard_panics` swaps the process-global panic hook, so
     /// guard windows must not overlap other debug tests.
     #[tokio::test]
-    #[serial_test::serial(family)]
+    #[serial_test::serial(family, tshm_counter)]
     async fn run_debug_dumps_schema_without_sql() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let args = vec![
@@ -2199,7 +2207,7 @@ mod tests {
     /// Serialized: `guard_panics` swaps the process-global panic hook, so
     /// guard windows must not overlap other debug tests.
     #[tokio::test]
-    #[serial_test::serial(family)]
+    #[serial_test::serial(family, tshm_counter)]
     async fn run_debug_dump_all_reports_missing_stores() {
         let (_store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
         let args = vec![
@@ -3014,8 +3022,12 @@ mod tests {
         );
     }
 
-    /// `debug detect` classifies synthetic states without opening anything.
+    /// `debug detect` classifies synthetic states without opening the store
+    /// through turso. It still performs path-based coordination reads (via
+    /// `run_debug_detect`), so it must be serialized under `tshm_counter`
+    /// alongside the counter-asserting test.
     #[test]
+    #[serial_test::serial(tshm_counter)]
     fn debug_detect_reports_non_healthy_state() {
         let dir = tempfile::TempDir::new().unwrap();
         write_tshm_only(dir.path(), "board");
