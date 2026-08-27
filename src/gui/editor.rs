@@ -147,6 +147,15 @@ fn empty_placeholder(
         .into()
 }
 
+/// Wrap a bar row in the full-width bar container. The `.width(Length::Fill)`
+/// keeps the bar background (theme::container_bar) spanning the full width.
+fn bar_harness<'a>(bar: impl Into<Element<'a, EditorMessage>>) -> Element<'a, EditorMessage> {
+    container(bar)
+        .style(theme::container_bar)
+        .width(Length::Fill)
+        .into()
+}
+
 // ── Types ─────────────────────────────────────────────────────────
 
 /// File-system entry for the directory tree.
@@ -5227,12 +5236,7 @@ impl EditorState {
         .align_y(Alignment::Center)
         .padding([4, 8]);
 
-        Some(
-            container(bar)
-                .style(theme::container_bar)
-                .width(Length::Fill)
-                .into(),
-        )
+        Some(bar_harness(bar))
     }
 
     /// Build the go-to-line input bar. Appears in the same slot as the find
@@ -5265,12 +5269,7 @@ impl EditorState {
         .align_y(Alignment::Center)
         .padding([4, 8]);
 
-        Some(
-            container(bar)
-                .style(theme::container_bar)
-                .width(Length::Fill)
-                .into(),
-        )
+        Some(bar_harness(bar))
     }
 
     fn build_editor_widget(&self) -> Element<'_, EditorMessage> {
