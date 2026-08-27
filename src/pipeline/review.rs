@@ -160,7 +160,6 @@ pub(crate) async fn record_reviewed_base_after_review(
     git_available: bool,
     transitioned: bool,
     results: &[ParallelVerdict],
-    log_prefix: &str,
 ) {
     let reviewed = results
         .iter()
@@ -170,7 +169,7 @@ pub(crate) async fn record_reviewed_base_after_review(
             warn!(
                 ticket = %ticket_id,
                 error = %e,
-                "{log_prefix}Failed to stage changes after review — reviewed base not recorded",
+                "Failed to stage changes after review — reviewed base not recorded",
             );
         } else {
             let head = run_git_head(repo_path).await.ok();
@@ -180,7 +179,7 @@ pub(crate) async fn record_reviewed_base_after_review(
                     ticket = %ticket_id,
                     head = head.is_some(),
                     tree = tree.is_some(),
-                    "{log_prefix}Could not compute content identity after review — reviewed base not recorded",
+                    "Could not compute content identity after review — reviewed base not recorded",
                 );
             } else if let Err(e) = super::board()
                 .set_reviewed_base(ticket_id, head.as_deref(), tree.as_deref())
@@ -189,10 +188,10 @@ pub(crate) async fn record_reviewed_base_after_review(
                 warn!(
                     ticket = %ticket_id,
                     error = %e,
-                    "{log_prefix}Failed to record reviewed base — later rounds will re-review",
+                    "Failed to record reviewed base — later rounds will re-review",
                 );
             } else {
-                debug!(ticket = %ticket_id, "{log_prefix}Recorded reviewed base after review");
+                debug!(ticket = %ticket_id, "Recorded reviewed base after review");
             }
         }
     }

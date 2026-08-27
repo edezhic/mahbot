@@ -647,7 +647,6 @@ impl PreparedUpdate {
     /// unnecessary or has different semantics. Prefer [`execute_no_cancel`](Self::execute_no_cancel)
     /// for simple post-agent updates that do not need stale-agent cancellation.
     /// Additionally, avoid this helper for:
-    /// - **`BoardStore::claim_diagnostics`** — returns `Result<bool>`, only cancels on success.
     /// - **`BoardStore::supersede_and_create`** — runs inside a transaction, cancels
     ///   before commit via a different pattern.
     async fn execute_and_cancel(self, conn: &db::Connection) -> Result<()> {
@@ -1277,10 +1276,10 @@ impl BoardStore {
         let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase);
         prepared.execute_and_cancel(&self.conn).await?;
         // A terminal transition (Done/Cancelled/Failed) completes the ticket's
-        // implementation (idempotent; no-op when the ticket has no implementation row) so a
-        // manual Done/Cancelled does not leave a lingering 'launched' implementation
-        // row. The pipeline path completes the implementation at its own Done
-        // handoff functions, so this only fires for external/manual callers.
+        // phase jobs (idempotent; no-op when the ticket has none) so a manual
+        // Done/Cancelled does not leave a lingering 'launched' phase job. The
+        // pipeline path completes the phase jobs at its own Done handoff
+        // functions, so this only fires for external/manual callers.
         // Guard on the session store being initialized: this is the MANUAL
         // path, and some board-only contexts (tests) never open the session DB.
         if target_phase.is_terminal()
@@ -1321,42 +1320,6 @@ impl BoardStore {
     fn ensure_ticket_found(rows: u64, ticket_id: &str) -> Result<()> {
         anyhow::ensure!(rows > 0, "Ticket {ticket_id} not found");
         Ok(())
-    }
-
-    /// Atomically guard the CAS for diagnostics execution.
-    ///
-    /// Despite the `claim_*` name, this does NOT persist a claim marker on the
-    /// ticket — it only bumps `updated_at` and cancels any stale agents
-    /// registered on the ticket (safety-in-depth against a stale dispatch).
-    /// The single-occupant in-flight marker is enforced by the CALLER via the
-    /// phase job's `agents` roster (status='launched').
-    ///
-    /// Guards the TOCTOU race between the poll listing pre-filter and the
-    /// subsequent claim: only when the ticket is still in
-    /// [`TicketPhase::InDiagnostics`] is the row updated.
-    ///
-    /// Returns `Ok(true)` if a row was updated (claim succeeded), `Ok(false)`
-    /// if no row matched (already claimed by another dispatch or ticket moved
-    /// out of [`TicketPhase::InDiagnostics`]).
-    pub async fn claim_diagnostics(&self, ticket_id: &str) -> Result<bool> {
-        let now = db::now();
-        let rows = self
-            .conn
-            .execute(
-                "UPDATE tickets \
-                 SET updated_at = ?1 \
-                 WHERE id = ?2 \
-                 AND phase = ?3 \
-                 AND is_archived = 0",
-                db::params![now, ticket_id, TicketPhase::InDiagnostics.as_ref()],
-            )
-            .await?;
-
-        if rows > 0 {
-            crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
-        }
-
-        Ok(rows > 0)
     }
 
     /// Record commit metadata on a ticket using an existing transaction.
@@ -1535,10 +1498,10 @@ impl BoardStore {
     /// Route a newly-persisted comment to any running agents assigned to the ticket.
     ///
     /// Looks up the ticket's currently-running agents (`launched` roster rows
-    /// across the ticket's implementation and analysis jobs — the replacement for the
-    /// historical `tickets.assigned_to`). If agents are registered in the
-    /// message router, the comment is delivered to each one. This is
-    /// best-effort — failures are logged but not propagated.
+    /// across the ticket's jobs — the replacement for the historical
+    /// `tickets.assigned_to`). If agents are registered in the message router,
+    /// the comment is delivered to each one. This is best-effort — failures
+    /// are logged but not propagated.
     async fn route_comment_to_agents(&self, ticket_id: &str, role: &str, content: &str) {
         // Best-effort: if the sessions store isn't initialized (e.g. a
         // board-only test), there are no active agents to route to.

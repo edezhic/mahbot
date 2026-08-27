@@ -573,13 +573,12 @@ pub(crate) async fn upsert_job_agent(
     agent_id: &str,
     kind: AgentKind,
     status: RowStatus,
-    task: &str,
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
-         VALUES (?1, ?2, ?3, NULL, ?4, ?5) \
+         VALUES (?1, ?2, ?3, NULL, ?4, '') \
          ON CONFLICT(job_id, agent_id) DO UPDATE SET status = ?4",
-        params![job_id, agent_id, kind.as_str(), status.as_str(), task],
+        params![job_id, agent_id, kind.as_str(), status.as_str()],
     )
     .await
     .with_context(|| format!("failed to upsert job agent {agent_id} for job {job_id}"))?;
@@ -1236,71 +1235,64 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
     let mut resumable: Vec<ResumableJob> = Vec::new();
     let mut resumed_other = 0usize;
     for job in &jobs {
-        match job.kind.as_str() {
-            "analysis" | "in_development" | "in_diagnostics" | "in_review" | "in_qa"
-            | "in_sanitation" => {
-                // A ticket phase job interrupted by a crash: any 'launched'
-                // roster rows from the previous process are stale. They are
-                // marked 'failed' (NOT deleted) so the puller re-dispatches a
-                // slot-resume that reuses the stored per-slot tasks and
-                // already-Done outcomes rather than re-deriving a fresh round.
-                if let Err(e) = interrupt_phase_job_roster(conn, &job.id).await {
-                    warn!(
-                        job = %job.id,
-                        ticket = %job.ticket_id.as_deref().unwrap_or("?"),
-                        error = %e,
-                        "Failed to mark stale launched agents on ticket phase boot scan",
-                    );
-                }
+        if is_ticket_phase_kind(&job.kind) {
+            // A ticket phase job interrupted by a crash: any 'launched'
+            // roster rows from the previous process are stale. They are
+            // marked 'failed' (NOT deleted) so the puller re-dispatches a
+            // slot-resume that reuses the stored per-slot tasks and
+            // already-Done outcomes rather than re-deriving a fresh round.
+            if let Err(e) = interrupt_phase_job_roster(conn, &job.id).await {
+                warn!(
+                    job = %job.id,
+                    ticket = %job.ticket_id.as_deref().unwrap_or("?"),
+                    error = %e,
+                    "Failed to mark stale launched agents on ticket phase boot scan",
+                );
             }
-            "research" | "analyze" => {
-                // Resume at the roster/state level (dispatch re-enters the
-                // orchestrator with the stored task). Always bump retry_count.
-                let kind = job.kind.as_str();
-                let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
-                resumable.push(if kind == "research" {
-                    ResumableJob::Research {
-                        job_id: job.id.clone(),
-                        workspace_name: job.workspace_name.clone(),
-                    }
-                } else {
-                    ResumableJob::Analyze {
-                        job_id: job.id.clone(),
-                        workspace_name: job.workspace_name.clone(),
-                    }
-                });
-                resumed_other += 1;
-            }
-            "research_cleanup" => {
-                // A research-run cleanup Sanitation agent interrupted by a
-                // crash. Resume it like any other durable job. Any path that
-                // removes a research_cleanup row must release the run folder in
-                // the same operation.
-                let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
-                resumable.push(ResumableJob::ResearchCleanup {
+        } else if job.kind == "research" || job.kind == "analyze" {
+            // Resume at the roster/state level (dispatch re-enters the
+            // orchestrator with the stored task). Always bump retry_count.
+            let kind = job.kind.as_str();
+            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
+            resumable.push(if kind == "research" {
+                ResumableJob::Research {
                     job_id: job.id.clone(),
                     workspace_name: job.workspace_name.clone(),
-                });
-                resumed_other += 1;
-            }
-            "temp_cleanup" => {
-                // A periodic OS temp-dir cleaner interrupted by a crash.
-                // Fire-and-forget: the cleanup is best-effort and the next
-                // scheduled pass re-runs it, so a leftover row is
-                // terminalized (never resumed). The cleaner's workspace is a
-                // synthetic ephemeral name that is never registered in
-                // the `workspaces` table — resuming would hit run_management's
-                // unresolvable-workspace path; terminalizing here keeps that
-                // explicit and skips the catch-all warning.
-                info!(
-                    job = %job.id,
-                    "Temp-dir cleanup row left over from a previous lifetime — terminalizing (fire-and-forget, no resume)",
-                );
-                let _ = terminalize_job(conn, &job.id).await;
-            }
-            _ => {
-                warn!(job = %job.id, kind = %job.kind, "Unknown job kind — skipping");
-            }
+                }
+            } else {
+                ResumableJob::Analyze {
+                    job_id: job.id.clone(),
+                    workspace_name: job.workspace_name.clone(),
+                }
+            });
+            resumed_other += 1;
+        } else if job.kind == "research_cleanup" {
+            // A research-run cleanup Sanitation agent interrupted by a
+            // crash. Resume it like any other durable job. Any path that
+            // removes a research_cleanup row must release the run folder in
+            // the same operation.
+            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
+            resumable.push(ResumableJob::ResearchCleanup {
+                job_id: job.id.clone(),
+                workspace_name: job.workspace_name.clone(),
+            });
+            resumed_other += 1;
+        } else if job.kind == "temp_cleanup" {
+            // A periodic OS temp-dir cleaner interrupted by a crash.
+            // Fire-and-forget: the cleanup is best-effort and the next
+            // scheduled pass re-runs it, so a leftover row is
+            // terminalized (never resumed). The cleaner's workspace is a
+            // synthetic ephemeral name that is never registered in
+            // the `workspaces` table — resuming would hit run_management's
+            // unresolvable-workspace path; terminalizing here keeps that
+            // explicit and skips the catch-all warning.
+            info!(
+                job = %job.id,
+                "Temp-dir cleanup row left over from a previous lifetime — terminalizing (fire-and-forget, no resume)",
+            );
+            let _ = terminalize_job(conn, &job.id).await;
+        } else {
+            warn!(job = %job.id, kind = %job.kind, "Unknown job kind — skipping");
         }
     }
 

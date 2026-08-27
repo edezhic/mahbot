@@ -137,7 +137,6 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) 
         &diag_agent_id,
         crate::jobs::AgentKind::Diagnostics,
         crate::jobs::RowStatus::Launched,
-        "",
     )
     .await
     {

@@ -239,15 +239,6 @@ async fn handle_engineer_failure(
         return;
     }
 
-    // Shutdown/drain race: leave the job for boot resume.
-    if crate::shutdown::aborting() {
-        info!(
-            ticket = %ticket.id,
-            "Engineer failure cut short by shutdown/drain — job stays launched for boot resume",
-        );
-        return;
-    }
-
     let pause_reason = if cancelled_by_user {
         "user cancelled the agent run"
     } else {

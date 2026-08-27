@@ -974,7 +974,6 @@ async fn register_running_agent(
         agent_id,
         kind,
         crate::jobs::RowStatus::Launched,
-        "",
     )
     .await
     {
@@ -1655,7 +1654,6 @@ async fn finalize_verifier_round(
             review::git_available_for_review(ws, vi).await,
             transitioned,
             results,
-            "",
         )
         .await;
     }
