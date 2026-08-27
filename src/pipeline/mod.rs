@@ -569,9 +569,10 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
     }
 }
 
-/// Bail when a phase body finishes but the ticket is no longer in the expected
-/// phase (e.g. a fresh attempt superseded this job mid-round): delete the phase
-/// job and return `true` so the body stops. Returns `false` to continue.
+/// Bail when the ticket is no longer in the expected phase: complete the phase
+/// job and return `true` so the caller stops. Guards both a phase `run` entry
+/// prologue (the puller re-drove this job after a transition) and a mid-round
+/// body that a fresh attempt has superseded. Returns `false` to continue.
 #[must_use]
 async fn guard_job_phase(ticket_id: &str, expected: TicketPhase, job_id: &str) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {

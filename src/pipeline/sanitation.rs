@@ -9,14 +9,13 @@ use crate::{Agent, Role, Workspace};
 use super::{
     BoardStore, FinalizeOutcome, StageRunKind, TicketPhase, TransitionCtx, board,
     bounce_to_development, clear_implementation_roster, determine_notify_policy, error,
-    guard_stage, info, is_ticket_in_phase, list_new_or_untracked_files, pause_freezing,
+    guard_job_phase, guard_stage, info, list_new_or_untracked_files, pause_freezing,
     reset_phase_attempt, run_git_status, run_stage_agent, sync_phase_job_task, warn,
     with_comment_and_transition,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::InSanitation).await {
-        let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
+    if guard_job_phase(&ticket.id, TicketPhase::InSanitation, &job_id).await {
         return;
     }
     dispatch_sanitation(ticket, ws, &job_id).await;

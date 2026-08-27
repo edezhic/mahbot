@@ -16,12 +16,11 @@ use crate::{Role, Workspace};
 
 use super::{
     ParallelVerdict, REVIEWER_VI, SYSTEM_ROLE, TicketPhase, TransitionCtx, VerifierInfo,
-    comment_and_transition, debug, dispatch_verifiers, info, is_ticket_in_phase, warn,
+    comment_and_transition, debug, dispatch_verifiers, guard_job_phase, info, warn,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::InReview).await {
-        let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
+    if guard_job_phase(&ticket.id, TicketPhase::InReview, &job_id).await {
         return;
     }
     dispatch_verifiers(ticket, ws, REVIEWER_VI, job_id).await;

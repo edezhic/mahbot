@@ -9,9 +9,8 @@ use crate::{Role, Workspace};
 use super::{
     AgentSlot, BoardStore, ExtractionMode, FinalizeOutcome, ParallelVerdict, TicketPhase,
     TransitionCtx, Write, agent_slot_from_roster_row, build_agent_slots, build_round_joint_comment,
-    deserialize_verdict_outcome, guard_job_phase, info, insert_round_slots, is_ticket_in_phase,
-    pause_freezing, reset_phase_attempt, run_parallel_agents, stage_name, warn,
-    with_comment_and_transition,
+    deserialize_verdict_outcome, guard_job_phase, info, insert_round_slots, pause_freezing,
+    reset_phase_attempt, run_parallel_agents, stage_name, warn, with_comment_and_transition,
 };
 
 /// Default number of parallel analyst agents per round. Reviewers use a
@@ -28,8 +27,7 @@ fn load_ticket_analysis_angles() -> Vec<String> {
 }
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::Analysis).await {
-        let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
+    if guard_job_phase(&ticket.id, TicketPhase::Analysis, &job_id).await {
         return;
     }
     dispatch_backlog_analysts(ticket, ws, &job_id).await;

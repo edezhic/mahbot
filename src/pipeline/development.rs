@@ -9,14 +9,13 @@ use crate::{Agent, Role, Workspace};
 
 use super::{
     RETRY_EXHAUSTION_MARKER, SYSTEM_ROLE, StageRunKind, TicketPhase, TransitionCtx, board,
-    comment_and_transition_or_bail, guard_stage, info, is_ticket_in_phase, manager_agent_id,
+    comment_and_transition_or_bail, guard_job_phase, guard_stage, info, manager_agent_id,
     message_router, pause_freezing, pause_workspace_on_failure, paused_workspace_sentence,
     run_stage_agent, sync_phase_job_task, warn,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
-    if !is_ticket_in_phase(&ticket.id, TicketPhase::InDevelopment).await {
-        let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, &job_id).await;
+    if guard_job_phase(&ticket.id, TicketPhase::InDevelopment, &job_id).await {
         return;
     }
     dispatch_engineer(ticket, ws, &job_id).await;
