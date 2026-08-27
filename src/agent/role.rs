@@ -11,15 +11,27 @@ use strum::IntoEnumIterator;
 
 use crate::Role;
 
-/// Role string for diagnostics comments — used both when posting diagnostics
-/// comments and when filtering comments for failure counting. Must stay in sync
-/// between both sites to prevent silent miscounting on re-dispatch.
+/// Role string for diagnostics comments — `"diagnostics"`.
+///
+/// Used when posting diagnostics success/failure comments (`diagnostics.rs`),
+/// as the diagnostics run's shell spill-owner key (`tools/shell/mod.rs`, via
+/// `cleanup_agent_spills`), as the sentinel that collapses diagnostics comments
+/// to a summary in the GUI board (`gui/board.rs`), and as the
+/// diagnostics-discovery agent id / stale-write log label (`workspace.rs`).
+///
+/// The literal is a key: it's compared against `comment.role` (`gui/board.rs`)
+/// and against agent ids (the shell spill collision guard in `tools/shell/mod.rs`),
+/// so a change must be coordinated across those sites.
 pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 
-/// Role string for system comments — used when posting system comments on
-/// tickets (notifications, bounce breaker trip comments, agent summaries)
-/// and when filtering comments for failure counting. Must stay in sync between
-/// all sites to prevent silent miscounting.
+/// Role string for system comments — `"system"`.
+///
+/// Used only to post non-agent ticket comments: the engineer hard-failure
+/// notice (`development.rs`), the skip-review notice (`review.rs`), and the
+/// phase-reset / bounce-breaker trip notices (`pipeline/mod.rs`). It is
+/// posting-only — no site reads or compares a comment's role against this
+/// value, and the GUI badge for `"system"` is an unrelated generic fallback
+/// in `gui/theme.rs`.
 pub(crate) const SYSTEM_ROLE: &str = "system";
 
 // ── RoleInfo ──────────────────────────────────────────────────────────────
