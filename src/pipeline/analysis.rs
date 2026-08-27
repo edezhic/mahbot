@@ -47,7 +47,6 @@ async fn ensure_analysis_slots(
         Role::Analyst,
         prompt,
         &load_ticket_analysis_angles(),
-        count,
         0,
         count,
     );
@@ -71,15 +70,7 @@ async fn append_analysis_slots(
         .filter_map(|r| r.idx)
         .max()
         .map_or(0, |m| m + 1);
-    let slots = build_agent_slots(
-        &ticket.id,
-        Role::Analyst,
-        prompt,
-        &[],
-        count,
-        next_idx,
-        count,
-    );
+    let slots = build_agent_slots(&ticket.id, Role::Analyst, prompt, &[], next_idx, count);
     insert_round_slots(job_id, &slots, crate::jobs::AgentKind::Analyst).await;
     Ok(slots)
 }

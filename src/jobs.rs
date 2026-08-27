@@ -544,8 +544,8 @@ pub(crate) async fn complete_ticket_phase_jobs(conn: &Connection, ticket_id: &st
     Ok(())
 }
 
-/// Update the phase job's stored `task` so a boot re-create re-dispatches the
-/// current stage with the right prompt.
+/// Update the phase job's stored `task`. Phase dispatch re-derives its prompt
+/// from live state, so the stored value is not read for re-dispatch.
 pub(crate) async fn update_phase_job_task(
     conn: &Connection,
     job_id: &str,

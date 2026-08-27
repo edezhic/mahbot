@@ -414,8 +414,8 @@ async fn dispatch_working_phases(ws: &Workspace) {
     }
 }
 
-/// The prompt `task` and dispatch `role` for a phase job (seeded on the job so a
-/// re-created phase job re-dispatches the right stage prompt).
+/// The prompt `task` and dispatch `role` for a phase job, re-derived fresh
+/// from the live ticket each time the phase job is created.
 fn phase_task(ticket: &Ticket, phase: TicketPhase) -> (String, Role) {
     match phase {
         TicketPhase::Analysis => (
@@ -1000,15 +1000,10 @@ fn agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
 
 /// Render the FINAL per-agent task for a ticket phase roster slot.
 #[must_use]
-fn agent_slot_task(
-    prompt: &str,
-    angles: &[String],
-    slot_count: usize,
-    global_idx: usize,
-) -> String {
+fn agent_slot_task(prompt: &str, angles: &[String], count: usize, global_idx: usize) -> String {
     if angles.is_empty() {
         prompt.to_string()
-    } else if slot_count == 1 {
+    } else if count == 1 {
         format!("{prompt}\n\n{}", angles.join("\n\n"))
     } else {
         format!("{prompt}\n\n{}", angles[global_idx % angles.len()])
@@ -1023,7 +1018,6 @@ fn build_agent_slots(
     role: Role,
     prompt: &str,
     angles: &[String],
-    slot_count: usize,
     start_idx: i64,
     count: usize,
 ) -> Vec<AgentSlot> {
@@ -1033,7 +1027,7 @@ fn build_agent_slots(
     for k in 0..count {
         let idx = start_idx + i64::try_from(k).unwrap_or(i64::MAX);
         let agent_id = agent_id(ticket_id, idx, &suffix, role);
-        let task = agent_slot_task(prompt, angles, slot_count, global_start + k);
+        let task = agent_slot_task(prompt, angles, count, global_start + k);
         slots.push(AgentSlot {
             idx,
             agent_id,
@@ -1484,8 +1478,9 @@ async fn run_stage_agent(
 
 // ── Stage-handoff roster helpers ────────────────────────────────────────
 
-/// Write the phase job's stored dispatch task at dispatch time (before the
-/// stage agent runs) for boot re-creation. Best-effort.
+/// Persist the phase job's dispatch task at dispatch time. Phase dispatch
+/// re-derives its prompt from live state, so this stored value is not read for
+/// re-dispatch. Best-effort.
 async fn sync_phase_job_task(conn: &crate::db::Connection, job_id: &str, task: &str) {
     if let Err(e) = crate::jobs::update_phase_job_task(conn, job_id, task).await {
         warn!(job = %job_id, error = %e, "Failed to sync phase job task");
@@ -1696,7 +1691,8 @@ async fn dispatch_verifiers_impl(
     // Slot-resume detection: a non-empty roster marks an interrupted round —
     // reconstruct Done slots from stored outcomes and re-run the not-Done ones
     // with their stored tasks. An empty roster (body crashed before its first
-    // roster write) degrades to a fresh dispatch derived from the jobs.task.
+    // roster write) degrades to a fresh dispatch re-derived from live ticket
+    // state.
     let roster = match crate::jobs::list_agents_for_job(conn, &job_id).await {
         Ok(roster) => roster,
         Err(e) => {
@@ -1793,7 +1789,6 @@ async fn fresh_dispatch_verifiers(
         vi.role,
         &prompt,
         &load_verifier_angles(vi.role),
-        count,
         0,
         count,
     );
