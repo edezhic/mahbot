@@ -37,7 +37,7 @@ use std::fmt::Write;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use futures_util::future::{BoxFuture, join_all};
+use futures_util::future::join_all;
 use tracing::{debug, error, info, warn};
 
 use crate::agent::message_router;
@@ -1612,7 +1612,7 @@ pub(crate) async fn bounce_to_development(
 // the reviewer-only git-state decisions differ). The verdict-processing core
 // (`process_verifier_verdicts` / `apply_clean_verifier_round`, the `VerifierInfo`
 // metadata, and the review/QA thresholds) lives in [`crate::pipeline::verdict`];
-// the phase-entry dispatch lives in `dispatch_verifiers_impl` here. The
+// the phase-entry dispatch lives in `dispatch_verifiers` here. The
 // per-phase entry points (`review::run`/`qa::run`) and the reviewer-only git
 // logic (`review::compute_review_skip`/`compute_reviewer_count`/
 // `record_reviewed_base_after_review`) and the QA count
@@ -1652,24 +1652,7 @@ async fn finalize_verifier_round(
 }
 
 /// Shared dispatch logic for parallel verifiers (reviewers and QA).
-fn dispatch_verifiers(
-    ticket: Arc<Ticket>,
-    ws: Workspace,
-    vi: VerifierInfo,
-    job_id: String,
-) -> BoxFuture<'static, ()> {
-    Box::pin(async move {
-        dispatch_verifiers_impl(ticket, ws, vi, job_id).await;
-    })
-}
-
-/// Body of [`dispatch_verifiers`].
-async fn dispatch_verifiers_impl(
-    ticket: Arc<Ticket>,
-    ws: Workspace,
-    vi: VerifierInfo,
-    job_id: String,
-) {
+async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo, job_id: String) {
     let is_reviewer = vi.role == Role::Reviewer;
     if review::maybe_skip_review(&ticket, &ws, vi, &job_id).await {
         return;
