@@ -18,13 +18,6 @@ use super::common::MAX_INPUT_CHARS;
 use super::theme;
 use super::widgets::{self, badge_pill, diff_stats_row, role_badge, selectable_text};
 
-// Whether a cancel of this ticket is a mid-pipeline cancel (the ticket is in
-// an implementation phase, so the workspace is paused on cancel). Shared by
-// the `PerformAction` workspace-pause gate and the `RequestCancel`
-// confirmation-eligibility check so the two sites can't drift (a drift
-// would desync the pause behavior and make the modal's consequence
-// text untrue).
-
 /// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
 pub struct FileStat {
@@ -718,9 +711,9 @@ impl BoardState {
                     None
                 } else if is_cancel {
                     // Cancels go through the eligibility gate first
-                    // (`RequestCancel`): mid-pipeline cancels (agent
-                    // running) require explicit confirmation; other
-                    // cancels execute directly, exactly as before.
+                    // (`RequestCancel`): mid-pipeline (implementation-phase)
+                    // cancels require explicit confirmation; other cancels
+                    // execute directly, exactly as before.
                     Some(BoardMessage::RequestCancel(ticket_id.to_string()))
                 } else {
                     Some(BoardMessage::PerformAction(
@@ -1629,7 +1622,8 @@ impl BoardState {
     /// (implementation-phase) ticket; the listed consequences are real as of
     /// that check. If the ticket leaves the pipeline before the user confirms,
     /// `PerformAction` re-pauses authoritatively at execution, so the pause
-    /// decision is always made there — the cancel itself is phase-CAS-guarded.
+    /// decision is always made there; the cancel transition itself is
+    /// unconditional (no expected-phase guard).
     fn cancel_confirm_dialog(ticket_id: &str) -> Element<'_, BoardMessage> {
         let dialog = container(
             column![

@@ -160,7 +160,6 @@ pub struct Toast {
 #[derive(Debug, Clone)]
 pub enum ToastMessage {
     Saved,
-    Created,
     Deleted,
     Error(String),
     Warning(String),
@@ -180,7 +179,6 @@ impl Toast {
     fn from_toast_msg(msg: &ToastMessage) -> Self {
         match msg {
             ToastMessage::Saved => Toast::new("Saved".to_string(), ToastKind::Success),
-            ToastMessage::Created => Toast::new("Created".to_string(), ToastKind::Success),
             ToastMessage::Deleted => Toast::new("Deleted".to_string(), ToastKind::Success),
             ToastMessage::Error(s) => Toast::new(format!("Failed: {s}"), ToastKind::Error),
             ToastMessage::Warning(s) => Toast::new(s.clone(), ToastKind::Warning),
