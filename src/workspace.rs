@@ -1580,7 +1580,7 @@ pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
 /// workspace churn. Unknown `config_kv` keys are purged on reload, except the
 /// preserved shared namespaces (this key and telegram_role_pin:*) which are left
 /// untouched.
-const NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY: &str = "nightly_discovery_last_pass_at";
+pub(crate) const NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY: &str = "nightly_discovery_last_pass_at";
 
 /// Returns `true` when the given local hour falls within the nightly
 /// re-analysis window (2:00–3:00 AM, inclusive of 2, exclusive of 3).

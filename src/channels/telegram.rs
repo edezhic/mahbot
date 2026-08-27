@@ -552,7 +552,7 @@ const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
 /// `config_kv` key prefix for the per-chat role-switch pin message id.
 /// Leftover entries for unbound chats are tiny and never re-read — harmless.
-const ROLE_PIN_KV_PREFIX: &str = "telegram_role_pin:";
+pub(crate) const ROLE_PIN_KV_PREFIX: &str = "telegram_role_pin:";
 
 /// Change-detection state for a chat's per-user command menu refresh.
 enum ChatMenuState {

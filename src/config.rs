@@ -1110,14 +1110,14 @@ pub async fn reload_from_db() -> Result<()> {
     migrate_old_default_models(store).await?;
 
     let kvs = store.get_all_kv().await?;
-    // Keep in sync with crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY and
-    // crate::channels::telegram::ROLE_PIN_KV_PREFIX (private constants).
     let mut unknown_garbage_keys: Vec<String> = Vec::new();
     for (key, value) in &kvs {
         if !config.set_string_field(key, value) {
             tracing::debug!(key, "Unknown config key, ignoring");
             // Preserved shared namespaces — leave untouched.
-            if key != "nightly_discovery_last_pass_at" && !key.starts_with("telegram_role_pin:") {
+            if key != crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY
+                && !key.starts_with(crate::channels::telegram::ROLE_PIN_KV_PREFIX)
+            {
                 unknown_garbage_keys.push(key.clone());
             }
         }
