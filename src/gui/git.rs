@@ -10,6 +10,8 @@
 
 use super::theme;
 
+use crate::git::commands::DiffStats;
+
 use iced::widget::{Column, Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length, Task};
 
@@ -41,7 +43,7 @@ fn file_change_tx() -> &'static tokio::sync::broadcast::Sender<()> {
 /// Minimum interval between event-driven local git refreshes (diff stats +
 /// branch). Coalesces bursts of file-change events into at most one git
 /// subprocess batch per interval.
-const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Interval between periodic remote syncs (behind/ahead + `git fetch`).
 const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -61,7 +63,7 @@ pub struct GitState {
     /// Filesystem path for the currently selected workspace.
     workspace_path: Option<PathBuf>,
     /// Cached diff stats (+N / -M) from periodic refresh.
-    diff_stats: Option<(i64, i64)>,
+    diff_stats: Option<DiffStats>,
     /// Cached current branch name from periodic refresh.
     current_branch: Option<String>,
     /// Cached behind/ahead counts from periodic refresh.
@@ -127,7 +129,7 @@ pub enum GitMessage {
     /// results from a superseded generation are discarded. `Ok` on genuine
     /// success (including a clean tree); `Err` on transient failure keeps
     /// the cached last-known-good value.
-    DiffStats(u64, Result<(i64, i64), String>),
+    DiffStats(u64, Result<DiffStats, String>),
     /// Result of `run_git_current_branch`. Same generation/staleness
     /// semantics as [`GitMessage::DiffStats`].
     CurrentBranch(u64, Result<String, String>),
@@ -145,6 +147,10 @@ pub enum GitMessage {
     /// (HEAD + `.git/index`) that the file watcher never reports, so the footer
     /// is refreshed promptly.
     RefreshAfterCommit,
+    /// A pipeline auto-commit completed (sanitation phase committed a ticket).
+    /// Carries the repo path so the footer refresh is applied only when it
+    /// matches the currently-viewed workspace.
+    PipelineCommit(PathBuf),
 
     // ── Branch listing ──────────────────────────────────────────
     /// Result of listing local branches.
@@ -216,7 +222,7 @@ impl GitState {
 
     /// Cached diff stats (+N / -M), if available.
     #[must_use]
-    pub fn diff_stats(&self) -> Option<(i64, i64)> {
+    pub fn diff_stats(&self) -> Option<DiffStats> {
         self.diff_stats
     }
 
@@ -359,6 +365,16 @@ impl GitState {
             // A manual commit is a ref-only change the watcher never reports,
             // so refresh the footer promptly (same as other git operations).
             GitMessage::RefreshAfterCommit => self.refresh_after_git_op(),
+            GitMessage::PipelineCommit(path) => {
+                // Only refresh the footer when the committed workspace is the
+                // one currently displayed — commits to other workspaces must
+                // not trigger a needless git subprocess batch.
+                if self.workspace_path.as_deref() == Some(path.as_path()) {
+                    self.refresh_after_git_op()
+                } else {
+                    Task::none()
+                }
+            }
 
             // ── Branch listing result ───────────────────────────
             GitMessage::ListBranches(result) => {
@@ -900,10 +916,24 @@ mod tests {
     #[test]
     fn test_refresh_success_applies_current_generation() {
         let mut s = state_with_gen(7);
-        let _ = s.update(GitMessage::DiffStats(7, Ok((3, 1))));
+        let _ = s.update(GitMessage::DiffStats(
+            7,
+            Ok(DiffStats {
+                added: 3,
+                removed: 1,
+                huge_binary_file_count: 0,
+            }),
+        ));
         let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
         let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
-        assert_eq!(s.diff_stats(), Some((3, 1)));
+        assert_eq!(
+            s.diff_stats(),
+            Some(DiffStats {
+                added: 3,
+                removed: 1,
+                huge_binary_file_count: 0
+            })
+        );
         assert_eq!(s.current_branch(), Some("main"));
         assert_eq!(s.behind_ahead(), Some((2, 5)));
     }
@@ -911,14 +941,28 @@ mod tests {
     #[test]
     fn test_refresh_error_keeps_last_known_good() {
         let mut s = state_with_gen(7);
-        let _ = s.update(GitMessage::DiffStats(7, Ok((3, 1))));
+        let _ = s.update(GitMessage::DiffStats(
+            7,
+            Ok(DiffStats {
+                added: 3,
+                removed: 1,
+                huge_binary_file_count: 0,
+            }),
+        ));
         let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
         let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
         // Transient failures — cached values must survive (no flicker).
         let _ = s.update(GitMessage::DiffStats(7, Err("spawn failed".into())));
         let _ = s.update(GitMessage::CurrentBranch(7, Err("spawn failed".into())));
         let _ = s.update(GitMessage::BehindAhead(7, Err("spawn failed".into())));
-        assert_eq!(s.diff_stats(), Some((3, 1)));
+        assert_eq!(
+            s.diff_stats(),
+            Some(DiffStats {
+                added: 3,
+                removed: 1,
+                huge_binary_file_count: 0
+            })
+        );
         assert_eq!(s.current_branch(), Some("main"));
         assert_eq!(s.behind_ahead(), Some((2, 5)));
     }
@@ -936,7 +980,14 @@ mod tests {
     fn test_stale_generation_results_are_dropped() {
         let mut s = state_with_gen(9);
         // Results from a superseded generation must not overwrite newer state.
-        let _ = s.update(GitMessage::DiffStats(8, Ok((99, 99))));
+        let _ = s.update(GitMessage::DiffStats(
+            8,
+            Ok(DiffStats {
+                added: 99,
+                removed: 99,
+                huge_binary_file_count: 0,
+            }),
+        ));
         let _ = s.update(GitMessage::CurrentBranch(8, Ok("old-branch".into())));
         let _ = s.update(GitMessage::BehindAhead(8, Ok((99, 99))));
         assert_eq!(s.diff_stats(), None);
@@ -947,10 +998,24 @@ mod tests {
     #[test]
     fn test_clear_invalidates_inflight_results() {
         let mut s = state_with_gen(3);
-        let _ = s.update(GitMessage::DiffStats(3, Ok((3, 1))));
+        let _ = s.update(GitMessage::DiffStats(
+            3,
+            Ok(DiffStats {
+                added: 3,
+                removed: 1,
+                huge_binary_file_count: 0,
+            }),
+        ));
         let _ = s.update(GitMessage::CurrentBranch(3, Ok("main".into())));
         s.clear(); // bumps both generations — in-flight results become stale
-        let _ = s.update(GitMessage::DiffStats(3, Ok((7, 7))));
+        let _ = s.update(GitMessage::DiffStats(
+            3,
+            Ok(DiffStats {
+                added: 7,
+                removed: 7,
+                huge_binary_file_count: 0,
+            }),
+        ));
         assert_eq!(s.diff_stats(), None);
     }
 
@@ -1063,5 +1128,34 @@ mod tests {
         assert!(!s.local_refresh_pending);
         assert_eq!(s.local_generation, before_local + 1);
         assert_eq!(s.remote_generation, before_remote + 1);
+    }
+
+    #[test]
+    fn test_pipeline_commit_refreshes_footer_when_path_matches() {
+        let mut s = GitState::new();
+        let ws = PathBuf::from("/some/ws");
+        s.workspace_path = Some(ws.clone());
+        s.local_refresh_pending = true;
+        let before_local = s.local_generation;
+        let before_remote = s.remote_generation;
+        let _ = s.update(GitMessage::PipelineCommit(ws));
+        // A pipeline commit on the displayed workspace is a ref-only change — the
+        // footer refreshes promptly (local + behind/ahead) and any owed
+        // file-change refresh is superseded.
+        assert!(s.last_local_refresh.is_some());
+        assert!(!s.local_refresh_pending);
+        assert_eq!(s.local_generation, before_local + 1);
+        assert_eq!(s.remote_generation, before_remote + 1);
+    }
+
+    #[test]
+    fn test_pipeline_commit_ignored_for_other_workspace() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/some/ws"));
+        let before_local = s.local_generation;
+        let before_remote = s.remote_generation;
+        let _ = s.update(GitMessage::PipelineCommit(PathBuf::from("/other/ws")));
+        assert_eq!(s.local_generation, before_local);
+        assert_eq!(s.remote_generation, before_remote);
     }
 }

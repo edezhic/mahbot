@@ -558,6 +558,9 @@ fn main() -> Result<()> {
     // runs (matching LOG_BROADCAST), so the file-change subscription always
     // has a source — an uninitialized one would end the subscription stream.
     mahbot::gui::init_git_file_change_tx();
+    // Initialise the git-commit broadcast so the pipeline-commit subscription
+    // always has a source (same convention as the file-change broadcast).
+    mahbot::gui::init_git_commit_tx();
     // Warm the CDC ticket sender before the app runs so the board change
     // subscription also has a source; otherwise it ends on the first frame and
     // the board freezes at the initial snapshot (Iced never re-spawns it).

@@ -79,6 +79,13 @@ pub fn init_git_file_change_tx() {
     git::init_file_change_tx();
 }
 
+/// Initialise the git-commit broadcast before the iced application runs
+/// (matching the [`LOG_BROADCAST`] convention) so the pipeline-commit
+/// subscription always has a source. Called from `main`.
+pub fn init_git_commit_tx() {
+    crate::git::commands::init_git_commit_tx();
+}
+
 /// Initialise the CDC ticket change broadcast before the iced application runs
 /// (same convention as [`init_git_file_change_tx`] / [`LOG_BROADCAST`]) so the
 /// board change subscription always has a source. An uninitialized `OnceLock`
@@ -2055,6 +2062,9 @@ impl Dashboard {
             // Git file-change subscription: drives the event-driven local git
             // footer refresh when workspace files change.
             iced::Subscription::run(git_file_changes_subscription),
+            // Git pipeline-commit subscription: refreshes the footer promptly
+            // after a pipeline auto-commit (ref-only change the watcher misses).
+            iced::Subscription::run(git_commit_subscription),
             // Board change-stream subscription: drives the board ticket list from
             // CDC deltas instead of a 1s full re-poll.
             iced::Subscription::run(board_change_subscription),
@@ -2142,6 +2152,25 @@ fn git_file_changes_subscription() -> impl futures_util::Stream<Item = Message> 
             Box::pin(async move {
                 if event.is_some() {
                     let _ = output.try_send(Message::Git(git::GitMessage::FileChanged));
+                }
+            })
+        },
+    )
+}
+
+/// Subscription that emits [`Message::Git`] with
+/// [`GitMessage::PipelineCommit`] when a pipeline auto-commit completes. A
+/// commit is a ref-only change the file watcher never reports, so the footer
+/// is refreshed promptly via [`GitState`]`s path-matched handler.
+fn git_commit_subscription() -> impl futures_util::Stream<Item = Message> {
+    use iced::futures::channel::mpsc;
+    common::broadcast_stream_producer(
+        1,
+        &crate::git::commands::GIT_COMMIT_TX,
+        |output: &mut mpsc::Sender<Message>, event: Option<std::path::PathBuf>| {
+            Box::pin(async move {
+                if let Some(path) = event {
+                    let _ = output.try_send(Message::Git(git::GitMessage::PipelineCommit(path)));
                 }
             })
         },
@@ -2581,15 +2610,17 @@ impl Dashboard {
     }
 
     /// Render the git diff stats button (+X/−Y, clickable -> diff modal).
-    /// Returns `None` when there are no non-zero changes.
+    /// Returns `None` when there are no non-zero changes (including no
+    /// oversized/binary untracked files to report).
     fn render_git_diff_stats(&self) -> Option<Element<'_, Message>> {
-        let (added, removed) = self.git_state.diff_stats()?;
-        if added == 0 && removed == 0 {
-            return None;
-        }
-        let stats_row = widgets::diff_stats_row::<Message>(added, removed, 15.0);
+        let stats = self.git_state.diff_stats()?;
         Some(widgets::icon_tooltip_button(
-            stats_row,
+            widgets::git_footer_stats::<Message>(
+                stats.added,
+                stats.removed,
+                stats.huge_binary_file_count,
+                15.0,
+            )?,
             "uncommitted changes",
             Some(Message::OpenDiffModal(None)),
             3,

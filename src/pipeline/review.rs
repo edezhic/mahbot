@@ -118,8 +118,10 @@ pub(crate) async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> an
 
 /// Gather the working-tree churn at review dispatch.
 async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
-    let (added, removed) = run_git_diff_stats(repo_path).await?;
-    Ok(added + removed)
+    let stats = run_git_diff_stats(repo_path).await?;
+    // Churn calibration uses only the exact line counts — the
+    // huge/binary untracked file-count must NOT influence reviewer counts.
+    Ok(stats.added + stats.removed)
 }
 
 /// Compute the reviewer count for a review round.
@@ -193,5 +195,24 @@ pub(crate) async fn record_reviewed_base_after_review(
                 debug!(ticket = %ticket_id, "{log_prefix}Recorded reviewed base after review");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::commands::MAX_UNTRACKED_SIZE;
+    use crate::util::test::init_temp_repo;
+
+    #[tokio::test]
+    async fn working_tree_churn_ignores_huge_binary_file_count() {
+        let (_dir, repo_path) = init_temp_repo();
+        // A normal untracked file (3 lines) plus an oversized untracked file.
+        std::fs::write(repo_path.join("a.rs"), b"fn foo() {\n    bar();\n}\n").unwrap();
+        let size = usize::try_from(MAX_UNTRACKED_SIZE).unwrap() + 1;
+        std::fs::write(repo_path.join("big.bin"), vec![b'a'; size]).unwrap();
+        let churn = working_tree_churn(&repo_path).await.unwrap();
+        // Churn is added+removed only; the oversized file contributes nothing.
+        assert_eq!(churn, 3);
     }
 }

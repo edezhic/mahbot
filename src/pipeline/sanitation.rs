@@ -105,6 +105,10 @@ async fn finalize_ticket_with_git_status(
 
     match crate::git::commands::run_git_commit(repo_path, &ticket.title).await {
         Ok(commit_info) => {
+            // A pipeline auto-commit is a ref-only change the file watcher
+            // never reports, so notify the GUI to refresh the footer promptly
+            // instead of waiting for the periodic remote timer.
+            crate::git::commands::notify_git_commit(repo_path);
             finalize_commit_and_transition(&ticket, commit_info, source).await;
         }
         Err(e) => {
