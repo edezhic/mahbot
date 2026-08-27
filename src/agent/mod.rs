@@ -247,31 +247,65 @@ pub(crate) fn role_tools_and_specs(
     (tools, tool_specs)
 }
 
+/// A role's derived chat-request triplet (model slot → per-model provider
+/// routing → per-role reasoning effort). Named fields keep the order
+/// unambiguous across cross-module callers — a bare tuple would have two
+/// type-identical `Option<String>` slots.
+pub(crate) struct RoleChatParams {
+    pub model: String,
+    pub provider_order: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+/// Derive a role's chat-request triplet — the single source of the
+/// model/routing/reasoning_effort derivation shared by [`chat_request`],
+/// [`crate::pipeline::verdict::synthesis_request`], and
+/// [`crate::tools::analyze::consolidate_findings`]. Consumers keep their own
+/// `max_tokens`, `tools`, and `meta`; the call sites do not share a KV-cache
+/// prefix with each other (distinct conversations/system prompts).
+#[must_use]
+pub(crate) fn role_chat_params(role: crate::Role) -> RoleChatParams {
+    let model = crate::config::CONFIG.role_model(role);
+    let routing = crate::config::CONFIG.model_routing(&model);
+    RoleChatParams {
+        model,
+        provider_order: routing.provider_order,
+        reasoning_effort: Some(
+            crate::agent::role::role_info(&role)
+                .default_reasoning_effort
+                .to_string(),
+        ),
+    }
+}
+
 /// Build the byte-relevant chat params (model, tools, reasoning_effort,
-/// routing, max_tokens) for a role — the single source shared by
-/// [`Agent::build_chat_request`], the research wrap-up snapshot, and
-/// [`crate::tools::research::orchestrator_params`], so all three replay the
-/// same KV-cache prefix. `meta` is telemetry-only (never part of the provider
-/// request body) and attached by call sites.
+/// routing, max_tokens) for a role. The model/routing/reasoning_effort
+/// triplet comes from [`role_chat_params`] — the single source also used by
+/// [`Agent::build_chat_request`], the research wrap-up snapshot
+/// ([`crate::tools::research::research_params`]),
+/// [`crate::tools::research::orchestrator_params`],
+/// [`crate::pipeline::verdict::synthesis_request`], and
+/// [`crate::tools::analyze::consolidate_findings`] — so every consumer derives
+/// the same triplet for a role. `meta` is telemetry-only (never part of the
+/// provider request body) and attached by call sites.
 #[must_use]
 pub(crate) fn chat_request(
     role: crate::Role,
     tool_specs: Option<Vec<crate::ToolSpec>>,
     messages: Vec<ChatMessage>,
 ) -> ChatRequest {
-    let model = crate::config::CONFIG.role_model(role);
-    let routing = crate::config::CONFIG.model_routing(&model);
+    let RoleChatParams {
+        model,
+        provider_order,
+        reasoning_effort,
+    } = role_chat_params(role);
     ChatRequest {
         messages,
         tools: tool_specs,
         model,
         max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
-        reasoning_effort: Some(
-            crate::agent::role::role_info(&role)
-                .default_reasoning_effort
-                .to_string(),
-        ),
-        provider_order: routing.provider_order,
+        reasoning_effort,
+        provider_order,
         meta: None,
     }
 }

@@ -17,7 +17,6 @@
 
 use crate::agent::message_router::{self, AgentJob, MessageKind};
 use crate::agent::{run_agent, run_default_agent};
-use crate::config::CONFIG;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::Tool;
 use crate::{Agent, ChatMessage, DEFAULT_MAX_TOKENS, Role, Workspace};
@@ -1117,8 +1116,7 @@ async fn consolidate_findings(
     let user =
         format!("# Original Question\n\n{analyze}\n\n# Agent Claims (id-numbered)\n\n{material}");
 
-    let model = CONFIG.role_model(Role::Analyst);
-    let routing = CONFIG.model_routing(&model);
+    let derived = crate::agent::role_chat_params(Role::Analyst);
     let system = format!(
         "{}\n\n{}",
         load_prompt("synthesis/analyst.md"),
@@ -1129,13 +1127,9 @@ async fn consolidate_findings(
         "consolidate",
         &system,
         &user,
-        model,
-        Some(
-            crate::agent::role::role_info(&Role::Analyst)
-                .default_reasoning_effort
-                .to_string(),
-        ),
-        routing.provider_order,
+        derived.model,
+        derived.reasoning_effort,
+        derived.provider_order,
         Some(DEFAULT_MAX_TOKENS),
     );
 

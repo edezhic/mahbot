@@ -127,19 +127,15 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
         round.stage,
         material,
     );
-    let model = crate::config::CONFIG.role_model(role);
-    let routing = crate::config::CONFIG.model_routing(&model);
+    let derived = crate::agent::role_chat_params(role);
     ChatRequest {
         messages: vec![ChatMessage::system(&system), ChatMessage::user(&user)],
         tools: None,
-        model,
+        model: derived.model,
+        // Override the default 32K budget with the 16K aggregation budget.
         max_tokens: Some(PIPELINE_GROUPING_MAX_TOKENS),
-        reasoning_effort: Some(
-            crate::agent::role::role_info(&role)
-                .default_reasoning_effort
-                .to_string(),
-        ),
-        provider_order: routing.provider_order,
+        reasoning_effort: derived.reasoning_effort,
+        provider_order: derived.provider_order,
         meta: Some(ChatRequestMeta {
             purpose: "synthesis",
             agent_id: format!("verdict_{}", crate::generate_suffix()),
