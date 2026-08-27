@@ -1198,16 +1198,13 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         });
     }
 
+    let canonical = trimmed_or_none(&trimmed).unwrap_or_default();
+
     match key {
-        // Provider endpoint changes re-init the provider and transcriber.
-        // Ordering: validate (structural) → write → cascade → warmup
-        // (best-effort: an unreachable custom endpoint saves with a warning,
-        // so a self-hosted server can be configured before it is reachable) →
-        // recreate (runtime switches to the saved
-        // endpoint even when unreachable — only structural validation and DB
-        // writes can fail a save now). The probe is the live config with only
-        // this field applied, so concurrent changes to other fields are never
-        // clobbered (the persist lock serializes settles anyway).
+        // Provider endpoint changes re-init the provider and transcriber. The
+        // probe→validate→write step is shared with the key arm via
+        // `probe_validate_write`; the endpoint-specific cascade, warmup, and
+        // recreate follow.
         //
         // Note: the active image model is deliberately NOT re-validated here.
         // The image-model catalog is endpoint-keyed, and validating the
@@ -1218,12 +1215,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         // committed endpoint — so a switch is two steps (endpoint first, then
         // model), each independently valid.
         CONFIG_KEY_PROVIDER_ENDPOINT => {
-            let mut probe = CONFIG.snapshot();
-            let _ = probe.set_string_field(key, &trimmed);
-            probe.normalize();
-            validate_config(&probe)?;
-
-            write_kv_and_update_config(key, &trimmed).await?;
+            let probe = probe_validate_write(key, &trimmed).await?;
 
             // Cascade: settling a default or empty endpoint removes the custom
             // endpoint's key row — the key is only meaningful while a custom
@@ -1274,7 +1266,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
             // fire a second background warmup of the same endpoint.
             crate::providers::recreate_all(&CONFIG.snapshot(), false).await;
             return Ok(PersistOutcome {
-                value: trimmed_or_none(&trimmed).unwrap_or_default(),
+                value: canonical,
                 warning,
             });
         }
@@ -1288,15 +1280,10 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         // endpoint is active must not surface an 'unreachable' warning under
         // the OpenRouter key field.
         CONFIG_KEY_PROVIDER_KEY | CONFIG_KEY_PROVIDER_ENDPOINT_KEY => {
-            let mut probe = CONFIG.snapshot();
-            let _ = probe.set_string_field(key, &trimmed);
-            probe.normalize();
-            validate_config(&probe)?;
-
-            write_kv_and_update_config(key, &trimmed).await?;
+            let _ = probe_validate_write(key, &trimmed).await?;
             crate::providers::recreate_all(&CONFIG.snapshot(), true).await;
             return Ok(PersistOutcome {
-                value: trimmed_or_none(&trimmed).unwrap_or_default(),
+                value: canonical,
                 warning: None,
             });
         }
@@ -1350,9 +1337,32 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
     }
 
     Ok(PersistOutcome {
-        value: trimmed_or_none(&trimmed).unwrap_or_default(),
+        value: canonical,
         warning: None,
     })
+}
+
+/// Probe→validate→write for the provider arms: snapshot the live CONFIG, apply
+/// `key = trimmed`, normalize, structurally validate, then write the KV row and
+/// mirror it into CONFIG. Returns the normalized probe — the live config with
+/// only this field applied, so concurrent changes to other fields are never
+/// clobbered.
+///
+/// # Precondition
+/// The caller holds [`persist_lock`] — this helper does not acquire it,
+/// matching [`write_kv_and_update_config`] and [`save_routing_row`].
+///
+/// This is the provider-arms-only probe contract, not the universal persist
+/// path (telegram/image_model/others use different validation). The returned
+/// probe is consumed only by the endpoint arm (for warmup); the key arm
+/// discards it via `let _ = …`.
+async fn probe_validate_write(key: &str, trimmed: &str) -> Result<ConfigData> {
+    let mut probe = CONFIG.snapshot();
+    let _ = probe.set_string_field(key, trimmed);
+    probe.normalize();
+    validate_config(&probe)?;
+    write_kv_and_update_config(key, trimmed).await?;
+    Ok(probe)
 }
 
 /// Persist a settled per-model routing `provider_order` (`""` clears it).
