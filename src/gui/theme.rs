@@ -338,13 +338,17 @@ pub fn ticket_priority_color(priority: i64) -> (Color, Color) {
 /// One-shot guard to log timestamp parse failure only once.
 static TIMESTAMP_PARSE_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Format an ISO 8601 timestamp string into a human-readable absolute form.
-/// Output style: "Jun 5, 21:54" — no microseconds, no raw timezone suffixes.
+/// Format an ISO 8601 timestamp string into a human-readable absolute form in
+/// the machine's local timezone. Output style: "Jun 5, 21:54" — no
+/// microseconds, no raw timezone suffixes. Storage stays UTC; only the
+/// displayed wall-clock is converted from the parsed instant to local.
 /// If parsing fails, returns the first 16 characters as a fallback.
 #[must_use]
 pub fn format_timestamp(ts: &str) -> String {
     if let Ok(dt) = crate::db::parse_utc_timestamp(ts) {
-        dt.format("%b %-d, %H:%M").to_string()
+        dt.with_timezone(&chrono::Local)
+            .format("%b %-d, %H:%M")
+            .to_string()
     } else {
         if !TIMESTAMP_PARSE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::warn!(timestamp = %ts, "Failed to parse timestamp, falling back to truncated string");
@@ -353,15 +357,20 @@ pub fn format_timestamp(ts: &str) -> String {
     }
 }
 
-/// Extract the HH:MM:SS portion of an ISO 8601 timestamp, or the full
-/// string when shorter than 20 chars. Char-boundary safe (mirrors
-/// `format_timestamp`'s hardening); byte-identical to a raw `ts[11..19]`
-/// slice for ASCII timestamps.
-pub fn format_hhmmss(ts: &str) -> &str {
-    if ts.len() > 19 {
-        &ts[ts.floor_char_boundary(11)..ts.floor_char_boundary(19)]
+/// Render the local-time HH:MM:SS portion of an ISO 8601 timestamp, or the
+/// full string when shorter than 20 chars. Char-boundary safe (mirrors
+/// `format_timestamp`'s hardening). On parse failure the raw `ts[11..19]`
+/// slice (or the whole string when short) is kept unchanged, so malformed
+/// inputs degrade to their stored (UTC) wall-clock rather than being dropped.
+pub fn format_hhmmss(ts: &str) -> String {
+    if let Ok(dt) = crate::db::parse_utc_timestamp(ts) {
+        dt.with_timezone(&chrono::Local)
+            .format("%H:%M:%S")
+            .to_string()
+    } else if ts.len() > 19 {
+        ts[ts.floor_char_boundary(11)..ts.floor_char_boundary(19)].to_string()
     } else {
-        ts
+        ts.to_string()
     }
 }
 
