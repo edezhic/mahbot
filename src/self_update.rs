@@ -27,8 +27,8 @@
 //! `target/release`). Uses `flock()` for single-instance enforcement. The WAL
 //! checkpoint before `exit(0)` is a clean store handoff: `std::process::exit(0)`
 //! bypasses all Rust destructors, so Turso connections are never properly
-//! closed. The TRUNCATE leaves a header-only WAL with the shared frame index
-//! reset; committed data is already fsync-durable at COMMIT.
+//! closed. The TRUNCATE leaves an empty WAL; committed data is already
+//! fsync-durable at COMMIT.
 //!
 //! ## macOS Gatekeeper safety
 //!

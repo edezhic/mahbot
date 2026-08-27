@@ -28,25 +28,6 @@ default = ["full"]
 full = []
 voice-tests = []
 voice-debug = []
-# Gates the two-writer checkpoint-race repro harness (benches/wal_race_repro.rs),
-# a discovery/regression instrument — not part of default bench builds.
-wal-repro = []
-# Gates the orphaned-WAL repro harness (benches/wal_orphan_repro.rs): an
-# external sqlite3 closing a live multiprocess-wal db truncates the -wal and
-# strands the -tshm index (class-A incident escalation artifact).
-wal-orphan-repro = []
-# Gates the macOS fcntl lock-drop repro harness (benches/lock_drop_repro.rs):
-# POSIX F_SETLK process-scoped .tshm byte locks are released by an unrelated
-# close on macOS; the two-process harness demonstrates the drop and the
-# resulting reader-slot panic (class-C escalation artifact).
-lock-drop-repro = []
-# Gates the lock-drop -> Exclusive-repair -> stale durable frame index repro
-# harness (benches/wal_stale_index_repro.rs): the same macOS close-drop lets a
-# second process classify the open Exclusive, repair the shared authority from
-# a stale local WAL scan, and strand a desynced durable index — class-A
-# write-path panics and class-B durable table/index desync (escalation
-# artifact, probabilistic: batch protocol + control group inside the bench).
-wal-stale-index-repro = []
 # Gates the grep-engine subprocess end-to-end harness (benches/grep_engine_e2e.rs):
 # the parent rewrites commands and spawns `sh -c` with the bench binary acting as
 # the hidden engine subcommand, then diffs against the real system grep.
@@ -123,6 +104,9 @@ rodio = { version = "0.22", default-features = false, features = ["playback", "h
 
 # Utils
 base64 = "0.22"
+# Local IPC for the mahbot debug read-only query endpoint (UDS on Unix,
+# named pipe on Windows). Enables the removal of multiprocess_wal.
+interprocess = { version = "2", default-features = false, features = ["tokio"] }
 jsonrepair-rs = "0.2"
 rand = "0.10"
 semver = "1"
@@ -130,10 +114,8 @@ tempfile = "3"
 unicode-normalization = "0.1"
 
 # Memory / persistence
-# Pinned exactly: the wal_race_repro / wal_stale_index_repro benches are the
-# escalation artifacts for the turso two-writer WAL defect and the macOS
-# lock-drop -> stale durable index defect, so the storage layer must not drift
-# under them.
+# Pinned exactly: the storage layer drives CDC capture (blob-encoding) and the
+# read-only debug/bench paths, so it must not drift under them.
 turso = { version = "=0.7.2", default-features = false, features = ["fts"] }
 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -225,26 +207,6 @@ serial_test = "3"
 name = "wake_word"
 harness = false
 required-features = ["voice-tests"]
-
-[[bench]]
-name = "wal_race_repro"
-harness = false
-required-features = ["wal-repro"]
-
-[[bench]]
-name = "wal_orphan_repro"
-harness = false
-required-features = ["wal-orphan-repro"]
-
-[[bench]]
-name = "lock_drop_repro"
-harness = false
-required-features = ["lock-drop-repro"]
-
-[[bench]]
-name = "wal_stale_index_repro"
-harness = false
-required-features = ["wal-stale-index-repro"]
 
 [[bench]]
 name = "grep_engine_e2e"

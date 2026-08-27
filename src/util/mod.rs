@@ -198,6 +198,21 @@ pub(crate) fn hex_string(bytes: &[u8]) -> String {
         })
 }
 
+/// Standard base64 (RFC 4648, `+`/`/`, `=` padding) encoding of a byte slice.
+#[must_use]
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+
+/// Standard base64 (RFC 4648, `+`/`/`, `=` padding) decoding of a byte slice.
+///
+/// Returns `None` on malformed input (wrong length, invalid characters, or
+/// non-canonical padding).
+#[must_use]
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    STANDARD.decode(s).ok()
+}
+
 /// Verify a file's SHA256 hash matches the expected hex string.
 ///
 /// Shared model-integrity verifier extracted from the three near-identical

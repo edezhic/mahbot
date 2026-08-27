@@ -44,7 +44,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use serde_json::json;
 
 use crate::util::UnwrapPoison;
@@ -348,13 +348,13 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
 
 /// Read one `config_kv` value from the live config store, read-only.
 ///
-/// Opens the consolidated `core.db` (the config store's home) with
-/// `ReadOnly|NoLock` — the same path `mahbot debug` uses — and never creates
-/// or mutates files, reusing the daemon's `.tshm` coordination. On a
-/// pre-consolidation install it falls back to the legacy per-store
-/// `config.db`. Any failure — missing file, unreadable store, missing row —
-/// degrades to `Ok(None)` with a `tracing::warn`: this is a fallback resolution
-/// path, never fatal.
+/// When the daemon is up it holds the single-process instance lock, so the
+/// lookup is routed through the debug IPC endpoint (the same query-only
+/// guard `mahbot debug` uses). When the daemon is down the consolidated
+/// `core.db` (or legacy `config.db`) is opened directly with `ReadOnly|NoLock`
+/// and never creates or mutates files. Any failure — missing file, unreadable
+/// store, missing row, IPC hiccup — degrades to `Ok(None)` with a
+/// `tracing::warn`: this is a fallback resolution path, never fatal.
 // The `Result` wrapper is part of the shared helper contract even though the
 // body swallows all errors (read-only fallback path).
 #[allow(clippy::unnecessary_wraps)]
@@ -383,17 +383,52 @@ fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option
         if !legacy.exists() {
             return Ok(None);
         }
-        return read_config_kv_file(&legacy, key);
+        return read_config_kv_impl(storage_root, &legacy, "config", key);
     }
-    read_config_kv_file(&db_path, key)
+    read_config_kv_impl(storage_root, &db_path, "core", key)
+}
+
+fn read_config_kv_impl(
+    storage_root: &Path,
+    db_path: &Path,
+    physical: &str,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    // When the daemon holds the instance lock it is the single-process writer;
+    // `bench-openrouter` must NOT open a second connection to the live store.
+    // Route the lookup through the debug IPC endpoint (same query-only guard as
+    // `mahbot debug`). When the daemon is down, open the store directly in
+    // single-process mode (ReadOnly|NoLock reads committed WAL frames).
+    //
+    // The legacy pre-consolidation `config.db` (`physical == "config"`) is the
+    // one exception: the IPC endpoint only routes `"core"`/`"logs"`, and this
+    // path is only reachable when the consolidated core.db is absent (daemon
+    // down), so the legacy file is always opened directly. The settled lock
+    // probe also avoids a direct open mid self-update handoff.
+    if physical != "config" && crate::util::lock::daemon_holds_lock_settled(storage_root) {
+        let req = crate::db::ipc::QueryRequest {
+            store: physical.to_string(),
+            sql: "SELECT value FROM config_kv WHERE key = ?1".to_string(),
+            params: vec![crate::db::ipc::WireValue::Text(key.to_string())],
+        };
+        let resp = crate::db::ipc::ipc_query_sync(storage_root, &req)
+            .with_context(|| format!("daemon IPC config lookup failed for '{key}'"))?;
+        if let Some(err) = &resp.error {
+            bail!("daemon IPC config lookup error: {err}");
+        }
+        let value = resp.rows.first().and_then(|r| r.first()).map(|v| match v {
+            crate::db::ipc::WireValue::Null => String::new(),
+            other => other.format(),
+        });
+        return Ok(value.filter(|v| !v.is_empty()));
+    }
+    read_config_kv_file(db_path, key)
 }
 
 fn read_config_kv_file(db_path: &Path, key: &str) -> anyhow::Result<Option<String>> {
     // Callers guarantee `db_path` exists (see `read_config_kv_inner`), so this
     // does not re-check — a missing file degrades to `Ok(None)` there.
-    let opts = turso::core::DatabaseOpts::new()
-        .with_multiprocess_wal(true)
-        .with_index_method(true);
+    let opts = crate::db::experimental_database_opts();
     let (io, db) = crate::db::debug::open_readonly(db_path, db_path, opts)?;
     let conn = crate::db::debug::connect_readonly(&db, db_path)?;
 

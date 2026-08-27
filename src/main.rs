@@ -58,6 +58,9 @@ async fn bootstrap_mahbot() -> Result<()> {
     // flows from this scan into turso::open_store.
     let storage_root = mahbot::config::CONFIG.global_storage_root();
     mahbot::db::wal_guard::diagnose_all_stores(std::path::Path::new(&storage_root));
+    // Single-process mode never creates a `.tshm`; remove any stale leftover
+    // from a pre-removal multiprocess run (the `-wal` is never touched).
+    mahbot::db::wal_guard::cleanup_stale_tshm(std::path::Path::new(&storage_root));
 
     let (log_store, log_broadcast) = mahbot::logs::init_tracing(&storage_root).await?;
     let _ = mahbot::gui::LOG_BROADCAST.set(log_broadcast);
@@ -179,7 +182,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &shutdown_token,
         "log-cleanup",
         run_cleanup_loop("Log cleanup", LOG_RETENTION_HOURS, {
-            let store = log_store;
+            let store = log_store.clone();
             move |cutoff| {
                 let store = store.clone();
                 async move { store.delete_older_than("INFO", &cutoff).await }
@@ -223,16 +226,14 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::workspace::run_nightly_check_loop(),
     );
 
-    // Live-WAL/tshm artifact guard: periodically inspects the store file set
-    // and warns when the daemon's WAL fd is orphaned (live frames advertised
-    // by .tshm but an empty on-disk -wal). Detection only — never touches the
-    // files.
-    spawn_cancellable(
-        &mut tasks,
-        &shutdown_token,
-        "wal-guard",
-        mahbot::db::wal_guard::run_wal_guard_loop(),
-    );
+    // Debug IPC query endpoint: `mahbot debug` connects to this local socket
+    // (UDS on Unix, named pipe on Windows) to run read-only SQL against the
+    // live stores while the daemon holds the instance lock. Binds after the
+    // stores (DOMAIN_CONN + LOG_STORE) are up.
+    let ipc_root = mahbot::config::CONFIG.global_storage_root();
+    spawn_cancellable(&mut tasks, &shutdown_token, "debug-ipc", async move {
+        mahbot::db::ipc::run_ipc_listener(&ipc_root, log_store.clone()).await;
+    });
 
     // Eagerly initialize search engines for all existing workspaces.
     spawn_cancellable(
@@ -344,7 +345,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     // WAL growth/reopen cost (committed data is fsync-durable at COMMIT
     // regardless of checkpoints). Non-truncating (PASSIVE) below the WAL-size
     // cap — TRUNCATE resets the shared WAL frame index, which is the
-    // two-writer corruption vector under live connections, so the periodic
+    // live-writer corruption vector under live connections, so the periodic
     // loop avoids it (see checkpoint::periodic_checkpoint_and_verify).
     spawn_cancellable(&mut tasks, &shutdown_token, "auto-checkpoint", async {
         loop {
@@ -506,10 +507,6 @@ fn main() -> Result<()> {
             .build()?;
         match rt.block_on(mahbot::db::debug::run_debug()) {
             Ok(()) => std::process::exit(0),
-            Err(e) if e.downcast_ref::<mahbot::db::debug::GateRefusal>().is_some() => {
-                eprintln!("Error: {e:#}");
-                std::process::exit(2);
-            }
             Err(e) => {
                 eprintln!("Error: {e:#}");
                 std::process::exit(1);

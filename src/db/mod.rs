@@ -1,7 +1,6 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
-use std::fs::File;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
@@ -11,36 +10,12 @@ use tracing::{info, warn};
 use turso::Builder;
 pub(crate) use turso::{IntoParams, Row, Value, params};
 
-use crate::util::UnwrapPoison;
-
 pub(crate) mod cdc;
 pub mod checkpoint;
 pub mod debug;
+pub mod ipc;
 pub(crate) mod migrations;
 pub mod wal_guard;
-
-/// Read `N` bytes at `offset` via a positional read (does not move the shared
-/// file offset and never opens/closes the file).
-#[cfg(unix)]
-pub(crate) fn pread_at<const N: usize>(file: &File, offset: u64) -> Option<[u8; N]> {
-    use std::os::unix::fs::FileExt;
-    let mut buf = [0u8; N];
-    file.read_exact_at(&mut buf, offset).ok()?;
-    Some(buf)
-}
-
-#[cfg(windows)]
-pub(crate) fn pread_at<const N: usize>(file: &File, offset: u64) -> Option<[u8; N]> {
-    use std::os::windows::fs::FileExt;
-    let mut buf = [0u8; N];
-    file.seek_read(&mut buf, offset).ok()?;
-    Some(buf)
-}
-
-/// Positional read from offset 0 — convenience for header-sized reads.
-pub(crate) fn pread<const N: usize>(file: &File) -> Option<[u8; N]> {
-    pread_at(file, 0)
-}
 
 // ── Timestamp helper ────────────────────────────────────────────────
 
@@ -103,7 +78,7 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
         reason = "Referenced only by assertion tests; kept for documentation"
     )
 )]
-pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method", "multiprocess_wal"];
+pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method"];
 
 /// Name (file stem) of the single consolidated domain database file that backs
 /// the board, sessions, workspaces, users, config, and chat_history stores.
@@ -268,8 +243,14 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
 /// [`Connection::open`] reads its builder calls from this function, and
 /// [`EXPERIMENTAL_FEATURES`] lists the feature names for test verification.
 ///
-/// Used by `mahbot debug` to open databases with the same feature set as the
-/// main daemon, preventing `.tshm` WAL coordination file inconsistencies.
+/// The daemon runs in **default single-process mode** — there is no
+/// `multiprocess_wal` coordination; `-tshm` is a stale leftover from a
+/// pre-removal multiprocess run and is never created in normal operation.
+///
+/// Forensic-family reads (`mahbot debug --family`, via `open_readonly` in
+/// `debug.rs`) use this same opts: family snapshots are copied from live stores
+/// (which are created with `index_method`), so they read with the same
+/// single-process feature set.
 ///
 /// # Adding a new feature
 ///
@@ -281,20 +262,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
 /// `DatabaseOpts::with_*()` and `Builder::experimental_*()`.
 #[must_use]
 pub(crate) fn experimental_database_opts() -> turso::core::DatabaseOpts {
-    turso::core::DatabaseOpts::new()
-        .with_multiprocess_wal(true)
-        .with_index_method(true)
-}
-
-/// Engine opts for forensic-family reads (`mahbot debug --family`): the live
-/// feature set minus `multiprocess_wal` — the legacy read-only WAL path reads
-/// `db` + `-wal` directly. Note it still probes a present `.tshm`
-/// (`reject_live_multiprocess_wal_for_legacy_open`), so tshm-bearing families
-/// are opened from a temp copy that omits the coordination file; the
-/// no-touch guarantee lives in that copy, not in these opts.
-#[must_use]
-pub(crate) fn family_database_opts() -> turso::core::DatabaseOpts {
-    experimental_database_opts().with_multiprocess_wal(false)
+    turso::core::DatabaseOpts::new().with_index_method(true)
 }
 
 /// Remove characters that cause FTS query parser errors.
@@ -373,139 +341,17 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
     vec!["?"; count].join(", ")
 }
 
-/// One sidecar file's identity check result (see [`PersistentSidecarFd::identity`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SidecarIdentity {
-    /// fd held and its inode/device match a fresh `stat` of the path.
-    Matches,
-    /// No fd and no file (fresh store — the sidecar appears lazily on first
-    /// write and is then opened once via [`PersistentSidecarFd::ensure_open`]).
-    Absent,
-    /// The path no longer exists while an fd is held (unlinked by an external
-    /// process). The coordination predicate detects any resulting orphaned-WAL
-    /// state; checkpoints via the daemon's own fd are unaffected.
-    Deleted,
-    /// The path resolves to a different inode than the held fd — the file was
-    /// replaced by an external process. Callers suspend checkpoints/TRUNCATE
-    /// for the store (the identity result itself is the signal).
-    Replaced,
-}
-
-/// Persistent read-only fd to a store sidecar (`-tshm`/`-wal`), opened once
-/// when the file first exists and never closed.
-///
-/// macOS fcntl locks are process-scoped: closing **any** fd to a file drops
-/// all of the process's locks on it. The daemon must therefore never open+
-/// close `.tshm` files after startup — that would silently release the byte-0
-/// lifetime lock and let a second process classify its open as `Exclusive`
-/// (triggering repair that wipes live reader slots). All coordination reads go
-/// through this fd via positional `pread`.
-///
-/// The fd's inode/device identity is compared against the path on each read
-/// (stat by path never opens the file); a mismatch means an external process
-/// replaced the file — consumers suspend destructive operations (checkpoints)
-/// on the store. When the store is recreated (logs quarantine path) the whole
-/// `Connection` is rebuilt, so the fd is naturally re-pointed at the new file.
-///
-/// A sidecar that does not exist yet (turso creates `-wal`/`-tshm` lazily on
-/// first write) is re-pointed once by [`ensure_open`](Self::ensure_open) when
-/// it appears; until then reads fall back to path-based access (counted by the
-/// daemon's open+close regression counter).
-#[derive(Debug)]
-pub(crate) struct PersistentSidecarFd {
-    path: std::path::PathBuf,
-    /// Opened on first appearance, never closed (see struct docs).
-    file: std::sync::OnceLock<File>,
-    /// Serializes the one-time lazy open — a second transient fd on a
-    /// coordination file must never be created and dropped (that drop would
-    /// release the process's fcntl locks on it).
-    open_lock: std::sync::Mutex<()>,
-}
-
-impl PersistentSidecarFd {
-    /// Open the sidecar `db_path + suffix` read-only. No fd when the file does
-    /// not exist yet (fresh store before first write; [`ensure_open`] re-points
-    /// once it appears).
-    fn open(db_path: &Path, suffix: &str) -> Self {
-        let path = std::path::PathBuf::from(format!("{}{suffix}", db_path.display()));
-        let file = std::sync::OnceLock::new();
-        if let Ok(f) = std::fs::File::open(&path) {
-            let _ = file.set(f);
-        }
-        Self {
-            path,
-            file,
-            open_lock: std::sync::Mutex::new(()),
-        }
-    }
-
-    /// Lazy one-time re-point: open the persistent fd when the sidecar file
-    /// first appears (serialized — see [`PersistentSidecarFd`]).
-    fn ensure_open(&self) {
-        if self.file.get().is_some() {
-            return;
-        }
-        let _guard = self.open_lock.lock().unwrap_poison();
-        if self.file.get().is_some() {
-            return; // another thread re-pointed first
-        }
-        if let Ok(f) = std::fs::File::open(&self.path) {
-            let _ = self.file.set(f); // cannot fail under the lock
-        }
-    }
-
-    /// The persistent fd, when the sidecar file exists.
-    pub(crate) fn file(&self) -> Option<&File> {
-        self.file.get()
-    }
-
-    /// Re-check the persistent fd's inode/device against a fresh `stat` of the
-    /// path. `Absent` is silent (fresh store — no fd to compare); `Deleted`
-    /// and `Replaced` are external-interference conditions (only `Replaced`
-    /// means the fd reads a stale inode — the caller suspends checkpoints).
-    #[must_use]
-    pub(crate) fn identity(&self) -> SidecarIdentity {
-        self.ensure_open();
-        let Some(file) = self.file.get() else {
-            return SidecarIdentity::Absent;
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let Ok(fd_meta) = file.metadata() else {
-                return SidecarIdentity::Deleted;
-            };
-            let Ok(path_meta) = std::fs::metadata(&self.path) else {
-                return SidecarIdentity::Deleted; // path unlinked
-            };
-            if fd_meta.dev() == path_meta.dev() && fd_meta.ino() == path_meta.ino() {
-                return SidecarIdentity::Matches;
-            }
-            SidecarIdentity::Replaced
-        }
-        #[cfg(not(unix))]
-        {
-            // The inode/device replacement detector guards the macOS
-            // process-scoped fcntl-lock vector; other platforms have no such
-            // lock-drop mechanism.
-            SidecarIdentity::Matches
-        }
-    }
-}
-
-/// One store's coordination-file read sources for wal-guard inspection.
-pub(crate) type StoreFds<'a> = crate::db::wal_guard::StoreFds<'a>;
-
-/// A serialized handle to a turso connection with persistent sidecar fds.
+/// A serialized handle to a turso connection.
 ///
 /// Mutex-serializes concurrent access (turso connections do not support
 /// concurrent operations) and tracks a dangling transaction: when a
 /// [`TxGuard`] is dropped without explicit commit/rollback, the flag is set
 /// and the next write operation rolls it back first (mirrors the upstream
 /// `turso::Connection::dangling_tx` pattern at wrapper level, avoiding async
-/// in `Drop`). The persistent sidecar fds (see [`PersistentSidecarFd`]) are
-/// opened once at store open and never closed — the daemon-side open+close
-/// of `.tshm`/`-wal` is what drops the macOS process-scoped fcntl locks.
+/// in `Drop`).
+///
+/// The daemon runs in **default single-process mode**: there is no `.tshm`
+/// coordination file, so no persistent sidecar fds are held.
 ///
 /// # Shared-connection discipline (consolidated layout)
 ///
@@ -529,46 +375,14 @@ pub(crate) struct Connection {
     /// Mirrors the upstream `turso::Connection::dangling_tx` pattern but
     /// works at our wrapper level so we don't need async in Drop.
     has_dangling_tx: Arc<AtomicBool>,
-    /// Persistent read-only fds to the store's `-tshm`/`-wal` sidecars —
-    /// opened once, never closed (see [`PersistentSidecarFd`]).
-    tshm_fd: Arc<PersistentSidecarFd>,
-    wal_fd: Arc<PersistentSidecarFd>,
 }
 
-impl Connection {
-    /// The persistent sidecar fds for wal-guard inspection (lazily re-pointed
-    /// when a sidecar appears after the store open).
-    #[must_use]
-    pub(crate) fn store_fds(&self) -> StoreFds<'_> {
-        self.tshm_fd.ensure_open();
-        self.wal_fd.ensure_open();
-        StoreFds {
-            tshm: self.tshm_fd.file(),
-            wal: self.wal_fd.file(),
-        }
-    }
-
-    /// Re-check the sidecar identities and return the worst non-matching
-    /// condition (`Replaced` > `Deleted`), or `None` when both sidecars match
-    /// or are absent. The caller throttles the announcement (the wal-guard
-    /// loop re-announces on the class-warning schedule); `Replaced` means the
-    /// persistent fds read stale inodes and checkpoints must be suspended.
-    #[must_use]
-    pub(crate) fn check_coordination_identity(&self) -> Option<SidecarIdentity> {
-        let mut worst = None;
-        for fd in [&self.tshm_fd, &self.wal_fd] {
-            match fd.identity() {
-                SidecarIdentity::Matches | SidecarIdentity::Absent => {}
-                SidecarIdentity::Deleted => {
-                    if worst != Some(SidecarIdentity::Replaced) {
-                        worst = Some(SidecarIdentity::Deleted);
-                    }
-                }
-                SidecarIdentity::Replaced => worst = Some(SidecarIdentity::Replaced),
-            }
-        }
-        worst
-    }
+/// Result of a read-only query: column names, row values, and whether the
+/// row limit was hit (more rows exist).
+pub(crate) struct ReadonlyRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+    pub truncated: bool,
 }
 
 /// Message prefix of a known Limbo quick_check false positive.
@@ -597,12 +411,12 @@ const FTS_INTERNAL_INDEX_PREFIX: &str = "__turso_internal_fts_dir_";
 pub(crate) const USER_OBJECT_FILTER: &str = "name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' \
      AND name NOT IN ('turso_cdc', 'turso_cdc_version')";
 
-/// Best-effort removal of a rebuild temp family (main + sidecars).
+/// Best-effort removal of a rebuild temp family (main + sidecars). Single-process
+/// mode never creates a `-tshm` sidecar, so only `-wal`/`-shm` are removed.
 fn remove_rebuild_temp(temp: &Path) {
     let _ = std::fs::remove_file(temp);
     let _ = std::fs::remove_file(format!("{}-wal", temp.display()));
     let _ = std::fs::remove_file(format!("{}-shm", temp.display()));
-    let _ = std::fs::remove_file(format!("{}-tshm", temp.display()));
 }
 
 /// RAII cleanup of the rebuild temp family: every exit from the migration —
@@ -642,6 +456,40 @@ where
         .collect()
 }
 
+/// Run a read-only query against an already-locked turso connection, bounded
+/// to `row_limit` rows using LIMIT+1 semantics. Caller is responsible for the
+/// `PRAGMA query_only` guard and its reset.
+async fn run_readonly_query(
+    conn: &turso::Connection,
+    sql: &str,
+    params: impl IntoParams + Send + 'static,
+    row_limit: usize,
+) -> turso::Result<ReadonlyRows> {
+    let mut rows = conn.query(sql, params).await?;
+    let columns = rows.column_names();
+    let col_count = columns.len();
+    let mut result_rows = Vec::new();
+    let mut count = 0usize;
+    let mut truncated = false;
+    while let Some(row) = rows.next().await? {
+        if count >= row_limit {
+            truncated = true;
+            break;
+        }
+        let mut values = Vec::with_capacity(col_count);
+        for idx in 0..col_count {
+            values.push(row.get_value(idx)?);
+        }
+        result_rows.push(values);
+        count += 1;
+    }
+    Ok(ReadonlyRows {
+        columns,
+        rows: result_rows,
+        truncated,
+    })
+}
+
 impl Connection {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let path_str = path
@@ -653,7 +501,6 @@ impl Connection {
         let opts = experimental_database_opts();
         let db = Builder::new_local(path_str)
             .experimental_index_method(opts.enable_index_method)
-            .experimental_multiprocess_wal(opts.enable_multiprocess_wal)
             .build()
             .await
             .context("failed to open local database")?;
@@ -674,16 +521,9 @@ impl Connection {
         conn.execute("PRAGMA temp_store = MEMORY;", ())
             .await
             .context("failed to set in-memory temp storage (PRAGMA temp_store = MEMORY)")?;
-        // Open the persistent sidecar fds AFTER turso's open (which creates
-        // the .tshm on first use). These fds are never closed for the
-        // process lifetime — see PersistentSidecarFd.
-        let tshm_fd = Arc::new(PersistentSidecarFd::open(path, "-tshm"));
-        let wal_fd = Arc::new(PersistentSidecarFd::open(path, "-wal"));
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
             has_dangling_tx: Arc::new(AtomicBool::new(false)),
-            tshm_fd,
-            wal_fd,
         })
     }
 
@@ -734,6 +574,103 @@ impl Connection {
     ) -> turso::Result<Vec<Row>> {
         let conn = self.lock_and_cleanup().await;
         Self::query_impl(&conn, sql, params).await
+    }
+
+    /// Execute a read-only query with engine-level write enforcement.
+    ///
+    /// Sets `PRAGMA query_only=1`, runs the query, and resets it to `0` — all
+    /// under a single hold of the connection mutex. The reset is attempted on
+    /// every outcome (including a query-engine panic) and is itself
+    /// panic-guarded, so a reset-phase never unwinds the caller. A reset-phase
+    /// panic, or a failure to roll a leaked transaction back, flags
+    /// `has_dangling_tx` so the next access attempts a rollback; a non-panic
+    /// `query_only=0` failure only surfaces an error. Either way a failed
+    /// `query_only=0` leaves `query_only=1` (rejecting daemon writes) — loud,
+    /// with no automatic recovery. Bounds the result set to `row_limit` rows
+    /// using LIMIT+1 semantics (a result of exactly `row_limit` rows is NOT
+    /// flagged truncated; the `row_limit + 1`-th row flags it). Returns column
+    /// names + rows.
+    pub(crate) async fn query_readonly(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        row_limit: usize,
+    ) -> turso::Result<ReadonlyRows> {
+        let conn = self.lock_and_cleanup().await;
+        conn.execute("PRAGMA query_only = 1;", ()).await?;
+        let result = AssertUnwindSafe(run_readonly_query(&conn, sql, params, row_limit))
+            .catch_unwind()
+            .await;
+        // Always restore the shared connection to its normal state (query_only
+        // off, autocommit) so daemon writes are never left disabled. The
+        // `query_only` reset happens first; then a transaction-control statement
+        // (BEGIN/SAVEPOINT) that a raw IPC client could send — not re-validated
+        // daemon-side — is rolled back to autocommit, since an open transaction
+        // on the shared connection would poison subsequent daemon writes. The
+        // whole reset is also panic-guarded: a turso engine panic here must not
+        // unwind (leaving query_only=1), so the caller gets an error instead.
+        let (reset, tx_reset) = match AssertUnwindSafe(async {
+            let reset = conn.execute("PRAGMA query_only = 0;", ()).await;
+            let tx_reset = match conn.is_autocommit() {
+                Ok(true) => Ok(()),
+                _ => conn.execute("ROLLBACK;", ()).await.map(|_| ()),
+            };
+            (reset, tx_reset)
+        })
+        .catch_unwind()
+        .await
+        {
+            Ok(ok) => ok,
+            Err(payload) => {
+                // The reset panicked: the connection state is unknown (`query_only`
+                // may still be 1 and/or a transaction may be open). Flag it so the
+                // next `lock_and_cleanup` attempts a rollback, and surface the error
+                // rather than leaving daemon writes silently blocked.
+                self.has_dangling_tx.store(true, Ordering::SeqCst);
+                return Err(turso::Error::Error(format!(
+                    "the database engine panicked while resetting the read-only query state: {}",
+                    crate::util::panic_message(&*payload)
+                )));
+            }
+        };
+        if let Err(e) = &reset {
+            tracing::error!(
+                error = %e,
+                "query_readonly: failed to reset PRAGMA query_only — daemon writes may \
+                 be left disabled on the shared connection"
+            );
+        }
+        if let Err(e) = &tx_reset {
+            // Flag the leaked transaction so the next `lock_and_cleanup` retries
+            // the rollback before a daemon write reuses the connection.
+            self.has_dangling_tx.store(true, Ordering::SeqCst);
+            tracing::error!(
+                error = %e,
+                "query_readonly: failed to roll back a leaked transaction — daemon writes may \
+                 be left disabled on the shared connection"
+            );
+        }
+        match result {
+            Ok(Ok(rows)) => {
+                reset?;
+                tx_reset?;
+                Ok(rows)
+            }
+            Ok(Err(e)) => {
+                reset?;
+                tx_reset?;
+                Err(e)
+            }
+            Err(payload) => {
+                // Always attempt the reset above; report the panic as a query error.
+                reset?;
+                tx_reset?;
+                Err(turso::Error::Error(format!(
+                    "the database engine panicked while executing the query: {}",
+                    crate::util::panic_message(&*payload)
+                )))
+            }
+        }
     }
 
     /// Core query logic shared by [`Connection::query`] and [`TxGuard::query`].
@@ -1368,7 +1305,11 @@ pub(crate) fn legacy_store_db_path(root: &Path, name: &str) -> std::path::PathBu
     root.join("db").join(format!("{name}.db"))
 }
 
-/// Sidecar files (`-wal`, `-shm`, `-tshm`) beside a store's database file.
+/// Sidecar files (`-wal`, `-shm`) beside a store's database file.
+///
+/// The `-tshm` field is retained for stale-leftover detection: it is a
+/// leftover from a pre-removal multiprocess run and is **never** created in
+/// normal operation (single-process mode uses the standard `-shm`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoreSidecars {
     pub wal: std::path::PathBuf,
@@ -1492,11 +1433,11 @@ impl std::error::Error for RecreateFailed {}
 ///
 /// During daemon boot (when a pre-flight diagnosis exists for `name`), the
 /// open runs the per-store heal strategy derived by the pre-flight:
-/// TRUNCATE-first for stale-tail, PASSIVE-first + TRUNCATE for durable-B,
+/// PASSIVE-first + TRUNCATE for durable-B (0-byte main DB + non-empty WAL),
 /// quarantine + recreate for structural damage, and class-B btree-index repair
 /// after the open. Every diagnosed open is panic-absorbed (turso's own reopen
-/// of a damaged-coordination store can panic; boot must never fail because of
-/// a damaged store): heal-phase panics and errors recreate, while post-heal
+/// of a damaged store can panic; boot must never fail because of a damaged
+/// store): heal-phase panics and errors recreate, while post-heal
 /// standard-open panics propagate loudly (recreate is not justified for a
 /// store whose data was just preserved). Outside the boot flow (tests, CLI)
 /// the diagnosis map is empty and this behaves exactly like
@@ -1512,37 +1453,8 @@ pub(crate) async fn open_store(
     };
 
     match diagnosis {
-        crate::db::wal_guard::BootDiagnosis::BlockedCoordination => {
-            // Pre-open intent: the coordination state blocks a safe reopen
-            // (orphaned/foreign/truncated WAL) — no heal; the open proceeds
-            // panic-absorbed and turso's own reopen rebuilds the `.tshm` from
-            // the WAL, after which the predicate sees Healthy again (the
-            // "blocked" state applies to the checkpoint loop only while the
-            // store is closed). turso's reopen of a truncated/foreign WAL can
-            // panic (wal.rs monotonicity, pager OOB — the documented prod
-            // class). Detect-and-continue on the intact main DB: move only
-            // the broken coordination sidecars aside and retry; full recreate
-            // is the last resort.
-            //
-            // Error asymmetry vs the healable arm: non-corruption-class open
-            // errors (busy/I-O/resource) here propagate raw (failing boot)
-            // rather than recreating — corruption-class errors already
-            // recreate inside `open_and_repair`, and a plain failure would
-            // discard the intact main DB's data.
-            let result = AssertUnwindSafe(open_and_repair(&db_path, name, schema))
-                .catch_unwind()
-                .await;
-            match result {
-                Ok(Ok(conn)) => Ok(conn),
-                Ok(Err(e)) => Err(e),
-                Err(payload) => {
-                    retry_after_coordination_panic(&db_path, name, schema, &panic_err(&*payload))
-                        .await
-                }
-            }
-        }
         crate::db::wal_guard::BootDiagnosis::Healthy => {
-            // Healthy coordination + open panic is a main-DB content issue
+            // Healthy main-DB header + open panic is a main-DB content issue
             // (pager OOB), not a coordination one — the sidecar-only
             // quarantine path would discard -wal durability while the
             // "intact main DB" premise is contradicted by the panic itself.
@@ -1558,16 +1470,19 @@ pub(crate) async fn open_store(
                 }
             }
         }
-        healable @ (crate::db::wal_guard::BootDiagnosis::StaleTail
-        | crate::db::wal_guard::BootDiagnosis::DurableB) => {
-            // Phase 1: the heal connection's own open — the risky reopen of
-            // damaged coordination. A panic or persistent error (e.g. busy)
-            // here is a recreate candidate — but only for corruption-
-            // class failures: ENOSPC/EMFILE are actionable signals and must
-            // never trigger a quarantine.
-            let healed = AssertUnwindSafe(heal_checkpoint_sequence(&db_path, name, healable))
-                .catch_unwind()
-                .await;
+        crate::db::wal_guard::BootDiagnosis::DurableB => {
+            // Phase 1: the heal connection's own open — the risky reopen of a
+            // 0-byte main DB with a non-empty WAL. A panic or persistent
+            // error (e.g. busy) here is a recreate candidate — but only for
+            // corruption-class failures: ENOSPC/EMFILE are actionable signals
+            // and must never trigger a quarantine.
+            let healed = AssertUnwindSafe(heal_checkpoint_sequence(
+                &db_path,
+                name,
+                crate::db::wal_guard::BootDiagnosis::DurableB,
+            ))
+            .catch_unwind()
+            .await;
             match healed {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -1970,8 +1885,8 @@ async fn import_legacy_stores_inner(conn: &Connection, root: &Path) -> anyhow::R
 /// Copy one legacy store's user tables into the consolidated database.
 ///
 /// The source is opened READ-ONLY (`ReadOnly | NoLock`) with the same
-/// experimental feature set as the daemon so the WAL/`.tshm` coordination is
-/// read correctly. Turso internals (`sqlite_%`, `__turso_internal_%`) are never
+/// experimental feature set as the daemon so the WAL is read correctly. Turso
+/// internals (`sqlite_%`, `__turso_internal_%`) are never
 /// copied — the consolidated schema recreates them. A source table that has no
 /// matching target table (schema drift) is skipped; the removed rework-child
 /// tables (`ticket_jobs`, `ticket_stage_jobs`) fall through to `None` and are
@@ -2303,55 +2218,6 @@ fn panic_err(payload: &(dyn std::any::Any + Send)) -> anyhow::Error {
     )
 }
 
-/// Detect-and-continue fallback after a BlockedCoordination open panic:
-/// turso's reopen of a truncated/foreign WAL can panic (wal.rs monotonicity,
-/// pager OOB — the documented prod class). Move only the broken coordination
-/// sidecars aside and retry on the intact main DB; full recreate is the last
-/// resort.
-///
-/// The whole `-wal` is moved aside, including for the Oversized class where it
-/// holds valid committed frames up to max_frame that a PASSIVE-first heal
-/// would preserve — asymmetric with the healable arms, but only reachable via
-/// a reopen panic (which signals deeper damage than a plain oversized tail).
-///
-/// The sidecar quarantine happens before the retry: an actionable-signal
-/// failure of the retry open (ENOSPC/EMFILE/permission) propagates with the
-/// coordination sidecars already quarantined while the main DB is preserved —
-/// the `-wal`'s uncheckpointed frames are lost in that scenario (inherent to
-/// the panic path that precedes it).
-async fn retry_after_coordination_panic(
-    db_path: &Path,
-    name: &str,
-    schema: &str,
-    reason: &anyhow::Error,
-) -> anyhow::Result<Connection> {
-    crate::boot::boot_diagnostic(format!(
-        "store '{name}' open panicked ({reason}) — quarantining coordination \
-         sidecars and retrying on the intact main DB",
-    ));
-    // The recreate path tolerates a partial quarantine — the bool is
-    // intentionally ignored.
-    let _ = quarantine_coordination_sidecars(db_path);
-    let retry = AssertUnwindSafe(open_with_schema(db_path, schema))
-        .catch_unwind()
-        .await;
-    match retry {
-        Ok(Ok(conn)) => Ok(conn),
-        Ok(Err(e)) => {
-            // Actionable resource conditions (ENOSPC/EMFILE/permission) must
-            // never quarantine the family — the main DB is intact here, so
-            // propagate the signal. Schema-mismatch is the same class: the
-            // main DB was readable enough to run DDL; recreating it would
-            // discard user data because of a code bug.
-            if is_actionable_signal(&e) || is_schema_mismatch(&e) {
-                return Err(e);
-            }
-            recreate_after_failed_heal(db_path, name, schema, &e).await
-        }
-        Err(p) => recreate_after_failed_heal(db_path, name, schema, &panic_err(&*p)).await,
-    }
-}
-
 /// Outcome of the class-B btree-index repair.
 enum RepairOutcome {
     /// No recreate needed: quick_check passed, or a report-only condition
@@ -2371,7 +2237,7 @@ enum RepairOutcome {
 }
 
 /// Open with the schema, then run the class-B btree-index repair (boot path
-/// only — single-writer, exclusive access, wal-guard not yet started). This
+/// only — single-writer, exclusive access before any live traffic). This
 /// runs a full quick_check on every store at every boot (7× full-DB scans,
 /// plus a verification scan after a repair) — the fixed boot cost of the
 /// repair-at-init design.
@@ -2565,8 +2431,8 @@ async fn repair_btree_index_if_desynced(
             );
         }
     }
-    // REINDEX is planner-safe under multiprocess_wal (it rewrites the index
-    // btree in place). Quoting: identifiers may contain special characters.
+    // REINDEX rewrites the index btree in place. Quoting: identifiers may
+    // contain special characters.
     let quoted = index.replace('"', "\"\"");
     if conn
         .execute_batch(&format!("REINDEX \"{quoted}\";"))
@@ -2599,10 +2465,10 @@ async fn repair_btree_index_if_desynced(
 /// mechanism). A fresh file is the only path that verifies clean (index valid,
 /// data intact).
 ///
-/// Preconditions hold at boot: single-writer, exclusive access, wal-guard and
-/// the periodic checkpoint loop not yet started. The original family is
-/// quarantined (renamed aside, never deleted — the forensic record) before the
-/// swap, satisfying the recreate-path preservation guarantee. Returns
+/// Preconditions hold at boot: single-writer, exclusive access before any
+/// live traffic. The original family is quarantined (renamed aside, never
+/// deleted — the forensic record) before the swap, satisfying the
+/// recreate-path preservation guarantee. Returns
 /// `Ok(([`RepairOutcome::Migrated`], reopened))` on success; aborts as
 /// `NoRepair` (report-only) on a constraint violation during the data copy —
 /// a data-integrity finding, not corruption, and never a silent recreate — or
@@ -2617,42 +2483,10 @@ async fn migrate_overflow_aliased_store(
     name: &str,
     schema: &str,
 ) -> anyhow::Result<(RepairOutcome, Connection)> {
-    // ── Precondition: fi_len == maxf, else TRUNCATE-checkpoint first ──
-    let status = crate::db::wal_guard::inspect_store_at(db_path, conn.store_fds());
-    if let Some(h) = status.tshm
-        && u64::from(h.frame_index_len) != h.max_frame
-    {
-        crate::boot::boot_diagnostic(format!(
-            "store '{name}' WAL frame index (len={}) does not match max_frame ({}) — \
-             TRUNCATE-checkpoint first in the single-writer window",
-            h.frame_index_len, h.max_frame,
-        ));
-        match conn.checkpoint().await {
-            Ok(o) if o.is_complete() => {}
-            // Incomplete (busy / frames remaining) is the same precondition
-            // failure as an error — the WAL cannot be reset in the
-            // single-writer window.
-            Ok(o) => {
-                crate::boot::boot_diagnostic(format!(
-                    "store '{name}' pre-rebuild TRUNCATE checkpoint incomplete \
-                     (busy={}, {} of {} frames) — recreate justified",
-                    o.busy, o.checkpointed_frames, o.log_frames,
-                ));
-                return Ok((RepairOutcome::Unreadable, conn));
-            }
-            Err(e) if is_actionable_signal(&e) => return Err(e),
-            // The WAL precondition cannot be met — recreate is justified here
-            // (unlike a table-enumeration failure): quarantine + fresh open
-            // clears a stuck WAL, so this is a recovery, not data loss.
-            Err(e) => {
-                crate::boot::boot_diagnostic(format!(
-                    "store '{name}' pre-rebuild TRUNCATE checkpoint failed: {e} — \
-                     recreate justified",
-                ));
-                return Ok((RepairOutcome::Unreadable, conn));
-            }
-        }
-    }
+    // The old `.tshm` frame-index precondition (`frame_index_len == max_fr`)
+    // no longer applies — multiprocess_wal was removed and the daemon runs in
+    // default single-process mode, so there is no shared WAL frame index to
+    // reset before a rebuild.
 
     // ── Readability + row-count per user table (quick_check does not name
     // the aliased index, so every table's read is gated; unreadable →
@@ -3163,26 +2997,13 @@ async fn heal_checkpoint_sequence(
     let sidecars = store_sidecars(db_path);
     // PASSIVE-first for durable-B (0-byte main DB + live WAL): backfill
     // without truncating, then a reopen + TRUNCATE compacts. Defensively
-    // re-checked in the StaleTail arm — TRUNCATE-first on a 0-byte main DB
-    // destroys committed frames.
+    // re-checked here — TRUNCATE-first on a 0-byte main DB destroys
+    // committed frames.
     let durable_b = matches!(diagnosis, crate::db::wal_guard::BootDiagnosis::DurableB)
         || (std::fs::metadata(db_path).is_ok_and(|m| m.len() == 0)
             && std::fs::metadata(&sidecars.wal).is_ok_and(|m| m.len() > 0));
     if durable_b {
         heal_checkpoint(db_path, CheckpointMode::Passive, name).await?;
-        heal_checkpoint(db_path, CheckpointMode::Truncate, name).await?;
-        return Ok(());
-    }
-    if matches!(diagnosis, crate::db::wal_guard::BootDiagnosis::StaleTail) {
-        // Defensive orphan guard: the WAL bytes are gone (a genuine stale
-        // tail always has frames on disk, wal ≥ 32) — TRUNCATE-first has
-        // nothing to heal and the heal connection's reopen could panic on the
-        // empty WAL; the panic-absorbed phase-2 open handles that state.
-        if std::fs::metadata(&sidecars.wal).is_ok_and(|m| m.len() < 32) {
-            return Ok(());
-        }
-        // TRUNCATE-first resets the shared frame index and max_frame while
-        // keeping committed frames (validated empirically).
         heal_checkpoint(db_path, CheckpointMode::Truncate, name).await?;
     }
     Ok(())
@@ -3219,13 +3040,9 @@ const HEAL_CHECKPOINT_RETRIES: usize = 3;
 /// busy outcomes ~3 times with a 1-second interval. The connection is closed
 /// before the next mode's open (or the standard store open).
 ///
-/// The temporary connection's fds are dropped on close — on macOS that
-/// releases the process's fcntl locks on that `.tshm` (the process-scoped
-/// fcntl mechanism the persistent fds exist to avoid).
 /// Benign here: the heal runs in the single-writer boot window before the
 /// main connection exists, and the instance flock already excludes a second
-/// daemon (the open+close regression counter does not observe turso-internal
-/// opens by design).
+/// daemon.
 async fn heal_checkpoint(db_path: &Path, mode: CheckpointMode, name: &str) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)
         .await
@@ -3282,23 +3099,6 @@ pub(crate) fn quarantine_store_artifacts(db_path: &Path) -> bool {
         db_path,
         &[
             (db_path, ""),
-            (&sidecars.wal, "-wal"),
-            (&sidecars.shm, "-shm"),
-            (&sidecars.tshm, "-tshm"),
-        ],
-    )
-}
-
-/// Move only the coordination sidecars (`-wal`/`-shm`/`-tshm`) aside, keeping
-/// the main DB in place — detect-and-continue on an intact main DB whose
-/// broken sidecars made turso's reopen panic. Same best-effort,
-/// never-deleted quarantine semantics as [`quarantine_store_artifacts`].
-#[must_use]
-fn quarantine_coordination_sidecars(db_path: &Path) -> bool {
-    let sidecars = store_sidecars(db_path);
-    quarantine_family(
-        db_path,
-        &[
             (&sidecars.wal, "-wal"),
             (&sidecars.shm, "-shm"),
             (&sidecars.tshm, "-tshm"),
@@ -3489,10 +3289,6 @@ mod tests {
                     opts.enable_index_method,
                     "index_method should be enabled per EXPERIMENTAL_FEATURES"
                 ),
-                "multiprocess_wal" => assert!(
-                    opts.enable_multiprocess_wal,
-                    "multiprocess_wal should be enabled per EXPERIMENTAL_FEATURES"
-                ),
                 other => panic!("unknown experimental feature: {other}"),
             }
         }
@@ -3537,18 +3333,11 @@ mod tests {
             "unsafe_testing is not an active experimental feature"
         );
 
-        // Family (forensic-snapshot) reads derive from the live opts minus
-        // multiprocess_wal (legacy read-only WAL path); the no-touch guarantee
-        // comes from the debug CLI's temp copy that omits the `.tshm`, since
-        // the legacy path still probes a present coordination file.
-        let fam = family_database_opts();
+        // Forensic-family reads use the same live single-process feature set.
+        let fam = experimental_database_opts();
         assert!(
             fam.enable_index_method,
             "family reads need index_method (stores are created with it)"
-        );
-        assert!(
-            !fam.enable_multiprocess_wal,
-            "family reads must disable multiprocess_wal (snapshot semantics)"
         );
     }
 
@@ -3738,9 +3527,6 @@ mod tests {
         if opts.enable_index_method {
             mapped.push("index_method");
         }
-        if opts.enable_multiprocess_wal {
-            mapped.push("multiprocess_wal");
-        }
         // Note: enable_views maps to experimental_materialized_views() but
         // is not an active feature — no if-guard needed.
         // Note: enable_autovacuum and unsafe_testing have no Builder
@@ -3773,10 +3559,7 @@ mod tests {
     ///
     /// This is a source-scanning tripwire, not a security boundary: any new
     /// module that opens a database via `turso::Builder` / `Builder::new_local`
-    /// directly fails this test with a pointer to the canonical path. (The
-    /// cross-process repro bench in `benches/` is outside this scan and is a
-    /// documented exception — it needs raw builder access for the two-writer
-    /// harness.)
+    /// directly fails this test with a pointer to the canonical path.
     #[test]
     fn raw_builder_usage_is_confined_to_persistence_and_debug() {
         const PATTERNS: [&str; 2] = ["turso::Builder", "Builder::new_local"];
@@ -3851,8 +3634,6 @@ mod tests {
     /// src/db/debug.rs) do NOT share an opening path — both must carry the
     /// PRAGMA. If either regresses, the guarantee silently breaks; this
     /// source-scanning tripwire fails with a pointer to the requirement.
-    /// The bench harnesses in `benches/` are outside this scan (documented
-    /// repro exceptions, not application code).
     #[test]
     fn in_memory_temp_store_applied_on_both_opening_paths() {
         const PRAGMA: &str = "PRAGMA temp_store = MEMORY";

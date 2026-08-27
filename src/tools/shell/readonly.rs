@@ -6973,7 +6973,8 @@ mod tests {
                 "SNAP=$(mktemp -d)\nmkdir -p \"$SNAP/.mahbot/db\"\ncp ~/.mahbot/db/board.db \"$SNAP/.mahbot/db/\"\nHOME=\"$SNAP\" mahbot debug --db board \"SELECT 1\"\nrm -rf \"$SNAP\"",
                 true,
             ),
-            // Full for-loop spelling from the deleted ops doc.
+            // Full for-loop spelling: copies every store file plus its `-wal`
+            // sidecar (a snapshot must include uncheckpointed committed frames).
             (
                 "SNAP=$(mktemp -d)\nmkdir -p \"$SNAP/.mahbot/db\"\nfor db in ~/.mahbot/db/*.db; do\ncp \"$db\" \"$SNAP/.mahbot/db/\"\ncp \"$db-wal\" \"$SNAP/.mahbot/db/\" 2>/dev/null || true\ndone\nHOME=\"$SNAP\" mahbot debug --db sessions \"SELECT COUNT(*) FROM messages\"\nrm -rf \"$SNAP\"",
                 true,

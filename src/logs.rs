@@ -70,7 +70,7 @@ pub struct LogStore {
 /// This store is initialized inside [`init_tracing()`] — it does NOT have an
 /// `init_global()` like other stores. Do NOT add one. Calling `init_tracing()`
 /// already opens `logs.db`. A second open via `init_global()` would create a
-/// second connection to the same database, causing `.tshm` coordination
+/// second connection to the same database, causing WAL coordination
 /// conflicts between the two connections.
 ///
 /// In addition to this global, [`crate::gui::BOOT_LOG_STORE`] holds another clone of
@@ -213,8 +213,8 @@ impl LogStore {
     ///
     /// Boot-time quarantine: if the existing store fails integrity verification
     /// (corruption-class `quick_check` output, or the open/verify path
-    /// panicking — opening a corrupt store under multiprocess_wal can panic),
-    /// the whole artifact family (database plus `-wal`/`-shm`/`-tshm`
+    /// panicking — opening a corrupt store can panic),
+    /// the whole artifact family (database plus `-wal`/`-shm`
     /// sidecars) is moved aside to a timestamped quarantine name and a fresh
     /// store is created. Logs-only by construction: this lives in the logs
     /// open path and is never reachable from the shared store helpers. Boot
@@ -387,7 +387,7 @@ impl LogStore {
 enum OpenFailure {
     /// Quarantine-worthy: integrity verification failed, the open failed with
     /// a corruption-class error, or the open/verify path panicked (opening a
-    /// corrupt store under multiprocess_wal can panic).
+    /// corrupt store can panic).
     Corrupt(String),
     /// Non-quarantine failures (busy/locked/IO) — propagate unchanged.
     Other(anyhow::Error),
@@ -400,8 +400,8 @@ enum OpenFailure {
 /// semantics) and recreate the store — the recreated store must be the one
 /// registered in `LOG_STORE`/`iter_checkpoint_stores`.
 ///
-/// The open itself is panic-absorbed: opening a corrupt store under
-/// multiprocess_wal can panic (e.g. the shared-WAL frame-index invariant), and
+/// The open itself is panic-absorbed: opening a corrupt store
+/// can panic (e.g. a pager/WAL index OOB), and
 /// a boot-time panic here must quarantine rather than crash startup.
 async fn open_verified_logs_store(root: &Path) -> Result<crate::db::Connection, OpenFailure> {
     let db_path = db::store_db_path(root, "logs");
