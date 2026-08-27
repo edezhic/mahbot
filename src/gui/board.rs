@@ -782,8 +782,7 @@ impl BoardState {
         .spacing(2)
         .align_y(Alignment::Center);
         let tooltip_text = format!(
-            "Validation bounces: {bounce_count} (max {}) — counts diagnostics/review/QA/sanitation \
-             non-success only; engineer hard-failures are pause-only and don't consume the budget",
+            "Validation bounces: {bounce_count} (max {})",
             crate::pipeline::MAX_BOUNCES,
         );
         Some(
