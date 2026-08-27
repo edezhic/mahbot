@@ -95,8 +95,8 @@ pub(crate) enum StopResult {
 /// Agent-scoped registry of background shell sessions.
 ///
 /// State is owned by the agent (dropped with it) and reachable from the
-/// synchronous teardown path for the teardown kill; the per-call tool
-/// context carries only an `Arc` handle re-scoped per tool-group invocation.
+/// synchronous teardown path for the teardown kill; the tool-batch context
+/// carries only an `Arc` handle, scoped once per tool batch.
 pub(crate) struct BackgroundSessions {
     inner: std::sync::Mutex<HashMap<PathBuf, SessionEntry>>,
 }

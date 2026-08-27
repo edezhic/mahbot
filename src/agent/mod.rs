@@ -22,12 +22,13 @@ pub mod registry;
 pub(crate) mod role;
 pub(crate) mod skills;
 
-// ── Per-tool-call user context ─────────────────────────────────────
-// Set by the Agent work loop before each tool execute(), read by tools
-// that need user context (e.g. AnalyzeTool async dispatch).
+// ── Tool-batch user context ────────────────────────────────────────
+// Set once per tool batch by the Agent work loop's `execute_tool_group`,
+// read by tools that need user context (e.g. AnalyzeTool async dispatch).
 //
 // # Contract
-// - Set by the Agent work loop before each tool execution.
+// - Set once per tool batch (per `execute_tool_group` round), not before
+//   each individual tool `execute()`.
 // - Must be read synchronously (before any `tokio::spawn` boundary) when
 //   the value is needed across an async boundary.
 // - Falls back to `unwrap_or_default()` → empty string for background
@@ -2648,9 +2649,9 @@ mod tests {
                 _args: serde_json::Value,
             ) -> anyhow::Result<String> {
                 // Read task-locals synchronously (no async boundary) — the
-                // contract is: the Agent work loop sets these before each
-                // tool execution group, and tools must read them before any
-                // tokio::spawn if crossing an async boundary.
+                // contract is: the Agent work loop sets these once per tool
+                // batch, and tools must read them before any tokio::spawn
+                // if crossing an async boundary.
                 let user_name = CURRENT_TOOL_USER_NAME
                     .try_with(String::clone)
                     .unwrap_or_default();

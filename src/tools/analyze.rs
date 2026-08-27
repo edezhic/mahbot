@@ -130,9 +130,9 @@ impl Tool for AnalyzeTool {
         let analyze = super::get_str(&args, "analyze")?;
 
         // Async dispatch path — delegate to analysts in background.
-        // Read user context from task-locals (set by Agent work loop
-        // before each tool.execute() call) so the queued result carries
-        // the correct user identity for per-user delivery.
+        // Read user context from task-locals (set once per tool batch by
+        // the Agent work loop) so the queued result carries the correct
+        // user identity for per-user delivery.
         if self.dispatch_mode.is_async() {
             let ws = ws.clone();
             let analyze = analyze.to_string();

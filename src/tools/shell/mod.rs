@@ -726,10 +726,10 @@ impl ShellTool {
         }
     }
 
-    /// The agent-scoped background-session registry, read from the per-call
-    /// tool context (set by the agent's tool-group executor). `None` outside
-    /// an agent run (management diagnostics, tests) — background mode is
-    /// unavailable there.
+    /// The agent-scoped background-session registry, read from the tool-batch
+    /// context (set once per tool batch by the agent's `execute_tool_group`).
+    /// `None` outside an agent run (management diagnostics, tests) —
+    /// background mode is unavailable there.
     fn background_sessions_handle()
     -> anyhow::Result<std::sync::Arc<crate::tools::shell::BackgroundSessions>> {
         crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS
@@ -3326,7 +3326,7 @@ mod tests {
 
     // ── Background mode (Full roles only) ─────────────────────────────
 
-    /// Run `shell_tool.execute(...)` inside the agent per-call context with a
+    /// Run `shell_tool.execute(...)` inside the agent tool-batch context with a
     /// background-session registry, so the background/stop arguments resolve.
     async fn execute_with_bg_registry(
         shell_tool: &ShellTool,
