@@ -256,6 +256,28 @@ pub(crate) const BOARD_MIGRATIONS: &[Migration] = &[
             column: "review_base_count",
         }),
     },
+    // ── CDC-driven timeline ───────────────────────────────────────────────
+    // The per-ticket phase-history timeline backing the Manager's grouped
+    // <ticket-updates> notification. Written EXCLUSIVELY by the chronicle CDC
+    // subscriber (db::cdc → pipeline::chronicle), never by transition sites.
+    // AUTOINCREMENT id is the restart-safe monotonic delivery cursor.
+    Migration {
+        id: "consolidate_008_create_ticket_chronicle",
+        sql: "\
+            CREATE TABLE IF NOT EXISTS ticket_chronicle (\
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,\
+                ticket_id      TEXT NOT NULL,\
+                workspace_name TEXT NOT NULL,\
+                source_phase   TEXT NOT NULL,\
+                target_phase   TEXT NOT NULL,\
+                at             TEXT NOT NULL\
+            );\
+            CREATE INDEX IF NOT EXISTS idx_ticket_chronicle_ws_id \
+                ON ticket_chronicle(workspace_name, id);\
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_chronicle_dedup \
+                ON ticket_chronicle(ticket_id, workspace_name, source_phase, target_phase, at);",
+        guard: None,
+    },
 ];
 
 /// Apply the consolidated **domain** migration history to the single
@@ -397,6 +419,7 @@ mod tests {
                 "002_drop_ticket_assigned_to",
                 "003_reset_nonterminal_tickets",
                 "004_drop_tickets_review_base_count",
+                "consolidate_008_create_ticket_chronicle",
             ],
             "all DROP migrations + the reset recorded in order"
         );
@@ -405,7 +428,7 @@ mod tests {
         run_pending_migrations(&conn, "board", BOARD_MIGRATIONS)
             .await
             .expect("second run is a no-op");
-        assert_eq!(applied_ids(&conn).await.len(), 4, "never re-run");
+        assert_eq!(applied_ids(&conn).await.len(), 5, "never re-run");
     }
 
     #[tokio::test]
@@ -464,6 +487,7 @@ mod tests {
                 "002_drop_ticket_assigned_to",
                 "003_reset_nonterminal_tickets",
                 "004_drop_tickets_review_base_count",
+                "consolidate_008_create_ticket_chronicle",
             ],
             "all recorded as applied even though the DDL was skipped"
         );

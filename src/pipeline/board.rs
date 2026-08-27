@@ -1732,7 +1732,9 @@ impl BoardStore {
     }
 
     /// List all tickets, optionally filtered by workspace and/or phase.
-    /// Used by the dashboard to show tickets across all workspaces.
+    /// Used by the dashboard to show tickets across all workspaces. The
+    /// `is_archived = 0` gate means a ticket appears here iff it is live,
+    /// which also backs the CDC removal decision.
     pub async fn list_all_tickets(
         &self,
         workspace_name: Option<&str>,

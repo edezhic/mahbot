@@ -99,8 +99,8 @@ fn telegram_delivery_content<'a>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
     /// User-typed message (chat or inline-button callback).
-    /// For Manager: the ticket transition buffer drains before the agent runs.
-    /// For other roles: no ticket buffer drain.
+    /// For Manager: the ticket_chronicle timeline drains before the agent runs.
+    /// For other roles: no ticket timeline drain.
     UserMessage,
     /// System notification from a ticket transition.
     /// Only enqueued for the Manager role.
@@ -516,14 +516,22 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         let typing_tasks = setup_telegram_typing(&users).await;
         broadcast_typing(&users, &job.workspace_name, true);
 
-        // ── Ticket buffer drain (Manager only) ────────────────────────
+        // ── Chronicle timeline drain (Manager only) ────────────────────────
         // TicketComment jobs should NEVER reach the consumer loop — they are
         // delivered directly via try_route() to agents that drain them in
         // llm_loop. If one arrives here, someone used route() instead of
         // try_route(), or the agent's receiver was dropped.
         let message = match (role, job.kind) {
             (Role::Manager, MessageKind::UserMessage) => {
-                let drained = crate::pipeline::chronicle::drain(&job.workspace_name);
+                // Flush the CDC drainer so a transition committed moments ago is
+                // materialized into the chronicle before the manager reads it
+                // (delayed, not lost, if skipped — the next drain delivers it).
+                if let Err(e) =
+                    crate::db::cdc::drain_once(&crate::pipeline::board::store().conn).await
+                {
+                    tracing::warn!(error = %e, "CDC flush before Manager user message failed");
+                }
+                let drained = crate::pipeline::chronicle::drain(&job.workspace_name).await;
                 if drained.is_empty() {
                     job.content.clone()
                 } else {

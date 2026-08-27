@@ -70,6 +70,10 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     mahbot::db::init_all_stores().await?;
 
+    // Start the CDC-driven chronicle subscriber (materializes ticket_chronicle
+    // transitions from ticket change events). Must run after the stores are up.
+    mahbot::pipeline::chronicle::start_subscriber();
+
     // Config DB must be loaded before providers, so that API keys
     // and model settings take effect.
     mahbot::config::reload_from_db().await?;
@@ -554,6 +558,10 @@ fn main() -> Result<()> {
     // runs (matching LOG_BROADCAST), so the file-change subscription always
     // has a source — an uninitialized one would end the subscription stream.
     mahbot::gui::init_git_file_change_tx();
+    // Warm the CDC ticket sender before the app runs so the board change
+    // subscription also has a source; otherwise it ends on the first frame and
+    // the board freezes at the initial snapshot (Iced never re-spawns it).
+    mahbot::gui::init_board_change_tx();
 
     iced::application(
         move || {

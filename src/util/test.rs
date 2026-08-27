@@ -897,12 +897,16 @@ pub async fn init_test_stores() {
         crate::db::init_all_stores()
             .await
             .expect("failed to initialize test stores (see chained error for per-store details)");
+
+        // Start the CDC-driven chronicle subscriber so the timeline is
+        // materialized from ticket change events in tests too.
+        crate::pipeline::chronicle::start_subscriber();
     })
     .await;
 }
 
 /// Initialize all stores needed by management tests that interact with
-/// the ticket buffer.
+/// the chronicle timeline.
 ///
 /// Calls [`init_test_stores`] (all test DBs) then initializes the global
 /// message_router. The router is required by callers that

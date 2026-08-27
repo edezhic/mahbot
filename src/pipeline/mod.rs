@@ -51,7 +51,6 @@ use crate::session::manager_agent_id;
 use crate::util::UnwrapPoison;
 use crate::{Role, Workspace, WorkspaceStatus};
 
-pub(crate) use chronicle::TransitionOrigin;
 pub(crate) use verdict::stage_name;
 pub(crate) use verdict::{
     AgentSlot, ExtractionMode, ParallelVerdict, build_round_joint_comment,
@@ -505,13 +504,6 @@ async fn run_claim_pipeline(ws: &Workspace) {
         .await
     {
         info!(ticket = %ticket.id, workspace = %ws.name, "Claimed Backlog → Analysis");
-        chronicle::push(
-            &ws.name,
-            &ticket.id,
-            TicketPhase::Backlog,
-            TicketPhase::Analysis,
-            TransitionOrigin::Pipeline,
-        );
     }
     if let Ok(Some(ticket)) = board()
         .claim_ticket_in_workspace(
@@ -524,13 +516,6 @@ async fn run_claim_pipeline(ws: &Workspace) {
         .await
     {
         info!(ticket = %ticket.id, workspace = %ws.name, "Claimed ReadyForDevelopment → InDevelopment");
-        chronicle::push(
-            &ws.name,
-            &ticket.id,
-            TicketPhase::ReadyForDevelopment,
-            TicketPhase::InDevelopment,
-            TransitionOrigin::Pipeline,
-        );
         let _ = crate::jobs::upsert_engineer_session_pin(
             &crate::session::store().conn,
             &ticket.id,
@@ -709,15 +694,9 @@ where
             NotifyPolicy::Notify => {
                 notify_ticket(ctx.ticket, ctx.source, ctx.target, ctx.breaker_trip).await;
             }
-            NotifyPolicy::Buffer => {
-                chronicle::push(
-                    &ctx.ticket.workspace_name,
-                    &ctx.ticket.id,
-                    ctx.source,
-                    ctx.target,
-                    chronicle::TransitionOrigin::Pipeline,
-                );
-            }
+            // Buffer: the transition is materialized by the CDC-driven chronicle
+            // subscriber and delivered on the next drain.
+            NotifyPolicy::Buffer => {}
         }
     }
     outcome
@@ -906,15 +885,22 @@ async fn notify_ticket(
     };
 
     let transition_log = format!(
-        "[{}] {}: {} → {} ({})",
+        "[{}] {}: {} → {}",
         ticket.reporter,
         ticket.id,
         source.as_ref(),
         target_phase.as_ref(),
-        chronicle::TransitionOrigin::Pipeline
     );
 
-    let drained = crate::pipeline::chronicle::drain(&ws.name);
+    // The chronicle row for the just-committed transition is materialized by the
+    // CDC drainer (synchronous materializer). Flush it now so the transition that
+    // triggered this notification is present in the <ticket-updates> block rather
+    // than deferred to a later drain.
+    if let Err(e) = crate::db::cdc::drain_once(&board().conn).await {
+        tracing::warn!(error = %e, "CDC flush before Manager notification failed");
+    }
+
+    let drained = crate::pipeline::chronicle::drain(&ws.name).await;
 
     let mut message = substitute(
         &load_prompt("pipeline/notification.md"),

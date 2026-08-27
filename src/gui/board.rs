@@ -39,10 +39,24 @@ pub struct CommitStats {
     files: Vec<FileStat>,
 }
 
+// The largest variants carry `Vec<Ticket>`/boxed payloads, so the enum contains
+// both tiny unit variants and sizable ones; that is inherent to a page message.
 #[derive(Debug, Clone)]
+#[expect(clippy::large_enum_variant)]
 pub enum BoardMessage {
-    Refreshed(Vec<Ticket>),
+    Refreshed {
+        tickets: Vec<Ticket>,
+        generation: u64,
+    },
     RefreshError(String),
+    /// A ticket change delivered by the CDC change stream (see
+    /// [`crate::db::cdc`]). The board applies the delta idempotently by ticket id.
+    TicketChanged(Box<crate::db::cdc::ChangeEvent>),
+    /// The change stream lagged — force a full board refresh (the delta was
+    /// lost, so the snapshot is the only safe way to recover).
+    BoardRefreshNeeded,
+    /// The re-fetched ticket for a [`TicketChanged`] delta, ready to upsert.
+    TicketUpserted(Ticket),
     TicketDetails(Box<Ticket>),
     DetailError(String),
     /// Periodic re-fetch of the open ticket detail (see
@@ -150,6 +164,22 @@ pub struct BoardState {
     comments_md: Vec<(usize, Vec<markdown::Item>)>,
     /// Current workspace name filter (set by global picker).
     pub(crate) workspace_name: Option<String>,
+    /// Bumped on every workspace selection / baseline refresh. The
+    /// [`BoardMessage::Refreshed`] handler drops a stale snapshot whose
+    /// generation no longer matches, preventing a previous workspace's tickets
+    /// from clobbering the newly-selected one.
+    pub(crate) board_generation: u64,
+    /// Ticket ids a CDC delta archived/removed since the last baseline. A
+    /// baseline snapshot read before such a delta must not re-add the ticket,
+    /// so `apply_refreshed` skips these ids from the snapshot.
+    pub(crate) delta_removed_ids: HashSet<String>,
+    /// True right after a workspace switch, so the next [`Refreshed`] REPLACES
+    /// the board (the previous workspace's tickets must not linger). Set again
+    /// on a lag recovery ([`BoardMessage::BoardRefreshNeeded`]) so the recovery
+    /// snapshot is authoritative and drops tickets a lost removal delta would
+    /// have removed. Cleared on the first snapshot; subsequent same-workspace
+    /// refreshes merge.
+    pub(crate) replace_on_refresh: bool,
     /// Loaded commit stats for the open ticket.
     commit_stats: Option<CommitStats>,
     /// Whether a commit stats fetch is in progress.
@@ -215,6 +245,9 @@ impl BoardState {
             description_md: None,
             comments_md: Vec::new(),
             workspace_name: None,
+            board_generation: 0,
+            delta_removed_ids: HashSet::new(),
+            replace_on_refresh: false,
             commit_stats: None,
             commit_stats_loading: false,
             commit_stats_generation: 0,
@@ -244,10 +277,10 @@ impl BoardState {
 
     /// Whether `ticket_id` is in a mid-pipeline (implementation) phase, using
     /// the freshest synchronous state available: the open detail modal's
-    /// `selected_ticket` (a fresh DB fetch, refreshed every second even
-    /// during search), then the search results (the exact cards the user
-    /// sees while a search is active), then the board list (refreshed every
-    /// second; paused during search). Decides between the confirmation
+    /// `selected_ticket` (a fresh DB fetch, refreshed on change/periodic
+    /// detail refresh), then the search results (the exact cards the user
+    /// sees while a search is active), then the board list (CDC-driven,
+    /// paused during search). Decides between the confirmation
     /// modal and a single-click cancel in `RequestCancel`. `PerformAction`
     /// re-checks the phase at execution, so the real
     /// pause decision is always authoritative regardless of staleness here.
@@ -289,6 +322,7 @@ impl BoardState {
 
     pub fn refresh(&self) -> Task<BoardMessage> {
         let ws_name = self.workspace_name.clone();
+        let generation = self.board_generation;
         Task::perform(
             async move {
                 let board = crate::pipeline::board::store();
@@ -297,11 +331,192 @@ impl BoardState {
                     .await
                     .map_err(|e| e.to_string())
             },
-            |res| match res {
-                Ok(tickets) => BoardMessage::Refreshed(tickets),
+            move |res| match res {
+                Ok(tickets) => BoardMessage::Refreshed {
+                    tickets,
+                    generation,
+                },
                 Err(e) => BoardMessage::RefreshError(e),
             },
         )
+    }
+
+    /// Apply a CDC ticket change delta to the board, idempotently by ticket id.
+    ///
+    /// - DELETEs (or an archived row) remove the ticket from the list and are
+    ///   recorded in `delta_removed_ids` so a stale baseline snapshot cannot
+    ///   re-add them.
+    /// - INSERT/UPDATE re-fetches the ticket by id and upserts it. Re-fetch uses
+    ///   the board's own parsing so the delta always carries a consistent, current
+    ///   snapshot; the render path re-sorts each frame, so no manual sort
+    ///   maintenance is needed. There is deliberately no global `change_id`
+    ///   watermark: `change_id` is a WAL `NewRowid` that restarts after
+    ///   `turso_cdc` is fully pruned, so a watermark would silently drop deltas.
+    /// - If the changed ticket is the open detail modal and its `updated_at`
+    ///   moved, the modal detail is re-refreshed (comments live on a separate
+    ///   table the board list does not load).
+    fn apply_ticket_change(&mut self, event: &crate::db::cdc::ChangeEvent) -> Task<BoardMessage> {
+        use crate::db::cdc::ChangeType;
+        let Some(id) = event.ticket_id().map(str::to_string) else {
+            return Task::none();
+        };
+        // Honor the workspace filter (ticket ids are globally unique, so an unknown
+        // workspace is safe to process; a mismatching one is skipped).
+        if let Some(ws) = &self.workspace_name {
+            let event_ws = event
+                .after
+                .as_ref()
+                .or(event.before.as_ref())
+                .and_then(|r| r.get("workspace_name"))
+                .and_then(crate::db::cdc::CdcValue::as_text);
+            if event_ws.is_some_and(|ew| ew != ws) {
+                return Task::none();
+            }
+        }
+        let detail_refresh = if self.selected_ticket.as_ref().is_some_and(|t| t.id == id) {
+            let changed = match &event.after {
+                Some(after) => {
+                    let new_at = after
+                        .get("updated_at")
+                        .and_then(crate::db::cdc::CdcValue::as_text);
+                    new_at != self.selected_ticket.as_ref().map(|t| t.updated_at.as_str())
+                }
+                None => true,
+            };
+            if changed {
+                self.refresh_selected_ticket()
+            } else {
+                Task::none()
+            }
+        } else {
+            Task::none()
+        };
+        let is_removed = match event.change_type {
+            ChangeType::Delete => true,
+            _ => {
+                event
+                    .after
+                    .as_ref()
+                    .and_then(|r| r.get("is_archived"))
+                    .and_then(crate::db::cdc::CdcValue::as_integer)
+                    == Some(1)
+            }
+        };
+        let upsert = if is_removed {
+            self.tickets.retain(|t| t.id != id);
+            self.delta_removed_ids.insert(id.clone());
+            Task::none()
+        } else {
+            self.delta_removed_ids.remove(&id);
+            // Re-fetch current state: the render path re-sorts each frame, so no
+            // manual sort maintenance is needed, and a re-fetch always returns the
+            // freshest snapshot (so an out-of-order delta cannot clobber the board).
+            Task::perform(
+                async move {
+                    let board = crate::pipeline::board::store();
+                    match board
+                        .get_tickets_by_ids(&[id], crate::pipeline::board::LoadComments::No)
+                        .await
+                        .map_err(|e| e.to_string())
+                    {
+                        Ok(mut v) => match v.pop() {
+                            Some(ticket) => BoardMessage::TicketUpserted(ticket),
+                            None => BoardMessage::BoardRefreshNeeded,
+                        },
+                        Err(_) => BoardMessage::BoardRefreshNeeded,
+                    }
+                },
+                |msg| msg,
+            )
+        };
+        Task::batch([upsert, detail_refresh])
+    }
+
+    /// Apply a baseline snapshot.
+    ///
+    /// - Right after a workspace switch or a lag recovery (`replace_on_refresh`)
+    ///   the snapshot is authoritative and replaces the board, so the previous
+    ///   workspace's tickets (or a ticket a lost removal delta would have
+    ///   removed) cannot linger. This also clears `delta_removed_ids` — the new
+    ///   selection has its own removal history.
+    /// - Otherwise (same-workspace recovery refresh) it merges by per-ticket
+    ///   `updated_at` freshness: a snapshot ticket older than the cached one is
+    ///   left alone (so a newer delta already applied is never clobbered), but a
+    ///   newer snapshot ticket updates the board (recovering a lost delta). This
+    ///   is correct even if two snapshots arrive out of order, and — unlike a
+    ///   global `change_id` watermark — is immune to `change_id` restarting after
+    ///   `turso_cdc` is fully pruned.
+    /// - Tickets a delta archived/removed (`delta_removed_ids`) are never re-added
+    ///   by a stale snapshot. A board ticket **absent** from the snapshot is kept:
+    ///   with no guaranteed snapshot/delta ordering, an omission is ambiguous (the
+    ///   snapshot may predate the ticket's creation/delta). Dropping it risks a
+    ///   permanent loss (a live ticket that never changes again), while keeping it
+    ///   is self-healing — a removal delta arrives and removes it, or a lag
+    ///   recovery snapshot replaces the board.
+    fn apply_refreshed(&mut self, tickets: Vec<Ticket>) {
+        if self.replace_on_refresh {
+            self.tickets = tickets;
+            self.delta_removed_ids.clear();
+            self.replace_on_refresh = false;
+        } else {
+            let mut merged: Vec<Ticket> = Vec::with_capacity(tickets.len());
+            for snap in tickets {
+                if self.delta_removed_ids.contains(&snap.id) {
+                    continue;
+                }
+                match self.tickets.iter().find(|t| t.id == snap.id) {
+                    Some(cur) => merged.push(if Self::is_at_least_as_fresh(cur, &snap) {
+                        cur.clone()
+                    } else {
+                        snap
+                    }),
+                    None => merged.push(snap),
+                }
+            }
+            // Keep a board ticket absent from the snapshot (see the doc above).
+            for cur in &self.tickets {
+                if !merged.iter().any(|t| t.id == cur.id) {
+                    merged.push(cur.clone());
+                }
+            }
+            self.tickets = merged;
+        }
+        self.load_state.finish_loading();
+    }
+
+    /// Whether `cached` is at least as fresh as `snap` by parsed RFC 3339
+    /// `updated_at` (each tickets write bumps it, so it is a sound per-ticket
+    /// freshness signal). Falls back to lexicographic comparison so a malformed
+    /// timestamp cannot panic.
+    fn is_at_least_as_fresh(cached: &Ticket, snap: &Ticket) -> bool {
+        let a = crate::db::parse_utc_timestamp(&cached.updated_at);
+        let b = crate::db::parse_utc_timestamp(&snap.updated_at);
+        match (a, b) {
+            (Ok(a), Ok(b)) => a >= b,
+            _ => cached.updated_at >= snap.updated_at,
+        }
+    }
+
+    /// Upsert a re-fetched ticket into the board list, honoring the workspace
+    /// filter and the archive state.
+    fn apply_ticket_upsert(&mut self, ticket: Ticket) {
+        if let Some(ws) = &self.workspace_name {
+            if &ticket.workspace_name != ws {
+                return;
+            }
+        }
+        if ticket.is_archived {
+            self.tickets.retain(|t| t.id != ticket.id);
+            // Track the removal so a stale snapshot read before the archive
+            // cannot re-add it.
+            self.delta_removed_ids.insert(ticket.id.clone());
+            return;
+        }
+        if let Some(pos) = self.tickets.iter().position(|t| t.id == ticket.id) {
+            self.tickets[pos] = ticket;
+        } else {
+            self.tickets.push(ticket);
+        }
     }
 
     /// Re-fetch the currently open ticket detail (periodic refresh).
@@ -586,13 +801,34 @@ impl BoardState {
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: BoardMessage) -> Task<BoardMessage> {
         match msg {
-            BoardMessage::Refreshed(tickets) => {
-                self.tickets = tickets;
-                self.load_state.finish_loading();
+            BoardMessage::Refreshed {
+                tickets,
+                generation,
+            } => {
+                // Workspace/generation guard: drop a stale snapshot from a
+                // previous workspace/refresh so it cannot clobber the current
+                // selection.
+                if generation == self.board_generation {
+                    self.apply_refreshed(tickets);
+                }
                 Task::none()
             }
             BoardMessage::RefreshError(e) => {
                 self.load_state.fail(e);
+                Task::none()
+            }
+            BoardMessage::TicketChanged(event) => self.apply_ticket_change(&event),
+            BoardMessage::BoardRefreshNeeded => {
+                // The CDC stream lagged (a delta was lost). Our delta-derived
+                // state may be wrong (e.g. a removal delta was dropped, leaving
+                // a resurrected ticket), so the recovery snapshot is
+                // authoritative: mark a replace so the next Refreshed drops a
+                // ticket a lost removal delta would have removed.
+                self.replace_on_refresh = true;
+                self.refresh()
+            }
+            BoardMessage::TicketUpserted(ticket) => {
+                self.apply_ticket_upsert(ticket);
                 Task::none()
             }
             BoardMessage::OpenModal(id) => {
@@ -732,20 +968,6 @@ impl BoardState {
                             .transition_to(&ticket_id, None, phase)
                             .await
                             .map_err(|e| e.to_string())?;
-                        let applied = true;
-                        // Skip the hop when the ticket already reached the
-                        // requested phase between render and click — the
-                        // transition was a no-op and a self-transition entry
-                        // would be a bogus hop.
-                        if source != phase && applied {
-                            crate::pipeline::chronicle::push(
-                                &ticket.workspace_name,
-                                &ticket_id,
-                                source,
-                                phase,
-                                crate::pipeline::chronicle::TransitionOrigin::User,
-                            );
-                        }
                         Ok(())
                     },
                     BoardMessage::ActionResult,
@@ -2313,6 +2535,174 @@ mod tests {
         Ticket {
             ..make_ticket(id, phase)
         }
+    }
+
+    // ── CDC change-stream delta application ───────────────────────
+
+    #[test]
+    fn refreshed_stale_generation_is_dropped() {
+        let mut state = BoardState::new();
+        state.board_generation = 2;
+        let _task = state.update(BoardMessage::Refreshed {
+            tickets: vec![ticket_with("T-1", TicketPhase::Backlog)],
+            generation: 1,
+        });
+        assert!(
+            state.tickets.is_empty(),
+            "a stale-generation snapshot must not clobber the current workspace"
+        );
+    }
+
+    #[test]
+    fn refreshed_current_generation_applies_and_finishes_loading() {
+        let mut state = BoardState::new();
+        state.board_generation = 2;
+        state.load_state.start_loading();
+        let _task = state.update(BoardMessage::Refreshed {
+            tickets: vec![ticket_with("T-1", TicketPhase::Backlog)],
+            generation: 2,
+        });
+        assert_eq!(state.tickets.len(), 1);
+        assert!(state.load_state.has_loaded());
+    }
+
+    #[test]
+    fn refreshed_replace_on_switch_drops_previous_workspace_tickets() {
+        let mut state = BoardState::new();
+        state.replace_on_refresh = true;
+        state.tickets = vec![ticket_with("T-old", TicketPhase::Backlog)];
+        let _task = state.update(BoardMessage::Refreshed {
+            tickets: vec![ticket_with("T-new", TicketPhase::Analysis)],
+            generation: 0,
+        });
+        assert_eq!(
+            state.tickets.len(),
+            1,
+            "replace must drop old-workspace tickets"
+        );
+        assert_eq!(state.tickets[0].id, "T-new");
+        assert!(!state.replace_on_refresh, "replace flag is one-shot");
+    }
+
+    #[test]
+    fn lag_recovery_marks_replace_so_snapshot_drops_resurrected_ticket() {
+        let mut state = BoardState::new();
+        // A ticket a delta updated (would be kept as absent), later removed by a
+        // delta that the lagged broadcast dropped. A lag recovery must replace
+        // the board so the recovered snapshot (which omits it) can drop it.
+        state.tickets = vec![ticket_with("T-1", TicketPhase::Done)];
+        let _task = state.update(BoardMessage::BoardRefreshNeeded);
+        assert!(
+            state.replace_on_refresh,
+            "a lagged stream marks the next snapshot as authoritative"
+        );
+    }
+
+    #[test]
+    fn refreshed_merge_keeps_newer_updated_at_and_does_not_readd_removed() {
+        let mut state = BoardState::new();
+        state.replace_on_refresh = true;
+        let mut ticket = ticket_with("T-1", TicketPhase::Backlog);
+        ticket.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
+        state.tickets = vec![ticket];
+        // Simulate a workspace switch already consumed: now a same-workspace
+        // recovery refresh merges.
+        state.replace_on_refresh = false;
+        // A newer snapshot updates the stale cached ticket.
+        let mut newer = ticket_with("T-1", TicketPhase::Analysis);
+        newer.updated_at = "2026-08-27T04:00:01.000000+00:00".into();
+        let _task = state.update(BoardMessage::Refreshed {
+            tickets: vec![newer],
+            generation: 0,
+        });
+        assert_eq!(state.tickets[0].phase, TicketPhase::Analysis);
+        assert_eq!(
+            state.tickets[0].updated_at,
+            "2026-08-27T04:00:01.000000+00:00"
+        );
+
+        // A removed ticket is not re-added by a stale snapshot.
+        state.replace_on_refresh = false;
+        state.delta_removed_ids.insert("T-2".into());
+        let mut removed = ticket_with("T-2", TicketPhase::Done);
+        removed.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
+        let _task = state.update(BoardMessage::Refreshed {
+            tickets: vec![removed],
+            generation: 0,
+        });
+        assert!(
+            state.tickets.iter().all(|t| t.id != "T-2"),
+            "an archived ticket must not be re-added from a stale snapshot"
+        );
+
+        // A board ticket absent from a stale snapshot is kept (an omission is
+        // ambiguous — the snapshot may predate its creation/delta), so a
+        // delta-created ticket survives an older snapshot that omits it.
+        state.replace_on_refresh = false;
+        let mut created = ticket_with("T-3", TicketPhase::Backlog);
+        created.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
+        state.tickets = vec![created];
+        let _task = state.update(BoardMessage::Refreshed {
+            tickets: vec![],
+            generation: 0,
+        });
+        assert_eq!(
+            state.tickets.len(),
+            1,
+            "a board ticket absent from the snapshot is preserved"
+        );
+        assert_eq!(state.tickets[0].id, "T-3");
+    }
+
+    #[test]
+    fn ticket_change_tracks_removal_for_snapshot_merge() {
+        let mut state = BoardState::new();
+        state.workspace_name = Some("test_ws".into());
+        state.tickets = vec![make_ticket("T-1", TicketPhase::Done)];
+        let event = crate::db::cdc::ChangeEvent {
+            table: "tickets".into(),
+            change_id: 5,
+            change_time: 1_750_000_000,
+            change_type: crate::db::cdc::ChangeType::Delete,
+            pk: crate::db::cdc::Pk::Text("T-1".into()),
+            before: None,
+            after: None,
+        };
+        let _task = state.apply_ticket_change(&event);
+        assert!(
+            state.tickets.is_empty(),
+            "a DELETE (or archived row) is removed from the board list"
+        );
+        assert!(
+            state.delta_removed_ids.contains("T-1"),
+            "a removed ticket is tracked so a stale snapshot cannot re-add it"
+        );
+    }
+
+    #[test]
+    fn ticket_upsert_respects_workspace_filter_and_dedupes_by_id() {
+        let mut state = BoardState::new();
+        state.workspace_name = Some("test_ws".into());
+        let mut other = make_ticket("T-a", TicketPhase::Backlog);
+        other.workspace_name = "other_ws".into();
+        state.apply_ticket_upsert(other);
+        assert!(
+            state.tickets.is_empty(),
+            "a ticket not in the selected workspace must be dropped"
+        );
+
+        let ticket = ticket_with("T-1", TicketPhase::InDevelopment);
+        state.apply_ticket_upsert(ticket.clone());
+        assert_eq!(state.tickets.len(), 1);
+        // Idempotent upsert by id — no duplicate.
+        state.apply_ticket_upsert(ticket);
+        assert_eq!(state.tickets.len(), 1);
+
+        // Archiving removes the ticket from the list.
+        let mut archived = make_ticket("T-1", TicketPhase::Done);
+        archived.is_archived = true;
+        state.apply_ticket_upsert(archived);
+        assert!(state.tickets.is_empty());
     }
 
     #[test]

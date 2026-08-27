@@ -79,6 +79,16 @@ pub fn init_git_file_change_tx() {
     git::init_file_change_tx();
 }
 
+/// Initialise the CDC ticket change broadcast before the iced application runs
+/// (same convention as [`init_git_file_change_tx`] / [`LOG_BROADCAST`]) so the
+/// board change subscription always has a source. An uninitialized `OnceLock`
+/// would end the subscription stream on its first poll and freeze the board at
+/// the initial snapshot — Iced does not re-spawn an ended subscription. Called
+/// from `main` before `iced::application(...).run()`.
+pub fn init_board_change_tx() {
+    let _ = crate::db::cdc::ticket_sender();
+}
+
 // ── Navigation pages ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +238,7 @@ impl ToggleKind {
 
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)]
+#[expect(clippy::large_enum_variant)]
 pub enum Message {
     /// MahBot finished async startup (or failed). On success, [`BOOT_LOG_STORE`] is set.
     Boot(Result<(), String>),
@@ -861,26 +872,15 @@ impl Dashboard {
 
         let page_task = match self.page {
             Page::Home => {
-                // Periodic ticket-list refresh (unchanged gating: skip while
-                // a previous refresh is in flight or a search is active).
-                let list_refresh = if !self.board_state.load_state.loading()
-                    && self.board_state.search_query.is_empty()
-                {
-                    self.board_state.load_state.start_loading();
-                    self.board_state.refresh().map(Message::Board)
-                } else {
-                    Task::none()
-                };
-                // Open ticket window: re-fetch on the same periodic refresh
-                // so the modal always shows the latest phase/comments
-                // without close/reopen. Runs even while a search is active
-                // (search mode pauses the list refresh but the modal can
-                // still be open on a searched ticket).
+                // The board ticket list is driven by CDC change-stream deltas
+                // (see `board_change_subscription`), not a full re-poll. The tick
+                // only refreshes the open-ticket detail as a fallback/health
+                // check (comments are not part of the board delta).
                 let detail_refresh = self
                     .board_state
                     .refresh_selected_ticket()
                     .map(Message::Board);
-                Task::batch([list_refresh, detail_refresh])
+                Task::batch([detail_refresh])
             }
             Page::Sessions if !self.sessions_state.load_state.loading() => {
                 self.sessions_state.load_state.start_loading();
@@ -1529,6 +1529,14 @@ impl Dashboard {
         self.board_state.search_query.clear();
         self.board_state.search_results.clear();
         self.board_state.search_generation += 1;
+        // Bump the board generation so a stale in-flight snapshot from the
+        // previous workspace is dropped on arrival.
+        self.board_state.board_generation += 1;
+        // On switch the next snapshot REPLACES the board (the previous
+        // workspace's tickets must not linger), and the removal-tracking set is
+        // cleared so old-workspace removals are not applied to the new snapshot.
+        self.board_state.replace_on_refresh = true;
+        self.board_state.delta_removed_ids.clear();
         let board_refresh = self.board_state.refresh().map(Message::Board);
 
         // Resolve the personal workspace path when name is empty (Personal)
@@ -2047,6 +2055,9 @@ impl Dashboard {
             // Git file-change subscription: drives the event-driven local git
             // footer refresh when workspace files change.
             iced::Subscription::run(git_file_changes_subscription),
+            // Board change-stream subscription: drives the board ticket list from
+            // CDC deltas instead of a 1s full re-poll.
+            iced::Subscription::run(board_change_subscription),
             // TTS download progress subscription (always active while ready).
             iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
             // Diff modal subscription (keyboard shortcuts, auto-refresh).
@@ -2132,6 +2143,32 @@ fn git_file_changes_subscription() -> impl futures_util::Stream<Item = Message> 
                 if event.is_some() {
                     let _ = output.try_send(Message::Git(git::GitMessage::FileChanged));
                 }
+            })
+        },
+    )
+}
+
+/// Subscription that emits [`BoardMessage::TicketChanged`] deltas from the
+/// CDC change stream, and [`BoardMessage::BoardRefreshNeeded`] on a lagged
+/// channel (a delta was lost — force a full snapshot refresh). The change
+/// source is the shared [`crate::db::cdc`] tickets sender, initialised before
+/// the iced app runs via [`crate::gui::init_board_change_tx`]; an uninitialized
+/// source would yield an immediately-ending stream (Iced does not re-spawn it),
+/// so the warm-up in `main` is required for the board to receive any delta.
+fn board_change_subscription() -> impl futures_util::Stream<Item = Message> {
+    use iced::futures::channel::mpsc;
+    common::broadcast_stream_producer(
+        128,
+        crate::db::cdc::ticket_sender_lock(),
+        |output: &mut mpsc::Sender<Message>, event: Option<crate::db::cdc::ChangeEvent>| {
+            Box::pin(async move {
+                // Awaited send (backpressure): a full/lagged channel triggers a
+                // refresh rather than silently dropping a delta.
+                let msg = Message::Board(match event {
+                    Some(ev) => board::BoardMessage::TicketChanged(Box::new(ev)),
+                    None => board::BoardMessage::BoardRefreshNeeded,
+                });
+                let _ = futures_util::SinkExt::send(output, msg).await;
             })
         },
     )

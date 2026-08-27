@@ -13,6 +13,7 @@ pub(crate) use turso::{IntoParams, Row, Value, params};
 
 use crate::util::UnwrapPoison;
 
+pub(crate) mod cdc;
 pub mod checkpoint;
 pub mod debug;
 pub(crate) mod migrations;
@@ -233,6 +234,11 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     // Record the shared connection before setting any cell so a concurrent
     // re-entry observes it and short-circuits.
     let _ = DOMAIN_CONN.set(conn.clone());
+
+    // Start the CDC drain loop once. It broadcasts ticket change events to the
+    // GUI and the chronicle subscriber; resuming after a heal/recreate re-enables
+    // capture in open_consolidated_store (above).
+    crate::db::cdc::spawn_drainer(conn.clone());
 
     crate::pipeline::board::BOARD
         .set(board)
@@ -583,12 +589,13 @@ const KNOWN_FTS_DIR_COUNT_FALSE_POSITIVE: &str =
 const FTS_INTERNAL_INDEX_PREFIX: &str = "__turso_internal_fts_dir_";
 
 /// `sqlite_master` filter for user-owned objects: excludes the engine's own
-/// tables (`sqlite_%`) and turso's protected `__turso_internal_%`
-/// (AUTOINCREMENT seq backing, FTS dir) — those reject user writes and are
+/// tables (`sqlite_%`), turso's protected `__turso_internal_%`
+/// (AUTOINCREMENT seq backing, FTS dir), and the engine-managed CDC tables
+/// (`turso_cdc`, `turso_cdc_version`) — those reject user writes and are
 /// recreated by the DDL replay. Shared by the rebuild's counts enumeration,
 /// DDL replay, and the debug CLI's schema dump so the three cannot drift.
-pub(crate) const USER_OBJECT_FILTER: &str =
-    "name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
+pub(crate) const USER_OBJECT_FILTER: &str = "name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' \
+     AND name NOT IN ('turso_cdc', 'turso_cdc_version')";
 
 /// Best-effort removal of a rebuild temp family (main + sidecars).
 fn remove_rebuild_temp(temp: &Path) {
@@ -1823,6 +1830,13 @@ pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Conne
 
     // One-time consolidation import from legacy per-store files.
     run_consolidation_import_if_pending(&conn, root).await?;
+
+    // Enable CDC on the FINAL connection, after all migrations/import, so
+    // boot-time schema + import writes are not captured. This single chokepoint
+    // covers every connection-recreation path (open_store's heal/recreate arms
+    // all funnel back through here) and the test-store opens (open_test_store!
+    // and init_test_stores both call open_consolidated_store).
+    cdc::enable_capture(&conn).await?;
 
     Ok(conn)
 }
