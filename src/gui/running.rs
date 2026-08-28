@@ -61,22 +61,72 @@ use iced_fonts::lucide;
 use super::{Message, WorkspaceInfo};
 
 /// Maximum display length (Unicode chars) of an analyze/research group header
-/// label (the question/task text). Truncated at a char boundary with "…".
-const MAX_GROUP_LABEL_CHARS: usize = 80;
+/// label (the question/task text). Truncated at a word/path-delimiter boundary
+/// with "…" (see [`truncate_at_boundary`]).
+const MAX_GROUP_LABEL_CHARS: usize = 104;
 
 /// Maximum display length (Unicode chars) of a single argument VALUE in the
 /// row's comma-separated key-value pairs line. The hover tooltip always shows
 /// the full untruncated value.
-const MAX_TOOL_VALUE_CHARS: usize = 20;
+const MAX_TOOL_VALUE_CHARS: usize = 26;
 
 /// Maximum display length (Unicode chars) of the whole key-value pairs line
 /// in the row (values already truncated per [`MAX_TOOL_VALUE_CHARS`]). Cut at
 /// a pair boundary with a trailing "…" so the line can never overflow into
 /// the right-aligned metrics (iced rows do not wrap).
-const MAX_TOOL_PAIRS_LINE_CHARS: usize = 80;
+const MAX_TOOL_PAIRS_LINE_CHARS: usize = 104;
+
+/// Maximum display length (Unicode chars) of the visible narration (the
+/// assistant's short reasoning text) on the LIVE state line and its
+/// trace-group label. Truncated at a word/path-delimiter boundary with "…" so
+/// a long narration cannot crowd the row or push the metrics off.
+const MAX_NARRATION_CHARS: usize = 104;
 
 /// Maximum width (px) of the hover tooltip content; long values wrap within it.
 const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
+
+/// A word/path-delimiter boundary at which wrapped/truncated page text may be
+/// cut: whitespace (word wrap) and `/`, `_`, `-` (paths, URLs, identifiers).
+fn is_delim(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '/' | '_' | '-')
+}
+
+/// Truncate `s` to at most `max_chars` Unicode chars, choosing a cut at a word
+/// or path/URL delimiter boundary (whitespace, `/`, `_`, `-`) rather than
+/// mid-token, and appending "…" when truncated. When no delimiter falls within
+/// the cap the cut falls back to a hard char boundary so the limit is always
+/// honoured. Used by the page-local truncation constants; leaves
+/// [`crate::util::truncate`](crate::util::truncate) untouched for its ~20
+/// non-UI callers.
+fn truncate_at_boundary(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let hard_end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(byte_idx, _)| byte_idx)
+        .expect("char count exceeds max_chars, so a char exists at index max_chars");
+    // If the cut lands right before a delimiter, the first `max_chars` chars
+    // already end at a complete word/path segment — cut exactly there.
+    if s[hard_end..].chars().next().is_some_and(is_delim) {
+        return format!("{}…", s[..hard_end].trim_end());
+    }
+    // Otherwise back up to the last delimiter strictly inside the cap so the
+    // cut lands at a wrap boundary (the delimiter is the wrapped segment's
+    // final char) instead of mid-word.
+    let mut cut = None;
+    for (char_pos, (byte_idx, c)) in s.char_indices().enumerate() {
+        if char_pos >= max_chars {
+            break;
+        }
+        if is_delim(c) {
+            cut = Some(byte_idx + c.len_utf8());
+        }
+    }
+    let end = cut.unwrap_or(hard_end);
+    format!("{}…", s[..end].trim_end())
+}
 
 /// Messages emitted by the Running Agents page.
 ///
@@ -457,14 +507,14 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
         GroupKind::AnalyzeRound => (
             group.label.as_deref().map_or_else(
                 || "Analyze round".to_string(),
-                |l| crate::util::truncate(l, MAX_GROUP_LABEL_CHARS),
+                |l| truncate_at_boundary(l, MAX_GROUP_LABEL_CHARS),
             ),
             None,
         ),
         GroupKind::Research => (
             group.label.as_deref().map_or_else(
                 || "Research run".to_string(),
-                |l| crate::util::truncate(l, MAX_GROUP_LABEL_CHARS),
+                |l| truncate_at_boundary(l, MAX_GROUP_LABEL_CHARS),
             ),
             None,
         ),
@@ -669,7 +719,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         }
         LiveStatus::Narration(narration) => {
             live = live.push(
-                text(narration.to_owned())
+                text(truncate_at_boundary(narration, MAX_NARRATION_CHARS))
                     .size(11)
                     .font(theme::FONT_BOLD)
                     .color(theme::ACCENT),
@@ -764,7 +814,7 @@ fn render_trace_group(
             column = column.push(text("thinking…").size(11).color(theme::TEXT_SECONDARY));
         } else {
             column = column.push(
-                text(group.narration.clone())
+                text(truncate_at_boundary(&group.narration, MAX_NARRATION_CHARS))
                     .size(11)
                     .font(theme::FONT_BOLD)
                     .color(theme::TEXT_SECONDARY),
@@ -1000,9 +1050,10 @@ fn render_tool_block(
 }
 
 /// Render the row's key-value pairs line: `name: value` pairs, comma-
-/// separated, each value collapsed to a single line and truncated to
-/// [`MAX_TOOL_VALUE_CHARS`] chars. The whole line is capped at
-/// [`MAX_TOOL_PAIRS_LINE_CHARS`] chars, cut at a pair boundary with "…".
+/// separated, each value collapsed to a single line and truncated at a
+/// word/path-delimiter boundary to [`MAX_TOOL_VALUE_CHARS`] chars. The whole
+/// line is capped at [`MAX_TOOL_PAIRS_LINE_CHARS`] chars, cut at a pair
+/// boundary with "…".
 fn render_tool_pairs_line(pairs: &[(String, String)]) -> String {
     let rendered: Vec<String> = pairs
         .iter()
@@ -1025,22 +1076,23 @@ fn render_tool_pairs_line(pairs: &[(String, String)]) -> String {
         out.push_str(pair);
     }
     if out.is_empty() {
-        // Even the first pair alone does not fit — hard-truncate it.
-        crate::util::truncate(&rendered[0], MAX_TOOL_PAIRS_LINE_CHARS)
+        // Even the first pair alone does not fit — truncate at a delimiter
+        // boundary so the cut lands at a sensible wrap point.
+        truncate_at_boundary(&rendered[0], MAX_TOOL_PAIRS_LINE_CHARS)
     } else {
         format!("{out}…")
     }
 }
 
 /// Single-line display form of a value: control characters (newlines, tabs)
-/// collapsed to spaces, then truncated to [`MAX_TOOL_VALUE_CHARS`] chars with
-/// "…" when cut.
+/// collapsed to spaces, then truncated to [`MAX_TOOL_VALUE_CHARS`] chars at a
+/// word/path-delimiter boundary with "…" when cut.
 fn value_display(value: &str) -> String {
     let single_line: String = value
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    crate::util::truncate(&single_line, MAX_TOOL_VALUE_CHARS)
+    truncate_at_boundary(&single_line, MAX_TOOL_VALUE_CHARS)
 }
 
 /// Render the hover tooltip: the tool name header (bold white) followed by
@@ -1758,5 +1810,93 @@ mod tests {
             expanded.contains(&("a".to_string(), 0)),
             "live agent keeps its expanded key"
         );
+    }
+
+    // ── Page truncation (boundary-aware) ─────────────────────────────
+
+    #[test]
+    fn truncation_constants_are_30_percent_larger() {
+        assert_eq!(MAX_GROUP_LABEL_CHARS, 104);
+        assert_eq!(MAX_TOOL_VALUE_CHARS, 26);
+        assert_eq!(MAX_TOOL_PAIRS_LINE_CHARS, 104);
+        assert_eq!(MAX_NARRATION_CHARS, 104);
+    }
+
+    #[test]
+    fn truncate_at_boundary_cuts_at_word_and_path_delimiters() {
+        // Cut at a word boundary rather than mid-word.
+        assert_eq!(truncate_at_boundary("abc def ghi", 5), "abc…");
+        // When the cap lands exactly before a delimiter, keep the full words.
+        assert_eq!(truncate_at_boundary("abc def ghi", 7), "abc def…");
+        // Paths break at a `/` segment boundary.
+        assert_eq!(
+            truncate_at_boundary("/Users/egordezic/Desktop/foo.rs", 26),
+            "/Users/egordezic/Desktop/…"
+        );
+        // An unbroken token falls back to a hard char cut at the cap.
+        assert_eq!(truncate_at_boundary("aaaaaaaa", 4), "aaaa…");
+        // Under the cap: unchanged.
+        assert_eq!(truncate_at_boundary("short", 10), "short");
+    }
+
+    #[test]
+    fn value_display_truncates_at_delimiter_boundary() {
+        // Path value cut at a `/`, content within the cap, trailing "…".
+        assert_eq!(
+            value_display("/Users/egordezic/Desktop/foo.rs"),
+            "/Users/egordezic/Desktop/…"
+        );
+        // Under the cap: unchanged.
+        assert_eq!(value_display("a.rs"), "a.rs");
+        // Control chars collapse to spaces.
+        assert_eq!(value_display("a\nb"), "a b");
+        // Unbroken long token hard-cuts at [`MAX_TOOL_VALUE_CHARS`].
+        assert_eq!(
+            value_display(&"a".repeat(40)),
+            format!("{}…", "a".repeat(MAX_TOOL_VALUE_CHARS))
+        );
+    }
+
+    #[test]
+    fn tool_pairs_line_truncates_at_pair_boundary() {
+        // Under the line cap: returned verbatim.
+        let short = vec![("path".to_string(), "a.rs".to_string())];
+        assert_eq!(render_tool_pairs_line(&short), "path: a.rs");
+
+        // Over the line cap: whole pairs kept while they fit, then a trailing
+        // "…" marks the cut; the excluded final pair never appears.
+        let pairs = vec![
+            (
+                "path".to_string(),
+                "/Users/egordezic/Desktop/project/foo.rs".to_string(),
+            ),
+            (
+                "offset".to_string(),
+                "/Users/egordezic/Desktop/project/bar.rs".to_string(),
+            ),
+            (
+                "limit".to_string(),
+                "/Users/egordezic/Desktop/project/baz.rs".to_string(),
+            ),
+            (
+                "query".to_string(),
+                "/Users/egordezic/Desktop/project/qux.rs".to_string(),
+            ),
+        ];
+        let line = render_tool_pairs_line(&pairs);
+        assert_eq!(line.chars().count(), MAX_TOOL_PAIRS_LINE_CHARS);
+        assert!(line.ends_with('…'));
+        assert!(line.contains("limit"));
+        assert!(!line.contains("query"), "excluded pair must not appear");
+    }
+
+    #[test]
+    fn tool_pairs_line_fallback_truncates_first_pair_at_boundary() {
+        // A single pair longer than the line cap: when the first pair contains
+        // no delimiter it is hard-cut exactly at the cap (with "…"), never left
+        // overflowing the line.
+        let pairs = vec![("k".repeat(120), "v".to_string())];
+        let line = render_tool_pairs_line(&pairs);
+        assert_eq!(line, format!("{}…", "k".repeat(MAX_TOOL_PAIRS_LINE_CHARS)));
     }
 }
