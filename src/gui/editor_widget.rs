@@ -256,6 +256,42 @@ fn mask_text(text: &str) -> String {
         .collect()
 }
 
+/// Build a masked (all-`•`) render buffer from an already-borrowed source
+/// buffer, preserving the character count and line structure so the drawn
+/// dots align 1:1 with the real buffer's cursor/selection coordinates.
+///
+/// Takes the source as `&cosmic_text::Buffer` — the deref of the `RefMut`
+/// held by `EditorWidget::layout` — so it can never re-borrow the
+/// `EditorBuffer`'s `RefCell` (which would panic with "already mutably
+/// borrowed").
+fn build_masked_render_buffer(
+    font_sys: &mut cosmic_text::FontSystem,
+    source: &cosmic_text::Buffer,
+    single_line: bool,
+    scroll_y: f32,
+    scroll_x: f32,
+    text_area_width: f32,
+    text_area_height: f32,
+) -> cosmic_text::Buffer {
+    let masked_text = mask_text(&buffer_text(source));
+    let mut mbuffer = cosmic_text::Buffer::new(font_sys, font_metrics());
+    EditorBuffer::set_buffer_text_highlighted(&mut mbuffer, font_sys, &masked_text, None);
+    // Single-line secret fields must not wrap either, so the masked dots
+    // stay aligned with the real (non-wrapping) buffer layout.
+    if single_line {
+        mbuffer.set_wrap(font_sys, cosmic_text::Wrap::None);
+    }
+    reshape_and_shape(
+        &mut mbuffer,
+        font_sys,
+        Some(scroll_y),
+        scroll_x,
+        text_area_width,
+        text_area_height,
+    );
+    mbuffer
+}
+
 impl EditorBuffer {
     /// Create a buffer pre-populated with the given text.
     ///
@@ -2694,27 +2730,19 @@ where
         }
 
         // Determine the buffer used for rendering. In masked mode we shape a
-        // separate buffer whose glyphs are all '•' (same char count and line
-        // structure), so the draw layer renders dots while cursor/selection
-        // coordinates still come from the real buffer.
+        // separate all-'•' buffer (same char count/line structure) from the
+        // held `buffer` RefMut; see `build_masked_render_buffer` for why we
+        // must not re-borrow via `self.buffer.text()`.
         let render_buffer = if self.masked {
-            let masked_text = mask_text(&self.buffer.text());
-            let mut mbuffer = cosmic_text::Buffer::new(font_sys, metrics);
-            EditorBuffer::set_buffer_text_highlighted(&mut mbuffer, font_sys, &masked_text, None);
-            // Single-line secret fields must not wrap either, so the masked
-            // dots stay aligned with the real (non-wrapping) buffer layout.
-            if self.single_line {
-                mbuffer.set_wrap(font_sys, cosmic_text::Wrap::None);
-            }
-            reshape_and_shape(
-                &mut mbuffer,
+            build_masked_render_buffer(
                 font_sys,
-                Some(state.scroll_y),
+                &buffer,
+                self.single_line,
+                state.scroll_y,
                 state.scroll_x,
                 text_area_width,
                 text_area_height,
-            );
-            mbuffer
+            )
         } else {
             buffer.clone()
         };

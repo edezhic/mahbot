@@ -835,3 +835,35 @@ fn test_cursor_rect_shaped_position() {
     let first = cursor_rect(&buffer, &geo, 0, 0, geo.x);
     assert!(rect.y >= first.y);
 }
+
+#[test]
+fn test_masked_render_buffer_builds_dots_without_reborrow() {
+    // Regression test for the Settings-page panic: `layout()` used to call
+    // `self.buffer.text()` (which re-borrows the RefCell via `borrow()`) while
+    // the `borrow_buffer_mut()` RefMut was still held, panicking on the masked
+    // (password) path with "already mutably borrowed". The masked render path
+    // must derive the text from the already-held RefMut instead.
+    let buf = EditorBuffer::with_text("secret\npassword", None);
+    let mbuffer = with_font_system(|font_sys| {
+        let buffer = buf.borrow_buffer_mut();
+        let mb = build_masked_render_buffer(font_sys, &buffer, false, 0.0, 0.0, 300.0, 100.0);
+        // The RefMut is still live and readable after building the masked buffer.
+        assert_eq!(buffer_text(&buffer), "secret\npassword");
+        mb
+    });
+    // Rendered text is fully masked, preserving character count and line structure.
+    assert_eq!(buffer_text(&mbuffer), "••••••\n••••••••");
+}
+
+#[test]
+fn test_masked_render_buffer_single_line_does_not_wrap() {
+    // Password fields on the Settings page are single-line. The masked dots
+    // must not wrap (matching the real single-line buffer layout) — this is
+    // the exact widget configuration that triggered the original panic.
+    let buf = EditorBuffer::with_text("hunter2", None);
+    let mbuffer = with_font_system(|font_sys| {
+        let buffer = buf.borrow_buffer_mut();
+        build_masked_render_buffer(font_sys, &buffer, true, 0.0, 0.0, 100.0, 30.0)
+    });
+    assert_eq!(buffer_text(&mbuffer), "•••••••");
+}
