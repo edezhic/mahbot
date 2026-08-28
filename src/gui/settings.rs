@@ -1761,12 +1761,19 @@ impl SettingsState {
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center),
                             // Status column (FillPortion: 10)
-                            container(widgets::badge_pill(
-                                ws_item.status.to_string(),
-                                (status_bg, status_color),
-                                11,
-                                [2, 8],
-                            ))
+                            container(
+                                tooltip(
+                                    widgets::badge_pill(
+                                        ws_item.status.to_string(),
+                                        (status_bg, status_color),
+                                        11,
+                                        [2, 8],
+                                    ),
+                                    text("Status").size(11),
+                                    tooltip::Position::Top,
+                                )
+                                .style(theme::tooltip_style),
+                            )
                             .width(Length::FillPortion(10))
                             .align_x(Alignment::Start)
                             .align_y(Alignment::Center),
@@ -1785,53 +1792,60 @@ impl SettingsState {
                                 {
                                     let name = role.as_str();
                                     let (color, _bg) = theme::role_badge_color_for(&role);
-                                    role_btns = role_btns.push(
-                                        button(theme::role_icon(&role).size(11).color(color))
-                                            .style(theme::button_text)
-                                            // Halve the default 10px horizontal
-                                            // padding so adjacent role icons sit
-                                            // closer; vertical stays at 5px.
-                                            .padding([5.0, 5.0])
-                                            .on_press(SettingsMessage::WorkspaceMsg(
-                                                workspaces::WorkspacesMessage::ViewContext(
-                                                    ws_item.name.clone(),
-                                                    name.to_string(),
-                                                ),
-                                            )),
-                                    );
+                                    role_btns = role_btns.push(widgets::icon_tooltip_button(
+                                        theme::role_icon(&role).size(11).color(color),
+                                        role.display_label(),
+                                        Some(SettingsMessage::WorkspaceMsg(
+                                            workspaces::WorkspacesMessage::ViewContext(
+                                                ws_item.name.clone(),
+                                                name.to_string(),
+                                            ),
+                                        )),
+                                        // Halve the default 10px horizontal
+                                        // padding so adjacent role icons sit
+                                        // closer; vertical stays at 5px.
+                                        [5.0, 5.0],
+                                        theme::button_text,
+                                        tooltip::Position::Top,
+                                    ));
                                 }
                                 left = left.push(role_btns);
-                                left = left.push(
-                                    button(
-                                        theme::general_context_icon().size(11).color(theme::ACCENT),
-                                    )
-                                    .style(theme::button_text)
-                                    .on_press(
-                                        SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::ViewGeneralContext(
-                                                ws_item.name.clone(),
-                                            ),
+                                left = left.push(widgets::icon_tooltip_button(
+                                    theme::general_context_icon().size(11).color(theme::ACCENT),
+                                    "General context",
+                                    Some(SettingsMessage::WorkspaceMsg(
+                                        workspaces::WorkspacesMessage::ViewGeneralContext(
+                                            ws_item.name.clone(),
                                         ),
-                                    ),
-                                );
-                                left = left.push(
-                                    button(text("Diag").size(11).color(theme::TEXT_MUTED))
-                                        .style(theme::button_text)
-                                        .on_press(SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::ShowDiagnostics(
-                                                ws_item.name.clone(),
-                                            ),
-                                        )),
-                                );
-                                left = left.push(
-                                    button(text("Notes").size(11).color(theme::TEXT_MUTED))
-                                        .style(theme::button_text)
-                                        .on_press(SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::ToggleNotes(
-                                                ws_item.name.clone(),
-                                            ),
-                                        )),
-                                );
+                                    )),
+                                    button::DEFAULT_PADDING,
+                                    theme::button_text,
+                                    tooltip::Position::Top,
+                                ));
+                                left = left.push(widgets::icon_tooltip_button(
+                                    text("Diag").size(11).color(theme::TEXT_MUTED),
+                                    "Diagnostics commands",
+                                    Some(SettingsMessage::WorkspaceMsg(
+                                        workspaces::WorkspacesMessage::ShowDiagnostics(
+                                            ws_item.name.clone(),
+                                        ),
+                                    )),
+                                    button::DEFAULT_PADDING,
+                                    theme::button_text,
+                                    tooltip::Position::Top,
+                                ));
+                                left = left.push(widgets::icon_tooltip_button(
+                                    text("Notes").size(11).color(theme::TEXT_MUTED),
+                                    "Custom context",
+                                    Some(SettingsMessage::WorkspaceMsg(
+                                        workspaces::WorkspacesMessage::ToggleNotes(
+                                            ws_item.name.clone(),
+                                        ),
+                                    )),
+                                    button::DEFAULT_PADDING,
+                                    theme::button_text,
+                                    tooltip::Position::Top,
+                                ));
                                 container(left)
                                     .width(Length::FillPortion(28))
                                     .align_x(Alignment::Start)
@@ -2009,14 +2023,16 @@ impl SettingsState {
         }
 
         // Inline "+" button in the section header
-        let plus_btn: Element<'_, SettingsMessage> = button(
+        let plus_btn = widgets::icon_tooltip_button(
             lucide::plus::<iced::Theme, iced::Renderer>()
                 .size(16)
                 .color(theme::ACCENT),
-        )
-        .style(theme::button_text)
-        .on_press(SettingsMessage::ToggleAddWorkspaceModal)
-        .into();
+            "Add workspace",
+            Some(SettingsMessage::ToggleAddWorkspaceModal),
+            button::DEFAULT_PADDING,
+            theme::button_text,
+            tooltip::Position::Top,
+        );
 
         let mut section_content = column![rows];
 
@@ -2408,14 +2424,16 @@ impl SettingsState {
         }
 
         // Inline "+" button in the section header
-        let plus_btn: Element<'_, SettingsMessage> = button(
+        let plus_btn = widgets::icon_tooltip_button(
             lucide::plus::<iced::Theme, iced::Renderer>()
                 .size(16)
                 .color(theme::ACCENT),
-        )
-        .style(theme::button_text)
-        .on_press(SettingsMessage::ToggleAddUserModal)
-        .into();
+            "Add user",
+            Some(SettingsMessage::ToggleAddUserModal),
+            button::DEFAULT_PADDING,
+            theme::button_text,
+            tooltip::Position::Top,
+        );
 
         section_with_header_action("Users", plus_btn, column![rows])
     }
