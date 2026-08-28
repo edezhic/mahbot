@@ -769,7 +769,10 @@ impl BoardState {
         padding: [u16; 2],
     ) -> Element<'a, BoardMessage> {
         let (bg, fg) = theme::ticket_phase_color(phase);
-        badge_pill(phase.display_name(), (bg, fg), text_size, padding)
+        let pill = badge_pill(phase.display_name(), (bg, fg), text_size, padding);
+        tooltip(pill, text("Current phase").size(11), tooltip::Position::Top)
+            .style(theme::tooltip_style)
+            .into()
     }
 
     /// Priority chip pill; colors from [`theme::ticket_priority_color`].
@@ -779,7 +782,10 @@ impl BoardState {
         padding: [u16; 2],
     ) -> Element<'a, BoardMessage> {
         let (bg, fg) = theme::ticket_priority_color(priority);
-        badge_pill(format!("P{priority}"), (bg, fg), text_size, padding)
+        let pill = badge_pill(format!("P{priority}"), (bg, fg), text_size, padding);
+        tooltip(pill, text("Priority").size(11), tooltip::Position::Top)
+            .style(theme::tooltip_style)
+            .into()
     }
 
     /// Bounce-count badge (icon + count + tooltip, matching the prereq indicator
