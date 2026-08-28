@@ -273,8 +273,8 @@ struct DisplayGroup {
     run_lifetime: bool,
 }
 
-/// One workspace section on the page: a section header (the workspace name)
-/// plus the groups running in that workspace.
+/// One workspace section on the page: the groups running in one workspace,
+/// keyed by the raw workspace name and ordered by its resolved label.
 #[derive(Debug, Clone)]
 struct WorkspaceSection {
     /// Raw workspace name — the grouping key.
@@ -435,7 +435,8 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
 }
 
 /// Group the display groups into WORKSPACE SECTIONS — the page is organized
-/// by workspace, each section headed by the workspace name.
+/// by workspace, whose resolved label is used only for deterministic ordering
+/// (the label no longer renders as a per-section heading).
 ///
 /// Sections are ordered alphabetically by their resolved label (deterministic
 /// — activity-based ordering would flicker as agents come and go); within a
@@ -467,8 +468,9 @@ fn build_sections(
 
 // ── Rendering ─────────────────────────────────────────────────────────────
 
-/// Render one workspace section: the workspace name as the page-level header
-/// (styled like a page title), then the section's groups.
+/// Render one workspace section: just the section's groups. The workspace
+/// name no longer gets a visual heading — `section.label` exists only for the
+/// deterministic section ordering in [`build_sections`].
 ///
 /// The returned element owns all rendered content (text widgets take owned
 /// Strings), so its lifetime is independent of the `section` borrow.
@@ -480,29 +482,20 @@ fn render_section(
     for group in &section.groups {
         groups = groups.push(render_group(group, expanded));
     }
-    column![
-        text(section.label.clone())
-            .size(18)
-            .color(theme::TEXT_PRIMARY),
-        groups,
-    ]
-    .spacing(10)
-    .into()
+    groups.into()
 }
 
-/// Resolve a group's header parts: the primary label plus an optional
-/// secondary element (the ticket id). `render_group` applies the visual
-/// hierarchy — for ticket groups the ID is rendered large/prominent and the
-/// title is the small, brighter subordinate line; single-label groups render
-/// their label as the small, brighter subordinate line.
+/// Resolve a group's header parts: the primary label plus an optional ticket
+/// id. `render_group` composes a single flat header — for ticket groups
+/// `[{id}] {title}`, otherwise just the label.
 ///
-/// - Ticket groups: the ticket NAME plus the ticket ID as the secondary. When
-///   no title was captured (defensive — every live ticket group carries one
-///   via its agents or the synthesis call), the ID becomes the sole label.
+/// - Ticket groups: the ticket NAME plus the ticket ID. When no title was
+///   captured (defensive — every live ticket group carries one via its agents
+///   or the synthesis call), the key becomes the sole label.
 /// - Analyze/research groups: the truncated question/task text; a generic
 ///   fallback when no label was captured. The raw NanoID key is NEVER shown.
 /// - Singleton/unattributed groups: generic labels — their workspace name is
-///   already the section header, so repeating it would be redundant.
+///   already the section grouping, so repeating it would be redundant.
 fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
     match &group.kind {
         GroupKind::Ticket => match &group.label {
@@ -528,31 +521,28 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
     }
 }
 
-/// Render one group: header (ID/label + run-lifetime marker) then the group
+/// Render one group: header (flat label + run-lifetime marker) then the group
 /// panel holding its cards/rows. Cards are visually separated from the panel
 /// via the established card style.
 fn render_group(
     group: &DisplayGroup,
     expanded: &HashSet<(String, u64)>,
 ) -> Element<'static, RunningMessage> {
-    let (title, secondary) = group_title(group);
+    let (title, id) = group_title(group);
     let mut header_parts: Vec<Element<'_, RunningMessage>> = Vec::new();
-    if group.kind == GroupKind::Ticket {
-        // Ticket group: the ID is the prominent ACCENT element rendered first;
-        // the title is the small, brighter subordinate line rendered second.
-        // When no title was captured (defensive), the ID is the sole large
-        // element.
-        if let Some(id) = secondary {
-            header_parts.push(text(id).size(15).color(theme::ACCENT).into());
-            header_parts.push(text(title).size(12).color(theme::TEXT_SECONDARY).into());
-        } else {
-            header_parts.push(text(title).size(15).color(theme::ACCENT).into());
+    // Ticket groups render a single flat `[{id}] {title}` header — the id is
+    // composed into the text, never styled as a separate ACCENT element. When
+    // no title was captured (defensive), the key is the sole label. All other
+    // groups render their label as the same flat line.
+    let header = if group.kind == GroupKind::Ticket {
+        match id {
+            Some(id) => format!("[{id}] {title}"),
+            None => title.clone(),
         }
     } else {
-        // Single-label groups (analyze/research/singleton/unattributed): the
-        // label is the small, brighter subordinate line (no large element).
-        header_parts.push(text(title).size(12).color(theme::TEXT_SECONDARY).into());
-    }
+        title.clone()
+    };
+    header_parts.push(text(header).size(12).color(theme::TEXT_SECONDARY).into());
     if group.run_lifetime {
         header_parts.push(text("run active").size(11).color(theme::ACCENT).into());
     }
@@ -657,10 +647,10 @@ fn fallback_workspace_label(workspace: &str) -> String {
     }
 }
 
-/// Resolve a workspace's display label for a section header: the bare name
-/// for registered workspaces, the fallback label (with the "(external)"
-/// marker) for unregistered/ephemeral ones, and "workspace" for an empty
-/// name.
+/// Resolve a workspace's display label, used for deterministic section
+/// ordering: the bare name for registered workspaces, the fallback label
+/// (with the "(external)" marker) for unregistered/ephemeral ones, and
+/// "workspace" for an empty name.
 fn workspace_label_for(
     name: &str,
     workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
@@ -1161,8 +1151,8 @@ fn render_metric_tooltip(label: String) -> Element<'static, RunningMessage> {
 }
 
 /// Render a compact non-agent LLM call row: zap marker + purpose + elapsed.
-/// No workspace name (the section header carries it); the elapsed time uses
-/// the same brighter tone as agent cards. The purpose is the static
+/// No workspace name (the workspace grouping already names it); the elapsed
+/// time uses the same brighter tone as agent cards. The purpose is the static
 /// human-readable label — raw kind names never leak.
 fn render_call_row(call: &CallRow) -> Element<'static, RunningMessage> {
     let h = &call.handle;
@@ -1576,7 +1566,7 @@ mod tests {
             Some("Fix the login flow"),
             "group label adopted from a member's parent label"
         );
-        // group_title preserves (name, id); render_group swaps which is emphasized.
+        // group_title preserves (title, id); render_group composes `[id] title`.
         let (title, secondary) = group_title(ticket);
         assert_eq!(title, "Fix the login flow");
         assert_eq!(secondary.as_deref(), Some("T1"));
@@ -1648,7 +1638,8 @@ mod tests {
     #[test]
     fn singleton_and_unattributed_headers_are_generic_not_workspace_titled() {
         // Inside a workspace section the singleton/unattributed group headers
-        // must NOT repeat the workspace name (the section header carries it).
+        // must NOT repeat the workspace name — the workspace grouping already
+        // names it.
         let agents = vec![agent_handle("mgr", "manager", None, "ws1", None)];
         let calls = vec![call_handle("some_orchestrator_call", "ws1", None, false)];
         let groups = build_groups(&agents, &calls);
