@@ -2448,6 +2448,23 @@ impl<'a> EditorWidget<'a> {
         }
     }
 
+    /// Whether the caret should be drawn on this frame. The caret is only
+    /// shown on the surface that currently owns the keyboard: a focus-id
+    /// field (search / rename / settings / password) draws it only while
+    /// focused and the window is focused; a focus-less field draws it only
+    /// when the window is focused and it is the always-active code editor
+    /// (`code_mode`). Unlike [`is_active_surface`], this does **not** exclude
+    /// masked fields — a focused password field must still show its caret.
+    fn should_draw_cursor(&self, state: &EditorWidgetState) -> bool {
+        if !state.is_window_focused || self.ignore_keyboard {
+            return false;
+        }
+        match self.focus_id {
+            Some(_) => state.is_focused,
+            None => self.code_mode,
+        }
+    }
+
     /// Compute the [`input_method::InputMethod`] for this frame. Must only be
     /// called during [`window::Event::RedrawRequested`], which is when
     /// `Shell::request_input_method` is honored. The active surface reports
@@ -2489,12 +2506,52 @@ impl<'a> EditorWidget<'a> {
     }
 }
 
+/// Resolve the desired layout-node height for the editor's content.
+///
+/// Single-line fields never wrap and are always exactly one visual line tall
+/// (`line_height + 2·padding`). Multi-line prose modes clamp the content
+/// height to `[min_height, max_height]`. The code editor (no `single_line`,
+/// no `min`/`max`) fills its container.
+fn autosize_height(
+    single_line: bool,
+    line_height: f32,
+    content_height: f32,
+    padding: f32,
+    min_height: Option<f32>,
+    max_height: Option<f32>,
+    container_height: f32,
+) -> f32 {
+    let single_line_h = if single_line {
+        Some(line_height + 2.0 * padding)
+    } else {
+        None
+    };
+    let eff_min = min_height.or(single_line_h);
+    let eff_max = max_height.or(single_line_h);
+    if eff_min.is_some() || eff_max.is_some() {
+        let max_h = eff_max.map_or(container_height, |h| h.min(container_height));
+        // Guard against min > max when the available container is tighter
+        // than min_height (clamp panics if min > max).
+        let min_h = eff_min.unwrap_or(0.0).min(max_h);
+        (content_height + 2.0 * padding).clamp(min_h, max_h)
+    } else {
+        container_height
+    }
+}
+
 impl<Theme, Renderer> Widget<EditorAction, Theme, Renderer> for EditorWidget<'_>
 where
     Renderer: iced::advanced::Renderer + graphics::text::Renderer + iced::advanced::text::Renderer,
 {
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fill)
+        Size::new(
+            Length::Fill,
+            if self.single_line {
+                Length::Shrink
+            } else {
+                Length::Fill
+            },
+        )
     }
 
     fn state(&self) -> widget::tree::State {
@@ -2600,39 +2657,39 @@ where
         // no-whitespace megabyte).
         let total_height = compute_total_height(&mut buffer, font_sys, metrics);
 
-        // ── Auto-size: clamp height to [min, max] for prose modes ──────
-        // When min/max heights are configured, lay the widget out at
-        // `(total_height + 2·padding).clamp(min, max)` rather than filling
-        // its container. The bounds height is set BEFORE recomputing the
-        // text area so the internal scroll viewport matches the visible
-        // (clamped) area, avoiding a height-shake when the content grows.
-        if self.min_height.is_some() || self.max_height.is_some() {
-            let max_h = self
-                .max_height
-                .map_or(bounds.height, |h| h.min(bounds.height));
-            // Guard against min > max when the available container is tighter
-            // than min_height (clamp panics if min > max).
-            let min_h = self.min_height.unwrap_or(0.0).min(max_h);
-            let desired_h = (total_height + 2.0 * self.padding).clamp(min_h, max_h);
-            if (desired_h - bounds.height).abs() > f32::EPSILON {
-                bounds.height = desired_h;
-                // Recompute the text area for the new height and re-shape so
-                // the scroll range/auto-scroll use the visible area.
-                let text_rect = text_area_rect(
-                    Rectangle::new(Point::ORIGIN, bounds),
-                    self.padding,
-                    gutter_width,
-                );
-                text_area_height = text_rect.height;
-                reshape_and_shape(
-                    &mut buffer,
-                    font_sys,
-                    Some(state.scroll_y),
-                    state.scroll_x,
-                    text_area_width,
-                    text_area_height,
-                );
-            }
+        // ── Auto-size: clamp height to content / min-max / one line ──
+        // Single-line fields resolve to exactly one line; multi-line prose
+        // modes clamp to [min, max]; the code editor fills the container.
+        // The bounds height is set BEFORE recomputing the text area so the
+        // internal scroll viewport matches the visible (clamped) area,
+        // avoiding a height-shake when the content grows.
+        let desired_h = autosize_height(
+            self.single_line,
+            metrics.line_height,
+            total_height,
+            self.padding,
+            self.min_height,
+            self.max_height,
+            bounds.height,
+        );
+        if (desired_h - bounds.height).abs() > f32::EPSILON {
+            bounds.height = desired_h;
+            // Recompute the text area for the new height and re-shape so the
+            // scroll range/auto-scroll use the visible area.
+            let text_rect = text_area_rect(
+                Rectangle::new(Point::ORIGIN, bounds),
+                self.padding,
+                gutter_width,
+            );
+            text_area_height = text_rect.height;
+            reshape_and_shape(
+                &mut buffer,
+                font_sys,
+                Some(state.scroll_y),
+                state.scroll_x,
+                text_area_width,
+                text_area_height,
+            );
         }
 
         // ── Auto-scroll: keep cursor in viewport ───────────────────────
@@ -2838,7 +2895,9 @@ where
                 draw_placeholder(renderer, placeholder.as_ref(), &text_geo);
             }
         }
-        draw_cursor(renderer, &buffer_for_draw, &text_geo, state, self.buffer);
+        if self.should_draw_cursor(state) {
+            draw_cursor(renderer, &buffer_for_draw, &text_geo, state, self.buffer);
+        }
     }
 
     #[expect(clippy::too_many_lines)]

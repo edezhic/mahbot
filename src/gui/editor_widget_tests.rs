@@ -867,3 +867,102 @@ fn test_masked_render_buffer_single_line_does_not_wrap() {
     });
     assert_eq!(buffer_text(&mbuffer), "•••••••");
 }
+
+// ── Single-line height & cursor focus (shared-editor regressions) ──────
+
+#[test]
+fn test_single_line_size_hint_is_shrink() {
+    let buf = EditorBuffer::with_text("", None);
+    // Single-line fields (search / password / rename) must not fill their
+    // container vertically — the size hint lets the wrapping container
+    // shrink to a single line instead of inheriting `Length::Fill`.
+    let size_of = |widget: &EditorWidget<'_>| {
+        <EditorWidget<'_> as Widget<EditorAction, iced::Theme, iced::Renderer>>::size(widget)
+    };
+    let single = EditorWidget::new(&buf).single_line(true);
+    assert_eq!(size_of(&single), Size::new(Length::Fill, Length::Shrink));
+    // Multi-line prose / code editors keep filling their container.
+    let multi = EditorWidget::new(&buf);
+    assert_eq!(size_of(&multi), Size::new(Length::Fill, Length::Fill));
+}
+
+#[test]
+fn test_cursor_follows_focus_state() {
+    let buf = EditorBuffer::with_text("", None);
+    // A focus-id field draws the caret only while focused.
+    let field = EditorWidget::new(&buf).single_line(true).id("field");
+    let state = EditorWidgetState::default();
+    assert!(!field.should_draw_cursor(&state));
+    let focused = EditorWidgetState {
+        is_focused: true,
+        ..EditorWidgetState::default()
+    };
+    assert!(field.should_draw_cursor(&focused));
+    // Masked / password fields still show the caret when focused (the IME
+    // `is_active_surface` predicate would suppress them, but the caret must
+    // not).
+    let masked = EditorWidget::new(&buf)
+        .single_line(true)
+        .masked(true)
+        .id("pw");
+    assert!(masked.should_draw_cursor(&focused));
+    // Window blur suppresses the caret even while focused.
+    let blurred = EditorWidgetState {
+        is_focused: true,
+        is_window_focused: false,
+        ..EditorWidgetState::default()
+    };
+    assert!(!field.should_draw_cursor(&blurred));
+    // A focus-less field is always active (code editor) while the window is
+    // focused and it is not ignoring the keyboard.
+    let code = EditorWidget::new(&buf);
+    assert!(code.should_draw_cursor(&EditorWidgetState::default()));
+    assert!(
+        !code
+            .ignore_keyboard(true)
+            .should_draw_cursor(&EditorWidgetState::default())
+    );
+    // A focus-less *non-code* field is not an active surface (matching
+    // `is_active_surface`), so it must not blink its caret either.
+    assert!(
+        !EditorWidget::new(&buf)
+            .code_mode(false)
+            .should_draw_cursor(&EditorWidgetState::default())
+    );
+}
+
+#[test]
+fn test_single_line_height_clamp() {
+    let line_height = font_metrics().line_height;
+    let padding = 5.0;
+    let single_line_h = line_height + 2.0 * padding;
+    let close = |a: f32, b: f32| assert!((a - b).abs() < f32::EPSILON, "{a} != {b}");
+    // Single-line fields always resolve to exactly one line, never filling
+    // the container vertically — but never taller than the container.
+    close(
+        autosize_height(true, line_height, line_height, padding, None, None, 300.0),
+        single_line_h,
+    );
+    close(
+        autosize_height(true, line_height, line_height, padding, None, None, 10.0),
+        10.0,
+    );
+    // Multi-line prose clamps content height to [min, max].
+    close(
+        autosize_height(
+            false,
+            line_height,
+            50.0,
+            padding,
+            Some(44.0),
+            Some(132.0),
+            300.0,
+        ),
+        60.0,
+    );
+    // The code editor (no single-line, no min/max) fills the container.
+    close(
+        autosize_height(false, line_height, 50.0, padding, None, None, 300.0),
+        300.0,
+    );
+}
