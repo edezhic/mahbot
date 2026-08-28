@@ -500,6 +500,10 @@ impl Session {
                 ("{{operating_system}}", std::env::consts::OS),
                 ("{{workspace}}", &ws.as_path().display().to_string()),
                 ("{{workspace_context}}", &workspace_context),
+                (
+                    "{{system_locale}}",
+                    &sys_locale::get_locale().unwrap_or_else(|| "unknown".to_string()),
+                ),
             ],
         );
 

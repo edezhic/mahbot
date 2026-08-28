@@ -196,6 +196,13 @@ pub enum HomeMessage {
     StopVoiceRecordingSend,
     /// Recording popup: stop recording and discard the voice message.
     StopVoiceRecordingDiscard,
+    /// The scripted onboarding exchange completed (provider configured) — re-run
+    /// the onboarding check (now firing the Phase-2 kickoff).
+    OnboardingScriptCompleted,
+    /// The scripted onboarding input was invalid — the script stays active.
+    OnboardingScriptRePrompt,
+    /// The Phase-2 kickoff task finished (marker; the work is done inside the task).
+    OnboardingKickoffDone,
     /// Toggle the composer role dropdown open/closed.
     RoleMenuToggled,
     /// Close the composer role dropdown (on role selection, message send,
@@ -229,6 +236,9 @@ pub struct HomeState {
     typing_tick_state: u8,
     /// Whether the initial history load has happened for the current user+workspace.
     history_loaded: bool,
+    /// Whether the Phase-1 scripted onboarding scenario is active (shown while
+    /// `provider_configured() == false`).
+    onboarding_script_active: bool,
     /// Generation counter for stale sending timeout detection.
     sending_gen: u64,
     /// True when WorkspaceChanged arrived before a user was selected — the
@@ -291,6 +301,7 @@ impl HomeState {
             typing: false,
             typing_tick_state: 0,
             history_loaded: false,
+            onboarding_script_active: false,
             sending_gen: 0,
             pending_workspace_refresh: false,
             auto_scroll_enabled: true,
@@ -486,6 +497,7 @@ impl HomeState {
         self.messages.clear();
         self.seen_ids.clear();
         self.history_loaded = false;
+        self.onboarding_script_active = false;
         self.role_menu_open = false;
         self.reset_pagination_state();
     }
@@ -495,6 +507,59 @@ impl HomeState {
         if self.auto_scroll_enabled {
             iced::widget::operation::snap_to_end(CHAT_SCROLL_ID)
         } else {
+            Task::none()
+        }
+    }
+
+    /// Start the Phase-1 scripted onboarding (no provider) or fire the Phase-2
+    /// Support kickoff (provider configured, state Init). Called after the first
+    /// history load for a selected user. No-op when the scenario is already active.
+    fn maybe_start_onboarding(&mut self) -> Task<HomeMessage> {
+        if self.selected_user.is_none() {
+            return Task::none();
+        }
+        // NOTE: the Phase-1 provider-setup script is intentionally NOT gated on
+        // the selected user being the admin — the onboarding flow is admin-only,
+        // but a non-admin created via the Settings bypass before a provider is
+        // set would see it and could set the global provider. That edge is out of
+        // scope; only the Phase-2 `kickoff_support` is admin-gated (via its
+        // `role_pool` Support check) so a non-admin never consumes the state.
+        if !crate::config::provider_configured() {
+            if self.onboarding_script_active {
+                return Task::none();
+            }
+            let user = self.selected_user.clone().unwrap_or_default();
+            let workspace = match self.visible_workspaces() {
+                Some(chat) => chat.primary.clone(),
+                None => return Task::none(),
+            };
+            // Only arm the scenario once a workspace is confirmed visible, so an
+            // empty picker can't strand `onboarding_script_active` with no script.
+            self.onboarding_script_active = true;
+            for (i, msg) in crate::onboarding::intro_messages().into_iter().enumerate() {
+                crate::channels::broadcast_transient_event(
+                    &format!("onboarding-intro-{i}"),
+                    &user,
+                    msg,
+                    crate::ChatDirection::Agent,
+                    "gui",
+                    Some("support".to_string()),
+                    &workspace,
+                    None,
+                    &crate::db::now(),
+                );
+            }
+            Task::none()
+        } else if crate::config::CONFIG.onboarding_stage() == crate::config::OnboardingState::Init {
+            self.onboarding_script_active = false;
+            let user = self.selected_user.clone().unwrap_or_default();
+            let user_for_task = user.clone();
+            Task::perform(
+                async move { crate::onboarding::kickoff_support(&user_for_task).await },
+                |_res| HomeMessage::OnboardingKickoffDone,
+            )
+        } else {
+            self.onboarding_script_active = false;
             Task::none()
         }
     }
@@ -860,9 +925,17 @@ impl HomeState {
                 .size(15)
                 .color(theme::TEXT_MUTED),
         };
+        // Personal-workspace picker hides the Manager role — routing maps
+        // Manager→Assistant there, so offering it in the menu is misleading.
+        // Use the filtered pool both for the button gate and the menu items.
+        let filtered_pool: Vec<Role> = role_pool
+            .iter()
+            .filter(|role| **role != Role::Manager || !self.at_personal_picker())
+            .copied()
+            .collect();
         let role_btn = button(role_icon)
             .on_press_maybe(
-                (self.selected_user.is_some() && !role_pool.is_empty())
+                (self.selected_user.is_some() && !filtered_pool.is_empty())
                     .then_some(HomeMessage::RoleMenuToggled),
             )
             .style(theme::icon_button_style(false))
@@ -877,9 +950,9 @@ impl HomeState {
         // publishes SwitchRole, which the Dashboard intercepts and persists
         // (it also sends RoleMenuClosed). Outside-click / Escape dismissal
         // is handled by the popup itself via RoleMenuClosed.
-        let role_btn: Element<'_, HomeMessage> = if !role_pool.is_empty() {
+        let role_btn: Element<'_, HomeMessage> = if !filtered_pool.is_empty() {
             let user = self.selected_user.clone().unwrap_or_default();
-            let items: Vec<RoleMenuItem<HomeMessage>> = role_pool
+            let items: Vec<RoleMenuItem<HomeMessage>> = filtered_pool
                 .iter()
                 .map(|role| {
                     let is_current = active_role.as_ref() == Some(role);
@@ -1138,8 +1211,8 @@ impl HomeState {
                     self.seen_ids.insert(msg_id);
                 }
                 self.history_loaded = true;
-                // Snap to end only if auto-scroll is enabled.
-                self.maybe_snap()
+                let onboarding = self.maybe_start_onboarding();
+                Task::batch([self.maybe_snap(), onboarding])
             }
             HomeMessage::HistoryLoadError(e) => {
                 tracing::warn!(error = %e, "Home: failed to load chat history");
@@ -1245,6 +1318,7 @@ impl HomeState {
                     agent_role,
                     workspace,
                     optimistic_id,
+                    ..
                 } => {
                     // 1. Replace optimistic placeholder if present.
                     if let Some(task) = self.replace_optimistic(
@@ -1451,6 +1525,16 @@ impl HomeState {
                 );
                 Task::none()
             }
+            HomeMessage::OnboardingScriptCompleted => {
+                self.sending = false;
+                self.onboarding_script_active = false;
+                self.maybe_start_onboarding()
+            }
+            HomeMessage::OnboardingScriptRePrompt => {
+                self.sending = false;
+                Task::none()
+            }
+            HomeMessage::OnboardingKickoffDone => Task::none(),
         }
     }
 
@@ -1511,6 +1595,13 @@ impl HomeState {
             ));
         }
 
+        // Phase-1 scripted onboarding intercepts the send before the pipeline:
+        // the provider entry is parsed and persisted directly, and the
+        // exchange is rendered as transient (never persisted) events.
+        if self.onboarding_script_active {
+            return self.send_scripted_message(content, optimistic_id);
+        }
+
         let msg = crate::ChannelMessage {
             user_name: sender.clone(),
             reply_target: sender,
@@ -1549,6 +1640,106 @@ impl HomeState {
         );
         // Snap to end on optimistic push if auto-scroll enabled.
         Task::batch([timeout_task, self.maybe_snap()])
+    }
+
+    /// Handle a Phase-1 scripted submit: broadcast the user's message
+    /// (transient, replacing the optimistic bubble), persist the provider
+    /// input, broadcast the success or re-prompt message, then emit the
+    /// completion/re-prompt message.
+    fn send_scripted_message(
+        &mut self,
+        content: String,
+        optimistic_id: Option<String>,
+    ) -> Task<HomeMessage> {
+        let user = match &self.selected_user {
+            Some(u) => u.clone(),
+            None => return Task::none(),
+        };
+        let workspace = match self.visible_workspaces() {
+            Some(chat) => chat.primary.clone(),
+            None => return Task::none(),
+        };
+        let opt = optimistic_id;
+        let send_task = Task::perform(
+            async move {
+                let parsed = crate::onboarding::parse_provider_input(&content);
+                // Replace the optimistic bubble with the user's transient message.
+                crate::channels::broadcast_transient_event(
+                    &crate::generate_id(),
+                    &user,
+                    &content,
+                    crate::ChatDirection::User,
+                    "gui",
+                    None,
+                    &workspace,
+                    opt,
+                    &crate::db::now(),
+                );
+                let outcome: Result<(), String> = match parsed {
+                    crate::onboarding::ProviderInput::Invalid => {
+                        crate::channels::broadcast_transient_event(
+                            &crate::generate_id(),
+                            &user,
+                            crate::onboarding::invalid_message(),
+                            crate::ChatDirection::Agent,
+                            "gui",
+                            Some("support".to_string()),
+                            &workspace,
+                            None,
+                            &crate::db::now(),
+                        );
+                        Err("invalid provider input".to_string())
+                    }
+                    valid => match crate::onboarding::persist_provider_input(&valid).await {
+                        Ok(()) => {
+                            crate::channels::broadcast_transient_event(
+                                &crate::generate_id(),
+                                &user,
+                                crate::onboarding::success_message(),
+                                crate::ChatDirection::Agent,
+                                "gui",
+                                Some("support".to_string()),
+                                &workspace,
+                                None,
+                                &crate::db::now(),
+                            );
+                            Ok(())
+                        }
+                        Err(e) => {
+                            crate::channels::broadcast_transient_event(
+                                &crate::generate_id(),
+                                &user,
+                                &format!("Couldn't save that: {e:#}"),
+                                crate::ChatDirection::Agent,
+                                "gui",
+                                Some("support".to_string()),
+                                &workspace,
+                                None,
+                                &crate::db::now(),
+                            );
+                            Err(e.to_string())
+                        }
+                    },
+                };
+                match outcome {
+                    Ok(()) => HomeMessage::OnboardingScriptCompleted,
+                    Err(_) => HomeMessage::OnboardingScriptRePrompt,
+                }
+            },
+            std::convert::identity,
+        );
+        // Arm the 30s SendingTimeout guard (same as the normal send path) so a
+        // stalled persist can't leave `sending=true` forever.
+        self.sending_gen = self.sending_gen.wrapping_add(1);
+        let generation = self.sending_gen;
+        let timeout_task = Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                HomeMessage::SendingTimeout(generation)
+            },
+            |msg| msg,
+        );
+        Task::batch([send_task, timeout_task])
     }
 }
 
@@ -2052,7 +2243,7 @@ mod tests {
             .get()
             .expect("users store initialized");
         store
-            .add_user(user, Some("full"), &[Role::Manager])
+            .add_user(user, Some("full"), Role::Manager)
             .await
             .expect("add user");
 

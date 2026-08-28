@@ -1638,8 +1638,8 @@ async fn route_to_agent(text: String) {
             return;
         };
         let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
-        // Manager→Analyst fallback in personal workspaces (pool-clamped) and
-        // Assistant/Artist pinning to the personal workspace, atomically.
+        // Manager→Assistant fallback in personal workspaces (pool-clamped) and
+        // Assistant/Artist/Support pinning to the personal workspace, atomically.
         let (role, ws) = crate::users::effective_role_and_workspace(role, ws, &user_name, &pool);
 
         info!(
@@ -1667,7 +1667,7 @@ async fn route_to_agent(text: String) {
     // warning + personal fallback as the active-user path). Pool-gated
     // like the active-user path: an emptied admin pool drops the command,
     // and the routed role stays inside the pool — including the same
-    // personal-workspace Manager→Analyst clamp.
+    // personal-workspace Manager→Assistant clamp.
     let ws = crate::users::resolve_workspace_for_user_name("admin").await;
     let admin_pool = crate::users::role_pool("admin").await;
     if admin_pool.is_empty() {

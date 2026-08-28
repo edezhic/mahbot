@@ -216,7 +216,7 @@ impl BrowserTool {
             super::browser_daemon::CliStatus::Missing => {
                 anyhow::bail!(
                     "chrome-use CLI is not available. {}",
-                    super::browser_daemon::CHROME_USE_INSTALL_HINT
+                    super::browser_daemon::CHROME_USE_INSTALL_HINT.as_str()
                 );
             }
             super::browser_daemon::CliStatus::Transient(failure) => {
@@ -229,7 +229,7 @@ impl BrowserTool {
                     super::browser_daemon::CliProbeFailure::BadVersion(status) => format!(
                         "chrome-use CLI is installed but its `--version` check failed \
                          ({status}) — the install looks broken. {}",
-                        super::browser_daemon::CHROME_USE_INSTALL_HINT
+                        super::browser_daemon::CHROME_USE_INSTALL_HINT.as_str()
                     ),
                     super::browser_daemon::CliProbeFailure::Timeout => {
                         "chrome-use CLI probe timed out — the binary is present but \
@@ -271,7 +271,7 @@ impl BrowserTool {
         let mut cmd = Command::new(super::browser_daemon::cli_path().with_context(|| {
             format!(
                 "chrome-use CLI is not available. {}",
-                super::browser_daemon::CHROME_USE_INSTALL_HINT
+                super::browser_daemon::CHROME_USE_INSTALL_HINT.as_str()
             )
         })?);
         super::browser_daemon::ensure_browser_env(&mut cmd);

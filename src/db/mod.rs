@@ -1568,6 +1568,12 @@ async fn import_one_legacy_store(
 /// job-per-phase model removed (it stores `ticket_id` directly on `jobs`).
 /// The consolidated `schema_migrations`/fresh-install probe paths do not depend
 /// on them.
+///
+/// `user_roles` is an explicit `None` arm (a deliberate, documented drop — the
+/// role pool is permission-derived now) even though the wildcard already maps
+/// unknown tables to `None`; `#[allow]` on the function documents the intent
+/// without a wildcard-only match.
+#[allow(clippy::match_same_arms)]
 fn consolidate_table_name(src: &str) -> Option<&'static str> {
     match src {
         // All other current user tables keep their name.
@@ -1585,7 +1591,10 @@ fn consolidate_table_name(src: &str) -> Option<&'static str> {
         "editor_tabs" => Some("editor_tabs"),
         "users" => Some("users"),
         "user_channels" => Some("user_channels"),
-        "user_roles" => Some("user_roles"),
+        // `user_roles` is dropped: role pools are permission-derived now, so
+        // no production code reads it and the consolidated schema never
+        // recreates it. Rows are discarded during the import.
+        "user_roles" => None,
         "config_kv" => Some("config_kv"),
         "config_model_routing" => Some("config_model_routing"),
         "chat_history" => Some("chat_history"),

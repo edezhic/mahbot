@@ -1,7 +1,5 @@
 use super::*;
 
-use strum::IntoEnumIterator;
-
 /// Create a Telegram Update JSON with sensible defaults, then apply
 /// shallow top-level overrides for test-specific fields.
 ///
@@ -1671,9 +1669,8 @@ fn setup_spy_channel() -> &'static Arc<Mutex<Vec<SendMessage>>> {
 async fn setup_user_with_telegram_binding(user_name: &str, reply_target: &str, ctx: &str) {
     use crate::users::store;
     let store = store();
-    let all_roles = crate::Role::iter().collect::<Vec<_>>();
     store
-        .add_user(user_name, Some("full"), &all_roles)
+        .add_user(user_name, Some("full"), crate::Role::Support)
         .await
         .unwrap_or_else(|e| panic!("{ctx}: add_user: {e}"));
     store
@@ -1757,14 +1754,14 @@ async fn assert_mirror_skips(setup: MirrorSkipSetup, msg: &ChannelMessage, reaso
         }
         MirrorSkipSetup::Unbound(u) => {
             let s = crate::users::store();
-            s.add_user(u, None, &[])
+            s.add_user(u, None, crate::Role::Assistant)
                 .await
                 .unwrap_or_else(|e| panic!("case {reason}: add_user: {e}"));
             (u, u)
         }
         MirrorSkipSetup::BoundNoTarget(u) => {
             let s = crate::users::store();
-            s.add_user(u, None, &[])
+            s.add_user(u, None, crate::Role::Assistant)
                 .await
                 .unwrap_or_else(|e| panic!("case {reason}: add_user: {e}"));
             s.bind_channel(u, "telegram", u)
@@ -1890,7 +1887,7 @@ async fn sends_to_multiple_telegram_bindings() {
     let (sent, _lock) = setup_mirror_test_env().await;
     let store = crate::users::store();
     store
-        .add_user("multi_user", None, &[])
+        .add_user("multi_user", None, crate::Role::Assistant)
         .await
         .expect("add_user");
     // Bind two Telegram accounts with unique recipients.
@@ -2036,30 +2033,39 @@ async fn user_command_entries_reflect_role_and_admin() {
     assert!(!cmds.contains(&"unpause"));
     assert!(cmds.contains(&"maintenance_on"));
     assert!(!cmds.contains(&"maintenance_off"));
-    // Pool roles are direct commands.
-    assert!(cmds.contains(&"engineer"));
+    // Pool roles are direct commands (full permissions → onboarding pool:
+    // Support, Assistant, Manager, Artist).
+    assert!(cmds.contains(&"support"));
+    assert!(cmds.contains(&"manager"));
     assert!(cmds.contains(&"artist"));
+    assert!(!cmds.contains(&"engineer"));
     // Artist is in the pool → model commands present.
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
-    assert_eq!(cmds[0], "manager");
+    assert_eq!(cmds[0], "support");
     // Menu order: role commands first, then board/admin (+ /update), then
     // workspace-state pairs, then model commands, with /clear last.
     assert_eq!(cmds.last(), Some(&"clear"));
     let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
-    assert!(pos("manager") < pos("board"));
+    assert!(pos("support") < pos("board"));
     assert!(pos("board") < pos("update"));
     assert!(pos("update") < pos("image_models"));
     assert!(pos("image_models") < pos("clear"));
 
     // The active role's entry is marked. add_user seeds the selection to the
-    // first pool role (Manager in Role::iter order).
+    // default role — Support for a full admin.
+    let support_desc = alice
+        .iter()
+        .find(|(c, _)| c == "support")
+        .map(|(_, d)| d.as_str())
+        .unwrap();
+    assert!(support_desc.contains("current"));
     let manager_desc = alice
         .iter()
         .find(|(c, _)| c == "manager")
         .map(|(_, d)| d.as_str())
         .unwrap();
-    assert!(manager_desc.contains("current"));
+    assert!(!manager_desc.contains("current"));
 
     // Switching the active role moves the marker.
     store
@@ -2078,12 +2084,12 @@ async fn user_command_entries_reflect_role_and_admin() {
         .map(|(_, d)| d.as_str())
         .unwrap();
     assert!(artist_desc.contains("current"));
-    let analyst_desc = entries
+    let manager_desc2 = entries
         .iter()
-        .find(|(c, _)| c == "analyst")
+        .find(|(c, _)| c == "manager")
         .map(|(_, d)| d.as_str())
         .unwrap();
-    assert!(!analyst_desc.contains("current"));
+    assert!(!manager_desc2.contains("current"));
 
     // Flipping the workspace state reverses the pairs (the ticket's
     // headline criterion): paused → /unpause, maintenance on →
@@ -2121,5 +2127,9 @@ async fn user_command_entries_reflect_role_and_admin() {
     assert!(!cmds.contains(&"update"));
     assert!(!cmds.contains(&"pause"));
     assert!(!cmds.contains(&"unpause"));
-    assert!(cmds.contains(&"engineer"));
+    // Restricted user: pool is [Assistant, Artist] — no admin/board commands,
+    // no engineer.
+    assert!(cmds.contains(&"assistant"));
+    assert!(cmds.contains(&"artist"));
+    assert!(!cmds.contains(&"engineer"));
 }

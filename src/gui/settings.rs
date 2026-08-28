@@ -22,8 +22,8 @@ use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Checkbox, Column, Id, Row, Space, button, column, container, pick_list, row, scrollable, stack,
-    text, toggler, tooltip,
+    Column, Id, Row, Space, button, column, container, pick_list, row, scrollable, stack, text,
+    toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -346,9 +346,9 @@ pub enum SettingsMessage {
     ToggleAddUserModal,
     /// Add-user modal fields.
     AddUserSender(EditorAction),
-    AddUserPermissions(EditorAction),
-    /// Toggle a role checkbox in the add-user modal (index into [`Role::iter`]).
-    AddUserRoleToggle(usize),
+    /// Select the default agent in the add-user modal (index into
+    /// `[Role::Assistant, Role::Artist]`).
+    AddUserDefaultRole(usize),
     /// Submit the add-user modal.
     SubmitAddUser,
     /// Result of user add.
@@ -515,10 +515,9 @@ pub struct SettingsState {
     show_add_user_modal: bool,
     /// Name field in the add-user modal.
     add_user_sender: SingleLineEditorState,
-    /// Permissions field in the add-user modal.
-    add_user_permissions: SingleLineEditorState,
-    /// Role checkboxes in the add-user modal, indexed by [`Role::iter`].
-    add_user_roles: Vec<bool>,
+    /// Default agent for the new user, as an index into
+    /// `[Role::Assistant, Role::Artist]` (0 = Assistant).
+    add_user_default: usize,
     /// Whether the add-user operation is in flight.
     add_user_adding: bool,
 
@@ -582,8 +581,7 @@ impl SettingsState {
             add_workspace_adding: false,
             show_add_user_modal: false,
             add_user_sender: SingleLineEditorState::new(""),
-            add_user_permissions: SingleLineEditorState::new(""),
-            add_user_roles: Vec::new(),
+            add_user_default: 0,
             add_user_adding: false,
             model_picker_inputs: std::array::from_fn(|_| SingleLineEditorState::new("")),
             voice_toggle_gen: 0,
@@ -766,8 +764,7 @@ impl SettingsState {
     fn close_add_user_modal(&mut self) {
         self.show_add_user_modal = false;
         self.add_user_sender.clear();
-        self.add_user_permissions.clear();
-        self.add_user_roles.clear();
+        self.add_user_default = 0;
         self.add_user_adding = false;
     }
 
@@ -1478,8 +1475,8 @@ impl SettingsState {
             SettingsMessage::ToggleAddUserModal => {
                 self.show_add_user_modal = !self.show_add_user_modal;
                 if self.show_add_user_modal {
-                    // Fresh checkbox state: all unchecked.
-                    self.add_user_roles = Role::iter().map(|_| false).collect();
+                    // Fresh default-agent selection.
+                    self.add_user_default = 0;
                 } else {
                     self.close_add_user_modal();
                 }
@@ -1492,16 +1489,9 @@ impl SettingsState {
                 self.add_user_sender.apply_action(action);
                 Task::none()
             }
-            SettingsMessage::AddUserPermissions(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.add_user_permissions.apply_action(action);
-                Task::none()
-            }
-            SettingsMessage::AddUserRoleToggle(idx) => {
-                if let Some(checked) = self.add_user_roles.get_mut(idx) {
-                    *checked = !*checked;
+            SettingsMessage::AddUserDefaultRole(idx) => {
+                if idx < [Role::Assistant, Role::Artist].len() {
+                    self.add_user_default = idx;
                 }
                 Task::none()
             }
@@ -1509,23 +1499,27 @@ impl SettingsState {
                 if self.add_user_sender.text().is_empty() {
                     return Task::none();
                 }
-                let roles: Vec<Role> = Role::iter()
-                    .zip(self.add_user_roles.iter())
-                    .filter(|(_, checked)| **checked)
-                    .map(|(r, _)| r)
-                    .collect();
+                // The permission-derived role pool no longer stores per-user
+                // roles; the manual Settings bypass picks a single default agent
+                // from the hard-coded {Assistant, Artist} pool.
+                let default_role = [Role::Assistant, Role::Artist][self.add_user_default];
                 self.add_user_adding = true;
                 let sender = self.add_user_sender.text();
-                let permissions = if self.add_user_permissions.text().is_empty() {
-                    None
-                } else {
-                    Some(self.add_user_permissions.text())
-                };
                 Task::perform(
                     async move {
                         let store = users::user_store()?;
+                        // Reject a duplicate name here too: the Settings bypass has no
+                        // way to complete a leftover unbound row, so a duplicate would
+                        // silently no-op (INSERT OR IGNORE) while reporting success.
+                        if store
+                            .user_exists(&sender)
+                            .await
+                            .map_err(|e| e.to_string())?
+                        {
+                            return Err(format!("A user named '{sender}' already exists"));
+                        }
                         store
-                            .add_user(&sender, permissions.as_deref(), &roles)
+                            .add_user(&sender, None, default_role)
                             .await
                             .map_err(|e| e.to_string())?;
                         Ok(())
@@ -2210,7 +2204,7 @@ impl SettingsState {
                                 .align_y(Alignment::Center)
                             },
                             // Role column (FillPortion: 15) — active role
-                            // picker (pool-restricted) + pool editor button
+                            // picker (permission-derived pool)
                             {
                                 let role_picker: Element<'_, SettingsMessage> = match us
                                     .active_role_options
@@ -2226,14 +2220,9 @@ impl SettingsState {
                                             .cloned()
                                             .or_else(|| {
                                                 // No (or stale) stored selection —
-                                                // mirror resolve_active_role's default:
-                                                // Analyst when in the pool, else the
-                                                // first pool role.
-                                                options
-                                                    .iter()
-                                                    .find(|o| o.value == "analyst")
-                                                    .or_else(|| options.first())
-                                                    .cloned()
+                                                // mirror resolve_active_role's default
+                                                // (the first pool role).
+                                                options.first().cloned()
                                             });
                                         tooltip(
                                             pick_list(options.as_slice(), role_selected, |opt| {
@@ -2255,30 +2244,10 @@ impl SettingsState {
                                     }
                                     _ => text("none").size(12).color(theme::TEXT_MUTED).into(),
                                 };
-                                container(
-                                    row![
-                                        role_picker,
-                                        Space::new().width(4),
-                                        widgets::icon_tooltip_button(
-                                            lucide::pencil_line::<iced::Theme, iced::Renderer>()
-                                                .size(15)
-                                                .color(theme::TEXT_MUTED),
-                                            "Edit role pool",
-                                            Some(SettingsMessage::UserMsg(
-                                                users::UsersMessage::OpenPoolEdit(
-                                                    user.name.clone(),
-                                                ),
-                                            )),
-                                            2,
-                                            theme::button_text,
-                                            tooltip::Position::Top,
-                                        ),
-                                    ]
-                                    .align_y(Alignment::Center),
-                                )
-                                .width(Length::FillPortion(15))
-                                .align_x(Alignment::Start)
-                                .align_y(Alignment::Center)
+                                container(role_picker)
+                                    .width(Length::FillPortion(15))
+                                    .align_x(Alignment::Start)
+                                    .align_y(Alignment::Center)
                             },
                             // Actions column (FillPortion: 12) — switch icon
                             container({
@@ -2467,13 +2436,6 @@ impl SettingsState {
                 SettingsMessage::UserMsg(users::UsersMessage::CancelDelete),
                 0.5,
             )
-        } else if let Some(ref pool_user) = self.users_state.pool_edit_target {
-            let dialog = self.pool_edit_dialog(pool_user);
-            widgets::modal_backdrop(
-                dialog,
-                SettingsMessage::UserMsg(users::UsersMessage::ClosePoolEdit),
-                0.5,
-            )
         } else if let Some(ref diag_ws_name) = self.workspaces_state.diagnostics_modal {
             let dialog = self.diagnostics_dialog(diag_ws_name);
             widgets::modal_backdrop(
@@ -2490,9 +2452,9 @@ impl SettingsState {
     /// Build the user-deletion confirmation modal.
     ///
     /// The text truthfully states what [`users::UserStore::delete_user`]
-    /// does — removes the user row, their roles, and all channel bindings
-    /// (access cut immediately) — and what it preserves (sessions, chat
-    /// history, userspace files).
+    /// does — removes the user row and all channel bindings (access cut
+    /// immediately) — and what it preserves (sessions, chat history,
+    /// userspace files).
     fn user_delete_dialog(user_name: &str) -> Element<'_, SettingsMessage> {
         container(
             column![
@@ -2502,7 +2464,7 @@ impl SettingsState {
                     .font(theme::FONT_BOLD),
                 Space::new().height(12),
                 text(
-                    "This permanently removes the user, their roles, and all \
+                    "This permanently removes the user and all their \
                      channel bindings (including Telegram) — their access is \
                      cut immediately. Their sessions, chat history, and \
                      userspace files are preserved.",
@@ -2530,33 +2492,6 @@ impl SettingsState {
         .padding(24)
         .style(theme::dialog_container_style)
         .into()
-    }
-
-    /// Build the role-pool editor modal for a user.
-    fn pool_edit_dialog(&self, user_name: &str) -> Element<'_, SettingsMessage> {
-        let checked = &self.users_state.pool_edit_checked;
-        modal_dialog(
-            format!("Edit roles — {user_name}"),
-            &[],
-            Some(
-                column![
-                    text("Unchecking every role stops agent answers until a role is assigned.")
-                        .size(12)
-                        .color(theme::TEXT_MUTED),
-                    Space::new().height(8),
-                    role_checkbox_row(
-                        |i| checked.get(i).copied().unwrap_or(false),
-                        move |i| SettingsMessage::UserMsg(users::UsersMessage::TogglePoolRole(i)),
-                    ),
-                ]
-                .into(),
-            ),
-            "Save",
-            false,
-            true,
-            SettingsMessage::UserMsg(users::UsersMessage::ClosePoolEdit),
-            SettingsMessage::UserMsg(users::UsersMessage::SubmitPoolEdit(user_name.to_string())),
-        )
     }
 
     /// Build the add-workspace modal dialog content.
@@ -2591,41 +2526,35 @@ impl SettingsState {
 
     /// Build the add-user modal dialog content.
     fn add_user_dialog(&self) -> Element<'_, SettingsMessage> {
-        let any_role_checked = self.add_user_roles.iter().any(|c| *c);
         modal_dialog(
             "Add User".to_string(),
-            &[
-                DialogField {
-                    label: "Name",
-                    placeholder: "user name",
-                    value: &self.add_user_sender.buffer,
-                    id: "add_user_sender",
-                    on_input: SettingsMessage::AddUserSender,
-                },
-                DialogField {
-                    label: "Permissions",
-                    placeholder: "optional",
-                    value: &self.add_user_permissions.buffer,
-                    id: "add_user_permissions",
-                    on_input: SettingsMessage::AddUserPermissions,
-                },
-            ],
+            &[DialogField {
+                label: "Name",
+                placeholder: "user name",
+                value: &self.add_user_sender.buffer,
+                id: "add_user_sender",
+                on_input: SettingsMessage::AddUserSender,
+            }],
             Some(
                 column![
-                    text("Allowed roles (at least one required)")
-                        .size(12)
-                        .color(theme::TEXT_MUTED),
-                    role_checkbox_row(
-                        |i| self.add_user_roles.get(i).copied().unwrap_or(false),
-                        SettingsMessage::AddUserRoleToggle,
-                    ),
+                    text("Default agent").size(12).color(theme::TEXT_MUTED),
+                    pick_list(
+                        vec![Role::Assistant, Role::Artist],
+                        Some([Role::Assistant, Role::Artist][self.add_user_default]),
+                        |r| match r {
+                            Role::Artist => SettingsMessage::AddUserDefaultRole(1),
+                            _ => SettingsMessage::AddUserDefaultRole(0),
+                        },
+                    )
+                    .style(super::widgets::pick_list_style)
+                    .padding([4, 8]),
                     Space::new().height(8),
                 ]
                 .into(),
             ),
             "Add",
             self.add_user_adding,
-            !self.add_user_sender.text().is_empty() && any_role_checked,
+            !self.add_user_sender.text().is_empty(),
             SettingsMessage::ToggleAddUserModal,
             SettingsMessage::SubmitAddUser,
         )
@@ -2890,7 +2819,7 @@ impl SettingsState {
             "Manager",
             crate::config::DEFAULT_MANAGER_MODEL,
             CONFIG_KEY_MANAGER_MODEL,
-            Some("Manager, Assistant, Discovery, Engineer"),
+            Some("Manager, Assistant, Discovery, Engineer, Support"),
         );
         let worker_row = self.config_text_field(
             "Worker",
@@ -3651,25 +3580,6 @@ fn field_row_with_error<'a>(
     } else {
         row_elem
     }
-}
-
-/// Role-pool checkbox row shared by the add-user and pool-edit modals.
-/// Only the row itself — surrounding spacing belongs to each dialog's middle.
-fn role_checkbox_row<'a>(
-    checked: impl Fn(usize) -> bool + Copy + 'a,
-    on_toggle: impl Fn(usize) -> SettingsMessage + Copy + 'a,
-) -> Element<'a, SettingsMessage> {
-    let role_checks: Vec<Element<'a, SettingsMessage>> = Role::iter()
-        .enumerate()
-        .map(|(i, role)| {
-            let label = crate::agent::role::role_info(&role).display_label;
-            Checkbox::new(checked(i))
-                .label(label)
-                .on_toggle(move |_| on_toggle(i))
-                .into()
-        })
-        .collect();
-    Row::with_children(role_checks).spacing(6).wrap().into()
 }
 
 /// Delete confirmation prompt — the inline "Delete? Yes / No" row shown

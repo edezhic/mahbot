@@ -1416,6 +1416,7 @@ fn role_icon_glyph(role: crate::Role) -> char {
         crate::Role::Maintainer => iced_fonts::lucide::advanced_text::cog,
         crate::Role::Sanitation => iced_fonts::lucide::advanced_text::spray_can,
         crate::Role::Assistant => iced_fonts::lucide::advanced_text::message_square,
+        crate::Role::Support => iced_fonts::lucide::advanced_text::life_buoy,
     };
     lucide_glyph(glyph)
 }
@@ -1630,6 +1631,7 @@ mod tests {
             (crate::Role::Maintainer, '\u{E30B}'),
             (crate::Role::Sanitation, '\u{E49A}'),
             (crate::Role::Assistant, '\u{E11B}'),
+            (crate::Role::Support, '\u{E107}'),
         ];
         for (role, codepoint) in expected {
             assert_eq!(role_icon_glyph(role), codepoint, "role {role:?}");

@@ -25,6 +25,7 @@ pub mod git;
 pub mod gui;
 pub mod jobs;
 pub mod logs;
+pub(crate) mod onboarding;
 pub(crate) mod onnx;
 pub mod pipeline;
 pub(crate) mod prompt;
@@ -548,6 +549,10 @@ pub enum ChatEvent {
         /// Optional ID the GUI sender generated (via `ChannelMessage::optimistic_id`) so
         /// the Home page can replace its optimistic message with the confirmed one.
         optimistic_id: Option<String>,
+        /// True when this event is intended for live GUI display only and is
+        /// deliberately NOT persisted to chat_history (e.g. the Phase-1
+        /// scripted onboarding exchange). Default false for all persisted paths.
+        transient: bool,
     },
     /// Typing indicator event.
     Typing {
@@ -678,6 +683,7 @@ pub enum Role {
     Maintainer,
     Sanitation,
     Assistant,
+    Support,
 }
 
 // ── Agent ───────────────────────────────────────────────────────

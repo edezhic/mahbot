@@ -17,6 +17,7 @@ pub(crate) mod research;
 pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod shell;
+pub(crate) mod support;
 pub(crate) mod ticket;
 pub(crate) mod video_edit;
 pub(crate) mod video_gen;
@@ -164,6 +165,10 @@ pub(crate) use research::ResearchTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
 pub(crate) use shell::{ShellMode, ShellTool};
+pub(crate) use support::{
+    AddUserTool, AddWorkspaceTool, BindTelegramTool, FinalizeTool, InstallChromeUseTool,
+    SetupTelegramBotTool, SetupWebSearchTool,
+};
 pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };
@@ -193,7 +198,10 @@ use crate::util::json::{
 /// they may still use it internally as a building block (e.g.,
 /// BrowserTool's `action_schema` calls it for each inner entry).
 #[must_use]
-fn tool_params_schema(properties: &serde_json::Value, required: &[&str]) -> serde_json::Value {
+pub(crate) fn tool_params_schema(
+    properties: &serde_json::Value,
+    required: &[&str],
+) -> serde_json::Value {
     let mut schema = serde_json::json!({
         "type": "object",
         "properties": properties,

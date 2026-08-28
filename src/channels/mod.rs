@@ -59,6 +59,7 @@ impl BroadcastPersistEntry {
             &self.workspace,
             self.optimistic_id.clone(),
             &timestamp,
+            false,
         );
 
         let store = crate::channels::chat_history::store();
@@ -116,6 +117,10 @@ pub(crate) async fn broadcast_and_persist_agent_response(
 /// responses, and any future message types.  The caller is responsible
 /// for generating a stable [`message_id`] and [`timestamp`] if they need
 /// to correlate the broadcast event with a persist operation.
+///
+/// `transient` marks an event destined for live GUI display only: it is
+/// never persisted to chat_history (e.g. the Phase-1 scripted onboarding
+/// exchange). Pass `false` for every persisted path.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn broadcast_chat_event(
     message_id: &str,
@@ -127,6 +132,7 @@ pub(crate) fn broadcast_chat_event(
     workspace: &str,
     optimistic_id: Option<String>,
     timestamp: &str,
+    transient: bool,
 ) {
     use crate::ChatEvent;
 
@@ -141,8 +147,38 @@ pub(crate) fn broadcast_chat_event(
             agent_role,
             workspace: workspace.to_string(),
             optimistic_id,
+            transient,
         });
     }
+}
+
+/// Broadcast a transient (non-persisted) chat event for the GUI. Used by the
+/// Phase-1 scripted onboarding scenario; the event is shown live but never
+/// written to chat_history.
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn broadcast_transient_event(
+    message_id: &str,
+    user_name: &str,
+    content: &str,
+    direction: ChatDirection,
+    channel: &str,
+    agent_role: Option<String>,
+    workspace: &str,
+    optimistic_id: Option<String>,
+    timestamp: &str,
+) {
+    broadcast_chat_event(
+        message_id,
+        user_name,
+        content,
+        direction,
+        channel,
+        agent_role,
+        workspace,
+        optimistic_id,
+        timestamp,
+        true,
+    );
 }
 
 /// Broadcast an incoming user message to the GUI and persist it to chat_history,
@@ -174,6 +210,7 @@ pub async fn broadcast_and_persist_incoming_message(
         &msg.workspace,
         msg.optimistic_id.clone(),
         &timestamp,
+        false,
     );
 
     tokio::join!(

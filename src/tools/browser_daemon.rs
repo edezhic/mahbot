@@ -363,10 +363,16 @@ impl std::fmt::Display for CliProbeFailure {
     }
 }
 
+/// The chrome-use curl|sh install URL — single source of truth, shared by the
+/// not-found install hint and the Support `install_chrome_use` tool.
+pub(crate) const CHROME_USE_INSTALL_URL: &str =
+    "https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh";
+
 /// Install hint for the definitive not-found case — shared by every
-/// user-facing message that names the chrome-use CLI as missing.
-pub(crate) const CHROME_USE_INSTALL_HINT: &str = "Install with: curl -fsSL \
-     https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh";
+/// user-facing message that names the chrome-use CLI as missing. Derived from
+/// [`CHROME_USE_INSTALL_URL`] so the URL has a single source of truth.
+pub(crate) static CHROME_USE_INSTALL_HINT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("Install with: curl -fsSL {CHROME_USE_INSTALL_URL} | sh"));
 
 /// Resolved absolute path of the chrome-use binary (PATH first, then common
 /// install locations), cached after the first probe. Re-resolves only when

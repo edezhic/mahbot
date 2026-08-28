@@ -1,8 +1,6 @@
 Run a read-only SQL query against mahbot's live databases and receive the result as pipe-delimited text. This runs in-process against the daemon's own connections — it does NOT spawn a subprocess and does NOT open a second instance of any store.
 
-Parameters:
-- `query` (required): the read-only SQL statement. Only a single statement is supported — multi-statement queries (e.g. two `SELECT`s separated by `;`) are rejected by the engine.
-- `db` (optional): the target database — one of the logical domain store names, `core` (the consolidated store, the default), or `logs`. The accepted values are listed in the tool schema (derived from the runtime validator, so they can't drift).
+Pass the read-only `query` and, optionally, a `db` selector naming the target database — the consolidated `core` store by default, or `logs`. The accepted `db` values are listed in the tool schema (derived from the runtime validator, so they can't drift). Only a single statement is supported: multi-statement queries (e.g. two `SELECT`s separated by `;`) are rejected by the engine.
 
 Read-only guarantee:
 - Mutating statements are rejected before execution: `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `REPLACE`, `BEGIN`, `COMMIT`, `ROLLBACK`, `VACUUM`, `REINDEX`, `GRANT`, `REVOKE`, `ATTACH`, `DETACH`, `ANALYZE`, and any PRAGMA not on the read-only allowlist.

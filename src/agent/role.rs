@@ -161,6 +161,12 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
             default_reasoning_effort: "xhigh",
             display_label: "Assistant",
         },
+        Role::Support => &RoleInfo {
+            has_discovery: false,
+            badge_fg: (0.463, 0.647, 0.843),
+            default_reasoning_effort: "high",
+            display_label: "Support",
+        },
     }
 }
 
@@ -255,11 +261,12 @@ use crate::Tool;
 use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
-    AddAlarmTool, AddCommentTool, AnalyzeTool, BrowserTool, CreateTicketTool, DispatchMode,
-    EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool, ListTicketsTool,
+    AddAlarmTool, AddCommentTool, AddUserTool, AddWorkspaceTool, AnalyzeTool, BindTelegramTool,
+    BrowserTool, CreateTicketTool, DispatchMode, EditTool, FinalizeTool, GetTicketTool,
+    ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool, ListTicketsTool,
     MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool, SearchArchivedTicketsTool,
-    SearchTool, ShellMode, ShellTool, StrictReadTool, UpdateTicketTool, VideoEditTool,
-    VideoGenTool, WebSearchBackend, WebSearchTool,
+    SearchTool, SetupTelegramBotTool, SetupWebSearchTool, ShellMode, ShellTool, StrictReadTool,
+    UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -386,9 +393,21 @@ impl Role {
                 }
                 t
             }
+            Role::Support => {
+                vec![
+                    Box::new(MahbotDebugTool),
+                    Box::new(SetupTelegramBotTool),
+                    Box::new(BindTelegramTool),
+                    Box::new(AddWorkspaceTool),
+                    Box::new(AddUserTool),
+                    Box::new(SetupWebSearchTool),
+                    Box::new(InstallChromeUseTool),
+                    Box::new(FinalizeTool),
+                ]
+            }
         };
 
-        if !matches!(self, Role::Manager | Role::Sanitation) {
+        if !matches!(self, Role::Manager | Role::Sanitation | Role::Support) {
             Self::add_web_search_tool(&mut tools);
         }
 
@@ -539,16 +558,19 @@ mod tests {
     }
 
     #[test]
-    fn analyst_exposes_mahbot_debug_and_other_roles_do_not() {
-        // Acceptance pin for the in-process read-only SQL tool: only the Analyst
-        // advertises `mahbot_debug` — it must not appear for the Assistant (either
-        // base or full-access) or any other role.
+    fn analyst_and_support_expose_mahbot_debug_and_other_roles_do_not() {
+        // Acceptance pin for the in-process read-only SQL tool: only Analyst and
+        // Support advertise `mahbot_debug` — it must not appear for the
+        // Assistant (either base or full-access) or any other role.
         let ws = crate::workspace::test_ws("test");
-        let analyst = crate::Role::Analyst.tools(&ws, false);
-        assert!(
-            analyst.iter().any(|t| t.name() == "mahbot_debug"),
-            "Analyst toolset must contain `mahbot_debug`"
-        );
+        for role in [crate::Role::Analyst, crate::Role::Support] {
+            let tools = role.tools(&ws, false);
+            assert!(
+                tools.iter().any(|t| t.name() == "mahbot_debug"),
+                "{} toolset must contain `mahbot_debug`",
+                role.as_str()
+            );
+        }
         for (role, full_access) in [
             (crate::Role::Manager, false),
             (crate::Role::Engineer, false),

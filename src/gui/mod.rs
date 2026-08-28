@@ -309,7 +309,7 @@ pub enum Message {
     CloseDiffModal,
     /// Set the selected user's active role + pool for the role switcher
     /// indicator. Fetched together (single task, single pool read) to
-    /// avoid a double `user_roles` query.
+    /// avoid a double pool query.
     RoleAndPoolLoaded {
         role: Option<Role>,
         pool: Vec<Role>,
@@ -629,25 +629,20 @@ impl Dashboard {
                     std::convert::identity,
                 );
 
-                // Start on Settings while no LLM provider is configured. The
-                // decision must be made here, after the config is fully
-                // loaded (bootstrap_mahbot finished), not in the initial
-                // loading state where CONFIG still holds defaults. A trimmed
-                // non-empty key counts as set — `provider_key()` collapses
-                // empty/whitespace to None, so those re-arm this startup. An
-                // active custom endpoint counts as configured too
-                // — a keyless custom endpoint user must not be parked on
-                // Settings.
-                let settings_start = if !crate::config::provider_configured() {
-                    self.navigate_to(Page::Settings)
-                } else {
-                    Task::none()
-                };
+                // The Home chat now runs the Phase-1 scripted onboarding
+                // scenario while no LLM provider is configured (and fires the
+                // Phase-2 Support kickoff once a provider is set), so no boot
+                // redirect to Settings is needed here. The decision is made
+                // after the config is fully loaded (bootstrap_mahbot
+                // finished), not in the initial loading state where CONFIG
+                // still holds defaults. A trimmed non-empty key counts as set
+                // — `provider_key()` collapses empty/whitespace to None, so
+                // those re-arm the script; an active custom endpoint counts as
+                // configured too.
                 Task::batch([
                     refresh_logs.map(Message::Logs),
                     refresh_board.map(Message::Board),
                     boot_workspaces,
-                    settings_start,
                 ])
             }
             Err(e) => {
@@ -982,7 +977,7 @@ impl Dashboard {
         };
         let user = user.clone();
         // Single task, single pool read: resolve the role from the
-        // already-fetched pool instead of re-querying `user_roles`.
+        // already-fetched pool instead of re-querying it.
         Task::perform(
             async move {
                 let pool = crate::users::role_pool(&user).await;
@@ -1027,13 +1022,12 @@ impl Dashboard {
                 {
                     intercept_task = Some(self.select_workspace(ws));
                 }
-                // A pool edit or active-role change in Settings leaves the
+                // An active-role change in Settings leaves the
                 // Dashboard's cached role/pool stale (composer role dropdown
                 // guard and 'current' marker) — refresh them for the selected
                 // user. Workspace changes are handled by the UpdateWorkspace
                 // arm above and need no role/pool refresh.
-                users::UsersMessage::PoolEditResult(Ok(()))
-                | users::UsersMessage::RoleUpdateResult(Ok(())) => {
+                users::UsersMessage::RoleUpdateResult(Ok(())) => {
                     intercept_task = Some(self.refresh_selected_user_role_cache());
                 }
                 _ => {}

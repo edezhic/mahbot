@@ -70,6 +70,7 @@ fn telegram_role_emoji(role: Role) -> &'static str {
         Role::Maintainer => "⚙️",
         Role::Sanitation => "🧼",
         Role::Assistant => "💬",
+        Role::Support => "🛟",
     }
 }
 

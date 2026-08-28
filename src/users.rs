@@ -21,10 +21,9 @@ use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::db::{self, TxGuard};
 use crate::git::commands::run_git_output;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use strum::IntoEnumIterator;
 use tracing::warn;
 
 crate::define_store! {
@@ -66,28 +65,27 @@ impl UserStore {
             .query("SELECT 1 FROM users WHERE name = 'admin'", db::params![])
             .await?;
         if rows.is_empty() {
-            // Analyst first so add_user seeds the pre-pool default active
-            // role in the same transaction — no two-step reset with a
-            // Manager-default crash window on fresh installs.
-            let mut roles = vec![Role::Analyst];
-            roles.extend(Role::iter().filter(|r| *r != Role::Analyst));
-            self.add_user("admin", Some("full"), &roles).await?;
+            // Fresh admin: full permissions + selected_role=Support (the first
+            // onboarding-pool role).
+            self.add_user("admin", Some("full"), Role::Support).await?;
         }
         Ok(())
     }
 
     // ── User CRUD ─────────────────────────────────────────────
 
-    /// Create a new user with the given role pool. The active role is set to
-    /// the first pool role. Also creates their personal workspace directory
-    /// under `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on
-    /// failure). Idempotent — re-adding an existing user preserves their
-    /// stored preferences and adds the given roles to their pool.
+    /// Create a new user with the given active role. The user's role pool is
+    /// permission-derived (no `user_roles` rows) — `default_role` is the
+    /// persisted active role, only applied on a fresh insert. Also creates
+    /// their personal workspace directory under
+    /// `~/.mahbot/userspaces/<name>/` with `git init` (non-fatal on failure).
+    /// Idempotent — re-adding an existing user preserves their stored
+    /// preferences.
     pub async fn add_user(
         &self,
         name: &str,
         permissions: Option<&str>,
-        roles: &[Role],
+        default_role: Role,
     ) -> Result<()> {
         let inserted = self
             .conn
@@ -98,19 +96,10 @@ impl UserStore {
             )
             .await?;
         let tx = self.conn.begin_tx().await?;
-        for role in roles {
-            tx.execute(
-                "INSERT OR IGNORE INTO user_roles (user_name, role) VALUES (?1, ?2)",
-                db::params![name, role.as_str()],
-            )
-            .await?;
-        }
-        if inserted > 0
-            && let Some(first) = roles.first()
-        {
+        if inserted > 0 {
             tx.execute(
                 "UPDATE users SET selected_role = ?1 WHERE name = ?2",
-                db::params![first.as_str(), name],
+                db::params![default_role.as_str(), name],
             )
             .await?;
         }
@@ -122,74 +111,11 @@ impl UserStore {
         Ok(())
     }
 
-    /// Replace a user's role pool. The active role stays in the pool when
-    /// possible; a removed selection falls back to the first remaining role,
-    /// and an emptied pool clears the selection (no routing until reassigned).
-    pub async fn set_user_roles(&self, name: &str, roles: &[Role]) -> Result<()> {
-        let tx = self.conn.begin_tx().await?;
-        tx.execute(
-            "DELETE FROM user_roles WHERE user_name = ?1",
-            db::params![name],
-        )
-        .await?;
-        for role in roles {
-            tx.execute(
-                "INSERT INTO user_roles (user_name, role) VALUES (?1, ?2)",
-                db::params![name, role.as_str()],
-            )
-            .await?;
-        }
-        let selected: Option<String> = tx
-            .query_row(
-                "SELECT selected_role FROM users WHERE name = ?1",
-                db::params![name],
-                |row| row.get::<Option<String>>(0),
-            )
-            .await
-            .context("Failed to read selected_role while updating role pool")?;
-        match selected {
-            Some(cur) if roles.iter().any(|r| r.as_str() == cur) => {}
-            Some(_) => {
-                // Current selection was removed — fall back to the first
-                // remaining pool role (or clear when the pool is empty).
-                let fallback = roles.first().map(|r| r.as_str().to_string());
-                tx.execute(
-                    "UPDATE users SET selected_role = ?1 WHERE name = ?2",
-                    db::params![fallback, name],
-                )
-                .await?;
-            }
-            None => {}
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// List the roles in a user's pool, in canonical [`Role`] iteration order.
-    pub async fn get_user_roles(&self, user_name: &str) -> Result<Vec<Role>> {
-        let rows = self
-            .conn
-            .query_map_strict(
-                "SELECT role FROM user_roles WHERE user_name = ?1",
-                db::params![user_name],
-                |row| row.get::<String>(0),
-            )
-            .await?;
-        let parsed: Vec<Role> = rows.iter().filter_map(|s| s.parse::<Role>().ok()).collect();
-        Ok(Role::iter().filter(|r| parsed.contains(r)).collect())
-    }
-
-    /// Delete a user and all their child rows (channel bindings, role pool).
-    /// The role-pool rows must be removed explicitly — `user_roles` has a
-    /// NO-ACTION FK to `users`, so the parent DELETE would fail under
-    /// `PRAGMA foreign_keys = ON` otherwise.
+    /// Delete a user and all their child rows (channel bindings). The
+    /// permission-derived role pool carries no per-user rows, so there is
+    /// nothing else to remove.
     pub async fn delete_user(&self, name: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
-        tx.execute(
-            "DELETE FROM user_roles WHERE user_name = ?1",
-            db::params![name],
-        )
-        .await?;
         tx.execute(
             "DELETE FROM user_channels WHERE user_name = ?1",
             db::params![name],
@@ -229,6 +155,15 @@ impl UserStore {
     /// Get the permissions value for a user (NULL = restricted, "full" = admin).
     pub async fn get_permissions(&self, user_name: &str) -> Result<Option<String>> {
         self.user_column("permissions", user_name).await
+    }
+
+    /// Whether a user row with this name exists.
+    pub async fn user_exists(&self, name: &str) -> Result<bool> {
+        let rows = self
+            .conn
+            .query("SELECT 1 FROM users WHERE name = ?1", db::params![name])
+            .await?;
+        Ok(!rows.is_empty())
     }
 
     /// Find the first user whose channel binding for `channel` has a
@@ -351,10 +286,11 @@ impl UserStore {
     /// Convert a `users` table row into a [`UserRecord`], loading channel bindings.
     async fn user_record_from_row(&self, row: &db::Row) -> Result<UserRecord> {
         let name: String = row.get(COL_USERS_NAME)?;
-        let roles = self.get_user_roles(&name).await.unwrap_or_default();
+        let permissions = row.get::<Option<String>>(COL_USERS_PERMISSIONS)?;
+        let roles = role_pool_for_permissions(permissions.as_deref());
         Ok(UserRecord {
             name: name.clone(),
-            permissions: row.get::<Option<String>>(COL_USERS_PERMISSIONS)?,
+            permissions: permissions.clone(),
             selected_workspace: row.get::<Option<String>>(COL_USERS_SELECTED_WORKSPACE)?,
             selected_role: row.get::<Option<String>>(COL_USERS_SELECTED_ROLE)?,
             roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
@@ -484,10 +420,12 @@ pub struct UserRecord {
     pub permissions: Option<String>,
     /// Selected shared workspace name, NULL = personal workspace.
     pub selected_workspace: Option<String>,
-    /// Selected active role, NULL = pool-dependent default (Analyst when in
-    /// the pool, else the first pool role). Empty pool → no routing.
+    /// Selected active role, NULL = pool-dependent default (the first pool
+    /// role). Empty pool → no routing.
     pub selected_role: Option<String>,
-    /// The role pool — role names the user is allowed to use.
+    /// The role pool — the roles the user is allowed to use, derived from
+    /// their permissions (the permission-derived pool). No longer read from
+    /// a `user_roles` table.
     pub roles: Vec<String>,
     /// Channel bindings for this user (Telegram, etc.).
     pub channels: Vec<ChannelBinding>,
@@ -505,6 +443,18 @@ impl UserRecord {
 #[must_use]
 pub fn is_admin_permissions(permissions: Option<&str>) -> bool {
     permissions == Some("full")
+}
+
+/// The role pool for a permissions value, derived at read time (no `user_roles`
+/// table). Full-permissions (admin) users get the onboarding pool; all other
+/// users are limited to the personal assistant roles.
+#[must_use]
+pub fn role_pool_for_permissions(permissions: Option<&str>) -> Vec<Role> {
+    if is_admin_permissions(permissions) {
+        vec![Role::Support, Role::Assistant, Role::Manager, Role::Artist]
+    } else {
+        vec![Role::Assistant, Role::Artist]
+    }
 }
 
 /// A single channel binding for a user.
@@ -688,8 +638,8 @@ pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
 /// latter). The warning is logged here — a single warn site shared with
 /// [`role_pool`].
 pub async fn role_pool_status(user_name: &str) -> (Vec<Role>, bool) {
-    match store().get_user_roles(user_name).await {
-        Ok(pool) => (pool, false),
+    match store().get_permissions(user_name).await {
+        Ok(perms) => (role_pool_for_permissions(perms.as_deref()), false),
         Err(e) => {
             tracing::warn!(error = %e, user_name, "Failed to read role pool");
             (Vec::new(), true)
@@ -697,10 +647,10 @@ pub async fn role_pool_status(user_name: &str) -> (Vec<Role>, bool) {
     }
 }
 
-/// The role pool for a user — the roles they are allowed to use.
-/// Empty when the user has no roles assigned, or when the store read fails
-/// (fail closed with a warning — an operator log distinguishes a transient
-/// DB error from a genuinely empty pool).
+/// The role pool for a user — the roles they are allowed to use, derived from
+/// their permissions at read time. Empty when the store read fails (fail
+/// closed with a warning), which an operator log distinguishes from a
+/// legitimate admin-permission classification.
 pub async fn role_pool(user_name: &str) -> Vec<Role> {
     role_pool_status(user_name).await.0
 }
@@ -724,16 +674,16 @@ pub async fn switch_active_role(user_name: &str, role: Role) -> Result<()> {
 /// caller must not route messages to any agent.
 ///
 /// A stored selection is honoured when it is still in the pool; a selection
-/// outside the pool (e.g. after a pool edit) falls back to the first pool
-/// role. Without a stored selection, Analyst is used when available (the
-/// pre-pool default), otherwise the first pool role.
+/// outside the pool falls back to the first pool role. Without a stored
+/// selection, the first pool role is used (Support for a full-permissions
+/// admin, Assistant otherwise).
 pub async fn resolve_active_role(user_name: &str) -> Option<Role> {
     let pool = role_pool(user_name).await;
     resolve_active_role_from_pool(user_name, &pool).await
 }
 
 /// Resolve the active role from an already-fetched pool — avoids a second
-/// `user_roles` read when the caller needs the pool anyway (e.g. the
+/// pool read when the caller needs the pool anyway (e.g. the
 /// Telegram command menu). Fails closed on a `selected_role` read error
 /// (warn + no routing), matching the pool-read failure policy.
 pub async fn resolve_active_role_from_pool(user_name: &str, pool: &[Role]) -> Option<Role> {
@@ -753,26 +703,20 @@ pub async fn resolve_active_role_from_pool(user_name: &str, pool: &[Role]) -> Op
             .ok()
             .filter(|r| pool.contains(r))
             .or_else(|| pool.first().copied()),
-        None if pool.contains(&Role::Analyst) => Some(Role::Analyst),
         None => pool.first().copied(),
     }
 }
 
 /// The role that answers for a user in a workspace: personal workspaces do
 /// not support the Manager agent (no board pipeline), so Manager falls back
-/// to Analyst. The fallback stays inside the user's pool — when Analyst is
-/// not in the pool (e.g. a Manager-only pool), the Manager selection is kept
-/// (the active-role invariant — the routed role is always one of the pool
-/// roles — takes precedence over the pipeline fallback). Product note: this
-/// is a deliberate shift from the pre-pool rule (Manager→Analyst
-/// unconditionally on personal workspaces); an admin can restore the old
-/// fallback for a user by adding Analyst to their pool. Canonical home for
-/// the chat and voice routing paths.
+/// to Assistant. The fallback stays inside the user's pool — a Manager-only
+/// pool (not possible under the permission-derived pools) would keep the
+/// Manager selection. Canonical home for the chat and voice routing paths.
 #[must_use]
 fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
     if role == Role::Manager && is_personal_workspace(ws_name) {
-        if pool.contains(&Role::Analyst) {
-            Role::Analyst
+        if pool.contains(&Role::Assistant) {
+            Role::Assistant
         } else {
             role
         }
@@ -782,14 +726,14 @@ fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
 }
 
 /// Whether an agent role is pinned to the user's personal workspace:
-/// Assistant and Artist always work there regardless of the selected
-/// workspace. An empty `user_name` disables pinning — there is no personal
-/// identity to pin to, so callers with an unresolvable user must pass the
-/// real user explicitly (the voice admin fallback passes "admin").
+/// Assistant, Artist, and Support always work there regardless of the
+/// selected workspace. An empty `user_name` disables pinning — there is no
+/// personal identity to pin to, so callers with an unresolvable user must
+/// pass the real user explicitly (the voice admin fallback passes "admin").
 #[must_use]
 fn pins_to_personal(role: Role, ws_name: &str, user_name: &str) -> bool {
     !user_name.is_empty()
-        && (role == Role::Assistant || role == Role::Artist)
+        && (role == Role::Assistant || role == Role::Artist || role == Role::Support)
         && !is_personal_workspace(ws_name)
 }
 
@@ -818,8 +762,8 @@ pub(crate) fn effective_workspace_for_role(
 }
 
 /// Resolve the effective (role, workspace) pair atomically: apply
-/// `resolve_effective_role` (Manager→Analyst in personal workspaces) then
-/// pin Assistant/Artist to the user's personal workspace via
+/// `resolve_effective_role` (Manager→Assistant in personal workspaces) then
+/// pin Assistant/Artist/Support to the user's personal workspace via
 /// `effective_workspace_for_role`. The transformations act on disjoint role
 /// sets, but a single call keeps session identity and the pinned workspace
 /// consistent at every routing entry point.
@@ -838,9 +782,9 @@ pub fn effective_role_and_workspace(
 /// Resolve the (role, workspace) a user's messages route to and their
 /// session lives in — the same resolution as routing, so ClearChat and
 /// Telegram /clear always clear the actual recipient: the DB-selected
-/// workspace, the pool-clamped active role (Analyst fallback for an
-/// empty pool), the personal-workspace Manager→Analyst remap, and
-/// Assistant/Artist pinning.
+/// workspace, the pool-clamped active role (Assistant fallback for an
+/// empty pool), the personal-workspace Manager→Assistant remap, and
+/// Assistant/Artist/Support pinning.
 pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     let (ws, pool) = tokio::join!(
         resolve_workspace_for_user_name(user_name),
@@ -848,7 +792,7 @@ pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     );
     let role = resolve_active_role_from_pool(user_name, &pool)
         .await
-        .unwrap_or(Role::Analyst);
+        .unwrap_or(Role::Assistant);
     effective_role_and_workspace(role, ws, user_name, &pool)
 }
 
@@ -935,13 +879,12 @@ pub(crate) mod test_util {
         // bindings.  Both `add_user` (INSERT OR IGNORE) and `bind_channel`
         // (INSERT OR REPLACE) are idempotent.
         if let Some(store) = USER_STORE.get() {
-            let all_roles = Role::iter().collect::<Vec<_>>();
             store
-                .add_user("alice", Some("full"), &all_roles)
+                .add_user("alice", Some("full"), Role::Support)
                 .await
                 .expect("failed to add alice to test USER_STORE");
             store
-                .add_user("bob", None, &all_roles)
+                .add_user("bob", None, Role::Assistant)
                 .await
                 .expect("failed to add bob to test USER_STORE");
             store
@@ -960,25 +903,41 @@ pub(crate) mod test_util {
 mod tests {
     use super::*;
 
+    #[test]
+    fn role_pool_for_permissions_is_permission_derived() {
+        // Full-permissions (admin) → the onboarding pool; everyone else → the
+        // personal assistant roles. The default (first) role drives routing.
+        assert_eq!(
+            role_pool_for_permissions(Some("full")),
+            vec![Role::Support, Role::Assistant, Role::Manager, Role::Artist]
+        );
+        assert_eq!(
+            role_pool_for_permissions(None),
+            vec![Role::Assistant, Role::Artist]
+        );
+    }
+
     #[tokio::test]
     async fn role_pool_lifecycle() {
         crate::util::test::init_test_stores().await;
         let store = store();
 
-        // add_user seeds the active role from the first pool role.
+        // add_user persists the default active role; the pool is
+        // permission-derived (no user_roles rows).
         store
-            .add_user("pool_user", None, &[Role::Analyst, Role::Coder])
+            .add_user("pool_user", None, Role::Assistant)
             .await
             .unwrap();
-        assert_eq!(resolve_active_role("pool_user").await, Some(Role::Analyst));
-
-        // Removing the active role from the pool falls back to the first
-        // remaining role.
-        store
-            .set_user_roles("pool_user", &[Role::Coder])
-            .await
-            .unwrap();
-        assert_eq!(resolve_active_role("pool_user").await, Some(Role::Coder));
+        // A non-full user's permission-derived pool is always
+        // [Assistant, Artist]; the persisted default role resolves as active.
+        assert_eq!(
+            role_pool("pool_user").await,
+            vec![Role::Assistant, Role::Artist]
+        );
+        assert_eq!(
+            resolve_active_role("pool_user").await,
+            Some(Role::Assistant)
+        );
 
         // A selection outside the pool (defensive) falls back to the first
         // pool role instead of routing to an unallowed role.
@@ -991,30 +950,22 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resolve_active_role("pool_user").await, Some(Role::Coder));
-
-        // Emptying the pool stops routing.
-        store.set_user_roles("pool_user", &[]).await.unwrap();
-        assert_eq!(resolve_active_role("pool_user").await, None);
-
-        // Re-adding a role restores routing; an unset selection keeps the
-        // pre-pool Analyst default when it is in the pool.
-        store
-            .set_user_roles("pool_user", &[Role::Analyst])
-            .await
-            .unwrap();
-        assert_eq!(resolve_active_role("pool_user").await, Some(Role::Analyst));
+        assert_eq!(
+            resolve_active_role("pool_user").await,
+            Some(Role::Assistant)
+        );
     }
 
     #[tokio::test]
-    async fn delete_user_removes_role_pool_rows() {
+    async fn delete_user_removes_channel_rows() {
         crate::util::test::init_test_stores().await;
         let store = store();
 
-        // add_user grants the role rows; deleting them must not trip the
-        // NO-ACTION FK on user_roles.user_name.
+        // add_user creates the user; deleting it removes the channel bindings
+        // and the user row. There is no `user_roles` table anymore (the pool is
+        // permission-derived), so nothing else needs a cascade.
         store
-            .add_user("doomed", None, &[Role::Analyst, Role::Coder])
+            .add_user("doomed", None, Role::Assistant)
             .await
             .unwrap();
         store.delete_user("doomed").await.unwrap();
@@ -1022,25 +973,26 @@ mod tests {
             store
                 .conn
                 .query(
-                    "SELECT 1 FROM user_roles WHERE user_name = 'doomed'",
+                    "SELECT 1 FROM user_channels WHERE user_name = 'doomed'",
                     crate::db::params![],
                 )
                 .await
                 .unwrap()
                 .is_empty(),
-            "user_roles rows must be deleted with the user"
+            "user_channels rows must be deleted with the user"
         );
-        assert_eq!(
-            store.get_user_roles("doomed").await.unwrap(),
-            Vec::<Role>::new()
+        assert!(
+            store.find_by_name("doomed").await.unwrap().is_none(),
+            "the user row must be deleted"
         );
     }
 
     #[test]
-    fn pinning_helpers_pin_assistant_artist_to_personal() {
-        // Assistant/Artist + non-personal workspace + non-empty user pin.
+    fn pinning_helpers_pin_assistant_artist_support_to_personal() {
+        // Assistant/Artist/Support + non-personal workspace + non-empty user pin.
         assert!(pins_to_personal(Role::Assistant, "ws1", "alice"));
         assert!(pins_to_personal(Role::Artist, "ws1", "alice"));
+        assert!(pins_to_personal(Role::Support, "ws1", "alice"));
         // Already personal, other roles, and empty user_name never pin.
         assert!(!pins_to_personal(
             Role::Assistant,
@@ -1067,9 +1019,22 @@ mod tests {
         let already = effective_workspace_for_role(Role::Artist, personal.clone(), "alice");
         assert_eq!(already.name, "personal:alice");
 
-        // Atomic composition: Manager→Analyst remap in personal workspaces and
-        // Assistant/Artist pinning resolve in one call.
+        // Atomic composition: Manager→Assistant remap in personal workspaces and
+        // Assistant/Artist/Support pinning resolve in one call. A pool that
+        // contains Assistant remaps Manager; without Assistant the Manager
+        // selection is kept (the active-role invariant).
         let (role, ws) = effective_role_and_workspace(
+            Role::Manager,
+            Workspace {
+                name: "personal:alice".to_string(),
+                ..Default::default()
+            },
+            "alice",
+            &[Role::Assistant],
+        );
+        assert_eq!(role, Role::Assistant);
+        assert_eq!(ws.name, "personal:alice");
+        let (role, _ws) = effective_role_and_workspace(
             Role::Manager,
             Workspace {
                 name: "personal:alice".to_string(),
@@ -1078,8 +1043,7 @@ mod tests {
             "alice",
             &[Role::Analyst],
         );
-        assert_eq!(role, Role::Analyst);
-        assert_eq!(ws.name, "personal:alice");
+        assert_eq!(role, Role::Manager);
     }
 
     #[tokio::test]
@@ -1088,11 +1052,7 @@ mod tests {
         let user = "home_clear_target";
         let store = store();
         store
-            .add_user(
-                user,
-                Some("full"),
-                &[Role::Manager, Role::Assistant, Role::Analyst],
-            )
+            .add_user(user, Some("full"), Role::Manager)
             .await
             .unwrap();
         crate::util::test::create_test_workspace(
@@ -1132,8 +1092,9 @@ mod tests {
         assert_eq!(role, Role::Assistant);
         assert_eq!(ws.name, "personal:home_clear_target");
 
-        // Manager active with no DB workspace → Manager clamps to
-        // Analyst@personal (the personal-workspace invariant).
+        // Manager active with no DB workspace → Manager remaps to
+        // Assistant@personal (the personal-workspace invariant; the pool
+        // contains Assistant).
         store
             .update_user(
                 user,
@@ -1144,7 +1105,7 @@ mod tests {
             .await
             .unwrap();
         let (role, ws) = resolve_session_target(user).await;
-        assert_eq!(role, Role::Analyst);
+        assert_eq!(role, Role::Assistant);
         assert_eq!(ws.name, "personal:home_clear_target");
     }
 }

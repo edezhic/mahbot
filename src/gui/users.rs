@@ -69,17 +69,6 @@ pub enum UsersMessage {
     /// Result of a bind/unbind operation.
     BindResult(Result<(), String>, String),
 
-    /// Open the role-pool editor for a user.
-    OpenPoolEdit(String),
-    /// Close the role-pool editor.
-    ClosePoolEdit,
-    /// Toggle a role checkbox in the pool editor (index into [`Role::iter`]).
-    TogglePoolRole(usize),
-    /// Save the edited role pool.
-    SubmitPoolEdit(String),
-    /// Result of saving a role pool.
-    PoolEditResult(Result<(), String>),
-
     /// Dismiss modals/panels (Escape key).
     Escape,
 
@@ -106,10 +95,6 @@ pub struct UsersState {
     pub(crate) bind_input: SingleLineEditorState,
     pub(crate) bind_error: Option<String>,
     pub(crate) binding: bool,
-
-    // Role-pool editor (modal, single-target)
-    pub(crate) pool_edit_target: Option<String>,
-    pub(crate) pool_edit_checked: Vec<bool>,
 }
 
 impl UsersState {
@@ -127,8 +112,6 @@ impl UsersState {
             bind_input: SingleLineEditorState::new(""),
             bind_error: None,
             binding: false,
-            pool_edit_target: None,
-            pool_edit_checked: Vec::new(),
         }
     }
 
@@ -243,8 +226,6 @@ impl UsersState {
                 self.bind_target = None;
                 self.bind_input.clear();
                 self.bind_error = None;
-                self.pool_edit_target = None;
-                self.pool_edit_checked.clear();
                 Task::none()
             }
             UsersMessage::DeleteResult(Ok(()), _deleted_user) => {
@@ -337,62 +318,6 @@ impl UsersState {
                 } else {
                     self.load_state.fail(format!("Failed to unbind: {e}"));
                 }
-                Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
-            }
-            UsersMessage::OpenPoolEdit(user_name) => {
-                // Seed the checkbox state from the user's current pool.
-                let checked = self.users.iter().find(|u| u.name == user_name).map_or_else(
-                    || Role::iter().map(|_| false).collect(),
-                    |u| {
-                        Role::iter()
-                            .map(|r| u.roles.iter().any(|name| name == r.as_str()))
-                            .collect()
-                    },
-                );
-                self.pool_edit_target = Some(user_name);
-                self.pool_edit_checked = checked;
-                // Also cancel any pending delete confirmation / bind input (mutual exclusion).
-                self.delete_target = None;
-                self.bind_target = None;
-                Task::none()
-            }
-            UsersMessage::ClosePoolEdit => {
-                self.pool_edit_target = None;
-                self.pool_edit_checked.clear();
-                Task::none()
-            }
-            UsersMessage::TogglePoolRole(idx) => {
-                if let Some(checked) = self.pool_edit_checked.get_mut(idx) {
-                    *checked = !*checked;
-                }
-                Task::none()
-            }
-            UsersMessage::SubmitPoolEdit(user_name) => {
-                let roles: Vec<Role> = Role::iter()
-                    .zip(self.pool_edit_checked.iter())
-                    .filter(|(_, checked)| **checked)
-                    .map(|(r, _)| r)
-                    .collect();
-                let Some(store) = crate::users::USER_STORE.get() else {
-                    return Task::none();
-                };
-                let name = user_name.clone();
-                Task::perform(
-                    async move {
-                        store
-                            .set_user_roles(&name, &roles)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    UsersMessage::PoolEditResult,
-                )
-            }
-            UsersMessage::PoolEditResult(Ok(())) => {
-                self.pool_edit_target = None;
-                self.pool_edit_checked.clear();
-                self.refresh()
-            }
-            UsersMessage::PoolEditResult(Err(e)) => {
                 Task::done(UsersMessage::Toast(super::ToastMessage::Error(e)))
             }
         }

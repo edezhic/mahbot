@@ -181,6 +181,7 @@ pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme,
         crate::Role::Reviewer => lucide::file_check(),
         crate::Role::Sanitation => lucide::spray_can(),
         crate::Role::Assistant => lucide::message_square(),
+        crate::Role::Support => lucide::life_buoy(),
     }
 }
 

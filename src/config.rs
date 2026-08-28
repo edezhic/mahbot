@@ -236,7 +236,7 @@ pub struct ConfigData {
     /// self-hosted servers are keyless). Only ever sent to the custom endpoint,
     /// never to OpenRouter.
     pub provider_endpoint_key: Option<String>,
-    /// Model slot for the Manager group (Manager, Assistant, Discovery, Engineer).
+    /// Model slot for the Manager group (Manager, Assistant, Discovery, Engineer, Support).
     pub manager_model: Option<String>,
     /// Model slot for all worker roles (Artist, Analyst, Coder, QA,
     /// Reviewer, Maintainer, Sanitation).
@@ -290,6 +290,10 @@ pub struct ConfigData {
     /// JSON-serialized wake word enrollment (v2 schema: prototype + calibration)
     /// for the voice assistant.  Owned exclusively by the voice pipeline.
     pub wake_word_templates: Option<String>,
+    /// Onboarding state machine: "init" | "welcomed" | "finished".
+    /// Absent = Init (fresh install). Set by the onboarding flow and by the
+    /// user_roles-removal migration for existing installs.
+    pub onboarding_state: Option<String>,
     /// Per-model provider routing.
     pub model_routings: Vec<ModelRouting>,
 }
@@ -556,6 +560,7 @@ string_config_fields! {
     tts_enabled [non_empty],
     tts_language [or(DEFAULT_TTS_LANGUAGE)],
     wake_word_templates [non_empty],
+    onboarding_state [non_empty],
 }
 
 impl ConfigData {
@@ -835,6 +840,12 @@ impl ConfigReload {
         self.read().clone()
     }
 
+    /// The current onboarding state (derived from the `onboarding_state` field).
+    #[must_use]
+    pub fn onboarding_stage(&self) -> OnboardingState {
+        OnboardingState::from_raw(self.onboarding_state().as_deref())
+    }
+
     /// Update a single string config field in-memory.
     ///
     /// This is intentionally lightweight — it only mutates the in-memory
@@ -899,14 +910,14 @@ impl ConfigReload {
 
     /// Resolve the configured model for a role from the three model slots.
     ///
-    /// The manager group (Manager, Assistant, Discovery, Engineer) uses the
-    /// manager slot; every other role (Artist, Analyst, Coder, QA, Reviewer,
-    /// Maintainer, Sanitation) uses the worker slot. Unset slots fall back to
-    /// their code default.
+    /// The manager group (Manager, Assistant, Discovery, Engineer, Support)
+    /// uses the manager slot; every other role (Artist, Analyst, Coder, QA,
+    /// Reviewer, Maintainer, Sanitation) uses the worker slot. Unset slots
+    /// fall back to their code default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
         match role {
-            Role::Manager | Role::Assistant | Role::Discovery | Role::Engineer => {
+            Role::Manager | Role::Assistant | Role::Discovery | Role::Engineer | Role::Support => {
                 self.manager_model()
             }
             _ => self.worker_model(),
@@ -1408,6 +1419,37 @@ async fn write_kv_and_update_config(key: &str, trimmed: &str) -> Result<()> {
     Ok(())
 }
 
+/// The onboarding state machine's durable value (stored as a lowercase string
+/// in `config_kv` under `onboarding_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingState {
+    /// Fresh install, no provider configured yet / first-time onboarding.
+    Init,
+    /// "hi mah bot" has been auto-sent; the Support agent is active.
+    Welcomed,
+    /// The finalize tool was called; onboarding complete.
+    Finished,
+}
+
+impl OnboardingState {
+    #[must_use]
+    pub fn from_raw(s: Option<&str>) -> Self {
+        match s {
+            Some("welcomed") => Self::Welcomed,
+            Some("finished") => Self::Finished,
+            _ => Self::Init,
+        }
+    }
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::Welcomed => "welcomed",
+            Self::Finished => "finished",
+        }
+    }
+}
+
 /// Validate a [`ConfigData`] before persisting — rejecting common misconfigurations.
 ///
 /// # Precondition
@@ -1626,6 +1668,7 @@ mod tests {
             Role::Assistant,
             Role::Discovery,
             Role::Engineer,
+            Role::Support,
         ] {
             assert_eq!(reload.role_model(role), "manager-slot-model");
         }

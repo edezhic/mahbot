@@ -90,6 +90,9 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 # Config
 directories = "6.0"
 
+# System locale (surfaced into agent session context for locale-aware chat)
+sys-locale = "0.3"
+
 # Logging
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json"] }

@@ -467,8 +467,9 @@ pub fn init_listener() {
                     user_name,
                     agent_role: Some(ref role_name),
                     content,
+                    transient,
                     ..
-                }) if is_enabled() => {
+                }) if is_enabled() && !transient => {
                     if let Some(active_role) = crate::users::resolve_active_role(&user_name).await
                         && active_role.as_str() == role_name.as_str()
                     {
@@ -1648,8 +1649,6 @@ async fn wait_for_player(player: &Player, cancel_rx: Option<&mut broadcast::Rece
 mod tests {
     use super::*;
 
-    use strum::IntoEnumIterator;
-
     #[test]
     fn test_has_ending_punctuation() {
         let cases: &[(&str, &str, bool)] = &[
@@ -2257,21 +2256,22 @@ mod tests {
             agent_role: agent_role.map(String::from),
             workspace: "test".to_string(),
             optimistic_id: None,
+            transient: false,
         });
     }
 
     #[tokio::test]
     #[serial_test::serial(tts)]
     async fn test_init_listener_dispatches_speak() {
-        // Initialize test stores and give the broadcast user a role pool
-        // with Analyst active (matching the broadcast event below).
+        // Initialize test stores and give the broadcast user an Assistant
+        // active role (the permission-derived pool for a non-full user is
+        // [Assistant, Artist]; Assistant is what the listener matches below).
         crate::util::test::init_test_stores().await;
-        let all_roles = crate::Role::iter().collect::<Vec<_>>();
         crate::users::store()
-            .add_user("testuser", None, &all_roles)
+            .add_user("testuser", None, crate::Role::Assistant)
             .await
             .expect("add_user");
-        crate::users::switch_active_role("testuser", crate::Role::Analyst)
+        crate::users::switch_active_role("testuser", crate::Role::Assistant)
             .await
             .expect("switch_active_role");
 
@@ -2295,8 +2295,8 @@ mod tests {
         // Give the listener time to subscribe before we send
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Broadcast a matching event (Agent direction, gui channel, analyst role)
-        broadcast_test_event(crate::ChatDirection::Agent, "gui", Some("analyst"));
+        // Broadcast a matching event (Agent direction, gui channel, assistant role)
+        broadcast_test_event(crate::ChatDirection::Agent, "gui", Some("assistant"));
 
         // Wait for the listener to process (up to 500ms total)
         let mut spoke = false;
@@ -2337,7 +2337,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Broadcast the same matching event
-        broadcast_test_event(crate::ChatDirection::Agent, "gui", Some("analyst"));
+        broadcast_test_event(crate::ChatDirection::Agent, "gui", Some("assistant"));
 
         // Wait enough time for processing
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;

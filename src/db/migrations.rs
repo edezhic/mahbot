@@ -663,6 +663,14 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Sql(DELTA_CHAT_HISTORY_TIMESTAMP),
     },
+    // Onboarding: drop the user_roles table (role pools are permission-derived
+    // now) and seed onboarding_state=finished for existing (non-fresh)
+    // installs, gated by the users-non-empty probe.
+    Migration {
+        id: "19",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(drop_user_roles_and_seed_onboarding),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -830,6 +838,84 @@ async fn run_drop_jobs_paused_frozen(conn: &Connection) -> anyhow::Result<()> {
             .await
             .context("Failed to drop jobs.paused_frozen")?;
     }
+    Ok(())
+}
+
+fn drop_user_roles_and_seed_onboarding<'a>(
+    conn: &'a Connection,
+    _root: &'a Path,
+) -> BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(run_drop_user_roles_and_seed_onboarding(conn))
+}
+
+/// Idempotently drop `user_roles` and seed the onboarding state for existing
+/// (non-fresh) installs. Fresh-vs-existing discriminator: at this tail-
+/// migration body the `users` table is EMPTY on a fresh install (the admin is
+/// seeded by `ensure_admin_user` as a POST-OPEN hook, AFTER migrations) and
+/// NON-EMPTY on an existing install.
+async fn run_drop_user_roles_and_seed_onboarding(conn: &Connection) -> anyhow::Result<()> {
+    // Probe user count. Non-empty → existing install.
+    let user_count: i64 = conn
+        .query("SELECT COUNT(*) FROM users", ())
+        .await
+        .context("Failed to probe users count")?
+        .into_iter()
+        .next()
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0);
+
+    if user_count > 0 {
+        // Existing install: mark onboarding complete (one-time; fresh installs
+        // are left at the default Init with no write).
+        conn.execute(
+            "INSERT OR REPLACE INTO config_kv (key, value) VALUES (?1, ?2)",
+            params![
+                crate::config::CONFIG_KEY_ONBOARDING_STATE,
+                crate::config::OnboardingState::Finished.as_str(),
+            ],
+        )
+        .await
+        .context("Failed to set onboarding_state=finished")?;
+
+        // Normalize selected_role values so existing installs land deterministically
+        // on the safe in-pool default:
+        // - a NULL/empty selection (legacy row) is set to Assistant, rather than
+        //   letting read-time resolution fall to pool.first() (Support for a full
+        //   admin); an existing install is NOT in onboarding, so Assistant is the
+        //   correct safe landing.
+        // - an out-of-pool selection is rewritten to Assistant; in-pool roles are
+        //   preserved.
+        let rows = conn
+            .query("SELECT name, permissions, selected_role FROM users", ())
+            .await?;
+        for row in rows {
+            let name: String = row.get(0)?;
+            let permissions: Option<String> = row.get(1)?;
+            let selected_role: Option<String> = row.get(2)?;
+            let sel = selected_role.unwrap_or_default();
+            let needs_default = sel.is_empty() || {
+                let in_pool = if permissions.as_deref() == Some("full") {
+                    matches!(sel.as_str(), "support" | "assistant" | "manager" | "artist")
+                } else {
+                    matches!(sel.as_str(), "assistant" | "artist")
+                };
+                !in_pool
+            };
+            if needs_default {
+                conn.execute(
+                    "UPDATE users SET selected_role = 'assistant' WHERE name = ?1",
+                    params![name],
+                )
+                .await
+                .context("Failed to normalize selected_role")?;
+            }
+        }
+    }
+
+    // Drop the user_roles table (the pool is permission-derived now).
+    conn.execute("DROP TABLE IF EXISTS user_roles", ())
+        .await
+        .context("Failed to drop user_roles")?;
     Ok(())
 }
 
@@ -1253,7 +1339,6 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
             "editor_tabs",
             "users",
             "user_channels",
-            "user_roles",
             "config_kv",
             "config_model_routing",
             "chat_history",
@@ -1264,7 +1349,12 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
                 "missing {table}"
             );
         }
-        for table in ["config_role", "ticket_jobs", "ticket_stage_jobs"] {
+        for table in [
+            "config_role",
+            "ticket_jobs",
+            "ticket_stage_jobs",
+            "user_roles",
+        ] {
             assert!(
                 !crate::db::table_exists(&conn, table).await.unwrap(),
                 "{table} must be gone"
@@ -1306,12 +1396,108 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
             "13",
             "15",
             "16",
+            "19",
         ] {
             assert!(
                 applied_ids(&conn).await.contains(&id.to_string()),
                 "missing applied id {id}"
             );
         }
+    }
+
+    /// Migration 19's existing-install branch: once the `users` table is
+    /// non-empty (admin seeded by `ensure_admin_user` AFTER the catalog), the
+    /// body seeds `onboarding_state=finished`, reads a NULL/out-of-pool
+    /// `selected_role` as Assistant (preserving in-pool roles), and drops
+    /// `user_roles`.
+    #[tokio::test]
+    async fn migration_19_existing_install_seeds_finished_and_normalizes_roles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Open a fresh consolidated store: the catalog runs (users table present,
+        // user_roles dropped, onboarding_state untouched since users was empty).
+        let conn = crate::db::open_consolidated_store(tmp.path())
+            .await
+            .expect("fresh consolidated store");
+
+        // Simulate an existing install by inserting rows into `users`, then
+        // re-invoking migration 19's body (idempotent) — exactly what a real
+        // existing install's post-upgrade boot does.
+        conn.execute(
+            "INSERT INTO users (name, permissions, selected_role) VALUES ('admin', 'full', 'manager')",
+            (),
+        )
+        .await
+        .expect("seed full admin");
+        conn.execute(
+            "INSERT INTO users (name, permissions, selected_role) VALUES ('bob', NULL, 'analyst')",
+            (),
+        )
+        .await
+        .expect("seed non-full out-of-pool user");
+        conn.execute(
+            "INSERT INTO users (name, permissions, selected_role) VALUES ('carol', 'full', NULL)",
+            (),
+        )
+        .await
+        .expect("seed full admin with NULL selected_role");
+
+        run_drop_user_roles_and_seed_onboarding(&conn)
+            .await
+            .expect("re-run migration 19 body");
+
+        // Existing install → onboarding_state=finished.
+        let state: String = conn
+            .query(
+                &format!(
+                    "SELECT value FROM config_kv WHERE key = '{}'",
+                    crate::config::CONFIG_KEY_ONBOARDING_STATE,
+                ),
+                (),
+            )
+            .await
+            .expect("read onboarding_state")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get::<String>(0).ok())
+            .expect("onboarding_state row");
+        assert_eq!(state, crate::config::OnboardingState::Finished.as_str());
+
+        // In-pool role preserved (full admin at manager is in-pool).
+        let admin_sel: String = conn
+            .query("SELECT selected_role FROM users WHERE name = 'admin'", ())
+            .await
+            .expect("read admin role")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get::<String>(0).ok())
+            .expect("admin row");
+        assert_eq!(admin_sel, "manager");
+
+        // Out-of-pool role normalized to assistant (non-full user at analyst).
+        let bob_sel: String = conn
+            .query("SELECT selected_role FROM users WHERE name = 'bob'", ())
+            .await
+            .expect("read bob role")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get::<String>(0).ok())
+            .expect("bob row");
+        assert_eq!(bob_sel, "assistant");
+
+        // Legacy NULL selection lands on Assistant (not Support, which would be
+        // the read-time pool.first() fallback for a full admin).
+        let carol_sel: String = conn
+            .query("SELECT selected_role FROM users WHERE name = 'carol'", ())
+            .await
+            .expect("read carol role")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get::<String>(0).ok())
+            .expect("carol row");
+        assert_eq!(carol_sel, "assistant");
+
+        // user_roles dropped (DROP TABLE IF EXISTS is idempotent).
+        assert!(!crate::db::table_exists(&conn, "user_roles").await.unwrap());
     }
 
     /// A fresh logs store runs the catalog and gets the current logs shape
