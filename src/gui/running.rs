@@ -3,23 +3,23 @@
 //! DIRECT PARENT INVOCATION (ticket / analyze round / research run / workspace
 //! singleton / unattributable orchestrator calls).
 //!
-//! The view is a running-only window: it reads the in-memory registries
-//! ([`crate::agent::registry::AGENT_REGISTRY`] and
-//! [`crate::agent::registry::NON_AGENT_CALLS`]) at render time — no database
-//! reads, no schema changes, no new subscriptions, no history retained
-//! between ticks. The existing 1-second UI tick re-renders the page, so the
-//! view refreshes at that cadence for free.
+//! The view is read-only: at render time it reads the in-memory registries
+//! (`AGENT_REGISTRY` and `NON_AGENT_CALLS`) plus the live transcript snapshots
+//! (`TRANSCRIPT_REGISTRY`), so it reflects the live in-memory conversation
+//! including the unpersisted tail. No database reads, no schema changes, no
+//! new subscriptions, no history retained between ticks. The existing 1-second
+//! UI tick re-renders the page, so the view refreshes at that cadence for free.
 //!
 //! Truthfulness rules:
-//! - An agent not executing a tool (in an LLM call, between rounds) shows its
-//!   last COMPLETED tool instead of nothing — a fast tool no longer flashes
-//!   and vanishes (deliberate override of the strict absence-is-honest rule
-//!   for tools; the last-tool block is a historical marker, always labeled by
-//!   its tool name, so it cannot be mistaken for live activity).
-//! - An agent that is alive and working but has neither a current tool nor a
-//!   completed tool (the pre-first-tool LLM reasoning window, or a run that
-//!   never invokes a tool) shows a static "thinking…" indicator instead of a
-//!   blank activity slot — the card never appears empty while the agent lives.
+//! - The LIVE state line (top of each card) shows what is running right now:
+//!   the currently-executing tool(s) (expanded with their args) if any, else
+//!   the live activity phase label (a non-tool LLM call), else a static
+//!   "thinking…" indicator. The transcript cannot see an in-flight tool or a
+//!   non-tool LLM phase (those are only committed after execution / produce no
+//!   message respectively), so this is the only record of "what's running now".
+//! - Trace groups (below the LIVE line) are derived from the live transcript
+//!   snapshot: tool-call assistant rounds grouped by shared narration, bounded
+//!   by real user turns. Content-only final answers are omitted.
 //! - Parallel tool execution is represented honestly: every tool that
 //!   actually started executing appears as its own tool block; tools that never
 //!   execute (unknown tool, pre-flight cancellation) never show.
@@ -32,18 +32,25 @@
 //!   visibility of what the agent is doing.
 //!
 //! The page is DB-free by design: everything it shows is derived from the
-//! live in-memory registries, plus the dashboard's registered-workspace map
-//! (only for the "(external)" marker on unregistered/ephemeral workspace
-//! sections). All header labels (ticket titles, analyze/research questions)
-//! are captured observationally at spawn — never read from the DB.
+//! live in-memory registries and the live transcript snapshots, plus the
+//! dashboard's registered-workspace map (only for the "(external)" marker on
+//! unregistered/ephemeral workspace sections). All header labels (ticket
+//! titles, analyze/research questions) are captured observationally at spawn —
+//! never read from the DB.
 
-use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey};
+use std::collections::HashMap;
+use std::collections::HashSet;
+
+use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey, RunningTool};
 use crate::gui::theme;
 use crate::gui::widgets;
+use crate::session::{DecodedNativeHistoryMessage, decode_native_history_message};
+use crate::{ChatMessage, ChatRole};
 use chrono::{DateTime, Utc};
 
 use iced::widget::{
-    Column, Row, Space, button, column, container, row, scrollable, stack, text, tooltip,
+    Column, Row, Space, button, column, container, mouse_area, row, scrollable, stack, text,
+    tooltip,
 };
 use iced::{Alignment, Element, Length};
 
@@ -75,7 +82,6 @@ const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
 /// confirmation lives on the [`Dashboard`](super::Dashboard) so the dialog
 /// requires no per-run page state beyond the pending confirmation itself.
 #[derive(Debug, Clone)]
-#[expect(clippy::enum_variant_names)] // the Cancel* names are deliberate — one cancel flow, four stages
 pub(crate) enum RunningMessage {
     /// Cancel button pressed on a research-run group header. Carries the
     /// run's durable job id — NEVER rendered as text; the button action
@@ -88,6 +94,10 @@ pub(crate) enum RunningMessage {
     /// The async cancel finished: `Ok(())` = run stopped and removed
     /// permanently; `Err` = the durable sweep failed (surfaced as a toast).
     CancelFinished(Result<(), String>),
+    /// Toggle the expanded/collapsed state of a running-agent card. Keyed by
+    /// (agent_id, generation) so a recycled agent_id never inherits a stale
+    /// expansion.
+    ToggleAgentExpanded { agent_id: String, generation: u64 },
 }
 
 /// Render the live running-agents page.
@@ -95,13 +105,19 @@ pub(crate) enum RunningMessage {
 /// The page is observational — it reads the live in-memory registries and
 /// renders directly into the dashboard's [`Message`] type; its only
 /// self-emitted messages are the research-run manual-cancel flow
-/// ([`RunningMessage`]). `workspaces` is the dashboard's
-/// registered-workspace map (name → info) — used only to mark
+/// ([`RunningMessage`]) and the card expand/collapse toggle. `workspaces` is
+/// the dashboard's registered-workspace map (name → info) — used only to mark
 /// unregistered/ephemeral workspace sections with the "(external)" suffix.
 /// Everything else comes from the live in-memory registries.
+///
+/// `expanded` is the dashboard's set of expanded agent cards, keyed by
+/// (agent_id, generation). Stale keys are pruned by the dashboard's
+/// [`process_tick`](super::Dashboard::process_tick) against the freshly-listed
+/// agents; rendering here only reads the set.
 pub(crate) fn view(
-    workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
+    workspaces: &HashMap<String, WorkspaceInfo>,
     pending_cancel: Option<&str>,
+    expanded: &HashSet<(String, u64)>,
 ) -> Element<'static, Message> {
     let agents = crate::agent::registry::AGENT_REGISTRY.list();
     let calls = crate::agent::registry::NON_AGENT_CALLS.list();
@@ -121,7 +137,7 @@ pub(crate) fn view(
     } else {
         let mut content = Column::new().spacing(20);
         for section in &sections {
-            content = content.push(render_section(section));
+            content = content.push(render_section(section, expanded));
         }
         scrollable(container(content).width(Length::Fill).padding([0, 4]))
             .height(Length::Fill)
@@ -399,10 +415,13 @@ fn build_sections(
 ///
 /// The returned element owns all rendered content (text widgets take owned
 /// Strings), so its lifetime is independent of the `section` borrow.
-fn render_section(section: &WorkspaceSection) -> Element<'static, RunningMessage> {
+fn render_section(
+    section: &WorkspaceSection,
+    expanded: &HashSet<(String, u64)>,
+) -> Element<'static, RunningMessage> {
     let mut groups = Column::new().spacing(10);
     for group in &section.groups {
-        groups = groups.push(render_group(group));
+        groups = groups.push(render_group(group, expanded));
     }
     column![
         text(section.label.clone())
@@ -453,7 +472,10 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
 /// Render one group: header (title + secondary + run-lifetime marker) then
 /// the group panel holding its cards/rows. Cards are visually separated from
 /// the panel via the established card style.
-fn render_group(group: &DisplayGroup) -> Element<'static, RunningMessage> {
+fn render_group(
+    group: &DisplayGroup,
+    expanded: &HashSet<(String, u64)>,
+) -> Element<'static, RunningMessage> {
     let (title, secondary) = group_title(group);
     let mut header_parts: Vec<Element<'_, RunningMessage>> =
         vec![text(title).size(15).color(theme::ACCENT).into()];
@@ -479,7 +501,9 @@ fn render_group(group: &DisplayGroup) -> Element<'static, RunningMessage> {
     for item in &group.items {
         match item {
             DisplayItem::Agent(card) => {
-                items = items.push(render_agent_card(card));
+                let is_expanded =
+                    expanded.contains(&(card.handle.agent_id.clone(), card.handle.generation));
+                items = items.push(render_agent_card(card, is_expanded));
             }
             DisplayItem::Call(call) => {
                 items = items.push(render_call_row(call));
@@ -579,12 +603,16 @@ fn workspace_label_for(
     }
 }
 
-/// Render one compact running-agent card: role icon, elapsed time, and last
-/// tool. The role text label and the workspace name are gone — the role icon
-/// carries the role and the workspace section header carries the workspace.
-/// Cards use the established surface-card style so they read as distinct from
-/// the group panel.
-fn render_agent_card(card: &AgentCard) -> Element<'static, RunningMessage> {
+/// Render one running-agent card: role icon, LIVE state line, trace groups,
+/// and right-aligned metrics (live token count + elapsed time). The whole card
+/// is clickable to expand/collapse the trace groups.
+///
+/// Live state: the currently-executing tool(s) (expanded with their args) if
+/// any, else the live activity phase label, else a static "thinking…"
+/// placeholder. Trace groups are derived from the live transcript snapshot
+/// (the unpersisted tail included) — the current (latest) group in the
+/// collapsed card, plus up to 5 previous groups when expanded.
+fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, RunningMessage> {
     let h = &card.handle;
     // Color resolution via the canonical string helper (handles derivative
     // names and falls back to muted grey for unknown roles); the icon still
@@ -592,64 +620,253 @@ fn render_agent_card(card: &AgentCard) -> Element<'static, RunningMessage> {
     let (fg, _bg) = theme::role_badge_color(&h.role);
     let role: crate::Role = h.role.parse().unwrap_or(crate::Role::Engineer);
     let icon = theme::role_icon(&role).size(20).color(fg);
-
-    // Elapsed time in the brighter readable tone (~4:1 on the card
-    // background, versus the old ~2:1 muted tone).
     let elapsed = format_elapsed(h.started_at);
 
-    // Fill slot between the icon and the right-aligned metrics: running tools
-    // if any, else the live activity phase, else the LAST COMPLETED tool —
-    // a fast tool no longer flashes and vanishes — else a static "thinking…"
-    // placeholder for the tool-less pre-first-tool window. Each tool renders
-    // as its own block (bold white name + truncated key-value pairs) wrapped
-    // in a hover tooltip showing the full untruncated args; the activity label
-    // is plain accent text with no tooltip.
-    let mut fill = Column::new().spacing(4).align_x(Alignment::Start);
+    // Live state column: running tools (expanded), else activity phase, else
+    // "thinking…". The transcript cannot see an in-flight tool or a non-tool
+    // LLM phase, so this is the only record of "what's running now".
+    let mut live = Column::new().spacing(4).align_x(Alignment::Start);
     for tool in &h.current_tools {
-        fill = fill.push(render_tool_block(tool));
+        live = live.push(render_tool_block(tool));
     }
     if h.current_tools.is_empty() {
-        // Activity indicator — a non-tool LLM phase (verdict/summary
-        // extraction, media transcription) running inside this agent. The
-        // agent card is the single tracker for these calls (no separate call
-        // rows are ever created), so the label is what keeps an
-        // extracting/transcribing agent from looking idle.
         if let Some(activity) = &h.activity {
-            fill = fill.push(text(activity.clone()).size(11).color(theme::ACCENT));
-        } else if let Some(last) = &h.last_tool {
-            fill = fill.push(render_tool_block(last));
+            live = live.push(text(activity.clone()).size(11).color(theme::ACCENT));
         } else {
-            // Pre-first-tool / tool-less window: the agent is alive and
-            // working but has not yet completed a tool — show a small static
-            // "thinking…" indicator instead of leaving the slot blank.
-            fill = fill.push(render_thinking_indicator());
+            live = live.push(render_thinking_indicator());
         }
     }
 
-    // Single row: role icon on the left; the tool/activity/last-tool display
-    // fills the middle; the session length (when known) and elapsed time sit
-    // right-aligned.
-    let mut first_row = row![icon, fill.width(Length::Fill)]
+    let mut first_row = row![icon, live.width(Length::Fill)]
         .spacing(8)
         .align_y(Alignment::Center);
-    if let Some(len) = h.session_tokens {
+    // The live token count comes from the published transcript snapshot (the
+    // registry no longer carries a session_tokens mirror).
+    let snapshot = crate::session::TRANSCRIPT_REGISTRY.snapshot(&h.agent_id);
+    if let Some(token_count) = snapshot.as_ref().and_then(|s| s.token_count) {
         first_row = first_row.push(
-            text(theme::format_compact_tokens(len))
+            text(theme::format_compact_tokens(token_count))
                 .size(11)
                 .color(theme::TEXT_SECONDARY),
         );
     }
     first_row = first_row.push(text(elapsed).size(11).color(theme::TEXT_SECONDARY));
 
-    container(first_row)
-        .width(Length::Fill)
-        .padding(8)
-        .style(theme::surface_card_style)
-        .into()
+    let mut content = Column::new().spacing(6).align_x(Alignment::Start);
+    content = content.push(first_row);
+    // Trace groups from the live snapshot (current unless the agent has no
+    // transcript yet). Content-only assistant messages (final answers) are
+    // deliberately omitted — only tool-call assistant messages form groups.
+    if let Some(snapshot) = &snapshot {
+        let groups = derive_trace_groups(&snapshot.history);
+        if !groups.is_empty() {
+            for group in render_visible_groups(&groups, expanded) {
+                content = content.push(group);
+            }
+        }
+    }
+
+    let on_press = RunningMessage::ToggleAgentExpanded {
+        agent_id: h.agent_id.clone(),
+        generation: h.generation,
+    };
+    // The whole card is a click target (expand/collapse), but it stays a
+    // `container` under a transparent `mouse_area` so the inner tool blocks
+    // keep their hover tooltips (a `button` wrapper would swallow them).
+    mouse_area(
+        container(content)
+            .width(Length::Fill)
+            .padding(8)
+            .style(theme::surface_card_style),
+    )
+    .on_press(on_press)
+    .into()
+}
+
+/// Render the visible trace groups for a card: the current (latest) group
+/// always (last, chronologically), plus up to 5 previous groups when the card
+/// is expanded. Returns owned elements.
+fn render_visible_groups(
+    groups: &[TraceGroup],
+    expanded: bool,
+) -> Vec<Element<'static, RunningMessage>> {
+    let mut rendered = Vec::new();
+    let (current, previous) = groups
+        .split_last()
+        .expect("caller guarantees at least one group");
+    if expanded {
+        // The 5 most-recent previous groups, oldest first, then current.
+        for group in previous.iter().rev().take(5).rev() {
+            rendered.push(render_trace_group(group, false));
+        }
+    }
+    // Current group: newest round expanded, earlier rounds collapsed.
+    rendered.push(render_trace_group(current, true));
+    rendered
+}
+
+/// Render one trace group. `expand_current` renders the newest round's calls
+/// expanded (current group); otherwise every call collapses to a name-only
+/// line (previous groups).
+fn render_trace_group(
+    group: &TraceGroup,
+    expand_current: bool,
+) -> Element<'static, RunningMessage> {
+    let mut column = Column::new().spacing(4).align_x(Alignment::Start);
+    let label = if group.narration.is_empty() {
+        "thinking…".to_string()
+    } else {
+        group.narration.clone()
+    };
+    column = column.push(text(label).size(11).color(theme::TEXT_SECONDARY));
+
+    if expand_current {
+        let (newest, earlier) = group
+            .rounds
+            .split_last()
+            .expect("a trace group always carries at least one round");
+        if !earlier.is_empty() {
+            column = column.push(
+                text(collapsed_calls_line(earlier))
+                    .size(10)
+                    .color(theme::TEXT_SECONDARY),
+            );
+        }
+        for call in newest {
+            column = column.push(render_tool_block(call));
+        }
+    } else {
+        column = column.push(
+            text(collapsed_calls_line(&group.rounds))
+                .size(10)
+                .color(theme::TEXT_SECONDARY),
+        );
+    }
+    column.into()
+}
+
+/// Compose the collapsed name-only line for a set of tool-call rounds: tool
+/// names with underscores replaced by spaces, in first-appearance order, each
+/// unique name suffixed with `(xN)` when it appears more than once within the
+/// collapsed set (e.g. `read file (x2), list files`).
+fn collapsed_calls_line(rounds: &[Vec<RunningTool>]) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for round in rounds {
+        for call in round {
+            let name = call.name.replace('_', " ");
+            if !counts.contains_key(&name) {
+                order.push(name.clone());
+            }
+            *counts.entry(name).or_default() += 1;
+        }
+    }
+    order
+        .iter()
+        .map(|name| {
+            let c = counts[name];
+            if c > 1 {
+                format!("{name} (x{c})")
+            } else {
+                name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Prune stale expanded-state keys: an agent that finished (or was replaced by
+/// a new generation of the same agent_id) must not keep a stale expansion.
+pub(crate) fn prune_expanded(expanded: &mut HashSet<(String, u64)>, agents: &[AgentHandle]) {
+    let live: HashSet<(String, u64)> = agents
+        .iter()
+        .map(|h| (h.agent_id.clone(), h.generation))
+        .collect();
+    expanded.retain(|key| live.contains(key));
+}
+
+/// One trace group in a running agent's live transcript: a maximal run of
+/// consecutive tool-call assistant rounds sharing a single (possibly empty)
+/// visible narration, bounded by a real user turn or a new narration.
+///
+/// Derived only from the decoded assistant `content` (the short visible
+/// narration) and `tool_calls` — never from the long `reasoning`
+/// (`Reasoning` struct) block. A group always carries at least one round.
+struct TraceGroup {
+    /// The assistant's short visible narration (empty → rendered "thinking…").
+    /// This is the decoded assistant `content`, NEVER the long `Reasoning`
+    /// / `[thinking]` block.
+    narration: String,
+    /// Tool-call rounds in first-appearance order; the LAST round is the newest
+    /// (expanded in the current group), earlier rounds collapse.
+    rounds: Vec<Vec<RunningTool>>,
+}
+
+/// Derive the trace groups for a live transcript in chronological order.
+///
+/// Boundary rules (see the ticket):
+/// - A new (non-empty) narration in a tool-call assistant message starts a new
+///   group; that narration becomes the group's `narration`.
+/// - Consecutive tool-call rounds with no narration accumulate into the current
+///   group.
+/// - A REAL user turn (content NOT starting with the injected-image tag) closes
+///   the current group; the next tool-call round starts a fresh one even with
+///   no narration (its `narration` slots to "thinking…").
+/// - Synthetic tool-injected `[IMAGE:*]` user messages are part of the ongoing
+///   tool sequence and never reset the group.
+fn derive_trace_groups(history: &[ChatMessage]) -> Vec<TraceGroup> {
+    let mut groups: Vec<TraceGroup> = Vec::new();
+    let mut current: Option<TraceGroup> = None;
+    for msg in history {
+        match msg.role {
+            ChatRole::User => {
+                if !msg.content.starts_with(crate::util::INJECTED_IMAGE_TAG) {
+                    if let Some(group) = current.take() {
+                        groups.push(group);
+                    }
+                }
+            }
+            ChatRole::Assistant => {
+                let Some(DecodedNativeHistoryMessage::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                }) = decode_native_history_message(msg)
+                else {
+                    continue;
+                };
+                let Some(calls) = tool_calls else {
+                    continue;
+                };
+                if calls.is_empty() {
+                    continue;
+                }
+                let round: Vec<RunningTool> =
+                    calls.iter().map(RunningTool::from_tool_call).collect();
+                let narration = content.unwrap_or_default();
+                let new_group = !narration.is_empty() || current.is_none();
+                if new_group {
+                    if let Some(group) = current.take() {
+                        groups.push(group);
+                    }
+                }
+                let group = current.get_or_insert_with(|| TraceGroup {
+                    narration,
+                    rounds: Vec::new(),
+                });
+                group.rounds.push(round);
+            }
+            _ => {}
+        }
+    }
+    if let Some(group) = current.take() {
+        groups.push(group);
+    }
+    groups
 }
 
 /// Render the "thinking…" placeholder shown when an agent is alive and
-/// working but has neither a currently-executing tool nor a completed tool
+/// working but has no currently-executing tool and no live activity phase
 /// (the pre-first-tool LLM reasoning window). Static icon + text, styled to
 /// match the surrounding activity label (small accent).
 fn render_thinking_indicator() -> Element<'static, RunningMessage> {
@@ -820,10 +1037,9 @@ mod tests {
             parent_label: None,
             started_at: Utc::now(),
             label: role.to_string(),
+            generation: 0,
             current_tools: Vec::new(),
-            last_tool: None,
             activity: None,
-            session_tokens: None,
         }
     }
 
@@ -1264,5 +1480,141 @@ mod tests {
                 "no workspace name in group headers: {title}"
             );
         }
+    }
+
+    // ── Trace-group derivation ──────────────────────────────────────
+
+    fn assistant_tool_call(narration: &str, calls: &[(&str, serde_json::Value)]) -> ChatMessage {
+        let calls_json: Vec<serde_json::Value> = calls
+            .iter()
+            .map(|(name, args)| {
+                serde_json::json!({
+                    "id": "call_1",
+                    "name": name,
+                    "arguments": serde_json::to_string(args).unwrap_or_default(),
+                })
+            })
+            .collect();
+        let content = if narration.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(narration.to_string())
+        };
+        ChatMessage::assistant(
+            serde_json::json!({ "content": content, "tool_calls": calls_json }).to_string(),
+        )
+    }
+
+    #[test]
+    fn empty_and_non_tool_history_produce_no_groups() {
+        assert!(derive_trace_groups(&[]).is_empty());
+        // A content-only assistant message (final answer) is NOT a group.
+        let history = vec![
+            ChatMessage::user("hello\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
+            ChatMessage::assistant("Final answer here."),
+        ];
+        assert!(derive_trace_groups(&history).is_empty());
+    }
+
+    #[test]
+    fn narration_starts_and_boundary_groups() {
+        let history = vec![
+            assistant_tool_call(
+                "Reading the file",
+                &[("read", serde_json::json!({"path": "a.rs"}))],
+            ),
+            assistant_tool_call(
+                "Editing it",
+                &[("edit", serde_json::json!({"path": "b.rs"}))],
+            ),
+        ];
+        let groups = derive_trace_groups(&history);
+        assert_eq!(groups.len(), 2, "new narration starts a new group");
+        assert_eq!(groups[0].narration, "Reading the file");
+        assert_eq!(groups[1].narration, "Editing it");
+    }
+
+    #[test]
+    fn consecutive_no_narration_rounds_accumulate() {
+        let history = vec![
+            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
+            assistant_tool_call("", &[("list", serde_json::json!({"path": "."}))]),
+        ];
+        let groups = derive_trace_groups(&history);
+        assert_eq!(groups.len(), 1, "no narration → same group");
+        assert_eq!(groups[0].rounds.len(), 2);
+        assert!(groups[0].narration.is_empty());
+    }
+
+    #[test]
+    fn real_user_turn_resets_group() {
+        let history = vec![
+            assistant_tool_call(
+                "Narration",
+                &[("read", serde_json::json!({"path": "a.rs"}))],
+            ),
+            ChatMessage::user("ok now fix it\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
+            assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
+        ];
+        let groups = derive_trace_groups(&history);
+        assert_eq!(groups.len(), 2, "user turn closes the group");
+        assert_eq!(groups[0].narration, "Narration");
+        // The post-reset empty-narration round starts a fresh group.
+        assert_eq!(groups[1].rounds.len(), 1);
+    }
+
+    #[test]
+    fn injected_image_user_message_does_not_reset_group() {
+        let history = vec![
+            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
+            ChatMessage::user(crate::util::injected_image_user_message(
+                "data:image/png;base64,xxx",
+            )),
+            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
+        ];
+        let groups = derive_trace_groups(&history);
+        assert_eq!(groups.len(), 1, "synthetic image stays in the same group");
+        assert_eq!(groups[0].rounds.len(), 2);
+    }
+
+    #[test]
+    fn collapsed_calls_line_counts_and_orders() {
+        let rounds = vec![
+            vec![
+                RunningTool::from_tool_call(&crate::ToolCall {
+                    id: "1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "a.rs"}),
+                }),
+                RunningTool::from_tool_call(&crate::ToolCall {
+                    id: "2".into(),
+                    name: "list_files".into(),
+                    arguments: serde_json::json!({"path": "."}),
+                }),
+            ],
+            vec![RunningTool::from_tool_call(&crate::ToolCall {
+                id: "3".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "b.rs"}),
+            })],
+        ];
+        assert_eq!(
+            collapsed_calls_line(&rounds),
+            "read file (x2), list files",
+            "underscores become spaces; (xN) counts collapsed repetitions; first-appearance order"
+        );
+    }
+
+    #[test]
+    fn prune_expanded_drops_stale_keys() {
+        let mut expanded: HashSet<(String, u64)> =
+            HashSet::from([("a".to_string(), 0), ("b".to_string(), 2)]);
+        let agents = vec![agent_handle("a", "analyst", None, "ws1", None)];
+        prune_expanded(&mut expanded, &agents);
+        assert_eq!(expanded.len(), 1);
+        assert!(
+            expanded.contains(&("a".to_string(), 0)),
+            "live agent keeps its expanded key"
+        );
     }
 }

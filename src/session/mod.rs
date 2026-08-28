@@ -1,11 +1,17 @@
 //! Session persistence — Turso-backed store + native history decoding.
+//!
+//! Also hosts the lock-free live transcript snapshot accessor
+//! ([`transcript`]) that the Running Agents GUI reads to show a running
+//! agent's in-memory conversation including the unpersisted tail.
 
 pub mod dead_session;
 pub(crate) mod image_strip;
 pub mod manager;
+pub(crate) mod transcript;
 pub(crate) use manager::FinalizeOutcome;
 pub(crate) use manager::RewriteOutcome;
 pub use manager::Session;
+pub(crate) use transcript::{TRANSCRIPT_REGISTRY, TranscriptSnapshot};
 
 use crate::db::{self, IntoParams, Row, TxGuard, Value, params};
 use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};

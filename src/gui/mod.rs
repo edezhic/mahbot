@@ -62,7 +62,7 @@ pub const JETBRAINS_MONO: iced::Font = iced::Font {
     style: iced::font::Style::Normal,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -548,6 +548,10 @@ pub struct Dashboard {
     /// page; the cancel runs only on [`running::RunningMessage::CancelConfirmed`].
     /// The id is never displayed as text — the button message carries it.
     pending_research_cancel: Option<String>,
+    /// Running Agents page expanded-card state, keyed by (agent_id, generation)
+    /// so a recycled agent_id never inherits a stale expansion. Pruned against
+    /// the live agent list on the Running Agents tick.
+    running_expanded: HashSet<(String, u64)>,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
     sessions_state: sessions::SessionsState,
@@ -590,6 +594,7 @@ impl Dashboard {
             draining: false,
             show_update_confirm: false,
             pending_research_cancel: None,
+            running_expanded: HashSet::new(),
             logs_state: logs::LogsState::new(),
             board_state: board::BoardState::new(),
             sessions_state: sessions::SessionsState::new(),
@@ -893,7 +898,16 @@ impl Dashboard {
             }
             Page::Settings => self.refresh_settings_lists(true),
             // Running Agents reads the live registries at render time — the
-            // 1-second tick re-render is its only refresh mechanism.
+            // 1-second tick re-render is its only refresh mechanism. The tick
+            // also prunes stale expanded-card keys (a finished agent, or a
+            // replacement generation of a recycled agent_id).
+            Page::RunningAgents => {
+                running::prune_expanded(
+                    &mut self.running_expanded,
+                    &crate::agent::registry::AGENT_REGISTRY.list(),
+                );
+                Task::none()
+            }
             _ => Task::none(),
         };
 
@@ -1085,6 +1099,20 @@ impl Dashboard {
                     Err(e) => ToastMessage::Error(format!("research cancel failed: {e}")),
                 };
                 self.toasts.push(Toast::from_toast_msg(&toast));
+                Task::none()
+            }
+            running::RunningMessage::ToggleAgentExpanded {
+                agent_id,
+                generation,
+            } => {
+                if self
+                    .running_expanded
+                    .contains(&(agent_id.clone(), generation))
+                {
+                    self.running_expanded.remove(&(agent_id, generation));
+                } else {
+                    self.running_expanded.insert((agent_id, generation));
+                }
                 Task::none()
             }
         }
@@ -1718,9 +1746,11 @@ impl Dashboard {
                 .settings_state
                 .view(self.selected_user_name.as_deref())
                 .map(Message::Settings),
-            Page::RunningAgents => {
-                running::view(&self.workspaces, self.pending_research_cancel.as_deref())
-            }
+            Page::RunningAgents => running::view(
+                &self.workspaces,
+                self.pending_research_cancel.as_deref(),
+                &self.running_expanded,
+            ),
         };
 
         let body = column![

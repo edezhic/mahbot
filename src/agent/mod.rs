@@ -389,10 +389,20 @@ impl Agent {
             pause_stop.clone(),
         );
 
+        // Register a fresh live-transcript snapshot holder for this agent run
+        // and attach it to the session, so the Running Agents GUI can read the
+        // in-memory conversation (including the unpersisted tail) at render
+        // time. A replacement run reusing the same agent_id gets a fresh holder
+        // (see the transcript registry's generation guard).
+        let mut session = Session::default();
+        session.attach_transcript(
+            crate::session::TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation),
+        );
+
         Self {
             agent_id,
             role,
-            session: Session::default(),
+            session,
             workspace: Arc::new(ws.clone()),
             tools,
             tool_specs,
@@ -422,6 +432,7 @@ impl Drop for Agent {
     fn drop(&mut self) {
         if self.generation > 0 {
             crate::agent::registry::AGENT_REGISTRY.deregister(&self.agent_id, self.generation);
+            crate::session::TRANSCRIPT_REGISTRY.deregister(&self.agent_id, self.generation);
         }
         // Teardown kill: the agent's background shell sessions must not
         // outlive it. Force-kill only (no grace), mirroring the existing
@@ -580,19 +591,6 @@ impl Agent {
                 self.round_ts.as_deref(),
             )
             .await?;
-
-        // Surface the persisted session length on the live card: the registry
-        // entry is created synchronously at `Agent::new` (no DB access there),
-        // so resumed sessions would otherwise show no length until the first
-        // successful LLM call of the turn. Purely observational — the page
-        // reads the registry, never the database.
-        if let Some(token_length) = self.session.token_length() {
-            crate::agent::registry::AGENT_REGISTRY.set_session_tokens(
-                &self.agent_id,
-                self.generation,
-                token_length,
-            );
-        }
 
         // Pre-maybe_summarize drain check: a fresh dispatch that starts during
         // the graceful drain (or a fired shutdown token) must not destructively
@@ -1378,11 +1376,6 @@ impl Agent {
                 "Failed to persist session token length — in-memory value may drift from the store until the next successful call"
             );
         }
-        crate::agent::registry::AGENT_REGISTRY.set_session_tokens(
-            &self.agent_id,
-            self.generation,
-            token_length,
-        );
     }
 
     /// Persist tool results to the session store and push them into the in-memory

@@ -14,8 +14,10 @@
 //!    (everything already durable) and is surfaced to the caller to log
 
 use std::fmt::Write;
+use std::sync::Arc;
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use futures_util::future::join_all;
 
 use crate::pipeline::board::BOARD;
@@ -25,6 +27,8 @@ use crate::workspace::truncate_workspace_notes;
 use crate::agent::skills;
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
 use crate::{ChatMessage, ChatRole, Role, Workspace};
+
+use super::TranscriptSnapshot;
 
 /// Coordinates session persistence and prompt building across a single
 /// agent turn.
@@ -45,6 +49,11 @@ pub struct Session {
     /// sessions that never recorded a value (new sessions, pre-migration
     /// sessions — approved no-backfill semantics).
     token_length: Option<u64>,
+    /// Shared lock-free holder this session publishes live transcript
+    /// snapshots into. `None` when the session is not attached to a running
+    /// agent (tests, detached sessions). Set by
+    /// [`attach_transcript`](Self::attach_transcript) from `Agent::new`.
+    transcript: Option<Arc<ArcSwap<TranscriptSnapshot>>>,
 }
 
 /// Outcome of a [`Session::finalize`] call.
@@ -205,7 +214,35 @@ impl Session {
         // so finalize only appends genuinely new assistant output.
         self.persisted_len = self.history.len();
 
+        // Publish the initial live snapshot so the Running Agents card reflects
+        // the loaded/unpersisted transcript and the persisted token length from
+        // the very start of the turn.
+        self.publish_transcript();
+
         Ok(())
+    }
+
+    // ── Live transcript snapshot ─────────────────────────────────────
+
+    /// Attach the shared lock-free holder this session publishes live
+    /// transcript snapshots into. Called by `Agent::new` after registering the
+    /// holder in the global accessor; must run before the first mutation.
+    pub(crate) fn attach_transcript(&mut self, holder: Arc<ArcSwap<TranscriptSnapshot>>) {
+        self.transcript = Some(holder);
+    }
+
+    /// Publish a fresh read-only snapshot of the current history + token count
+    /// into the holder. Copy-on-write: clones the history Vec (the one
+    /// per-publish cost) and stores the new snapshot. No-op when no holder is
+    /// attached (detached sessions / tests).
+    fn publish_transcript(&self) {
+        if let Some(holder) = &self.transcript {
+            let snapshot = TranscriptSnapshot {
+                history: Arc::new(self.history.clone()),
+                token_count: self.token_length,
+            };
+            holder.store(Arc::new(snapshot));
+        }
     }
 
     // ── History access (for agent loop) ────────────────────────────────
@@ -225,16 +262,18 @@ impl Session {
     }
 
     /// Update the in-memory session length after a successful agent LLM call.
-    /// The durable store write and the observational registry mirror are the
-    /// caller's responsibility ([`crate::Agent::record_session_usage`]).
+    /// The durable store write is the caller's responsibility
+    /// ([`crate::Agent::record_session_usage`]).
     pub(crate) fn set_token_length(&mut self, token_length: Option<u64>) {
         self.token_length = token_length;
+        self.publish_transcript();
     }
 
     /// Append an assistant message (final response or intermediate tool-call).
     /// Operates on in-memory history only, not the session store.
     pub(crate) fn push_assistant(&mut self, content: String) {
         self.history.push(ChatMessage::assistant(content));
+        self.publish_transcript();
     }
 
     /// Persist any unpersisted history tail plus `messages` in one
@@ -260,6 +299,7 @@ impl Session {
             .await?;
         self.persisted_len += batch.len();
         self.history.extend_from_slice(messages);
+        self.publish_transcript();
         Ok(())
     }
 
@@ -268,6 +308,7 @@ impl Session {
     /// successful persist flushes them in order.
     pub(crate) fn push_messages_unpersisted(&mut self, messages: &[ChatMessage]) {
         self.history.extend_from_slice(messages);
+        self.publish_transcript();
     }
 
     /// Durable rewrite of the most recent User-role message: persist the new
@@ -301,6 +342,7 @@ impl Session {
             .rewrite_last_user_message(agent_id, &content)
             .await?;
         self.history[idx].content = content;
+        self.publish_transcript();
         Ok(RewriteOutcome::Rewritten)
     }
 
@@ -355,6 +397,7 @@ impl Session {
         } else {
             self.history = compacted;
             self.persisted_len = self.history.len();
+            self.publish_transcript();
             // Refresh the change-detection baseline when the block was
             // (re)rendered: it is the newest authoritative state — a stale
             // snapshot would fire a spurious change-info on the first turn
