@@ -85,6 +85,11 @@ const MAX_NARRATION_CHARS: usize = 104;
 /// Maximum width (px) of the hover tooltip content; long values wrap within it.
 const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
 
+/// Maximum width (px) of a metric hover tooltip body. Much narrower than
+/// [`MAX_TOOL_TOOLTIP_WIDTH`] (tuned for multi-arg tool calls) since a metric
+/// tooltip holds one short line of explanatory text.
+const MAX_METRIC_TOOLTIP_WIDTH: f32 = 360.0;
+
 /// A word/path-delimiter boundary at which wrapped/truncated page text may be
 /// cut: whitespace (word wrap) and `/`, `_`, `-` (paths, URLs, identifiers).
 fn is_delim(c: char) -> bool {
@@ -734,15 +739,31 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         .spacing(8)
         .align_y(Alignment::Center);
     // The live token count comes from the published transcript snapshot (the
-    // registry no longer carries a session_tokens mirror).
+    // registry no longer carries a session_tokens mirror). It renders as a
+    // compact count; hovering reveals the label and the exact unrounded value.
     if let Some(token_count) = snapshot.as_ref().and_then(|s| s.token_count) {
         first_row = first_row.push(
-            text(theme::format_compact_tokens(token_count))
-                .size(11)
-                .color(theme::TEXT_SECONDARY),
+            tooltip(
+                text(theme::format_compact_tokens(token_count))
+                    .size(11)
+                    .color(theme::TEXT_SECONDARY),
+                render_metric_tooltip(format!("Session tokens: {token_count}")),
+                tooltip::Position::Top,
+            )
+            .gap(4)
+            .style(theme::tooltip_style),
         );
     }
-    first_row = first_row.push(text(elapsed).size(11).color(theme::TEXT_SECONDARY));
+    // Elapsed time since the agent started; hovering explains the meaning.
+    first_row = first_row.push(
+        tooltip(
+            text(elapsed).size(11).color(theme::TEXT_SECONDARY),
+            render_metric_tooltip("Elapsed run time since the agent started".to_string()),
+            tooltip::Position::Top,
+        )
+        .gap(4)
+        .style(theme::tooltip_style),
+    );
 
     let mut content = Column::new().spacing(6).align_x(Alignment::Start);
     content = content.push(first_row);
@@ -1122,6 +1143,21 @@ fn render_tool_tooltip(
         );
     }
     container(content).max_width(MAX_TOOL_TOOLTIP_WIDTH).into()
+}
+
+/// Render a one-line metric tooltip body in a narrow, styled container: the
+/// explanatory text (metric label plus, where useful, the precise value). Kept
+/// narrower than [`MAX_TOOL_TOOLTIP_WIDTH`] because a metric tooltip holds a
+/// single short line, not multi-arg tool calls.
+fn render_metric_tooltip(label: String) -> Element<'static, RunningMessage> {
+    container(
+        text(label)
+            .size(11)
+            .color(theme::TEXT_PRIMARY)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+    )
+    .max_width(MAX_METRIC_TOOLTIP_WIDTH)
+    .into()
 }
 
 /// Render a compact non-agent LLM call row: zap marker + purpose + elapsed.
