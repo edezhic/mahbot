@@ -2574,7 +2574,11 @@ fn spill_output(output: &str) -> Option<std::path::PathBuf> {
 
 /// If output exceeds threshold, spill to a temp file and return a preview.
 /// The full output is saved to a file; the inline preview is a short summary.
-fn try_spill_to_file(output: String, threshold_bytes: usize) -> String {
+///
+/// Reused by read-only tools (e.g. [`crate::tools::mahbot_debug`]) to keep
+/// large result sets out of the LLM context while still making them available
+/// on demand via the read path.
+pub(crate) fn try_spill_to_file(output: String, threshold_bytes: usize) -> String {
     if output.len() <= threshold_bytes {
         return output;
     }

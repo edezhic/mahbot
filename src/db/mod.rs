@@ -167,6 +167,20 @@ pub(crate) fn store_names() -> Vec<&'static str> {
     names
 }
 
+/// All accepted database selector values for the read-only debug/query surface
+/// (the CLI's `--db` argument and the Analyst `mahbot_debug` tool's `db`
+/// parameter): the logical store names ([`store_names`]) plus the physical
+/// consolidated file name ([`CONSOLIDATED_DB_NAME`]).
+///
+/// This is the single derivation of that accepted set — [`crate::db::debug`]'s
+/// validator, CLI usage text, and the tool's model-facing schema all use it so
+/// the three cannot drift.
+pub(crate) fn debug_db_names() -> Vec<&'static str> {
+    let mut names = store_names();
+    names.push(CONSOLIDATED_DB_NAME);
+    names
+}
+
 /// Initialize all database stores concurrently.
 ///
 /// This is the canonical initialization path for the domain stores (board,

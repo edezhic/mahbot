@@ -257,9 +257,9 @@ use crate::config::CONFIG;
 use crate::tools::{
     AddAlarmTool, AddCommentTool, AnalyzeTool, BrowserTool, CreateTicketTool, DispatchMode,
     EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool, ListTicketsTool,
-    ReadTool, RemoveAlarmTool, ResearchTool, SearchArchivedTicketsTool, SearchTool, ShellMode,
-    ShellTool, StrictReadTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend,
-    WebSearchTool,
+    MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool, SearchArchivedTicketsTool,
+    SearchTool, ShellMode, ShellTool, StrictReadTool, UpdateTicketTool, VideoEditTool,
+    VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -323,6 +323,7 @@ impl Role {
             }
             Role::Analyst => {
                 let mut t = Self::readonly_core_tools();
+                t.push(Box::new(MahbotDebugTool));
                 t.push(Box::new(BrowserTool::default()));
                 t
             }
@@ -535,6 +536,39 @@ mod tests {
             ["read", "shell"],
             "Sanitation toolset must be exactly read + read-only shell, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn analyst_exposes_mahbot_debug_and_other_roles_do_not() {
+        // Acceptance pin for the in-process read-only SQL tool: only the Analyst
+        // advertises `mahbot_debug` — it must not appear for the Assistant (either
+        // base or full-access) or any other role.
+        let ws = crate::workspace::test_ws("test");
+        let analyst = crate::Role::Analyst.tools(&ws, false);
+        assert!(
+            analyst.iter().any(|t| t.name() == "mahbot_debug"),
+            "Analyst toolset must contain `mahbot_debug`"
+        );
+        for (role, full_access) in [
+            (crate::Role::Manager, false),
+            (crate::Role::Engineer, false),
+            (crate::Role::Coder, false),
+            (crate::Role::Qa, false),
+            (crate::Role::Reviewer, false),
+            (crate::Role::Discovery, false),
+            (crate::Role::Artist, false),
+            (crate::Role::Maintainer, false),
+            (crate::Role::Sanitation, false),
+            (crate::Role::Assistant, false),
+            (crate::Role::Assistant, true),
+        ] {
+            let tools = role.tools(&ws, full_access);
+            assert!(
+                !tools.iter().any(|t| t.name() == "mahbot_debug"),
+                "{} must not advertise `mahbot_debug`",
+                role.as_str()
+            );
+        }
     }
 
     #[test]

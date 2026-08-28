@@ -163,9 +163,8 @@ fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
 /// PHYSICAL consolidated file name ([`turso_mod::CONSOLIDATED_DB_NAME`], shown
 /// as the label in `--db all`/`detect` output). Both lists must stay in sync
 /// with the debug CLI's `--db` surface.
-fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
-    let mut names = turso_mod::store_names();
-    names.push(turso_mod::CONSOLIDATED_DB_NAME);
+pub(crate) fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
+    let names = turso_mod::debug_db_names();
     if names.contains(&name) {
         return Ok(());
     }
@@ -1272,7 +1271,7 @@ fn resolve_db_list(name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>> {
 
 /// Reject any SQL containing mutation keywords (whole-word, case-insensitive)
 /// or a PRAGMA not on the read-only allowlist.
-fn validate_read_only(sql: &str) -> Result<()> {
+pub(crate) fn validate_read_only(sql: &str) -> Result<()> {
     let tokens = tokenize_sql(sql);
     for (idx, token) in tokens.iter().enumerate() {
         let upper = token.to_uppercase();
@@ -1339,7 +1338,7 @@ fn format_core_value(val: &turso::core::Value) -> String {
 /// For 2 columns: `truncated|truncated`
 /// For N≥3:       `...|truncated|truncated|...|...`
 ///                 (ellipsis at first and last, `truncated` in between)
-fn format_truncation_row(column_count: usize) -> String {
+pub(crate) fn format_truncation_row(column_count: usize) -> String {
     let parts: Vec<&str> = match column_count {
         1 => vec!["truncated"],
         2 => vec!["truncated", "truncated"],
@@ -1358,9 +1357,7 @@ fn print_usage() {
     eprintln!("       mahbot debug detect [--db <name>]");
     eprintln!("       mahbot debug families [--db <name>]");
     eprintln!("       mahbot debug --family <id> \"SQL query\"");
-    let mut names = turso_mod::store_names();
-    names.push(turso_mod::CONSOLIDATED_DB_NAME);
-    let names = names.join(" | ");
+    let names = turso_mod::debug_db_names().join(" | ");
     eprintln!("  -h, --help  print this help and exit 0");
     eprintln!("  --db <name> {names} | all");
     eprintln!("              with a SQL argument: read-only query, pipe-delimited output");
