@@ -192,32 +192,15 @@ fn resolve_query(args: &serde_json::Value) -> Option<String> {
     if query.is_empty() { None } else { Some(query) }
 }
 
-/// Resolve a workspace's search engine. Ephemeral per-run workspaces (freshly
-/// created research folders with zero files) downgrade the empty-index
-/// scan error to a warning — their index legitimately starts empty; real
-/// workspaces keep the hard error.
+/// Resolve a workspace's search engine, ensuring the background scan has
+/// finished (or timed out). A completed-but-empty index is not an error —
+/// the live watcher populates it incrementally as files are added.
 async fn resolve_workspace_engine(
     ws: &crate::Workspace,
 ) -> anyhow::Result<std::sync::Arc<search_engine::SearchEngineEntry>> {
-    match search_engine::resolve_engine(&ws.name, &ws.path, "", ws.ephemeral).await {
-        Ok(entry) => Ok(entry),
-        Err(e) if ws.ephemeral && search_engine::is_empty_index_error(&e) => {
-            tracing::warn!(ws = %ws.name, "Ephemeral workspace has an empty search index — searching a not-yet-written folder");
-            // `get_or_init_engine` returns the SAME registered entry (Arc
-            // dedup by name) — this recovers the handle to search on, it does
-            // NOT re-initialize. Residual (accepted): an index built while the
-            // folder was empty stays empty for the run's lifetime — the scan
-            // never re-runs, so a coder searching its own run_root after
-            // writing prototypes sees no results.
-            search_engine::get_or_init_engine(
-                &ws.name,
-                std::path::Path::new(&ws.path),
-                ws.ephemeral,
-            )
-            .map_err(|e| anyhow::anyhow!(e))
-        }
-        Err(e) => Err(anyhow::anyhow!(e)),
-    }
+    search_engine::resolve_engine(&ws.name, &ws.path, "", ws.ephemeral)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Unified workspace search tool.
@@ -316,7 +299,7 @@ impl SearchTool {
                 "  ⚠ offset={offset} exceeds total prefiltered files ({total_matched}) — no files to search. Try offset=0."
             );
         } else if total_files == 0 {
-            diag.push_str("  ⚠ index has 0 files — workspace may not be scanned yet\n");
+            diag.push_str("  ℹ index has 0 files — results populate as files are added\n");
         } else if total_matched == 0 {
             diag.push_str(
                 "  ℹ 0 files matched before pagination — try broader query or remove constraints\n",
@@ -737,7 +720,7 @@ fn build_grep_zero_diag(
             offset, result.next_file_offset
         );
     } else if result.total_files == 0 {
-        diag.push_str("  ⚠ index has 0 files — workspace may not be scanned yet\n");
+        diag.push_str("  ℹ index has 0 files — results populate as files are added\n");
     } else if result.filtered_file_count == 0
         && result.total_files_searched == 0
         && result.total_files > 0

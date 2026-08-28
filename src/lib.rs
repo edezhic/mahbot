@@ -245,8 +245,8 @@ pub struct Workspace {
     /// Ephemeral per-run workspace (research run roots): never registered in
     /// the `workspaces` table, created on the fly for a single run's lifetime.
     /// Ephemeral workspaces get local handling in shared tool paths — e.g.
-    /// the search tool downgrades an empty index to a warning instead of an
-    /// error (a fresh per-run folder has no files yet).
+    /// the per-run query tracker lives inside the run folder instead of
+    /// `~/.mahbot/search/`.
     pub ephemeral: bool,
 }
 

@@ -65,7 +65,7 @@ When zero results are returned, the tool includes a `── diagnostics ──` 
 
 - `total_matched: 0` with constraints present → constraints filtered everything. Try removing or broadening constraints.
 - `total_matched > 0` but `offset` >= `total_matched` → you paginated past the end. Reset `offset` to 0.
-- `total_files: 0` → workspace index is empty (scanning may not be done yet).
+- `total_files: 0` → workspace index is empty (files added later populate it incrementally).
 
 ### Grep mode diagnostics
 
