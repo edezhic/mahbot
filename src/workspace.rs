@@ -2490,6 +2490,7 @@ mod tests {
             None,
             String::new(),
             String::new(),
+            false,
             None,
             None,
         );

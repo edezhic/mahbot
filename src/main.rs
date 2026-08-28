@@ -204,6 +204,15 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::pipeline::board::run_archive_cancelled_loop(),
     );
 
+    // Alarm/reminder sweep: fires due reminders back into the Assistant's
+    // personal session. The first tick acts as the boot-time overdue scan.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "alarm-sweep",
+        mahbot::alarms::run_alarm_sweep_loop(),
+    );
+
     // Dead-session recovery: detects user-agent sessions that failed silently
     // (user sent a message, no agent responded, no agent is running) and
     // automatically re-triggers the agent.

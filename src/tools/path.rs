@@ -142,26 +142,31 @@ pub(crate) async fn resolve_write_target(
 /// Resolve and validate a file path for read operations.
 ///
 /// Path security is enforced by `check_path_read_allowed` (pre- and
-/// post-canonicalization), permitting `EXTRA_READ_ALLOWED` paths (temp files,
-/// dependency source directories) in addition to workspace-scoped paths.
+/// post-canonicalization). When `strict` is `true`, only workspace-scoped paths
+/// are permitted — `EXTRA_READ_ALLOWED` paths (temp files, dependency source
+/// directories) and spill-file early-returns are **not** allowed. When `strict`
+/// is `false`, the legacy behavior applies (`EXTRA_READ_ALLOWED` paths are
+/// permitted in addition to workspace-scoped paths).
 ///
 /// Key differences from [`resolve_write_target`]:
 /// - Canonicalizes the **full path**, not just the parent (file must exist).
 /// - No `ensure_parent` parameter — parent creation is a write-only concept.
 /// - No explicit symlink refusal — `tokio::fs::canonicalize` resolves symlinks,
 ///   so the post-canonicalization check catches escapes via the resolved path.
-/// - Also allows `EXTRA_READ_ALLOWED` paths (e.g. /tmp files, dependency caches).
+/// - Also allows `EXTRA_READ_ALLOWED` paths (e.g. /tmp files, dependency caches)
+///   when `strict` is `false`.
 ///
 /// Returns `Ok(path)` on success, or an error message to propagate to the agent.
 pub(crate) async fn resolve_read_target(
     workspace_root: &Path,
     path: &str,
+    strict: bool,
 ) -> anyhow::Result<PathBuf> {
     let full_path = resolve_tool_path_with_base(path, workspace_root);
 
     // Pre-canonicalization check — allows EXTRA_READ_ALLOWED paths
     // (temp files, dependency source directories) outside the workspace
-    check_path_read_allowed(path, workspace_root)?;
+    check_path_read_allowed(path, workspace_root, strict)?;
 
     // Canonicalize full path (file must exist). Resolves symlinks,
     // so the post-canonicalization check catches escapes.
@@ -182,7 +187,7 @@ pub(crate) async fn resolve_read_target(
         }
     };
 
-    check_path_read_allowed(&resolved_path.to_string_lossy(), workspace_root)?;
+    check_path_read_allowed(&resolved_path.to_string_lossy(), workspace_root, strict)?;
 
     Ok(resolved_path)
 }
@@ -391,10 +396,22 @@ fn is_grandparent_temp_root(path: &Path) -> bool {
 
 /// Check that a path is allowed by the read-path security policy.
 ///
-/// The path must be either within the workspace (via [`is_path_safe_for_workspace`])
-/// or under one of the [`EXTRA_READ_ALLOWED`] directories (temp files,
-/// dependency caches, SDK headers, etc.).
-fn check_path_read_allowed(path: &str, workspace_root: &Path) -> anyhow::Result<()> {
+/// When `strict` is `true`, the ONLY allowed paths are those within the
+/// workspace (via [`is_path_safe_for_workspace`]) — `EXTRA_READ_ALLOWED`
+/// directories and the spill-file early-return are skipped.
+///
+/// When `strict` is `false`, the path may additionally be within one of the
+/// [`EXTRA_READ_ALLOWED`] directories (temp files, dependency caches, SDK
+/// headers, etc.), or be a spill file on an OS temp root (allowed
+/// unconditionally).
+fn check_path_read_allowed(path: &str, workspace_root: &Path, strict: bool) -> anyhow::Result<()> {
+    if strict {
+        if is_path_safe_for_workspace(path, workspace_root) {
+            return Ok(());
+        }
+        anyhow::bail!("Path not allowed by security policy: {path}");
+    }
+
     let path_buf = Path::new(path);
 
     // Early-return for spill files on an OS temp root (allowed unconditionally).
@@ -1009,7 +1026,7 @@ mod tests {
         });
 
         for case in &cases {
-            let result = check_path_read_allowed(&case.path, &workspace);
+            let result = check_path_read_allowed(&case.path, &workspace, false);
             assert_eq!(
                 result.is_ok(),
                 case.allowed,
@@ -1029,7 +1046,7 @@ mod tests {
         {
             let mac_spill = PathBuf::from("/var/folders/xx/yy/T/.agent/spill_cd34.txt");
             assert!(
-                check_path_read_allowed(&mac_spill.to_string_lossy(), &workspace).is_ok(),
+                check_path_read_allowed(&mac_spill.to_string_lossy(), &workspace, false).is_ok(),
                 "macOS-shaped spill path should be allowed"
             );
         }
@@ -1042,7 +1059,7 @@ mod tests {
         {
             let outside = PathBuf::from("/usr/local/.agent/spill_ab12.txt");
             assert!(
-                check_path_read_allowed(&outside.to_string_lossy(), &workspace).is_err(),
+                check_path_read_allowed(&outside.to_string_lossy(), &workspace, false).is_err(),
                 "non-temp spill-shaped path should be rejected"
             );
         }
@@ -1132,7 +1149,7 @@ mod tests {
         let temp_file = std::env::temp_dir().join("test-read.txt");
         let temp_str = temp_file.to_string_lossy().to_string();
         assert!(
-            check_path_read_allowed(&temp_str, &workspace).is_ok(),
+            check_path_read_allowed(&temp_str, &workspace, false).is_ok(),
             "Temp file should be allowed for read"
         );
 
@@ -1140,14 +1157,14 @@ mod tests {
         if let Ok(home) = std::env::var("HOME") {
             let dep_path = format!("{home}/.cargo/registry/src/crate-0.1.0/src/lib.rs");
             assert!(
-                check_path_read_allowed(&dep_path, &workspace).is_ok(),
+                check_path_read_allowed(&dep_path, &workspace, false).is_ok(),
                 "Dependency path should be allowed for read"
             );
 
             // ~-prefixed version (pre-canonicalization check)
             let tilde_input = "~/.cargo/registry/src/crate-0.1.0/src/lib.rs";
             assert!(
-                check_path_read_allowed(tilde_input, &workspace).is_ok(),
+                check_path_read_allowed(tilde_input, &workspace, false).is_ok(),
                 "~-prefixed dependency path should be allowed for read"
             );
         }
@@ -1171,7 +1188,7 @@ mod tests {
         let file_path = ws.join("existing.txt");
         tokio::fs::write(&file_path, "hello").await.unwrap();
 
-        let result = resolve_read_target(&ws, "existing.txt").await;
+        let result = resolve_read_target(&ws, "existing.txt", false).await;
         assert!(
             result.is_ok(),
             "Should resolve existing file: {:?}",
@@ -1191,7 +1208,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = resolve_read_target(&ws, "nested").await;
+        let result = resolve_read_target(&ws, "nested", false).await;
         assert!(
             result.is_ok(),
             "Should resolve existing directory without trailing slash: {:?}",
@@ -1206,7 +1223,7 @@ mod tests {
     async fn resolve_read_target_file_not_found() {
         let (_tmp, ws) = test_workspace().await;
 
-        let result = resolve_read_target(&ws, "nonexistent.txt").await;
+        let result = resolve_read_target(&ws, "nonexistent.txt", false).await;
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("File not found"),
@@ -1228,7 +1245,7 @@ mod tests {
         // Remove search permission from directory so canonicalize can't enter it
         std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let result = resolve_read_target(&ws, "secret/file.txt").await;
+        let result = resolve_read_target(&ws, "secret/file.txt", false).await;
 
         // Restore permissions so TempDir can clean up
         let _ = std::fs::set_permissions(&restricted_dir, std::fs::Permissions::from_mode(0o755));
@@ -1250,7 +1267,7 @@ mod tests {
         let link = ws.join("link.txt");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
 
-        let result = resolve_read_target(&ws, "link.txt").await;
+        let result = resolve_read_target(&ws, "link.txt", false).await;
         assert!(result.is_ok(), "Should resolve symlink: {:?}", result.err());
 
         let resolved = result.unwrap();
@@ -1272,7 +1289,7 @@ mod tests {
             .unwrap();
         let spill_str = spill_file.to_string_lossy().to_string();
 
-        let result = resolve_read_target(&ws, &spill_str).await;
+        let result = resolve_read_target(&ws, &spill_str, false).await;
         let _ = tokio::fs::remove_file(&spill_file).await;
 
         assert!(
@@ -1280,6 +1297,43 @@ mod tests {
             "Should allow extra read paths (e.g. /tmp): {:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_read_target_strict_rejects_extra_allowed_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir(&ws).await.unwrap();
+
+        let spill_dir = std::env::temp_dir().join(".agent");
+        tokio::fs::create_dir_all(&spill_dir).await.unwrap();
+        let spill_file = spill_dir.join("spill_ef56.txt");
+        tokio::fs::write(&spill_file, "spill content")
+            .await
+            .unwrap();
+        let spill_str = spill_file.to_string_lossy().to_string();
+
+        // Non-strict read still permits the extra-allowed spill path.
+        let result = resolve_read_target(&ws, &spill_str, false).await;
+        assert!(
+            result.is_ok(),
+            "non-strict read should allow extra-allowed path: {:?}",
+            result.err()
+        );
+
+        // Strict read rejects it — the ONLY allowed paths are in-workspace.
+        let result = resolve_read_target(&ws, &spill_str, true).await;
+        assert!(
+            result.is_err(),
+            "strict read must reject an extra-allowed path"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Path not allowed by security policy"),
+            "strict rejection should cite the security policy: {err}"
+        );
+
+        let _ = tokio::fs::remove_file(&spill_file).await;
     }
 
     #[tokio::test]
@@ -1295,7 +1349,7 @@ mod tests {
         tokio::fs::write(&file_path, "world").await.unwrap();
 
         // Use the non-canonicalized ws_dir as workspace_root.
-        let result = resolve_read_target(&ws_dir, "hello.txt").await;
+        let result = resolve_read_target(&ws_dir, "hello.txt", false).await;
         assert!(
             result.is_ok(),
             "Read should succeed even with non-canonicalized root: {:?}",

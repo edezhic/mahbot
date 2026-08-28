@@ -1,0 +1,1 @@
+Stop and remove one of your scheduled reminders by its id, so it will no longer wake you up. Pass the exact id returned by `list_alarms`. Only active (not yet fired/removed) alarms can be removed; a removed alarm will never fire.

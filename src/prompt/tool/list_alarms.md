@@ -1,0 +1,1 @@
+List the reminders you have scheduled that will wake you up, each with its id, kind (one-shot or periodic), text, and next fire time in both local and UTC. Use this to inspect what is scheduled before removing or adjusting a reminder.

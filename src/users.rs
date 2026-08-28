@@ -117,7 +117,7 @@ impl UserStore {
         tx.commit().await?;
 
         // Create personal workspace directory.
-        init_personal_workspace_dir(name).await;
+        ensure_personal_workspace(name).await;
 
         Ok(())
     }
@@ -568,10 +568,11 @@ pub fn personal_workspace_path(user_name: &str) -> PathBuf {
     userspaces_root().join(user_name)
 }
 
-/// Creates the personal workspace directory for a user and runs `git init`
-/// inside it. Both failures are non-fatal — they are logged as warnings but
-/// the caller continues normally.
-async fn init_personal_workspace_dir(name: &str) {
+/// Ensure the personal workspace directory for a user exists and is
+/// git-initialized. Creates the directory if it's missing and runs `git init`
+/// only when no repo is present yet (idempotent otherwise). Both failures are
+/// non-fatal — they are logged as warnings but the caller continues normally.
+pub(crate) async fn ensure_personal_workspace(name: &str) {
     let path = personal_workspace_path(name);
     if let Err(e) = tokio::fs::create_dir_all(&path).await {
         warn!(
@@ -580,7 +581,10 @@ async fn init_personal_workspace_dir(name: &str) {
             "Failed to create personal workspace directory"
         );
     }
-    // Try git init; non-fatal on failure.
+    // Try git init only when there is no repo yet; non-fatal on failure.
+    if path.join(".git").exists() {
+        return;
+    }
     match run_git_output(&path, &["init", "-q"]).await {
         Ok(o) if o.status.success() => {}
         Ok(_) => warn!(
@@ -620,6 +624,24 @@ pub async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
         // Personal workspace: construct from userspace path
         let path = personal_workspace_path(user_name);
         Ok(Some(personal_workspace_struct(user_name, &path)))
+    }
+}
+
+/// Resolve a workspace by name, synthesizing a personal workspace
+/// (`personal:{user}`) when the name is not in the `workspaces` table.
+///
+/// Shared by the message router and the boot resume path so both treat
+/// synthetic personal workspaces identically.
+pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>> {
+    match crate::workspace::get_by_name(workspace_name).await? {
+        Some(ws) => Ok(Some(ws)),
+        None if is_personal_workspace(workspace_name) => {
+            let user_name = personal_user_name(workspace_name)
+                .expect("invariant: is_personal_workspace checked the prefix");
+            let path = personal_workspace_path(user_name);
+            Ok(Some(personal_workspace_struct(user_name, &path)))
+        }
+        None => Ok(None),
     }
 }
 

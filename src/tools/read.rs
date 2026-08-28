@@ -122,7 +122,7 @@ fn image_read_annotation(path: &Path, kind: SniffedImage) -> String {
 
 /// Candidate paths for a literal `path` that `resolve_read_target` could not
 /// resolve (a typo/missing path). Queried by filename, as
-/// [`recover_missing_path`](ReadTool::recover_missing_path) does. This is the
+/// [`recover_missing_path`] does. This is the
 /// single recovery-search source shared by the read-annotation path and
 /// `image_payload`'s resolve path, so the two can never drift apart.
 async fn find_recovery_candidates(ws: &Workspace, path: &str) -> Vec<String> {
@@ -158,8 +158,8 @@ struct ResolvedRead {
 /// (which receives the original, possibly typo'd, `path`). Returns `None` when
 /// the path is missing and no unique match exists, and when it does not resolve
 /// at all.
-async fn resolve_for_read(ws: &Workspace, path: &str) -> Option<ResolvedRead> {
-    match super::path::resolve_read_target(ws.as_path(), path).await {
+async fn resolve_for_read(ws: &Workspace, path: &str, strict: bool) -> Option<ResolvedRead> {
+    match super::path::resolve_read_target(ws.as_path(), path, strict).await {
         Ok(resolved) => {
             return Some(ResolvedRead {
                 path: resolved,
@@ -174,13 +174,50 @@ async fn resolve_for_read(ws: &Workspace, path: &str) -> Option<ResolvedRead> {
         return None;
     }
     let recovered = &matches[0];
-    let resolved = super::path::resolve_read_target(ws.as_path(), recovered)
+    let resolved = super::path::resolve_read_target(ws.as_path(), recovered, strict)
         .await
         .ok()?;
     Some(ResolvedRead {
         path: resolved,
         recovery_note: Some(recovery_note(path, recovered)),
     })
+}
+
+/// Build the read tool's parameter schema. `path_desc` describes the path
+/// boundary so the strict variant (workspace-only) can advertise an accurate
+/// restriction while the general variant keeps its allowlist wording.
+fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
+    super::tool_params_schema(
+        &json!({
+            "path": {
+                "type": "string",
+                "description": path_desc
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["content", "symbols", "zoom"],
+                "description": "Read mode. 'content' (default): line-numbered file read, or — for a raster image (PNG, JPEG, WebP) — attaches it to the conversation as a native image rather than reading text. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name.",
+                "default": "content"
+            },
+            "symbol": {
+                "type": "string",
+                "description": "Symbol name for zoom mode. Required when mode is 'zoom'.",
+                "minLength": 1
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Starting line number (1-based, default: 1)",
+                "default": 1,
+                "minimum": 1
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines to return (default: all)",
+                "minimum": 1
+            }
+        }),
+        &["path"],
+    )
 }
 
 #[async_trait]
@@ -190,58 +227,13 @@ impl Tool for ReadTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        super::tool_params_schema(
-            &json!({
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["content", "symbols", "zoom"],
-                    "description": "Read mode. 'content' (default): line-numbered file read, or — for a raster image (PNG, JPEG, WebP) — attaches it to the conversation as a native image rather than reading text. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name.",
-                    "default": "content"
-                },
-                "symbol": {
-                    "type": "string",
-                    "description": "Symbol name for zoom mode. Required when mode is 'zoom'.",
-                    "minLength": 1
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "Starting line number (1-based, default: 1)",
-                    "default": 1,
-                    "minimum": 1
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to return (default: all)",
-                    "minimum": 1
-                }
-            }),
-            &["path"],
+        read_parameters_schema(
+            "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist.",
         )
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        let path = super::get_str(&args, "path")?.to_string();
-
-        if super::path::contains_glob(&path, true) {
-            return self.recover_wildcard_path(ws, &path).await;
-        }
-
-        let resolved_path = match super::path::resolve_read_target(ws.as_path(), &path).await {
-            Ok(p) => p,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("File not found") {
-                    return self.recover_missing_path(ws, &path, &args, &msg).await;
-                }
-                return Err(e);
-            }
-        };
-
-        self.read_resolved(ws, &resolved_path, None, &args).await
+        execute_read(ws, args, false).await
     }
 
     fn should_scrub_output(&self, args: &serde_json::Value) -> bool {
@@ -300,305 +292,379 @@ impl Tool for ReadTool {
         ws: &Workspace,
         args: &serde_json::Value,
     ) -> Option<crate::tools::ImagePayload> {
-        // Robust file-magic gate (NOT the annotation wording): only a PNG/JPEG/
-        // WebP raster opens the decode+encode below. This runs AFTER path
-        // resolution, so text/unsupported reads still pay resolve + metadata +
-        // a 64-byte sniff — but never a full read/decode of the file.
-        let path = super::get_str(args, "path").ok()?.to_string();
-        // Image behaviour is content-mode only (symbols/zoom run tree-sitter).
-        if super::get_opt_str(args, "mode").unwrap_or("content") != "content" {
-            return None;
-        }
-        if super::path::contains_glob(&path, true) {
-            return None;
-        }
-        // Resolve the literal path, or — for a typo'd path that `execute`
-        // already recovered to a unique match — the recovered path, so a
-        // recovered raster is attached rather than only annotated.
-        let res = resolve_for_read(ws, &path).await?;
-        if !is_native_image_file(&res.path).await {
-            return None;
-        }
-        // The compressed encode applies EXIF orientation and reports the
-        // post-EXIF/post-resize dims + source-format label; its metadata-first
-        // `is_file()` guard keeps a FIFO/special file from being reopened.
-        let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&res.path)
-            .await
-            .ok()?;
-        Some(crate::tools::ImagePayload::from_compressed_meta(
-            &res.path,
-            meta,
-            res.recovery_note,
-            crate::tools::ImagePayloadSource::Read,
-        ))
+        read_image_payload(ws, args, false).await
     }
 }
 
-impl ReadTool {
-    /// Read a resolved file path (content, symbols, or zoom mode).
-    async fn read_resolved(
+/// Produce the image payload for a read, honoring the strict workspace-only
+/// boundary when `strict` is set (the Assistant's restricted read). The
+/// non-strict path additionally allows dependency-source / temp-file reads.
+async fn read_image_payload(
+    ws: &Workspace,
+    args: &serde_json::Value,
+    strict: bool,
+) -> Option<crate::tools::ImagePayload> {
+    // Robust file-magic gate (NOT the annotation wording): only a PNG/JPEG/
+    // WebP raster opens the decode+encode below. This runs AFTER path
+    // resolution, so text/unsupported reads still pay resolve + metadata +
+    // a 64-byte sniff — but never a full read/decode of the file.
+    let path = super::get_str(args, "path").ok()?.to_string();
+    // Image behaviour is content-mode only (symbols/zoom run tree-sitter).
+    if super::get_opt_str(args, "mode").unwrap_or("content") != "content" {
+        return None;
+    }
+    if super::path::contains_glob(&path, true) {
+        return None;
+    }
+    // Resolve the literal path, or — for a typo'd path that `execute`
+    // already recovered to a unique match — the recovered path, so a
+    // recovered raster is attached rather than only annotated.
+    let res = resolve_for_read(ws, &path, strict).await?;
+    if !is_native_image_file(&res.path).await {
+        return None;
+    }
+    // The compressed encode applies EXIF orientation and reports the
+    // post-EXIF/post-resize dims + source-format label; its metadata-first
+    // `is_file()` guard keeps a FIFO/special file from being reopened.
+    let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&res.path)
+        .await
+        .ok()?;
+    Some(crate::tools::ImagePayload::from_compressed_meta(
+        &res.path,
+        meta,
+        res.recovery_note,
+        crate::tools::ImagePayloadSource::Read,
+    ))
+}
+
+/// Workspace-only read — the Assistant's restricted read variant. Unlike
+/// `ReadTool`, it permits NO path outside the workspace: no dependency-source
+/// caches, no temp spill files, no `/tmp`. Edit is already workspace-strict.
+pub struct StrictReadTool;
+
+#[async_trait]
+impl Tool for StrictReadTool {
+    fn name(&self) -> &'static str {
+        "read"
+    }
+
+    fn description(&self) -> String {
+        crate::prompt::load_prompt("tool/read_strict.md")
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        read_parameters_schema(
+            "Path to the file within the personal workspace. Only the workspace is accessible — dependency sources, temp files, and other outside paths are rejected.",
+        )
+    }
+
+    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
+        execute_read(ws, args, true).await
+    }
+
+    fn should_scrub_output(&self, args: &serde_json::Value) -> bool {
+        ReadTool.should_scrub_output(args)
+    }
+
+    fn side_effects(&self) -> bool {
+        false // read-only file inspection
+    }
+
+    fn format_output(&self, output: &str) -> String {
+        ReadTool.format_output(output)
+    }
+
+    async fn image_payload(
         &self,
         ws: &Workspace,
-        resolved_path: &Path,
-        recovery_note: Option<&str>,
         args: &serde_json::Value,
-    ) -> anyhow::Result<String> {
-        match tokio::fs::metadata(resolved_path).await {
-            Ok(meta) => {
-                if meta.is_dir() {
-                    return list_directory(resolved_path, ws).await;
-                }
-                super::check_file_size(&meta)?;
-                // FIFOs are streams, not seekable files — read them with a
-                // bounded non-blocking wait so a missing writer cannot hang
-                // the tool (see read_fifo). Other modes (symbols/zoom) make no
-                // sense on a pipe, so content is always used.
-                #[cfg(unix)]
-                if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
-                    let bytes = read_fifo(resolved_path, fifo_read_timeout()).await?;
-                    let contents = String::from_utf8_lossy(&bytes);
-                    let body = format_content(&contents, args);
-                    return Ok(match recovery_note {
-                        Some(note) => format!("{note}\n{body}"),
-                        None => body,
-                    });
-                }
+    ) -> Option<crate::tools::ImagePayload> {
+        read_image_payload(ws, args, true).await
+    }
+}
+
+/// Read a resolved file path (content, symbols, or zoom mode).
+async fn read_resolved(
+    ws: &Workspace,
+    resolved_path: &Path,
+    recovery_note: Option<&str>,
+    args: &serde_json::Value,
+) -> anyhow::Result<String> {
+    match tokio::fs::metadata(resolved_path).await {
+        Ok(meta) => {
+            if meta.is_dir() {
+                return list_directory(resolved_path, ws).await;
             }
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    anyhow::bail!("File not found: {}", resolved_path.display());
-                }
-                std::io::ErrorKind::PermissionDenied => {
-                    anyhow::bail!("Permission denied: {}", resolved_path.display());
-                }
-                _ => {
-                    anyhow::bail!("Failed to read file metadata: {e}");
-                }
-            },
-        }
-
-        let mode = super::get_opt_str(args, "mode").unwrap_or("content");
-
-        let body = match mode {
-            "symbols" => self.execute_symbols(resolved_path).await?,
-            "zoom" => self.execute_zoom(resolved_path, args).await?,
-            _ => self.execute_content(resolved_path, args).await?,
-        };
-
-        Ok(match recovery_note {
-            Some(note) => format!("{note}\n{body}"),
-            None => body,
-        })
-    }
-
-    /// Wildcard path: return matching workspace files instead of failing open.
-    async fn recover_wildcard_path(&self, ws: &Workspace, path: &str) -> anyhow::Result<String> {
-        if !crate::search_engine::registry_initialized() {
-            anyhow::bail!(
-                "Wildcard path '{path}' requires the workspace search index, which is unavailable."
-            );
-        }
-        let matches = SearchTool::find_file_paths(ws, path, 20).await?;
-        if matches.is_empty() {
-            anyhow::bail!(
-                "No files matching wildcard path '{path}' found in workspace.\n\
-                 Use the search tool with mode='files' to browse paths."
-            );
-        }
-        let mut output = format!("Wildcard path '{path}' matched:\n");
-        for m in &matches {
-            output.push_str("  ");
-            output.push_str(m);
-            output.push('\n');
-        }
-        Ok(output)
-    }
-
-    /// Missing literal path: suggest matches or auto-read a single high-confidence hit.
-    async fn recover_missing_path(
-        &self,
-        ws: &Workspace,
-        path: &str,
-        args: &serde_json::Value,
-        original_err: &str,
-    ) -> anyhow::Result<String> {
-        let matches = find_recovery_candidates(ws, path).await;
-        if matches.is_empty() {
-            anyhow::bail!("{original_err}");
-        }
-
-        if matches.len() == 1 {
-            let recovered = &matches[0];
-            let resolved = super::path::resolve_read_target(ws.as_path(), recovered).await?;
-            let note = recovery_note(path, recovered);
-            return self.read_resolved(ws, &resolved, Some(&note), args).await;
-        }
-
-        anyhow::bail!("{original_err}\nDid you mean:\n  {}", matches.join("\n  "))
-    }
-
-    /// Execute the standard content read mode.
-    async fn execute_content(
-        &self,
-        resolved_path: &Path,
-        args: &serde_json::Value,
-    ) -> anyhow::Result<String> {
-        match tokio::fs::read_to_string(resolved_path).await {
-            Ok(contents) => {
-                // A raster can be valid UTF-8 (e.g. a minimal GIF patch / a
-                // NUL-padded header) — sniff magic bytes before treating it as
-                // text so it gets the image annotation rather than rendering as
-                // garbage. SVG, source, and other text are not image magic and
-                // stay readable.
-                if let Some(kind) = sniff_read_image(contents.as_bytes()) {
-                    return Ok(image_read_annotation(resolved_path, kind));
-                }
-                Ok(format_content(&contents, args))
-            }
-            Err(e) => {
-                // Not valid UTF-8 — read raw bytes and try to extract text
-                let bytes = tokio::fs::read(resolved_path).await.map_err(|ee| {
-                    anyhow::anyhow!(
-                        "Initial error: {e}\n\
-                         Failed to read file: {ee}"
-                    )
-                })?;
-
-                // Content-sniff (magic bytes, never the extension) so SVG and
-                // other text files stay readable as text and only real raster
-                // images take the image path.
-                if let Some(kind) = sniff_read_image(&bytes) {
-                    return Ok(image_read_annotation(resolved_path, kind));
-                }
-
-                // Lossy fallback — replaces invalid bytes with U+FFFD
-                let lossy = String::from_utf8_lossy(&bytes).into_owned();
-                Ok(lossy)
+            super::check_file_size(&meta)?;
+            // FIFOs are streams, not seekable files — read them with a
+            // bounded non-blocking wait so a missing writer cannot hang
+            // the tool (see read_fifo). Other modes (symbols/zoom) make no
+            // sense on a pipe, so content is always used.
+            #[cfg(unix)]
+            if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
+                let bytes = read_fifo(resolved_path, fifo_read_timeout()).await?;
+                let contents = String::from_utf8_lossy(&bytes);
+                let body = format_content(&contents, args);
+                return Ok(match recovery_note {
+                    Some(note) => format!("{note}\n{body}"),
+                    None => body,
+                });
             }
         }
-    }
-
-    /// List all top-level AST symbols with line ranges.
-    async fn execute_symbols(&self, resolved_path: &Path) -> anyhow::Result<String> {
-        let ctx = prepare_symbol_query(resolved_path, "symbol extraction").await?;
-
-        let symbols = collect_symbols(&ctx.ps, &ctx.query);
-        let mut lines: Vec<String> = symbols
-            .iter()
-            .map(|s| {
-                let kind_label = symbol_kind_label(&s.kind);
-                format!(
-                    "  {kind_label} `{}` ({}-{})",
-                    s.name, s.start_line, s.end_line
-                )
-            })
-            .collect();
-        lines.sort();
-        lines.dedup();
-
-        let filename = display_filename(resolved_path);
-        let output = if lines.is_empty() {
-            format!("[No symbols found in {filename}]")
-        } else {
-            format!("[Symbols in {filename}]\n{}", lines.join("\n"))
-        };
-
-        Ok(output)
-    }
-
-    /// Extract a single named symbol's complete source.
-    async fn execute_zoom(
-        &self,
-        resolved_path: &Path,
-        args: &serde_json::Value,
-    ) -> anyhow::Result<String> {
-        let symbol_name = match super::get_opt_str(args, "symbol") {
-            Some(s) if !s.is_empty() => s,
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow::bail!("File not found: {}", resolved_path.display());
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                anyhow::bail!("Permission denied: {}", resolved_path.display());
+            }
             _ => {
-                anyhow::bail!("Missing 'symbol' parameter — required for zoom mode");
+                anyhow::bail!("Failed to read file metadata: {e}");
             }
-        };
+        },
+    }
 
-        let ctx = prepare_symbol_query(resolved_path, "zoom").await?;
+    let mode = super::get_opt_str(args, "mode").unwrap_or("content");
 
-        // Find the named symbol via query-based matching (restricts to declarations only)
-        let root_node = ctx.ps.tree.root_node();
-        let mut qcursor = QueryCursor::new();
-        let mut qmatches = qcursor.matches(&ctx.query, root_node, ctx.ps.source.as_bytes());
-        let mut found_node = None;
-        qmatches.advance();
-        while let Some(m) = qmatches.get() {
-            for c in m.captures {
-                if let Ok(name) = c.node.utf8_text(ctx.ps.source.as_bytes())
-                    && name == symbol_name
-                {
-                    // Found the matching declaration — grab parent node for zoom
-                    found_node = c.node.parent();
-                    break;
-                }
+    let body = match mode {
+        "symbols" => execute_symbols(resolved_path).await?,
+        "zoom" => execute_zoom(resolved_path, args).await?,
+        _ => execute_content(resolved_path, args).await?,
+    };
+
+    Ok(match recovery_note {
+        Some(note) => format!("{note}\n{body}"),
+        None => body,
+    })
+}
+
+/// Wildcard path: return matching workspace files instead of failing open.
+async fn recover_wildcard_path(ws: &Workspace, path: &str) -> anyhow::Result<String> {
+    if !crate::search_engine::registry_initialized() {
+        anyhow::bail!(
+            "Wildcard path '{path}' requires the workspace search index, which is unavailable."
+        );
+    }
+    let matches = SearchTool::find_file_paths(ws, path, 20).await?;
+    if matches.is_empty() {
+        anyhow::bail!(
+            "No files matching wildcard path '{path}' found in workspace.\n\
+                 Use the search tool with mode='files' to browse paths."
+        );
+    }
+    let mut output = format!("Wildcard path '{path}' matched:\n");
+    for m in &matches {
+        output.push_str("  ");
+        output.push_str(m);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+/// Missing literal path: suggest matches or auto-read a single high-confidence hit.
+async fn recover_missing_path(
+    ws: &Workspace,
+    path: &str,
+    args: &serde_json::Value,
+    original_err: &str,
+    strict: bool,
+) -> anyhow::Result<String> {
+    let matches = find_recovery_candidates(ws, path).await;
+    if matches.is_empty() {
+        anyhow::bail!("{original_err}");
+    }
+
+    if matches.len() == 1 {
+        let recovered = &matches[0];
+        let resolved = super::path::resolve_read_target(ws.as_path(), recovered, strict).await?;
+        let note = recovery_note(path, recovered);
+        return read_resolved(ws, &resolved, Some(&note), args).await;
+    }
+
+    anyhow::bail!("{original_err}\nDid you mean:\n  {}", matches.join("\n  "))
+}
+
+/// Execute the standard content read mode.
+async fn execute_content(resolved_path: &Path, args: &serde_json::Value) -> anyhow::Result<String> {
+    match tokio::fs::read_to_string(resolved_path).await {
+        Ok(contents) => {
+            // A raster can be valid UTF-8 (e.g. a minimal GIF patch / a
+            // NUL-padded header) — sniff magic bytes before treating it as
+            // text so it gets the image annotation rather than rendering as
+            // garbage. SVG, source, and other text are not image magic and
+            // stay readable.
+            if let Some(kind) = sniff_read_image(contents.as_bytes()) {
+                return Ok(image_read_annotation(resolved_path, kind));
             }
-            if found_node.is_some() {
+            Ok(format_content(&contents, args))
+        }
+        Err(e) => {
+            // Not valid UTF-8 — read raw bytes and try to extract text
+            let bytes = tokio::fs::read(resolved_path).await.map_err(|ee| {
+                anyhow::anyhow!(
+                    "Initial error: {e}\n\
+                         Failed to read file: {ee}"
+                )
+            })?;
+
+            // Content-sniff (magic bytes, never the extension) so SVG and
+            // other text files stay readable as text and only real raster
+            // images take the image path.
+            if let Some(kind) = sniff_read_image(&bytes) {
+                return Ok(image_read_annotation(resolved_path, kind));
+            }
+
+            // Lossy fallback — replaces invalid bytes with U+FFFD
+            let lossy = String::from_utf8_lossy(&bytes).into_owned();
+            Ok(lossy)
+        }
+    }
+}
+
+/// List all top-level AST symbols with line ranges.
+async fn execute_symbols(resolved_path: &Path) -> anyhow::Result<String> {
+    let ctx = prepare_symbol_query(resolved_path, "symbol extraction").await?;
+
+    let symbols = collect_symbols(&ctx.ps, &ctx.query);
+    let mut lines: Vec<String> = symbols
+        .iter()
+        .map(|s| {
+            let kind_label = symbol_kind_label(&s.kind);
+            format!(
+                "  {kind_label} `{}` ({}-{})",
+                s.name, s.start_line, s.end_line
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+
+    let filename = display_filename(resolved_path);
+    let output = if lines.is_empty() {
+        format!("[No symbols found in {filename}]")
+    } else {
+        format!("[Symbols in {filename}]\n{}", lines.join("\n"))
+    };
+
+    Ok(output)
+}
+
+/// Extract a single named symbol's complete source.
+async fn execute_zoom(resolved_path: &Path, args: &serde_json::Value) -> anyhow::Result<String> {
+    let symbol_name = match super::get_opt_str(args, "symbol") {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            anyhow::bail!("Missing 'symbol' parameter — required for zoom mode");
+        }
+    };
+
+    let ctx = prepare_symbol_query(resolved_path, "zoom").await?;
+
+    // Find the named symbol via query-based matching (restricts to declarations only)
+    let root_node = ctx.ps.tree.root_node();
+    let mut qcursor = QueryCursor::new();
+    let mut qmatches = qcursor.matches(&ctx.query, root_node, ctx.ps.source.as_bytes());
+    let mut found_node = None;
+    qmatches.advance();
+    while let Some(m) = qmatches.get() {
+        for c in m.captures {
+            if let Ok(name) = c.node.utf8_text(ctx.ps.source.as_bytes())
+                && name == symbol_name
+            {
+                // Found the matching declaration — grab parent node for zoom
+                found_node = c.node.parent();
                 break;
             }
-            qmatches.advance();
         }
+        if found_node.is_some() {
+            break;
+        }
+        qmatches.advance();
+    }
 
-        let Some(node) = found_node else {
-            let suggestions = Self::symbol_suggestions(&ctx.ps, &ctx.query, symbol_name);
-            if suggestions.is_empty() {
-                anyhow::bail!(
-                    "Symbol '{symbol_name}' not found in {}",
-                    display_filename(resolved_path),
-                );
-            }
+    let Some(node) = found_node else {
+        let suggestions = symbol_suggestions(&ctx.ps, &ctx.query, symbol_name);
+        if suggestions.is_empty() {
             anyhow::bail!(
-                "Symbol '{symbol_name}' not found in {}. Did you mean: {}",
+                "Symbol '{symbol_name}' not found in {}",
                 display_filename(resolved_path),
-                suggestions.join(", ")
             );
+        }
+        anyhow::bail!(
+            "Symbol '{symbol_name}' not found in {}. Did you mean: {}",
+            display_filename(resolved_path),
+            suggestions.join(", ")
+        );
+    };
+
+    let start = node.start_position().row + 1;
+    let end = node.end_position().row + 1;
+    let byte_range = node.byte_range();
+    let extracted = &ctx.ps.source[byte_range.start..byte_range.end];
+    let kind_label = symbol_kind_label(node.kind());
+
+    Ok(format!(
+        "[Symbol: {kind_label} `{symbol_name}` (lines {start}-{end})]\n{extracted}",
+    ))
+}
+
+/// Suggest symbol names when zoom lookup fails.
+fn symbol_suggestions(ps: &ParsedSource, query: &Query, wanted: &str) -> Vec<String> {
+    // Use collect_symbols for cursor iteration, then filter out any "?"
+    // placeholders that were substituted for non-UTF-8 bytes. This preserves
+    // the original behavior where unrepresentable identifiers were silently
+    // skipped (old code used `if let Ok(name) = utf8_text(...)`).
+    let symbols = collect_symbols(ps, query);
+    let mut names: Vec<String> = symbols
+        .into_iter()
+        .map(|s| s.name)
+        .filter(|n| n != "?")
+        .collect();
+    names.sort();
+    names.dedup();
+
+    let wanted_lc = wanted.to_ascii_lowercase();
+    names.sort_by_cached_key(|name| {
+        let name_lc = name.to_ascii_lowercase();
+        let tier = if name_lc == wanted_lc {
+            0 // exact match
+        } else if name_lc.starts_with(&wanted_lc) || wanted_lc.starts_with(&name_lc) {
+            1 // prefix-related
+        } else {
+            2 // everything else
         };
+        (tier, name_lc)
+    });
+    names.truncate(8);
+    names
+}
 
-        let start = node.start_position().row + 1;
-        let end = node.end_position().row + 1;
-        let byte_range = node.byte_range();
-        let extracted = &ctx.ps.source[byte_range.start..byte_range.end];
-        let kind_label = symbol_kind_label(node.kind());
+/// Shared entry point for the read tool, workspace-strict or not. `strict`
+/// controls whether [`super::path::resolve_read_target`] permits
+/// `EXTRA_READ_ALLOWED` paths (spill files, dependency caches).
+async fn execute_read(
+    ws: &Workspace,
+    args: serde_json::Value,
+    strict: bool,
+) -> anyhow::Result<String> {
+    let path = super::get_str(&args, "path")?.to_string();
 
-        Ok(format!(
-            "[Symbol: {kind_label} `{symbol_name}` (lines {start}-{end})]\n{extracted}",
-        ))
+    if super::path::contains_glob(&path, true) {
+        return recover_wildcard_path(ws, &path).await;
     }
 
-    /// Suggest symbol names when zoom lookup fails.
-    fn symbol_suggestions(ps: &ParsedSource, query: &Query, wanted: &str) -> Vec<String> {
-        // Use collect_symbols for cursor iteration, then filter out any "?"
-        // placeholders that were substituted for non-UTF-8 bytes. This preserves
-        // the original behavior where unrepresentable identifiers were silently
-        // skipped (old code used `if let Ok(name) = utf8_text(...)`).
-        let symbols = collect_symbols(ps, query);
-        let mut names: Vec<String> = symbols
-            .into_iter()
-            .map(|s| s.name)
-            .filter(|n| n != "?")
-            .collect();
-        names.sort();
-        names.dedup();
+    let resolved_path = match super::path::resolve_read_target(ws.as_path(), &path, strict).await {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("File not found") {
+                return recover_missing_path(ws, &path, &args, &msg, strict).await;
+            }
+            return Err(e);
+        }
+    };
 
-        let wanted_lc = wanted.to_ascii_lowercase();
-        names.sort_by_cached_key(|name| {
-            let name_lc = name.to_ascii_lowercase();
-            let tier = if name_lc == wanted_lc {
-                0 // exact match
-            } else if name_lc.starts_with(&wanted_lc) || wanted_lc.starts_with(&name_lc) {
-                1 // prefix-related
-            } else {
-                2 // everything else
-            };
-            (tier, name_lc)
-        });
-        names.truncate(8);
-        names
-    }
+    read_resolved(ws, &resolved_path, None, &args).await
 }
 
 /// Format file contents for content-mode output (line numbering + offset/limit).

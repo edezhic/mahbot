@@ -81,9 +81,9 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 pub(crate) const EXPERIMENTAL_FEATURES: &[&str] = &["index_method"];
 
 /// Name (file stem) of the single consolidated domain database file that backs
-/// the board, sessions, workspaces, users, config, and chat_history stores.
+/// the board, sessions, workspaces, users, config, chat_history, and alarms stores.
 ///
-/// The 6 domain stores were historically split across 6 separate files; they
+/// The domain stores were historically split across separate files; they
 /// now share one file (and one shared [`Connection`]) so that cross-store
 /// integrity is enforceable with real foreign keys and phase+stage updates are
 /// atomic within a single transaction domain. The logs store remains a
@@ -106,6 +106,7 @@ pub(crate) const DOMAIN_STORE_NAMES: &[&str] = &[
     "users",
     "config",
     "chat_history",
+    "alarms",
 ];
 
 /// Name (file stem) of the logs store — the one store that stays a separate
@@ -126,7 +127,7 @@ pub(crate) static DOMAIN_CONN: tokio::sync::OnceCell<Connection> =
 /// store has not been initialized yet.
 ///
 /// This is the single source of truth for which **physical files** exist and
-/// are checkpointed. After consolidation the 6 domain stores share ONE file
+/// are checkpointed. After consolidation all the domain stores share ONE file
 /// ([`CONSOLIDATED_DB_NAME`]) plus the separate logs file, so this yields
 /// exactly two units. [`store_names`] returns the LOGICAL store names accepted
 /// by `mahbot debug --db <name>` — a deliberately separate list, because
@@ -155,8 +156,8 @@ pub(crate) fn iter_checkpoint_stores()
 ///
 /// # Consolidated layout
 ///
-/// The 6 domain stores (board, sessions, workspaces, users, config,
-/// chat_history) are consolidated into ONE physical file
+/// The domain stores (board, sessions, workspaces, users, config,
+/// chat_history, alarms) are consolidated into ONE physical file
 /// ([`CONSOLIDATED_DB_NAME`]); only the logs store is a separate file. This
 /// function returns the LOGICAL store names so `--db board`, `--db sessions`,
 /// etc. resolve to the single consolidated file via [`store_db_path`].
@@ -168,8 +169,8 @@ pub(crate) fn store_names() -> Vec<&'static str> {
 
 /// Initialize all database stores concurrently.
 ///
-/// This is the canonical initialization path for the 6 data stores (board,
-/// session, workspace, users, chat_history, config).  The `logs` store
+/// This is the canonical initialization path for the domain stores (board,
+/// session, workspace, users, chat_history, config, alarms).  The `logs` store
 /// is **not** included here because it must be initialized earlier via
 /// [`crate::logs::init_tracing`], which requires the log store before any
 /// other subsystem is ready. The stats tables (tool_calls, llm_requests)
@@ -177,10 +178,11 @@ pub(crate) fn store_names() -> Vec<&'static str> {
 ///
 /// # Consolidated layout (decision 1)
 ///
-/// The 6 domain stores now share ONE file ([`CONSOLIDATED_DB_NAME`]) and ONE
-/// shared [`Connection`] ([`DOMAIN_CONN`]) — every store struct holds a clone
-/// of the same connection, so `begin_tx` on any store acquires the same mutex
-/// and phase+stage updates are atomic within a single transaction domain. The
+/// The domain stores ([`DOMAIN_STORE_NAMES`]) now share ONE file
+/// ([`CONSOLIDATED_DB_NAME`]) and ONE shared [`Connection`] ([`DOMAIN_CONN`]) —
+/// every store struct holds a clone of the same connection, so `begin_tx` on
+/// any store acquires the same mutex and phase+stage updates are atomic within
+/// a single transaction domain. The
 /// consolidated schema + migrations are applied once via
 /// [`open_consolidated_store`], and per-store post-open hooks (tickets FTS
 /// index, admin-user seed) run idempotently before the cells are set.
@@ -205,6 +207,7 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     let workspace = crate::workspace::WorkspaceStore { conn: conn.clone() };
     let config = crate::config_db::ConfigStore { conn: conn.clone() };
     let chat_history = crate::channels::chat_history::ChatHistoryStore { conn: conn.clone() };
+    let alarms = crate::alarms::AlarmStore { conn: conn.clone() };
 
     // Record the shared connection before setting any cell so a concurrent
     // re-entry observes it and short-circuits.
@@ -233,6 +236,9 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     crate::channels::chat_history::CHAT_HISTORY
         .set(chat_history)
         .map_err(|_| anyhow::anyhow!("CHAT_HISTORY already initialized"))?;
+    crate::alarms::ALARMS
+        .set(alarms)
+        .map_err(|_| anyhow::anyhow!("ALARMS already initialized"))?;
 
     Ok(())
 }
@@ -355,7 +361,7 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
 ///
 /// # Shared-connection discipline (consolidated layout)
 ///
-/// After consolidation all 6 domain stores hold a **clone of one** connection
+/// After consolidation all the domain stores hold a **clone of one** connection
 /// (the same [`Mutex`]), so the mutex is NOT reentrant and is never shared
 /// between independent locks. A code path that holds a [`TxGuard`] (which keeps
 /// the mutex locked for the transaction's lifetime) MUST use `tx.query()` /
@@ -1084,7 +1090,7 @@ async fn execute_schema_ddl(conn: &Connection, sql: &str) -> anyhow::Result<()> 
 ///
 /// # Consolidated layout (decision 1)
 ///
-/// The 6 domain stores ([`DOMAIN_STORE_NAMES`]) are consolidated into ONE file
+/// The domain stores ([`DOMAIN_STORE_NAMES`]) are consolidated into ONE file
 /// ([`CONSOLIDATED_DB_NAME`]); the logs store remains its own file. So this
 /// function maps every domain name (and the canonical
 /// [`CONSOLIDATED_DB_NAME`] itself) to `root/db/{CONSOLIDATED_DB_NAME}.db`, and
@@ -1355,7 +1361,7 @@ pub(crate) async fn open_store(
 
 /// Open (or create) the single consolidated domain database file.
 ///
-/// This is the canonical open for the 6 domain stores: it opens the one
+/// This is the canonical open for the domain stores: it opens the one
 /// consolidated file ([`store_db_path`] mapping all domain names to
 /// [`CONSOLIDATED_DB_NAME`]) and applies the append-only schema catalog
 /// ([`crate::db::migrations`]) — the single owner of every schema creation,

@@ -406,6 +406,24 @@ CREATE INDEX IF NOT EXISTS idx_grep_telemetry_served ON grep_telemetry(served);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_reason ON grep_telemetry(reason);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command);";
 
+/// Alarm/reminder table backing the `add_alarm`/`list_alarms`/`remove_alarm`
+/// tools and the periodic sweep that routes due reminders back into the
+/// Assistant's own session.
+const DELTA_ALARMS: &str = "\
+CREATE TABLE IF NOT EXISTS alarms (
+    id               TEXT PRIMARY KEY,
+    session_id       TEXT NOT NULL,
+    user_name        TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    text             TEXT NOT NULL,
+    fire_at          TEXT,
+    interval_seconds INTEGER,
+    next_fire_at     TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(status, next_fire_at);";
+
 /// The id of the one-time consolidation import (a Rust-function migration).
 pub(crate) const CONSOLIDATION_IMPORT_ID: &str = "consolidate_001_import_domain_stores";
 
@@ -628,6 +646,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "14",
         target: TargetDb::Logs,
         body: MigrationBody::Sql(DELTA_GREP_TELEMETRY),
+    },
+    Migration {
+        id: "17",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(DELTA_ALARMS),
     },
 ];
 

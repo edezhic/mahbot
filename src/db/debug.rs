@@ -190,8 +190,8 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
             vec![name]
         }
         // No `--db` → diagnose each PHYSICAL file once (core + logs), not
-        // once per logical domain name (the 6 domain names all share the one
-        // consolidated file).
+        // once per logical domain name (every logical name maps to one of the
+        // physical files).
         None => physical_store_list(&mahbot_home)
             .into_iter()
             .map(|(n, _)| n)
@@ -1248,7 +1248,7 @@ fn quote_ident(name: &str) -> String {
 
 /// The physical database files for the debug CLI, each opened once.
 ///
-/// After consolidation the 6 domain stores share ONE file, so `--db all` and
+/// After consolidation all the domain stores share ONE file, so `--db all` and
 /// `detect` (with no `--db`) open each unique file once rather than once per
 /// logical domain name. Labels are the physical store names from
 /// [`turso_mod::iter_checkpoint_stores`].

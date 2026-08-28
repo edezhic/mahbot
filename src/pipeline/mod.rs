@@ -142,13 +142,16 @@ pub async fn run_management() {
                 job_id,
                 workspace_name,
             }
+            | crate::jobs::ResumableJob::Implement {
+                job_id,
+                workspace_name,
+            }
             | crate::jobs::ResumableJob::ResearchCleanup {
                 job_id,
                 workspace_name,
             } => (job_id, workspace_name),
         };
-        let Ok(Some(workspace)) = crate::workspace::store().get_by_name(workspace_name).await
-        else {
+        let Ok(Some(workspace)) = crate::users::resolve_workspace(workspace_name).await else {
             warn!(
                 job = %job_id,
                 workspace = %workspace_name,
@@ -171,6 +174,12 @@ pub async fn run_management() {
                 info!(job = %job_id, "Resuming analyze round at boot");
                 tokio::spawn(async move {
                     crate::tools::analyze::resume_analyze_round(&job_id, &workspace).await;
+                });
+            }
+            crate::jobs::ResumableJob::Implement { job_id, .. } => {
+                info!(job = %job_id, "Resuming implement round at boot");
+                tokio::spawn(async move {
+                    crate::tools::implement::resume_implement_round(&job_id, &workspace).await;
                 });
             }
             crate::jobs::ResumableJob::ResearchCleanup { job_id, .. } => {
@@ -1190,6 +1199,7 @@ async fn run_parallel_agents(
                         if has_session { "" } else { &task },
                         String::new(),
                         String::new(),
+                        false,
                         Some(rx),
                         resume,
                         Some(round),
@@ -1328,6 +1338,7 @@ async fn run_single_agent(
         message,
         String::new(),
         String::new(),
+        false,
         Some(incoming_rx),
         resume,
         None,

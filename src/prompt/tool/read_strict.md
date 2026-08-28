@@ -1,0 +1,10 @@
+Read file contents with line numbers, limited to the personal workspace. This workspace-only variant rejects any path outside the workspace: dependency-source caches, temp spill files, `/tmp`, and other system paths are not accessible. Relative paths resolve from the workspace.
+
+When the path is a directory, the tool lists its contents (using `ls -lA`) instead of returning an error. The directory listing groups subdirectories and files with sizes and an extension summary. Note that `mode`, `offset`, and `limit` parameters only apply to file reads — they are silently ignored when a directory is passed.
+
+Modes:
+- `content` (default): Outputs an entire file or a range (using `offset`+`limit`) with line numbers. Handles any file type; binary files are read with lossy UTF-8 conversion. When the path is a directory, lists the directory contents.
+- `symbols`: Lists all AST-level symbols (functions, structs, impl blocks, etc.) with line ranges. Supports Rust, JavaScript/TypeScript, and Python files. Use this to get a quick overview of a file's structure.
+- `zoom`: Extract a single symbol's full source by name (requires `symbol` parameter). Use with the output of `symbols` mode to drill into specific definitions.
+
+When a content-mode path is a raster image (PNG, JPEG, or WebP), the tool reads and attaches it to the conversation as a native image the model can inspect, instead of returning lossy text. Other binary formats that cannot be decoded (e.g. GIF, BMP, HEIC) are reported as unsupported. Files larger than 10 MB are rejected. PDF files are automatically extracted to plain text.

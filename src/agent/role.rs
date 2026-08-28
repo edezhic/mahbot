@@ -210,6 +210,21 @@ impl Role {
         crate::prompt::load_prompt(&format!("role/{}.md", self.as_str()))
     }
 
+    /// Role description for this role, optionally widened for a full-access
+    /// (admin) Assistant.
+    ///
+    /// Only the Assistant has a separate description when the triggering user
+    /// has `permissions='full'`; every other role returns its canonical
+    /// [`Role::role_description`] regardless of `full_access`.
+    #[must_use]
+    pub fn role_description_for(&self, full_access: bool) -> String {
+        if *self == Role::Assistant && full_access {
+            crate::prompt::load_prompt("role/assistant_full.md")
+        } else {
+            self.role_description()
+        }
+    }
+
     /// Discovery prompt for this role, loaded from embedded prompt files.
     ///
     /// # Panics
@@ -240,10 +255,11 @@ use crate::Tool;
 use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
-    AddCommentTool, AnalyzeTool, BrowserTool, CreateTicketTool, DispatchMode, EditTool,
-    GetTicketTool, ImageGenTool, ImplementTool, ListTicketsTool, ReadTool, ResearchTool,
-    SearchArchivedTicketsTool, SearchTool, ShellMode, ShellTool, UpdateTicketTool, VideoEditTool,
-    VideoGenTool, WebSearchBackend, WebSearchTool,
+    AddAlarmTool, AddCommentTool, AnalyzeTool, BrowserTool, CreateTicketTool, DispatchMode,
+    EditTool, GetTicketTool, ImageGenTool, ImplementTool, ListAlarmsTool, ListTicketsTool,
+    ReadTool, RemoveAlarmTool, ResearchTool, SearchArchivedTicketsTool, SearchTool, ShellMode,
+    ShellTool, StrictReadTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend,
+    WebSearchTool,
 };
 
 impl Role {
@@ -272,8 +288,13 @@ impl Role {
     ///
     /// Ticket tools are bound to `ws` at construction time — all their
     /// operations are confined to that workspace.
+    ///
+    /// `full_access` is the triggering user's `permissions='full'` (admin)
+    /// flag. It only widens the Assistant's toolset (adding `shell`,
+    /// `implement`, and `research`); every other role's toolset is
+    /// byte-identical regardless of its value.
     #[must_use]
-    pub(crate) fn tools(self, ws: &Workspace) -> Vec<Box<dyn Tool>> {
+    pub(crate) fn tools(self, ws: &Workspace, full_access: bool) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
                 let mut t = Self::full_core_tools();
@@ -281,7 +302,10 @@ impl Role {
                     DispatchMode::Sync,
                     Role::Engineer,
                 )));
-                t.push(Box::new(ImplementTool));
+                t.push(Box::new(ImplementTool::new(
+                    DispatchMode::Sync,
+                    Role::Engineer,
+                )));
                 t
             }
             Role::Manager => {
@@ -335,10 +359,31 @@ impl Role {
                 t
             }
             Role::Assistant => {
-                vec![Box::new(AnalyzeTool::new(
-                    DispatchMode::Async,
-                    Role::Assistant,
-                ))]
+                let mut t: Vec<Box<dyn Tool>> = vec![
+                    Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Assistant)),
+                    Box::new(AddAlarmTool),
+                    Box::new(ListAlarmsTool),
+                    Box::new(RemoveAlarmTool),
+                    Box::new(EditTool),
+                    Box::new(SearchTool),
+                ];
+                // Base Assistant is workspace-bounded (strict read only);
+                // full-access retains the general ReadTool so it can also read
+                // dependency sources / temp files.
+                if full_access {
+                    t.push(Box::new(ReadTool));
+                } else {
+                    t.push(Box::new(StrictReadTool));
+                }
+                if full_access {
+                    t.push(Box::new(ShellTool::new(ShellMode::Full)));
+                    t.push(Box::new(ImplementTool::new(
+                        DispatchMode::Async,
+                        Role::Assistant,
+                    )));
+                    t.push(Box::new(ResearchTool::new(Role::Assistant)));
+                }
+                t
             }
         };
 
@@ -460,7 +505,7 @@ mod tests {
         // missing arms in the match, but cannot catch an arm that returns
         // vec![]. Every role needs at least one tool to function.
         for role in Role::iter() {
-            let tools = role.tools(&crate::workspace::test_ws("test"));
+            let tools = role.tools(&crate::workspace::test_ws("test"), false);
             assert!(
                 !tools.is_empty(),
                 "{}: Role::tools() must not be empty — every role needs at least one tool",
@@ -480,7 +525,7 @@ mod tests {
         let _ = crate::config::CONFIG.set_string_field("web_search_provider", "exa");
         let _ = crate::config::CONFIG.set_string_field("exa_key", "test-key");
         let names: Vec<&str> = crate::Role::Sanitation
-            .tools(&crate::workspace::test_ws("test"))
+            .tools(&crate::workspace::test_ws("test"), false)
             .iter()
             .map(|t| t.name())
             .collect();
@@ -490,6 +535,67 @@ mod tests {
             ["read", "shell"],
             "Sanitation toolset must be exactly read + read-only shell, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn assistant_toolset_gates_full_access_tools() {
+        // The Assistant toolset must differ by the triggering user's
+        // full-access (admin) flag: base mode has no shell/implement/research,
+        // full mode does. Base gets the workspace-only StrictReadTool; full
+        // keeps the general ReadTool (which also permits dependency sources).
+        let ws = crate::workspace::test_ws("test");
+        let base = crate::Role::Assistant.tools(&ws, false);
+        let full = crate::Role::Assistant.tools(&ws, true);
+
+        for name in ["shell", "implement", "research"] {
+            assert!(
+                !base.iter().any(|t| t.name() == name),
+                "base Assistant toolset must not contain '{name}'"
+            );
+            assert!(
+                full.iter().any(|t| t.name() == name),
+                "full Assistant toolset must contain '{name}'"
+            );
+        }
+        // The read boundary is what the model is told: base (restricted) only
+        // advertises the personal workspace; full keeps the general allowlist.
+        let base_read = base.iter().find(|t| t.name() == "read");
+        let base_path_desc = base_read
+            .map(|t| t.parameters_schema()["properties"]["path"]["description"].to_string())
+            .unwrap_or_default();
+        assert!(
+            base_path_desc.contains("Only the workspace is accessible"),
+            "base Assistant read must advertise the workspace-only boundary, got: {base_path_desc}"
+        );
+        let full_read = full.iter().find(|t| t.name() == "read");
+        let full_path_desc = full_read
+            .map(|t| t.parameters_schema()["properties"]["path"]["description"].to_string())
+            .unwrap_or_default();
+        assert!(
+            full_path_desc.contains("policy allowlist"),
+            "full Assistant read must advertise the general allowlist boundary, got: {full_path_desc}"
+        );
+    }
+
+    #[test]
+    fn assistant_role_descriptions_are_populated() {
+        // Both Assistant descriptions (base + full) must be non-empty, free of
+        // unsubstituted template keys, and carry the alarm-notification marker.
+        for full_access in [false, true] {
+            let desc = crate::Role::Assistant.role_description_for(full_access);
+            assert!(
+                !desc.trim().is_empty(),
+                "Assistant role description must not be empty"
+            );
+            assert!(
+                !crate::prompt::TEMPLATE_RE.is_match(&desc),
+                "Assistant role description must not contain unsubstituted template keys"
+            );
+            assert!(
+                desc.contains("<alarm-notification>"),
+                "Assistant role description must explain the <alarm-notification> marker"
+            );
+        }
     }
 
     #[test]

@@ -501,7 +501,10 @@ impl Tool for SearchTool {
     }
 
     fn side_effects(&self) -> bool {
-        false // indexed search, no mutations
+        // The lazily git-init of a personal workspace is a one-time idempotent
+        // setup that never mutates content and cannot conflict with parallel
+        // read-only tools, so search stays safely groupable.
+        false
     }
 
     async fn execute(
@@ -509,6 +512,17 @@ impl Tool for SearchTool {
         ws: &crate::Workspace,
         mut args: serde_json::Value,
     ) -> anyhow::Result<String> {
+        // Personal workspaces are not registered in the workspaces table and
+        // may lack a git repo (the indexer scans normal content fine without
+        // one, but a repo ensures hidden/dot-prefixed content is indexed).
+        // Ensure the directory exists and is git-initialized before the search
+        // engine scans it.
+        if crate::users::is_personal_workspace(&ws.name)
+            && let Some(user) = crate::users::personal_user_name(&ws.name)
+        {
+            crate::users::ensure_personal_workspace(user).await;
+        }
+
         normalize_search_args(&mut args);
 
         let mode = super::get_opt_str(&args, "mode")

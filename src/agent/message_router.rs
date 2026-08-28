@@ -108,6 +108,9 @@ pub enum MessageKind {
     /// Result from an async AnalyzeTool sub-agent, injected back into the caller's
     /// agent session.
     AnalyzeToolResult,
+    /// Result from an async ImplementTool dispatch, injected back into the
+    /// caller's agent session.
+    ImplementResult,
     /// Result from an async deep research run (ResearchTool), injected back
     /// into the Manager's agent session. Exactly one envelope per run.
     ResearchResult,
@@ -327,9 +330,10 @@ pub async fn route_user_message(
 
 /// Persist an envelope to `pending_jobs`. The target agent id is derived
 /// from the envelope by [`crate::jobs::pending_job_params`].
-/// Used by the durable producers (manager-bound messages here; analyze/research
-/// use the source job id via [`crate::jobs::complete_job_with_envelope`]).
-async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
+/// Used by the durable producers: manager-bound messages routed here,
+/// analyze/research results via [`crate::jobs::complete_job_with_envelope`],
+/// and alarm notifications from [`crate::alarms::fire_alarm`].
+pub(crate) async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
     let now = db::now();
     crate::session::store()
         .conn
@@ -407,18 +411,7 @@ pub fn try_route(agent_id: &str, job: AgentJob) -> bool {
 /// (and is not a personal workspace).
 /// Returns `Err(e)` on database errors.
 async fn resolve_workspace(workspace_name: &str) -> anyhow::Result<Option<Workspace>> {
-    match crate::workspace::get_by_name(workspace_name).await? {
-        Some(ws) => Ok(Some(ws)),
-        None if crate::users::is_personal_workspace(workspace_name) => {
-            let user_name = crate::users::personal_user_name(workspace_name)
-                .expect("invariant: is_personal_workspace checked prefix");
-            let path = crate::users::personal_workspace_path(user_name);
-            Ok(Some(crate::users::personal_workspace_struct(
-                user_name, &path,
-            )))
-        }
-        None => Ok(None),
-    }
+    crate::users::resolve_workspace(workspace_name).await
 }
 
 // ── Consumer loop ─────────────────────────────────────────────────────────
@@ -549,6 +542,9 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         };
 
         // ── Run the agent ─────────────────────────────────────────────
+        // Full-access (admin) users get the Assistant's full-permission toolset
+        // and role prompt; everyone else runs the base Assistant.
+        let full_access = users.first().is_some_and(UserRecord::is_admin);
         let (agent, response) = crate::agent::run_agent(
             agent_id.clone(),
             role,
@@ -557,6 +553,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             &message,
             job.user_name.clone(),
             job.channel.clone(),
+            full_access,
             None,
             false,
             None,

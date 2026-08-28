@@ -5,7 +5,7 @@
 //!
 //! ## Usage
 //! 1. `Session::default()` at turn start
-//! 2. `session.init(agent_id, msg, ws, role, ticket, channel, user_name, round_ts)` — loads history, builds prompt
+//! 2. `session.init(agent_id, msg, ws, role, ticket, channel, user_name, round_ts, full_access)` — loads history, builds prompt
 //!    for new sessions, persists user message, stores history internally
 //! 3. Agent loop calls `session.push_assistant()`, `session.persist_messages()`,
 //!    `session.push_messages_unpersisted()`, etc. during tool rounds
@@ -132,6 +132,7 @@ impl Session {
         channel: &str,
         user_name: &str,
         round_ts: Option<&str>,
+        full_access: bool,
     ) -> Result<()> {
         // Load existing history from DB
         let mut history = crate::session::store().load(agent_id).await;
@@ -144,7 +145,7 @@ impl Session {
 
             if is_new {
                 let (msgs, snapshot) =
-                    Self::build_turn_messages(msg, ws, role, ticket, round_ts).await;
+                    Self::build_turn_messages(msg, ws, role, ticket, round_ts, full_access).await;
 
                 // Batch-write all messages + session context atomically.
                 crate::session::store()
@@ -371,9 +372,11 @@ impl Session {
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
+        full_access: bool,
     ) {
         // Build fresh system prompt (may have changed since session start).
-        let (mut compacted, snapshot) = Self::build_context_messages(ws, role, ticket).await;
+        let (mut compacted, snapshot) =
+            Self::build_context_messages(ws, role, ticket, full_access).await;
 
         // Append conversation summary, then the retained latest turns in
         // chronological order. The in-flight user message is already among
@@ -461,6 +464,7 @@ impl Session {
         ws: &Workspace,
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
+        full_access: bool,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (stored_context, board_context) = tokio::join!(
             lookup_workspace_context(ws, role),
@@ -499,7 +503,7 @@ impl Session {
             ],
         );
 
-        let role_description = role.role_description();
+        let role_description = role.role_description_for(full_access);
         let skills = skills::load_skills(ws).await;
 
         let mut msgs = Vec::with_capacity(6);
@@ -551,8 +555,10 @@ impl Session {
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
         round_ts: Option<&str>,
+        full_access: bool,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
-        let (mut msgs, snapshot) = Self::build_context_messages(ws, role, ticket).await;
+        let (mut msgs, snapshot) =
+            Self::build_context_messages(ws, role, ticket, full_access).await;
         msgs.push(crate::session::user_msg_with_ts(msg, round_ts));
         (msgs, snapshot)
     }

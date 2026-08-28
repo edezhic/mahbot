@@ -384,6 +384,7 @@ async fn run_analyze_with_job(
                 None,
                 String::new(),
                 String::new(),
+                false,
                 Some(crate::agent::registry::ParentKey::AnalyzeRound(
                     job_id.to_string(),
                 )),
@@ -400,6 +401,7 @@ async fn run_analyze_with_job(
                     "",
                     "",
                     None,
+                    false,
                 )
                 .await;
             runs.push(AnalyzeRun::Completed {
@@ -486,6 +488,7 @@ async fn run_analyze_slots(
                     if has_session { "" } else { task.as_str() },
                     String::new(),
                     String::new(),
+                    false,
                     None,
                     resume,
                     Some(round),
@@ -1818,6 +1821,7 @@ mod tests {
             None,
             String::new(),
             String::new(),
+            false,
             None,
             None,
         );

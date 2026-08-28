@@ -356,7 +356,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wal_guard_all_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Only the PHYSICAL store files exist on disk: one consolidated domain
-        // file (core.db, backing all 6 domain stores) + the logs file. Write
+        // file (core.db, backing all the domain stores) + the logs file. Write
         // a valid main-DB header for both physical files so every logical name
         // resolves to a Healthy classification.
         let mut db = vec![0u8; 4096];

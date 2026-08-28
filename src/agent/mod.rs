@@ -238,9 +238,10 @@ async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> 
 pub(crate) fn role_tools_and_specs(
     role: crate::Role,
     ws: &crate::Workspace,
+    full_access: bool,
 ) -> (Vec<Box<dyn Tool>>, Vec<crate::ToolSpec>) {
     let tools: Vec<Box<dyn Tool>> = role
-        .tools(ws)
+        .tools(ws, full_access)
         .into_iter()
         .filter(|t| t.is_advertised())
         .collect();
@@ -338,10 +339,11 @@ impl Agent {
         ticket: Option<crate::pipeline::board::Ticket>,
         user_name: String,
         channel: String,
+        full_access: bool,
         parent_key: Option<crate::agent::registry::ParentKey>,
         parent_label: Option<String>,
     ) -> Self {
-        let (tools, tool_specs) = role_tools_and_specs(role, ws);
+        let (tools, tool_specs) = role_tools_and_specs(role, ws, full_access);
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -414,6 +416,7 @@ impl Agent {
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name,
             channel,
+            full_access,
             parent_key,
             parent_label,
             incoming_rx: None,
@@ -589,6 +592,7 @@ impl Agent {
                 &self.channel,
                 &self.user_name,
                 self.round_ts.as_deref(),
+                self.full_access,
             )
             .await?;
 
@@ -1772,6 +1776,7 @@ impl Agent {
                             &self.workspace,
                             &self.role,
                             self.ticket.as_ref(),
+                            self.full_access,
                         )
                         .await;
                 }
@@ -1982,6 +1987,7 @@ pub(crate) async fn run_agent(
     message: &str,
     user_name: String,
     channel: String,
+    full_access: bool,
     incoming_rx: Option<
         tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob>,
     >,
@@ -2013,6 +2019,7 @@ pub(crate) async fn run_agent(
         ticket.cloned(),
         user_name,
         channel,
+        full_access,
         parent_key,
         parent_label,
     );
@@ -2106,6 +2113,7 @@ pub(crate) async fn run_default_agent(
         message,
         String::new(),
         String::new(),
+        false,
         None,
         false,
         round,
@@ -2232,6 +2240,7 @@ mod tests {
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name: String::new(),
             channel: String::new(),
+            full_access: false,
             parent_key: None,
             parent_label: None,
             incoming_rx: None,
@@ -2816,7 +2825,7 @@ mod tests {
         agent.agent_id = agent_id.to_string();
         agent
             .session
-            .init(agent_id, "", ws, &role, Some(&ticket), "", "", None)
+            .init(agent_id, "", ws, &role, Some(&ticket), "", "", None, false)
             .await
             .unwrap();
         agent.ticket = Some(ticket);
@@ -3210,6 +3219,7 @@ mod tests {
             "task",
             String::new(),
             String::new(),
+            false,
             None,
             false,
             Some(RoundOpts {

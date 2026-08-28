@@ -65,6 +65,8 @@ pub enum AgentKind {
     Analyst,
     Verifier,
     Engineer,
+    /// Single coder sub-agent for the durable async ImplementTool dispatch.
+    Coder,
     Sanitation,
     /// Synthetic in-flight marker for the shell-command diagnostics stage (not
     /// an LLM agent — the roster row only drives the re-dispatch guard).
@@ -78,6 +80,7 @@ impl AgentKind {
             Self::Analyst => "analyst",
             Self::Verifier => "verifier",
             Self::Engineer => "engineer",
+            Self::Coder => "coder",
             Self::Sanitation => "sanitation",
             Self::Diagnostics => "diagnostics",
         }
@@ -220,6 +223,10 @@ pub(crate) fn agent_params(
 pub(crate) enum SpawnChild {
     /// Pure kind marker — no child row (resume reads the jobs row alone).
     Analyze,
+    /// Pure kind marker — no child row (resume reads the jobs row alone). The
+    /// single coder's roster row holds the dispatched task; the job row holds
+    /// the caller identity for resume delivery.
+    Implement,
     /// research_jobs (id, state).
     Research,
     /// A research-run cleanup Sanitation agent. No child row: the jobs row's
@@ -251,6 +258,7 @@ impl SpawnChild {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::Analyze => "analyze",
+            Self::Implement => "implement",
             Self::Research => "research",
             Self::ResearchCleanup => "research_cleanup",
             Self::TempCleanup => "temp_cleanup",
@@ -323,10 +331,11 @@ pub(crate) async fn spawn_job(
         .with_context(|| format!("failed to insert agent roster for job {id}"))?;
     }
     match child {
-        // Analyze / ResearchCleanup / TempCleanup / ticket Phase are pure
-        // kind markers — the job row alone drives resume (the cleanup prompt
-        // lives in jobs.task, the ticket id on jobs.ticket_id).
+        // Analyze / Implement / ResearchCleanup / TempCleanup / ticket Phase are
+        // pure kind markers — the job row alone drives resume (the cleanup
+        // prompt lives in jobs.task, the ticket id on jobs.ticket_id).
         SpawnChild::Analyze
+        | SpawnChild::Implement
         | SpawnChild::ResearchCleanup
         | SpawnChild::TempCleanup
         | SpawnChild::Phase { .. } => {}
@@ -962,6 +971,10 @@ pub(crate) enum ResumableJob {
         job_id: String,
         workspace_name: String,
     },
+    Implement {
+        job_id: String,
+        workspace_name: String,
+    },
     /// A research-run cleanup Sanitation agent interrupted by a crash. The
     /// jobs row id == the run id, so the row is the cleanup's resume marker
     /// and holds the folder until the cleanup completes.
@@ -1229,8 +1242,9 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
     // current phase) are NOT kind-discriminated resume targets — the single
     // puller re-drives them. We only clear their stale launched roster rows
     // (the previous process's agents are dead) so the puller re-dispatches.
-    // The research/analyze/research_cleanup/temp_cleanup kinds resume or
-    // terminalize in line. The kind only selects the `ResumableJob` variant.
+    // The research/analyze/implement/research_cleanup/temp_cleanup kinds
+    // resume or terminalize in line. The kind only selects the `ResumableJob`
+    // variant.
     let jobs = list_active_jobs(conn).await?;
     let mut resumable: Vec<ResumableJob> = Vec::new();
     let mut resumed_other = 0usize;
@@ -1264,6 +1278,16 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                     job_id: job.id.clone(),
                     workspace_name: job.workspace_name.clone(),
                 }
+            });
+            resumed_other += 1;
+        } else if job.kind == "implement" {
+            // A single-coder implement round interrupted by a crash: resume it
+            // like any other durable envelope kind. The coder roster row holds
+            // the terminal outcome; the job row holds the caller identity.
+            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
+            resumable.push(ResumableJob::Implement {
+                job_id: job.id.clone(),
+                workspace_name: job.workspace_name.clone(),
             });
             resumed_other += 1;
         } else if job.kind == "research_cleanup" {

@@ -1046,6 +1046,7 @@ mod tests {
                 "gui",
                 "tester",
                 None,
+                false,
             )
             .await
             .unwrap();

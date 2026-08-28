@@ -2,6 +2,7 @@
 
 use anyhow::Context;
 pub(crate) mod active_models;
+pub(crate) mod alarms;
 pub(crate) mod analyze;
 pub mod browser;
 pub mod browser_daemon;
@@ -150,12 +151,13 @@ pub(crate) fn fit_request_body_budget(
 
 // ── Re-exports ─────────────────────────────────────────────────────────
 
+pub(crate) use alarms::{AddAlarmTool, ListAlarmsTool, RemoveAlarmTool};
 pub(crate) use analyze::{AnalyzeTool, DispatchMode};
 pub(crate) use browser::BrowserTool;
 pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use implement::ImplementTool;
-pub(crate) use read::ReadTool;
+pub(crate) use read::{ReadTool, StrictReadTool};
 pub(crate) use research::ResearchTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
