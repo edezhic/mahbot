@@ -433,13 +433,15 @@ fn render_section(
     .into()
 }
 
-/// Resolve a group's header: the primary title plus an optional small
-/// secondary element (the ticket id).
+/// Resolve a group's header parts: the primary label plus an optional
+/// secondary element (the ticket id). `render_group` applies the visual
+/// hierarchy — for ticket groups the ID is rendered large/prominent and the
+/// title is the small, brighter subordinate line; single-label groups render
+/// their label as the small, brighter subordinate line.
 ///
-/// - Ticket groups: the ticket NAME prominently, the ticket ID as a small
-///   secondary element. When no title was captured (defensive — every live
-///   ticket group carries one via its agents or the synthesis call), the ID
-///   becomes the title.
+/// - Ticket groups: the ticket NAME plus the ticket ID as the secondary. When
+///   no title was captured (defensive — every live ticket group carries one
+///   via its agents or the synthesis call), the ID becomes the sole label.
 /// - Analyze/research groups: the truncated question/task text; a generic
 ///   fallback when no label was captured. The raw NanoID key is NEVER shown.
 /// - Singleton/unattributed groups: generic labels — their workspace name is
@@ -469,18 +471,30 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
     }
 }
 
-/// Render one group: header (title + secondary + run-lifetime marker) then
-/// the group panel holding its cards/rows. Cards are visually separated from
-/// the panel via the established card style.
+/// Render one group: header (ID/label + run-lifetime marker) then the group
+/// panel holding its cards/rows. Cards are visually separated from the panel
+/// via the established card style.
 fn render_group(
     group: &DisplayGroup,
     expanded: &HashSet<(String, u64)>,
 ) -> Element<'static, RunningMessage> {
     let (title, secondary) = group_title(group);
-    let mut header_parts: Vec<Element<'_, RunningMessage>> =
-        vec![text(title).size(15).color(theme::ACCENT).into()];
-    if let Some(secondary) = secondary {
-        header_parts.push(text(secondary).size(11).color(theme::TEXT_MUTED).into());
+    let mut header_parts: Vec<Element<'_, RunningMessage>> = Vec::new();
+    if group.kind == GroupKind::Ticket {
+        // Ticket group: the ID is the prominent ACCENT element rendered first;
+        // the title is the small, brighter subordinate line rendered second.
+        // When no title was captured (defensive), the ID is the sole large
+        // element.
+        if let Some(id) = secondary {
+            header_parts.push(text(id).size(15).color(theme::ACCENT).into());
+            header_parts.push(text(title).size(12).color(theme::TEXT_SECONDARY).into());
+        } else {
+            header_parts.push(text(title).size(15).color(theme::ACCENT).into());
+        }
+    } else {
+        // Single-label groups (analyze/research/singleton/unattributed): the
+        // label is the small, brighter subordinate line (no large element).
+        header_parts.push(text(title).size(12).color(theme::TEXT_SECONDARY).into());
     }
     if group.run_lifetime {
         header_parts.push(text("run active").size(11).color(theme::ACCENT).into());
@@ -1396,7 +1410,7 @@ mod tests {
             Some("Fix the login flow"),
             "group label adopted from a member's parent label"
         );
-        // The header title is the ticket name; the id is only the secondary.
+        // group_title preserves (name, id); render_group swaps which is emphasized.
         let (title, secondary) = group_title(ticket);
         assert_eq!(title, "Fix the login flow");
         assert_eq!(secondary.as_deref(), Some("T1"));
