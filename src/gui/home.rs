@@ -849,7 +849,7 @@ impl HomeState {
         let transcription_disabled = crate::audio::voice::is_transcription_disabled();
         let recording_unavailable = mic_busy || transcription_disabled;
 
-        // Right-edge controls column: role selector + mic button.
+        // Controls for the composer action toolbar: role selector + mic button.
         let mut controls: Vec<Element<'_, HomeMessage>> = Vec::new();
         let role_icon = match active_role {
             Some(role) => {
@@ -944,9 +944,9 @@ impl HomeState {
                 // Input disabled during the graceful drain:
                 // sends are blocked while draining.
                 sending: self.sending || draining,
-                // One line taller than the plain composer so the controls
-                // column (role + mic) fits above the send button.
-                min_height: 88.0,
+                // The action toolbar sits below the editor, so no reserved
+                // height is needed.
+                min_height: 44.0,
                 max_height: 330.0,
                 controls,
                 grey_on_empty: true,

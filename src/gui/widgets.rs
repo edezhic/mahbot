@@ -401,8 +401,9 @@ pub struct ChatComposerOptions<'a, M> {
     /// Editor min/max heights in px.
     pub min_height: f32,
     pub max_height: f32,
-    /// Right-edge controls rendered above the send button (Home role/mic
-    /// column; empty for the plain Board composer).
+    /// Action toolbar controls rendered alongside the send button inside the
+    /// input surface (Home role/mic buttons; empty for the plain Board
+    /// composer).
     pub controls: Vec<Element<'a, M>>,
     /// Grey the send button while the input is empty/whitespace-only.
     /// Home enables this (empty-input affordance); Board keeps its legacy
@@ -418,12 +419,13 @@ pub struct ChatComposerOptions<'a, M> {
     pub id: Option<iced::widget::Id>,
 }
 
-/// Shared chat composer: text editor with Enter-to-send, a floating send
-/// button, and the overlay stack. `on_action`/`send_msg` parameterize the
-/// page's messages; callers supply the placeholder and an
-/// [`ChatComposerOptions`] bundle (editor min/max heights, the sending flag,
-/// optional right-edge controls, and whether the send button greys on empty
-/// input).
+/// Shared chat composer: a bubble-styled input surface matching the user
+/// message bubbles (BG_ELEVATED, radius 8, no border, 10px padding) holding
+/// the multi-line prose editor above a right-aligned action toolbar.
+/// `on_action`/`send_msg` parameterize the page's messages; callers supply
+/// the placeholder and a [`ChatComposerOptions`] bundle (editor min/max
+/// heights, the sending flag, optional controls, and whether the send button
+/// greys on empty input).
 #[must_use]
 pub fn chat_composer<'a, M: Clone + 'a>(
     content: &'a super::editor_widget::EditorBuffer,
@@ -441,31 +443,19 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         .placeholder(placeholder)
         .min_height(options.min_height)
         .max_height(options.max_height)
-        .padding(5.0);
+        .padding(5.0)
+        .background(Some(theme::BG_ELEVATED));
     if let Some(id) = options.id {
         editor = editor.id(id);
     }
-
-    // The widget has a uniform scalar padding; keep the text clear of the
-    // right-edge control column by insetting the chrome container on the
-    // right when controls are present (the widget already provides the 5px
-    // inset on every other edge).
-    let input_editor: Element<'a, M> = {
-        let editor: Element<'a, M> = iced::Element::new(editor).map(move |action| match action {
+    let input_editor: Element<'a, M> =
+        container(iced::Element::new(editor).map(move |action| match action {
             super::editor_widget::EditorAction::Submit => send_msg.clone(),
             other => on_action(other),
-        });
-        let mut editor_container = container(editor)
-            .width(Length::Fill)
-            .height(Length::Shrink)
-            .style(|_theme| theme::container_style(theme::BG_ELEVATED, 8.0, 1.0, theme::ACCENT));
-        if !options.controls.is_empty() {
-            // 33px container inset + 5px widget padding ≈ the shared editor's
-            // 38px right clearance for the controls column.
-            editor_container = editor_container.padding(iced::Padding::default().right(33.0));
-        }
-        editor_container.into()
-    };
+        }))
+        .width(Length::Fill)
+        .height(Length::Shrink)
+        .into();
 
     // Whitespace-only input counts as empty (greys the send button).
     // The emptiness check is gated on grey_on_empty so Board (legacy look)
@@ -491,24 +481,31 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         tooltip::Position::Top,
     );
 
-    // Right-edge overlay: controls column (when present) above the send button.
-    let mut col = Column::new().spacing(6).align_x(Alignment::End);
+    // Right-aligned action toolbar inside the input surface: controls (Home
+    // role/mic; empty for the plain Board composer) then the send button.
+    let mut toolbar = Row::new().spacing(6).align_y(Alignment::Center);
+    toolbar = toolbar.push(Space::new().width(Length::Fill));
     for c in options.controls {
-        col = col.push(c);
+        toolbar = toolbar.push(c);
     }
-    let overlay: Element<'_, M> = container(col.push(send_btn))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Alignment::End)
-        .align_y(Alignment::End)
-        .padding(iced::Padding::default().right(8.0).bottom(8.0))
-        .into();
+    toolbar = toolbar.push(send_btn);
 
-    // Stack the editor with the send button overlaid at bottom-right.
-    container(stack([input_editor, overlay]))
-        .padding(8)
-        .style(theme::base_container_style)
-        .into()
+    // Bubble-styled input surface: editor above, action icons below-right,
+    // inside one container matching the user message bubble form. A trailing
+    // spacer gives the composer the same 3/4 width as message bubbles — the
+    // bubble's FillPortion(3) only takes effect with a FillPortion(1) sibling
+    // (mirroring the user/agent bubble rows).
+    row![
+        container(column![input_editor, toolbar].spacing(6))
+            .padding(10)
+            .style(theme::bubble_style(
+                theme::BG_ELEVATED,
+                Some(theme::TEXT_PRIMARY),
+            ))
+            .width(Length::FillPortion(3)),
+        Space::new().width(Length::FillPortion(1)),
+    ]
+    .into()
 }
 
 /// Render formatted diff stats (+X/−Y) matching ticket card style.
