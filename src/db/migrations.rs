@@ -424,6 +424,11 @@ CREATE TABLE IF NOT EXISTS alarms (
 );
 CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(status, next_fire_at);";
 
+/// Chat-history message timestamp: a nullable RFC 3339 column (`db::now()`)
+/// populated on every new row so the GUI can render relative times. Old rows
+/// stay NULL, which maps to no label.
+const DELTA_CHAT_HISTORY_TIMESTAMP: &str = "ALTER TABLE chat_history ADD COLUMN timestamp TEXT;";
+
 /// The id of the one-time consolidation import (a Rust-function migration).
 pub(crate) const CONSOLIDATION_IMPORT_ID: &str = "consolidate_001_import_domain_stores";
 
@@ -651,6 +656,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "17",
         target: TargetDb::Core,
         body: MigrationBody::Sql(DELTA_ALARMS),
+    },
+    // Chat-history message-timestamp delta.
+    Migration {
+        id: "18",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(DELTA_CHAT_HISTORY_TIMESTAMP),
     },
 ];
 
@@ -1699,6 +1710,13 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
         // Simulate a pre-change "current" DB: the same current shape, but
         // `schema_migrations` holds ONLY the historical ids.
         conn.execute("DELETE FROM schema_migrations", ())
+            .await
+            .unwrap();
+        // Migration "18" (chat_history.timestamp) is a genuine one-time schema
+        // addition, not an idempotent cleanup like "15"/"16". The pre-change
+        // DB had no such column, so drop it to restore that shape before the
+        // reopen re-applies it.
+        conn.execute("ALTER TABLE chat_history DROP COLUMN timestamp;", ())
             .await
             .unwrap();
         for id in OLD_DEPLOYED_IDS {

@@ -70,6 +70,7 @@ impl BroadcastPersistEntry {
                 content: self.content,
                 agent_role: self.agent_role,
                 workspace: self.workspace,
+                timestamp: Some(timestamp),
             })
             .await;
     }
@@ -186,6 +187,7 @@ pub async fn broadcast_and_persist_incoming_message(
                     content: persist_content.to_string(),
                     agent_role: None,
                     workspace: msg.workspace.clone(),
+                    timestamp: Some(timestamp),
                 })
                 .await;
         },

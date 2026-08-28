@@ -17,7 +17,7 @@ crate::define_store! {
 
 /// Parameters for inserting a chat history entry.
 ///
-/// This struct bundles the 6 fields needed by [`ChatHistoryStore::insert`].
+/// This struct bundles the 7 fields needed by [`ChatHistoryStore::insert`].
 /// Owned `String` fields match the pattern established by
 /// [`LogEntry`](crate::logs::LogEntry).
 #[derive(Debug, Clone)]
@@ -28,6 +28,7 @@ pub struct ChatHistoryInsert {
     pub content: String,
     pub agent_role: Option<String>,
     pub workspace: String,
+    pub timestamp: Option<String>,
 }
 
 /// A single chat message record for history display.
@@ -38,6 +39,7 @@ pub struct ChatHistoryEntry {
     pub content: String,
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
+    pub timestamp: Option<String>,
 }
 
 /// Maximum number of history entries to load at once.
@@ -51,6 +53,7 @@ crate::columns! {
         CONTENT     => "content",
         DIRECTION   => "direction",
         AGENT_ROLE  => "agent_role",
+        TIMESTAMP   => "timestamp",
     }
 }
 
@@ -67,6 +70,7 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
             _ => ChatDirection::User,
         },
         agent_role: row.get::<Option<String>>(COL_CH_AGENT_ROLE)?,
+        timestamp: row.get::<Option<String>>(COL_CH_TIMESTAMP)?,
     })
 }
 
@@ -98,8 +102,8 @@ impl ChatHistoryStore {
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO chat_history \
-                 (message_id, user_name, direction, content, agent_role, workspace) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (message_id, user_name, direction, content, agent_role, workspace, timestamp) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 db::params![
                     entry.message_id.clone(),
                     entry.user_name.clone(),
@@ -107,6 +111,7 @@ impl ChatHistoryStore {
                     entry.content.clone(),
                     entry.agent_role.clone(),
                     entry.workspace.clone(),
+                    entry.timestamp.clone(),
                 ],
             )
             .await?;
@@ -206,6 +211,7 @@ impl ChatHistoryStore {
             content: db::now(),
             agent_role: None,
             workspace: workspace.to_string(),
+            timestamp: None,
         })
         .await
     }
@@ -245,6 +251,7 @@ mod tests {
                 content: "hello".to_string(),
                 agent_role: None,
                 workspace: "ws".to_string(),
+                timestamp: None,
             })
             .await
             .expect("insert should succeed");
@@ -369,6 +376,7 @@ mod tests {
                 content: "hello".to_string(),
                 agent_role: None,
                 workspace: "ws1".to_string(),
+                timestamp: None,
             })
             .await
             .expect("insert should succeed");
@@ -388,6 +396,7 @@ mod tests {
                 content: "world".to_string(),
                 agent_role: None,
                 workspace: "ws1".to_string(),
+                timestamp: None,
             })
             .await
             .expect("insert should succeed");
@@ -433,6 +442,7 @@ mod tests {
                     content: content.to_string(),
                     agent_role: None,
                     workspace: ws.to_string(),
+                    timestamp: None,
                 })
                 .await
                 .expect("insert should succeed");
@@ -477,6 +487,7 @@ mod tests {
                     content: format!("c{i}"),
                     agent_role: None,
                     workspace: ws.to_string(),
+                    timestamp: None,
                 })
                 .await
                 .expect("insert should succeed");

@@ -36,6 +36,8 @@ pub struct DisplayMessage {
     pub content: String,
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
+    /// Timestamp (from chat_history) used for the relative-time label.
+    pub timestamp: Option<String>,
     /// Pre-parsed markdown items for rendering.
     pub md_items: Vec<iced::widget::markdown::Item>,
     /// True when this is an optimistic placeholder pushed before the pipeline
@@ -53,6 +55,7 @@ fn display_message(
     content: String,
     direction: ChatDirection,
     agent_role: Option<String>,
+    timestamp: Option<String>,
     is_optimistic: bool,
 ) -> DisplayMessage {
     use iced::widget::markdown;
@@ -69,6 +72,7 @@ fn display_message(
         content,
         direction,
         agent_role,
+        timestamp,
         md_items,
         is_optimistic,
     }
@@ -82,9 +86,18 @@ impl From<ChatHistoryEntry> for DisplayMessage {
             content,
             direction,
             agent_role,
+            timestamp,
             ..
         } = entry;
-        display_message(Some(id), message_id, content, direction, agent_role, false)
+        display_message(
+            Some(id),
+            message_id,
+            content,
+            direction,
+            agent_role,
+            timestamp,
+            false,
+        )
     }
 }
 
@@ -500,6 +513,7 @@ impl HomeState {
         content: &str,
         direction: ChatDirection,
         agent_role: Option<&str>,
+        timestamp: Option<&str>,
     ) -> Option<Task<HomeMessage>> {
         if let Some(opt_id) = optimistic_id {
             if let Some(pos) = self
@@ -513,6 +527,7 @@ impl HomeState {
                     content.to_string(),
                     direction,
                     agent_role.map(std::string::ToString::to_string),
+                    timestamp.map(std::string::ToString::to_string),
                     false,
                 );
                 // Track the canonical ID for dedup — the optimistic ID was
@@ -588,6 +603,7 @@ impl HomeState {
     /// The caller should call [`maybe_snap()`](Self::maybe_snap)
     /// unconditionally after this (snap is always safe when nothing was
     /// appended).
+    #[expect(clippy::too_many_arguments)]
     fn append_message(
         &mut self,
         user_name: &str,
@@ -596,6 +612,7 @@ impl HomeState {
         content: String,
         direction: ChatDirection,
         agent_role: Option<String>,
+        timestamp: Option<String>,
     ) {
         if Some(user_name) != self.selected_user.as_deref() {
             return;
@@ -605,7 +622,7 @@ impl HomeState {
         }
 
         self.messages.push(display_message(
-            None, message_id, content, direction, agent_role, false,
+            None, message_id, content, direction, agent_role, timestamp, false,
         ));
     }
 
@@ -703,9 +720,15 @@ impl HomeState {
                         if let Some(role) = maybe_role {
                             let (icon_color, _) = theme::role_badge_color_for(&role);
                             let icon = theme::role_icon(&role).size(14).color(icon_color);
-                            column![row![icon].align_y(Alignment::Center), content]
-                                .spacing(4)
-                                .into()
+                            let mut icon_row = row![icon].align_y(Alignment::Center).spacing(6);
+                            if let Some(ts) = msg.timestamp.as_deref() {
+                                let label = theme::format_relative_time(ts, chrono::Local::now());
+                                if !label.is_empty() {
+                                    icon_row = icon_row
+                                        .push(text(label).size(11).color(theme::TEXT_MUTED));
+                                }
+                            }
+                            column![icon_row, content].spacing(4).into()
                         } else {
                             content
                         }
@@ -1217,7 +1240,7 @@ impl HomeState {
                     user_name,
                     content,
                     direction,
-                    timestamp: _,
+                    timestamp,
                     channel: _,
                     agent_role,
                     workspace,
@@ -1230,6 +1253,7 @@ impl HomeState {
                         &content,
                         direction,
                         agent_role.as_deref(),
+                        Some(timestamp.as_str()),
                     ) {
                         return task;
                     }
@@ -1244,7 +1268,13 @@ impl HomeState {
 
                     // 4. Append the message (filtered by selected user + workspace).
                     self.append_message(
-                        &user_name, &workspace, message_id, content, direction, agent_role,
+                        &user_name,
+                        &workspace,
+                        message_id,
+                        content,
+                        direction,
+                        agent_role,
+                        Some(timestamp),
                     );
 
                     self.maybe_snap()
@@ -1476,6 +1506,7 @@ impl HomeState {
                 content.clone(),
                 ChatDirection::User,
                 None,
+                None,
                 true,
             ));
         }
@@ -1579,6 +1610,7 @@ mod tests {
             content: content.to_string(),
             direction,
             agent_role: agent_role.map(String::from),
+            timestamp: None,
             md_items: Vec::new(),
             is_optimistic,
         }
@@ -1604,6 +1636,7 @@ mod tests {
             "real-42",
             "Hello!",
             ChatDirection::User,
+            None,
             None,
         );
 
@@ -1638,6 +1671,7 @@ mod tests {
             "Hello!",
             ChatDirection::User,
             None,
+            None,
         );
 
         assert!(task.is_none(), "expected None when no optimistic match");
@@ -1652,7 +1686,8 @@ mod tests {
     fn test_replace_optimistic_no_opt_id() {
         let mut state = make_home_state("alice", "ws1");
 
-        let task = state.replace_optimistic(None, "real-42", "Hello!", ChatDirection::User, None);
+        let task =
+            state.replace_optimistic(None, "real-42", "Hello!", ChatDirection::User, None, None);
 
         assert!(task.is_none(), "expected None when optimistic_id is None");
     }
@@ -1768,6 +1803,7 @@ mod tests {
             "Hello!".to_string(),
             ChatDirection::User,
             None,
+            None,
         );
 
         assert_eq!(state.messages.len(), 1);
@@ -1785,6 +1821,7 @@ mod tests {
             "msg-1".to_string(),
             "Hello!".to_string(),
             ChatDirection::User,
+            None,
             None,
         );
 
@@ -1806,6 +1843,7 @@ mod tests {
             "Hello!".to_string(),
             ChatDirection::User,
             None,
+            None,
         );
 
         assert_eq!(
@@ -1826,6 +1864,7 @@ mod tests {
             "Agent answer".to_string(),
             ChatDirection::Agent,
             Some("engineer".to_string()),
+            None,
         );
 
         assert_eq!(state.messages.len(), 1);
@@ -2081,6 +2120,7 @@ mod tests {
                 content.to_string(),
                 ChatDirection::Agent,
                 Some(role.to_string()),
+                None,
             );
             assert_eq!(state.messages.len(), 1);
             assert_eq!(state.messages[0].content, content);
@@ -2102,6 +2142,7 @@ mod tests {
             "other".to_string(),
             ChatDirection::Agent,
             None,
+            None,
         );
         assert_eq!(
             state.messages.len(),
@@ -2122,6 +2163,7 @@ mod tests {
             content: "Hello **world**".to_string(),
             direction: ChatDirection::User,
             agent_role: None,
+            timestamp: None,
         };
         let msg = DisplayMessage::from(entry);
 
@@ -2143,6 +2185,7 @@ mod tests {
             content: "2026-07-17T20:30:00Z".to_string(),
             direction: ChatDirection::Divider,
             agent_role: None,
+            timestamp: None,
         };
         let msg = DisplayMessage::from(entry);
 

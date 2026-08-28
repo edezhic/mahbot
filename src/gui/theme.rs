@@ -374,6 +374,28 @@ pub fn format_hhmmss(ts: &str) -> String {
     }
 }
 
+/// Render a relative timestamp label for a chat message, computed against
+/// the supplied local `now`. Today's messages render as local HH:MM,
+/// yesterday as "yesterday", and older messages as "X days ago" (calendar-day
+/// difference). Future timestamps / clock skew (negative day difference) are
+/// treated as today and render as HH:MM; invalid timestamps render as an
+/// empty string.
+#[must_use]
+pub fn format_relative_time(ts: &str, now: chrono::DateTime<chrono::Local>) -> String {
+    let Ok(dt) = crate::db::parse_utc_timestamp(ts) else {
+        return String::new();
+    };
+    let local_dt = dt.with_timezone(&chrono::Local);
+    let days = (now.date_naive() - local_dt.date_naive()).num_days();
+    if days <= 0 {
+        local_dt.format("%H:%M").to_string()
+    } else if days == 1 {
+        "yesterday".to_string()
+    } else {
+        format!("{days} days ago")
+    }
+}
+
 /// Compact session-length format: raw below 1,000 ("500"), one decimal in the
 /// k-range ("12.3k" for 12300), one decimal at/above one million ("1.2M") —
 /// sessions routinely exceed 200K tokens with context windows up to 1M.
@@ -1072,5 +1094,49 @@ mod tests {
             assert_eq!(button_text(&theme, status), expected(TEXT_PRIMARY));
             assert_eq!(button_text_danger(&theme, status), expected(STATUS_ERROR));
         }
+    }
+
+    #[test]
+    fn relative_time_today_yesterday_days_ago() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 28, 12, 0, 0)
+            .single()
+            .unwrap();
+        let off = now.offset().clone();
+        assert_eq!(
+            format_relative_time(&format!("2026-08-28T09:15:00{off}"), now),
+            "09:15"
+        );
+        assert_eq!(
+            format_relative_time(&format!("2026-08-27T09:15:00{off}"), now),
+            "yesterday"
+        );
+        assert_eq!(
+            format_relative_time(&format!("2026-08-25T09:15:00{off}"), now),
+            "3 days ago"
+        );
+    }
+
+    #[test]
+    fn relative_time_future_treated_as_today() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 28, 12, 0, 0)
+            .single()
+            .unwrap();
+        let off = now.offset().clone();
+        assert_eq!(
+            format_relative_time(&format!("2026-08-29T09:15:00{off}"), now),
+            "09:15"
+        );
+    }
+
+    #[test]
+    fn relative_time_invalid_returns_empty() {
+        assert_eq!(
+            format_relative_time("not-a-timestamp", chrono::Local::now()),
+            ""
+        );
     }
 }
