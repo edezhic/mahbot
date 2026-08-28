@@ -2130,6 +2130,18 @@ struct EditorWidgetState {
     /// Whether this widget is currently focused (only meaningful when the
     /// widget has a focus id). Set by Iced's focus operations.
     is_focused: bool,
+    /// Whether the OS window is currently focused. Gates IME enablement.
+    is_window_focused: bool,
+    /// Whether an IME composition session is currently active (keyed on
+    /// non-empty `Preedit` content, not on `Opened`). While true the widget
+    /// lets the IME own the keyboard: all `KeyPressed` handling is skipped so
+    /// intermediate composition keystrokes do not leak into the buffer, and
+    /// only the final `Commit` inserts text.
+    is_composing: bool,
+    /// The current IME preedit text, reported to the runtime via
+    /// `request_input_method` for the over-the-spot overlay. `None` when no
+    /// composition is active.
+    preedit: Option<input_method::Preedit>,
 }
 
 impl Default for EditorWidgetState {
@@ -2150,6 +2162,9 @@ impl Default for EditorWidgetState {
             last_buffer_key: None,
             is_focused: false,
             modifiers: keyboard::Modifiers::empty(),
+            is_window_focused: true,
+            is_composing: false,
+            preedit: None,
         }
     }
 }
@@ -2165,6 +2180,12 @@ impl iced::advanced::widget::operation::focusable::Focusable for EditorWidgetSta
 
     fn unfocus(&mut self) {
         self.is_focused = false;
+        // Lose the IME session when focus leaves: the OS may not deliver a
+        // `Closed` event to a now-inactive widget, so clear the composition
+        // state to avoid a stale `is_composing`/`preedit` reappearing on
+        // refocus (which would suppress all typed characters).
+        self.is_composing = false;
+        self.preedit = None;
     }
 }
 
@@ -2373,6 +2394,62 @@ impl<'a> EditorWidget<'a> {
     pub const fn max_height(mut self, max_height: f32) -> Self {
         self.max_height = Some(max_height);
         self
+    }
+
+    /// Whether this widget is the single active editing surface that should own
+    /// IME. Active iff: window focused, not masked, not ignoring keyboard, and
+    /// either focused (has `focus_id`) or the full-page code editor
+    /// (`focus_id` unset and `code_mode`). Only the active surface reports
+    /// `Enabled`; every other widget reports `Disabled` so iced's
+    /// `InputMethod::merge` (keeps first `Enabled`) picks the correct widget.
+    fn is_active_surface(&self, state: &EditorWidgetState) -> bool {
+        if !state.is_window_focused || self.masked || self.ignore_keyboard {
+            return false;
+        }
+        match self.focus_id {
+            Some(_) => state.is_focused,
+            None => self.code_mode,
+        }
+    }
+
+    /// Compute the [`input_method::InputMethod`] for this frame. Must only be
+    /// called during [`window::Event::RedrawRequested`], which is when
+    /// `Shell::request_input_method` is honored. The active surface reports
+    /// `Enabled` (with current preedit if any) even when not composing — this is
+    /// what makes the OS IME open — and everything else reports `Disabled`.
+    fn input_method<'b>(
+        &self,
+        state: &'b EditorWidgetState,
+        bounds: Rectangle,
+    ) -> input_method::InputMethod<&'b str> {
+        if !self.is_active_surface(state) {
+            return input_method::InputMethod::Disabled;
+        }
+
+        let text_rect = text_area_rect(bounds, self.padding, state.gutter_width);
+        let cursor = state.buffer_for_render.as_deref().map_or_else(
+            || {
+                let metrics = font_metrics();
+                Rectangle::new(
+                    Point::new(text_rect.x, text_rect.y),
+                    Size::new(1.0, metrics.line_height),
+                )
+            },
+            |buffer| {
+                let geo = TextGeometry {
+                    clip: text_rect,
+                    x: text_rect.x - state.scroll_x,
+                    y: text_rect.y,
+                };
+                ime_caret_rect(buffer, &geo, self.buffer)
+            },
+        );
+
+        input_method::InputMethod::Enabled {
+            cursor,
+            purpose: input_method::Purpose::Normal,
+            preedit: state.preedit.as_ref().map(input_method::Preedit::as_ref),
+        }
     }
 }
 
@@ -2990,6 +3067,15 @@ where
                 if self.focus_id.is_some() && !state.is_focused {
                     return;
                 }
+                // While an IME composition is active the IME owns the
+                // keyboard: skip all key handling so intermediate composition
+                // keystrokes (which may arrive as `KeyPressed.text` or Named
+                // keys) do not leak into the buffer. The result is delivered
+                // by `Commit`, and the composition is cancelled via `Closed` /
+                // empty `Preedit`.
+                if state.is_composing {
+                    return;
+                }
                 // Any keyboard cursor movement re-enables auto-scroll
                 if is_cursor_movement_key(key_press) {
                     state.auto_scroll_enabled = true;
@@ -3309,14 +3395,51 @@ where
 
             // ── Input Method (IME) events ──────────────────────────
             Event::InputMethod(ime_event) => {
-                if self.ignore_keyboard {
-                    return;
-                }
-                if self.focus_id.is_some() && !state.is_focused {
+                // Only the active surface consumes IME events; masked/disabled
+                // fields and non-focused widgets ignore them (no preedit leak,
+                // and the defensive commit guard for masked fields).
+                if !self.is_active_surface(state) {
                     return;
                 }
                 match ime_event {
+                    input_method::Event::Opened => {
+                        // IME enabled, but no composition yet: do NOT set
+                        // `is_composing` (keyed on actual preedit content).
+                        // On Wayland `set_ime_allowed(true)` emits this
+                        // synchronously, so keying on it would suppress all
+                        // ASCII text for the whole focused period.
+                        state.preedit = Some(input_method::Preedit::new());
+                        shell.request_redraw();
+                    }
+                    input_method::Event::Closed => {
+                        state.is_composing = false;
+                        state.preedit = None;
+                        shell.request_redraw();
+                    }
+                    input_method::Event::Preedit(content, selection) => {
+                        // `is_composing` tracks an active composition, keyed on
+                        // non-empty preedit content (not `Opened`). An empty
+                        // preedit means the composition was cleared — either
+                        // right before a `Commit` or as a cancellation.
+                        let empty = content.is_empty();
+                        state.is_composing = !empty;
+                        state.preedit = if empty {
+                            None
+                        } else {
+                            Some(input_method::Preedit {
+                                content: content.clone(),
+                                selection: selection.clone(),
+                                text_size: Some(iced::Pixels(font_metrics().font_size)),
+                            })
+                        };
+                        shell.request_redraw();
+                    }
                     input_method::Event::Commit(committed) => {
+                        state.is_composing = false;
+                        // Clear preedit defensively: not every platform sends the
+                        // empty-Preedit-before-Commit ordering that iced's
+                        // `text_editor` relies on.
+                        state.preedit = None;
                         if committed.is_empty() {
                             return;
                         }
@@ -3332,18 +3455,24 @@ where
                         shell.invalidate_layout();
                         shell.request_redraw();
                     }
-                    // Preedit rendering is deferred (no on-the-spot display).
-                    input_method::Event::Preedit(_, _)
-                    | input_method::Event::Opened
-                    | input_method::Event::Closed => {}
                 }
             }
 
-            // ── Window focus lost: reset modifier state ─────────────
+            // ── Window focus gained — re-enable IME ────────────────
+            Event::Window(window::Event::Focused) => {
+                state.is_window_focused = true;
+                shell.request_redraw();
+            }
+
+            // ── Window focus lost: reset modifier + IME state ──────
             // A stale shift/ctrl state must not persist when the OS window
             // loses focus mid-click; clear it so the next click after
-            // refocusing starts from a clean modifier baseline.
+            // refocusing starts from a clean modifier baseline. IME state is
+            // cleared so a stale composition does not persist across focus.
             Event::Window(window::Event::Unfocused) => {
+                state.is_window_focused = false;
+                state.is_composing = false;
+                state.preedit = None;
                 state.modifiers = keyboard::Modifiers::empty();
             }
 
@@ -3366,6 +3495,20 @@ where
                 // time in draw_cursor). Adding `request_redraw()` here would
                 // cancel this At schedule and re-arm a per-frame redraw loop.
                 shell.request_redraw_at(window::RedrawRequest::At(next));
+                // Clear stale composition state when this widget is no longer
+                // the active surface (focus moved away, a find bar / modal
+                // opened over the code editor). Otherwise `is_composing`
+                // would suppress all typed characters and the stale `preedit`
+                // would be re-shown when focus returns.
+                if !self.is_active_surface(state) {
+                    state.is_composing = false;
+                    state.preedit = None;
+                }
+                // Report the IME request so the runtime may open the OS input
+                // method and render the over-the-spot preedit overlay. Only
+                // the active surface reports `Enabled`; `InputMethod::merge`
+                // keeps the first `Enabled` in widget order.
+                shell.request_input_method(&self.input_method(state, layout.bounds()));
             }
 
             _ => {}
@@ -3602,6 +3745,62 @@ fn draw_selection<Renderer>(
     }
 }
 
+/// Compute the caret rectangle at the given `(line, col)` in the text area's
+/// coordinate space, accounting for the widget's internal scroll.
+///
+/// `fallback_x` is the x position used when no layout run is found for the
+/// cursor (a degenerate case). The drawn caret passes `0.0` (which leaves it
+/// outside the clip so it is not drawn — the original `draw_cursor`
+/// behavior); the IME request passes `geo.x` so the overlay is positioned in
+/// the text area rather than at the widget's absolute left edge.
+fn cursor_rect(
+    buffer: &cosmic_text::Buffer,
+    geo: &TextGeometry,
+    line: usize,
+    col: usize,
+    fallback_x: f32,
+) -> Rectangle {
+    let metrics = font_metrics();
+    if let Some(run) = find_cursor_run(buffer.layout_runs(), line, col) {
+        let found_x = run
+            .glyphs
+            .iter()
+            .find(|g| col < byte_col_to_char_col_in_line(run.text, g.end))
+            .map(|g| g.x);
+        Rectangle {
+            x: geo.x + found_x.unwrap_or_else(|| run.glyphs.last().map_or(0.0, |l| l.x + l.w)),
+            y: geo.y + run.line_top,
+            width: 1.5,
+            height: run.line_height,
+        }
+    } else {
+        Rectangle {
+            x: fallback_x,
+            y: geo.y,
+            width: 1.5,
+            height: metrics.line_height,
+        }
+    }
+}
+
+/// Anchor for the IME request: the caret, or the selection start when a
+/// selection is active (the caret end not drawn by `draw_cursor`).
+fn ime_caret_rect(
+    buffer: &cosmic_text::Buffer,
+    geo: &TextGeometry,
+    editor_buffer: &EditorBuffer,
+) -> Rectangle {
+    let cursor_state = editor_buffer.cursor();
+    let (line, col) = if let Some(anchor) = cursor_state.selection.as_ref() {
+        let start = (cursor_state.line, cursor_state.column);
+        let end = (anchor.line, anchor.column);
+        if start < end { start } else { end }
+    } else {
+        (cursor_state.line, cursor_state.column)
+    };
+    cursor_rect(buffer, geo, line, col, geo.x)
+}
+
 /// Draw the blinking cursor caret when no selection is active.
 fn draw_cursor<Renderer>(
     renderer: &mut Renderer,
@@ -3618,36 +3817,8 @@ fn draw_cursor<Renderer>(
     let has_selection = cursor_state.selection.is_some();
 
     if blink_on && !has_selection {
-        let cursor_x;
-        let cursor_y;
-        let cursor_height;
-
-        if let Some(run) =
-            find_cursor_run(buffer.layout_runs(), cursor_state.line, cursor_state.column)
-        {
-            cursor_y = geo.y + run.line_top;
-            cursor_height = run.line_height;
-            let found_x = run
-                .glyphs
-                .iter()
-                .find(|g| cursor_state.column < byte_col_to_char_col_in_line(run.text, g.end))
-                .map(|g| g.x);
-            cursor_x = geo.x
-                + found_x.unwrap_or_else(|| run.glyphs.last().map_or(0.0, |last| last.x + last.w));
-        } else {
-            cursor_x = 0.0;
-            cursor_y = geo.y;
-            cursor_height = font_metrics().line_height;
-        }
-
-        let cursor_rect = Rectangle {
-            x: cursor_x,
-            y: cursor_y,
-            width: 1.5,
-            height: cursor_height,
-        };
-
-        if let Some(clipped) = geo.clip.intersection(&cursor_rect) {
+        let caret = cursor_rect(buffer, geo, cursor_state.line, cursor_state.column, 0.0);
+        if let Some(clipped) = geo.clip.intersection(&caret) {
             renderer.fill_quad(
                 renderer::Quad {
                     bounds: clipped,

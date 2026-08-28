@@ -730,3 +730,108 @@ fn test_single_line_strips_newlines_and_enter() {
     assert_eq!(buf.text(), "axyb");
     assert_eq!(buf.cursor().line, 0);
 }
+
+// ── IME composition (over-the-spot preedit) ──────────────────────
+
+#[test]
+fn test_ime_surface_activation() {
+    let buf = EditorBuffer::with_text("", None);
+    // Masked / password fields never activate IME.
+    assert!(
+        !EditorWidget::new(&buf)
+            .masked(true)
+            .is_active_surface(&EditorWidgetState::default())
+    );
+    // The window must be focused.
+    let mut unfocused = EditorWidgetState::default();
+    unfocused.is_window_focused = false;
+    assert!(!EditorWidget::new(&buf).is_active_surface(&unfocused));
+    // A focus-id field activates only while focused.
+    let field = EditorWidget::new(&buf).id("field");
+    let mut focused = EditorWidgetState::default();
+    assert!(!field.is_active_surface(&focused));
+    focused.is_focused = true;
+    assert!(field.is_active_surface(&focused));
+    // The full-page code editor (no focus id, code_mode) is active unless it
+    // ignores the keyboard; a focus-id-less *non-code* field is not active.
+    assert!(EditorWidget::new(&buf).is_active_surface(&EditorWidgetState::default()));
+    assert!(
+        !EditorWidget::new(&buf)
+            .ignore_keyboard(true)
+            .is_active_surface(&EditorWidgetState::default())
+    );
+    assert!(
+        !EditorWidget::new(&buf)
+            .code_mode(false)
+            .is_active_surface(&EditorWidgetState::default())
+    );
+}
+
+#[test]
+fn test_input_method_preedit_reported() {
+    let buf = EditorBuffer::with_text("", None);
+    let widget = EditorWidget::new(&buf);
+    let mut state = EditorWidgetState::default();
+    state.preedit = Some(input_method::Preedit {
+        content: "你好".to_string(),
+        selection: Some(1..2),
+        text_size: None,
+    });
+    let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 200.0));
+    let ime = widget.input_method(&state, bounds);
+    assert!(ime.to_owned().is_enabled());
+    match ime {
+        input_method::InputMethod::Enabled {
+            preedit: Some(p), ..
+        } => {
+            assert_eq!(p.content, "你好");
+            assert_eq!(p.selection, Some(1..2));
+        }
+        other => panic!("expected Enabled with preedit, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_cursor_rect_selection_anchor() {
+    let buf = EditorBuffer::with_text("hello\nworld", None);
+    // Cursor at (1,4), selection anchor at (0,3) — reversed selection so the
+    // IME must anchor at the selection start, not the drawn caret end.
+    buf.move_to(0, 3);
+    buf.perform_action(EditorAction::SelectTo { line: 1, col: 4 });
+    let buffer = with_font_system(|font_sys| {
+        let mut b = buf.borrow_buffer_mut();
+        reshape_and_shape(&mut b, font_sys, Some(0.0), 0.0, 200.0, 200.0);
+        b.clone()
+    });
+    let geo = TextGeometry {
+        clip: Rectangle::new(Point::ORIGIN, Size::new(200.0, 200.0)),
+        x: 8.0,
+        y: 8.0,
+    };
+    let rect = ime_caret_rect(&buffer, &geo, &buf);
+    let expected = cursor_rect(&buffer, &geo, 0, 3, geo.x);
+    assert_eq!(rect, expected);
+    // The anchor (line 0) sits above the caret (line 1).
+    assert!(rect.y < cursor_rect(&buffer, &geo, 1, 4, geo.x).y);
+}
+
+#[test]
+fn test_cursor_rect_shaped_position() {
+    let buf = EditorBuffer::with_text("hello\nworld", None);
+    buf.move_to(1, 2);
+    let buffer = with_font_system(|font_sys| {
+        let mut b = buf.borrow_buffer_mut();
+        reshape_and_shape(&mut b, font_sys, Some(0.0), 0.0, 200.0, 200.0);
+        b.clone()
+    });
+    let geo = TextGeometry {
+        clip: Rectangle::new(Point::ORIGIN, Size::new(200.0, 200.0)),
+        x: 8.0,
+        y: 8.0,
+    };
+    let rect = cursor_rect(&buffer, &geo, 1, 2, geo.x);
+    assert!(rect.y > 8.0);
+    // Second line sits below the first.
+    let first = cursor_rect(&buffer, &geo, 0, 0, geo.x);
+    assert!(rect.y >= first.y);
+}
