@@ -17,18 +17,6 @@ crate::define_store! {
     expect = "CONFIG_STORE not initialized — call init_all_stores() first",
 }
 
-pub(crate) const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS config_kv (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS config_model_routing (
-    model              TEXT PRIMARY KEY,
-    provider_order     TEXT,
-    allow_fallbacks    INTEGER
-);";
-
 // ── Column index constants ──────────────────────────────────
 
 // config_kv table (2-column SELECT: key, value)

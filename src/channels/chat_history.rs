@@ -15,21 +15,6 @@ crate::define_store! {
     expect = "CHAT_HISTORY not initialized — call init_all_stores() first",
 }
 
-pub(crate) const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS chat_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT NOT NULL UNIQUE,
-    user_name TEXT NOT NULL,
-    direction TEXT NOT NULL,
-    content TEXT NOT NULL,
-    agent_role TEXT,
-    workspace TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_name);
-CREATE INDEX IF NOT EXISTS idx_chat_history_workspace ON chat_history(workspace);
-CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);
-";
-
 /// Parameters for inserting a chat history entry.
 ///
 /// This struct bundles the 6 fields needed by [`ChatHistoryStore::insert`].

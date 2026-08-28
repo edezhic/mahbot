@@ -79,109 +79,6 @@ pub struct LogStore {
 /// is cheaply cloneable since `Connection` wraps an `Arc` internally).
 pub static LOG_STORE: OnceCell<LogStore> = OnceCell::const_new();
 
-const LOGS_SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS logs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT NOT NULL,
-    level       TEXT NOT NULL,
-    target      TEXT NOT NULL,
-    message     TEXT NOT NULL,
-    fields      TEXT NOT NULL DEFAULT '{}',
-    agent_id    TEXT NOT NULL DEFAULT '',
-    agent_role  TEXT NOT NULL DEFAULT '',
-    workspace   TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
-CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
-CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
-CREATE INDEX IF NOT EXISTS idx_logs_agent_role ON logs(agent_role);
-CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
-CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);
--- Consolidated tool-call stats (formerly stats.db). Both the
--- normal open path and the quarantine-recreate branch execute this schema, so
--- a quarantine silently recreates the stats tables too.
-CREATE TABLE IF NOT EXISTS tool_calls (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id       TEXT NOT NULL,
-    role           TEXT NOT NULL,
-    tool_name      TEXT NOT NULL,
-    arguments      TEXT NOT NULL DEFAULT '{}',
-    duration_ms    INTEGER NOT NULL DEFAULT 0,
-    success        INTEGER NOT NULL DEFAULT 1,
-    error_message  TEXT,
-    workspace      TEXT NOT NULL DEFAULT '',
-    recorded_at    TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
--- Per-operation LLM request stats (all purposes: agent runs, verdict
--- extraction, summarization, consolidation). Metadata only — no request
--- inputs/outputs are stored. Auto-created on existing databases at next
--- store open (CREATE TABLE IF NOT EXISTS), including quarantine recreation.
-CREATE TABLE IF NOT EXISTS llm_requests (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    recorded_at         TEXT NOT NULL,
-    purpose             TEXT NOT NULL,
-    agent_id            TEXT NOT NULL DEFAULT '',
-    role                TEXT NOT NULL DEFAULT '',
-    workspace           TEXT NOT NULL DEFAULT '',
-    ticket_id           TEXT,
-    model               TEXT NOT NULL,
-    routing             TEXT NOT NULL DEFAULT '',
-    input_tokens        INTEGER,
-    output_tokens       INTEGER,
-    cached_input_tokens INTEGER,
-    cache_miss_tokens   INTEGER,
-    duration_ms         INTEGER NOT NULL,
-    retry_attempts      INTEGER NOT NULL,
-    finish_reason       TEXT,
-    failure_class       TEXT,
-    success             INTEGER NOT NULL DEFAULT 1,
-    -- Observability additions: billed cost (the invoice amount), raw
-    -- cost_details, serving upstream provider, system_fingerprint. All
-    -- telemetry fields are parsed generically from the response envelope,
-    -- so cost/upstream_provider/system_fingerprint are NULL on failures
-    -- and whenever the provider omits them.
-    cost                REAL,
-    cost_details        TEXT,
-    upstream_provider   TEXT,
-    system_fingerprint  TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
--- Dedicated grep-engine telemetry: one row per greppable shell call,
--- recording what the engine decided (served vs skipped + first fallback
--- reason) and the command shape. Self-contained (no tool_calls.id
--- correlation) so a grep-specific analysis can be run without joins.
-CREATE TABLE IF NOT EXISTS grep_telemetry (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    recorded_at   TEXT NOT NULL,
-    command       TEXT NOT NULL,
-    served        INTEGER NOT NULL DEFAULT 0,
-    reason        TEXT NOT NULL DEFAULT '',
-    recursive     INTEGER NOT NULL DEFAULT 0,
-    piped         INTEGER NOT NULL DEFAULT 0,
-    operand_count INTEGER NOT NULL DEFAULT 0,
-    flags         TEXT NOT NULL DEFAULT '',
-    mode          TEXT NOT NULL DEFAULT '',
-    workspace     TEXT NOT NULL DEFAULT '',
-    grep_count    INTEGER NOT NULL DEFAULT 0,
-    served_count  INTEGER NOT NULL DEFAULT 0,
-    skipped_count INTEGER NOT NULL DEFAULT 0,
-    duration_ms   INTEGER,
-    exit_code     INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_grep_telemetry_recorded_at ON grep_telemetry(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_grep_telemetry_served ON grep_telemetry(served);
-CREATE INDEX IF NOT EXISTS idx_grep_telemetry_reason ON grep_telemetry(reason);
-CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command);";
-
 /// One greppable shell call's grep-engine decision, persisted to the dedicated
 /// `grep_telemetry` table (self-contained — no tool_calls.id correlation).
 /// Bundled into a struct so the writer's signature stays shallow; the caller
@@ -222,8 +119,8 @@ impl LogStore {
     /// logged and the store is recreated (or, in the extreme case, the
     /// pre-quarantine error is surfaced).
     pub(crate) async fn open(root: &Path) -> anyhow::Result<Self> {
-        let store = match open_verified_logs_store(root).await {
-            Ok(conn) => Self { conn },
+        let conn = match open_verified_logs_store(root).await {
+            Ok(conn) => conn,
             Err(OpenFailure::Corrupt(reason)) => {
                 warn!(
                     error = %reason,
@@ -237,15 +134,18 @@ impl LogStore {
                 // second quarantine: the fresh store is not corrupt, a failure
                 // is a code bug, and a double quarantine would destroy the
                 // forensic record.
-                let conn =
-                    crate::db::open_with_schema(&db::store_db_path(root, "logs"), LOGS_SCHEMA)
-                        .await
-                        .context("Failed to recreate logs store after quarantine")?;
-                Self { conn }
+                crate::db::open_with_schema(&db::store_db_path(root, "logs"), "")
+                    .await
+                    .context("Failed to recreate logs store after quarantine")?
             }
             Err(OpenFailure::Other(e)) => return Err(e),
         };
-        Ok(store)
+        // The catalog owns the logs schema; run it OUTSIDE the catch_unwind /
+        // quarantine wrappers so a catalog failure is a hard boot failure,
+        // never reclassified as corruption and healed.
+        crate::db::migrations::run_migrations(&conn, crate::db::migrations::TargetDb::Logs, root)
+            .await?;
+        Ok(Self { conn })
     }
 
     /// Insert a batch of log entries in a single transaction.
@@ -409,7 +309,7 @@ async fn open_verified_logs_store(root: &Path) -> Result<crate::db::Connection, 
     // inside open_and_repair — the verify below would duplicate the 7× boot
     // scan for the logs store. Non-boot opens (tests) verify here.
     let boot_verified = crate::db::wal_guard::has_boot_diagnosis(&db_path);
-    let open = AssertUnwindSafe(crate::db::open_store(root, "logs", LOGS_SCHEMA))
+    let open = AssertUnwindSafe(crate::db::open_store(root, "logs", ""))
         .catch_unwind()
         .await;
     let conn = match open {

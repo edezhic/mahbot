@@ -49,69 +49,6 @@ pub async fn run_archive_cancelled_loop() {
     }
 }
 
-/// Fresh-DB shape of the board tables. Indexes in this string run after
-/// migrations (`open_consolidated_store`); `CREATE TABLE IF NOT EXISTS` does
-/// not add columns to an existing `tickets` table.
-pub(crate) const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS tickets (
-    id              TEXT PRIMARY KEY,
-    title           TEXT NOT NULL,
-    description     TEXT NOT NULL,
-    phase          TEXT NOT NULL DEFAULT 'backlog',
-    workspace_name  TEXT NOT NULL,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL,
-    prerequisites   TEXT NOT NULL DEFAULT '[]',
-    supersedes      TEXT,
-    superseded_by   TEXT,
-    commit_hash     TEXT,
-    lines_added     INTEGER,
-    lines_removed   INTEGER,
-    reporter        TEXT NOT NULL DEFAULT '',
-    is_archived     INTEGER NOT NULL DEFAULT 0,
-    embedding       BLOB,
-    priority        INTEGER NOT NULL DEFAULT 1,
-    reviewed_head   TEXT,
-    reviewed_tree   TEXT,
-    done_at         TEXT,
-    bounce_count    INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS ticket_comments (
-    id          TEXT PRIMARY KEY,
-    ticket_id   TEXT NOT NULL,
-    role        TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    FOREIGN KEY (ticket_id) REFERENCES tickets(id)
-);
-CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
-CREATE TABLE IF NOT EXISTS ticket_counters (
-    workspace_name TEXT PRIMARY KEY,
-    next_id        INTEGER NOT NULL DEFAULT 1
-);
--- The `idx_tickets_title_fts` FTS index is declared HERE (not only via the
--- tokenizer-checking `ensure_fts_index` in `after_open`) so it exists BEFORE
--- the one-time import populates `tickets`: once the index exists, the bulk
--- INSERTs maintain it, so imported tickets are FTS-searchable immediately.
--- (turso's `CREATE INDEX ... USING fts` does NOT backfill pre-existing rows.)
--- `open_consolidated_store` applies CREATE INDEX after migrations and before
--- import; do not move this into the pre-migration batch. `ensure_fts_index`
--- still runs later to tokenizer-migrate the index; its DDL must match this
--- one — keep in sync.
-CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
-USING fts (title) WITH (tokenizer = 'ngram');
--- The `idx_tickets_board_active` composite index serves the board query in
--- [`BoardStore::list_all_tickets`]: `WHERE is_archived = 0 ORDER BY
--- priority ASC, created_at DESC`. It is deliberately NON-partial (full table)
--- because Turso has known partial-index maintenance/integrity issues, and the
--- `? IS NULL OR col = ?` optional workspace/phase predicates are not
--- indexable, so `is_archived` is the only sargable leading column. Both
--- `priority` and `created_at` are set at insert and never updated, so the
--- write cost is negligible.
-CREATE INDEX IF NOT EXISTS idx_tickets_board_active ON tickets \
-(is_archived, priority ASC, created_at DESC);
-";
-
 const TICKETS_FTS_INDEX_NAME: &str = "idx_tickets_title_fts";
 const TICKETS_FTS_INDEX_DDL: &str = "\
 CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
@@ -697,15 +634,16 @@ pub(crate) enum LoadComments {
 impl BoardStore {
     /// Post-open setup: ensure the FTS index exists with the correct tokenizer.
     ///
-    /// The index is ALSO declared in [`SCHEMA`] so the consolidated schema
-    /// creates it before the one-time import (guaranteeing imported tickets are
-    /// FTS-searchable). This hook therefore only tokenizer-migrates an existing
-    /// index (drops and recreates if the tokenizer changed); it is idempotent
-    /// and runs from both [`crate::db::init_all_stores`] (production, on the
-    /// shared consolidated connection) and each isolated board store open. The
-    /// board migrations are NOT run here — they are part of the consolidated
-    /// domain migration history applied once by
-    /// [`crate::db::migrations::run_domain_migrations`].
+    /// The index is ALSO declared in the schema catalog
+    /// ([`crate::db::migrations`]) so the consolidated schema creates it before
+    /// the one-time import (guaranteeing imported tickets are FTS-searchable).
+    /// This hook therefore only tokenizer-migrates an existing index (drops
+    /// and recreates if the tokenizer changed); it is idempotent and runs from
+    /// both [`crate::db::init_all_stores`] (production, on the shared
+    /// consolidated connection) and each isolated board store open. The board
+    /// schema changes are NOT run here — every schema change is an entry in the
+    /// append-only catalog ([`crate::db::migrations`]) applied once by
+    /// [`crate::db::open_consolidated_store`].
     pub(crate) async fn after_open(&self) -> anyhow::Result<()> {
         crate::db::ensure_fts_index(
             &self.conn,

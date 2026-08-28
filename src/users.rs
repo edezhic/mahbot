@@ -34,26 +34,6 @@ crate::define_store! {
     expect = "USER_STORE not initialized — call init_all_stores() first",
 }
 
-pub(crate) const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS users (
-    name                TEXT PRIMARY KEY,
-    permissions         TEXT,
-    selected_workspace  TEXT,
-    selected_role       TEXT
-);
-CREATE TABLE IF NOT EXISTS user_channels (
-    user_name   TEXT NOT NULL REFERENCES users(name),
-    channel     TEXT NOT NULL,
-    identifier  TEXT NOT NULL,
-    reply_target TEXT,
-    UNIQUE(channel, identifier)
-);
-CREATE TABLE IF NOT EXISTS user_roles (
-    user_name   TEXT NOT NULL REFERENCES users(name),
-    role        TEXT NOT NULL,
-    PRIMARY KEY (user_name, role)
-);";
-
 // ── Column index constants ──────────────────────────────────
 
 // users table (4-column SELECT: name, permissions, selected_workspace, selected_role)

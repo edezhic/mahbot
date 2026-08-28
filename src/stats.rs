@@ -7,9 +7,10 @@
 //! store on session finalization via [`crate::logs::LogStore::flush_batch`].
 //!
 //! The `tool_calls` table (and its indexes) is created
-//! by the logs store's schema (`LOGS_SCHEMA` in `logs.rs`), so a logs-store
-//! quarantine recreate also recreates it. Consumers access the table
-//! through [`crate::logs::LOG_STORE`] with fail-open accessors.
+//! by the logs store's baseline schema catalog entry (in the append-only
+//! catalog), so a logs-store quarantine recreate also recreates it. Consumers
+//! access the table through [`crate::logs::LOG_STORE`] with fail-open
+//! accessors.
 
 use crate::db::{self};
 use anyhow::Result;
@@ -622,7 +623,7 @@ mod tests {
     }
 
     /// `llm_requests` insert round-trip — verifies the schema (including
-    /// auto-creation on an existing store via LOGS_SCHEMA) and the
+    /// auto-creation on an existing store via the catalog) and the
     /// parameterized insert are valid against a real store.
     #[tokio::test]
     async fn record_llm_request_round_trip() {

@@ -6,8 +6,8 @@
 //! transaction domain, so cross-store ordering and crash-safety can be
 //! expressed in a single transaction (see the purge section in the design).
 //!
-//! Table ownership: the DDL is appended to the session SCHEMA const
-//! (see `session/mod.rs`); this module owns the row model, the lifecycle
+//! Table ownership: the DDL lives in the append-only schema catalog
+//! ([`crate::db::migrations`]); this module owns the row model, the lifecycle
 //! helpers, the boot scan, and the purge orchestrator.
 
 use crate::Role;

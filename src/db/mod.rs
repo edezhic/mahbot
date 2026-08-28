@@ -110,7 +110,7 @@ pub(crate) const DOMAIN_STORE_NAMES: &[&str] = &[
 
 /// Name (file stem) of the logs store — the one store that stays a separate
 /// file/connection. Opened manually in [`crate::logs::init_tracing`] before the
-/// other stores; it carries no migration runner.
+/// other stores; its schema is owned by the catalog ([`crate::db::migrations`]).
 pub(crate) const LOG_DB_NAME: &str = "logs";
 
 /// The single shared consolidated domain connection, set once by
@@ -1027,83 +1027,11 @@ pub(crate) async fn ensure_fts_index(
     Ok(())
 }
 
-// ── Database migrations ────────────────────────────────────────────────
-//
-// Centralized migration machinery. This design tracks applied migrations in a
-// `schema_migrations` table — the historical PRAGMA user_version approach was
-// deliberately removed and must NOT be resurrected (it is not
-// transaction-atomic with DDL). Each migration is a ready-made SQL
-// statement/script applied exactly once, in order, at store initialization.
-
-/// Existence-guard direction for a migration: whether the SQL runs when the
-/// column EXISTS or when it is ABSENT. This is what makes the wipe-and-recreate
-/// vs upgrade-in-place paths converge to the same final state.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum MigrationGuard {
-    /// Add-column migration: skip the SQL when the column already exists
-    /// (a fresh-DB SCHEMA already declared it); run it when the column is
-    /// missing (an older database being upgraded in place).
-    ColumnExists {
-        table: &'static str,
-        column: &'static str,
-    },
-    /// Drop-column migration: run the SQL when the column still exists
-    /// (an older database being upgraded in place); skip it when the column
-    /// is already absent (a fresh-DB SCHEMA never declared it).
-    ColumnDropped {
-        table: &'static str,
-        column: &'static str,
-    },
-    /// Table-rename migration: run the SQL when the table still exists under
-    /// its old name (an older database being upgraded in place); skip it when
-    /// the table is already absent (a fresh-DB SCHEMA created the new name
-    /// directly). Both paths record the migration as applied.
-    TableExists { table: &'static str },
-}
-
-/// One ordered, ready-made schema migration.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Migration {
-    /// Stable unique id recorded in `schema_migrations` — a migration with
-    /// this id never runs twice, even across store recreations.
-    pub(crate) id: &'static str,
-    /// The SQL statement/script applied when the migration is pending.
-    pub(crate) sql: &'static str,
-    /// Optional existence guard. When the guard's condition holds, the SQL is
-    /// skipped but the migration is still recorded as applied. This is what
-    /// makes the wipe-and-recreate operational sequence safe — a fresh-DB
-    /// SCHEMA already contains the migrated shape, so a duplicate-column
-    /// ALTER (or a no-op DROP) must never fire; the guard turns it into a
-    /// no-op recorded as applied. The upgrade-in-place path runs the SQL and
-    /// records it. Both paths converge to the same final state.
-    pub(crate) guard: Option<MigrationGuard>,
-}
-
-/// Check whether `table` has a column named `column`.
-///
-/// `PRAGMA table_info` reports one row per column with the column name at
-/// position 1. A missing table reports zero rows (column absent), which is the
-/// fresh-DB shape for a column that was never declared.
-pub(crate) async fn column_exists(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-) -> anyhow::Result<bool> {
-    let rows = conn
-        .query(&format!("PRAGMA table_info({table})"), ())
-        .await
-        .context("Failed to read table schema (PRAGMA table_info)")?;
-    Ok(rows
-        .iter()
-        .any(|row| row.get::<String>(1).ok().as_deref() == Some(column)))
-}
+// Any schema creation, change, or removal is an entry in the append-only
+// catalog (see [`crate::db::migrations`]); the only tracking mechanism is the
+// id-based applied check in [`crate::db::migrations::run_migrations`].
 
 /// Check whether a table currently exists under `name`.
-///
-/// Backs the [`MigrationGuard::TableExists`] guard: a table that shipped under
-/// an old name (to be RENAMEd by the migration) reports `true` on an
-/// upgraded-in-place database and `false` on a fresh-DB SCHEMA that created
-/// the new name directly.
 pub(crate) async fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     let rows = conn
         .query(
@@ -1113,130 +1041,6 @@ pub(crate) async fn table_exists(conn: &Connection, table: &str) -> anyhow::Resu
         .await
         .context("Failed to read table schema (sqlite_master)")?;
     Ok(!rows.is_empty())
-}
-
-/// Apply pending migrations for a store, in order, exactly once each.
-///
-/// Called at store initialization (after the SCHEMA batch ran) via the
-/// store's `post_open` hook (see [`crate::define_store!`]). Migrations are
-/// tracked in a per-store `schema_migrations` table:
-///
-/// - The tracking table is created if missing (fresh databases).
-/// - Each pending migration runs inside its own transaction — the schema
-///   change and its tracking row commit atomically (turso supports
-///   transactional DDL), so a failed migration never leaves a half-applied
-///   state or a false "applied" record.
-/// - When a migration's guard already holds (e.g. a fresh-DB SCHEMA that
-///   already contains the migrated shape), the SQL is skipped and only the
-///   tracking row is written.
-/// - Already-applied migrations are skipped entirely (never re-run).
-///
-/// The `logs` store and the read-only `mahbot debug` path never call this —
-/// the debug CLI opens with `OpenFlags::ReadOnly|NoLock` and migrations only
-/// run through the store `open` methods.
-pub(crate) async fn run_pending_migrations(
-    conn: &Connection,
-    store_name: &str,
-    migrations: &[Migration],
-) -> anyhow::Result<()> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (\
-             id         TEXT PRIMARY KEY,\
-             applied_at TEXT NOT NULL\
-         )",
-        (),
-    )
-    .await
-    .context("Failed to create schema_migrations tracking table")?;
-
-    let applied: std::collections::HashSet<String> = conn
-        .query("SELECT id FROM schema_migrations", ())
-        .await
-        .context("Failed to read applied migrations")?
-        .into_iter()
-        .filter_map(|row| row.get::<String>(0).ok())
-        .collect();
-
-    for migration in migrations {
-        if applied.contains(migration.id) {
-            continue;
-        }
-        // Decide whether the migration's SQL must actually run, based on the
-        // guard's direction:
-        //   - None                 → always run.
-        //   - ColumnExists         → run only if the column is ABSENT
-        //                             (already-present = fresh-DB shape = skip).
-        //   - ColumnDropped        → run only if the column is PRESENT
-        //                             (already-absent = fresh-DB shape = skip).
-        //   - TableExists          → run only if the table is PRESENT under its
-        //                             old name (already-absent = fresh-DB SCHEMA
-        //                             created the new name = skip).
-        let run_sql = match migration.guard {
-            None => true,
-            Some(MigrationGuard::ColumnExists { table, column }) => {
-                !column_exists(conn, table, column).await.with_context(|| {
-                    format!(
-                        "Migration '{}' guard check failed on {table}.{column}",
-                        migration.id
-                    )
-                })?
-            }
-            Some(MigrationGuard::ColumnDropped { table, column }) => {
-                column_exists(conn, table, column).await.with_context(|| {
-                    format!(
-                        "Migration '{}' guard check failed on {table}.{column}",
-                        migration.id
-                    )
-                })?
-            }
-            Some(MigrationGuard::TableExists { table }) => {
-                table_exists(conn, table).await.with_context(|| {
-                    format!(
-                        "Migration '{}' guard check failed on table {table}",
-                        migration.id
-                    )
-                })?
-            }
-        };
-        // The tracking-row INSERT is identical whether the migration SQL ran
-        // (in-tx, atomic with the schema change) or was skipped (fresh-DB
-        // shape); factor the statement + params so the two arms cannot drift.
-        let record_migration = |id: &str| {
-            (
-                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
-                params![id, now()],
-            )
-        };
-        if run_sql {
-            let tx = conn.begin_tx().await.with_context(|| {
-                format!("Migration '{}': failed to begin transaction", migration.id)
-            })?;
-            tx.execute_batch(migration.sql)
-                .await
-                .with_context(|| format!("Migration '{}' failed", migration.id))?;
-            let (sql, params) = record_migration(migration.id);
-            tx.execute(sql, params).await.with_context(|| {
-                format!("Failed to record migration '{}' as applied", migration.id)
-            })?;
-            tx.commit()
-                .await
-                .with_context(|| format!("Migration '{}': failed to commit", migration.id))?;
-        } else {
-            // Fresh-DB path: the SCHEMA already produced the migrated shape —
-            // record the migration as applied without running its SQL.
-            let (sql, params) = record_migration(migration.id);
-            conn.execute(sql, params).await.with_context(|| {
-                format!("Failed to record migration '{}' as applied", migration.id)
-            })?;
-        }
-        tracing::info!(
-            store = store_name,
-            migration = migration.id,
-            skipped_sql = !run_sql,
-            "Applied database migration",
-        );
-    }
-    Ok(())
 }
 
 /// Open a database, create parent directories if needed, and run schema init.
@@ -1264,7 +1068,7 @@ pub(crate) async fn open_with_schema(db_path: &Path, schema: &str) -> anyhow::Re
     Ok(conn)
 }
 
-/// Run a SCHEMA batch. The source Turso error is the context's cause — do not
+/// Run a schema batch. The source Turso error is the context's cause — do not
 /// interpolate `sql` into the message (see [`open_with_schema`]).
 async fn execute_schema_ddl(conn: &Connection, sql: &str) -> anyhow::Result<()> {
     if sql.trim().is_empty() {
@@ -1357,9 +1161,9 @@ fn has_resource_signal(lower: &str) -> bool {
 /// signal; reclassify new strings as they surface.
 ///
 /// Schema-mismatch / DDL-shape errors are **never** corruption — they are a
-/// code bug (SCHEMA ran before a migration added a column, a typo, …). Those
-/// must fail boot with the store intact; quarantining them destroyed readable
-/// installs. See [`is_schema_mismatch`].
+/// code bug (a catalog migration ordering error, a typo, …). Those must fail
+/// boot with the store intact; quarantining them destroyed readable installs.
+/// See [`is_schema_mismatch`].
 pub(crate) fn is_corruption_class(e: &anyhow::Error) -> bool {
     if is_schema_mismatch(e) {
         return false;
@@ -1376,14 +1180,14 @@ pub(crate) fn is_corruption_class(e: &anyhow::Error) -> bool {
         || lower.contains("no such file"))
 }
 
-/// True when a SCHEMA/`execute_batch` failure is a DDL shape error, not
+/// True when a schema/`execute_batch` failure is a DDL shape error, not
 /// page-level damage.
 ///
 /// `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table even when the
-/// live columns differ from SCHEMA. A later `CREATE INDEX … ON t(new_col)`
-/// then fails with `no such column` — that is an upgrade-ordering bug, not
-/// an unreadable file. Keep this list in lockstep with Turso/SQLite wording
-/// as new strings surface; do **not** fold these into the fail-closed
+/// live columns differ from the expected shape. A later `CREATE INDEX … ON
+/// t(new_col)` then fails with `no such column` — that is a catalog ordering
+/// bug, not an unreadable file. Keep this list in lockstep with Turso/SQLite
+/// wording as new strings surface; do **not** fold these into the fail-closed
 /// corruption path.
 fn is_schema_mismatch(e: &anyhow::Error) -> bool {
     const DDL_SHAPE: [&str; 8] = [
@@ -1549,202 +1353,68 @@ pub(crate) async fn open_store(
     }
 }
 
-/// The consolidated schema for the single domain database: the concatenation
-/// of all six domain-store schemas (board, sessions, workspaces, users,
-/// config, chat_history), which now share one file.
-///
-/// Built at runtime because Rust `concat!` only accepts string literals, not
-/// the per-module `SCHEMA` constants.
-///
-/// # `CREATE TABLE IF NOT EXISTS` does not reshape existing tables
-///
-/// `IF NOT EXISTS` is a no-op when the table is already present, even if
-/// SCHEMA declares extra columns. Indexes in SCHEMA that mention those
-/// columns must not run until migrations have `ALTER TABLE … ADD COLUMN`.
-/// [`open_consolidated_store`] enforces that by applying CREATE TABLE first,
-/// then migrations, then the remaining DDL. Do not "simplify" this back to a
-/// single pre-migration `execute_batch` of the full SCHEMA.
-fn consolidated_schema() -> String {
-    let mut s = String::with_capacity(2048);
-    s.push_str(crate::pipeline::board::SCHEMA);
-    s.push_str(crate::session::SCHEMA);
-    s.push_str(crate::workspace::SCHEMA);
-    s.push_str(crate::users::SCHEMA);
-    s.push_str(crate::config_db::SCHEMA);
-    s.push_str(crate::channels::chat_history::SCHEMA);
-    s
-}
-
-/// Split a SCHEMA batch into CREATE TABLE statements vs everything else
-/// (CREATE INDEX, …).
-///
-/// Statement boundaries are `;` outside strings and `--` comments. Leading
-/// `--` comments on a statement travel with it so FTS/index documentation
-/// stays attached to the index, not the preceding table.
-fn split_schema_table_ddl(schema: &str) -> (String, String) {
-    let mut tables = String::new();
-    let mut rest = String::new();
-    for stmt in split_sql_statements(schema) {
-        let target = if is_create_table_ddl(&stmt) {
-            &mut tables
-        } else {
-            &mut rest
-        };
-        if !target.is_empty() {
-            target.push('\n');
-        }
-        target.push_str(&stmt);
-        target.push(';');
-    }
-    (tables, rest)
-}
-
-/// Split `sql` on `;` that are not inside single-quoted strings or `--` line
-/// comments.
-fn split_sql_statements(sql: &str) -> Vec<String> {
-    let bytes = sql.as_bytes();
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut i = 0;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if in_string {
-            cur.push(c);
-            if c == '\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    cur.push('\'');
-                    i += 2;
-                    continue;
-                }
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                cur.push(bytes[i] as char);
-                i += 1;
-            }
-            continue;
-        }
-        if c == '\'' {
-            in_string = true;
-            cur.push(c);
-            i += 1;
-            continue;
-        }
-        if c == ';' {
-            let stmt = cur.trim();
-            if !stmt.is_empty() {
-                out.push(stmt.to_string());
-            }
-            cur.clear();
-            i += 1;
-            continue;
-        }
-        cur.push(c);
-        i += 1;
-    }
-    let stmt = cur.trim();
-    if !stmt.is_empty() {
-        out.push(stmt.to_string());
-    }
-    out
-}
-
-/// True when `stmt` is `CREATE TABLE` after skipping leading `--` comments.
-fn is_create_table_ddl(stmt: &str) -> bool {
-    let mut rest = stmt.trim_start();
-    loop {
-        if let Some(after) = rest.strip_prefix("--") {
-            rest = after.split_once('\n').map_or("", |(_, t)| t).trim_start();
-            continue;
-        }
-        break;
-    }
-    rest.len() >= 12 && rest[..12].eq_ignore_ascii_case("create table")
-}
-
 /// Open (or create) the single consolidated domain database file.
 ///
 /// This is the canonical open for the 6 domain stores: it opens the one
 /// consolidated file ([`store_db_path`] mapping all domain names to
-/// [`CONSOLIDATED_DB_NAME`]), applies SCHEMA in two DDL passes around the
-/// consolidated migration list, and runs the one-time consolidation import
-/// when legacy per-store files are present. It does NOT run the per-store
-/// post-open hooks (tickets FTS index, admin-user seed) — those are
-/// idempotent and run in [`init_all_stores`] (production) and each store's
-/// `open` (isolated tests).
+/// [`CONSOLIDATED_DB_NAME`]) and applies the append-only schema catalog
+/// ([`crate::db::migrations`]) — the single owner of every schema creation,
+/// change, and removal for core.db. It does NOT run the per-store post-open
+/// hooks (tickets FTS index, admin-user seed) — those are idempotent and run
+/// in [`init_all_stores`] (production) and each store's `open` (isolated
+/// tests).
 ///
-/// # Boot DDL order (do not collapse)
+/// # Catalog, not SCHEMA
 ///
-/// 1. **CREATE TABLE IF NOT EXISTS** — safe on an existing file (no-op when
-///    the table is already there; does **not** add columns).
-/// 2. **Migrations** — `ALTER TABLE … ADD COLUMN` / data resets / guarded
-///    drops. This is the only path that reshapes an old table.
-/// 3. **Remaining SCHEMA DDL** (CREATE INDEX, …) — now legal even when an
-///    index mentions a column that SCHEMA's CREATE TABLE added in this
-///    version, because step 2 has run.
-/// 4. **Consolidation import** — FTS/board indexes from step 3 already exist,
-///    so bulk INSERTs maintain them.
+/// The catalog is a strictly linear history anchored at the 0.4.2 baseline:
+/// the starter entries create the 0.4.2 table shapes, then every later entry
+/// brings a database to the current shape. The only control flow is the
+/// id-based applied check (skip if the id is already recorded, otherwise run
+/// and record). A catalog failure is a hard boot failure — it is never
+/// classified as corruption and never triggers a quarantine/recreate.
 ///
-/// Putting step 3 before step 2 quarantined live stores: SCHEMA gained
-/// `CREATE UNIQUE INDEX … ON jobs(kind, ticket_id)` while `ticket_id` was
-/// only added by `consolidate_003`. `CREATE TABLE IF NOT EXISTS jobs` left
-/// the old table unchanged; the index failed with `no such column`; that
-/// was classified as corruption and the family was recreated empty.
+/// # Why tables → ALTER → indexes is baked into the catalog order
 ///
-/// When adding a column: put it on the CREATE TABLE in SCHEMA **and** add an
-/// `ALTER TABLE … ADD COLUMN` migration with a `ColumnExists` guard. Put
-/// indexes that mention the new column in SCHEMA (they run at step 3) and/or
-/// in a later migration. Never rely on CREATE TABLE IF NOT EXISTS to upgrade
-/// an existing table.
+/// The historical incident was real: SCHEMA gained `CREATE UNIQUE INDEX … ON
+/// jobs(kind, ticket_id)` while `ticket_id` was only added by a later ALTER.
+/// `CREATE TABLE IF NOT EXISTS jobs` left the old table unchanged; the index
+/// failed with `no such column` and the store was misclassified as corruption
+/// and recreated empty. In the catalog, `jobs.ticket_id` is ADDed
+/// (consolidate_003) strictly before the `idx_jobs_phase_ticket` unique index
+/// (consolidate_007) — the linear order preserves the invariant.
 ///
-/// # Migration vs import ordering
+/// # Catalog ordering around the import
 ///
-/// [`crate::db::migrations::run_domain_migrations`] runs **before** the one-time
-/// import. This is deliberate: the merged board+sessions history includes two
-/// UNGUARDED one-time data resets — board `003_reset_nonterminal_tickets`
-/// (resets every non-terminal ticket to `backlog`) and sessions
-/// `004_reset_implementation_jobs` (deletes `kind='ticket_stage'` jobs). On the
-/// fresh consolidated file those run against EMPTY tables (no-ops) and are
-/// recorded as applied; the import then copies the legacy user tables
-/// **verbatim**. So the resets never destructively re-fire on migrated data,
-/// and the consolidation contract is *migrate without losing data*: stale
-/// `kind='ticket_stage'` jobs and pre-rework ticket phases roll in as-is
-/// (downstream phase parsing/kind dispatch sees them exactly as the legacy
-/// store carried them — a separate concern from the storage consolidation).
+/// The FTS/board indexes run **before** the one-time consolidation import (a
+/// Rust-function catalog entry) so imported tickets are already FTS-searchable.
+/// The import copies the legacy user tables **verbatim** (FK off → bulk load →
+/// FK on), then two post-import entries shape the migrated rows:
+///
+/// - `003_reset_nonterminal_tickets` — non-terminal legacy tickets are reset to
+///   `backlog` (it is a DATA reset, so it must run after the import fills the
+///   consolidated tickets table; on an already-current DB it is recorded and
+///   skipped, never touching live in-progress tickets).
+/// - the `13` post-import cleanup DELETE — pre-rework `kind='ticket_stage'`,
+///   `'ticket_analysis'`, `'ticket_implementation'` jobs the import rolled in
+///   are discarded, and a `PRAGMA foreign_key_check` reports (never fails on)
+///   any orphan rows.
+///
+/// So the consolidation contract is *migrate without losing data* (rows that
+/// should survive are preserved) while the deliberate resets/drops are applied
+/// to the imported rows, and no destructive operation re-fires on an
+/// already-current DB.
 ///
 /// Returns a **fresh** connection. Production shares it across all domain
 /// stores via [`DOMAIN_CONN`]; isolated test opens (`open_test_store!`) drop it
 /// with the store. There is deliberately no process-global cache here so test
 /// isolation never leaks a connection across roots.
 pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Connection> {
-    let schema = consolidated_schema();
-    let (tables, rest) = split_schema_table_ddl(&schema);
-    // `CONSOLIDATED_DB_NAME` maps (via store_db_path) to the one consolidated
-    // file; the boot-diagnosis heal path keys off that same path, so a
-    // pre-flight diagnosis set for the consolidated file is consumed here.
-    // Heal/recreate inside `open_store` sees tables-only DDL: a fresh
-    // recreate gets current CREATE TABLE (full column set), then we migrate
-    // and apply indexes below.
-    let conn = open_store(root, CONSOLIDATED_DB_NAME, &tables).await?;
-
-    // Single consolidated migration runner: board + sessions migrations, ids
-    // preserved (never renumbered — two of them are unguarded one-time data
-    // resets that must not re-fire if renumbered). The unified
-    // `schema_migrations` table holds all of them.
-    crate::db::migrations::run_domain_migrations(&conn).await?;
-
-    // Indexes and other non-table SCHEMA DDL. Failure here is a code bug
-    // (or a unique-index conflict on migrated rows): fail boot, never
-    // quarantine — the tables and data are already open.
-    execute_schema_ddl(&conn, &rest).await?;
-
-    // One-time consolidation import from legacy per-store files.
-    run_consolidation_import_if_pending(&conn, root).await?;
+    // The catalog owns the ENTIRE schema. Open the raw connection (no DDL) and
+    // run the catalog; a catalog failure is a hard boot error — never healed
+    // or quarantined. A fresh/recreated store is empty until the catalog builds
+    // the full current shape.
+    let conn = open_store(root, CONSOLIDATED_DB_NAME, "").await?;
+    migrations::run_migrations(&conn, migrations::TargetDb::Core, root).await?;
 
     // Enable CDC on the FINAL connection, after all migrations/import, so
     // boot-time schema + import writes are not captured. This single chokepoint
@@ -1756,117 +1426,32 @@ pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Conne
     Ok(conn)
 }
 
-/// Id recorded in the unified `schema_migrations` table for the one-time
-/// consolidation import. This is the ONLY migration that brings the merged
-/// stores into the consolidated schema; future schema changes use the
-/// `consolidate_` prefix (e.g. `consolidate_002_...`).
-const CONSOLIDATION_MIGRATION_ID: &str = "consolidate_001_import_domain_stores";
-
-/// True when `id` is recorded in the unified `schema_migrations` table.
-async fn migration_applied(conn: &Connection, id: &str) -> anyhow::Result<bool> {
-    conn.query_optional(
-        "SELECT 1 FROM schema_migrations WHERE id = ?1",
-        params![id],
-        |_| Ok::<_, ::turso::Error>(()),
-    )
-    .await
-    .map(|row| row.is_some())
-    .context("Failed to read schema_migrations")
-}
-
-/// Record `id` as applied in the unified `schema_migrations` table.
-async fn record_migration(conn: &Connection, id: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2) \
-         ON CONFLICT(id) DO NOTHING",
-        params![id, now()],
-    )
-    .await
-    .map(|_| ())
-    .context("Failed to record consolidation migration as applied")
-}
-
-/// Run the one-time consolidation import when legacy per-store files are
-/// present and it has not already been applied.
-///
-/// *Idempotency / crash safety*: the import is tracked by
-/// [`CONSOLIDATION_MIGRATION_ID`] in the unified `schema_migrations` table. If
-/// it is already recorded, the function is a no-op. If it failed partway
-/// through, it is NOT recorded, so the next boot re-runs it — the import is
-/// written to be re-runnable (each table is emptied before re-copy, and rows
-/// are copied by the source rowid, so a partial copy leaves no duplicate rows).
-///
-/// *Non-atomicity*: copying from 6 separate legacy files cannot be atomic in a
-/// single transaction. The import therefore runs FK enforcement OFF during the
-/// bulk load (per decision 4), then turns FK enforcement back ON and validates
-/// with `PRAGMA foreign_key_check`. Violations are REPORTED (a `warn!`), not
-/// fatal — the one-time migration must preserve all legacy data even if a store
-/// carried orphan child rows (they remain soft references; FK enforcement
-/// applies only to subsequent writes).
-async fn run_consolidation_import_if_pending(conn: &Connection, root: &Path) -> anyhow::Result<()> {
-    if migration_applied(conn, CONSOLIDATION_MIGRATION_ID).await? {
-        return Ok(());
-    }
-    // `run_domain_migrations` already created schema_migrations; the import
-    // records its own id after success.
-    let any_legacy = DOMAIN_STORE_NAMES
-        .iter()
-        .any(|name| legacy_store_db_path(root, name).exists());
-    if any_legacy {
-        import_legacy_stores(conn, root).await?;
-    }
-    record_migration(conn, CONSOLIDATION_MIGRATION_ID).await?;
-    Ok(())
-}
-
 /// Copy user tables from the 6 legacy per-store files into the consolidated
 /// database, preserving the AUTOINCREMENT watermark (`sqlite_sequence`).
 ///
 /// *FK handling*: FK enforcement is OFF during the bulk load (children may be
 /// copied before their parents, and the target schema's FKs must not fire
-/// mid-copy). It is restored to ON and validated with
-/// `PRAGMA foreign_key_check` afterwards.
-async fn import_legacy_stores(conn: &Connection, root: &Path) -> anyhow::Result<()> {
+/// mid-copy). It is restored to ON afterwards; the post-import cleanup DELETE
+/// and `PRAGMA foreign_key_check` live in the catalog's own cleanup migration
+/// ([`crate::db::migrations`]).
+pub(crate) async fn import_legacy_stores(conn: &Connection, root: &Path) -> anyhow::Result<()> {
     conn.execute("PRAGMA foreign_keys = OFF;", ())
         .await
         .context("Failed to disable FK enforcement during consolidation import")?;
 
     let result = import_legacy_stores_inner(conn, root).await;
 
-    conn.execute("PRAGMA foreign_keys = ON;", ())
+    // Restore FK enforcement regardless of the import outcome so the connection
+    // is left in a sane state, but surface the import (root-cause) error
+    // preferentially over a secondary FK-re-enable failure.
+    let reenabled = conn
+        .execute("PRAGMA foreign_keys = ON;", ())
         .await
-        .context("Failed to re-enable FK enforcement after consolidation import")?;
-    result?;
-
-    // Discard pre-rework ticket jobs that the legacy import just rolled in.
-    // `consolidate_004_discard_old_ticket_jobs` runs during `run_domain_migrations`
-    // (before this import), so on the fresh->legacy-import path its DELETE hits
-    // an empty table; re-running it here guarantees nothing old is preserved
-    // (the ticket's "no backward compatibility" requirement).
-    conn.execute(
-        "DELETE FROM jobs WHERE kind IN ('ticket_analysis', 'ticket_implementation')",
-        (),
-    )
-    .await
-    .context("Failed to discard legacy ticket jobs after consolidation import")?;
-
-    // Validate referential integrity: the existing jobs/tickets cascades must
-    // hold on the migrated data. Validation REPORTS (does not fail) — the
-    // one-time migration must preserve all data even if a legacy store carried
-    // orphan child rows (they remain soft references; FK enforcement applies
-    // only to subsequent writes).
-    let violations = conn
-        .query("PRAGMA foreign_key_check", ())
-        .await
-        .context("Failed to run PRAGMA foreign_key_check after consolidation import")?;
-    if !violations.is_empty() {
-        tracing::warn!(
-            count = violations.len(),
-            "consolidation import found orphan rows violating the new FKs; \
-             preserving them as soft references (future writes still enforce the FK)",
-        );
+        .context("Failed to re-enable FK enforcement after consolidation import");
+    match (result, reenabled) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(e), _) | (Ok(()), Err(e)) => Err(e),
     }
-    Ok(())
 }
 
 async fn import_legacy_stores_inner(conn: &Connection, root: &Path) -> anyhow::Result<()> {
@@ -1956,11 +1541,11 @@ async fn import_one_legacy_store(
 /// keeps its name or maps to `None`.
 ///
 /// **Dormant legacy tables are deliberately dropped** (mapped to `None`): the
-/// consolidated SCHEMA never recreates them and no production code reads them.
-/// These include `config_role` — historically created for the (removed)
-/// per-role config override rows (no code references, not part of
-/// [`crate::config_db::SCHEMA`]) — and the old `ticket_jobs` child table, which
-/// the job-per-phase model removed (it stores `ticket_id` directly on `jobs`).
+/// consolidated schema catalog never recreates them and no production code
+/// reads them. These include `config_role` — historically created for the
+/// (removed) per-role config override rows (no code references, not part of the
+/// config tables) — and the old `ticket_jobs` child table, which the
+/// job-per-phase model removed (it stores `ticket_id` directly on `jobs`).
 /// The consolidated `schema_migrations`/fresh-install probe paths do not depend
 /// on them.
 fn consolidate_table_name(src: &str) -> Option<&'static str> {
@@ -3373,43 +2958,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn split_schema_table_ddl_keeps_indexes_out_of_the_table_pass() {
-        let schema = consolidated_schema();
-        let (tables, rest) = split_schema_table_ddl(&schema);
-        assert!(
-            tables.to_lowercase().contains("create table") && tables.contains("tickets"),
-            "tickets CREATE TABLE belongs in the table pass"
-        );
-        assert!(
-            tables.to_lowercase().contains("create table") && tables.contains("jobs"),
-            "jobs CREATE TABLE belongs in the table pass"
-        );
-        assert!(
-            !tables.to_lowercase().contains("create unique index")
-                && !tables.to_lowercase().contains("create index"),
-            "no CREATE INDEX in the table pass: {tables}"
-        );
-        assert!(
-            rest.contains("idx_jobs_phase_ticket"),
-            "jobs unique index must run after migrations, not with CREATE TABLE"
-        );
-        assert!(
-            rest.contains("idx_tickets_title_fts"),
-            "FTS index is post-table DDL (still before consolidation import)"
-        );
-        // `--` comments with semicolons must not split statements.
-        let commented = "-- note: do not run this; it is a comment\n\
-             CREATE TABLE IF NOT EXISTS t (id INTEGER);\n\
-             -- index on id; applied after migrations\n\
-             CREATE INDEX IF NOT EXISTS idx_t ON t(id);";
-        let (t, r) = split_schema_table_ddl(commented);
-        assert!(t.to_lowercase().contains("create table"));
-        assert!(r.to_lowercase().contains("create index"));
-        assert!(!t.to_lowercase().contains("create index"));
-    }
-
-    /// An existing, readable store whose SCHEMA batch indexes a column the
+    /// An existing, readable store whose open-time DDL indexes a column the
     /// live table does not have must fail boot — never quarantine. This is
     /// the job-per-phase incident in miniature.
     #[tokio::test]

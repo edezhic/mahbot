@@ -32,41 +32,6 @@ pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
     store().get_by_name(name).await
 }
 
-pub(crate) const SCHEMA: &str = "\
-CREATE TABLE IF NOT EXISTS workspaces (
-    name       TEXT PRIMARY KEY,
-    path       TEXT NOT NULL UNIQUE,
-    status     TEXT NOT NULL DEFAULT 'pending',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    maintenance INTEGER NOT NULL DEFAULT 0,
-    paused      INTEGER NOT NULL DEFAULT 1,
-    maintainer_debounce_mins INTEGER NOT NULL DEFAULT 5,
-    maintainer_last_run_at TEXT,
-    diagnostics TEXT,
-    diagnostics_generation INTEGER NOT NULL DEFAULT 0,
-    notes TEXT NOT NULL DEFAULT '',
-    last_analyzed_commit TEXT,
-    discovery_generation INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS workspace_contexts (
-    workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
-    role           TEXT,
-    content        TEXT NOT NULL,
-    created_at     TEXT NOT NULL,
-    UNIQUE(workspace_name, role)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS workspace_contexts_null_role ON workspace_contexts(workspace_name) WHERE role IS NULL;
-CREATE TABLE IF NOT EXISTS editor_tabs (
-    workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
-    file_path      TEXT NOT NULL,
-    tab_order      INTEGER NOT NULL DEFAULT 0,
-    is_active      INTEGER NOT NULL DEFAULT 0,
-    is_dirty       INTEGER NOT NULL DEFAULT 0,
-    dirty_content  TEXT,
-    PRIMARY KEY (workspace_name, file_path)
-);";
-
 // Column definitions for workspace SELECT queries.
 // Note: `discovery_generation` and `diagnostics_generation` are intentionally
 // excluded from this column list: both are read only via their own single-column

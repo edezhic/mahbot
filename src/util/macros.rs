@@ -131,10 +131,9 @@ macro_rules! columns {
 ///
 /// The macro no longer takes `db_name`/`schema`: after consolidation every
 /// domain store opens the ONE consolidated database file via
-/// [`crate::db::open_consolidated_store`]. The per-module `SCHEMA` const is
-/// still declared (and referenced directly by
-/// [`crate::db::consolidated_schema`]) but is no longer threaded through
-/// this macro.
+/// [`crate::db::open_consolidated_store`]. Every schema creation/change is an
+/// entry in the append-only catalog ([`crate::db::migrations`]); there is no
+/// per-module `SCHEMA` const anymore.
 ///
 /// An arbitrary-block form is **not** provided because Rust `macro_rules!`
 /// hygiene prevents user-provided `self` / `conn` tokens inside generated
@@ -158,8 +157,8 @@ macro_rules! define_store {
             ///
             /// For the domain stores this opens the consolidated database file
             /// ([`crate::db::CONSOLIDATED_DB_NAME`]) via
-            /// [`crate::db::open_consolidated_store`], which runs the shared
-            /// schema + consolidated migrations + one-time consolidation import.
+            /// [`crate::db::open_consolidated_store`], which runs the unified,
+            /// append-only schema catalog ([`crate::db::migrations`]).
             /// The connection returned is **fresh** and owned by this store
             /// (used by isolated `open_test_store!`); the production bootstrap
             /// shares one connection across all domain stores via
