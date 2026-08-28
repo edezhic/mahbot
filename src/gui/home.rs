@@ -1008,7 +1008,11 @@ impl HomeState {
         .style(theme::tooltip_style);
         controls.push(mic_btn.into());
 
-        let input_area = super::widgets::chat_composer(
+        // Composer strip matches the BG_BASE chat pane so the empty space around
+        // the rounded bubble blends with the page instead of showing a gray panel;
+        // the 8px horizontal padding matches the message-bubble column padding.
+        // The bubble itself keeps its own elevated styling.
+        let input_area: Element<'_, HomeMessage> = container(super::widgets::chat_composer(
             &self.editor_content,
             HomeMessage::InputChanged,
             HomeMessage::SendMessage,
@@ -1026,7 +1030,11 @@ impl HomeState {
                 send_tooltip: "send text message",
                 id: Some(Id::new("home_chat_composer")),
             },
-        );
+        ))
+        .style(theme::base_container_style)
+        .padding([0, 8])
+        .width(Length::Fill)
+        .into();
 
         // ── Recording popup (stop + send / stop + discard) ───────
         // While transcribing, the popup stays visible as a passive

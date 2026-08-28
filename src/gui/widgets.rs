@@ -425,9 +425,9 @@ pub struct ChatComposerOptions<'a, M> {
     pub id: Option<iced::widget::Id>,
 }
 
-/// Shared chat composer: a bubble-styled input surface matching the user
-/// message bubbles (BG_ELEVATED, radius 8, no border, 10px padding) holding
-/// the multi-line prose editor above a right-aligned action toolbar.
+/// Shared chat composer: a full-width bubble-styled input surface that
+/// callers inset to keep small side margins, holding the multi-line prose
+/// editor above a right-aligned action toolbar.
 /// `on_action`/`send_msg` parameterize the page's messages; callers supply
 /// the placeholder and a [`ChatComposerOptions`] bundle (editor min/max
 /// heights, the sending flag, optional controls, and whether the send button
@@ -497,21 +497,17 @@ pub fn chat_composer<'a, M: Clone + 'a>(
     toolbar = toolbar.push(send_btn);
 
     // Bubble-styled input surface: editor above, action icons below-right,
-    // inside one container matching the user message bubble form. A trailing
-    // spacer gives the composer the same 3/4 width as message bubbles — the
-    // bubble's FillPortion(3) only takes effect with a FillPortion(1) sibling
-    // (mirroring the user/agent bubble rows).
-    row![
-        container(column![input_editor, toolbar].spacing(6))
-            .padding(10)
-            .style(theme::bubble_style(
-                theme::BG_ELEVATED,
-                Some(theme::TEXT_PRIMARY),
-            ))
-            .width(Length::FillPortion(3)),
-        Space::new().width(Length::FillPortion(1)),
-    ]
-    .into()
+    // inside one container matching the user message bubble form, stretched to
+    // the full width of the chat pane. Callers inset the bubble (Home's black
+    // composer strip) to keep small side margins; Board's modal already pads it.
+    container(column![input_editor, toolbar].spacing(6))
+        .padding(10)
+        .style(theme::bubble_style(
+            theme::BG_ELEVATED,
+            Some(theme::TEXT_PRIMARY),
+        ))
+        .width(Length::Fill)
+        .into()
 }
 
 /// Render formatted diff stats (+X/−Y) matching ticket card style.
