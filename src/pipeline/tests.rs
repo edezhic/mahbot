@@ -852,8 +852,9 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
 // ── 2. Analysis escalation + blocker verification ───────────────────────
 
 /// A base analysis round that flags a shared blocker escalates to 2
-/// blocker-verification analysts; when both refute the blocker the ticket
-/// still advances to Planning and the joint comment records the verification.
+/// blocker-verification analysts; the verifiers grade the blocker with
+/// substance (kind/severity/impact/reasoning), the ticket still advances to
+/// Planning, and the joint comment records the enrichment.
 
 #[serial_test::serial(provider)]
 #[tokio::test]
@@ -883,8 +884,10 @@ async fn analysis_escalation_and_blocker_verification() {
         let _lock = crate::util::test::retry_tests_lock();
         let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // 3 base analysts: 2 flag the SAME blocker, 1 passes clean. Then 2
-        // escalation verifiers both refute it. The base joint-comment synthesis
-        // falls back deterministically (3 scripted invalid responses).
+        // escalation verifiers grade the blocker (enrichment-only: one sees it
+        // as a risk/edge-case, the other as a main-path blocker). The base
+        // joint-comment synthesis falls back deterministically (3 scripted
+        // invalid responses).
         let fake = crate::util::test::FakeProvider::new()
             .ok("analyst one")
             .ok(r#"{"score":5,"issues":["missing error handling"]}"#)
@@ -896,9 +899,9 @@ async fn analysis_escalation_and_blocker_verification() {
             .ok("{}")
             .ok("{}")
             .ok("verifier one")
-            .ok(r#"{"verdicts":[{"index":0,"verdict":"refuted","reasoning":"handled"}]}"#)
+            .ok(r#"{"verdicts":[{"index":0,"kind":"risk_edge_case","severity":"medium","impact":"delays onboarding","reasoning":"present but not blocking"}]}"#)
             .ok("verifier two")
-            .ok(r#"{"verdicts":[{"index":0,"verdict":"refuted","reasoning":"handled"}]}"#);
+            .ok(r#"{"verdicts":[{"index":0,"kind":"main_path_blocker","severity":"high","impact":"blocks the main path","reasoning":"core requirement"}]}"#);
         let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
         super::analysis::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
@@ -1080,7 +1083,7 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
 
     let conn = &crate::session::store().conn;
     // Base round (idx 0-2): two sub-threshold analysts flag the SAME blocker,
-    // one passes clean. Escalation (idx 3-4): idx 3 already refuted the blocker
+    // one passes clean. Escalation (idx 3-4): idx 3 already graded the blocker
     // (Done); idx 4 was interrupted (Failed) and must be re-run.
     let blocker_verdict =
         super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
@@ -1092,13 +1095,14 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
             score: 8,
             issues_detected: Vec::new(),
         }));
-    let refute_outcome = super::serialize_verdict_outcome(
+    let grade_outcome = super::serialize_verdict_outcome(
         &super::ParallelVerdict::BlockerVerification(crate::BlockerVerificationVerdict {
             verdicts: vec![crate::BlockerVerificationItem {
                 index: 0,
-                verdict: crate::BlockerDisposition::Refuted,
+                kind: crate::BlockerKind::RiskEdgeCase,
+                severity: crate::BlockerSeverity::Low,
+                impact: "handled".to_string(),
                 reasoning: "handled".to_string(),
-                sharpened_text: None,
             }],
         }),
     );
@@ -1123,7 +1127,7 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
         (
             3_i64,
             crate::jobs::RowStatus::Done,
-            Some(refute_outcome.as_str()),
+            Some(grade_outcome.as_str()),
         ),
         (
             4_i64,
@@ -1158,7 +1162,7 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
         // scripted responses (base verdicts carry issues, so it is not clean).
         let fake = crate::util::test::FakeProvider::new()
             .ok("verifier one")
-            .ok(r#"{"verdicts":[{"index":0,"verdict":"refuted","reasoning":"handled"}]}"#)
+            .ok(r#"{"verdicts":[{"index":0,"kind":"risk_edge_case","severity":"low","impact":"handled","reasoning":"handled"}]}"#)
             .ok("{}")
             .ok("{}")
             .ok("{}");
@@ -1192,6 +1196,37 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
         analysis_comment.content.contains("Blocker verification"),
         "the joint comment must record the resumed blocker-verification round",
     );
+}
+
+#[test]
+fn blocker_verification_merge_reduces_two_verifiers_to_one_outcome() {
+    let blockers = vec!["missing error handling".to_string()];
+    let v1 = crate::BlockerVerificationVerdict {
+        verdicts: vec![crate::BlockerVerificationItem {
+            index: 0,
+            kind: crate::BlockerKind::RiskEdgeCase,
+            severity: crate::BlockerSeverity::Medium,
+            impact: "delays onboarding".to_string(),
+            reasoning: "present but not blocking".to_string(),
+        }],
+    };
+    let v2 = crate::BlockerVerificationVerdict {
+        verdicts: vec![crate::BlockerVerificationItem {
+            index: 0,
+            kind: crate::BlockerKind::MainPathBlocker,
+            severity: crate::BlockerSeverity::High,
+            impact: "blocks the main path".to_string(),
+            reasoning: "core requirement".to_string(),
+        }],
+    };
+    let resolved = super::analysis::apply_blocker_verification(&blockers, &[&v1, &v2]);
+    assert_eq!(resolved.len(), 1);
+    let r = &resolved[0];
+    assert_eq!(r.text, "missing error handling");
+    assert_eq!(r.kind, crate::BlockerKind::MainPathBlocker);
+    assert_eq!(r.severity, crate::BlockerSeverity::High);
+    assert_eq!(r.impact, "delays onboarding — blocks the main path");
+    assert_eq!(r.reasoning, "present but not blocking — core requirement");
 }
 
 // ── 3. Reviewer/QA dynamic count calibration ────────────────────────────

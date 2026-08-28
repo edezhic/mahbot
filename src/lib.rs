@@ -811,27 +811,41 @@ pub(crate) struct Verdict {
     pub issues_detected: Vec<String>,
 }
 
-/// Disposition of a single aggregated blocker after the escalation round.
+/// Whether an aggregated blocker hinders the main implementation path or is a
+/// real but non-blocking risk/edge case. Stored as a snake_case enum; any
+/// human label is emitted only at render time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum BlockerDisposition {
-    Confirmed,
-    Refuted,
-    Sharpened,
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BlockerKind {
+    MainPathBlocker,
+    RiskEdgeCase,
 }
 
-/// One blocker's verification verdict from an escalation analyst.
+/// Severity of an aggregated blocker if left unaddressed. `Ord` uses
+/// declaration order so the two-verifier merge can take the max
+/// (critical > high > medium > low).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BlockerSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// One blocker's substance outcome from an escalation analyst.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct BlockerVerificationItem {
     /// 0-based index of the blocker in the injected list.
     pub index: usize,
-    /// Disposition of the blocker.
-    pub verdict: BlockerDisposition,
+    /// Whether the blocker blocks the main path or is a risk/edge case.
+    pub kind: BlockerKind,
+    /// Severity if left unaddressed.
+    pub severity: BlockerSeverity,
+    /// What the blocker affects / how it constrains the ticket (required).
+    pub impact: String,
     /// Evidence-backed justification (required).
     pub reasoning: String,
-    /// Replacement text when the verdict is `Sharpened`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sharpened_text: Option<String>,
 }
 
 /// Result of one escalation analyst verifying the aggregated blocker list.

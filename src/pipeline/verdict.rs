@@ -459,17 +459,8 @@ pub(crate) fn validate_blocker_verification(
         if item.reasoning.trim().is_empty() {
             return Err(format!("blocker {} missing reasoning", item.index));
         }
-        if item.verdict == crate::BlockerDisposition::Sharpened
-            && item
-                .sharpened_text
-                .as_deref()
-                .map_or("", str::trim)
-                .is_empty()
-        {
-            return Err(format!(
-                "sharpened blocker {} requires sharpened_text",
-                item.index
-            ));
+        if item.impact.trim().is_empty() {
+            return Err(format!("blocker {} missing impact", item.index));
         }
     }
     Ok(())

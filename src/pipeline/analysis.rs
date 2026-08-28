@@ -101,37 +101,82 @@ fn aggregate_blockers(results: &[ParallelVerdict]) -> Vec<String> {
     out
 }
 
-/// Apply the escalation agents' verdicts to the blocker list.
-fn apply_blocker_verification(
+/// A merged substance outcome for one aggregate blocker after the escalation
+/// round. The two verifiers are reduced deterministically and conservatively
+/// into a single grade; every aggregated blocker survives (enrichment-only).
+pub(crate) struct ResolvedBlocker {
+    pub text: String,
+    pub kind: crate::BlockerKind,
+    pub severity: crate::BlockerSeverity,
+    pub impact: String,
+    pub reasoning: String,
+}
+
+/// Human label for a blocker kind (display only; never stored).
+fn display_kind(kind: crate::BlockerKind) -> &'static str {
+    match kind {
+        crate::BlockerKind::MainPathBlocker => "main-path blocker",
+        crate::BlockerKind::RiskEdgeCase => "risk/edge-case",
+    }
+}
+
+/// Human label for a blocker severity (display only; never stored).
+fn display_severity(severity: crate::BlockerSeverity) -> &'static str {
+    match severity {
+        crate::BlockerSeverity::Low => "low",
+        crate::BlockerSeverity::Medium => "medium",
+        crate::BlockerSeverity::High => "high",
+        crate::BlockerSeverity::Critical => "critical",
+    }
+}
+
+/// Merge the escalation verifiers' substance verdicts into one per-blocker
+/// outcome. Deterministic and conservative: severity is the max across
+/// verifiers, kind is `main_path_blocker` if any verifier chose it, and
+/// impact/reasoning concatenate the non-empty per-verifier values separated by
+/// " — ". A verifier that produced no verdict for a blocker contributes
+/// nothing. Every aggregated blocker survives with an enriched grade (this is
+/// never a filter).
+pub(crate) fn apply_blocker_verification(
     blockers: &[String],
     verdicts: &[&crate::BlockerVerificationVerdict],
-) -> Vec<String> {
-    let mut judged = vec![0usize; blockers.len()];
-    let mut refuted = vec![0usize; blockers.len()];
-    let mut sharpened: Vec<Option<String>> = vec![None; blockers.len()];
-    for round in verdicts {
-        for item in &round.verdicts {
-            judged[item.index] += 1;
-            match item.verdict {
-                crate::BlockerDisposition::Refuted => refuted[item.index] += 1,
-                crate::BlockerDisposition::Sharpened => {
-                    if sharpened[item.index].is_none() {
-                        sharpened[item.index].clone_from(&item.sharpened_text);
+) -> Vec<ResolvedBlocker> {
+    blockers
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let mut severity = crate::BlockerSeverity::Low;
+            let mut kind = crate::BlockerKind::RiskEdgeCase;
+            let mut impact_parts: Vec<&str> = Vec::new();
+            let mut reasoning_parts: Vec<&str> = Vec::new();
+            for round in verdicts {
+                for item in &round.verdicts {
+                    if item.index != i {
+                        continue;
+                    }
+                    if item.severity > severity {
+                        severity = item.severity;
+                    }
+                    if item.kind == crate::BlockerKind::MainPathBlocker {
+                        kind = item.kind;
+                    }
+                    if !item.impact.trim().is_empty() {
+                        impact_parts.push(item.impact.trim());
+                    }
+                    if !item.reasoning.trim().is_empty() {
+                        reasoning_parts.push(item.reasoning.trim());
                     }
                 }
-                crate::BlockerDisposition::Confirmed => {}
             }
-        }
-    }
-    let mut out = Vec::new();
-    for (i, blocker) in blockers.iter().enumerate() {
-        let all_refuted = judged[i] > 0 && refuted[i] == judged[i];
-        if all_refuted {
-            continue;
-        }
-        out.push(sharpened[i].clone().unwrap_or_else(|| blocker.clone()));
-    }
-    out
+            ResolvedBlocker {
+                text: text.clone(),
+                kind,
+                severity,
+                impact: impact_parts.join(" — "),
+                reasoning: reasoning_parts.join(" — "),
+            }
+        })
+        .collect()
 }
 
 /// Number the blocker list for the escalation prompt template.
@@ -144,23 +189,26 @@ fn format_blocker_list(blockers: &[String]) -> String {
         .join("\n")
 }
 
-/// Render the escalation round's verification outcome.
-fn format_blocker_verification_report(blockers: &[String], final_blockers: &[String]) -> String {
+/// Render the escalation round's substance outcome. Always reached with a
+/// non-empty blocker list (escalation only appends when blockers aggregate).
+fn format_blocker_verification_report(blockers: &[ResolvedBlocker]) -> String {
     let mut out = String::from("\n\n### Blocker verification\n");
-    if final_blockers.is_empty() {
-        out.push_str(
-            "All flagged blockers were refuted by the verification round — no blockers remain.",
-        );
-    } else {
+    let _ = writeln!(
+        out,
+        "{} flagged blocker(s) verified with substance grades:",
+        blockers.len()
+    );
+    for (i, b) in blockers.iter().enumerate() {
         let _ = writeln!(
             out,
-            "{} of {} flagged blocker(s) survived verification. Remaining actionable blockers:",
-            final_blockers.len(),
-            blockers.len(),
+            "\n{}. {} — {} (severity: {})",
+            i + 1,
+            b.text,
+            display_kind(b.kind),
+            display_severity(b.severity),
         );
-        for (i, b) in final_blockers.iter().enumerate() {
-            let _ = write!(out, "\n{}. {b}", i + 1);
-        }
+        let _ = write!(out, "\n   Impact: {}", b.impact);
+        let _ = write!(out, "\n   Reasoning: {}", b.reasoning);
     }
     out
 }
@@ -191,11 +239,8 @@ fn append_escalation_report(
         return;
     }
     let blockers = aggregate_blockers(base_results);
-    let final_blockers = apply_blocker_verification(&blockers, &verification);
-    joint_comment.push_str(&format_blocker_verification_report(
-        &blockers,
-        &final_blockers,
-    ));
+    let resolved = apply_blocker_verification(&blockers, &verification);
+    joint_comment.push_str(&format_blocker_verification_report(&resolved));
     if succeeded < dispatched {
         let _ = write!(
             joint_comment,
