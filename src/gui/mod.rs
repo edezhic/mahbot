@@ -1722,15 +1722,20 @@ impl Dashboard {
                     )],
                 )
                 .into();
-                // Wrap sidebar in a right-click context menu with "Archive done & cancelled" option.
-                let sidebar: Element<'_, Message> = ContextMenu::new(
-                    sidebar,
-                    vec![menus::MenuItem::new(
-                        "Archive done & cancelled".into(),
-                        Message::Board(board::BoardMessage::ArchiveAllCompleted),
-                    )],
-                )
-                .into();
+                // Wrap sidebar in a right-click context menu with "Archive done
+                // & cancelled", plus the bulk pause item when a
+                // ready-for-development ticket is listed.
+                let mut menu_items = vec![menus::MenuItem::new(
+                    "Archive done & cancelled".into(),
+                    Message::Board(board::BoardMessage::ArchiveAllCompleted),
+                )];
+                if self.board_state.has_visible_rfd_tickets() {
+                    menu_items.push(menus::MenuItem::new(
+                        "Pause all ready-for-development tickets".into(),
+                        Message::Board(board::BoardMessage::PauseAllReadyForDevelopment),
+                    ));
+                }
+                let sidebar: Element<'_, Message> = ContextMenu::new(sidebar, menu_items).into();
                 let base = row![
                     container(home_view).width(Length::FillPortion(7)),
                     container(sidebar).width(Length::FillPortion(3))
