@@ -966,3 +966,42 @@ fn test_single_line_height_clamp() {
         300.0,
     );
 }
+
+#[test]
+fn mouse_interaction_gated_on_cursor_bounds() {
+    // Regression for modal click-outside-to-close: the editor must report
+    // `Text` only while the cursor is over its own bounds. Reporting it
+    // unconditionally makes iced `Stack` levitate the cursor over a modal's
+    // backdrop `mouse_area`, which then bails on the now-Levitating cursor and
+    // never delivers the click — so embedding an editor broke click-outside.
+    let bounds = Rectangle::new(Point::new(10.0, 10.0), Size::new(100.0, 40.0));
+
+    // Cursor inside the editor bounds → the text-edit affordance.
+    let inside = mouse::Cursor::Available(Point::new(50.0, 30.0));
+    assert_eq!(
+        editor_mouse_interaction(inside, bounds),
+        mouse::Interaction::Text
+    );
+
+    // Cursor outside the bounds → default (`None`), so the editor never
+    // claims the cursor beyond its field and the backdrop stays clickable.
+    let outside = mouse::Cursor::Available(Point::new(300.0, 300.0));
+    assert_eq!(
+        editor_mouse_interaction(outside, bounds),
+        mouse::Interaction::default()
+    );
+
+    // A levitating cursor (an overlay above already claimed it) is never
+    // "over" the editor, so it must not be re-claimed nor re-levitated.
+    let levitating = mouse::Cursor::Levitating(Point::new(50.0, 30.0));
+    assert_eq!(
+        editor_mouse_interaction(levitating, bounds),
+        mouse::Interaction::default()
+    );
+
+    // No cursor available → default (`None`).
+    assert_eq!(
+        editor_mouse_interaction(mouse::Cursor::Unavailable, bounds),
+        mouse::Interaction::default()
+    );
+}

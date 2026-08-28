@@ -3605,12 +3605,28 @@ where
     fn mouse_interaction(
         &self,
         _tree: &Tree,
-        _layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
+        editor_mouse_interaction(cursor, layout.bounds())
+    }
+}
+
+/// Interaction reported by [`EditorWidget`] at a cursor position.
+///
+/// The editor claims [`mouse::Interaction::Text`] only while the cursor is
+/// over its own bounds, matching iced's `text_editor`/`text_input`. Reporting
+/// it unconditionally would make the editor claim the cursor across the whole
+/// window, so iced's `Stack` levitates the cursor over any modal backdrop's
+/// `mouse_area`, which then bails and never delivers the click — breaking
+/// click-outside-to-close for modals embedding an editor.
+fn editor_mouse_interaction(cursor: mouse::Cursor, bounds: Rectangle) -> mouse::Interaction {
+    if cursor.is_over(bounds) {
         mouse::Interaction::Text
+    } else {
+        mouse::Interaction::default()
     }
 }
 
