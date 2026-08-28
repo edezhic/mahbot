@@ -6,10 +6,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use iced::keyboard;
 use iced::widget::{
     self, Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable,
-    stack, text, text_editor, text_input, tooltip,
+    stack, text, tooltip,
 };
 use iced::{Alignment, Color, Element, Length, Padding, Task};
 
@@ -60,44 +59,117 @@ pub fn pick_list_style(_theme: &iced::Theme, _status: pick_list::Status) -> pick
     }
 }
 
-/// Flexoki-dark themed style for [`fn@text_input`] widgets.
-/// Matches [`pick_list_style`] for visual consistency.
-#[must_use]
-pub fn text_input_style(_theme: &iced::Theme, _status: text_input::Status) -> text_input::Style {
-    text_input::Style {
-        background: iced::Background::Color(theme::BG_ELEVATED),
-        border: iced::Border {
-            radius: 4.0.into(),
-            width: 1.0,
-            color: theme::BORDER_STRONG,
-        },
-        icon: theme::TEXT_MUTED,
-        placeholder: theme::TEXT_MUTED,
-        value: theme::TEXT_PRIMARY,
-        selection: theme::ACCENT,
-    }
+// ── Shared single-line editor field ──────────────────────────────────
+
+/// A single shared-editor field frame matching the app's `text_input` visual
+/// language (`BG_ELEVATED` fill, radius 4, hairline border).
+pub(crate) fn editor_field_style(border_color: Color) -> impl Fn(&iced::Theme) -> container::Style {
+    move |_theme: &iced::Theme| theme::container_style(theme::BG_ELEVATED, 4.0, 1.0, border_color)
 }
 
-/// Highlighted [`fn@text_input`] style for fields that need attention (e.g.
-/// the provider API key while unset): an accent border plus a subtle accent
-/// background tint. Identical to [`text_input_style`] otherwise.
+/// Render a single-line shared editor field, replacing iced `text_input`.
+///
+/// `submit_on_enter` selects the bare-Enter behavior: `true` submits the
+/// field's action, `false` leaves Enter a no-op. The buffer is owned by the
+/// caller; the caller applies [`super::editor_widget::EditorAction`] via
+/// [`super::common::apply_editor_action`] and reads `buffer.text()`.
+///
+/// `id` makes the field click-to-focus and gates keyboard processing on focus.
+/// Tab in a single-line field emits a focus action that the page maps to
+/// `operation::focus_next()` / `focus_previous()` (the code editor keeps
+/// Tab→Indent itself). Pass `None` when the field does not need its own focus
+/// id.
 #[must_use]
-pub fn text_input_highlight_style(
-    _theme: &iced::Theme,
-    _status: text_input::Status,
-) -> text_input::Style {
-    text_input::Style {
-        background: iced::Background::Color(theme::ACCENT.scale_alpha(0.07)),
-        border: iced::Border {
-            radius: 4.0.into(),
-            width: 1.5,
-            color: theme::ACCENT,
-        },
-        icon: theme::TEXT_MUTED,
-        placeholder: theme::TEXT_MUTED,
-        value: theme::TEXT_PRIMARY,
-        selection: theme::ACCENT,
+pub fn single_line_editor<'a, M: 'a>(
+    buffer: &'a super::editor_widget::EditorBuffer,
+    placeholder: &'a str,
+    submit_on_enter: bool,
+    width: Length,
+    id: Option<iced::widget::Id>,
+    on_action: impl Fn(super::editor_widget::EditorAction) -> M + 'a,
+) -> Element<'a, M> {
+    let mut editor = super::editor_widget::EditorWidget::new(buffer)
+        .single_line(true)
+        .show_gutter(false)
+        .code_mode(false)
+        .enter(if submit_on_enter {
+            super::editor_widget::EnterBehavior::Submit
+        } else {
+            super::editor_widget::EnterBehavior::Newline
+        })
+        .placeholder(placeholder)
+        .padding(5.0)
+        .background(Some(theme::BG_ELEVATED));
+    if let Some(id) = id {
+        editor = editor.id(id);
     }
+    let element = iced::Element::new(editor).map(on_action);
+    container(element)
+        .width(width)
+        .style(editor_field_style(theme::BORDER_STRONG))
+        .into()
+}
+
+/// Render a masked single-line shared editor field with a lucide show/hide
+/// toggle (the mismatched glyph button is replaced by `eye`/`eye_off`).
+///
+/// Copy always returns the plaintext value; masking only affects rendering.
+/// `id` makes the field click-to-focus and gates keyboard processing on focus.
+/// Tab emits a focus action the page maps to `focus_next` / `focus_previous`
+/// (single-line fields never indent).
+#[must_use]
+#[expect(clippy::too_many_arguments)]
+pub fn password_field_editor<'a, M: Clone + 'a>(
+    buffer: &'a super::editor_widget::EditorBuffer,
+    placeholder: &'a str,
+    show: bool,
+    width: Length,
+    highlight: bool,
+    id: Option<iced::widget::Id>,
+    on_action: impl Fn(super::editor_widget::EditorAction) -> M + 'a,
+    on_toggle: M,
+) -> Element<'a, M> {
+    let border_color = if highlight {
+        theme::ACCENT
+    } else {
+        theme::BORDER_STRONG
+    };
+    let mut editor = super::editor_widget::EditorWidget::new(buffer)
+        .single_line(true)
+        .masked(!show)
+        .show_gutter(false)
+        .code_mode(false)
+        .enter(super::editor_widget::EnterBehavior::Submit)
+        .placeholder(placeholder)
+        .padding(5.0)
+        .background(Some(theme::BG_ELEVATED));
+    if let Some(id) = id {
+        editor = editor.id(id);
+    }
+    let element = iced::Element::new(editor).map(on_action);
+    let field = container(element)
+        .width(width)
+        .style(editor_field_style(border_color));
+
+    let eye_icon: Element<'_, M> = if show {
+        lucide::eye_off::<iced::Theme, iced::Renderer>()
+            .size(14)
+            .color(theme::TEXT_MUTED)
+            .into()
+    } else {
+        lucide::eye::<iced::Theme, iced::Renderer>()
+            .size(14)
+            .color(theme::TEXT_MUTED)
+            .into()
+    };
+    let toggle = button(eye_icon)
+        .padding(2)
+        .style(theme::button_secondary)
+        .on_press(on_toggle);
+
+    row![field, Space::new().width(4), toggle]
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// Render a styled error banner for dashboard panels.
@@ -340,79 +412,66 @@ pub struct ChatComposerOptions<'a, M> {
     /// ("send text message" on Home, "send comment" on the Board ticket
     /// modal). Shown on hover even while the button is disabled.
     pub send_tooltip: &'a str,
+    /// Optional focus id for the composer editor, making it click-to-focus
+    /// and gating keyboard processing on focus so keystrokes don't leak when
+    /// it is not focused.
+    pub id: Option<iced::widget::Id>,
 }
 
-/// Shared chat composer: text editor with Enter-to-send and Cmd+Z intercept,
-/// a floating send button, and the overlay stack. `on_action`/`send_msg`
-/// parameterize the page's messages; callers supply the placeholder and an
+/// Shared chat composer: text editor with Enter-to-send, a floating send
+/// button, and the overlay stack. `on_action`/`send_msg` parameterize the
+/// page's messages; callers supply the placeholder and an
 /// [`ChatComposerOptions`] bundle (editor min/max heights, the sending flag,
 /// optional right-edge controls, and whether the send button greys on empty
 /// input).
 #[must_use]
 pub fn chat_composer<'a, M: Clone + 'a>(
-    content: &'a text_editor::Content,
-    on_action: impl Fn(text_editor::Action) -> M + 'a,
+    content: &'a super::editor_widget::EditorBuffer,
+    on_action: impl Fn(super::editor_widget::EditorAction) -> M + 'a,
     send_msg: M,
     placeholder: &'a str,
     options: ChatComposerOptions<'a, M>,
 ) -> Element<'a, M> {
     let send_msg_btn = send_msg.clone();
-    let mut input_editor = text_editor(content)
-        .on_action(on_action)
+
+    let mut editor = super::editor_widget::EditorWidget::new(content)
+        .show_gutter(false)
+        .code_mode(false)
+        .enter(super::editor_widget::EnterBehavior::Submit)
         .placeholder(placeholder)
         .min_height(options.min_height)
         .max_height(options.max_height)
-        .style(|_theme: &iced::Theme, status| {
-            let is_focused = matches!(status, text_editor::Status::Focused { .. });
-            text_editor::Style {
-                background: iced::Background::Color(theme::BG_ELEVATED),
-                border: iced::Border {
-                    radius: 8.0.into(),
-                    width: if is_focused { 1.0 } else { 0.0 },
-                    color: if is_focused {
-                        theme::ACCENT
-                    } else {
-                        iced::Color::TRANSPARENT
-                    },
-                },
-                placeholder: theme::TEXT_MUTED,
-                value: theme::TEXT_PRIMARY,
-                selection: theme::ACCENT_DIM,
-            }
-        })
-        .key_binding(move |key_press| {
-            // Intercept Cmd+Z / Cmd+Shift+Z — handled by the keyboard
-            // subscription; on macOS only Cmd+Z triggers undo (Ctrl+Z is the
-            // terminal SUSP character and should insert 'z').
-            let km = super::detect_keyboard_mods(key_press.modifiers);
-            if km.is_shortcut_platform_mod()
-                && matches!(
-                    &key_press.key,
-                    keyboard::Key::Character(c) if c == "z"
-                )
-            {
-                return None;
-            }
-            if key_press.key == keyboard::Key::Named(keyboard::key::Named::Enter)
-                && !key_press.modifiers.shift()
-            {
-                Some(text_editor::Binding::Custom(send_msg.clone()))
-            } else {
-                text_editor::Binding::from_key_press(key_press)
-            }
-        });
-
-    // Keep the text clear of the right-edge control column when present.
-    // Preserve the text_editor's default 5px padding on the other edges.
-    if !options.controls.is_empty() {
-        input_editor = input_editor.padding(iced::Padding::new(5.0).right(38.0));
+        .padding(5.0);
+    if let Some(id) = options.id {
+        editor = editor.id(id);
     }
+
+    // The widget has a uniform scalar padding; keep the text clear of the
+    // right-edge control column by insetting the chrome container on the
+    // right when controls are present (the widget already provides the 5px
+    // inset on every other edge).
+    let input_editor: Element<'a, M> = {
+        let editor: Element<'a, M> = iced::Element::new(editor).map(move |action| match action {
+            super::editor_widget::EditorAction::Submit => send_msg.clone(),
+            other => on_action(other),
+        });
+        let mut editor_container = container(editor)
+            .width(Length::Fill)
+            .height(Length::Shrink)
+            .style(|_theme| theme::container_style(theme::BG_ELEVATED, 8.0, 1.0, theme::ACCENT));
+        if !options.controls.is_empty() {
+            // 33px container inset + 5px widget padding ≈ the shared editor's
+            // 38px right clearance for the controls column.
+            editor_container = editor_container.padding(iced::Padding::default().right(33.0));
+        }
+        editor_container.into()
+    };
 
     // Whitespace-only input counts as empty (greys the send button).
     // The emptiness check is gated on grey_on_empty so Board (legacy look)
     // never allocates content.text() per frame.
-    let send_disabled = options.sending
-        || (options.grey_on_empty && (content.is_empty() || content.text().trim().is_empty()));
+    let send_disabled =
+        options.sending || (options.grey_on_empty && content.text().trim().is_empty());
     let send_btn = icon_tooltip_button(
         lucide::send::<iced::Theme, iced::Renderer>()
             .size(14)
@@ -446,7 +505,7 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         .into();
 
     // Stack the editor with the send button overlaid at bottom-right.
-    container(stack([input_editor.into(), overlay]))
+    container(stack([input_editor, overlay]))
         .padding(8)
         .style(theme::base_container_style)
         .into()

@@ -22,8 +22,8 @@ use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Checkbox, Column, Row, Space, button, column, container, pick_list, row, scrollable, stack,
-    text, text_editor, text_input, toggler, tooltip,
+    Checkbox, Column, Id, Row, Space, button, column, container, pick_list, row, scrollable, stack,
+    text, toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -31,6 +31,8 @@ use iced_fonts::lucide;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use super::common::SingleLineEditorState;
+use super::editor_widget::EditorAction;
 use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::users;
@@ -49,8 +51,8 @@ fn parse_models(raw: Option<&str>) -> Vec<String> {
 
 /// Add a model from an input buffer to a model list, preventing duplicates.
 /// Clears the input buffer after the operation.
-fn add_model_to_list(input: &mut String, list: &mut Option<String>) {
-    let model = input.trim().to_string();
+fn add_model_to_list(input: &mut SingleLineEditorState, list: &mut Option<String>) {
+    let model = input.text().trim().to_string();
     if !model.is_empty() {
         let mut models = parse_models(list.as_deref());
         if !models.contains(&model) {
@@ -88,13 +90,13 @@ fn model_picker_list<'a>(
     target: ModelPickerTarget,
     models_field: Option<&'a str>,
     active_field: Option<&'a str>,
-    add_input: &'a str,
+    add_input: &'a SingleLineEditorState,
     add_placeholder: &'static str,
     error: Option<&'a str>,
 ) -> Element<'a, SettingsMessage> {
-    let on_add_input = move |v| SettingsMessage::ModelPicker {
+    let on_add_input = move |action| SettingsMessage::ModelPicker {
         target,
-        action: ModelPickerAction::AddInput(v),
+        action: ModelPickerAction::AddInput(action),
     };
     let on_add = SettingsMessage::ModelPicker {
         target,
@@ -176,10 +178,14 @@ fn model_picker_list<'a>(
     };
 
     let add_row = row![
-        text_input(add_placeholder, add_input)
-            .on_input(on_add_input)
-            .style(super::widgets::text_input_style)
-            .width(Length::Fixed(450.0)),
+        widgets::single_line_editor(
+            &add_input.buffer,
+            add_placeholder,
+            false, // Enter adds nothing here; the Add button drives the mutation.
+            Length::Fixed(450.0),
+            Some(Id::from(format!("model_picker:{}", target.idx()))),
+            on_add_input,
+        ),
         Space::new().width(4),
         button(text("Add").size(11))
             .padding(4)
@@ -223,7 +229,7 @@ impl ModelPickerTarget {
 /// Action performed on a model picker.
 #[derive(Debug, Clone)]
 pub enum ModelPickerAction {
-    AddInput(String),
+    AddInput(EditorAction),
     AddModel,
     RemoveModel(String),
     SetActive(String),
@@ -301,7 +307,23 @@ pub enum SettingsMessage {
     /// Per-model provider routing edits
     ModelRoutingOrder {
         model: String,
-        order: String,
+        action: EditorAction,
+    },
+    /// A shared-editor action on a stateless config text field. The field's
+    /// buffer lives in [`SettingsState::field_editors`] keyed by
+    /// `config:<key>`; the handler applies the action to it and stages the
+    /// resulting text as a [`ConfigField`], settling immediately on
+    /// [`EditorAction::Submit`].
+    ConfigFieldAction {
+        key: &'static str,
+        action: EditorAction,
+    },
+    /// A shared-editor action on a masked config (password) field. Mirrors
+    /// [`ConfigFieldAction`], with [`password_field_editor`](super::widgets::password_field_editor)
+    /// rendering and the eye toggle handled separately.
+    PasswordFieldAction {
+        key: &'static str,
+        action: EditorAction,
     },
     /// Toggle password visibility for a specific field.
     TogglePasswordVisibility(PasswordTarget),
@@ -311,8 +333,8 @@ pub enum SettingsMessage {
     /// Toggle the add-workspace modal.
     ToggleAddWorkspaceModal,
     /// Add-workspace modal fields.
-    AddWorkspaceName(String),
-    AddWorkspacePath(String),
+    AddWorkspaceName(EditorAction),
+    AddWorkspacePath(EditorAction),
     /// Submit the add-workspace modal.
     SubmitAddWorkspace,
     /// Result of workspace add.
@@ -323,8 +345,8 @@ pub enum SettingsMessage {
     /// Toggle the add-user modal.
     ToggleAddUserModal,
     /// Add-user modal fields.
-    AddUserSender(String),
-    AddUserPermissions(String),
+    AddUserSender(EditorAction),
+    AddUserPermissions(EditorAction),
     /// Toggle a role checkbox in the add-user modal (index into [`Role::iter`]).
     AddUserRoleToggle(usize),
     /// Submit the add-user modal.
@@ -379,7 +401,7 @@ pub enum SettingsMessage {
     /// Retry loading voice models after a [`VoiceStatus::ModelError`].
     RetryVoiceModels,
     /// User typed in the wake word phrase text input.
-    WakeWordPhraseInput(String),
+    WakeWordPhraseInput(EditorAction),
     // ── TTS messages ─────────────────────────────────────
     /// Toggle TTS on/off (persisted to config DB).
     TtsToggle(bool),
@@ -458,6 +480,13 @@ pub struct SettingsState {
     /// Last error message rendered in the bottom banner — voice/TTS toggle
     /// failures and failed custom-endpoint saves.
     error: Option<String>,
+    /// Per-field presentation/undo state for stateless config fields rendered
+    /// through the shared single-line editor. Keyed by the canonical field id
+    /// (`config:<key>`, `routing_order:<model>`), so each field owns its own
+    /// buffer and undo stack across renders while `view(&self)` stays immutable.
+    /// Entries are (re)populated from the config snapshot on [`Self::refresh`];
+    /// update handlers insert lazily via [`Self::field_editor_mut`].
+    field_editors: HashMap<String, SingleLineEditorState>,
     /// Which password fields are currently visible.
     password_visible: HashSet<PasswordTarget>,
     /// Whether the custom-endpoint section was revealed by the user this
@@ -474,9 +503,9 @@ pub struct SettingsState {
     /// Whether the add-workspace modal is visible.
     show_add_workspace_modal: bool,
     /// Name field in the add-workspace modal.
-    add_workspace_name: String,
+    add_workspace_name: SingleLineEditorState,
     /// Path field in the add-workspace modal.
-    add_workspace_path: String,
+    add_workspace_path: SingleLineEditorState,
     /// Whether the add-workspace operation is in flight.
     add_workspace_adding: bool,
 
@@ -485,9 +514,9 @@ pub struct SettingsState {
     /// Whether the add-user modal is visible.
     show_add_user_modal: bool,
     /// Name field in the add-user modal.
-    add_user_sender: String,
+    add_user_sender: SingleLineEditorState,
     /// Permissions field in the add-user modal.
-    add_user_permissions: String,
+    add_user_permissions: SingleLineEditorState,
     /// Role checkboxes in the add-user modal, indexed by [`Role::iter`].
     add_user_roles: Vec<bool>,
     /// Whether the add-user operation is in flight.
@@ -495,7 +524,7 @@ pub struct SettingsState {
 
     // ── Model picker state ────────────────────────────────
     /// Text input buffers for model pickers, indexed by [`ModelPickerTarget::idx`].
-    model_picker_inputs: [String; ModelPickerTarget::COUNT],
+    model_picker_inputs: [SingleLineEditorState; ModelPickerTarget::COUNT],
 
     // ── Voice assistant state ─────────────────────────────
     /// Generation counter for voice toggle operations.
@@ -510,7 +539,7 @@ pub struct SettingsState {
     transcription_toggle_gen: u64,
     /// Transient text input for the wake word phrase.
     /// Not persisted — passed to [`VoiceCommand::StartEnrollment`] on click.
-    wake_word_phrase_input: String,
+    wake_word_phrase_input: SingleLineEditorState,
 
     // ── TTS state ─────────────────────────────────────────
     /// Generation counter for TTS toggle operations.
@@ -540,6 +569,7 @@ impl SettingsState {
             in_flight_persists: HashSet::new(),
             pending_persists: HashMap::new(),
             field_errors: HashMap::new(),
+            field_editors: Self::initial_field_editors(&CONFIG.snapshot()),
             endpoint_warning: None,
             error: None,
             password_visible: HashSet::new(),
@@ -547,18 +577,18 @@ impl SettingsState {
             workspaces_state: workspaces::WorkspacesState::new(),
             users_state: users::UsersState::new(),
             show_add_workspace_modal: false,
-            add_workspace_name: String::new(),
-            add_workspace_path: String::new(),
+            add_workspace_name: SingleLineEditorState::new(""),
+            add_workspace_path: SingleLineEditorState::new(""),
             add_workspace_adding: false,
             show_add_user_modal: false,
-            add_user_sender: String::new(),
-            add_user_permissions: String::new(),
+            add_user_sender: SingleLineEditorState::new(""),
+            add_user_permissions: SingleLineEditorState::new(""),
             add_user_roles: Vec::new(),
             add_user_adding: false,
-            model_picker_inputs: [const { String::new() }; ModelPickerTarget::COUNT],
+            model_picker_inputs: std::array::from_fn(|_| SingleLineEditorState::new("")),
             voice_toggle_gen: 0,
             transcription_toggle_gen: 0,
-            wake_word_phrase_input: String::new(),
+            wake_word_phrase_input: SingleLineEditorState::new(""),
             tts_toggle_gen: 0,
         }
     }
@@ -573,6 +603,145 @@ impl SettingsState {
         self.error = None;
         self.field_errors.clear();
         self.endpoint_warning = None;
+        self.resync_field_editors();
+    }
+
+    /// Pre-populate the lazy field editors from a config snapshot: every
+    /// `config:<key>` in [`TEXT_INPUT_KEYS`] plus a `routing_order:<model>`
+    /// entry for the two routable slots (manager + worker), the set reflected
+    /// by [`Self::routing_section`]. Kept in sync on [`Self::refresh`] via
+    /// [`Self::resync_field_editors`].
+    fn initial_field_editors(config: &ConfigData) -> HashMap<String, SingleLineEditorState> {
+        let mut map = HashMap::new();
+        for key in TEXT_INPUT_KEYS {
+            let field = format!("config:{key}");
+            let value = config.get_string_field(key).unwrap_or_default().to_string();
+            map.insert(field, SingleLineEditorState::new(&value));
+        }
+        let mut models = BTreeSet::new();
+        models.insert(crate::config::resolve_or(
+            config.manager_model.clone(),
+            crate::config::DEFAULT_MANAGER_MODEL,
+        ));
+        models.insert(crate::config::resolve_or(
+            config.worker_model.clone(),
+            crate::config::DEFAULT_WORKER_MODEL,
+        ));
+        for model in models {
+            let field = format!("routing_order:{model}");
+            let value = config
+                .model_routings
+                .iter()
+                .find(|mr| mr.model == model)
+                .and_then(|mr| mr.provider_order.clone())
+                .unwrap_or_default();
+            map.insert(field, SingleLineEditorState::new(&value));
+        }
+        map
+    }
+
+    /// Re-create/re-sync the stateless field editors from the current config
+    /// snapshot. Existing editors get `set_text` (so an in-flight external
+    /// refresh is applied); entries for fields not yet rendered are inserted
+    /// with the current value. Routing editors cover the two routable slots
+    /// (manager + worker), the set reflected by [`Self::routing_section`].
+    fn resync_field_editors(&mut self) {
+        for key in TEXT_INPUT_KEYS {
+            let field = format!("config:{key}");
+            let value = self
+                .config
+                .get_string_field(key)
+                .unwrap_or_default()
+                .to_string();
+            self.field_editors
+                .entry(field)
+                .and_modify(|e| e.set_text(&value))
+                .or_insert_with(|| SingleLineEditorState::new(&value));
+        }
+        let mut models = BTreeSet::new();
+        models.insert(crate::config::resolve_or(
+            self.config.manager_model.clone(),
+            crate::config::DEFAULT_MANAGER_MODEL,
+        ));
+        models.insert(crate::config::resolve_or(
+            self.config.worker_model.clone(),
+            crate::config::DEFAULT_WORKER_MODEL,
+        ));
+        for model in models {
+            let field = format!("routing_order:{model}");
+            let value = self
+                .config
+                .model_routings
+                .iter()
+                .find(|mr| mr.model == model)
+                .and_then(|mr| mr.provider_order.clone())
+                .unwrap_or_default();
+            self.field_editors
+                .entry(field)
+                .and_modify(|e| e.set_text(&value))
+                .or_insert_with(|| SingleLineEditorState::new(&value));
+        }
+    }
+
+    /// Push the canonical value for a single field id into its editor (if the
+    /// editor has been created). Called after an external config reload or a
+    /// completed persist so the rendered value reflects the source of truth.
+    fn resync_field_editor(&mut self, field: &str) {
+        if let Some(value) = self.staged_value(field) {
+            if let Some(editor) = self.field_editors.get_mut(field) {
+                editor.set_text(&value);
+            }
+        }
+    }
+
+    /// Borrow the per-field editor for a rendered stateless config field.
+    /// Entries are guaranteed to exist via [`Self::resync_field_editors`]
+    /// (config keys) / the routing pre-population, so this never panics in
+    /// practice.
+    fn field_editor(&self, key: &str) -> &SingleLineEditorState {
+        self.field_editors
+            .get(key)
+            .expect("field editor populated on refresh")
+    }
+
+    /// Mutable variant of [`Self::field_editor`] used by update handlers. The
+    /// editor is inserted from `initial` if the field was never rendered (and
+    /// thus not yet pre-populated).
+    fn field_editor_mut(&mut self, key: &str, initial: &str) -> &mut SingleLineEditorState {
+        self.field_editors
+            .entry(key.to_string())
+            .or_insert_with(|| SingleLineEditorState::new(initial))
+    }
+
+    /// Apply an [`EditorAction`] to a stateless `config:<key>` field's editor
+    /// and stage the resulting text. Non-submit edits arm the debounced settle
+    /// via [`ConfigField`]; [`EditorAction::Submit`] settles immediately (the
+    /// staged value is already current in the editable snapshot).
+    fn handle_field_action(
+        &mut self,
+        key: &'static str,
+        action: EditorAction,
+    ) -> Task<SettingsMessage> {
+        if let Some(task) = super::common::focus_navigation_task(&action) {
+            return task;
+        }
+        let field = format!("config:{key}");
+        self.field_errors.remove(&field);
+        let submit = matches!(action, EditorAction::Submit);
+        let changes_text = action.changes_text();
+        let value = {
+            let initial = self.staged_value(&field).unwrap_or_default();
+            let editor = self.field_editor_mut(&field, &initial);
+            editor.apply_action(action);
+            editor.text()
+        };
+        if submit {
+            self.settle_now(&field, value)
+        } else if changes_text {
+            self.update(SettingsMessage::ConfigField { key, value })
+        } else {
+            Task::none()
+        }
     }
 
     /// Whether a genuinely non-default custom chat endpoint is staged or
@@ -786,6 +955,7 @@ impl SettingsState {
     /// toggle / picker — rather than free text).
     fn revert_field(&mut self, field: &str) {
         self.sync_field(field, None);
+        self.resync_field_editor(field);
     }
 
     /// Apply a canonical persisted value back into the editable snapshot
@@ -794,6 +964,7 @@ impl SettingsState {
     /// and must win).
     fn apply_persisted_value(&mut self, field: &str, value: &str) {
         self.sync_field(field, Some(value));
+        self.resync_field_editor(field);
     }
 
     /// Whether a failed persist should roll the control back to the last
@@ -1012,25 +1183,50 @@ impl SettingsState {
                 self.field_errors.remove(&endpoint_field);
                 self.field_errors.remove(&key_field);
                 self.endpoint_warning = None;
+                self.resync_field_editor(&endpoint_field);
+                self.resync_field_editor(&key_field);
                 self.settle_now(&endpoint_field, String::new())
             }
-            SettingsMessage::ModelRoutingOrder { model, order } => {
+            SettingsMessage::ModelRoutingOrder { model, action } => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
                 let field = format!("routing_order:{model}");
                 self.field_errors.remove(&field);
-                let order_opt = Some(order.clone()).filter(|s| !s.is_empty());
-                ModelRouting::upsert(&mut self.config.model_routings, model, |mr| {
-                    mr.provider_order = order_opt;
-                });
-                let generation = self.bump_gen(&field);
-                let f = field.clone();
-                Task::perform(
-                    super::widgets::debounce_sleep(SETTLE_MS, generation),
-                    move |g| SettingsMessage::ConfigFieldSettled {
-                        field: f,
-                        value: order,
-                        generation: g,
-                    },
-                )
+                let submit = matches!(action, EditorAction::Submit);
+                let changes_text = action.changes_text();
+                let order = {
+                    let initial = self.staged_value(&field).unwrap_or_default();
+                    let editor = self.field_editor_mut(&field, &initial);
+                    editor.apply_action(action);
+                    editor.text()
+                };
+                if changes_text || submit {
+                    let order_opt = Some(order.clone()).filter(|s| !s.is_empty());
+                    ModelRouting::upsert(&mut self.config.model_routings, model, |mr| {
+                        mr.provider_order = order_opt;
+                    });
+                }
+                if submit {
+                    self.settle_now(&field, order)
+                } else if changes_text {
+                    let generation = self.bump_gen(&field);
+                    let f = field.clone();
+                    Task::perform(
+                        super::widgets::debounce_sleep(SETTLE_MS, generation),
+                        move |g| SettingsMessage::ConfigFieldSettled {
+                            field: f,
+                            value: order,
+                            generation: g,
+                        },
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            SettingsMessage::ConfigFieldAction { key, action }
+            | SettingsMessage::PasswordFieldAction { key, action } => {
+                self.handle_field_action(key, action)
             }
             SettingsMessage::TogglePasswordVisibility(target) => {
                 if self.password_visible.contains(&target) {
@@ -1189,14 +1385,17 @@ impl SettingsState {
                 Task::none()
             }
             SettingsMessage::StartVoiceEnrollment => {
-                let phrase = self.wake_word_phrase_input.clone();
+                let phrase = self.wake_word_phrase_input.text();
                 crate::audio::voice::send_command(
                     crate::audio::voice::VoiceCommand::StartEnrollment(phrase),
                 );
                 Task::none()
             }
-            SettingsMessage::WakeWordPhraseInput(v) => {
-                self.wake_word_phrase_input = v;
+            SettingsMessage::WakeWordPhraseInput(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.wake_word_phrase_input.apply_action(action);
                 Task::none()
             }
             SettingsMessage::CancelVoiceEnrollment => {
@@ -1225,21 +1424,29 @@ impl SettingsState {
                 }
                 Task::none()
             }
-            SettingsMessage::AddWorkspaceName(v) => {
-                self.add_workspace_name = v;
+            SettingsMessage::AddWorkspaceName(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.add_workspace_name.apply_action(action);
                 Task::none()
             }
-            SettingsMessage::AddWorkspacePath(v) => {
-                self.add_workspace_path = v;
+            SettingsMessage::AddWorkspacePath(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.add_workspace_path.apply_action(action);
                 Task::none()
             }
             SettingsMessage::SubmitAddWorkspace => {
-                if self.add_workspace_name.is_empty() || self.add_workspace_path.is_empty() {
+                if self.add_workspace_name.text().is_empty()
+                    || self.add_workspace_path.text().is_empty()
+                {
                     return Task::none();
                 }
                 self.add_workspace_adding = true;
-                let name = self.add_workspace_name.clone();
-                let path = self.add_workspace_path.clone();
+                let name = self.add_workspace_name.text();
+                let path = self.add_workspace_path.text();
                 Task::perform(
                     async move {
                         crate::workspace::store()
@@ -1278,12 +1485,18 @@ impl SettingsState {
                 }
                 Task::none()
             }
-            SettingsMessage::AddUserSender(v) => {
-                self.add_user_sender = v;
+            SettingsMessage::AddUserSender(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.add_user_sender.apply_action(action);
                 Task::none()
             }
-            SettingsMessage::AddUserPermissions(v) => {
-                self.add_user_permissions = v;
+            SettingsMessage::AddUserPermissions(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.add_user_permissions.apply_action(action);
                 Task::none()
             }
             SettingsMessage::AddUserRoleToggle(idx) => {
@@ -1293,7 +1506,7 @@ impl SettingsState {
                 Task::none()
             }
             SettingsMessage::SubmitAddUser => {
-                if self.add_user_sender.is_empty() {
+                if self.add_user_sender.text().is_empty() {
                     return Task::none();
                 }
                 let roles: Vec<Role> = Role::iter()
@@ -1302,11 +1515,11 @@ impl SettingsState {
                     .map(|(r, _)| r)
                     .collect();
                 self.add_user_adding = true;
-                let sender = self.add_user_sender.clone();
-                let permissions = if self.add_user_permissions.is_empty() {
+                let sender = self.add_user_sender.text();
+                let permissions = if self.add_user_permissions.text().is_empty() {
                     None
                 } else {
-                    Some(self.add_user_permissions.clone())
+                    Some(self.add_user_permissions.text())
                 };
                 Task::perform(
                     async move {
@@ -1334,8 +1547,11 @@ impl SettingsState {
             // ── Model picker messages ─────────────────────────
             SettingsMessage::ModelPicker { target, action } => {
                 match (target, action) {
-                    (t, ModelPickerAction::AddInput(v)) => {
-                        self.model_picker_inputs[t.idx()] = v;
+                    (t, ModelPickerAction::AddInput(action)) => {
+                        if let Some(task) = super::common::focus_navigation_task(&action) {
+                            return task;
+                        }
+                        self.model_picker_inputs[t.idx()].apply_action(action);
                         Task::none()
                     }
                     (t, ModelPickerAction::AddModel) => match t {
@@ -1347,7 +1563,7 @@ impl SettingsState {
                         // against the default endpoint — a custom chat endpoint
                         // must not gate media model additions.
                         ModelPickerTarget::ImageGen => {
-                            let model = self.model_picker_inputs[t.idx()].trim().to_string();
+                            let model = self.model_picker_inputs[t.idx()].text().trim().to_string();
                             if model.is_empty() {
                                 return Task::none();
                             }
@@ -1412,7 +1628,7 @@ impl SettingsState {
                     // Clear the input only when it still holds the added model
                     // (modulo whitespace); anything the user typed meanwhile
                     // must survive.
-                    if self.model_picker_inputs[target.idx()].trim() == model {
+                    if self.model_picker_inputs[target.idx()].text().trim() == model {
                         self.model_picker_inputs[target.idx()].clear();
                     }
                     // Persist silently — no success toast.
@@ -1720,20 +1936,32 @@ impl SettingsState {
                     let char_count = content.text().chars().count();
                     let over_limit = char_count > MAX_WORKSPACE_NOTES_CHARS;
 
-                    let editor = text_editor(content)
-                        .on_action(move |action| {
+                    let editor_widget = super::editor_widget::EditorWidget::new(content)
+                        .show_gutter(false)
+                        .code_mode(false)
+                        .enter(super::editor_widget::EnterBehavior::Newline)
+                        .id(iced::widget::Id::from(format!("workspace_notes:{}", ws_item.name)))
+                        .placeholder(
+                            format!("Add manual context notes for all agents… (max {MAX_WORKSPACE_NOTES_CHARS} characters)"),
+                        )
+                        .min_height(100.0)
+                        .max_height(300.0)
+                        .padding(5.0);
+                    let editor: Element<'_, SettingsMessage> =
+                        container(iced::Element::new(editor_widget).map(move |action| {
                             SettingsMessage::WorkspaceMsg(
                                 workspaces::WorkspacesMessage::NotesEdited(
                                     ws_item.name.clone(),
                                     action,
                                 ),
                             )
+                        }))
+                        .width(Length::Fill)
+                        .height(Length::Shrink)
+                        .style(|_theme| {
+                            theme::container_style(theme::BG_ELEVATED, 8.0, 1.0, theme::ACCENT)
                         })
-                        .placeholder(
-                            format!("Add manual context notes for all agents… (max {MAX_WORKSPACE_NOTES_CHARS} characters)"),
-                        )
-                        .min_height(100.0)
-                        .max_height(300.0);
+                        .into();
 
                     let char_counter = text(if over_limit {
                         format!("{char_count}/{MAX_WORKSPACE_NOTES_CHARS} — please trim")
@@ -2075,17 +2303,18 @@ impl SettingsState {
                                         .color(theme::TEXT_SECONDARY)
                                         .into(),
                                     Space::new().width(8).into(),
-                                    text_input("@username", &us.bind_input)
-                                        .on_input(|v| {
+                                    widgets::single_line_editor(
+                                        &us.bind_input.buffer,
+                                        "@username",
+                                        false,
+                                        Length::Fixed(270.0),
+                                        Some(Id::from(format!("bind_input:{}", user.name))),
+                                        |action| {
                                             SettingsMessage::UserMsg(
-                                                users::UsersMessage::BindInputChanged(v),
+                                                users::UsersMessage::BindInputChanged(action),
                                             )
-                                        })
-                                        .style(widgets::text_input_style)
-                                        .size(13)
-                                        .padding([2, 6])
-                                        .width(Length::Fixed(270.0))
-                                        .into(),
+                                        },
+                                    ),
                                     Space::new().width(8).into(),
                                 ];
                                 row_elements.push(
@@ -2094,7 +2323,7 @@ impl SettingsState {
                                             .size(11),
                                     )
                                     .style(theme::button_primary)
-                                    .on_press_maybe(if us.bind_input.is_empty() {
+                                    .on_press_maybe(if us.bind_input.text().trim().is_empty() {
                                         None
                                     } else {
                                         Some(SettingsMessage::UserMsg(
@@ -2338,20 +2567,23 @@ impl SettingsState {
                 DialogField {
                     label: "Name",
                     placeholder: "workspace name",
-                    value: &self.add_workspace_name,
+                    value: &self.add_workspace_name.buffer,
+                    id: "add_workspace_name",
                     on_input: SettingsMessage::AddWorkspaceName,
                 },
                 DialogField {
                     label: "Path",
                     placeholder: "/path/to/workspace",
-                    value: &self.add_workspace_path,
+                    value: &self.add_workspace_path.buffer,
+                    id: "add_workspace_path",
                     on_input: SettingsMessage::AddWorkspacePath,
                 },
             ],
             None,
             "Add",
             self.add_workspace_adding,
-            !self.add_workspace_name.is_empty() && !self.add_workspace_path.is_empty(),
+            !self.add_workspace_name.text().is_empty()
+                && !self.add_workspace_path.text().is_empty(),
             SettingsMessage::ToggleAddWorkspaceModal,
             SettingsMessage::SubmitAddWorkspace,
         )
@@ -2366,13 +2598,15 @@ impl SettingsState {
                 DialogField {
                     label: "Name",
                     placeholder: "user name",
-                    value: &self.add_user_sender,
+                    value: &self.add_user_sender.buffer,
+                    id: "add_user_sender",
                     on_input: SettingsMessage::AddUserSender,
                 },
                 DialogField {
                     label: "Permissions",
                     placeholder: "optional",
-                    value: &self.add_user_permissions,
+                    value: &self.add_user_permissions.buffer,
+                    id: "add_user_permissions",
                     on_input: SettingsMessage::AddUserPermissions,
                 },
             ],
@@ -2391,7 +2625,7 @@ impl SettingsState {
             ),
             "Add",
             self.add_user_adding,
-            !self.add_user_sender.is_empty() && any_role_checked,
+            !self.add_user_sender.text().is_empty() && any_role_checked,
             SettingsMessage::ToggleAddUserModal,
             SettingsMessage::SubmitAddUser,
         )
@@ -2405,12 +2639,12 @@ impl SettingsState {
         let is_busy = ws_state.diagnostics_busy;
         let error = ws_state.diagnostics_error.as_deref();
 
-        // Get the edit buffers — if modal is open they should exist.
-        let buffers: [String; crate::DiagnosticsCommands::COMMAND_COUNT] = ws_state
+        // Get the edit buffers — if modal is open they should exist (they are
+        // inserted by ShowDiagnostics before the modal is flagged open).
+        let buffers: &[SingleLineEditorState; crate::DiagnosticsCommands::COMMAND_COUNT] = ws_state
             .diagnostics_edit_buffers
             .get(&ws_name)
-            .cloned()
-            .unwrap_or([const { String::new() }; crate::DiagnosticsCommands::COMMAND_COUNT]);
+            .expect("diagnostics edit buffers inserted when the modal opens");
 
         // Use static labels from DiagnosticsCommands to avoid duplicating
         // the label-to-field mapping in two places.
@@ -2424,7 +2658,6 @@ impl SettingsState {
         }
 
         for (i, label) in labels.iter().enumerate() {
-            let value = &buffers[i];
             rows_col = rows_col.push(
                 row![
                     text(*label)
@@ -2432,22 +2665,25 @@ impl SettingsState {
                         .color(theme::TEXT_MUTED)
                         .width(Length::Fixed(120.0))
                         .align_y(Alignment::Center),
-                    text_input("(skipped)", value)
-                        .size(12)
-                        .font(iced::Font::MONOSPACE)
-                        .on_input({
+                    widgets::single_line_editor(
+                        &buffers[i].buffer,
+                        "(skipped)",
+                        false,
+                        Length::Fill,
+                        Some(Id::from(format!("diagnostics:{ws_name}:{i}"))),
+                        {
                             let name = ws_name.clone();
-                            move |v| {
+                            move |action| {
                                 SettingsMessage::WorkspaceMsg(
                                     workspaces::WorkspacesMessage::DiagnosticsFieldEdited(
                                         name.clone(),
                                         i,
-                                        v,
+                                        action,
                                     ),
                                 )
                             }
-                        })
-                        .width(Length::Fill),
+                        },
+                    ),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -2516,18 +2752,18 @@ impl SettingsState {
     // ── Config-field builders ────────────────────────────────────
     //
     // Collapse the repeated ~20-line block (a `field_row`/`field_row_with_error`
-    // wrapping a `text_input`/`password_input` that emits `ConfigField` on input,
-    // `ConfigFieldSettleNow` on Enter, styled + fixed-width, with the `field_errors`
-    // lookup) into a single helper per input kind. Behavior-preserving: the field id
-    // is always `config:<key>` derived from the `CONFIG_KEY_*` const, which is
-    // `stringify!` of the snake_case field name — no per-call literal ids.
+    // wrapping a shared single-line editor that emits `ConfigFieldAction` /
+    // `PasswordFieldAction` on input, styled + fixed-width, with the
+    // `field_errors` lookup) into a single helper per input kind. Behavior-
+    // preserving: the field id is always `config:<key>` derived from the
+    // `CONFIG_KEY_*` const, which is `stringify!` of the snake_case field name —
+    // no per-call literal ids.
 
     /// A single inline-editable text config field row (with error placement).
     fn config_text_field<'a>(
         &'a self,
         label: &'static str,
         placeholder: &'static str,
-        value: &'a str,
         key: &'static str,
         hint: Option<&'static str>,
     ) -> Element<'a, SettingsMessage> {
@@ -2535,47 +2771,45 @@ impl SettingsState {
         let error = self.field_errors.get(&field).map(String::as_str);
         field_row_with_error(
             label,
-            text_input(placeholder, value)
-                .on_input(move |v| SettingsMessage::ConfigField { key, value: v })
-                .on_submit(SettingsMessage::ConfigFieldSettleNow {
-                    field: field.clone(),
-                })
-                .style(super::widgets::text_input_style)
-                .width(Length::Fixed(375.0))
-                .into(),
+            widgets::single_line_editor(
+                &self.field_editor(&field).buffer,
+                placeholder,
+                true,
+                Length::Fixed(375.0),
+                Some(Id::from(field.clone())),
+                move |action| SettingsMessage::ConfigFieldAction { key, action },
+            ),
             hint,
             error,
         )
     }
 
     /// A single maskable password config field row (with password highlighting).
-    #[expect(clippy::too_many_arguments)]
     fn config_password_field<'a>(
         &'a self,
         label: &'static str,
         target: PasswordTarget,
         placeholder: &'static str,
-        value: &'a str,
         key: &'static str,
         hint: Option<&'static str>,
         highlight: bool,
     ) -> Element<'a, SettingsMessage> {
         let field = format!("config:{key}");
-        field_row(
+        let error = self.field_errors.get(&field).map(String::as_str);
+        field_row_with_error(
             label,
-            password_input(
+            widgets::password_field_editor(
+                &self.field_editor(&field).buffer,
                 placeholder,
-                value,
                 self.password_visible.contains(&target),
-                move |v| SettingsMessage::ConfigField { key, value: v },
-                SettingsMessage::TogglePasswordVisibility(target),
-                SettingsMessage::ConfigFieldSettleNow {
-                    field: field.clone(),
-                },
-                self.field_errors.get(&field).map(String::as_str),
+                Length::Fixed(375.0),
                 highlight,
+                Some(Id::from(field.clone())),
+                move |action| SettingsMessage::PasswordFieldAction { key, action },
+                SettingsMessage::TogglePasswordVisibility(target),
             ),
             hint,
+            error,
         )
     }
 
@@ -2608,7 +2842,6 @@ impl SettingsState {
                 "OpenRouter key",
                 PasswordTarget::ProviderKey,
                 "sk-or-v1-...",
-                self.config.provider_key.as_deref().unwrap_or_default(),
                 CONFIG_KEY_PROVIDER_KEY,
                 None,
                 api_key_unset,
@@ -2628,7 +2861,6 @@ impl SettingsState {
             let mut endpoint_row = self.config_text_field(
                 "Endpoint URL",
                 "https://openrouter.ai/api/v1",
-                self.config.provider_endpoint.as_deref().unwrap_or_default(),
                 CONFIG_KEY_PROVIDER_ENDPOINT,
                 None,
             );
@@ -2640,20 +2872,14 @@ impl SettingsState {
             rows.push(endpoint_row);
 
             // Endpoint key (optional) — only ever sent to the custom endpoint.
-            rows.push(
-                self.config_password_field(
-                    "Endpoint key (optional)",
-                    PasswordTarget::EndpointKey,
-                    "Leave empty for keyless servers",
-                    self.config
-                        .provider_endpoint_key
-                        .as_deref()
-                        .unwrap_or_default(),
-                    CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
-                    None,
-                    false,
-                ),
-            );
+            rows.push(self.config_password_field(
+                "Endpoint key (optional)",
+                PasswordTarget::EndpointKey,
+                "Leave empty for keyless servers",
+                CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
+                None,
+                false,
+            ));
         }
 
         section("Provider", Column::with_children(rows).spacing(4))
@@ -2663,24 +2889,18 @@ impl SettingsState {
         let manager_row = self.config_text_field(
             "Manager",
             crate::config::DEFAULT_MANAGER_MODEL,
-            self.config.manager_model.as_deref().unwrap_or_default(),
             CONFIG_KEY_MANAGER_MODEL,
             Some("Manager, Assistant, Discovery, Engineer"),
         );
         let worker_row = self.config_text_field(
             "Worker",
             crate::config::DEFAULT_WORKER_MODEL,
-            self.config.worker_model.as_deref().unwrap_or_default(),
             CONFIG_KEY_WORKER_MODEL,
             Some("Artist, Analyst, Coder, QA, Reviewer, Maintainer, Sanitation"),
         );
         let video_transcription_row = self.config_text_field(
             "Video Transcription",
             crate::config::DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
-            self.config
-                .video_transcription_model
-                .as_deref()
-                .unwrap_or_default(),
             CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
             None,
         );
@@ -2907,11 +3127,15 @@ impl SettingsState {
 
         // Text input for the wake word phrase (before enrollment).
         let phrase_input = if voice_enabled && transcription_enabled && !is_enrolling {
-            let input = text_input("mahbot", &self.wake_word_phrase_input)
-                .on_input(SettingsMessage::WakeWordPhraseInput)
-                .style(super::widgets::text_input_style)
-                .width(Length::Fixed(250.0));
-            field_row("Wake Word Phrase", input.into(), None)
+            let input = widgets::single_line_editor(
+                &self.wake_word_phrase_input.buffer,
+                "mahbot",
+                false,
+                Length::Fixed(250.0),
+                Some(Id::new("wake_word_phrase")),
+                SettingsMessage::WakeWordPhraseInput,
+            );
+            field_row("Wake Word Phrase", input, None)
         } else {
             Space::new().height(0).into()
         };
@@ -3117,7 +3341,7 @@ impl SettingsState {
                     ModelPickerTarget::ImageGen,
                     self.config.image_gen_models.as_deref(),
                     self.config.image_gen_model.as_deref(),
-                    self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()].as_str(),
+                    &self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()],
                     "model name (e.g. google/gemini-...)",
                     self.field_errors
                         .get("config:image_gen_models")
@@ -3134,7 +3358,7 @@ impl SettingsState {
                     ModelPickerTarget::Video,
                     self.config.video_models.as_deref(),
                     self.config.video_model.as_deref(),
-                    self.model_picker_inputs[ModelPickerTarget::Video.idx()].as_str(),
+                    &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
                     "model name (e.g. minimax/hailuo-3)",
                     self.field_errors
                         .get("config:video_models")
@@ -3186,7 +3410,6 @@ impl SettingsState {
                     "Firecrawl API Key",
                     PasswordTarget::FirecrawlKey,
                     "fc-...",
-                    self.config.firecrawl_key.as_deref().unwrap_or_default(),
                     CONFIG_KEY_FIRECRAWL_KEY,
                     None,
                     false,
@@ -3195,7 +3418,6 @@ impl SettingsState {
                     "Exa API Key",
                     PasswordTarget::ExaKey,
                     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-                    self.config.exa_key.as_deref().unwrap_or_default(),
                     CONFIG_KEY_EXA_KEY,
                     None,
                     false,
@@ -3204,10 +3426,6 @@ impl SettingsState {
                     "Telegram Bot Token",
                     PasswordTarget::TelegramToken,
                     "123:abc",
-                    self.config
-                        .telegram_bot_token
-                        .as_deref()
-                        .unwrap_or_default(),
                     CONFIG_KEY_TELEGRAM_BOT_TOKEN,
                     None,
                     false,
@@ -3279,21 +3497,6 @@ impl SettingsState {
             );
         }
         for model_name in &model_names {
-            // Look up the current routing entry for this model
-            let current = self
-                .config
-                .model_routings
-                .iter()
-                .find(|mr| mr.model == *model_name)
-                .map_or(
-                    ModelRouting {
-                        model: model_name.clone(),
-                        provider_order: None,
-                    },
-                    Clone::clone,
-                );
-            let current_order = current.provider_order;
-
             let display_name = model_name.clone();
             let order_model = model_name.clone();
             let order_field = format!("routing_order:{model_name}");
@@ -3311,16 +3514,23 @@ impl SettingsState {
             } else {
                 ""
             };
-            let order_input: Element<'_, SettingsMessage> =
-                text_input(placeholder, &current_order.unwrap_or_default())
-                    .on_input(move |v| SettingsMessage::ModelRoutingOrder {
-                        model: order_model.clone(),
-                        order: v,
-                    })
-                    .on_submit(order_submit)
-                    .style(super::widgets::text_input_style)
-                    .width(Length::Fixed(375.0))
-                    .into();
+            let order_input: Element<'_, SettingsMessage> = widgets::single_line_editor(
+                &self.field_editor(&order_field).buffer,
+                placeholder,
+                true,
+                Length::Fixed(375.0),
+                Some(Id::from(order_field.clone())),
+                move |action| {
+                    if matches!(action, EditorAction::Submit) {
+                        order_submit.clone()
+                    } else {
+                        SettingsMessage::ModelRoutingOrder {
+                            model: order_model.clone(),
+                            action,
+                        }
+                    }
+                },
+            );
 
             let row = column![
                 // Model name label (read-only)
@@ -3462,60 +3672,6 @@ fn role_checkbox_row<'a>(
     Row::with_children(role_checks).spacing(6).wrap().into()
 }
 
-/// Password input — masked by default, eye button toggles visibility.
-/// Settles on Enter in addition to the debounce timer. Optional inline error.
-/// `highlight` switches to the accent attention style (used for the provider
-/// API key while unset).
-#[expect(clippy::too_many_arguments)]
-fn password_input<'a>(
-    placeholder: &str,
-    value: &str,
-    show: bool,
-    on_input: impl Fn(String) -> SettingsMessage + 'a,
-    on_toggle: SettingsMessage,
-    on_submit: SettingsMessage,
-    error: Option<&'a str>,
-    highlight: bool,
-) -> Element<'a, SettingsMessage> {
-    let style = if highlight {
-        super::widgets::text_input_highlight_style
-    } else {
-        super::widgets::text_input_style
-    };
-    let input: Element<_> = text_input(placeholder, value)
-        .secure(!show)
-        .on_input(on_input)
-        .on_submit(on_submit)
-        .style(style)
-        .width(Length::Fixed(375.0))
-        .into();
-
-    let eye_text: Element<_> = if show {
-        text("×").size(14.0).into()
-    } else {
-        text("👁").size(14.0).into()
-    };
-
-    let controls: Element<'a, SettingsMessage> = row![
-        input,
-        Space::new().width(4),
-        button(eye_text)
-            .padding(2)
-            .style(theme::button_secondary)
-            .on_press(on_toggle),
-    ]
-    .align_y(Alignment::Center)
-    .into();
-
-    if let Some(err) = error {
-        column![controls, inline_error(err, 188.0),]
-            .spacing(2)
-            .into()
-    } else {
-        controls
-    }
-}
-
 /// Delete confirmation prompt — the inline "Delete? Yes / No" row shown
 /// below a workspace card when the row is the delete target.
 fn delete_confirm_button<'a>(
@@ -3564,18 +3720,21 @@ async fn persist_settled_field(
 struct DialogField<'a> {
     label: &'static str,
     placeholder: &'static str,
-    value: &'a str,
-    /// Function pointer for the text-input `on_input` handler.
+    value: &'a super::editor_widget::EditorBuffer,
+    /// Stable widget id for the field (unique across fields on the page).
+    id: &'static str,
+    /// Function pointer for the shared-editor `on_action` handler.
     ///
-    /// Uses `fn(String) -> SettingsMessage` (function pointer) rather than
-    /// `impl Fn(String) -> SettingsMessage + 'a` to keep the struct simple,
-    /// avoid boxing, and rely on monomorphization at the callsite. This works
-    /// because all current callers pass enum tuple-variant constructors (e.g.
-    /// [`SettingsMessage::AddWorkspaceName`]), which coerce to function pointers.
+    /// Uses `fn(EditorAction) -> SettingsMessage` (function pointer) rather
+    /// than `impl Fn(EditorAction) -> SettingsMessage + 'a` to keep the struct
+    /// simple, avoid boxing, and rely on monomorphization at the callsite. This
+    /// works because all current callers pass enum tuple-variant constructors
+    /// (e.g. [`SettingsMessage::AddWorkspaceName`]), which coerce to function
+    /// pointers.
     ///
     /// If a future caller needs to capture state in the closure, this field
-    /// must be changed to `Box<dyn Fn(String) -> SettingsMessage + 'a>`.
-    on_input: fn(String) -> SettingsMessage,
+    /// must be changed to `Box<dyn Fn(EditorAction) -> SettingsMessage + 'a>`.
+    on_input: fn(EditorAction) -> SettingsMessage,
 }
 
 /// Build a reusable modal dialog: title, optional field rows, optional `middle`
@@ -3614,11 +3773,14 @@ fn modal_dialog<'a>(
         }
         col = col.push(field_row(
             field.label,
-            text_input(field.placeholder, field.value)
-                .on_input(field.on_input)
-                .style(widgets::text_input_style)
-                .width(Length::Fixed(375.0))
-                .into(),
+            widgets::single_line_editor(
+                field.value,
+                field.placeholder,
+                true,
+                Length::Fixed(375.0),
+                Some(Id::new(field.id)),
+                field.on_input,
+            ),
             None,
         ));
     }
@@ -3775,7 +3937,7 @@ mod tests {
         ];
 
         for case in &cases {
-            let mut input = case.input.to_string();
+            let mut input = SingleLineEditorState::new(case.input);
             let mut list = case.initial_list.map(String::from);
             add_model_to_list(&mut input, &mut list);
             assert_eq!(
@@ -3786,13 +3948,14 @@ mod tests {
             );
             if case.expect_input_cleared {
                 assert!(
-                    input.is_empty(),
+                    input.text().is_empty(),
                     "case: {} — input buffer should be cleared",
                     case.name
                 );
             } else {
                 assert_eq!(
-                    input, case.input,
+                    input.text(),
+                    case.input,
                     "case: {} — input should remain unchanged",
                     case.name
                 );

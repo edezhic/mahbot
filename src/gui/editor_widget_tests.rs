@@ -701,3 +701,32 @@ fn test_shift_right_then_back_collapses_selection() {
     assert_eq!(cursor.column, 0);
     assert!(cursor.selection.is_none());
 }
+
+#[test]
+fn test_set_text_resets_cursor_and_clear() {
+    let buf = EditorBuffer::with_text("hello", None);
+    buf.move_to(0, 2);
+    buf.set_text("world");
+    assert_eq!(buf.text(), "world");
+    let cursor = buf.cursor();
+    assert_eq!(cursor.line, 0);
+    assert_eq!(cursor.column, 0);
+    assert!(cursor.selection.is_none());
+    assert!(!buf.is_empty());
+    buf.clear();
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn test_single_line_strips_newlines_and_enter() {
+    let buf = EditorBuffer::with_text("a\nb", None);
+    buf.set_single_line(true);
+    assert_eq!(buf.text(), "ab");
+    buf.move_to(0, 1);
+    buf.perform_action(EditorAction::Paste("x\ny".to_string()));
+    assert_eq!(buf.text(), "axyb");
+    assert_eq!(buf.cursor().column, 3);
+    buf.perform_action(EditorAction::Enter);
+    assert_eq!(buf.text(), "axyb");
+    assert_eq!(buf.cursor().line, 0);
+}

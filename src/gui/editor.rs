@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{
     Alignment, Element, Length, Subscription, Task,
     keyboard::{self},
@@ -35,10 +35,11 @@ use super::menus::{ContextMenu, MenuItem};
 use crate::git::commands::{is_git_repo, run_git_check_ignore, run_git_output, run_git_status};
 use crate::util::unquote_c_style;
 
-use super::common::{UndoSnapshot, UndoStack};
+use super::common::{SingleLineEditorState, UndoSnapshot, UndoStack};
 use super::editor_widget::{LineEnding, detect_line_ending};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
+use super::editor_widget::EnterBehavior;
 use super::editor_widget::{EditorBuffer, byte_offset_to_line_col};
 use super::theme;
 use super::widgets::{self, FileTree, TreeNavDirection};
@@ -251,12 +252,11 @@ fn make_tab_and_data(
 // ── Find/Replace ───────────────────────────────────────────────────
 
 /// State for the find/replace search bar.
-#[derive(Debug, Clone)]
 struct FindReplaceState {
     /// Current search query string.
-    query: String,
+    query: SingleLineEditorState,
     /// Replace-with string.
-    replace: String,
+    replace: SingleLineEditorState,
     /// Byte ranges of all matches in the file.
     matches: Vec<std::ops::Range<usize>>,
     /// Index of the currently focused match.
@@ -300,10 +300,9 @@ pub struct OwnedGrepMatch {
 }
 
 /// State for the global search (Cmd+Shift+F) panel.
-#[derive(Debug, Clone)]
 struct GlobalSearchState {
     /// Current query text in the search input.
-    query: String,
+    query: SingleLineEditorState,
     /// Search results (empty when no search has been performed).
     results: Vec<OwnedGrepMatch>,
     /// Index of the currently selected result in the list.
@@ -514,9 +513,9 @@ pub enum EditorMessage {
     /// Open/toggle the find/replace bar.
     FindToggle,
     /// Search query text changed.
-    FindQueryInput(String),
+    FindQueryInput(super::editor_widget::EditorAction),
     /// Replace text changed.
-    FindReplaceInput(String),
+    FindReplaceInput(super::editor_widget::EditorAction),
     /// Navigate to the next match.
     FindNext,
     /// Navigate to the previous match.
@@ -551,13 +550,13 @@ pub enum EditorMessage {
     /// Toggle the go-to-line input bar.
     GoToLineToggle,
     /// Input text for the go-to-line bar.
-    GoToLineInput(String),
+    GoToLineInput(super::editor_widget::EditorAction),
     /// Jump to the entered line number.
     GoToLineGo,
     /// Toggle the quick-open file picker.
     QuickOpenToggle,
     /// Filter text for the quick-open file picker.
-    QuickOpenInput(String),
+    QuickOpenInput(super::editor_widget::EditorAction),
     /// Select a file from the quick-open list by index.
     QuickOpenSelect(usize),
     /// Switch to the next tab (Ctrl+Tab).
@@ -569,7 +568,7 @@ pub enum EditorMessage {
     /// Toggle the global search panel (Cmd+Shift+F / Ctrl+Shift+F).
     GlobalSearchToggle,
     /// Query text changed in the global search input.
-    GlobalSearchInput(String),
+    GlobalSearchInput(super::editor_widget::EditorAction),
     /// Results returned from the async global search.
     GlobalSearchResults {
         /// Generation counter for stale-result prevention.
@@ -603,12 +602,12 @@ pub enum EditorMessage {
     /// User submitted a name for a new file or directory.
     NewItemSubmit(String),
     /// User changed the new-item name input.
-    NewItemInput(String),
+    NewItemInput(super::editor_widget::EditorAction),
     // ── Inline rename ───────────────────────────────────────────
     /// Context menu: rename a file or directory (starts inline rename).
     RenameRequested(String),
     /// User changed the rename input text.
-    RenameInput(String),
+    RenameInput(super::editor_widget::EditorAction),
     /// User submitted the rename (Enter pressed in inline input).
     RenameSubmit,
     /// User cancelled the inline rename.
@@ -648,7 +647,6 @@ struct DeleteConfirmTarget {
 }
 
 /// Target for the new file/directory name input.
-#[derive(Debug, Clone)]
 struct NewItemTarget {
     /// Parent directory path (relative to workspace root; empty = root).
     parent_dir: String,
@@ -659,11 +657,10 @@ struct NewItemTarget {
     /// Absolute path of the workspace root.
     ws_root: String,
     /// Current input text.
-    input_text: String,
+    input_text: SingleLineEditorState,
 }
 
 /// Target for the inline rename operation.
-#[derive(Debug, Clone)]
 struct RenameTarget {
     /// Full path (relative to workspace root) of the item being renamed.
     path: String,
@@ -674,27 +671,9 @@ struct RenameTarget {
     /// Absolute path of the workspace root.
     ws_root: String,
     /// Current input text (the new name being edited).
-    input_text: String,
+    input_text: SingleLineEditorState,
     /// Optional inline error message (e.g., "File already exists").
     error: Option<String>,
-}
-
-/// Style for the inline rename text input — transparent background, no border,
-/// matching the appearance of the tree node label it replaces.
-#[must_use]
-fn rename_input_style(_theme: &iced::Theme, _status: text_input::Status) -> text_input::Style {
-    text_input::Style {
-        background: iced::Background::Color(iced::Color::TRANSPARENT),
-        border: iced::Border {
-            radius: 0.0.into(),
-            width: 0.0,
-            color: iced::Color::TRANSPARENT,
-        },
-        icon: theme::TEXT_MUTED,
-        placeholder: theme::TEXT_MUTED,
-        value: theme::TEXT_PRIMARY,
-        selection: theme::ACCENT_DIM,
-    }
 }
 
 /// Validate a user-supplied file/directory name for new-item or rename operations.
@@ -708,7 +687,6 @@ fn rename_input_style(_theme: &iced::Theme, _status: text_input::Status) -> text
 /// - Path separators (`/`, `\`, NUL)
 /// - Reserved path components (`.`, `..`)
 /// - OS-reserved names (CON, NUL, PRN, AUX, COM1–COM9, LPT1–LPT9) — Windows only
-#[must_use]
 fn validate_item_name(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         return Some("Name cannot be empty");
@@ -1590,16 +1568,18 @@ pub struct EditorState {
     /// The tuple is (abs_path, 1-based line_number, expected_file_gen). Consumed by the
     /// `FileLoaded` handler only when both path and generation match.
     pending_goto: Option<(String, usize, u64)>,
+    /// Buffer for the go-to-line bar, owned by `EditorState` so it survives
+    /// across the `GotoLine` modal's open/close cycles.
+    goto_line_input: SingleLineEditorState,
 }
 
 /// Identifies which modal overlay is currently open, in Escape-dismissal
 /// priority order (GlobalSearch highest, CloseOthers lowest).
 ///
 /// Each variant carries the state data for that overlay.
-#[derive(Debug, Clone)]
 enum ModalKind {
     GlobalSearch(GlobalSearchState),
-    GotoLine(String),
+    GotoLine,
     QuickOpen(QuickOpenState),
     Rename(RenameTarget),
     NewItem(NewItemTarget),
@@ -1609,10 +1589,9 @@ enum ModalKind {
 }
 
 /// State for the quick-open file picker.
-#[derive(Debug, Clone)]
 struct QuickOpenState {
     /// Current filter text.
-    filter: String,
+    filter: SingleLineEditorState,
     /// Currently highlighted result index.
     selected_index: usize,
     /// Filtered file list (matching the filter text).
@@ -1654,6 +1633,7 @@ impl EditorState {
             global_search_gen: 0,
             git_status_gen: 0,
             pending_goto: None,
+            goto_line_input: SingleLineEditorState::new(""),
         }
     }
 
@@ -1832,7 +1812,7 @@ impl EditorState {
             .collapse_dir_and_keep_focus::<EditorMessage>(path)
     }
 
-    /// Build an inline rename [`TextInput`] element for a tree node that is
+    /// Build an inline rename [`EditorWidget`] element for a tree node that is
     /// currently being renamed.  Returns [`None`] when the node is not the
     /// rename target, so callers can fall through to their normal label rendering.
     fn build_rename_input<'a>(
@@ -1845,17 +1825,23 @@ impl EditorState {
         if rt.path != node.full_path {
             return None;
         }
-        let input: Element<'a, EditorMessage> = text_input("", &rt.input_text)
-            .id(Id::from(format!("rename_input_{}", node.full_path)))
-            .on_input(EditorMessage::RenameInput)
-            .on_submit(EditorMessage::RenameSubmit)
-            .size(12)
-            .padding([0, 2])
-            .style(rename_input_style)
-            .into();
+        let editor = super::editor_widget::EditorWidget::new(&rt.input_text.buffer)
+            .single_line(true)
+            .show_gutter(false)
+            .code_mode(false)
+            .enter(EnterBehavior::Submit)
+            .placeholder("")
+            .padding(2.0)
+            .background(Some(iced::Color::TRANSPARENT))
+            .id(Id::from(format!("rename_input_{}", node.full_path)));
+        let input: Element<'a, EditorMessage> =
+            iced::Element::new(editor).map(|action| match action {
+                super::editor_widget::EditorAction::Submit => EditorMessage::RenameSubmit,
+                other => EditorMessage::RenameInput(other),
+            });
         // Only wrap in a Column when an inline error needs to be shown
         // below the input.  The common (no-error) case returns a bare
-        // TextInput to keep widget nesting shallow.
+        // EditorWidget to keep widget nesting shallow.
         if let Some(ref err) = rt.error {
             Some(
                 column![input, text(err).size(10).color(theme::STATUS_ERROR)]
@@ -2217,10 +2203,9 @@ impl EditorState {
             // Clear find/replace state — match byte ranges are now stale.
             tab_data.find_replace_state = None;
             tab_data.content = EditorBuffer::from_file(&snapshot.text, &path);
-            tab_data.content.move_to(
-                snapshot.cursor.position.line,
-                snapshot.cursor.position.column,
-            );
+            tab_data
+                .content
+                .move_to(snapshot.cursor.line, snapshot.cursor.column);
         }
         update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
     }
@@ -2248,10 +2233,10 @@ impl EditorState {
     /// Handle Undo or Redo after checking that the find bar or modal overlay
     /// won't intercept the keyboard shortcut.
     ///
-    /// When the find bar is open, Cmd+Z / Cmd+Shift+Z should undo/redo within
-    /// the find bar's text input (handled natively by Iced's text widget), not
-    /// undo the editor content. Bail out early so the text input handles the
-    /// shortcut internally.
+    /// When the find bar or a modal overlay is open, the overlay's shared
+    /// editor widget owns the text field and handles Cmd+Z / Cmd+Shift+Z
+    /// itself (per-field undo). Bail out so the code editor content is not
+    /// undone by a keystroke aimed at the overlay's input.
     fn handle_undo_or_redo(&mut self, is_redo: bool) -> Task<EditorMessage> {
         if self.is_find_bar_open() || self.active_modal.is_some() {
             Task::none()
@@ -2321,7 +2306,7 @@ impl EditorState {
             is_dir,
             abs_parent,
             ws_root: ws.clone(),
-            input_text: String::new(),
+            input_text: SingleLineEditorState::new(""),
         }));
         iced::widget::operation::focus::<EditorMessage>(Id::new(NEW_ITEM_INPUT_ID))
     }
@@ -2388,14 +2373,24 @@ impl EditorState {
             // ── Go-to-line ────────────────────────────────────────────
             EditorMessage::GoToLineToggle => self.go_to_line_toggle(),
 
-            EditorMessage::GoToLineInput(input) => self.go_to_line_input(&input),
+            EditorMessage::GoToLineInput(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.go_to_line_input(action)
+            }
 
             EditorMessage::GoToLineGo => self.go_to_line_go(),
 
             // ── Global search (find-in-files) ──────────────────────────
             EditorMessage::GlobalSearchToggle => self.global_search_toggle(),
 
-            EditorMessage::GlobalSearchInput(query) => self.global_search_input(query),
+            EditorMessage::GlobalSearchInput(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.global_search_input(action)
+            }
 
             EditorMessage::GlobalSearchResults {
                 r#gen,
@@ -2433,12 +2428,22 @@ impl EditorState {
 
             EditorMessage::NewItemSubmit(name) => self.new_item_submit(&name),
 
-            EditorMessage::NewItemInput(new_text) => self.new_item_input(new_text),
+            EditorMessage::NewItemInput(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.new_item_input(action)
+            }
 
             // ── Inline rename ────────────────────────────────────────────
             EditorMessage::RenameRequested(path) => self.rename_requested(&path),
 
-            EditorMessage::RenameInput(new_text) => self.rename_input(new_text),
+            EditorMessage::RenameInput(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.rename_input(action)
+            }
 
             EditorMessage::RenameSubmit => self.rename_submit(),
 
@@ -2463,7 +2468,12 @@ impl EditorState {
             // ── Quick-open file picker ────────────────────────────────
             EditorMessage::QuickOpenToggle => self.quick_open_toggle(),
 
-            EditorMessage::QuickOpenInput(filter) => self.quick_open_input(filter),
+            EditorMessage::QuickOpenInput(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.quick_open_input(action)
+            }
 
             EditorMessage::QuickOpenSelect(idx) => self.quick_open_select(idx),
 
@@ -2500,9 +2510,19 @@ impl EditorState {
 
             EditorMessage::FindToggle => self.find_toggle(),
 
-            EditorMessage::FindQueryInput(query) => self.find_query_input(query),
+            EditorMessage::FindQueryInput(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.find_query_input(action)
+            }
 
-            EditorMessage::FindReplaceInput(replace) => self.find_replace_input(replace),
+            EditorMessage::FindReplaceInput(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.find_replace_input(action)
+            }
 
             EditorMessage::FindNext => self.navigate_find_match(FindDirection::Next),
 
@@ -3045,7 +3065,7 @@ impl EditorState {
         let gs_gen = self.global_search_gen;
 
         self.active_modal = Some(ModalKind::GlobalSearch(GlobalSearchState {
-            query: String::new(),
+            query: SingleLineEditorState::new(""),
             results: Vec::new(),
             selected_index: 0,
             status: GlobalSearchStatus::Idle,
@@ -3100,7 +3120,7 @@ impl EditorState {
             return Task::none();
         }
 
-        if results.is_empty() && state.query.is_empty() {
+        if results.is_empty() && state.query.text().is_empty() {
             state.status = GlobalSearchStatus::Idle;
             return Task::none();
         }
@@ -3134,11 +3154,11 @@ impl EditorState {
                         .snap_before_edit(&tab_data.content);
                     let cursor_before = tab_data.content.cursor();
                     let text = tab_data.content.text();
-                    let replace = &state.replace;
+                    let replace = state.replace.text();
                     // Replace all in reverse order to preserve positions.
                     let mut new_text = text;
                     for range in state.matches.iter().rev() {
-                        new_text.replace_range(range.start..range.end, replace);
+                        new_text.replace_range(range.start..range.end, replace.as_str());
                     }
                     tab_data.content = EditorBuffer::from_file(&new_text, &path);
                     tab_data
@@ -3357,12 +3377,12 @@ impl EditorState {
         // Allow toggle-to-close when GotoLine is already open, but
         // block if any other modal is active.
         if let Some(modal) = &self.active_modal {
-            if !matches!(modal, ModalKind::GotoLine(_)) {
+            if !matches!(modal, ModalKind::GotoLine) {
                 return Task::none();
             }
         }
         if let Some((_, path)) = self.active_tab() {
-            if matches!(self.active_modal, Some(ModalKind::GotoLine(_))) {
+            if matches!(self.active_modal, Some(ModalKind::GotoLine)) {
                 self.active_modal = None;
                 return Task::none();
             }
@@ -3370,29 +3390,30 @@ impl EditorState {
             if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                 tab_data.find_replace_state = None;
             }
-            self.active_modal = Some(ModalKind::GotoLine(String::new()));
+            self.active_modal = Some(ModalKind::GotoLine);
+            self.goto_line_input.clear();
             return iced::widget::operation::focus::<EditorMessage>(Id::new(GOTO_LINE_INPUT_ID));
         }
         Task::none()
     }
 
-    /// Handle go-to-line input — filters to digits only.
-    fn go_to_line_input(&mut self, input: &str) -> Task<EditorMessage> {
-        // Only keep digits in the input.
-        let digits: String = input.chars().filter(char::is_ascii_digit).collect();
-        if matches!(self.active_modal, Some(ModalKind::GotoLine(_))) {
-            self.active_modal = Some(ModalKind::GotoLine(digits));
+    /// Handle go-to-line input — applies the typed action.
+    fn go_to_line_input(
+        &mut self,
+        action: super::editor_widget::EditorAction,
+    ) -> Task<EditorMessage> {
+        if matches!(self.active_modal, Some(ModalKind::GotoLine)) {
+            self.goto_line_input.apply_action(action);
         }
         Task::none()
     }
 
     /// Handle go-to-line go — jumps to the entered line number.
     fn go_to_line_go(&mut self) -> Task<EditorMessage> {
-        let input = match &self.active_modal {
-            Some(ModalKind::GotoLine(v)) => v.clone(),
-            _ => return Task::none(),
-        };
-        let line_num: usize = match input.parse::<usize>() {
+        if !matches!(self.active_modal, Some(ModalKind::GotoLine)) {
+            return Task::none();
+        }
+        let line_num: usize = match self.goto_line_input.text().parse::<usize>() {
             Ok(n) if n > 0 => n.saturating_sub(1), // convert 1-based to 0-based
             _ => return Task::none(),
         };
@@ -3407,11 +3428,22 @@ impl EditorState {
     }
 
     /// Handle global search input — updates query and triggers async search.
-    fn global_search_input(&mut self, query: String) -> Task<EditorMessage> {
+    fn global_search_input(
+        &mut self,
+        action: super::editor_widget::EditorAction,
+    ) -> Task<EditorMessage> {
+        let changes_text = action.changes_text();
         let Some(ModalKind::GlobalSearch(state)) = &mut self.active_modal else {
             return Task::none();
         };
-        state.query.clone_from(&query);
+        state.query.apply_action(action);
+        let query = state.query.text();
+
+        // Only text changes re-trigger the search/debounce pipeline; cursor
+        // movement just repositions the caret.
+        if !changes_text {
+            return Task::none();
+        }
 
         if query.is_empty() {
             state.status = GlobalSearchStatus::Idle;
@@ -3526,10 +3558,9 @@ impl EditorState {
 
     /// Handle confirm-delete — performs the actual file/directory deletion.
     fn confirm_delete(&mut self) -> Task<EditorMessage> {
-        let Some(ModalKind::DeleteConfirm(target)) = self.active_modal.clone() else {
+        let Some(ModalKind::DeleteConfirm(target)) = self.active_modal.take() else {
             return Task::none();
         };
-        self.active_modal = None;
         if target.is_dir {
             self.perform_dir_delete(&target)
         } else {
@@ -3539,7 +3570,7 @@ impl EditorState {
 
     /// Handle new-item-submit — validates and creates the new file/directory.
     fn new_item_submit(&mut self, name: &str) -> Task<EditorMessage> {
-        let Some(ModalKind::NewItem(target)) = self.active_modal.clone() else {
+        let Some(ModalKind::NewItem(target)) = self.active_modal.take() else {
             return Task::none();
         };
         let trimmed = name.trim();
@@ -3548,14 +3579,16 @@ impl EditorState {
                 msg.into(),
             )));
         }
-        self.active_modal = None;
         self.perform_create_item(&target, trimmed)
     }
 
     /// Handle new-item-input — updates the input text as the user types.
-    fn new_item_input(&mut self, new_text: String) -> Task<EditorMessage> {
+    fn new_item_input(
+        &mut self,
+        action: super::editor_widget::EditorAction,
+    ) -> Task<EditorMessage> {
         if let Some(ModalKind::NewItem(ref mut target)) = self.active_modal {
-            target.input_text = new_text;
+            target.input_text.apply_action(action);
         }
         Task::none()
     }
@@ -3586,16 +3619,16 @@ impl EditorState {
             ws_root: ws.clone(),
             path: path.to_string(),
             is_dir,
-            input_text: file_name,
+            input_text: SingleLineEditorState::new(&file_name),
             error: None,
         }));
         iced::widget::operation::focus::<EditorMessage>(Id::from(format!("rename_input_{path}")))
     }
 
     /// Handle rename-input — updates the inline rename text as the user types.
-    fn rename_input(&mut self, new_text: String) -> Task<EditorMessage> {
+    fn rename_input(&mut self, action: super::editor_widget::EditorAction) -> Task<EditorMessage> {
         if let Some(ModalKind::Rename(ref mut target)) = self.active_modal {
-            target.input_text = new_text;
+            target.input_text.apply_action(action);
             // Clear error when user starts typing again.
             if target.error.is_some() {
                 target.error = None;
@@ -3606,20 +3639,20 @@ impl EditorState {
 
     /// Handle rename-submit — validates and performs the async rename operation.
     fn rename_submit(&mut self) -> Task<EditorMessage> {
-        let Some(ModalKind::Rename(target)) = self.active_modal.clone() else {
+        let Some(ModalKind::Rename(target)) = self.active_modal.take() else {
             return Task::none();
         };
         // All-space names fall through to the empty-name check below.
-        let trimmed = target.input_text.trim().to_string();
+        let trimmed = target.input_text.text().trim().to_string();
 
         // ── Validation ────────────────────────────────────────
         // validate_item_name covers empty name, path separators,
         // dot/dotdot, and OS-reserved names.
         let error_msg = validate_item_name(&trimmed);
         if let Some(msg) = error_msg {
-            if let Some(ModalKind::Rename(ref mut rt)) = self.active_modal {
-                rt.error = Some(msg.into());
-            }
+            let mut rt = target;
+            rt.error = Some(msg.into());
+            self.active_modal = Some(ModalKind::Rename(rt));
             return Task::none();
         }
 
@@ -3640,18 +3673,16 @@ impl EditorState {
 
         // Check if target already exists.
         if Path::new(&new_abs_path).exists() {
-            if let Some(ModalKind::Rename(ref mut rt)) = self.active_modal {
-                rt.error = Some("A file or directory with that name already exists".into());
-            }
+            let mut rt = target;
+            rt.error = Some("A file or directory with that name already exists".into());
+            self.active_modal = Some(ModalKind::Rename(rt));
             return Task::none();
         }
 
         // All validations passed — clear the inline rename state
         // and fire the async rename task.
-        self.active_modal = None;
-
-        let old_abs = target.abs_path.clone();
-        let old_rel = target.path.clone();
+        let old_abs = target.abs_path;
+        let old_rel = target.path;
         let is_dir = target.is_dir;
         let parent_dir_clone = parent_dir;
         let ws_root = target.ws_root;
@@ -3948,7 +3979,7 @@ impl EditorState {
         self.scan_all_workspace_files();
 
         self.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-            filter: String::new(),
+            filter: SingleLineEditorState::new(""),
             selected_index: 0,
             results: Vec::new(),
         }));
@@ -3956,12 +3987,25 @@ impl EditorState {
     }
 
     /// Handle quick-open input — filters the file list.
-    fn quick_open_input(&mut self, filter: String) -> Task<EditorMessage> {
-        let results = self.filter_workspace_files(&filter);
-        if let Some(ModalKind::QuickOpen(ref mut qo)) = self.active_modal {
-            qo.filter = filter;
-            qo.results = results;
-            qo.selected_index = 0;
+    fn quick_open_input(
+        &mut self,
+        action: super::editor_widget::EditorAction,
+    ) -> Task<EditorMessage> {
+        let changes_text = action.changes_text();
+        let filter = if let Some(ModalKind::QuickOpen(ref mut qo)) = self.active_modal {
+            qo.filter.apply_action(action);
+            qo.filter.text()
+        } else {
+            return Task::none();
+        };
+        // The shared widget emits cursor movements too; only re-filter on
+        // text changes (edits and undo/redo).
+        if changes_text {
+            let results = self.filter_workspace_files(&filter);
+            if let Some(ModalKind::QuickOpen(ref mut qo)) = self.active_modal {
+                qo.results = results;
+                qo.selected_index = 0;
+            }
         }
         Task::none()
     }
@@ -4121,8 +4165,8 @@ impl EditorState {
                 // Open find bar with current selection as default query.
                 let default_query = tab_data.content.selection().unwrap_or_default();
                 let mut state = FindReplaceState {
-                    query: default_query,
-                    replace: String::new(),
+                    query: SingleLineEditorState::new(&default_query),
+                    replace: SingleLineEditorState::new(""),
                     matches: Vec::new(),
                     current_match_idx: 0,
                     case_sensitive: false,
@@ -4153,17 +4197,28 @@ impl EditorState {
     }
 
     /// Handle find-query-input — updates the search query and recomputes matches.
-    fn find_query_input(&mut self, query: String) -> Task<EditorMessage> {
+    fn find_query_input(
+        &mut self,
+        action: super::editor_widget::EditorAction,
+    ) -> Task<EditorMessage> {
+        let changes_text = action.changes_text();
         self.with_active_find_state(|state, content| {
-            state.query = query;
-            state.recompute(content);
+            state.query.apply_action(action);
+            // The shared widget emits cursor movements too; only recompute
+            // matches on text changes (edits and undo/redo).
+            if changes_text {
+                state.recompute(content);
+            }
         })
     }
 
     /// Handle find-replace-input — updates the replace text.
-    fn find_replace_input(&mut self, replace: String) -> Task<EditorMessage> {
+    fn find_replace_input(
+        &mut self,
+        action: super::editor_widget::EditorAction,
+    ) -> Task<EditorMessage> {
         self.with_active_find_state(|state, _| {
-            state.replace = replace;
+            state.replace.apply_action(action);
         })
     }
 
@@ -4185,9 +4240,9 @@ impl EditorState {
                 let range = state.matches.get(state.current_match_idx)?;
                 Some((
                     range.clone(),
-                    state.replace.clone(),
+                    state.replace.text(),
                     state.case_sensitive,
-                    state.query.clone(),
+                    state.query.text(),
                 ))
             })
         else {
@@ -4639,7 +4694,7 @@ impl EditorState {
                 editor_dialog::build_delete_confirm_dialog(target)
             }
             // GotoLine and Rename are rendered inline (not as stack overlays).
-            Some(ModalKind::GotoLine(_) | ModalKind::Rename(_)) | None => placeholder,
+            Some(ModalKind::GotoLine | ModalKind::Rename(_)) | None => placeholder,
         };
 
         iced::widget::stack([body.into(), overlay]).into()
@@ -5163,28 +5218,37 @@ impl EditorState {
         let path = &self.tabs[idx].path;
         let state = self.tab_contents.get(path)?.find_replace_state.as_ref()?;
 
-        let search_input = text_input("Find…", &state.query)
-            .on_input(EditorMessage::FindQueryInput)
-            .on_submit(EditorMessage::FindNext)
-            .id(Id::new(FIND_SEARCH_ID))
-            .style(widgets::text_input_style)
-            .width(Length::Fixed(200.0))
-            .size(13);
+        let search_input = widgets::single_line_editor(
+            &state.query.buffer,
+            "Find…",
+            true,
+            Length::Fixed(200.0),
+            Some(Id::new(FIND_SEARCH_ID)),
+            |action| match action {
+                super::editor_widget::EditorAction::Submit => EditorMessage::FindNext,
+                other => EditorMessage::FindQueryInput(other),
+            },
+        );
 
-        let replace_input = text_input("Replace…", &state.replace)
-            .on_input(EditorMessage::FindReplaceInput)
-            .on_submit(EditorMessage::FindNext)
-            .id(Id::new(FIND_REPLACE_ID))
-            .style(widgets::text_input_style)
-            .width(Length::Fixed(160.0))
-            .size(13);
+        let replace_input = widgets::single_line_editor(
+            &state.replace.buffer,
+            "Replace…",
+            true,
+            Length::Fixed(160.0),
+            Some(Id::new(FIND_REPLACE_ID)),
+            |action| match action {
+                super::editor_widget::EditorAction::Submit => EditorMessage::FindNext,
+                other => EditorMessage::FindReplaceInput(other),
+            },
+        );
 
         let total = state.matches.len();
-        let match_label = if !state.query.is_empty() && state.query.len() < 2 {
+        let query = state.query.text();
+        let match_label = if !query.is_empty() && query.len() < 2 {
             "Min 2 chars".to_string()
-        } else if !state.query.is_empty() && total > 0 {
+        } else if !query.is_empty() && total > 0 {
             format!("{}/{}", state.current_match_idx.saturating_add(1), total)
-        } else if !state.query.is_empty() {
+        } else if !query.is_empty() {
             "0/0".to_string()
         } else {
             String::new()
@@ -5242,17 +5306,21 @@ impl EditorState {
     /// Build the go-to-line input bar. Appears in the same slot as the find
     /// bar (below the tab bar) and is mutually exclusive with it.
     fn build_go_to_line_bar(&self) -> Option<Element<'_, EditorMessage>> {
-        let ModalKind::GotoLine(input_text) = self.active_modal.as_ref()? else {
+        let ModalKind::GotoLine = self.active_modal.as_ref()? else {
             return None;
         };
 
-        let line_input = text_input("Line #", input_text)
-            .on_input(EditorMessage::GoToLineInput)
-            .on_submit(EditorMessage::GoToLineGo)
-            .id(Id::new(GOTO_LINE_INPUT_ID))
-            .style(widgets::text_input_style)
-            .width(Length::Fixed(120.0))
-            .size(13);
+        let line_input = widgets::single_line_editor(
+            &self.goto_line_input.buffer,
+            "Line #",
+            true,
+            Length::Fixed(120.0),
+            Some(Id::new(GOTO_LINE_INPUT_ID)),
+            |action| match action {
+                super::editor_widget::EditorAction::Submit => EditorMessage::GoToLineGo,
+                other => EditorMessage::GoToLineInput(other),
+            },
+        );
 
         let go_btn = button(text("Go").size(12).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::GoToLineGo)
@@ -5695,7 +5763,7 @@ impl FindReplaceState {
     /// Recompute matches against the current text and jump to the first match (or reset the index).
     fn recompute(&mut self, content: &EditorBuffer) {
         let text = content.text();
-        self.matches = compute_text_matches(&text, &self.query, self.case_sensitive);
+        self.matches = compute_text_matches(&text, &self.query.text(), self.case_sensitive);
         auto_jump_to_first_match(&text, content, self);
     }
 }

@@ -397,7 +397,7 @@ fn test_misc_focus_actions() {
                     abs_path: String::new(),
                     is_dir: false,
                     ws_root: String::new(),
-                    input_text: "main.rs".to_string(),
+                    input_text: crate::gui::common::SingleLineEditorState::new("main.rs"),
                     error: None,
                 }));
             },
@@ -893,8 +893,8 @@ fn test_find_replace_auto_advance() {
         let mut state = make_editor_with_single_tab(c.text);
         if let Some(tab) = state.tab_contents.get_mut(&path) {
             tab.find_replace_state = Some(FindReplaceState {
-                query: c.query.to_string(),
-                replace: c.replace.to_string(),
+                query: crate::gui::common::SingleLineEditorState::new(c.query),
+                replace: crate::gui::common::SingleLineEditorState::new(c.replace),
                 matches: c.initial_matches.iter().map(|&(s, e)| s..e).collect(),
                 current_match_idx: 0,
                 case_sensitive: true,
@@ -955,8 +955,8 @@ fn make_editor_with_find_state(
             content: EditorBuffer::with_text(text, None),
             undo_stack: RefCell::new(UndoStack::new()),
             find_replace_state: Some(FindReplaceState {
-                query: query.to_string(),
-                replace: String::new(),
+                query: crate::gui::common::SingleLineEditorState::new(query),
+                replace: crate::gui::common::SingleLineEditorState::new(""),
                 matches,
                 current_match_idx,
                 case_sensitive: true,
@@ -1211,7 +1211,7 @@ fn test_undo_noop_when_quick_open_active() {
         tab_data.content.perform_action(EditorAction::Insert('!'));
     }
     state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: String::new(),
+        filter: crate::gui::common::SingleLineEditorState::new(""),
         selected_index: 0,
         results: Vec::new(),
     }));
@@ -1231,7 +1231,7 @@ fn test_refresh_file_tree_noop_when_quick_open_active() {
 
     // Activate a modal overlay (QuickOpen).
     state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: String::new(),
+        filter: crate::gui::common::SingleLineEditorState::new(""),
         selected_index: 0,
         results: Vec::new(),
     }));
@@ -1254,7 +1254,7 @@ fn test_tree_focus_toggled_noop_during_modal_overlay() {
 
     // Activate a modal overlay (QuickOpen).
     state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: String::new(),
+        filter: crate::gui::common::SingleLineEditorState::new(""),
         selected_index: 0,
         results: Vec::new(),
     }));
@@ -1278,7 +1278,7 @@ fn test_tree_nav_suppressed_during_goto_line_overlay() {
     state.file_tree.tree_focus_index = 0; // "src"
 
     // Activate a non-search modal overlay (GotoLine).
-    state.active_modal = Some(ModalKind::GotoLine(String::new()));
+    state.active_modal = Some(ModalKind::GotoLine);
 
     let prev_focus = state.file_tree.tree_focus_index;
     // Up/Down/Enter/Left/Right — assert tree_focus_index unchanged.
@@ -1313,8 +1313,8 @@ fn test_find_replace_all_preserves_cursor() {
     if let Some(tab_data) = state.tab_contents.get_mut(&path) {
         tab_data.content.move_to(0, 5);
         tab_data.find_replace_state = Some(FindReplaceState {
-            query: "ab".to_string(),
-            replace: "xy".to_string(),
+            query: crate::gui::common::SingleLineEditorState::new("ab"),
+            replace: crate::gui::common::SingleLineEditorState::new("xy"),
             matches: vec![0..2, 6..8],
             current_match_idx: 0,
             case_sensitive: true,
@@ -1329,7 +1329,7 @@ fn test_find_replace_all_preserves_cursor() {
 #[test]
 fn test_quick_open_toggle_blocked_when_goto_line_open() {
     let mut state = make_editor_with_single_tab("hello");
-    state.active_modal = Some(ModalKind::GotoLine(String::new()));
+    state.active_modal = Some(ModalKind::GotoLine);
     let _ = state.update(EditorMessage::QuickOpenToggle);
     assert!(!matches!(state.active_modal, Some(ModalKind::QuickOpen(_))));
 }
@@ -1338,7 +1338,7 @@ fn test_quick_open_toggle_blocked_when_goto_line_open() {
 fn test_quick_open_toggle_closes_when_already_open() {
     let mut state = make_editor_with_single_tab("hello");
     state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: "foo".to_string(),
+        filter: crate::gui::common::SingleLineEditorState::new("foo"),
         selected_index: 0,
         results: Vec::new(),
     }));
@@ -1352,7 +1352,7 @@ fn test_global_search_toggle_blocked_when_quick_open_open() {
     state.selected_workspace_name = Some("ws".to_string());
     state.selected_workspace_path = Some("/tmp/ws".to_string());
     state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: String::new(),
+        filter: crate::gui::common::SingleLineEditorState::new(""),
         selected_index: 0,
         results: Vec::new(),
     }));
@@ -1372,11 +1372,11 @@ fn test_rename_request_sets_target() {
     let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
     assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
     let rt = match state.active_modal {
-        Some(ModalKind::Rename(ref rt)) => rt.clone(),
+        Some(ModalKind::Rename(rt)) => rt,
         _ => panic!("expected Rename modal"),
     };
     assert_eq!(rt.path, "Cargo.toml");
-    assert_eq!(rt.input_text, "Cargo.toml");
+    assert_eq!(rt.input_text.text(), "Cargo.toml");
     assert!(!rt.is_dir);
 }
 
@@ -1400,11 +1400,11 @@ fn test_rename_request_on_directory_sets_is_dir() {
     let _ = state.update(EditorMessage::RenameRequested("src".into()));
     assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
     let rt = match state.active_modal {
-        Some(ModalKind::Rename(ref rt)) => rt.clone(),
+        Some(ModalKind::Rename(rt)) => rt,
         _ => panic!("expected Rename modal"),
     };
     assert_eq!(rt.path, "src");
-    assert_eq!(rt.input_text, "src");
+    assert_eq!(rt.input_text.text(), "src");
     assert!(rt.is_dir);
 }
 
@@ -1427,10 +1427,16 @@ fn test_rename_input_updates_text_and_clears_error() {
     if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
         rt.error = Some("bad".into());
     }
+    // The buffer pre-fills with the file name; model clearing it before typing.
+    if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
+        rt.input_text.set_text("");
+    }
     // Type new text
-    let _ = state.update(EditorMessage::RenameInput("new_name".into()));
+    let _ = state.update(EditorMessage::RenameInput(EditorAction::Paste(
+        "new_name".into(),
+    )));
     if let Some(ModalKind::Rename(ref rt)) = state.active_modal {
-        assert_eq!(rt.input_text, "new_name");
+        assert_eq!(rt.input_text.text(), "new_name");
         // Error should be cleared when user types
         assert!(rt.error.is_none());
     } else {
@@ -1520,7 +1526,7 @@ fn setup_rename_state(state: &mut EditorState, input_text: &str) {
     state.selected_workspace_path = Some("/tmp".to_string());
     let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
     if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
-        rt.input_text = input_text.to_string();
+        rt.input_text.set_text(input_text);
     }
 }
 
@@ -1598,7 +1604,7 @@ fn test_rename_validation_target_already_exists() {
     state.selected_workspace_path = Some(ws.clone());
     let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
     if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
-        rt.input_text = "existing.txt".to_string();
+        rt.input_text.set_text("existing.txt");
     }
     let _ = state.update(EditorMessage::RenameSubmit);
     let err = match &state.active_modal {
@@ -1624,7 +1630,7 @@ fn test_rename_stale_generation_discarded() {
     // parent dir is non-empty) is actually exercised.
     let _ = state.update(EditorMessage::RenameRequested("src/main.rs".into()));
     if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
-        rt.input_text = "lib.rs".to_string();
+        rt.input_text.set_text("lib.rs");
     }
     let _ = state.update(EditorMessage::RenameSubmit);
 

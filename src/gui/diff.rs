@@ -24,7 +24,7 @@ use crate::git::diff_parse::{
 };
 
 use iced::widget::Id;
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Color, Element, Length, Task, keyboard};
 
 use iced_fonts::lucide;
@@ -115,7 +115,7 @@ pub enum DiffMessage {
     Tick,
     ToggleDir(String),
     SelectFile(String),
-    CommitMessageChanged(String),
+    CommitMessageChanged(super::editor_widget::EditorAction),
     CommitClicked,
     CommitResult(Result<CommitInfo, String>),
     /// Emitted on successful manual commit — signals the parent to close the modal.
@@ -236,7 +236,7 @@ pub struct DiffState {
     /// diff data or file selection changes; consumed by `view()`.
     file_buffers: Vec<DiffFileBuffer>,
     /// Commit message typed by the user.
-    commit_message: String,
+    commit_message: super::common::SingleLineEditorState,
     /// Whether a commit is in-flight.
     committing: bool,
     /// Current commit being viewed, if any.
@@ -265,7 +265,7 @@ impl DiffState {
             file_tree: FileTree::new(Id::new("diff_tree_panel")),
             selected_file: None,
             file_buffers: Vec::new(),
-            commit_message: String::new(),
+            commit_message: super::common::SingleLineEditorState::new(""),
             committing: false,
             current_commit_ref: None,
             current_commit_message: None,
@@ -532,13 +532,16 @@ impl DiffState {
                 self.rebuild_file_buffers();
                 Task::none()
             }
-            DiffMessage::CommitMessageChanged(msg) => {
-                self.commit_message = msg;
+            DiffMessage::CommitMessageChanged(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.commit_message.apply_action(action);
                 self.file_tree.tree_focused = false;
                 Task::none()
             }
             DiffMessage::CommitClicked => {
-                let trimmed = self.commit_message.trim().to_string();
+                let trimmed = self.commit_message.text().trim().to_string();
                 if trimmed.is_empty() || self.committing {
                     return Task::none();
                 }
@@ -760,13 +763,19 @@ impl DiffState {
             .width(Length::Fill)
             .padding([8, 12])
         } else if show_commit_bar {
-            let commit_input = text_input("Commit message…", &self.commit_message)
-                .on_input(DiffMessage::CommitMessageChanged)
-                .on_submit(DiffMessage::CommitClicked)
-                .width(Length::Fill)
-                .size(12);
+            let commit_input = super::widgets::single_line_editor(
+                &self.commit_message.buffer,
+                "Commit message…",
+                true,
+                Length::Fill,
+                Some(Id::new("diff_commit_message")),
+                |action| match action {
+                    super::editor_widget::EditorAction::Submit => DiffMessage::CommitClicked,
+                    other => DiffMessage::CommitMessageChanged(other),
+                },
+            );
 
-            let msg_empty = self.commit_message.trim().is_empty();
+            let msg_empty = self.commit_message.text().trim().is_empty();
             let commit_disabled = msg_empty || self.committing;
 
             let commit_btn = button(if self.committing {
@@ -2110,7 +2119,9 @@ mod tests {
     fn test_commit_message_clears_tree_focus() {
         let mut state = make_diff_with_tree();
         state.file_tree.tree_focused = true;
-        let _ = state.update(DiffMessage::CommitMessageChanged("fix bug".to_owned()));
+        let _ = state.update(DiffMessage::CommitMessageChanged(
+            crate::gui::editor_widget::EditorAction::Paste("fix bug".to_owned()),
+        ));
         assert!(!state.file_tree.tree_focused);
     }
 
@@ -2301,7 +2312,7 @@ mod tests {
             "status_message should be cleared to prevent stale status text"
         );
         assert!(
-            state.commit_message.is_empty(),
+            state.commit_message.text().is_empty(),
             "commit_message should be cleared to prevent stale typed text"
         );
         assert!(!state.committing, "committing should be reset to false");
@@ -2354,7 +2365,7 @@ mod tests {
         state.diff_has_loaded = true;
         state.error = Some("stale error".into());
         state.status_message = Some("stale status".into());
-        state.commit_message = "stale commit".into();
+        state.commit_message.set_text("stale commit");
         state.committing = true;
         state.selected_file = Some("stale/path.rs".into());
         state.file_buffers.push(DiffFileBuffer {

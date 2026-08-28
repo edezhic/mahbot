@@ -9,9 +9,7 @@
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
 use iced::advanced::text::Span;
-use iced::widget::{
-    Column, Space, button, column, container, row, scrollable, text, text_input, tooltip,
-};
+use iced::widget::{Column, Space, button, column, container, row, scrollable, text, tooltip};
 use iced::{Alignment, Element, Length, Subscription, Task, window};
 use iced_anim::Animated;
 use iced_anim::transition::Easing;
@@ -62,7 +60,7 @@ pub enum LogMessage {
     StreamLagged,
 
     // Search
-    SearchInput(String),
+    SearchInput(super::editor_widget::EditorAction),
 
     // Tab switching
     TabSelected(LogsTab),
@@ -125,6 +123,8 @@ pub struct LogsState {
     fade_anim: Animated<f32>,
     /// Debounce state for search-text input filtering.
     debounce: super::common::DebounceState,
+    /// Buffer for the shared search input (bound to the active tab's query).
+    search_buffer: super::common::SingleLineEditorState,
 }
 
 impl LogsState {
@@ -143,6 +143,7 @@ impl LogsState {
                 Easing::EASE_OUT.with_duration(Duration::from_millis(theme::ANIM_LOG_FADE_MS)),
             ),
             debounce: super::common::DebounceState::new(),
+            search_buffer: super::common::SingleLineEditorState::new(""),
         }
     }
 
@@ -321,11 +322,23 @@ impl LogsState {
                 // Only delivered while the All Logs stream is active.
                 self.refresh_active_tab(log_store)
             }
-            LogMessage::SearchInput(v) => {
+            LogMessage::SearchInput(action) => {
+                // Single-line Tab moves focus rather than editing.
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
                 // The search input is bound to the active tab's own query.
+                let changes_text = action.changes_text();
+                self.search_buffer.apply_action(action);
+                let text = self.search_buffer.text();
                 match self.tab_data_mut(self.active_tab) {
-                    Some(data) => data.search = v,
-                    None => self.tool_failures_state.set_search(v),
+                    Some(data) => data.search = text,
+                    None => self.tool_failures_state.set_search(text),
+                }
+                // Only text changes re-trigger the debounced refresh; cursor
+                // movement emits actions too but shouldn't restart the timer.
+                if !changes_text {
+                    return Task::none();
                 }
                 self.reset_pagination_for_active_tab();
                 // Tag the debounced refresh with the tab whose query changed
@@ -390,6 +403,9 @@ impl LogsState {
             }
             LogMessage::TabSelected(tab) => {
                 self.active_tab = tab;
+                // Sync the shared search buffer to the newly-active tab's query.
+                let active_search = self.active_search().to_string();
+                self.search_buffer.set_text(&active_search);
                 self.refresh_active_tab(log_store)
             }
             LogMessage::ToolFailures(msg) => self
@@ -555,25 +571,26 @@ impl LogsState {
         };
 
         let search_input: Element<'_, LogMessage> = if self.focus_search {
-            container(
-                text_input("search", self.active_search())
-                    .on_input(LogMessage::SearchInput)
-                    .style(super::widgets::text_input_style)
-                    .size(13)
-                    .padding(4)
-                    .width(Length::Fixed(160.0)),
-            )
+            container(super::widgets::single_line_editor(
+                &self.search_buffer.buffer,
+                "search",
+                false,
+                Length::Fill,
+                Some(iced::widget::Id::new("logs_search")),
+                LogMessage::SearchInput,
+            ))
             .padding(2)
             .style(|_| theme::container_style(iced::Color::TRANSPARENT, 4.0, 1.0, theme::ACCENT))
             .into()
         } else {
-            text_input("search", self.active_search())
-                .on_input(LogMessage::SearchInput)
-                .style(super::widgets::text_input_style)
-                .size(13)
-                .padding(4)
-                .width(Length::Fixed(160.0))
-                .into()
+            super::widgets::single_line_editor(
+                &self.search_buffer.buffer,
+                "search",
+                false,
+                Length::Fill,
+                Some(iced::widget::Id::new("logs_search")),
+                LogMessage::SearchInput,
+            )
         };
 
         let search_group = row![

@@ -7,10 +7,9 @@ use crate::git::commands::{parse_numstat_lines, run_git_output};
 use crate::pipeline::board::{Ticket, TicketPhase};
 
 use iced::widget::{
-    Column, Row, Space, button, column, container, markdown, row, scrollable, text, text_editor,
-    tooltip,
+    Column, Row, Space, button, column, container, markdown, row, scrollable, text, tooltip,
 };
-use iced::{Alignment, Element, Length, Task, keyboard};
+use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
 
@@ -121,23 +120,16 @@ pub enum BoardMessage {
     ToggleCommentExpand(usize),
 
     /// Comment text input changed in the ticket detail modal.
-    CommentInputChanged(text_editor::Action),
+    CommentInputChanged(super::editor_widget::EditorAction),
     /// Send a comment on the current ticket.
     SendComment,
     /// Result of adding a comment via the backend. Carries the generation
     /// counter captured at send-time for stale-callback detection.
     CommentSent(u64, Result<(), String>),
-    /// Keyboard modifier state change (Shift, Ctrl, Cmd) — tracked for
-    /// Shift+Click→Drag conversion in the comment input.
-    CommentModifiersChanged(keyboard::Modifiers),
-    /// Undo the last text edit in the comment input.
-    Undo,
-    /// Redo a previously undone text edit in the comment input.
-    Redo,
 
     // ── Ticket search (sidebar) ──────────────────────────────────
     /// Search query text changed (user typing in the sidebar search input).
-    SearchInputChanged(String),
+    SearchInputChanged(super::editor_widget::EditorAction),
     /// Search results returned from async FTS query.
     /// Carries a generation counter for stale-callback detection.
     SearchResults(Vec<Ticket>, u64),
@@ -193,7 +185,7 @@ pub struct BoardState {
     detail_refresh_in_flight: bool,
 
     /// Comment text input state for the ticket detail modal.
-    comment_input: text_editor::Content,
+    comment_input: super::editor_widget::EditorBuffer,
     /// Whether a comment is currently being sent (prevents double-send).
     sending_comment: bool,
     /// Whether the comment input is focused (for Escape-key blur behavior).
@@ -210,15 +202,12 @@ pub struct BoardState {
     /// `TicketDetails`). Captured in `SendComment` and verified in
     /// `CommentSent` to detect stale async callbacks.
     comment_generation: u64,
-    /// Latest keyboard modifiers, tracked for Shift+Click→Drag conversion
-    /// in the comment input (matching the Home chat input pattern).
-    modifiers: keyboard::Modifiers,
     /// Undo/redo stack for the comment input text editor.
     undo_stack: super::common::UndoStack,
 
     // ── Ticket search (sidebar) ──────────────────────────────────
     /// Current search query (empty = no search active).
-    pub(crate) search_query: String,
+    pub(crate) search_query: super::common::SingleLineEditorState,
     /// Search results, populated when `search_query` is non-empty.
     pub(crate) search_results: Vec<Ticket>,
     /// Incremented on each new search; stale callbacks check this before
@@ -248,14 +237,16 @@ impl BoardState {
             expanded_comments: HashSet::new(),
             detail_error: None,
             detail_refresh_in_flight: false,
-            comment_input: text_editor::Content::new(),
+            comment_input: super::editor_widget::EditorBuffer::with_text(
+                "",
+                Some(super::highlight::HighlightLanguage::Markdown),
+            ),
             sending_comment: false,
             comment_focused: false,
             current_user_name: None,
             comment_generation: 0,
-            modifiers: keyboard::Modifiers::empty(),
             undo_stack: super::common::UndoStack::new(),
-            search_query: String::new(),
+            search_query: super::common::SingleLineEditorState::new(""),
             search_results: Vec::new(),
             search_generation: 0,
         }
@@ -306,7 +297,7 @@ impl BoardState {
         self.commit_stats = None;
         self.commit_stats_loading = false;
         self.commit_stats_generation += 1;
-        self.comment_input = text_editor::Content::new();
+        self.comment_input.clear();
         self.sending_comment = false;
         self.comment_focused = false;
         self.comment_generation += 1;
@@ -610,18 +601,11 @@ impl BoardState {
 
     #[allow(clippy::unused_self)]
     pub fn subscription(&self) -> iced::Subscription<BoardMessage> {
-        // Track keyboard modifiers for Shift+Click→Drag conversion in the
-        // comment input, and handle Cmd+Z / Cmd+Shift+Z for undo/redo,
-        // mirroring the Home chat input pattern.
-        use iced::keyboard;
-        keyboard::listen().filter_map(|event| {
-            super::common::composer_keyboard_event(
-                event,
-                BoardMessage::CommentModifiersChanged,
-                || BoardMessage::Undo,
-                || BoardMessage::Redo,
-            )
-        })
+        // Undo/Redo in the comment input flows through
+        // `BoardMessage::CommentInputChanged(EditorAction::Undo/Redo)`, which
+        // the shared widget now emits internally. No page-level keyboard
+        // subscription needed.
+        iced::Subscription::none()
     }
 
     /// Phase transition actions (ported from Board.tsx `availableActions`)
@@ -903,7 +887,7 @@ impl BoardState {
                 // Clear comment input state when switching to a new ticket
                 // to prevent a draft from the previous ticket being
                 // accidentally sent to the new one.
-                self.comment_input = text_editor::Content::new();
+                self.comment_input.clear();
                 self.sending_comment = false;
                 self.comment_focused = false;
                 self.undo_stack.clear();
@@ -1056,22 +1040,7 @@ impl BoardState {
                     &mut self.comment_input,
                     &mut self.undo_stack,
                     action,
-                    self.modifiers.shift(),
                 );
-                Task::none()
-            }
-            BoardMessage::Undo => {
-                let snapshot = self.undo_stack.undo(&self.comment_input);
-                super::common::restore_undo_snapshot(&mut self.comment_input, snapshot);
-                Task::none()
-            }
-            BoardMessage::Redo => {
-                let snapshot = self.undo_stack.redo(&self.comment_input);
-                super::common::restore_undo_snapshot(&mut self.comment_input, snapshot);
-                Task::none()
-            }
-            BoardMessage::CommentModifiersChanged(modifiers) => {
-                self.modifiers = modifiers;
                 Task::none()
             }
             BoardMessage::SendComment => {
@@ -1119,7 +1088,7 @@ impl BoardState {
                 }
 
                 self.sending_comment = true;
-                self.comment_input = text_editor::Content::new();
+                self.comment_input.clear();
                 self.undo_stack.clear();
                 let generation = self.comment_generation;
 
@@ -1270,8 +1239,20 @@ impl BoardState {
             }
 
             // ── Ticket search (sidebar) ──────────────────────────────
-            BoardMessage::SearchInputChanged(query) => {
-                self.search_query.clone_from(&query);
+            BoardMessage::SearchInputChanged(action) => {
+                // Single-line Tab moves focus rather than editing.
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                let changes_text = action.changes_text();
+                self.search_query.apply_action(action);
+                // The shared widget emits every action (cursor moves too);
+                // only re-run the search/debounce pipeline on actual text
+                // changes (edits and undo/redo).
+                if !changes_text {
+                    return Task::none();
+                }
+                let query = self.search_query.text();
                 self.search_generation += 1;
 
                 if query.is_empty() {
@@ -1941,10 +1922,11 @@ impl BoardState {
                 min_height: 44.0,
                 max_height: 132.0,
                 controls: Vec::new(),
-                // Board comment input is out of ticket scope — keep its
-                // legacy always-active send button look.
+                // Board keeps its legacy always-active send button look
+                // (Home greys it out on empty input).
                 grey_on_empty: false,
                 send_tooltip: "send comment",
+                id: Some(iced::widget::Id::new("board_comment_composer")),
             },
         ))
         .width(Length::Fill)
@@ -2056,8 +2038,9 @@ impl BoardState {
 
 #[cfg(test)]
 mod tests {
+    use super::super::editor_widget::{EditorAction, EditorBuffer};
+    use super::super::highlight::HighlightLanguage;
     use super::*;
-    use iced::Point;
 
     fn make_board_state() -> BoardState {
         let mut state = BoardState::new();
@@ -2093,7 +2076,8 @@ mod tests {
     #[test]
     fn test_comment_within_limit_clears_input() {
         let mut state = make_board_state();
-        state.comment_input = text_editor::Content::with_text("hello world");
+        state.comment_input =
+            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
         let _task = state.update(BoardMessage::SendComment);
         // Editor must be cleared on accepted message.
         assert!(
@@ -2121,7 +2105,7 @@ mod tests {
     fn test_comment_no_user_returns_warning() {
         let mut state = make_board_state();
         state.current_user_name = None;
-        state.comment_input = text_editor::Content::with_text("hello");
+        state.comment_input = EditorBuffer::with_text("hello", Some(HighlightLanguage::Markdown));
         let _task = state.update(BoardMessage::SendComment);
 
         // Editor should NOT be cleared — message was rejected.
@@ -2135,7 +2119,7 @@ mod tests {
     fn test_comment_no_ticket_is_noop() {
         let mut state = make_board_state();
         state.selected_ticket = None;
-        state.comment_input = text_editor::Content::with_text("hello");
+        state.comment_input = EditorBuffer::with_text("hello", Some(HighlightLanguage::Markdown));
         let _task = state.update(BoardMessage::SendComment);
         assert!(!state.sending_comment);
         assert_eq!(
@@ -2150,15 +2134,15 @@ mod tests {
     #[test]
     fn test_comment_input_changed_non_edit_passes_through() {
         let mut state = make_board_state();
-        state.comment_input = text_editor::Content::with_text("hello world");
+        state.comment_input =
+            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
 
-        // Cursor movement (non-edit action) must be passed to perform().
-        // After a Click, the cursor position should reflect the click.
-        let _ = state.update(BoardMessage::CommentInputChanged(
-            text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
-        ));
-        // perform() was called — the editor state accepted the action
-        // (no crash, content unchanged).
+        // Cursor movement (non-edit action) must be passed to perform_action().
+        // After a MoveTo, the content is unchanged.
+        let _ = state.update(BoardMessage::CommentInputChanged(EditorAction::MoveTo {
+            line: 0,
+            col: 0,
+        }));
         assert_eq!(state.comment_input.text(), "hello world");
         assert!(
             state.comment_focused,
@@ -2166,60 +2150,45 @@ mod tests {
         );
     }
 
-    // ── CommentInputChanged: Shift+Click → Drag conversion ───────
+    // ── CommentInputChanged: selection creation ───────────────────
 
     #[test]
-    fn test_comment_shift_click_converts_to_drag() {
+    fn test_comment_select_to_creates_selection() {
         let mut state = make_board_state();
-        state.comment_input = text_editor::Content::with_text("hello world");
-        // Set Shift modifier
-        state.modifiers = keyboard::Modifiers::SHIFT;
+        state.comment_input =
+            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
 
-        // Click at position should be converted to Drag (which extends selection).
-        // This is a behavioral contract — we can't easily assert the internal
-        // conversion happened, but we can verify no crash and that the editor
-        // state was updated.
-        let _ = state.update(BoardMessage::CommentInputChanged(
-            text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
-        ));
+        // Move the cursor away, then extend a selection via SelectTo.
+        state
+            .comment_input
+            .perform_action(EditorAction::MoveTo { line: 0, col: 0 });
+        let _ = state.update(BoardMessage::CommentInputChanged(EditorAction::SelectTo {
+            line: 0,
+            col: 5,
+        }));
+
+        let cursor = state.comment_input.cursor();
         assert!(
-            state.comment_focused,
-            "comment_focused should be true after Click with Shift"
+            cursor.selection.is_some(),
+            "SelectTo should create a selection; got selection={:?}",
+            cursor.selection
         );
     }
 
-    // ── CommentInputChanged: without Shift, Click stays Click ─────
+    // ── CommentInputChanged: plain cursor move keeps content ──────
 
     #[test]
-    fn test_comment_click_without_shift_stays_click() {
+    fn test_comment_move_to_keeps_content() {
         let mut state = make_board_state();
-        state.comment_input = text_editor::Content::with_text("hello world");
-        // No modifier — Click should remain as Click
-        state.modifiers = keyboard::Modifiers::empty();
+        state.comment_input =
+            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
 
-        let _ = state.update(BoardMessage::CommentInputChanged(
-            text_editor::Action::Click(Point { x: 0.0, y: 0.0 }),
-        ));
+        let _ = state.update(BoardMessage::CommentInputChanged(EditorAction::MoveTo {
+            line: 0,
+            col: 3,
+        }));
         // No crash — content unchanged.
         assert_eq!(state.comment_input.text(), "hello world");
-    }
-
-    // ── CommentModifiersChanged: updates state ────────────────────
-
-    #[test]
-    fn test_comment_modifiers_changed_updates_state() {
-        let mut state = make_board_state();
-        assert_eq!(state.modifiers, keyboard::Modifiers::empty());
-
-        let _ = state.update(BoardMessage::CommentModifiersChanged(
-            keyboard::Modifiers::SHIFT,
-        ));
-        assert_eq!(state.modifiers, keyboard::Modifiers::SHIFT);
-
-        let _ = state.update(BoardMessage::CommentModifiersChanged(
-            keyboard::Modifiers::CTRL,
-        ));
-        assert_eq!(state.modifiers, keyboard::Modifiers::CTRL);
     }
 
     // ── OpenModal bumps generation ────────────────────────────────
@@ -2240,7 +2209,8 @@ mod tests {
     #[test]
     fn test_ticket_details_clears_comment_input() {
         let mut state = make_board_state();
-        state.comment_input = text_editor::Content::with_text("draft comment");
+        state.comment_input =
+            EditorBuffer::with_text("draft comment", Some(HighlightLanguage::Markdown));
         state.sending_comment = true;
         state.comment_focused = true;
 
@@ -2330,7 +2300,8 @@ mod tests {
     #[test]
     fn test_ticket_details_refreshed_updates_and_preserves_draft() {
         let mut state = make_board_state(); // selected_ticket: T-1, Backlog
-        state.comment_input = text_editor::Content::with_text("draft comment");
+        state.comment_input =
+            EditorBuffer::with_text("draft comment", Some(HighlightLanguage::Markdown));
         let gen_before = state.comment_generation;
 
         // The periodic refresh delivers the same ticket with a new phase
@@ -2862,22 +2833,20 @@ mod tests {
         let mut state = make_board_state();
         // Simulate typing "abc" by performing edit actions.
         for ch in &['a', 'b', 'c'] {
-            let _task = state.update(BoardMessage::CommentInputChanged(
-                text_editor::Action::Edit(text_editor::Edit::Insert(*ch)),
-            ));
+            let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Insert(*ch)));
         }
         let text_before = state.comment_input.text();
         assert_eq!(text_before, "abc", "input should have typed text");
 
         // Undo restores previous state.
-        let _task = state.update(BoardMessage::Undo);
+        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Undo));
         let text_after_undo = state.comment_input.text();
         assert_ne!(
             text_before, text_after_undo,
             "undo should change the content"
         );
         // Redo restores the undone state.
-        let _task = state.update(BoardMessage::Redo);
+        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Redo));
         assert_eq!(
             state.comment_input.text(),
             text_before,
@@ -2889,7 +2858,7 @@ mod tests {
     fn test_comment_redo_no_undo_is_noop() {
         let mut state = make_board_state();
         let text = state.comment_input.text();
-        let _task = state.update(BoardMessage::Redo);
+        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Redo));
         assert_eq!(
             state.comment_input.text(),
             text,
@@ -2901,20 +2870,14 @@ mod tests {
     fn test_comment_undo_cleared_on_reset_modal() {
         let mut state = make_board_state();
         // Build some history
-        let _task = state.update(BoardMessage::CommentInputChanged(
-            text_editor::Action::Edit(text_editor::Edit::Insert('h')),
-        ));
+        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Insert('h')));
         // Simulate more typing to build real undo history
-        let _task = state.update(BoardMessage::CommentInputChanged(
-            text_editor::Action::Edit(text_editor::Edit::Insert('e')),
-        ));
-        let _task = state.update(BoardMessage::CommentInputChanged(
-            text_editor::Action::Edit(text_editor::Edit::Insert('l')),
-        ));
+        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Insert('e')));
+        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Insert('l')));
         state.reset_modal();
         // After reset, undo should be a no-op.
         let text = state.comment_input.text();
-        let _task = state.update(BoardMessage::Undo);
+        let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Undo));
         assert_eq!(
             state.comment_input.text(),
             text,
@@ -2949,7 +2912,6 @@ mod tests {
     #[test]
     fn test_search_empty_input_clears_results() {
         let mut state = make_board_state();
-        state.search_query = "old".into();
         state.search_results = vec![Ticket {
             id: "T-1".into(),
             title: "Old result".into(),
@@ -2975,9 +2937,11 @@ mod tests {
         }];
         state.search_generation = 5;
 
-        let _task = state.update(BoardMessage::SearchInputChanged(String::new()));
+        let _task = state.update(BoardMessage::SearchInputChanged(EditorAction::Paste(
+            String::new(),
+        )));
 
-        assert!(state.search_query.is_empty());
+        assert!(state.search_query.text().is_empty());
         assert!(state.search_results.is_empty());
         // Generation bumped even on empty — invalidates any in-flight tasks
         assert_eq!(state.search_generation, 6);
@@ -2988,9 +2952,11 @@ mod tests {
         let mut state = make_board_state();
         state.search_generation = 3;
 
-        let _task = state.update(BoardMessage::SearchInputChanged("network".into()));
+        let _task = state.update(BoardMessage::SearchInputChanged(EditorAction::Paste(
+            "network".into(),
+        )));
 
-        assert_eq!(state.search_query, "network");
+        assert_eq!(state.search_query.text(), "network");
         // Generation bumped so stale callbacks are discarded
         assert!(
             state.search_generation > 3,
@@ -3040,7 +3006,7 @@ mod tests {
     #[test]
     fn test_search_results_current_generation_accepted() {
         let mut state = make_board_state();
-        state.search_query = "network".into();
+        state.search_query.set_text("network");
         state.search_generation = 42;
 
         let _task = state.update(BoardMessage::SearchResults(
@@ -3077,7 +3043,7 @@ mod tests {
     #[test]
     fn test_search_cleared_resets_query_and_results() {
         let mut state = make_board_state();
-        state.search_query = "something".into();
+        state.search_query.set_text("something");
         state.search_results = vec![Ticket {
             id: "T-1".into(),
             title: "Result".into(),
@@ -3105,7 +3071,7 @@ mod tests {
 
         let _task = state.update(BoardMessage::SearchCleared);
 
-        assert!(state.search_query.is_empty());
+        assert!(state.search_query.text().is_empty());
         assert!(state.search_results.is_empty());
         assert_eq!(state.search_generation, 8);
     }

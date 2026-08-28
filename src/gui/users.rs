@@ -9,6 +9,9 @@ use strum::IntoEnumIterator;
 
 use iced::Task;
 
+use super::common::SingleLineEditorState;
+use super::editor_widget::EditorAction;
+
 /// De-duplicated access to the global user store.
 pub(crate) fn user_store() -> Result<&'static UserStore, String> {
     crate::users::USER_STORE
@@ -58,7 +61,7 @@ pub enum UsersMessage {
     /// Close the inline binding input.
     CloseBindInput,
     /// Inline binding text input changed.
-    BindInputChanged(String),
+    BindInputChanged(EditorAction),
     /// Confirm binding the entered Telegram username to the target user.
     SubmitBind(String),
     /// Unbind a Telegram channel from a user.
@@ -100,7 +103,7 @@ pub struct UsersState {
 
     // Telegram binding inline input (single-target, like delete_target)
     pub(crate) bind_target: Option<String>,
-    pub(crate) bind_input: String,
+    pub(crate) bind_input: SingleLineEditorState,
     pub(crate) bind_error: Option<String>,
     pub(crate) binding: bool,
 
@@ -121,7 +124,7 @@ impl UsersState {
             delete_target: None,
             deleting: false,
             bind_target: None,
-            bind_input: String::new(),
+            bind_input: SingleLineEditorState::new(""),
             bind_error: None,
             binding: false,
             pool_edit_target: None,
@@ -273,20 +276,23 @@ impl UsersState {
                 self.bind_error = None;
                 Task::none()
             }
-            UsersMessage::BindInputChanged(v) => {
-                self.bind_input = v;
+            UsersMessage::BindInputChanged(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.bind_input.apply_action(action);
                 self.bind_error = None;
                 Task::none()
             }
             UsersMessage::SubmitBind(user_name) => {
-                if self.bind_input.trim().is_empty() {
+                if self.bind_input.text().trim().is_empty() {
                     self.bind_error = Some("Telegram username required".into());
                     return Task::none();
                 }
                 self.binding = true;
                 self.bind_error = None;
                 // Strip leading @ if the admin typed it.
-                let mut identifier = self.bind_input.trim().to_string();
+                let mut identifier = self.bind_input.text().trim().to_string();
                 if let Some(stripped) = identifier.strip_prefix('@') {
                     identifier = stripped.to_string();
                 }

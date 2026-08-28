@@ -490,7 +490,7 @@ where
         let viewport_bottom = visible.y + visible.height;
 
         // ── 0. Fill background ──
-        draw_background(renderer, bounds);
+        draw_background(renderer, bounds, theme::BG_BASE);
 
         let text_rect = text_area_rect(bounds, self.padding, gutter_width);
         let text_x = text_rect.x;

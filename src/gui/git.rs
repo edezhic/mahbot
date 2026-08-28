@@ -12,7 +12,7 @@ use super::theme;
 
 use crate::git::commands::DiffStats;
 
-use iced::widget::{Column, Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Column, Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Task};
 
 use fff_search::{Error as FffError, WatchId, WatchOptions};
@@ -57,7 +57,6 @@ const WATCH_RETRY_WINDOW: Duration = Duration::from_secs(30);
 /// All git-related fields are encapsulated here. The Dashboard accesses
 /// state via query methods (`current_branch()`, `is_modal_open()`, etc.)
 /// and drives updates via [`GitMessage`].
-#[derive(Debug)]
 pub struct GitState {
     // ── Cached git info ──────────────────────────────────────────
     /// Filesystem path for the currently selected workspace.
@@ -73,7 +72,7 @@ pub struct GitState {
     /// Whether the branch management modal is open.
     show_branch_modal: bool,
     /// Branch search query text.
-    branch_search_query: String,
+    branch_search_query: super::common::SingleLineEditorState,
     /// Cached list of local branches.
     local_branches: Vec<String>,
     /// Whether a git sync/switch/create operation is in-flight.
@@ -81,7 +80,7 @@ pub struct GitState {
     /// Error message from branch switch/create failure.
     branch_error: Option<String>,
     /// Current value of the "new branch name" text input.
-    new_branch_name: String,
+    new_branch_name: super::common::SingleLineEditorState,
 
     // ── Refresh state ───────────────────────────────────────────
     /// Workspace name for the currently selected workspace, used to resolve the
@@ -164,7 +163,7 @@ pub enum GitMessage {
 
     // ── Branch search ──────────────────────────────────────────
     /// Branch search query changed.
-    BranchQueryChanged(String),
+    BranchQueryChanged(super::editor_widget::EditorAction),
 
     // ── Sync ────────────────────────────────────────────────────
     /// Trigger a git sync (pull --ff-only + push).
@@ -184,7 +183,7 @@ pub enum GitMessage {
     /// Result of creating a new branch.
     CreateBranchResult(Result<(), String>),
     /// The new-branch name input changed.
-    NewBranchNameChanged(String),
+    NewBranchNameChanged(super::editor_widget::EditorAction),
 
     // ── Cross-state communication ───────────────────────────────
     /// Toast notification for Dashboard interception.
@@ -201,11 +200,11 @@ impl GitState {
             current_branch: None,
             behind_ahead: None,
             show_branch_modal: false,
-            branch_search_query: String::new(),
+            branch_search_query: super::common::SingleLineEditorState::new(""),
             local_branches: Vec::new(),
             syncing: false,
             branch_error: None,
-            new_branch_name: String::new(),
+            new_branch_name: super::common::SingleLineEditorState::new(""),
             workspace_name: None,
             local_generation: 0,
             remote_generation: 0,
@@ -415,8 +414,11 @@ impl GitState {
             }
 
             // ── Branch search ──────────────────────────────────
-            GitMessage::BranchQueryChanged(query) => {
-                self.branch_search_query = query;
+            GitMessage::BranchQueryChanged(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.branch_search_query.apply_action(action);
                 Task::none()
             }
 
@@ -488,7 +490,7 @@ impl GitState {
                 if self.syncing {
                     return Task::none();
                 }
-                let branch = self.new_branch_name.clone();
+                let branch = self.new_branch_name.text();
                 if branch.trim().is_empty() {
                     self.branch_error = Some("Branch name cannot be empty".to_string());
                     return Task::none();
@@ -512,8 +514,11 @@ impl GitState {
             GitMessage::CreateBranchResult(result) => {
                 self.finish_branch_op(result, "Created and switched to new branch")
             }
-            GitMessage::NewBranchNameChanged(name) => {
-                self.new_branch_name = name;
+            GitMessage::NewBranchNameChanged(action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
+                self.new_branch_name.apply_action(action);
                 Task::none()
             }
 
@@ -621,16 +626,20 @@ impl GitState {
     /// done by the Dashboard so the close message is consistent with the
     /// rest of the overlay stack.
     pub fn view(&self) -> Element<'_, GitMessage> {
-        let search_input = text_input("Search branches…", &self.branch_search_query)
-            .on_input(GitMessage::BranchQueryChanged)
-            .padding(8)
-            .size(14);
+        let search_input = super::widgets::single_line_editor(
+            &self.branch_search_query.buffer,
+            "Search branches…",
+            false,
+            Length::Fill,
+            Some(iced::widget::Id::new("git_branch_search")),
+            GitMessage::BranchQueryChanged,
+        );
 
         // Filter branches by search query
-        let filtered: Vec<&String> = if self.branch_search_query.is_empty() {
+        let filtered: Vec<&String> = if self.branch_search_query.text().is_empty() {
             self.local_branches.iter().collect()
         } else {
-            let q = self.branch_search_query.to_lowercase();
+            let q = self.branch_search_query.text().to_lowercase();
             self.local_branches
                 .iter()
                 .filter(|b| b.to_lowercase().contains(&q))
@@ -666,11 +675,17 @@ impl GitState {
         };
 
         // Create new branch input + button
-        let create_input = text_input("New branch name…", &self.new_branch_name)
-            .on_input(GitMessage::NewBranchNameChanged)
-            .on_submit(GitMessage::Create)
-            .padding(8)
-            .size(14);
+        let create_input = super::widgets::single_line_editor(
+            &self.new_branch_name.buffer,
+            "New branch name…",
+            true,
+            Length::Fill,
+            Some(iced::widget::Id::new("git_new_branch")),
+            |action| match action {
+                super::editor_widget::EditorAction::Submit => GitMessage::Create,
+                other => GitMessage::NewBranchNameChanged(other),
+            },
+        );
 
         let create_btn = button(text("Create & Switch").size(14).color(theme::TEXT_PRIMARY))
             .padding([6, 12])

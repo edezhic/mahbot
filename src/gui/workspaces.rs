@@ -4,9 +4,12 @@ use crate::Workspace;
 use crate::workspace::truncate_workspace_notes;
 
 use iced::Task;
-use iced::widget::{markdown, text_editor};
+use iced::widget::markdown;
 
 use std::collections::{HashMap, HashSet};
+
+use super::common::SingleLineEditorState;
+use super::editor_widget::EditorAction;
 
 /// Format the time until the next maintainer run, if applicable.
 ///
@@ -79,7 +82,7 @@ pub enum WorkspacesMessage {
 
     /// A diagnostics command field was edited: (workspace_name, field_index, new_value).
     /// Field index corresponds to the order in [`crate::DiagnosticsCommands::commands`].
-    DiagnosticsFieldEdited(String, usize, String),
+    DiagnosticsFieldEdited(String, usize, EditorAction),
     /// Save diagnostics commands for a workspace.
     SaveDiagnostics(String),
     /// Async result of saving diagnostics.
@@ -99,7 +102,7 @@ pub enum WorkspacesMessage {
     /// Toggle the notes editor for a workspace.
     ToggleNotes(String),
     /// Notes editor content changed.
-    NotesEdited(String, text_editor::Action),
+    NotesEdited(String, super::editor_widget::EditorAction),
     /// Save notes to DB.
     SaveNotes(String),
     /// Async result of saving notes.
@@ -134,7 +137,7 @@ pub struct WorkspacesState {
     /// Keyed by workspace name. Each entry is a 7-element array corresponding
     /// to the order in [`crate::DiagnosticsCommands::commands`].
     pub(crate) diagnostics_edit_buffers:
-        HashMap<String, [String; crate::DiagnosticsCommands::COMMAND_COUNT]>,
+        HashMap<String, [SingleLineEditorState; crate::DiagnosticsCommands::COMMAND_COUNT]>,
     /// Whether a diagnostics save or rediscover operation is in progress.
     pub(crate) diagnostics_busy: bool,
     /// Last save error for diagnostics (resets on modal open).
@@ -142,7 +145,11 @@ pub struct WorkspacesState {
 
     // ── User notes editor ────────────────────────────────────────
     /// Open notes editors per workspace (keyed by workspace name).
-    pub(crate) notes_editor_content: HashMap<String, text_editor::Content>,
+    pub(crate) notes_editor_content: HashMap<String, super::editor_widget::EditorBuffer>,
+    /// Per-workspace undo stacks for the notes editors, kept in lockstep with
+    /// [`notes_editor_content`](Self::notes_editor_content). Each open editors
+    /// owns its own undo/redo, matching the per-field undo requirement.
+    pub(crate) notes_undo: HashMap<String, super::common::UndoStack>,
     /// Which workspaces have their notes editor expanded.
     pub(crate) notes_open: HashSet<String>,
 }
@@ -162,6 +169,7 @@ impl WorkspacesState {
             diagnostics_busy: false,
             diagnostics_error: None,
             notes_editor_content: HashMap::new(),
+            notes_undo: HashMap::new(),
             notes_open: HashSet::new(),
         }
     }
@@ -343,25 +351,26 @@ impl WorkspacesState {
                     .and_then(|w| w.diagnostics.as_deref())
                     .and_then(|json| serde_json::from_str::<crate::DiagnosticsCommands>(json).ok())
                     .map_or(
-                        [const { String::new() }; crate::DiagnosticsCommands::COMMAND_COUNT],
+                        std::array::from_fn(|_| SingleLineEditorState::new("")),
                         |cmds| {
-                            let mut arr = [const { String::new() };
-                                crate::DiagnosticsCommands::COMMAND_COUNT];
-                            for (i, (_, cmd_opt)) in cmds.commands().iter().enumerate() {
-                                if let Some(cmd) = cmd_opt {
-                                    arr[i] = cmd.to_string();
-                                }
-                            }
-                            arr
+                            std::array::from_fn(|i| {
+                                cmds.commands()[i].1.map_or_else(
+                                    || SingleLineEditorState::new(""),
+                                    SingleLineEditorState::new,
+                                )
+                            })
                         },
                     );
                 self.diagnostics_edit_buffers.insert(name, fields);
                 Task::none()
             }
-            WorkspacesMessage::DiagnosticsFieldEdited(name, idx, value) => {
+            WorkspacesMessage::DiagnosticsFieldEdited(name, idx, action) => {
+                if let Some(task) = super::common::focus_navigation_task(&action) {
+                    return task;
+                }
                 if let Some(buffers) = self.diagnostics_edit_buffers.get_mut(&name) {
                     if idx < crate::DiagnosticsCommands::COMMAND_COUNT {
-                        buffers[idx] = value;
+                        buffers[idx].apply_action(action);
                     }
                 }
                 Task::none()
@@ -372,9 +381,13 @@ impl WorkspacesState {
 
                 // Build DiagnosticsCommands from edit buffers using the
                 // canonical from_buffers method.
-                let buffers = self.diagnostics_edit_buffers.get(&name).cloned().unwrap_or(
-                    [const { String::new() }; crate::DiagnosticsCommands::COMMAND_COUNT],
-                );
+                let buffers: [String; crate::DiagnosticsCommands::COMMAND_COUNT] = match self
+                    .diagnostics_edit_buffers
+                    .get(&name)
+                {
+                    Some(buffers) => std::array::from_fn(|i| buffers[i].text()),
+                    None => [const { String::new() }; crate::DiagnosticsCommands::COMMAND_COUNT],
+                };
 
                 let cmds = crate::DiagnosticsCommands::from_buffers(&buffers);
 
@@ -433,6 +446,7 @@ impl WorkspacesState {
                     // Close: discard editor state
                     self.notes_open.remove(&name);
                     self.notes_editor_content.remove(&name);
+                    self.notes_undo.remove(&name);
                 } else {
                     // Open: initialize editor from current workspace's notes
                     let notes = self
@@ -441,8 +455,15 @@ impl WorkspacesState {
                         .find(|w| w.name == name)
                         .map_or("", |w| w.notes.as_str());
                     self.notes_open.insert(name.clone());
-                    self.notes_editor_content
-                        .insert(name, text_editor::Content::with_text(notes));
+                    self.notes_editor_content.insert(
+                        name.clone(),
+                        super::editor_widget::EditorBuffer::with_text(
+                            notes,
+                            Some(super::highlight::HighlightLanguage::Markdown),
+                        ),
+                    );
+                    self.notes_undo
+                        .insert(name, super::common::UndoStack::new());
                 }
                 Task::none()
             }
@@ -452,18 +473,33 @@ impl WorkspacesState {
                     .notes_editor_content
                     .entry(name_for_entry)
                     .or_insert_with(|| {
-                        self.workspaces
-                            .iter()
-                            .find(|w| w.name == name)
-                            .map(|w| text_editor::Content::with_text(&w.notes))
-                            .unwrap_or_default()
+                        self.workspaces.iter().find(|w| w.name == name).map_or_else(
+                            || {
+                                super::editor_widget::EditorBuffer::with_text(
+                                    "",
+                                    Some(super::highlight::HighlightLanguage::Markdown),
+                                )
+                            },
+                            |w| {
+                                super::editor_widget::EditorBuffer::with_text(
+                                    &w.notes,
+                                    Some(super::highlight::HighlightLanguage::Markdown),
+                                )
+                            },
+                        )
                     });
-                content.perform(action);
+                // Route through the shared undo-aware path so Cmd+Z / Cmd+Shift+Z
+                // undo/redo in the notes editor instead of being a no-op.
+                let undo = self
+                    .notes_undo
+                    .entry(name.clone())
+                    .or_insert_with(super::common::UndoStack::new);
+                super::common::apply_editor_action(content, undo, action);
                 // Enforce cap at the UI level
                 let current = content.text().clone();
                 let truncated = truncate_workspace_notes(&current);
                 if truncated.len() < current.len() {
-                    *content = text_editor::Content::with_text(&truncated);
+                    content.set_text(&truncated);
                 }
                 Task::none()
             }
@@ -487,6 +523,7 @@ impl WorkspacesState {
             WorkspacesMessage::NotesSaved(name, Ok(())) => {
                 self.notes_open.remove(&name);
                 self.notes_editor_content.remove(&name);
+                self.notes_undo.remove(&name);
                 self.refresh()
             }
             WorkspacesMessage::NotesSaved(_name, Err(e)) => {
@@ -497,6 +534,7 @@ impl WorkspacesState {
             WorkspacesMessage::NotesCancel(name) => {
                 self.notes_open.remove(&name);
                 self.notes_editor_content.remove(&name);
+                self.notes_undo.remove(&name);
                 Task::none()
             }
 
@@ -510,6 +548,7 @@ impl WorkspacesState {
                 self.diagnostics_error = None;
                 self.notes_open.clear();
                 self.notes_editor_content.clear();
+                self.notes_undo.clear();
                 Task::none()
             }
             WorkspacesMessage::Toast(_) => Task::none(),

@@ -1,13 +1,14 @@
 //! A [`cosmic_text::Buffer`]-backed text buffer with cursor and selection
 //! management. Serves as the core text editing buffer for the editor.rs codebase.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 
 use cosmic_text::Scroll;
+use iced::Color;
 use iced::advanced::graphics::text::cosmic_text;
 use iced::advanced::input_method;
 use iced::mouse::ScrollDelta;
-use iced::widget::text_editor;
 
 use super::highlight::{self, FileHighlights, HighlightLanguage};
 use super::text_rendering::{
@@ -69,6 +70,17 @@ pub enum CursorMove {
     PageDown,
 }
 
+// ── EnterBehavior ───────────────────────────────────────────────────
+
+/// How a bare Enter key behaves in the widget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnterBehavior {
+    /// Enter submits the field (does not insert a newline).
+    Submit,
+    /// Enter inserts a newline.
+    Newline,
+}
+
 // ── EditorAction ────────────────────────────────────────────────────
 
 /// An action to perform on an [`EditorBuffer`].
@@ -78,6 +90,8 @@ pub enum EditorAction {
     Insert(char),
     /// Insert a newline at the cursor.
     Enter,
+    /// Submit the field (bare Enter in submit mode). Not an edit action.
+    Submit,
     /// Delete the character behind the cursor.
     Backspace,
     /// Delete the character in front of the cursor.
@@ -135,6 +149,20 @@ pub enum EditorAction {
     MoveLineUp,
     /// Move the current line (or selected lines) down by one.
     MoveLineDown,
+    /// Undo the last edit. Not an edit action and not a cursor movement —
+    /// handled by the parent's undo stack.
+    Undo,
+    /// Redo a previously undone edit. Not an edit action and not a cursor
+    /// movement — handled by the parent's undo stack.
+    Redo,
+    /// Move keyboard focus to the next focusable widget (single-line Tab).
+    /// Not an edit action, not a cursor movement, and not a text change —
+    /// the page maps it to `iced::widget::operation::focus_next()`.
+    FocusNext,
+    /// Move keyboard focus to the previous focusable widget (single-line
+    /// Shift+Tab). Not an edit action, not a cursor movement, and not a text
+    /// change — the page maps it to `iced::widget::operation::focus_previous()`.
+    FocusPrevious,
 }
 
 impl EditorAction {
@@ -158,6 +186,16 @@ impl EditorAction {
                 | Self::MoveLineUp
                 | Self::MoveLineDown
         )
+    }
+
+    /// Returns `true` if this action changes the buffer's text content.
+    ///
+    /// Equivalent to [`is_edit_action`](Self::is_edit_action) but also treats
+    /// undo/redo as content changes (they restore prior text), so callers that
+    /// re-run debounced searches/recomputes on text change must include them.
+    #[must_use]
+    pub const fn changes_text(&self) -> bool {
+        self.is_edit_action() || matches!(self, Self::Undo | Self::Redo)
     }
 
     /// Returns `true` if this action moves the cursor (including extending selection).
@@ -195,6 +233,27 @@ pub struct EditorBuffer {
     /// `"yml"`, `"dockerfile"`) when `language` is `None` or has no line
     /// comment syntax.
     file_extension: RefCell<Option<String>>,
+    /// When `true`, the buffer is a single-line field: `\n`/`\r` are never
+    /// inserted and Enter becomes a submit/no-op.
+    single_line: Cell<bool>,
+}
+
+/// Strip `\n`/`\r` from `text` for single-line mode (returns the input
+/// unchanged when no newline characters are present).
+fn sanitize_single_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\n') || text.contains('\r') {
+        std::borrow::Cow::Owned(text.chars().filter(|c| !matches!(c, '\n' | '\r')).collect())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// Replace every non-newline character with `•`, preserving the character
+/// count and line structure so masked glyphs align 1:1 with the real buffer.
+fn mask_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if matches!(c, '\n' | '\r') { c } else { '•' })
+        .collect()
 }
 
 impl EditorBuffer {
@@ -219,6 +278,7 @@ impl EditorBuffer {
             has_selection: Cell::new(false),
             language,
             file_extension: RefCell::new(None),
+            single_line: Cell::new(false),
         }
     }
 
@@ -229,6 +289,8 @@ impl EditorBuffer {
         let language = path_ref.to_str().and_then(HighlightLanguage::from_path);
         let content = Self::with_text(text, language);
         content.set_file_extension(path_ref.extension().and_then(|e| e.to_str()));
+        // File-backed editors are always multi-line.
+        content.set_single_line(false);
         content
     }
 
@@ -248,6 +310,58 @@ impl EditorBuffer {
     /// Return the full text content.
     pub fn text(&self) -> String {
         buffer_text(&self.buffer.borrow())
+    }
+
+    /// Replace all text, re-highlight with the stored `language`, and reset
+    /// the cursor to `(0, 0)` with no selection.
+    pub fn set_text(&self, text: &str) {
+        let text = if self.single_line.get() {
+            sanitize_single_line(text).to_string()
+        } else {
+            text.to_string()
+        };
+        let language = self.language;
+        with_font_system(|font_sys| {
+            let mut buffer = self.buffer.borrow_mut();
+            Self::set_buffer_text_highlighted(&mut buffer, font_sys, &text, language);
+        });
+        self.cursor_line.set(0);
+        self.cursor_col.set(0);
+        self.sel_line.set(0);
+        self.sel_col.set(0);
+        self.has_selection.set(false);
+    }
+
+    /// Clear all text (equivalent to [`set_text`](Self::set_text) with `""`).
+    pub fn clear(&self) {
+        self.set_text("");
+    }
+
+    /// Returns `true` when every line in the buffer is empty (blank content).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer
+            .borrow()
+            .lines
+            .iter()
+            .all(|line| line.text().is_empty())
+    }
+
+    /// Toggle single-line mode. When enabled the buffer never contains
+    /// `\n`/`\r`: any already-present newlines are stripped and later
+    /// insertions (paste, Enter) are filtered. Disabling it is a no-op and
+    /// leaves existing text unchanged.
+    pub fn set_single_line(&self, single_line: bool) {
+        if self.single_line.get() == single_line {
+            return;
+        }
+        self.single_line.set(single_line);
+        if single_line {
+            let text = self.text();
+            if text.contains('\n') || text.contains('\r') {
+                self.set_text(&text);
+            }
+        }
     }
 
     /// Return the number of lines in the buffer.
@@ -346,6 +460,17 @@ impl EditorBuffer {
         match action {
             EditorAction::Insert(c) => self.do_insert(c),
             EditorAction::Enter => self.do_enter(),
+            EditorAction::Submit
+            | EditorAction::Undo
+            | EditorAction::Redo
+            | EditorAction::FocusNext
+            | EditorAction::FocusPrevious => {
+                // Submit is handled by the parent (send). Undo/Redo are
+                // handled at the undo-stack level in
+                // `common::apply_editor_action`; the buffer itself never
+                // restores them. FocusNext/FocusPrevious are focus-only and
+                // never touch the buffer.
+            }
             EditorAction::Backspace => self.do_backspace(),
             EditorAction::Delete => self.do_delete(),
             EditorAction::Paste(s) => self.do_paste(&s),
@@ -619,6 +744,10 @@ impl EditorBuffer {
 
     /// Insert a single character at cursor.
     fn do_insert(&self, c: char) {
+        // In single-line mode a newline/CR is discarded (Enter is a submit).
+        if self.single_line.get() && matches!(c, '\n' | '\r') {
+            return;
+        }
         // If there's a selection, replace it.
         let sel_range = self.delete_selection_get_range();
         self.edit_text(|text| {
@@ -640,8 +769,11 @@ impl EditorBuffer {
     }
 
     /// Insert a newline at cursor, preserving the leading whitespace of the
-    /// current line (auto-indent).
+    /// current line (auto-indent). No-op in single-line mode.
     fn do_enter(&self) {
+        if self.single_line.get() {
+            return;
+        }
         let sel_range = self.delete_selection_get_range();
 
         // Determine the "current line" after selection removal: if a selection
@@ -731,8 +863,12 @@ impl EditorBuffer {
 
     /// Paste a string at cursor.
     fn do_paste(&self, s: &str) {
+        let s = if self.single_line.get() {
+            sanitize_single_line(s).into_owned()
+        } else {
+            s.to_string()
+        };
         let sel_range = self.delete_selection_get_range();
-        let s = s.to_string();
         self.edit_text(move |text| {
             let mut new_text = text.to_string();
             let new_offset = if let Some((start, end)) = sel_range {
@@ -1360,16 +1496,16 @@ impl super::common::UndoableText for EditorBuffer {
         EditorBuffer::text(self)
     }
 
-    fn cursor(&self) -> text_editor::Cursor {
-        let c = EditorBuffer::cursor(self);
-        text_editor::Cursor {
-            position: text_editor::Position {
-                line: c.line,
-                column: c.column,
-            },
-            // Editor's undo stack never stored selections, so drop it.
-            selection: None,
-        }
+    fn cursor(&self) -> CursorState {
+        EditorBuffer::cursor(self)
+    }
+
+    fn set_text(&mut self, text: &str) {
+        EditorBuffer::set_text(self, text);
+    }
+
+    fn move_to(&mut self, line: usize, col: usize) {
+        EditorBuffer::move_to(self, line, col);
     }
 }
 
@@ -1901,10 +2037,15 @@ fn hit_test(
     cursor: mouse::Cursor,
     gutter_width: f32,
     padding: f32,
+    scroll_x: f32,
 ) -> Option<(usize, usize)> {
     let (buf_x, buf_y) = cursor_to_buffer_coords(layout, cursor, gutter_width, padding)?;
     let buf = buffer.borrow_buffer();
-    let hit = buf.hit(buf_x, buf_y)?;
+    // `buf_x` is viewport-relative, but cosmic_text glyph positions are
+    // stored in unscrolled buffer coordinates (horizontal scroll is applied
+    // by the renderer, not the buffer). Add `scroll_x` to map the click back
+    // to the buffer coordinate space. `scroll_x` is 0.0 for the code editor.
+    let hit = buf.hit(buf_x + scroll_x, buf_y)?;
     let line_text = buf.lines.get(hit.line).map_or("", |l| l.text());
     let col = byte_col_to_char_col_in_line(line_text, hit.index);
     Some((hit.line, col))
@@ -1960,6 +2101,10 @@ struct EditorWidgetState {
     scroll_y: f32,
     /// Maximum allowed vertical scroll offset.
     max_scroll_y: f32,
+    /// Current horizontal scroll offset in pixels (single-line mode only).
+    scroll_x: f32,
+    /// Maximum allowed horizontal scroll offset (single-line mode only).
+    max_scroll_x: f32,
     /// Cached gutter width in pixels (computed per frame in layout).
     gutter_width: f32,
     /// Whether the left mouse button is currently held (for drag-selection).
@@ -1982,6 +2127,9 @@ struct EditorWidgetState {
     /// Updated from `ModifiersChanged` events. Used to detect shift+click
     /// for extending the selection.
     modifiers: keyboard::Modifiers,
+    /// Whether this widget is currently focused (only meaningful when the
+    /// widget has a focus id). Set by Iced's focus operations.
+    is_focused: bool,
 }
 
 impl Default for EditorWidgetState {
@@ -1991,6 +2139,8 @@ impl Default for EditorWidgetState {
             last_blink: std::time::Instant::now(),
             scroll_y: 0.0,
             max_scroll_y: 0.0,
+            scroll_x: 0.0,
+            max_scroll_x: 0.0,
             gutter_width: 0.0,
             mouse_held: false,
             auto_scroll_enabled: true,
@@ -1998,8 +2148,23 @@ impl Default for EditorWidgetState {
             last_click_pos: None,
             ime_commit_suppress: None,
             last_buffer_key: None,
+            is_focused: false,
             modifiers: keyboard::Modifiers::empty(),
         }
+    }
+}
+
+impl iced::advanced::widget::operation::focusable::Focusable for EditorWidgetState {
+    fn is_focused(&self) -> bool {
+        self.is_focused
+    }
+
+    fn focus(&mut self) {
+        self.is_focused = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.is_focused = false;
     }
 }
 
@@ -2024,10 +2189,39 @@ pub struct EditorWidget<'a> {
     /// Identity of the active buffer (typically file path). When this
     /// changes, widget scroll and interaction state are reset.
     buffer_key: Option<&'a str>,
+    /// Render as a single-line field (bare Enter submits / is a no-op).
+    single_line: bool,
+    /// Mask the rendered glyphs with `•` (copy still returns plaintext).
+    masked: bool,
+    /// Render the line-number gutter.
+    show_gutter: bool,
+    /// Enable code-editor hotkeys (line comment, bracket jump, line ops, etc.).
+    code_mode: bool,
+    /// How a bare Enter key behaves.
+    enter: EnterBehavior,
+    /// Placeholder text drawn when the buffer is empty.
+    placeholder: Option<Cow<'a, str>>,
+    /// Minimum widget height for auto-sizing prose modes (`None` → the
+    /// widget fills its container as a code editor).
+    min_height: Option<f32>,
+    /// Maximum widget height for auto-sizing prose modes (`None` → the
+    /// widget fills its container as a code editor).
+    max_height: Option<f32>,
+    /// Fill the widget bounds with this color. `None` draws a transparent
+    /// background so the surrounding container's background/border shows.
+    background: Option<Color>,
+    /// Iced focus id. When set, the widget is click-to-focus focusable and
+    /// only processes keyboard/IME events while focused. In single-line mode
+    /// Tab emits [`EditorAction::FocusNext`]/[`FocusPrevious`] (the page maps
+    /// these to `operation::focus_next`/`focus_previous`); the code editor
+    /// keeps Tab→Indent itself. Unset for the full-page code editor, which
+    /// gates the keyboard through [`EditorWidget::ignore_keyboard`] instead
+    /// (the tree / modal / find-bar overlay toggles it).
+    focus_id: Option<iced::widget::Id>,
 }
 
 impl<'a> EditorWidget<'a> {
-    /// Create a new [`EditorWidget`].
+    /// Create a new [`EditorWidget`] in the default code-editor mode.
     pub const fn new(buffer: &'a EditorBuffer) -> Self {
         Self {
             buffer,
@@ -2037,7 +2231,36 @@ impl<'a> EditorWidget<'a> {
             match_current_idx: 0,
             bracket_pair: None,
             buffer_key: None,
+            single_line: false,
+            masked: false,
+            show_gutter: true,
+            code_mode: true,
+            enter: EnterBehavior::Newline,
+            placeholder: None,
+            min_height: None,
+            max_height: None,
+            background: Some(theme::BG_BASE),
+            focus_id: None,
         }
+    }
+
+    /// Set the field background color. `None` draws a transparent background
+    /// so the surrounding container's background/border shows through.
+    #[must_use]
+    pub const fn background(mut self, background: Option<Color>) -> Self {
+        self.background = background;
+        self
+    }
+
+    /// Give the widget an Iced focus id, making it click-to-focus focusable
+    /// and gating keyboard processing on focus. Multiple fields in one view
+    /// (e.g. the settings page) should each set a unique id. In single-line
+    /// mode Tab emits a focus action that the page maps to `focus_next` /
+    /// `focus_previous`; the code editor keeps Tab→Indent itself.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<iced::widget::Id>) -> Self {
+        self.focus_id = Some(id.into());
+        self
     }
 
     /// Set the padding.
@@ -2087,6 +2310,70 @@ impl<'a> EditorWidget<'a> {
         self.buffer_key = key;
         self
     }
+
+    /// Render as a single-line field (bare Enter submits / is a no-op).
+    #[must_use]
+    pub const fn single_line(mut self, single_line: bool) -> Self {
+        self.single_line = single_line;
+        self
+    }
+
+    /// Mask the rendered glyphs with `•` (copy still returns plaintext).
+    #[must_use]
+    pub const fn masked(mut self, masked: bool) -> Self {
+        self.masked = masked;
+        self
+    }
+
+    /// Render the line-number gutter.
+    #[must_use]
+    pub const fn show_gutter(mut self, show_gutter: bool) -> Self {
+        self.show_gutter = show_gutter;
+        self
+    }
+
+    /// Enable code-editor hotkeys (line comment, bracket jump, line ops, etc.).
+    #[must_use]
+    pub const fn code_mode(mut self, code_mode: bool) -> Self {
+        self.code_mode = code_mode;
+        self
+    }
+
+    /// Set how a bare Enter key behaves.
+    #[must_use]
+    pub const fn enter(mut self, enter: EnterBehavior) -> Self {
+        self.enter = enter;
+        self
+    }
+
+    /// Set the placeholder text drawn when the buffer is empty.
+    #[must_use]
+    pub fn placeholder(mut self, placeholder: impl Into<Cow<'a, str>>) -> Self {
+        self.placeholder = Some(placeholder.into());
+        self
+    }
+
+    /// Set the minimum widget height for auto-sizing prose modes.
+    ///
+    /// When set (along with [`max_height`](Self::max_height)), the widget
+    /// lays out at `(total_height + 2·padding).clamp(min, max)` instead of
+    /// filling its container, with internal scroll.
+    #[must_use]
+    pub const fn min_height(mut self, min_height: f32) -> Self {
+        self.min_height = Some(min_height);
+        self
+    }
+
+    /// Set the maximum widget height for auto-sizing prose modes.
+    ///
+    /// When set (along with [`min_height`](Self::min_height)), the widget
+    /// lays out at `(total_height + 2·padding).clamp(min, max)` instead of
+    /// filling its container, with internal scroll.
+    #[must_use]
+    pub const fn max_height(mut self, max_height: f32) -> Self {
+        self.max_height = Some(max_height);
+        self
+    }
 }
 
 impl<Theme, Renderer> Widget<EditorAction, Theme, Renderer> for EditorWidget<'_>
@@ -2105,14 +2392,28 @@ where
         widget::tree::Tag::of::<EditorWidgetState>()
     }
 
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        _renderer: &Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        if let Some(id) = &self.focus_id {
+            let state = tree.state.downcast_mut::<EditorWidgetState>();
+            operation.focusable(Some(id), layout.bounds(), state);
+        }
+    }
+
     #[expect(clippy::cast_precision_loss)]
+    #[expect(clippy::too_many_lines)]
     fn layout(
         &mut self,
         tree: &mut Tree,
         _renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let bounds = limits.max();
+        let mut bounds = limits.max();
 
         let state = tree.state.downcast_mut::<EditorWidgetState>();
 
@@ -2120,6 +2421,7 @@ where
         let current_key = self.buffer_key.map(str::to_string);
         if state.last_buffer_key != current_key {
             state.scroll_y = 0.0;
+            state.scroll_x = 0.0;
             state.auto_scroll_enabled = true;
             state.mouse_held = false;
             state.last_click_time = None;
@@ -2129,9 +2431,11 @@ where
 
         // ── Gutter width ───────────────────────────────────────────────
         let line_count = self.buffer.line_count();
-        let gutter_width = {
+        let gutter_width = if self.show_gutter {
             let digits = (line_count.max(1).ilog10() + 1).min(6) as f32;
             digits * 5.0 + 10.0
+        } else {
+            0.0
         };
         state.gutter_width = gutter_width;
 
@@ -2142,25 +2446,86 @@ where
             gutter_width,
         );
         let text_area_width = text_rect.width;
-        let text_area_height = text_rect.height;
+        let mut text_area_height = text_rect.height;
 
         // ── Shape the buffer with current scroll ───────────────────────
         let mut guard = graphics_text::font_system().write().unwrap_poison();
         let font_sys = guard.raw();
         let mut buffer = self.buffer.borrow_buffer_mut();
 
+        // Single-line fields must never wrap: a long value becomes a single
+        // overflowing run that is scrolled horizontally instead. This is a
+        // no-op when the wrap is already `None` (cheap per frame).
+        // For non-single-line (code editor / multi-line prose) restore the
+        // default wrap and clear any horizontal scroll so a buffer reused
+        // from a single-line frame cannot leak scrolling state in.
+        if self.single_line {
+            buffer.set_wrap(font_sys, cosmic_text::Wrap::None);
+        } else {
+            buffer.set_wrap(font_sys, cosmic_text::Wrap::WordOrGlyph);
+            state.scroll_x = 0.0;
+            state.max_scroll_x = 0.0;
+        }
+
         reshape_and_shape(
             &mut buffer,
             font_sys,
             Some(state.scroll_y),
+            state.scroll_x,
             text_area_width,
             text_area_height,
         );
 
+        let metrics = font_metrics();
+        // Count visual lines (including wrapped lines) using line_layout().
+        // Previously used source line count which prevented scrolling to the
+        // end of files with wrapped lines beyond the viewport.
+        // line_layout() returns cached data for already-shaped lines at
+        // near-zero cost. First frame after load/resize shapes all lines.
+        // Cap each source line at MAX_VISUAL_LINES_PER_SOURCE visual lines
+        // as a safety limit against pathological single lines (e.g.
+        // no-whitespace megabyte).
+        let total_height = compute_total_height(&mut buffer, font_sys, metrics);
+
+        // ── Auto-size: clamp height to [min, max] for prose modes ──────
+        // When min/max heights are configured, lay the widget out at
+        // `(total_height + 2·padding).clamp(min, max)` rather than filling
+        // its container. The bounds height is set BEFORE recomputing the
+        // text area so the internal scroll viewport matches the visible
+        // (clamped) area, avoiding a height-shake when the content grows.
+        if self.min_height.is_some() || self.max_height.is_some() {
+            let max_h = self
+                .max_height
+                .map_or(bounds.height, |h| h.min(bounds.height));
+            // Guard against min > max when the available container is tighter
+            // than min_height (clamp panics if min > max).
+            let min_h = self.min_height.unwrap_or(0.0).min(max_h);
+            let desired_h = (total_height + 2.0 * self.padding).clamp(min_h, max_h);
+            if (desired_h - bounds.height).abs() > f32::EPSILON {
+                bounds.height = desired_h;
+                // Recompute the text area for the new height and re-shape so
+                // the scroll range/auto-scroll use the visible area.
+                let text_rect = text_area_rect(
+                    Rectangle::new(Point::ORIGIN, bounds),
+                    self.padding,
+                    gutter_width,
+                );
+                text_area_height = text_rect.height;
+                reshape_and_shape(
+                    &mut buffer,
+                    font_sys,
+                    Some(state.scroll_y),
+                    state.scroll_x,
+                    text_area_width,
+                    text_area_height,
+                );
+            }
+        }
+
         // ── Auto-scroll: keep cursor in viewport ───────────────────────
         let cursor = self.buffer.cursor();
         let old_scroll_y = state.scroll_y;
-        let metrics = font_metrics();
+        let old_scroll_x = state.scroll_x;
         if state.auto_scroll_enabled {
             let mut cursor_in_view = false;
             if let Some(run) = find_cursor_run(buffer.layout_runs(), cursor.line, cursor.column) {
@@ -2188,32 +2553,98 @@ where
             }
         }
 
+        // ── Horizontal auto-scroll: keep cursor visible (single-line) ──
+        // Single-line fields never wrap, so long values overflow the text
+        // area horizontally. Track the widest shaped line and auto-scroll
+        // the horizontal viewport so the cursor stays in view. This block
+        // is a no-op for non-single-line buffers (`scroll_x` stays 0.0 and
+        // `max_scroll_x` remains 0.0), keeping the code-editor path intact.
+        if self.single_line {
+            let mut max_content_width: f32 = 0.0;
+            for i in 0..buffer.lines.len() {
+                if let Some(layout) = buffer.line_layout(font_sys, i) {
+                    for line in layout {
+                        if let Some(last) = line.glyphs.last() {
+                            max_content_width = max_content_width.max(last.x + last.w);
+                        }
+                    }
+                }
+            }
+            state.max_scroll_x = (max_content_width - text_area_width).max(0.0);
+
+            if state.auto_scroll_enabled {
+                if let Some(run) = find_cursor_run(buffer.layout_runs(), cursor.line, cursor.column)
+                {
+                    // Cursor x-offset within the (unscrolled) buffer line.
+                    let cursor_x = run
+                        .glyphs
+                        .iter()
+                        .find(|g| cursor.column < byte_col_to_char_col_in_line(run.text, g.end))
+                        .map_or_else(
+                            || run.glyphs.last().map_or(0.0, |last| last.x + last.w),
+                            |g| g.x,
+                        );
+                    // Cursor left of viewport → scroll so it is visible.
+                    if cursor_x < state.scroll_x {
+                        state.scroll_x = cursor_x;
+                    }
+                    // Cursor right of viewport → scroll so it is visible.
+                    let caret_w = 2.0;
+                    if cursor_x + caret_w > state.scroll_x + text_area_width {
+                        state.scroll_x = cursor_x + caret_w - text_area_width;
+                    }
+                }
+            }
+            state.scroll_x = state.scroll_x.clamp(0.0, state.max_scroll_x);
+        }
+
         // ── Compute max scroll range ───────────────────────────────────
-        // Count visual lines (including wrapped lines) using line_layout().
-        // Previously used source line count which prevented scrolling to the
-        // end of files with wrapped lines beyond the viewport.
-        // line_layout() returns cached data for already-shaped lines at
-        // near-zero cost. First frame after load/resize shapes all lines.
-        // Cap each source line at MAX_VISUAL_LINES_PER_SOURCE visual lines
-        // as a safety limit against pathological single lines (e.g.
-        // no-whitespace megabyte).
-        let total_height = compute_total_height(&mut buffer, font_sys, metrics);
+        // `total_height` (computed above) is unchanged by the auto-size
+        // clamp re-shape — wrapping depends only on the (fixed) text width.
         state.max_scroll_y = (total_height - text_area_height).max(0.0);
         state.scroll_y = state.scroll_y.clamp(0.0, state.max_scroll_y);
 
         // Re-apply scroll if auto-scroll changed it
-        if (state.scroll_y - old_scroll_y).abs() > f32::EPSILON {
+        if (state.scroll_y - old_scroll_y).abs() > f32::EPSILON
+            || (state.scroll_x - old_scroll_x).abs() > f32::EPSILON
+        {
             buffer.set_scroll(Scroll {
                 line: 0,
                 vertical: state.scroll_y,
-                horizontal: 0.0,
+                horizontal: state.scroll_x,
             });
             buffer.shape_until_scroll(font_sys, false);
         }
 
+        // Determine the buffer used for rendering. In masked mode we shape a
+        // separate buffer whose glyphs are all '•' (same char count and line
+        // structure), so the draw layer renders dots while cursor/selection
+        // coordinates still come from the real buffer.
+        let render_buffer = if self.masked {
+            let masked_text = mask_text(&self.buffer.text());
+            let mut mbuffer = cosmic_text::Buffer::new(font_sys, metrics);
+            EditorBuffer::set_buffer_text_highlighted(&mut mbuffer, font_sys, &masked_text, None);
+            // Single-line secret fields must not wrap either, so the masked
+            // dots stay aligned with the real (non-wrapping) buffer layout.
+            if self.single_line {
+                mbuffer.set_wrap(font_sys, cosmic_text::Wrap::None);
+            }
+            reshape_and_shape(
+                &mut mbuffer,
+                font_sys,
+                Some(state.scroll_y),
+                state.scroll_x,
+                text_area_width,
+                text_area_height,
+            );
+            mbuffer
+        } else {
+            buffer.clone()
+        };
+
         // Clone the shaped buffer into an Arc and store for fill_raw
         // This keeps the buffer alive across frames during rendering
-        let arc = Arc::new(buffer.clone());
+        let arc = Arc::new(render_buffer);
         state.buffer_for_render = Some(arc);
         drop(buffer);
         drop(guard);
@@ -2250,6 +2681,7 @@ where
                     &mut buffer,
                     font_sys,
                     None,
+                    state.scroll_x,
                     text_area_width,
                     text_area_height,
                 );
@@ -2259,20 +2691,28 @@ where
 
         let text_geo = TextGeometry {
             clip: text_rect,
-            x: text_x,
+            // In single-line mode the buffer is scrolled horizontally; shift
+            // the render origin left so the overflowing content scrolls
+            // within the (fixed) clip rectangle. `scroll_x` is 0.0 for the
+            // code editor and multi-line prose.
+            x: text_x - state.scroll_x,
             y: text_y,
         };
 
-        draw_background(renderer, bounds);
-        draw_line_numbers(
-            renderer,
-            &buffer_for_draw,
-            bounds,
-            self.padding,
-            text_y,
-            gutter_width,
-            text_area_height,
-        );
+        if let Some(background) = self.background {
+            draw_background(renderer, bounds, background);
+        }
+        if self.show_gutter {
+            draw_line_numbers(
+                renderer,
+                &buffer_for_draw,
+                bounds,
+                self.padding,
+                text_y,
+                gutter_width,
+                text_area_height,
+            );
+        }
         draw_find_match_highlights(
             renderer,
             &buffer_for_draw,
@@ -2288,6 +2728,11 @@ where
             Point::new(text_geo.x, text_geo.y),
             text_geo.clip,
         );
+        if let Some(ref placeholder) = self.placeholder {
+            if self.buffer.is_empty() {
+                draw_placeholder(renderer, placeholder.as_ref(), &text_geo);
+            }
+        }
         draw_cursor(renderer, &buffer_for_draw, &text_geo, state, self.buffer);
     }
 
@@ -2324,6 +2769,12 @@ where
 
             // ── Mouse button press: move cursor to click point ───────
             Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
+                // Focusable fields: a click inside this widget focuses it; a
+                // click elsewhere unfocuses it (each widget in the view does
+                // the same check against its own bounds).
+                if self.focus_id.is_some() {
+                    state.is_focused = cursor.position_in(layout.bounds()).is_some();
+                }
                 // Re-shape the buffer with the current scroll BEFORE hit-test.
                 // layout() runs after events, but WheelScrolled only calls
                 // invalidate_layout() — the buffer still has the pre-scroll
@@ -2337,12 +2788,14 @@ where
                     let text_area_height = text_rect.height;
 
                     let scroll_y = state.scroll_y;
+                    let scroll_x = state.scroll_x;
                     with_font_system(|font_sys| {
                         let mut buffer = self.buffer.borrow_buffer_mut();
                         reshape_and_shape(
                             &mut buffer,
                             font_sys,
                             Some(scroll_y),
+                            scroll_x,
                             text_area_width,
                             text_area_height,
                         );
@@ -2355,6 +2808,7 @@ where
                     cursor,
                     state.gutter_width,
                     self.padding,
+                    state.scroll_x,
                 ) {
                     state.mouse_held = true;
                     // Reset blink so cursor becomes visible immediately after click.
@@ -2500,6 +2954,7 @@ where
                     cursor,
                     state.gutter_width,
                     self.padding,
+                    state.scroll_x,
                 ) {
                     shell.publish(EditorAction::SelectTo { line, col });
                     // Keep the redraw cycle alive while dragging to select.
@@ -2527,6 +2982,12 @@ where
                     // keys (including arrows) so navigation does not move the
                     // code cursor while editing the search/replace fields.
                     // Tree panel and modal overlays block everything too.
+                    return;
+                }
+                // When a focus id is set, only process keys while focused so
+                // multiple fields in one view (e.g. the settings page) do not
+                // steal each other's keystrokes.
+                if self.focus_id.is_some() && !state.is_focused {
                     return;
                 }
                 // Any keyboard cursor movement re-enables auto-scroll
@@ -2588,12 +3049,14 @@ where
                         let text_area_height = text_rect.height;
 
                         let scroll_y = state.scroll_y;
+                        let scroll_x = state.scroll_x;
                         let result = with_font_system(|font_sys| {
                             let mut buffer = self.buffer.borrow_buffer_mut();
                             reshape_and_shape(
                                 &mut buffer,
                                 font_sys,
                                 Some(scroll_y),
+                                scroll_x,
                                 text_area_width,
                                 text_area_height,
                             );
@@ -2688,12 +3151,14 @@ where
                         let text_area_height = text_rect.height;
 
                         let scroll_y = state.scroll_y;
+                        let scroll_x = state.scroll_x;
                         let result = with_font_system(|font_sys| {
                             let mut buffer = self.buffer.borrow_buffer_mut();
                             reshape_and_shape(
                                 &mut buffer,
                                 font_sys,
                                 Some(scroll_y),
+                                scroll_x,
                                 text_area_width,
                                 text_area_height,
                             );
@@ -2814,8 +3279,15 @@ where
                     }
                 }
 
-                let action =
-                    map_key_to_action(key_press, *modifiers, *physical_key, text.is_some());
+                let action = map_key_to_action(
+                    key_press,
+                    *modifiers,
+                    *physical_key,
+                    text.is_some(),
+                    self.single_line,
+                    self.code_mode,
+                    self.enter,
+                );
                 if let Some(ref action) = action {
                     // Cursor-movement actions re-enable auto-scroll (catches emacs
                     // shortcuts that aren't Named keys).
@@ -2840,6 +3312,9 @@ where
                 if self.ignore_keyboard {
                     return;
                 }
+                if self.focus_id.is_some() && !state.is_focused {
+                    return;
+                }
                 match ime_event {
                     input_method::Event::Commit(committed) => {
                         if committed.is_empty() {
@@ -2862,6 +3337,14 @@ where
                     | input_method::Event::Opened
                     | input_method::Event::Closed => {}
                 }
+            }
+
+            // ── Window focus lost: reset modifier state ─────────────
+            // A stale shift/ctrl state must not persist when the OS window
+            // loses focus mid-click; clear it so the next click after
+            // refocusing starts from a clean modifier baseline.
+            Event::Window(window::Event::Unfocused) => {
+                state.modifiers = keyboard::Modifiers::empty();
             }
 
             // ── Redraw requested — schedule next blink toggle ─────
@@ -2979,6 +3462,31 @@ fn draw_line_numbers<Renderer>(
             number_clip,
         );
     }
+}
+
+/// Draw the placeholder text in the text area when the buffer is empty.
+fn draw_placeholder<Renderer>(renderer: &mut Renderer, text: &str, geo: &TextGeometry)
+where
+    Renderer: iced::advanced::text::Renderer,
+{
+    let metrics = font_metrics();
+    let placeholder_text = iced::advanced::text::Text {
+        content: text.to_string(),
+        bounds: Size::new(geo.clip.width, geo.clip.height),
+        size: iced::Pixels(metrics.font_size),
+        line_height: iced::advanced::text::LineHeight::Relative(1.3),
+        font: renderer.default_font(),
+        align_x: iced::alignment::Horizontal::Left.into(),
+        align_y: iced::alignment::Vertical::Center,
+        shaping: iced::advanced::text::Shaping::Advanced,
+        wrapping: iced::advanced::text::Wrapping::None,
+    };
+    renderer.fill_text(
+        placeholder_text,
+        Point::new(geo.x, geo.y + metrics.line_height / 2.0),
+        theme::TEXT_MUTED,
+        geo.clip,
+    );
 }
 
 /// Draw find match highlight backgrounds behind text.
@@ -3178,11 +3686,15 @@ const fn is_cursor_movement_key(key: &key::Key) -> bool {
 /// `text` field (dead key / IME / AltGr composition). Only used for
 /// distinguishing AltGr from shortcuts on non-macOS — character insertion
 /// itself is handled in `on_event`.
+#[expect(clippy::too_many_lines)]
 fn map_key_to_action(
     key: &key::Key,
     modifiers: keyboard::Modifiers,
     physical_key: key::Physical,
     _has_text: bool,
+    single_line: bool,
+    code_mode: bool,
+    enter: EnterBehavior,
 ) -> Option<EditorAction> {
     // On macOS, platform shortcuts use Cmd only, not Ctrl.
     // Ctrl is reserved for emacs-style shortcuts (Ctrl+F/B/A/E/etc.)
@@ -3237,8 +3749,12 @@ fn map_key_to_action(
                 (key::Named::ArrowRight, false, s, true) => mv(CursorMove::WordRight, s),
 
                 // Alt+Up/Down → move line up/down (no selection variant — always moves)
-                (key::Named::ArrowUp, false, false, true) => Some(EditorAction::MoveLineUp),
-                (key::Named::ArrowDown, false, false, true) => Some(EditorAction::MoveLineDown),
+                (key::Named::ArrowUp, false, false, true) if code_mode => {
+                    Some(EditorAction::MoveLineUp)
+                }
+                (key::Named::ArrowDown, false, false, true) if code_mode => {
+                    Some(EditorAction::MoveLineDown)
+                }
 
                 // Delete/Backspace
                 (key::Named::Backspace, false, false, false) => Some(EditorAction::Backspace),
@@ -3247,13 +3763,30 @@ fn map_key_to_action(
                 (key::Named::Backspace, true, false, false) => Some(EditorAction::DeleteWordBack),
                 (key::Named::Delete, true, false, false) => Some(EditorAction::DeleteWordForward),
 
-                // Enter / Shift+Enter → insert a newline. Shift+Enter mirrors
-                // the chat-composer/board-comment convention where Enter
-                // submits and Shift+Enter inserts a newline. The find/replace
+                // Enter / Shift+Enter behaviour depends on the widget mode:
+                // single-line fields submit (or no-op), multi-line fields either
+                // insert a newline or submit based on `enter`. Shift+Enter always
+                // inserts a newline in multi-line submit mode. The find/replace
                 // bar has its own Shift+Enter binding (FindPrev) handled at the
                 // subscription level in editor.rs; that path is unaffected.
                 // (Alt+Enter and platform-mod+Enter stay unbound below.)
-                (key::Named::Enter, false, _, false) => Some(EditorAction::Enter),
+                (key::Named::Enter, false, shift, false) => {
+                    if single_line {
+                        if shift {
+                            None
+                        } else if enter == EnterBehavior::Submit {
+                            Some(EditorAction::Submit)
+                        } else {
+                            None
+                        }
+                    } else {
+                        match enter {
+                            EnterBehavior::Submit if shift => Some(EditorAction::Enter),
+                            EnterBehavior::Submit => Some(EditorAction::Submit),
+                            EnterBehavior::Newline => Some(EditorAction::Enter),
+                        }
+                    }
+                }
 
                 // Space — defensive: some platforms may deliver space as Named
                 (key::Named::Space, false, false, false) => Some(EditorAction::Insert(' ')),
@@ -3262,11 +3795,29 @@ fn map_key_to_action(
                 // NOTE: On macOS, Ctrl+Tab and Ctrl+Shift+Tab should NOT trigger
                 // Indent/Unindent since the editor.rs subscription uses Ctrl+Tab
                 // for tab switching and Ctrl+Shift+Tab for reverse tab switching.
-                // The control() guard prevents that conflict.
-                (key::Named::Tab, false, false, false) if !modifiers.control() => {
+                // The control() guard prevents that conflict. The code editor owns
+                // Tab→Indent itself; single-line fields instead emit a focus-only
+                // action that the page maps to `operation::focus_next` /
+                // `focus_previous` (emitted only when the field is actually
+                // focused, courtesy of the on_event focus gate below).
+                (key::Named::Tab, false, false, false)
+                    if !modifiers.control() && single_line && !code_mode =>
+                {
+                    Some(EditorAction::FocusNext)
+                }
+                (key::Named::Tab, false, true, false)
+                    if !modifiers.control() && single_line && !code_mode =>
+                {
+                    Some(EditorAction::FocusPrevious)
+                }
+                (key::Named::Tab, false, false, false)
+                    if !modifiers.control() && !single_line && code_mode =>
+                {
                     Some(EditorAction::Indent)
                 }
-                (key::Named::Tab, false, true, false) if !modifiers.control() => {
+                (key::Named::Tab, false, true, false)
+                    if !modifiers.control() && !single_line && code_mode =>
+                {
                     Some(EditorAction::Unindent)
                 }
 
@@ -3279,11 +3830,11 @@ fn map_key_to_action(
             // keyboard layout (Cyrillic, Greek, etc.).
             let latin = key.to_latin(physical_key);
 
-            // Mac-specific emacs shortcuts (Ctrl, not Cmd)
+            // Mac-specific emacs shortcuts (Ctrl, not Cmd). Code-only.
             #[cfg(target_os = "macos")]
             {
                 let ctrl = modifiers.control();
-                if ctrl && !modifiers.command() {
+                if ctrl && !modifiers.command() && code_mode {
                     match latin {
                         Some('f') => return mv(CursorMove::Right, false),
                         Some('b') => return mv(CursorMove::Left, false),
@@ -3305,24 +3856,38 @@ fn map_key_to_action(
                 return Some(EditorAction::SelectAll);
             }
 
-            // Toggle line comment via platform mod + /
-            if !altgr_active && latin == Some('/') && platform_mod && !shift {
+            // Toggle line comment via platform mod + / (code-only)
+            if code_mode && !altgr_active && latin == Some('/') && platform_mod && !shift {
                 return Some(EditorAction::ToggleLineComment);
             }
 
-            // Jump to matching bracket via platform mod + Shift + \
-            if !altgr_active && latin == Some('\\') && platform_mod && shift {
+            // Jump to matching bracket via platform mod + Shift + \ (code-only)
+            if code_mode && !altgr_active && latin == Some('\\') && platform_mod && shift {
                 return Some(EditorAction::JumpToMatchingBracket);
             }
 
-            // Delete line via platform mod + Shift + K
-            if !altgr_active && latin == Some('k') && platform_mod && shift {
+            // Delete line via platform mod + Shift + K (code-only)
+            if code_mode && !altgr_active && latin == Some('k') && platform_mod && shift {
                 return Some(EditorAction::DeleteLine);
             }
 
-            // Duplicate line via platform mod + Shift + D
-            if !altgr_active && latin == Some('d') && platform_mod && shift {
+            // Duplicate line via platform mod + Shift + D (code-only)
+            if code_mode && !altgr_active && latin == Some('d') && platform_mod && shift {
                 return Some(EditorAction::DuplicateLine);
+            }
+
+            // Undo / Redo via platform mod + Z / Shift + Z. Non-code mode only:
+            // the code editor keeps its own subscription-driven undo. Gated on
+            // `!code_mode` so the code-editor path is untouched.
+            if !code_mode && !altgr_active && latin == Some('z') {
+                let shortcut_mod =
+                    super::detect_keyboard_mods(modifiers).is_shortcut_platform_mod();
+                if shortcut_mod {
+                    if shift {
+                        return Some(EditorAction::Redo);
+                    }
+                    return Some(EditorAction::Undo);
+                }
             }
 
             // Fallback: character input when no non-Shift modifiers are held.

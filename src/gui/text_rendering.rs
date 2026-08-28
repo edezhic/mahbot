@@ -15,7 +15,6 @@ use iced::advanced::mouse;
 use iced::advanced::renderer;
 use iced::{Color, Point, Rectangle};
 
-use super::theme;
 use crate::util::UnwrapPoison;
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -68,13 +67,11 @@ pub(crate) fn with_font_system<R>(f: impl FnOnce(&mut cosmic_text::FontSystem) -
 /// Pass `scroll_y: None` to skip the scroll reset (e.g. in draw fallbacks
 /// where [`layout`] already positioned the scroll).
 ///
-/// # Scroll parameters
-///
-/// `line` is always 0 and `horizontal` is always 0.0 — every current
-/// caller places the cursor at the first logical line and left-aligns the
-/// viewport.  Accepting these as parameters would complicate every call
-/// site for no present benefit; if a future use-case needs different
-/// values, add them as optional parameters.
+/// `scroll_x` is the horizontal viewport scroll in pixels (left-aligned
+/// content).  It is threaded through to [`set_scroll`] so the buffer
+/// records the horizontal scroll state; callers that do not scroll
+/// horizontally pass `0.0` (the code editor and multi-line prose never
+/// scroll horizontally).
 ///
 /// [`set_scroll`]: cosmic_text::Buffer::set_scroll
 /// [`set_size`]: cosmic_text::Buffer::set_size
@@ -84,6 +81,7 @@ pub(crate) fn reshape_and_shape(
     buffer: &mut cosmic_text::Buffer,
     font_sys: &mut cosmic_text::FontSystem,
     scroll_y: Option<f32>,
+    scroll_x: f32,
     text_area_width: f32,
     text_area_height: f32,
 ) {
@@ -92,7 +90,7 @@ pub(crate) fn reshape_and_shape(
         buffer.set_scroll(cosmic_text::Scroll {
             line: 0,
             vertical: scroll_y,
-            horizontal: 0.0,
+            horizontal: scroll_x,
         });
     }
     buffer.set_size(font_sys, Some(text_area_width), Some(text_area_height));
@@ -241,7 +239,7 @@ pub(crate) fn draw_highlight_background<Renderer>(
 }
 
 /// Fill the widget background. Byte-identical in the editor and diff widgets.
-pub(crate) fn draw_background<Renderer>(renderer: &mut Renderer, bounds: Rectangle)
+pub(crate) fn draw_background<Renderer>(renderer: &mut Renderer, bounds: Rectangle, color: Color)
 where
     Renderer: iced::advanced::Renderer,
 {
@@ -251,7 +249,7 @@ where
             border: iced::Border::default(),
             ..renderer::Quad::default()
         },
-        theme::BG_BASE,
+        color,
     );
 }
 

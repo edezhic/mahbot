@@ -4,7 +4,7 @@
 //! These are free functions extracted from `EditorState` in `editor.rs`.
 //! They take all state explicitly via parameters; none access `&self`.
 
-use iced::widget::{Row, Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{Row, Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Color, Element, Length, widget::Id};
 
 use iced_fonts::lucide;
@@ -50,21 +50,25 @@ pub(super) fn wrap_dialog<'a>(
 
 /// Build the quick-open overlay: a centered dialog with search input
 /// and filtered results list.
-pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, EditorMessage> {
-    let search_input: iced::widget::TextInput<'_, EditorMessage> =
-        text_input("Search files…", &qo.filter)
-            .on_input(EditorMessage::QuickOpenInput)
-            .on_submit(qo.results.first().map_or(EditorMessage::Escape, |_| {
-                EditorMessage::QuickOpenSelect(qo.selected_index)
-            }))
-            .id(Id::new(QUICK_OPEN_INPUT_ID))
-            .style(widgets::text_input_style)
-            .size(14)
-            .width(Length::Fill)
-            .padding([8, 12]);
+pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, EditorMessage> {
+    let search_input = widgets::single_line_editor(
+        &qo.filter.buffer,
+        "Search files…",
+        true,
+        Length::Fill,
+        Some(Id::new(QUICK_OPEN_INPUT_ID)),
+        |action| match action {
+            super::super::editor_widget::EditorAction::Submit => {
+                qo.results.first().map_or(EditorMessage::Escape, |_| {
+                    EditorMessage::QuickOpenSelect(qo.selected_index)
+                })
+            }
+            other => EditorMessage::QuickOpenInput(other),
+        },
+    );
 
     // Convert to Element for use in column.
-    let search_elem: Element<'static, EditorMessage> = search_input.into();
+    let search_elem: Element<'_, EditorMessage> = search_input;
 
     // Build results list with owned data to satisfy 'static lifetime.
     let results_owned: Vec<String> = qo.results.clone();
@@ -101,8 +105,8 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, 
 
     let results_column = column(results).spacing(0).width(Length::Fill);
 
-    let empty_hint: Option<Element<'static, EditorMessage>> =
-        if qo.filter.is_empty() && qo.results.is_empty() {
+    let empty_hint: Option<Element<'_, EditorMessage>> =
+        if qo.filter.text().is_empty() && qo.results.is_empty() {
             Some(
                 text("Type to filter files…")
                     .size(12)
@@ -120,7 +124,7 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'static, 
             None
         };
 
-    let content: Element<'static, EditorMessage> = if let Some(hint) = empty_hint {
+    let content: Element<'_, EditorMessage> = if let Some(hint) = empty_hint {
         column![search_elem, hint].spacing(4).into()
     } else {
         column![
@@ -310,12 +314,19 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
         format!("New file in \"{}\"", target.parent_dir)
     };
 
-    let input = text_input("Name…", &target.input_text)
-        .id(Id::new(NEW_ITEM_INPUT_ID))
-        .on_input(EditorMessage::NewItemInput)
-        .on_submit(EditorMessage::NewItemSubmit(target.input_text.clone()))
-        .style(widgets::text_input_style)
-        .padding(8);
+    let input = widgets::single_line_editor(
+        &target.input_text.buffer,
+        "Name…",
+        true,
+        Length::Fill,
+        Some(Id::new(NEW_ITEM_INPUT_ID)),
+        |action| match action {
+            super::super::editor_widget::EditorAction::Submit => {
+                EditorMessage::NewItemSubmit(target.input_text.text())
+            }
+            other => EditorMessage::NewItemInput(other),
+        },
+    );
 
     // Dialog content.
     wrap_dialog(
@@ -333,7 +344,7 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
                     "Create",
                     theme::ACCENT_LIGHT,
                     theme::button_primary,
-                    EditorMessage::NewItemSubmit(target.input_text.clone()),
+                    EditorMessage::NewItemSubmit(target.input_text.text()),
                 ),
             ]),
         ]
@@ -350,24 +361,26 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
 /// Build the global search (find-in-files) overlay: a search input with
 /// status line and results list, wrapped in a centered overlay dialog.
 #[expect(clippy::too_many_lines)]
-pub(super) fn build_global_search_overlay(
-    gs: &GlobalSearchState,
-) -> Element<'static, EditorMessage> {
-    let search_input: iced::widget::TextInput<'_, EditorMessage> =
-        text_input("Search across workspace…", &gs.query)
-            .on_input(EditorMessage::GlobalSearchInput)
-            .on_submit(if gs.results.is_empty() {
-                EditorMessage::Escape
-            } else {
-                EditorMessage::GlobalSearchSelect(gs.selected_index)
-            })
-            .id(Id::new(GLOBAL_SEARCH_INPUT_ID))
-            .style(widgets::text_input_style)
-            .size(14)
-            .width(Length::Fill)
-            .padding([8, 12]);
+pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_, EditorMessage> {
+    let search_input = widgets::single_line_editor(
+        &gs.query.buffer,
+        "Search across workspace…",
+        true,
+        Length::Fill,
+        Some(Id::new(GLOBAL_SEARCH_INPUT_ID)),
+        |action| match action {
+            super::super::editor_widget::EditorAction::Submit => {
+                if gs.results.is_empty() {
+                    EditorMessage::Escape
+                } else {
+                    EditorMessage::GlobalSearchSelect(gs.selected_index)
+                }
+            }
+            other => EditorMessage::GlobalSearchInput(other),
+        },
+    );
 
-    let search_elem: Element<'static, EditorMessage> = search_input.into();
+    let search_elem: Element<'_, EditorMessage> = search_input;
 
     // Status/hint line below the input.
     let status_elem: Element<'static, EditorMessage> = match &gs.status {
@@ -505,7 +518,7 @@ pub(super) fn build_global_search_overlay(
 
     let has_results = !gs.results.is_empty();
 
-    let content: Element<'static, EditorMessage> = if !has_results {
+    let content: Element<'_, EditorMessage> = if !has_results {
         column![search_elem, status_elem].spacing(4).into()
     } else {
         column![

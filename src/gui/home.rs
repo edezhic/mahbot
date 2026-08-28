@@ -9,10 +9,8 @@ use crate::Role;
 use crate::channels::chat_history::ChatHistoryEntry;
 use futures_util::SinkExt;
 use iced::widget::rule;
-use iced::widget::{
-    Column, Id, Space, button, column, container, row, scrollable, text, text_editor, tooltip,
-};
-use iced::{Alignment, Element, Length, Task, keyboard};
+use iced::widget::{Column, Id, Space, button, column, container, row, scrollable, text, tooltip};
+use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 use std::collections::HashSet;
 
@@ -116,7 +114,7 @@ pub enum HomeMessage {
     /// Workspace changed (from global picker — propagated via Dashboard).
     WorkspaceChanged(Option<String>),
     /// Text editor content changed.
-    InputChanged(text_editor::Action),
+    InputChanged(super::editor_widget::EditorAction),
     /// Send button pressed or Enter key in editor.
     SendMessage,
     /// Chat history loaded from the store (entries, has_more).
@@ -179,13 +177,6 @@ pub enum HomeMessage {
     /// auto-clear it. Carries the generation counter to prevent stale
     /// timeouts from interfering with a fresh send.
     SendingTimeout(u64),
-    /// Undo the last text edit in the chat input.
-    Undo,
-    /// Redo a previously undone text edit in the chat input.
-    Redo,
-    /// Keyboard modifiers changed (shift, ctrl, alt, etc.).
-    /// Used to track shift state for shift+click selection in the text editor.
-    ModifiersChanged(keyboard::Modifiers),
     /// Mic button clicked — start a voice message recording to the active role.
     StartVoiceRecording,
     /// Recording popup: stop recording, transcribe, and send the voice message.
@@ -216,7 +207,7 @@ pub struct HomeState {
     /// Deduplication set of seen message IDs.
     seen_ids: HashSet<String>,
     /// Text editor content.
-    editor_content: text_editor::Content,
+    editor_content: super::editor_widget::EditorBuffer,
     /// Whether a message is currently being sent / agent is responding.
     sending: bool,
     /// Whether a typing indicator is active.
@@ -242,10 +233,6 @@ pub struct HomeState {
     pagination_gen: u64,
     /// Undo/redo stack for the chat input text editor.
     undo_stack: super::common::UndoStack,
-    /// Current keyboard modifiers (shift, ctrl, alt, etc.).
-    /// Updated from `ModifiersChanged` events. Used to detect shift+click
-    /// for extending text selection.
-    modifiers: keyboard::Modifiers,
     /// Whether the composer role dropdown is open.
     role_menu_open: bool,
 }
@@ -283,7 +270,10 @@ impl HomeState {
             user_project_workspace: None,
             messages: Vec::new(),
             seen_ids: HashSet::new(),
-            editor_content: text_editor::Content::new(),
+            editor_content: super::editor_widget::EditorBuffer::with_text(
+                "",
+                Some(super::highlight::HighlightLanguage::Markdown),
+            ),
             sending: false,
             typing: false,
             typing_tick_state: 0,
@@ -296,7 +286,6 @@ impl HomeState {
             loading_older: false,
             pagination_gen: 0,
             undo_stack: super::common::UndoStack::new(),
-            modifiers: keyboard::Modifiers::empty(),
             role_menu_open: false,
         }
     }
@@ -939,6 +928,7 @@ impl HomeState {
                 controls,
                 grey_on_empty: true,
                 send_tooltip: "send text message",
+                id: Some(Id::new("home_chat_composer")),
             },
         );
 
@@ -1008,28 +998,6 @@ impl HomeState {
             subs.push(iced::Subscription::run(typing_tick));
         }
 
-        // Keyboard shortcuts: Cmd+Z → undo, Cmd+Shift+Z → redo.
-        // Also track modifier changes for shift+click text selection.
-        subs.push(keyboard::listen().filter_map(|event| {
-            super::common::composer_keyboard_event(
-                event,
-                HomeMessage::ModifiersChanged,
-                || HomeMessage::Undo,
-                || HomeMessage::Redo,
-            )
-        }));
-
-        // Reset keyboard modifiers when the window loses focus, preventing
-        // stale shift/ctrl/alt state from affecting the editor if the user
-        // presses a modifier, switches apps, releases it, and returns.
-        subs.push(iced::window::events().filter_map(|(_id, event)| {
-            if matches!(event, iced::window::Event::Unfocused) {
-                Some(HomeMessage::ModifiersChanged(keyboard::Modifiers::empty()))
-            } else {
-                None
-            }
-        }));
-
         iced::Subscription::batch(subs)
     }
 
@@ -1096,22 +1064,7 @@ impl HomeState {
                     &mut self.editor_content,
                     &mut self.undo_stack,
                     action,
-                    self.modifiers.shift(),
                 );
-                Task::none()
-            }
-            HomeMessage::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers;
-                Task::none()
-            }
-            HomeMessage::Undo => {
-                let snapshot = self.undo_stack.undo(&self.editor_content);
-                super::common::restore_undo_snapshot(&mut self.editor_content, snapshot);
-                Task::none()
-            }
-            HomeMessage::Redo => {
-                let snapshot = self.undo_stack.redo(&self.editor_content);
-                super::common::restore_undo_snapshot(&mut self.editor_content, snapshot);
                 Task::none()
             }
             HomeMessage::ResolveUserSelected {
@@ -1510,7 +1463,7 @@ impl HomeState {
         };
 
         // Clear the editor.
-        self.editor_content = text_editor::Content::new();
+        self.editor_content.clear();
         self.undo_stack.clear();
         self.sending = true;
 
@@ -1598,6 +1551,8 @@ fn typing_tick() -> impl futures_util::Stream<Item = HomeMessage> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::editor_widget::{EditorAction, EditorBuffer};
+    use super::super::highlight::HighlightLanguage;
     use super::*;
 
     // ------------------------------------------------------------------
@@ -2204,66 +2159,35 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ModifiersChanged + shift+click
+    // Selection (shift+click / drag)
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_modifiers_changed_updates_state() {
+    fn test_select_to_creates_selection() {
         let mut state = make_home_state("alice", "ws1");
+        state.editor_content =
+            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
 
-        // Default is empty modifiers
-        assert!(!state.modifiers.shift());
-
-        // Simulate Shift pressed
-        let shift_mods = keyboard::Modifiers::SHIFT;
-        let _task = state.update(HomeMessage::ModifiersChanged(shift_mods));
-
-        assert!(state.modifiers.shift());
-
-        // Simulate reset via Unfocused (empty modifiers)
-        let _task = state.update(HomeMessage::ModifiersChanged(keyboard::Modifiers::empty()));
-
-        assert!(!state.modifiers.shift());
-    }
-
-    #[test]
-    fn test_shift_click_converts_to_drag() {
-        use iced::Point;
-
-        let mut state = make_home_state("alice", "ws1");
-        state.editor_content = text_editor::Content::with_text("hello world");
-
-        // Click somewhere to position cursor. Even without a font system,
-        // hit-testing at (0,0) on non-empty text typically resolves to
-        // the first cursor position (line 0, col 0).
+        // Move the cursor away from the anchor, then extend a selection.
         state
             .editor_content
-            .perform(text_editor::Action::Click(Point { x: 0.0, y: 0.0 }));
-
+            .perform_action(EditorAction::MoveTo { line: 0, col: 0 });
         let cursor_before = state.editor_content.cursor();
-        // Click clears selection
         assert!(
             cursor_before.selection.is_none(),
-            "Click should clear selection"
+            "MoveTo should clear selection"
         );
 
-        // Now hold Shift
-        state.modifiers = keyboard::Modifiers::SHIFT;
-
-        // Dispatch a Click at a different position — should be converted to Drag
-        let _task = state.update(HomeMessage::InputChanged(text_editor::Action::Click(
-            Point { x: 100.0, y: 0.0 },
-        )));
+        // Dispatch a SelectTo through the page update.
+        let _task = state.update(HomeMessage::InputChanged(EditorAction::SelectTo {
+            line: 0,
+            col: 5,
+        }));
 
         let cursor_after = state.editor_content.cursor();
-
-        // Drag anchors selection at current cursor when none exists. Even if
-        // hit-testing at (100, 0) yields the same or no position, the selection
-        // should now be Some — verifying the Click→Drag conversion happened.
         assert!(
             cursor_after.selection.is_some(),
-            "shift+click should create selection via Action::Drag conversion; \
-             got selection={:?}",
+            "SelectTo should create a selection; got selection={:?}",
             cursor_after.selection
         );
     }
@@ -2276,13 +2200,13 @@ mod tests {
     fn test_send_message_empty_is_noop() {
         let mut state = make_home_state("alice", "ws1");
         // Empty content — should return Task::none() and not change state.
-        state.editor_content = text_editor::Content::new();
+        state.editor_content.clear();
         let _task = state.send_message();
         assert!(!state.sending);
         assert!(state.editor_content.text().is_empty());
 
         // Whitespace-only content should also be treated as empty.
-        state.editor_content = text_editor::Content::with_text("   ");
+        state.editor_content = EditorBuffer::with_text("   ", Some(HighlightLanguage::Markdown));
         let _task = state.send_message();
         assert!(!state.sending);
     }
@@ -2290,7 +2214,8 @@ mod tests {
     #[test]
     fn test_send_message_within_limit_clears_editor() {
         let mut state = make_home_state("alice", "ws1");
-        state.editor_content = text_editor::Content::with_text("hello world");
+        state.editor_content =
+            EditorBuffer::with_text("hello world", Some(HighlightLanguage::Markdown));
         let _task = state.send_message();
         // Editor must be cleared before the GUI_MESSAGE_TX send attempt.
         assert!(

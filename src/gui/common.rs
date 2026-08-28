@@ -1,10 +1,11 @@
 //! Shared state types used across GUI pages.
 
 use iced::Task;
-use iced::widget::text_editor;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::broadcast;
+
+use super::editor_widget::{CursorState, EditorAction, EditorBuffer};
 
 /// Maximum characters allowed in a chat message / comment input.
 pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
@@ -349,31 +350,30 @@ impl DebounceState {
 
 // ── Undo/Redo stack ─────────────────────────────────────────────────
 
-/// Content accessor for the shared undo stack. Implemented for
-/// [`text_editor::Content`] (chat composers) and `editor_widget::EditorBuffer`
-/// (the code editor); `cursor` returns a full [`text_editor::Cursor`] so
-/// selection anchors survive undo/redo where the underlying buffer has them.
+/// Content accessor for the shared undo stack.
+///
+/// Implemented for `editor_widget::EditorBuffer` — the single text-buffer
+/// engine shared by the code editor and all GUI prose fields.
+///
+/// `cursor` returns the unified [`CursorState`] so undo/redo snapshots can
+/// restore both text and cursor position regardless of the underlying buffer.
 pub(crate) trait UndoableText {
     fn text(&self) -> String;
-    fn cursor(&self) -> text_editor::Cursor;
-}
+    fn cursor(&self) -> CursorState;
 
-impl UndoableText for text_editor::Content {
-    fn text(&self) -> String {
-        text_editor::Content::text(self)
-    }
+    /// Replace all content with `text` and reset the cursor to (0, 0).
+    fn set_text(&mut self, text: &str);
 
-    fn cursor(&self) -> text_editor::Cursor {
-        text_editor::Content::cursor(self)
-    }
+    /// Move the cursor to `(line, column)`, clearing any selection.
+    fn move_to(&mut self, line: usize, col: usize);
 }
 
 /// Snapshot-based undo/redo stack for a text input editor.
 ///
-/// Stores `(String, Cursor)` pairs because [`text_editor::Content`] does not
-/// implement `Clone` in a way that preserves cursor position.  Restoration
-/// reconstructs via [`text_editor::Content::with_text`] +
-/// [`text_editor::Content::move_to`].
+/// Stores `(String, CursorState)` pairs because `editor_widget::EditorBuffer`
+/// does not implement `Clone` in a way that preserves cursor position.
+/// Restoration reconstructs via [`UndoableText::set_text`] +
+/// [`UndoableText::move_to`].
 #[derive(Debug, Clone)]
 pub(crate) struct UndoStack {
     /// Previous states, newest last.
@@ -386,7 +386,7 @@ pub(crate) struct UndoStack {
 #[derive(Debug, Clone)]
 pub(crate) struct UndoSnapshot {
     pub(crate) text: String,
-    pub(crate) cursor: text_editor::Cursor,
+    pub(crate) cursor: CursorState,
 }
 
 impl UndoStack {
@@ -500,68 +500,103 @@ where
     )
 }
 
-/// Map a keyboard event for a chat composer: modifier changes plus
-/// Cmd+Z / Cmd+Shift+Z undo/redo. `mods_changed`, `undo`, `redo` are the
-/// consuming page's message constructors (passed as `fn` pointers so the
-/// per-page `filter_map` closures stay non-capturing).
-pub(crate) fn composer_keyboard_event<M>(
-    event: iced::keyboard::Event,
-    mods_changed: fn(iced::keyboard::Modifiers) -> M,
-    undo: fn() -> M,
-    redo: fn() -> M,
-) -> Option<M> {
-    match event {
-        iced::keyboard::Event::ModifiersChanged(modifiers) => Some(mods_changed(modifiers)),
-        iced::keyboard::Event::KeyPressed {
-            key,
-            modifiers,
-            physical_key,
-            ..
-        } => {
-            let km = super::detect_keyboard_mods(modifiers);
-            // Cmd+Z / Ctrl+Z → undo. Check shift first so Cmd+Shift+Z → redo.
-            if km.is_shortcut_platform_mod() && key.to_latin(physical_key) == Some('z') {
-                if modifiers.shift() {
-                    return Some(redo());
-                }
-                return Some(undo());
-            }
-            None
-        }
-        iced::keyboard::Event::KeyReleased { .. } => None,
-    }
-}
-
-/// Apply a text-editor action to the composer content: shift+click becomes a
-/// drag (extending the selection), and edit actions snapshot the pre-edit
-/// state for undo. `perform()` must be called unconditionally for every
-/// action (cursor movement, click positioning, edit) — the Iced text_editor
-/// widget does not call it itself.
+/// Apply a text-editor action to a buffer: edit actions snapshot the
+/// pre-edit state for undo, then the action is performed. The editor widget
+/// publishes every action (cursor movement, click positioning, edit), so
+/// `perform_action` is called unconditionally; only edit actions are
+/// snapshotted. Undo/Redo restore from the undo/redo stack instead.
 pub(crate) fn apply_editor_action(
-    content: &mut text_editor::Content,
+    content: &mut EditorBuffer,
     undo_stack: &mut UndoStack,
-    action: text_editor::Action,
-    shift: bool,
+    action: EditorAction,
 ) {
-    let action = match action {
-        text_editor::Action::Click(pos) if shift => text_editor::Action::Drag(pos),
-        other => other,
-    };
-    if action.is_edit() {
-        undo_stack.snap_before_edit(content);
+    match action {
+        EditorAction::Undo => {
+            if let Some(s) = undo_stack.undo(content) {
+                restore_undo_snapshot(content, Some(s));
+            }
+        }
+        EditorAction::Redo => {
+            if let Some(s) = undo_stack.redo(content) {
+                restore_undo_snapshot(content, Some(s));
+            }
+        }
+        other => {
+            if other.is_edit_action() {
+                undo_stack.snap_before_edit(content);
+            }
+            content.perform_action(other);
+        }
     }
-    content.perform(action);
 }
 
-/// Restore an undo/redo snapshot into the composer content (`None`, i.e. an
-/// empty stack, is a no-op).
-pub(crate) fn restore_undo_snapshot(
-    content: &mut text_editor::Content,
-    snapshot: Option<UndoSnapshot>,
-) {
+/// Restore an undo/redo snapshot into a buffer (`None`, i.e. an empty stack,
+/// is a no-op).
+pub(crate) fn restore_undo_snapshot(content: &mut EditorBuffer, snapshot: Option<UndoSnapshot>) {
     if let Some(snapshot) = snapshot {
-        *content = text_editor::Content::with_text(&snapshot.text);
-        content.move_to(snapshot.cursor);
+        content.set_text(&snapshot.text);
+        content.move_to(snapshot.cursor.line, snapshot.cursor.column);
+    }
+}
+
+/// Map a single-line Tab / Shift+Tab action to Iced focus traversal.
+///
+/// Returns `Some(task)` for [`EditorAction::FocusNext`] / [`FocusPrevious`]
+/// and `None` for every other action, so a page can intercept focus navigation
+/// at the top of any single-line field's handler without disturbing the
+/// buffer/undo logic below.
+#[must_use]
+pub(crate) fn focus_navigation_task<Message>(action: &EditorAction) -> Option<iced::Task<Message>> {
+    match action {
+        EditorAction::FocusNext => Some(iced::widget::operation::focus_next()),
+        EditorAction::FocusPrevious => Some(iced::widget::operation::focus_previous()),
+        _ => None,
+    }
+}
+
+/// Per-field state for a single-line shared-editor field: an [`EditorBuffer`]
+/// plus its own undo stack. Each input owns its own undo/redo, matching the
+/// per-field undo requirement.
+pub(crate) struct SingleLineEditorState {
+    pub(crate) buffer: EditorBuffer,
+    undo: UndoStack,
+}
+
+impl SingleLineEditorState {
+    /// Create a single-line field pre-populated with `text`.
+    pub(crate) fn new(text: &str) -> Self {
+        let buffer = EditorBuffer::with_text(text, None);
+        buffer.set_single_line(true);
+        Self {
+            buffer,
+            undo: UndoStack::new(),
+        }
+    }
+
+    /// Re-populate the field from an external source (e.g. config reload),
+    /// resetting the undo stack so stale snapshots cannot be restored.
+    pub(crate) fn set_text(&mut self, text: &str) {
+        self.buffer.set_text(text);
+        self.undo.clear();
+    }
+
+    /// Current field text.
+    pub(crate) fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    /// Reset the field to empty (clears undo too).
+    pub(crate) fn clear(&mut self) {
+        self.buffer.clear();
+        self.undo.clear();
+    }
+
+    /// Apply an [`EditorAction`] emitted by the shared widget.
+    pub(crate) fn apply_action(&mut self, action: EditorAction) {
+        // `apply_editor_action` uniformly handles undo/redo (restoring from the
+        // stack) and edit actions (snapshotting then performing), so there is
+        // no separate undo/redo dispatch here.
+        apply_editor_action(&mut self.buffer, &mut self.undo, action);
     }
 }
 
@@ -613,7 +648,7 @@ mod tests {
     /// Stack with one snapshot of `text` taken before any edit.
     fn stack_with_snapshot(text: &str) -> UndoStack {
         let mut stack = UndoStack::new();
-        let content = text_editor::Content::with_text(text);
+        let content = EditorBuffer::with_text(text, None);
         stack.snap_before_edit(&content);
         stack
     }
@@ -621,7 +656,7 @@ mod tests {
     #[test]
     fn undo_restores_snapshot() {
         let mut stack = stack_with_snapshot("original");
-        let modified = text_editor::Content::with_text("modified");
+        let modified = EditorBuffer::with_text("modified", None);
         let snapshot = stack.undo(&modified).unwrap();
         assert_eq!(snapshot.text, "original");
     }
@@ -629,7 +664,7 @@ mod tests {
     #[test]
     fn redo_restores_undone_state() {
         let mut stack = stack_with_snapshot("original");
-        let modified = text_editor::Content::with_text("modified");
+        let modified = EditorBuffer::with_text("modified", None);
         let _ = stack.undo(&modified);
 
         let snapshot = stack.redo(&modified).unwrap();
@@ -639,11 +674,11 @@ mod tests {
     #[test]
     fn new_edit_clears_redo() {
         let mut stack = stack_with_snapshot("v1");
-        let v2 = text_editor::Content::with_text("v2");
+        let v2 = EditorBuffer::with_text("v2", None);
         let _ = stack.undo(&v2);
 
         // New edit after undo should clear redo.
-        let v3 = text_editor::Content::with_text("v3");
+        let v3 = EditorBuffer::with_text("v3", None);
         stack.snap_before_edit(&v3);
 
         assert!(stack.redo(&v3).is_none());
@@ -651,18 +686,44 @@ mod tests {
 
     #[test]
     fn snapshot_preserves_cursor() {
-        let mut content = text_editor::Content::with_text("line1\nline2\nline3");
-        content.move_to(text_editor::Cursor {
-            position: text_editor::Position { line: 1, column: 2 },
-            selection: None,
-        });
+        let content = EditorBuffer::with_text("line1\nline2\nline3", None);
+        content.move_to(1, 2);
         let mut stack = UndoStack::new();
         stack.snap_before_edit(&content);
 
-        let modified = text_editor::Content::with_text("changed");
+        let modified = EditorBuffer::with_text("changed", None);
         let snapshot = stack.undo(&modified).unwrap();
-        assert_eq!(snapshot.cursor.position.line, 1);
-        assert_eq!(snapshot.cursor.position.column, 2);
+        assert_eq!(snapshot.cursor.line, 1);
+        assert_eq!(snapshot.cursor.column, 2);
+    }
+
+    #[test]
+    fn apply_editor_action_snapshots_edits() {
+        let mut buffer = EditorBuffer::with_text("hello", None);
+        buffer.move_to(0, 5);
+        let mut stack = UndoStack::new();
+        apply_editor_action(&mut buffer, &mut stack, EditorAction::Insert('!'));
+        assert_eq!(buffer.text(), "hello!");
+        // The edit was snapshotted before it happened.
+        assert_eq!(stack.undo(&buffer).unwrap().text, "hello");
+    }
+
+    #[test]
+    fn restore_undo_snapshot_restores_text_and_cursor() {
+        let mut buffer = EditorBuffer::with_text("changed", None);
+        let snapshot = Some(UndoSnapshot {
+            text: "line1\nline2\nline3".to_string(),
+            cursor: CursorState {
+                line: 1,
+                column: 3,
+                selection: None,
+            },
+        });
+        restore_undo_snapshot(&mut buffer, snapshot);
+        assert_eq!(buffer.text(), "line1\nline2\nline3");
+        let cursor = buffer.cursor();
+        assert_eq!(cursor.line, 1);
+        assert_eq!(cursor.column, 3);
     }
 
     /// Run `send_guard`, recording whether `over_limit` fired (task never run).

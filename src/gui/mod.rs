@@ -39,7 +39,7 @@ use crate::pipeline::board::Ticket;
 
 use iced::keyboard;
 use iced::widget::{
-    Column, Row, Space, button, column, container, row, rule, scrollable, text, text_input, tooltip,
+    Column, Row, Space, button, column, container, row, rule, scrollable, text, tooltip,
 };
 use iced::window;
 use iced::{Alignment, Color, Element, Length, Task};
@@ -1875,14 +1875,17 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
 /// Displays all non-archived tickets grouped by phase. A right-click
 /// context menu on this panel offers "Archive done & cancelled".
 fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
-    let search_active = !board_state.search_query.is_empty();
+    let search_active = !board_state.search_query.text().is_empty();
 
     // ── Search input row ───────────────────────────────────────────
-    let search_input = text_input("Search tickets…", &board_state.search_query)
-        .on_input(|q| Message::Board(board::BoardMessage::SearchInputChanged(q)))
-        .style(widgets::text_input_style)
-        .size(13)
-        .padding([4, 8]);
+    let search_input = widgets::single_line_editor(
+        &board_state.search_query.buffer,
+        "Search tickets…",
+        false,
+        Length::Fill,
+        Some(iced::widget::Id::new("board_ticket_search")),
+        |action| Message::Board(board::BoardMessage::SearchInputChanged(action)),
+    );
     let clear_btn = widgets::icon_tooltip_button(
         text("×").size(14),
         "clear search",
