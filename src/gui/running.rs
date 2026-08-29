@@ -22,9 +22,11 @@
 //!   cannot see an in-flight tool or a non-tool LLM phase (those are only
 //!   committed after execution / produce no message respectively), so this is
 //!   the only record of "what's running now".
-//! - Trace groups (below the LIVE line) are derived from the live transcript
-//!   snapshot: tool-call assistant rounds grouped by shared narration, bounded
-//!   by real user turns. Content-only final answers are omitted.
+//! - Trace groups (below the LIVE line) are a projection of the shared
+//!   session ledger (the live transcript snapshot decoded via
+//!   `session_view::build_ledger`): tool-call assistant rounds grouped by
+//!   shared narration, bounded by real user turns. Content-only final answers
+//!   are omitted.
 //! - Parallel tool execution is represented honestly: every tool that
 //!   actually started executing appears as its own tool block; tools that never
 //!   execute (unknown tool, pre-flight cancellation) never show.
@@ -46,11 +48,13 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use crate::ChatRole;
 use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey, RunningTool};
+use crate::gui::session_view::{
+    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, build_ledger, tool_block, truncate_at_boundary,
+};
 use crate::gui::theme;
 use crate::gui::widgets;
-use crate::session::{DecodedNativeHistoryMessage, decode_native_history_message};
-use crate::{ChatMessage, ChatRole};
 use chrono::{DateTime, Utc};
 
 use iced::widget::{
@@ -68,17 +72,6 @@ use super::{Message, WorkspaceInfo};
 /// with "…" (see [`truncate_at_boundary`]).
 const MAX_GROUP_LABEL_CHARS: usize = 104;
 
-/// Maximum display length (Unicode chars) of a single argument VALUE in the
-/// row's comma-separated key-value pairs line. The hover tooltip always shows
-/// the full untruncated value.
-const MAX_TOOL_VALUE_CHARS: usize = 26;
-
-/// Maximum display length (Unicode chars) of the whole key-value pairs line
-/// in the row (values already truncated per [`MAX_TOOL_VALUE_CHARS`]). Cut at
-/// a pair boundary with a trailing "…" so the line can never overflow the
-/// card width (iced rows do not wrap).
-const MAX_TOOL_PAIRS_LINE_CHARS: usize = 104;
-
 /// Maximum display length (Unicode chars) of the visible narration (the
 /// assistant's short reasoning text) on the LIVE state line and its
 /// trace-group label. Truncated at a word/path-delimiter boundary with "…" so
@@ -87,56 +80,10 @@ const MAX_TOOL_PAIRS_LINE_CHARS: usize = 104;
 /// pixels as the original 104-char cap did at 11px.
 const MAX_NARRATION_CHARS: usize = 88;
 
-/// Maximum width (px) of the hover tooltip content; long values wrap within it.
-const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
-
 /// Maximum width (px) of a metric hover tooltip body. Much narrower than
 /// [`MAX_TOOL_TOOLTIP_WIDTH`] (tuned for multi-arg tool calls) since a metric
 /// tooltip holds one short line of explanatory text.
 const MAX_METRIC_TOOLTIP_WIDTH: f32 = 360.0;
-
-/// A word/path-delimiter boundary at which wrapped/truncated page text may be
-/// cut: whitespace (word wrap) and `/`, `_`, `-` (paths, URLs, identifiers).
-fn is_delim(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '/' | '_' | '-')
-}
-
-/// Truncate `s` to at most `max_chars` Unicode chars, choosing a cut at a word
-/// or path/URL delimiter boundary (whitespace, `/`, `_`, `-`) rather than
-/// mid-token, and appending "…" when truncated. When no delimiter falls within
-/// the cap the cut falls back to a hard char boundary so the limit is always
-/// honoured. Used by the page-local truncation constants; leaves
-/// [`crate::util::truncate`](crate::util::truncate) untouched for its ~20
-/// non-UI callers.
-fn truncate_at_boundary(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let hard_end = s
-        .char_indices()
-        .nth(max_chars)
-        .map(|(byte_idx, _)| byte_idx)
-        .expect("char count exceeds max_chars, so a char exists at index max_chars");
-    // If the cut lands right before a delimiter, the first `max_chars` chars
-    // already end at a complete word/path segment — cut exactly there.
-    if s[hard_end..].chars().next().is_some_and(is_delim) {
-        return format!("{}…", s[..hard_end].trim_end());
-    }
-    // Otherwise back up to the last delimiter strictly inside the cap so the
-    // cut lands at a wrap boundary (the delimiter is the wrapped segment's
-    // final char) instead of mid-word.
-    let mut cut = None;
-    for (char_pos, (byte_idx, c)) in s.char_indices().enumerate() {
-        if char_pos >= max_chars {
-            break;
-        }
-        if is_delim(c) {
-            cut = Some(byte_idx + c.len_utf8());
-        }
-    }
-    let end = cut.unwrap_or(hard_end);
-    format!("{}…", s[..end].trim_end())
-}
 
 /// Messages emitted by the Running Agents page.
 ///
@@ -701,10 +648,13 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     let snapshot = crate::session::TRANSCRIPT_REGISTRY.snapshot(&h.agent_id);
     let groups = snapshot
         .as_ref()
-        .map(|s| derive_trace_groups(&s.history))
+        .map(|s| derive_trace_groups(&build_ledger(&s.history)))
         .unwrap_or_default();
 
     let status = live_status(h, &groups);
+    // Reasoning behind the current group's narration — surfaced on hover
+    // wherever the collapsed LIVE line carries the narration text.
+    let current_reasoning = groups.last().and_then(|g| g.reasoning.as_deref());
     // The current group's narration label is suppressed only when the top
     // status line already carries that text (a narration or "thinking…") AND
     // the card is collapsed; in the expanded card the current group's label
@@ -729,20 +679,20 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
             if expanded {
                 None
             } else {
-                Some(
-                    text(truncate_at_boundary(narration, MAX_NARRATION_CHARS))
-                        .size(13)
-                        .font(theme::FONT_BOLD)
-                        .color(theme::TEXT_SECONDARY)
-                        .into(),
-                )
+                let label = text(truncate_at_boundary(narration, MAX_NARRATION_CHARS))
+                    .size(13)
+                    .font(theme::FONT_BOLD)
+                    .color(theme::TEXT_SECONDARY);
+                Some(reasoning_tooltip(current_reasoning, label.into()))
             }
         }
         LiveStatus::Thinking => {
             // The expanded card lets the group's "thinking…" label carry this,
-            // so the LIVE indicator shows only when no group exists yet.
+            // so the LIVE indicator shows only when no group exists yet. An
+            // empty narration with reasoning still gets the hover tooltip.
             if !expanded || groups.is_empty() {
-                Some(text("thinking…").size(13).color(theme::ACCENT).into())
+                let label = text("thinking…").size(13).color(theme::ACCENT);
+                Some(reasoning_tooltip(current_reasoning, label.into()))
             } else {
                 None
             }
@@ -784,7 +734,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     if let LiveStatus::Tools = status {
         let mut tools = Column::new().spacing(4).align_x(Alignment::Start);
         for tool in &h.current_tools {
-            tools = tools.push(render_tool_block(tool));
+            tools = tools.push(tool_block(tool, false));
         }
         content = content.push(tools);
     }
@@ -908,7 +858,8 @@ fn render_visible_groups(
 /// Render one trace group. `expand_current` renders the newest round's calls
 /// expanded (current group); otherwise every call collapses to a name-only
 /// line (previous groups). `show_label` renders the narration label (the short
-/// reasoning text, or the "thinking…" placeholder when empty). When
+/// reasoning text, or the "thinking…" placeholder when empty); hovering the
+/// label reveals the group's full decoded Reasoning when it carried one. When
 /// `label_metrics` is [`Some`] the label row also carries the metrics,
 /// right-aligned (see [`render_agent_card`]); otherwise the label renders
 /// alone.
@@ -936,6 +887,7 @@ fn render_trace_group(
                 .color(theme::TEXT_SECONDARY)
                 .into()
         };
+        let label = reasoning_tooltip(group.reasoning.as_deref(), label);
         if let Some(metrics) = label_metrics {
             column = column.push(row_with_metrics(Some(label), metrics));
         } else {
@@ -956,7 +908,7 @@ fn render_trace_group(
             );
         }
         for call in newest {
-            column = column.push(render_tool_block(call));
+            column = column.push(tool_block(call, false));
         }
     } else {
         column = column.push(
@@ -966,6 +918,30 @@ fn render_trace_group(
         );
     }
     column.into()
+}
+
+/// Wrap a narration label in a hover tooltip revealing the full decoded
+/// Reasoning behind it (see [`TraceGroup::reasoning`]). When there is no
+/// reasoning the label renders bare.
+fn reasoning_tooltip<'a>(
+    reasoning: Option<&str>,
+    label: Element<'a, RunningMessage>,
+) -> Element<'a, RunningMessage> {
+    let Some(reasoning) = reasoning.filter(|r| !r.is_empty()) else {
+        return label;
+    };
+    let tooltip_content: Element<'static, RunningMessage> = container(
+        text(reasoning.to_string())
+            .size(11)
+            .color(theme::TEXT_SECONDARY)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+    )
+    .max_width(MAX_TOOL_TOOLTIP_WIDTH)
+    .into();
+    tooltip(label, tooltip_content, tooltip::Position::Top)
+        .gap(4)
+        .style(theme::tooltip_style)
+        .into()
 }
 
 /// Compose the collapsed name-only line for a set of tool-call rounds: tool
@@ -1012,61 +988,49 @@ pub(crate) fn prune_expanded(expanded: &mut HashSet<(String, u64)>, agents: &[Ag
 /// consecutive tool-call assistant rounds sharing a single (possibly empty)
 /// visible narration, bounded by a real user turn or a new narration.
 ///
-/// Derived only from the decoded assistant `content` (the short visible
-/// narration) and `tool_calls` — never from the long `reasoning`
-/// (`Reasoning` struct) block. A group always carries at least one round.
+/// Derived from the shared session ledger: the group's narration comes from
+/// the decoded assistant `content` (the short visible reasoning text); its
+/// `reasoning` is the long decoded `Reasoning` block of the group's rounds,
+/// surfaced on hover. A group always carries at least one round.
 struct TraceGroup {
     /// The assistant's short visible narration (empty → rendered "thinking…").
     /// This is the decoded assistant `content`, NEVER the long `Reasoning`
     /// / `[thinking]` block.
     narration: String,
+    /// The full decoded Reasoning of the group: the first non-empty reasoning
+    /// among its rounds. `None` when the rounds carried none (the narration
+    /// label then renders bare, no hover tooltip).
+    reasoning: Option<String>,
     /// Tool-call rounds in first-appearance order; the LAST round is the newest
     /// (expanded in the current group), earlier rounds collapse.
     rounds: Vec<Vec<RunningTool>>,
 }
 
-/// Derive the trace groups for a live transcript in chronological order.
+/// Project the shared session ledger into a running agent's trace groups, in
+/// chronological order.
 ///
-/// Boundary rules (see the ticket):
-/// - A new (non-empty) narration in a tool-call assistant message starts a new
+/// Boundary rules:
+/// - A new (non-empty) narration in a tool-call assistant round starts a new
 ///   group; that narration becomes the group's `narration`.
 /// - Consecutive tool-call rounds with no narration accumulate into the current
 ///   group.
-/// - A REAL user turn (content NOT starting with the injected-image tag) closes
-///   the current group; the next tool-call round starts a fresh one even with
-///   no narration (its `narration` slots to "thinking…").
-/// - Synthetic tool-injected `[IMAGE:*]` user messages are part of the ongoing
-///   tool sequence and never reset the group.
-fn derive_trace_groups(history: &[ChatMessage]) -> Vec<TraceGroup> {
+/// - A real user turn closes the current group; the next tool-call round then
+///   starts a fresh one even with no narration (its `narration` slots to
+///   "thinking…").
+/// - Synthetic tool-injected user messages (content starting with the
+///   `crate::util::INJECTED_IMAGE_TAG` marker, `<injected-tool-result-image>`)
+///   are part of the ongoing tool sequence and never reset the group.
+fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup> {
     let mut groups: Vec<TraceGroup> = Vec::new();
     let mut current: Option<TraceGroup> = None;
-    for msg in history {
-        match msg.role {
-            ChatRole::User => {
-                if !msg.content.starts_with(crate::util::INJECTED_IMAGE_TAG) {
-                    if let Some(group) = current.take() {
-                        groups.push(group);
-                    }
-                }
-            }
-            ChatRole::Assistant => {
-                let Some(DecodedNativeHistoryMessage::Assistant {
-                    content,
-                    tool_calls,
-                    ..
-                }) = decode_native_history_message(msg)
-                else {
-                    continue;
-                };
-                let Some(calls) = tool_calls else {
-                    continue;
-                };
-                if calls.is_empty() {
-                    continue;
-                }
-                let round: Vec<RunningTool> =
-                    calls.iter().map(RunningTool::from_tool_call).collect();
-                let narration = content.unwrap_or_default();
+    for entry in entries {
+        match entry {
+            SessionEntry::ToolRound {
+                narration,
+                reasoning,
+                calls,
+            } => {
+                let narration = narration.clone().unwrap_or_default();
                 let new_group = !narration.is_empty() || current.is_none();
                 if new_group {
                     if let Some(group) = current.take() {
@@ -1075,11 +1039,34 @@ fn derive_trace_groups(history: &[ChatMessage]) -> Vec<TraceGroup> {
                 }
                 let group = current.get_or_insert_with(|| TraceGroup {
                     narration,
+                    reasoning: None,
                     rounds: Vec::new(),
                 });
-                group.rounds.push(round);
+                if group.reasoning.is_none()
+                    && let Some(reasoning) = reasoning
+                    && !reasoning.is_empty()
+                {
+                    group.reasoning = Some(reasoning.clone());
+                }
+                group
+                    .rounds
+                    .push(calls.iter().map(|c| c.tool.clone()).collect());
             }
-            _ => {}
+            SessionEntry::Message {
+                role: ChatRole::User,
+                content,
+                ..
+            } => {
+                let injected_image = content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(crate::util::INJECTED_IMAGE_TAG));
+                if !injected_image {
+                    if let Some(group) = current.take() {
+                        groups.push(group);
+                    }
+                }
+            }
+            SessionEntry::Message { .. } => {}
         }
     }
     if let Some(group) = current.take() {
@@ -1124,109 +1111,6 @@ fn live_status<'a>(h: &'a AgentHandle, groups: &'a [TraceGroup]) -> LiveStatus<'
     } else {
         LiveStatus::Thinking
     }
-}
-
-/// Render one tool block: the tool name (bold primary) and its comma-separated
-/// key-value pairs (regular secondary) on a single line — `tool args`. The
-/// pairs portion is length-capped ([`MAX_TOOL_PAIRS_LINE_CHARS`]) so the short
-/// tool name plus the args fit on one row without overflowing the card. The
-/// whole block is the hover target of a tooltip showing the FULL
-/// untruncated argument values.
-fn render_tool_block(
-    tool: &crate::agent::registry::RunningTool,
-) -> Element<'static, RunningMessage> {
-    let mut line = Row::new().spacing(4).align_y(Alignment::Center).push(
-        text(tool.name.clone())
-            .size(11)
-            .font(theme::FONT_BOLD)
-            .color(theme::TEXT_PRIMARY),
-    );
-    if !tool.args.is_empty() {
-        line = line.push(
-            text(render_tool_pairs_line(&tool.args))
-                .size(11)
-                .color(theme::TEXT_SECONDARY),
-        );
-    }
-    tooltip(line, render_tool_tooltip(tool), tooltip::Position::Top)
-        .gap(4)
-        .style(theme::tooltip_style)
-        .into()
-}
-
-/// Render the row's key-value pairs line: `name: value` pairs, comma-
-/// separated, each value collapsed to a single line and truncated at a
-/// word/path-delimiter boundary to [`MAX_TOOL_VALUE_CHARS`] chars. The whole
-/// line is capped at [`MAX_TOOL_PAIRS_LINE_CHARS`] chars, cut at a pair
-/// boundary with "…".
-fn render_tool_pairs_line(pairs: &[(String, String)]) -> String {
-    let rendered: Vec<String> = pairs
-        .iter()
-        .map(|(k, v)| format!("{k}: {}", value_display(v)))
-        .collect();
-    let joined = rendered.join(", ");
-    if joined.chars().count() <= MAX_TOOL_PAIRS_LINE_CHARS {
-        return joined;
-    }
-    // Over budget: keep whole pairs while they fit (leaving room for the
-    // trailing "…"), then mark the cut.
-    let mut out = String::new();
-    for pair in &rendered {
-        let sep = if out.is_empty() { "" } else { ", " };
-        let candidate_len = out.chars().count() + sep.chars().count() + pair.chars().count();
-        if candidate_len + 1 > MAX_TOOL_PAIRS_LINE_CHARS {
-            break;
-        }
-        out.push_str(sep);
-        out.push_str(pair);
-    }
-    if out.is_empty() {
-        // Even the first pair alone does not fit — truncate at a delimiter
-        // boundary so the cut lands at a sensible wrap point.
-        truncate_at_boundary(&rendered[0], MAX_TOOL_PAIRS_LINE_CHARS)
-    } else {
-        format!("{out}…")
-    }
-}
-
-/// Single-line display form of a value: control characters (newlines, tabs)
-/// collapsed to spaces, then truncated to [`MAX_TOOL_VALUE_CHARS`] chars at a
-/// word/path-delimiter boundary with "…" when cut.
-fn value_display(value: &str) -> String {
-    let single_line: String = value
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    truncate_at_boundary(&single_line, MAX_TOOL_VALUE_CHARS)
-}
-
-/// Render the hover tooltip: the tool name header (bold white) followed by
-/// every argument pair on its own line, sorted by FULL value length ascending
-/// (stable, so equal-length pairs keep registration order) — the shortest
-/// pairs sit at the top and stay visible even when the longest values extend
-/// beyond the viewport. Values are full and untruncated, including secrets.
-fn render_tool_tooltip(
-    tool: &crate::agent::registry::RunningTool,
-) -> Element<'static, RunningMessage> {
-    let mut pairs = tool.args.clone();
-    pairs.sort_by_key(|(_, v)| v.chars().count());
-
-    let mut content = Column::new().spacing(2).push(
-        text(tool.name.clone())
-            .size(11)
-            .font(theme::FONT_BOLD)
-            .color(theme::TEXT_PRIMARY),
-    );
-    for (k, v) in &pairs {
-        content = content.push(
-            text(format!("{k}: {v}"))
-                .size(11)
-                .font(super::JETBRAINS_MONO)
-                .color(theme::TEXT_SECONDARY)
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-        );
-    }
-    container(content).max_width(MAX_TOOL_TOOLTIP_WIDTH).into()
 }
 
 /// Render a one-line metric tooltip body in a narrow, styled container: the
@@ -1282,7 +1166,9 @@ fn format_elapsed(started_at: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChatMessage;
     use crate::agent::registry::AgentHandle;
+    use crate::gui::session_view::build_ledger;
 
     fn agent_handle(
         id: &str,
@@ -1750,6 +1636,16 @@ mod tests {
     // ── Trace-group derivation ──────────────────────────────────────
 
     fn assistant_tool_call(narration: &str, calls: &[(&str, serde_json::Value)]) -> ChatMessage {
+        assistant_tool_call_reasoning(narration, calls, None)
+    }
+
+    /// Like [`assistant_tool_call`] but with an optional decoded `reasoning`
+    /// field, so the ledger's `ToolRound.reasoning` is populated.
+    fn assistant_tool_call_reasoning(
+        narration: &str,
+        calls: &[(&str, serde_json::Value)],
+        reasoning: Option<&str>,
+    ) -> ChatMessage {
         let calls_json: Vec<serde_json::Value> = calls
             .iter()
             .map(|(name, args)| {
@@ -1765,9 +1661,11 @@ mod tests {
         } else {
             serde_json::Value::String(narration.to_string())
         };
-        ChatMessage::assistant(
-            serde_json::json!({ "content": content, "tool_calls": calls_json }).to_string(),
-        )
+        let mut body = serde_json::json!({ "content": content, "tool_calls": calls_json });
+        if let Some(reasoning) = reasoning {
+            body["reasoning"] = serde_json::json!(reasoning);
+        }
+        ChatMessage::assistant(body.to_string())
     }
 
     #[test]
@@ -1778,7 +1676,7 @@ mod tests {
             ChatMessage::user("hello\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
             ChatMessage::assistant("Final answer here."),
         ];
-        assert!(derive_trace_groups(&history).is_empty());
+        assert!(derive_trace_groups(&build_ledger(&history)).is_empty());
     }
 
     #[test]
@@ -1793,7 +1691,7 @@ mod tests {
                 &[("edit", serde_json::json!({"path": "b.rs"}))],
             ),
         ];
-        let groups = derive_trace_groups(&history);
+        let groups = derive_trace_groups(&build_ledger(&history));
         assert_eq!(groups.len(), 2, "new narration starts a new group");
         assert_eq!(groups[0].narration, "Reading the file");
         assert_eq!(groups[1].narration, "Editing it");
@@ -1805,7 +1703,7 @@ mod tests {
             assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
             assistant_tool_call("", &[("list", serde_json::json!({"path": "."}))]),
         ];
-        let groups = derive_trace_groups(&history);
+        let groups = derive_trace_groups(&build_ledger(&history));
         assert_eq!(groups.len(), 1, "no narration → same group");
         assert_eq!(groups[0].rounds.len(), 2);
         assert!(groups[0].narration.is_empty());
@@ -1821,7 +1719,7 @@ mod tests {
             ChatMessage::user("ok now fix it\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
             assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
         ];
-        let groups = derive_trace_groups(&history);
+        let groups = derive_trace_groups(&build_ledger(&history));
         assert_eq!(groups.len(), 2, "user turn closes the group");
         assert_eq!(groups[0].narration, "Narration");
         // The post-reset empty-narration round starts a fresh group.
@@ -1837,9 +1735,47 @@ mod tests {
             )),
             assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
         ];
-        let groups = derive_trace_groups(&history);
+        let groups = derive_trace_groups(&build_ledger(&history));
         assert_eq!(groups.len(), 1, "synthetic image stays in the same group");
         assert_eq!(groups[0].rounds.len(), 2);
+    }
+
+    #[test]
+    fn trace_group_reasoning_is_first_non_empty_round() {
+        // Reasoning is captured from the first non-empty reasoning among the
+        // group's rounds; rounds with no reasoning are skipped, and a group
+        // with none at all carries None (the narration label renders bare).
+        let history = vec![
+            assistant_tool_call_reasoning(
+                "",
+                &[("read", serde_json::json!({"path": "a.rs"}))],
+                None,
+            ),
+            assistant_tool_call_reasoning(
+                "",
+                &[("edit", serde_json::json!({"path": "b.rs"}))],
+                Some("first"),
+            ),
+            assistant_tool_call_reasoning(
+                "",
+                &[("list", serde_json::json!({"path": "."}))],
+                Some("second"),
+            ),
+        ];
+        let groups = derive_trace_groups(&build_ledger(&history));
+        assert_eq!(groups.len(), 1, "no narration → same group");
+        assert_eq!(groups[0].reasoning.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn trace_group_without_reasoning_is_none() {
+        let history = vec![assistant_tool_call_reasoning(
+            "Narration",
+            &[("read", serde_json::json!({"path": "a.rs"}))],
+            None,
+        )];
+        let groups = derive_trace_groups(&build_ledger(&history));
+        assert_eq!(groups[0].reasoning, None);
     }
 
     #[test]
@@ -1891,17 +1827,17 @@ mod tests {
 
         // Idle + a non-empty narration → the current/latest group's narration.
         let idle = agent_handle("a", "engineer", None, "ws1", None);
-        let groups = derive_trace_groups(&[assistant_tool_call(
+        let groups = derive_trace_groups(&build_ledger(&[assistant_tool_call(
             "Reading the file",
             &[("read", serde_json::json!({"path": "a.rs"}))],
-        )]);
+        )]));
         assert_eq!(
             live_status(&idle, &groups),
             LiveStatus::Narration("Reading the file")
         );
 
         // Multi-group transcript: the LAST group's narration is shown.
-        let groups = derive_trace_groups(&[
+        let groups = derive_trace_groups(&build_ledger(&[
             assistant_tool_call(
                 "Editing it",
                 &[("edit", serde_json::json!({"path": "b.rs"}))],
@@ -1910,7 +1846,7 @@ mod tests {
                 "Reading again",
                 &[("read", serde_json::json!({"path": "c.rs"}))],
             ),
-        ]);
+        ]));
         assert_eq!(
             live_status(&idle, &groups),
             LiveStatus::Narration("Reading again")
@@ -1931,96 +1867,5 @@ mod tests {
             expanded.contains(&("a".to_string(), 0)),
             "live agent keeps its expanded key"
         );
-    }
-
-    // ── Page truncation (boundary-aware) ─────────────────────────────
-
-    #[test]
-    fn truncation_constants_are_pinned() {
-        // The narration cap is sized so that 88 mono chars at the 13px
-        // narration font span the same pixels as 104 chars did at 11px; the
-        // tool-line caps are unchanged (tool text stayed at 11px).
-        assert_eq!(MAX_GROUP_LABEL_CHARS, 104);
-        assert_eq!(MAX_TOOL_VALUE_CHARS, 26);
-        assert_eq!(MAX_TOOL_PAIRS_LINE_CHARS, 104);
-        assert_eq!(MAX_NARRATION_CHARS, 88);
-    }
-
-    #[test]
-    fn truncate_at_boundary_cuts_at_word_and_path_delimiters() {
-        // Cut at a word boundary rather than mid-word.
-        assert_eq!(truncate_at_boundary("abc def ghi", 5), "abc…");
-        // When the cap lands exactly before a delimiter, keep the full words.
-        assert_eq!(truncate_at_boundary("abc def ghi", 7), "abc def…");
-        // Paths break at a `/` segment boundary.
-        assert_eq!(
-            truncate_at_boundary("/Users/egordezic/Desktop/foo.rs", 26),
-            "/Users/egordezic/Desktop/…"
-        );
-        // An unbroken token falls back to a hard char cut at the cap.
-        assert_eq!(truncate_at_boundary("aaaaaaaa", 4), "aaaa…");
-        // Under the cap: unchanged.
-        assert_eq!(truncate_at_boundary("short", 10), "short");
-    }
-
-    #[test]
-    fn value_display_truncates_at_delimiter_boundary() {
-        // Path value cut at a `/`, content within the cap, trailing "…".
-        assert_eq!(
-            value_display("/Users/egordezic/Desktop/foo.rs"),
-            "/Users/egordezic/Desktop/…"
-        );
-        // Under the cap: unchanged.
-        assert_eq!(value_display("a.rs"), "a.rs");
-        // Control chars collapse to spaces.
-        assert_eq!(value_display("a\nb"), "a b");
-        // Unbroken long token hard-cuts at [`MAX_TOOL_VALUE_CHARS`].
-        assert_eq!(
-            value_display(&"a".repeat(40)),
-            format!("{}…", "a".repeat(MAX_TOOL_VALUE_CHARS))
-        );
-    }
-
-    #[test]
-    fn tool_pairs_line_truncates_at_pair_boundary() {
-        // Under the line cap: returned verbatim.
-        let short = vec![("path".to_string(), "a.rs".to_string())];
-        assert_eq!(render_tool_pairs_line(&short), "path: a.rs");
-
-        // Over the line cap: whole pairs kept while they fit, then a trailing
-        // "…" marks the cut; the excluded final pair never appears.
-        let pairs = vec![
-            (
-                "path".to_string(),
-                "/Users/egordezic/Desktop/project/foo.rs".to_string(),
-            ),
-            (
-                "offset".to_string(),
-                "/Users/egordezic/Desktop/project/bar.rs".to_string(),
-            ),
-            (
-                "limit".to_string(),
-                "/Users/egordezic/Desktop/project/baz.rs".to_string(),
-            ),
-            (
-                "query".to_string(),
-                "/Users/egordezic/Desktop/project/qux.rs".to_string(),
-            ),
-        ];
-        let line = render_tool_pairs_line(&pairs);
-        assert_eq!(line.chars().count(), MAX_TOOL_PAIRS_LINE_CHARS);
-        assert!(line.ends_with('…'));
-        assert!(line.contains("limit"));
-        assert!(!line.contains("query"), "excluded pair must not appear");
-    }
-
-    #[test]
-    fn tool_pairs_line_fallback_truncates_first_pair_at_boundary() {
-        // A single pair longer than the line cap: when the first pair contains
-        // no delimiter it is hard-cut exactly at the cap (with "…"), never left
-        // overflowing the line.
-        let pairs = vec![("k".repeat(120), "v".to_string())];
-        let line = render_tool_pairs_line(&pairs);
-        assert_eq!(line, format!("{}…", "k".repeat(MAX_TOOL_PAIRS_LINE_CHARS)));
     }
 }

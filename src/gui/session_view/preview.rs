@@ -45,16 +45,16 @@ use std::sync::LazyLock;
 use cosmic_text::{Attrs, AttrsList, BufferLine, Family, LineEnding, Shaping, Wrap};
 use iced::advanced::graphics::text::cosmic_text;
 
-use super::media_markers;
-use super::text_rendering::with_font_system;
-use super::theme::MARKDOWN_TEXT_SIZE;
+use crate::gui::media_markers;
+use crate::gui::text_rendering::with_font_system;
+use crate::gui::theme::MARKDOWN_TEXT_SIZE;
 use crate::util::file_name_or_path;
 
 /// Body text size of the transcript markdown — derived from
 /// [`theme::MARKDOWN_TEXT_SIZE`], the single source of truth shared with
 /// the actual renderer (`theme::markdown_settings`), so a theme font-size
 /// change cannot silently drift the measured wrap count from the render.
-pub(crate) const BODY_FONT_SIZE: f32 = MARKDOWN_TEXT_SIZE;
+const BODY_FONT_SIZE: f32 = MARKDOWN_TEXT_SIZE;
 
 /// Line budget: any message rendering more than this many wrapped lines is
 /// collapsed to a [`MAX_PREVIEW_LINES`]-line preview by default.
@@ -182,13 +182,11 @@ pub(crate) fn width_bucket(width: f32) -> u32 {
 /// [`MAX_PREVIEW_LINES`]-line plain-text preview when the message exceeds
 /// the budget.
 ///
-/// `display_text` is the raw message body (the same text that
-/// [`parse_messages_to_md_items`] feeds to `markdown::parse`); media-marker
+/// `display_text` is the raw message body (the same text that the Sessions
+/// ledger's `parse_entry_bodies` feeds to `markdown::parse`); media-marker
 /// preprocessing and image placeholder reduction happen here. The source is
 /// owned as [`Arc<str>`] so a width-bucket change can re-measure without
 /// copying the (potentially hundreds of KB) display text again.
-///
-/// [`parse_messages_to_md_items`]: crate::gui::sessions::parse_messages_to_md_items
 pub(crate) fn measure_message(
     display_text: impl Into<Arc<str>>,
     width: f32,
@@ -563,7 +561,7 @@ mod tests {
                 .write()
                 .unwrap_poison();
             guard.load_font(std::borrow::Cow::Borrowed(include_bytes!(
-                "JetBrainsMono-Regular.ttf"
+                "../JetBrainsMono-Regular.ttf"
             )));
         });
     }

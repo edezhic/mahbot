@@ -23,7 +23,7 @@ pub(crate) mod markdown_breaks;
 pub(crate) mod media_markers;
 pub(crate) mod menus;
 pub(crate) mod running;
-pub(crate) mod session_preview;
+pub(crate) mod session_view;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod shell;

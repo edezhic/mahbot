@@ -253,7 +253,7 @@ pub const FONT_REGULAR: iced::Font = iced::Font {
 
 /// Body text size (px) of the transcript markdown renderer
 /// (`markdown_settings`). The sessions-page collapse measurement
-/// (`session_preview`) derives its body and heading sizes from this
+/// (`session_view::preview`) derives its body and heading sizes from this
 /// constant, so a theme font-size change cannot silently drift the measured
 /// wrap count away from the actual render.
 pub const MARKDOWN_TEXT_SIZE: f32 = 13.0;

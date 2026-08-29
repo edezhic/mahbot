@@ -302,27 +302,6 @@ pub(crate) fn with_block_in_place<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Produce a short human-readable summary of tool arguments.
-#[must_use]
-pub fn summarize_args(args: &serde_json::Value) -> String {
-    match args {
-        serde_json::Value::Object(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    let val = match v {
-                        serde_json::Value::String(s) => truncate(s, 80),
-                        other => truncate(&other.to_string(), 80),
-                    };
-                    format!("{k}: {val}")
-                })
-                .collect();
-            parts.join(", ")
-        }
-        other => truncate(&other.to_string(), 120),
-    }
-}
-
 /// Extract a human-readable message from a panic payload returned by
 /// [`catch_unwind`](futures_util::FutureExt::catch_unwind).
 #[must_use]
