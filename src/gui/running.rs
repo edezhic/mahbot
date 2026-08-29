@@ -75,15 +75,17 @@ const MAX_TOOL_VALUE_CHARS: usize = 26;
 
 /// Maximum display length (Unicode chars) of the whole key-value pairs line
 /// in the row (values already truncated per [`MAX_TOOL_VALUE_CHARS`]). Cut at
-/// a pair boundary with a trailing "…" so the line can never overflow into
-/// the right-aligned metrics (iced rows do not wrap).
+/// a pair boundary with a trailing "…" so the line can never overflow the
+/// card width (iced rows do not wrap).
 const MAX_TOOL_PAIRS_LINE_CHARS: usize = 104;
 
 /// Maximum display length (Unicode chars) of the visible narration (the
 /// assistant's short reasoning text) on the LIVE state line and its
 /// trace-group label. Truncated at a word/path-delimiter boundary with "…" so
-/// a long narration cannot crowd the row or push the metrics off.
-const MAX_NARRATION_CHARS: usize = 104;
+/// a long narration cannot push the rest of its row (e.g. the metrics) out of
+/// the card. Sized for the 13px narration font: 88 mono chars span the same
+/// pixels as the original 104-char cap did at 11px.
+const MAX_NARRATION_CHARS: usize = 88;
 
 /// Maximum width (px) of the hover tooltip content; long values wrap within it.
 const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
@@ -668,8 +670,10 @@ fn workspace_label_for(
 }
 
 /// Render one running-agent card: role icon (left rail), top status line,
-/// trace groups, and right-aligned metrics (live token count + elapsed time).
-/// The whole card is clickable to expand/collapse the trace groups.
+/// trace groups, and the token / elapsed metrics (right-aligned on the top
+/// row, or right-aligned on the current group's label row when the live line
+/// is empty on an expanded card). The whole card is clickable to expand/collapse
+/// the trace groups.
 ///
 /// Top status line: the live activity phase label, else the current trace
 /// group's visible narration (the assistant's short reasoning text) when
@@ -707,78 +711,70 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     // carries it instead, keeping the reasoning in order below.
     let current_label_suppressed =
         !expanded && matches!(status, LiveStatus::Narration(_) | LiveStatus::Thinking);
-    // Top status line column: the live activity phase label, else the current
-    // trace group's narration, else "thinking…". The narration renders only on
-    // the collapsed card (the expanded card carries it via the current group's
-    // label). Status verbs stay accent; the narration renders neutral.
-    let mut live = Column::new().spacing(4).align_x(Alignment::Start);
-    match status {
-        LiveStatus::Tools => {} // the "current toolcalls" render at the bottom
-        LiveStatus::Activity(activity) => {
-            live = live.push(text(activity.to_owned()).size(11).color(theme::ACCENT));
-        }
+    // The live status slot on the top row: the live activity phase label, else
+    // the current trace group's narration (collapsed cards only), else the
+    // "thinking…" placeholder. Status verbs stay accent; the narration renders
+    // neutral. When the slot is empty the top row is omitted (expanded card
+    // with trace groups) and the metrics render on the current group's label
+    // row instead.
+    let live: Option<Element<'static, RunningMessage>> = match status {
+        LiveStatus::Tools => None, // the "current toolcalls" render at the bottom
+        LiveStatus::Activity(activity) => Some(
+            text(activity.to_owned())
+                .size(13)
+                .color(theme::ACCENT)
+                .into(),
+        ),
         LiveStatus::Narration(narration) => {
-            if !expanded {
-                live = live.push(
+            if expanded {
+                None
+            } else {
+                Some(
                     text(truncate_at_boundary(narration, MAX_NARRATION_CHARS))
-                        .size(11)
+                        .size(13)
                         .font(theme::FONT_BOLD)
-                        .color(theme::TEXT_SECONDARY),
-                );
+                        .color(theme::TEXT_SECONDARY)
+                        .into(),
+                )
             }
         }
         LiveStatus::Thinking => {
             // The expanded card lets the group's "thinking…" label carry this,
             // so the LIVE indicator shows only when no group exists yet.
             if !expanded || groups.is_empty() {
-                live = live.push(render_thinking_indicator());
+                Some(text("thinking…").size(13).color(theme::ACCENT).into())
+            } else {
+                None
             }
         }
-    }
+    };
 
-    // Top row of the content column: the status line plus the right-aligned
-    // token / elapsed metrics. The role icon lives in the left rail beside the
-    // content column.
-    let mut top_row = row![live.width(Length::Fill)]
-        .spacing(8)
-        .align_y(Alignment::Center);
-    // The live token count comes from the published transcript snapshot (the
-    // registry no longer carries a session_tokens mirror). It renders as a
-    // compact count; hovering reveals the label and the exact unrounded value.
-    if let Some(token_count) = snapshot.as_ref().and_then(|s| s.token_count) {
-        top_row = top_row.push(
-            tooltip(
-                text(theme::format_compact_tokens(token_count))
-                    .size(11)
-                    .color(theme::TEXT_SECONDARY),
-                render_metric_tooltip(format!("Session tokens: {token_count}")),
-                tooltip::Position::Top,
-            )
-            .gap(4)
-            .style(theme::tooltip_style),
-        );
-    }
-    // Elapsed time since the agent started; hovering explains the meaning.
-    top_row = top_row.push(
-        tooltip(
-            text(elapsed).size(11).color(theme::TEXT_SECONDARY),
-            render_metric_tooltip("Elapsed run time since the agent started".to_string()),
-            tooltip::Position::Top,
-        )
-        .gap(4)
-        .style(theme::tooltip_style),
-    );
+    let token_count = snapshot.as_ref().and_then(|s| s.token_count);
 
     let mut content = Column::new()
         .spacing(6)
         .align_x(Alignment::Start)
         .width(Length::Fill);
-    content = content.push(top_row);
+    // On an expanded card with trace groups and no live status line, skip the
+    // top row entirely (it would read as a blank line above the activity): the
+    // groups come first and the metrics ride right-aligned on the current
+    // group's label row. Otherwise the top row carries the live status line
+    // (when present) beside the right-aligned metrics.
+    let metrics_on_label = live.is_none() && expanded && !groups.is_empty();
+    if !metrics_on_label {
+        content = content.push(row_with_metrics(
+            live,
+            render_metrics(token_count, &elapsed),
+        ));
+    }
     // Trace groups from the live snapshot (current unless the agent has no
     // transcript yet). Content-only assistant messages (final answers) are
     // deliberately omitted — only tool-call assistant messages form groups.
     if !groups.is_empty() {
-        for group in render_visible_groups(&groups, expanded, current_label_suppressed) {
+        let label_metrics = metrics_on_label.then(|| render_metrics(token_count, &elapsed));
+        for group in
+            render_visible_groups(&groups, expanded, current_label_suppressed, label_metrics)
+        {
             content = content.push(group);
         }
     }
@@ -820,14 +816,74 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     .into()
 }
 
+/// Render a Fill-width row carrying `content` (when present, wrapped in a
+/// Fill-width column so long text wraps within the remaining space; otherwise
+/// a Fill spacer) with `metrics` pinned to the row's right edge.
+fn row_with_metrics(
+    content: Option<Element<'static, RunningMessage>>,
+    metrics: Element<'static, RunningMessage>,
+) -> Element<'static, RunningMessage> {
+    let mut row = Row::new()
+        .width(Length::Fill)
+        .spacing(8)
+        .align_y(Alignment::Center);
+    match content {
+        Some(content) => row = row.push(column![content].width(Length::Fill)),
+        None => row = row.push(Space::new().width(Length::Fill)),
+    }
+    row.push(metrics).into()
+}
+
+/// Render the card's metrics row: the live session-token count (when known)
+/// and the elapsed run time, each as a compact labeled tooltip. Rendered at
+/// the right edge of the top row, or right-aligned on the current group's
+/// label row when an expanded card has no live status line (see
+/// [`render_agent_card`]).
+fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, RunningMessage> {
+    let mut metrics = Row::new().spacing(8).align_y(Alignment::Center);
+    // The live token count comes from the published transcript snapshot (the
+    // registry no longer carries a session_tokens mirror). It renders as a
+    // compact count; hovering reveals the label and the exact unrounded value.
+    if let Some(token_count) = token_count {
+        metrics = metrics.push(
+            tooltip(
+                text(theme::format_compact_tokens(token_count))
+                    .size(11)
+                    .color(theme::TEXT_SECONDARY),
+                render_metric_tooltip(format!("Session tokens: {token_count}")),
+                tooltip::Position::Top,
+            )
+            .gap(4)
+            .style(theme::tooltip_style),
+        );
+    }
+    // Elapsed time since the agent started; hovering explains the meaning.
+    metrics = metrics.push(
+        tooltip(
+            text(elapsed.to_owned())
+                .size(11)
+                .color(theme::TEXT_SECONDARY),
+            render_metric_tooltip("Elapsed run time since the agent started".to_string()),
+            tooltip::Position::Top,
+        )
+        .gap(4)
+        .style(theme::tooltip_style),
+    );
+    metrics.into()
+}
+
 /// Render the visible trace groups for a card: the current (latest) group
 /// always (last, chronologically), plus up to 5 previous groups when the card
 /// is expanded. Returns owned elements. The current group's narration label is
 /// omitted when `current_label_suppressed` is set (see [`render_agent_card`]).
+/// `label_metrics` renders on the current group's label row only (previous
+/// groups never carry metrics) — used when an expanded card's live status line
+/// is empty (see [`render_agent_card`]).
 fn render_visible_groups(
     groups: &[TraceGroup],
     expanded: bool,
     current_label_suppressed: bool,
+    label_metrics: Option<Element<'static, RunningMessage>>,
 ) -> Vec<Element<'static, RunningMessage>> {
     let mut rendered = Vec::new();
     let (current, previous) = groups
@@ -836,34 +892,54 @@ fn render_visible_groups(
     if expanded {
         // The 5 most-recent previous groups, oldest first, then current.
         for group in previous.iter().rev().take(5).rev() {
-            rendered.push(render_trace_group(group, false, true));
+            rendered.push(render_trace_group(group, false, true, None));
         }
     }
     // Current group: newest round expanded, earlier rounds collapsed.
-    rendered.push(render_trace_group(current, true, !current_label_suppressed));
+    rendered.push(render_trace_group(
+        current,
+        true,
+        !current_label_suppressed,
+        label_metrics,
+    ));
     rendered
 }
 
 /// Render one trace group. `expand_current` renders the newest round's calls
 /// expanded (current group); otherwise every call collapses to a name-only
 /// line (previous groups). `show_label` renders the narration label (the short
-/// reasoning text, or the "thinking…" placeholder when empty).
+/// reasoning text, or the "thinking…" placeholder when empty). When
+/// `label_metrics` is [`Some`] the label row also carries the metrics,
+/// right-aligned (see [`render_agent_card`]); otherwise the label renders
+/// alone.
 fn render_trace_group(
     group: &TraceGroup,
     expand_current: bool,
     show_label: bool,
+    label_metrics: Option<Element<'static, RunningMessage>>,
 ) -> Element<'static, RunningMessage> {
+    debug_assert!(
+        label_metrics.is_none() || show_label,
+        "label metrics have nowhere to render without the label row"
+    );
     let mut column = Column::new().spacing(4).align_x(Alignment::Start);
     if show_label {
-        if group.narration.is_empty() {
-            column = column.push(text("thinking…").size(11).color(theme::TEXT_SECONDARY));
+        let label: Element<'static, RunningMessage> = if group.narration.is_empty() {
+            text("thinking…")
+                .size(13)
+                .color(theme::TEXT_SECONDARY)
+                .into()
         } else {
-            column = column.push(
-                text(truncate_at_boundary(&group.narration, MAX_NARRATION_CHARS))
-                    .size(11)
-                    .font(theme::FONT_BOLD)
-                    .color(theme::TEXT_SECONDARY),
-            );
+            text(truncate_at_boundary(&group.narration, MAX_NARRATION_CHARS))
+                .size(13)
+                .font(theme::FONT_BOLD)
+                .color(theme::TEXT_SECONDARY)
+                .into()
+        };
+        if let Some(metrics) = label_metrics {
+            column = column.push(row_with_metrics(Some(label), metrics));
+        } else {
+            column = column.push(label);
         }
     }
 
@@ -1050,27 +1126,11 @@ fn live_status<'a>(h: &'a AgentHandle, groups: &'a [TraceGroup]) -> LiveStatus<'
     }
 }
 
-/// Render the "thinking…" placeholder shown when an agent is alive and
-/// working but has no currently-executing tool and no live activity phase
-/// (the pre-first-tool LLM reasoning window). Static icon + text, styled to
-/// match the surrounding activity label (small accent).
-fn render_thinking_indicator() -> Element<'static, RunningMessage> {
-    row![
-        lucide::loader_circle::<iced::Theme, iced::Renderer>()
-            .size(12)
-            .color(theme::ACCENT),
-        text("thinking…").size(11).color(theme::ACCENT),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center)
-    .into()
-}
-
 /// Render one tool block: the tool name (bold primary) and its comma-separated
 /// key-value pairs (regular secondary) on a single line — `tool args`. The
 /// pairs portion is length-capped ([`MAX_TOOL_PAIRS_LINE_CHARS`]) so the short
-/// tool name plus the args fit on one row without crowding the right-aligned
-/// metrics. The whole block is the hover target of a tooltip showing the FULL
+/// tool name plus the args fit on one row without overflowing the card. The
+/// whole block is the hover target of a tooltip showing the FULL
 /// untruncated argument values.
 fn render_tool_block(
     tool: &crate::agent::registry::RunningTool,
@@ -1876,11 +1936,14 @@ mod tests {
     // ── Page truncation (boundary-aware) ─────────────────────────────
 
     #[test]
-    fn truncation_constants_are_30_percent_larger() {
+    fn truncation_constants_are_pinned() {
+        // The narration cap is sized so that 88 mono chars at the 13px
+        // narration font span the same pixels as 104 chars did at 11px; the
+        // tool-line caps are unchanged (tool text stayed at 11px).
         assert_eq!(MAX_GROUP_LABEL_CHARS, 104);
         assert_eq!(MAX_TOOL_VALUE_CHARS, 26);
         assert_eq!(MAX_TOOL_PAIRS_LINE_CHARS, 104);
-        assert_eq!(MAX_NARRATION_CHARS, 104);
+        assert_eq!(MAX_NARRATION_CHARS, 88);
     }
 
     #[test]
