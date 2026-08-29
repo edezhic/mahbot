@@ -1790,7 +1790,8 @@ impl BoardState {
             .into()
     }
 
-    /// Render the modal header: title, ticket ID, phase badge, action icons, and metadata lines.
+    /// Render the modal header: title row, ticket ID + created/updated metadata
+    /// (with optional prerequisites/supersedes line below), then badges + action icons.
     fn render_header_metadata(
         ticket: &Ticket,
         is_action_disabled: bool,
@@ -1802,6 +1803,11 @@ impl BoardState {
         let updated = theme::format_timestamp(&ticket.updated_at);
 
         let meta_els: Vec<Element<'_, BoardMessage>> = vec![
+            text(&ticket.id)
+                .size(12)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+            text(" · ").size(12).color(theme::TEXT_SECONDARY).into(),
             text(format!("Created: {created}"))
                 .size(12)
                 .color(theme::TEXT_SECONDARY)
@@ -1859,8 +1865,7 @@ impl BoardState {
                 ),
             ]
             .align_y(Alignment::Center),
-            text(&ticket.id).size(12).color(theme::TEXT_SECONDARY),
-            Space::new().height(6),
+            metadata_block,
             {
                 let mut badges = vec![
                     Self::priority_badge(ticket.priority, 12, [2, 8]),
@@ -1876,7 +1881,6 @@ impl BoardState {
                     .spacing(8)
                     .padding([4, 0])
             },
-            metadata_block,
         ]
         .spacing(4)
         .into()
@@ -2027,7 +2031,7 @@ impl BoardState {
             return None;
         }
 
-        let mut cmt_col = Column::new().spacing(4);
+        let mut cmt_col = Column::new().spacing(12);
         for (i, comment) in ticket.comments.iter().enumerate().rev() {
             let role_colors = theme::role_badge_color(&comment.role);
 
