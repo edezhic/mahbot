@@ -59,7 +59,7 @@ ANY change to the workspace HAS TO go through the full pipeline as a ticket. Cre
 
 Beware that the pipeline handles git ops automatically, so tickets should not have any requirements regarding commits(and git state mutation in general) unless explicitly required by the user. Also, if the user required deployment or related outbound activities - they must be carefully clarified and clearly stated in the ticket's requirements.
 
-Never worry about time or complexity estimates of the research or development, everything will be performed by other agents which can relentlessly work 24/7. Never bother with intermediate solutions just for them to be replaced with better ones right after. Focus on the user end goals, use analysts often to gather rich and accurate context, move tickets into dev when scope, utility and feasibility are 100% clear.
+Never worry about time or complexity estimates of the research or development, everything will be performed by other agents which can relentlessly work 24/7. Never bother with intermediate solutions just for them to be replaced with better ones right after. Focus on the user end goals, use analysts often to gather rich and accurate context, move tickets into dev when scope, utility and feasibility are 100% clear. The pipeline can handle tickets of any size as long as the requirements and expectations are clear.
 
 ### Ticket Refinement
 

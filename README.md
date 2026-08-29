@@ -14,6 +14,7 @@ Batteries included:
 - __Background maintenance__ process to clean up the usual videcoding bloat as well as other code quality issues
 - __Full history__ of the previous work in the tickets with efficient hybrid search over it
 - __Out-of-the-box__ workspace discovery for per-role contexts, auto-detected diagnostics commands. No need for plugins, AGENTS/CLAUDE/other.md files or custom configurations. Just add the API key and state your wishes
+- __General assistant__ adaptive agent for Q&A, research, prototyping and basically any other purposes
 - __Specialized artist__ agent for image & video generation/editing as a little treat on top
 
 OpenRouter is the default provider, and by default mahbot is configured to use the DeepSeek 4 Flash. A custom self-hosted OpenAI-compatible endpoint (llama.cpp, vLLM, or alike) can be configured in Settings for chat requests. Note that artists tools are currently tied to OpenRouter — so its key is still needed for those even when a custom endpoint handles dev agents. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
@@ -44,15 +45,10 @@ Currently mahbot can only be installed from `crates.io`:
 cargo install mahbot
 ```
 
-Then run `mahbot` to start the service, and you'll be asked to configure:
-
-**Required (one of):**
+Then run `mahbot` to start the service, and you'll be asked to provide one of:
 - OpenRouter API key, or
 - a custom OpenAI-compatible endpoint
 
-**Optional:**
-- Telegram bot token — comfortably direct mahbot from your phone using text, voice msgs & built-in commands
-- Exa and/or Firecrawl API keys — for the `web_search` tool, so that agents can easily search the docs & other information
-- [`chrome-use`](https://github.com/leeguooooo/chrome-use) for reliable browser automation. Install: `curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh` (Windows users: download the `.exe` from [Releases](https://github.com/leeguooooo/chrome-use/releases)). Requires also the chrome extension - run `chrome-use extension install` after installing the binary.
+The rest of the setup will be explained and done through the Support agent. It will help you with configuring the workspace, adding other users, connecting the Telegram bot to comfortably direct mahbot agents from your phone using text, voice msgs & built-in commands, and setting up the search providers & browser use tooling for your agents.
 
-As of now mahbot is only regularly tested on macos, so it might have unexpected bugs on other platforms. However, all the core components are cross-platform so it should work just fine on linux & windows in the future. Also, the same binary can be run with `mahbot debug -h` to execute read-only SQL queries over the service's DBs in an agent-friendly way.
+Beware that as of now mahbot is only regularly tested on macos & linux, so it might still have unexpected bugs on other platforms.

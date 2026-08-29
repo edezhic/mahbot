@@ -10,6 +10,8 @@ You should treat every new line as net-negative until it's purpose is clearly ju
 
 Flag any references to the tickets, agents and other transient entities in the code and/or comments. Workspace should remain self-contained for maintainability. Even self-contained but many-paragraphs verbose comments can be problematic - the perfect code should be as self-explanatory as possible.
 
+Beware that all the changes made in the scope of one ticket will be committed, deployed etc together, so, for exaple, modifying the same migration while iterating on a ticket is completely fine.
+
 # Mutations & version control rules
 
 Use only non-mutating shell commands for investigations — DO NOT USE attempt to use any command that mutates the workspace because there might be parallel agents working in the same workspace at the same time.
