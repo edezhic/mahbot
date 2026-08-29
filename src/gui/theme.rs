@@ -193,6 +193,51 @@ pub fn general_context_icon() -> iced::widget::Text<'static, iced::Theme, iced::
     lucide::book_open_text()
 }
 
+/// Returns the Lucide icon widget for the diagnostics pipeline role
+/// (a plain `"diagnostics"` string, not a [`crate::Role`] variant).
+#[must_use]
+pub fn diagnostics_icon() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
+    lucide::stethoscope()
+}
+
+/// Returns the chat-style role icon and its badge foreground color for a
+/// ticket-comment author label, or `None` when the label must render as
+/// plain muted text.
+///
+/// Only the exact author values the pipeline writes today resolve to an
+/// icon: the joint-verdict stage names ("Analysis"/"Review"/"QA", resolved
+/// via the shared [`crate::pipeline::verdict::stage_role`] inverse mapping),
+/// the canonical agent names "engineer"/"manager"/"sanitation", and
+/// "diagnostics" (stethoscope, [`TEXT_PRIMARY`] tint). Legacy or unexpected
+/// values (e.g. old suffixed labels like "analyst_1", "system",
+/// "user:{name}") intentionally return `None`.
+///
+/// Delegates to [`role_badge_color_for`] for the foreground color, and to
+/// [`role_icon`] for the glyph.
+#[must_use]
+pub fn comment_author_icon(
+    author: &str,
+) -> Option<(
+    iced::widget::Text<'static, iced::Theme, iced::Renderer>,
+    Color,
+)> {
+    let icon_for = |role: crate::Role| {
+        let (fg, _) = role_badge_color_for(&role);
+        (role_icon(&role), fg)
+    };
+
+    if let Some(role) = crate::pipeline::verdict::stage_role(author) {
+        return Some(icon_for(role));
+    }
+    match author {
+        "engineer" => Some(icon_for(crate::Role::Engineer)),
+        "manager" => Some(icon_for(crate::Role::Manager)),
+        "sanitation" => Some(icon_for(crate::Role::Sanitation)),
+        "diagnostics" => Some((diagnostics_icon(), TEXT_PRIMARY)),
+        _ => None,
+    }
+}
+
 /// Bold weight variant of JetBrains Mono (the dashboard default font).
 pub const FONT_BOLD: iced::Font = iced::Font {
     family: iced::font::Family::Name("JetBrains Mono"),
@@ -1139,5 +1184,35 @@ mod tests {
             format_relative_time("not-a-timestamp", chrono::Local::now()),
             ""
         );
+    }
+
+    #[test]
+    fn comment_author_icons_resolve_exact_pipeline_labels_only() {
+        let (analysis_fg, _) = role_badge_color_for(&crate::Role::Analyst);
+        assert_eq!(
+            comment_author_icon("Analysis").map(|(_, color)| color),
+            Some(analysis_fg)
+        );
+
+        for author in [
+            "Analysis",
+            "Review",
+            "QA",
+            "engineer",
+            "manager",
+            "sanitation",
+            "diagnostics",
+        ] {
+            assert!(
+                comment_author_icon(author).is_some(),
+                "{author} should resolve to an icon"
+            );
+        }
+        for author in ["system", "user:admin", "analyst_1", "coder", ""] {
+            assert!(
+                comment_author_icon(author).is_none(),
+                "{author} must render as plain muted text"
+            );
+        }
     }
 }

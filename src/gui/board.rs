@@ -15,7 +15,7 @@ use iced_fonts::lucide;
 
 use super::common::MAX_INPUT_CHARS;
 use super::theme;
-use super::widgets::{self, badge_pill, diff_stats_row, role_badge, selectable_text};
+use super::widgets::{self, badge_pill, diff_stats_row, selectable_text};
 
 /// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
@@ -1769,7 +1769,7 @@ impl BoardState {
             sections.push(Space::new().height(12).into());
             sections.push(
                 text("Comments:")
-                    .size(13)
+                    .size(15)
                     .color(theme::TEXT_SECONDARY)
                     .into(),
             );
@@ -1793,6 +1793,18 @@ impl BoardState {
             .into()
     }
 
+    /// Relative timestamp label falling back to the absolute format when the
+    /// stored timestamp is unparseable ([`theme::format_relative_time`]
+    /// yields an empty string then).
+    fn relative_timestamp(ts: &str) -> String {
+        let relative = theme::format_relative_time(ts, chrono::Local::now());
+        if relative.is_empty() {
+            theme::format_timestamp(ts)
+        } else {
+            relative
+        }
+    }
+
     /// Render the modal header: title row, ticket ID + created/updated metadata
     /// (with optional prerequisites/supersedes line below), then badges + action icons.
     fn render_header_metadata(
@@ -1802,8 +1814,8 @@ impl BoardState {
         let actions = Self::available_actions(ticket.phase);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
-        let created = theme::format_timestamp(&ticket.created_at);
-        let updated = theme::format_timestamp(&ticket.updated_at);
+        let created = Self::relative_timestamp(&ticket.created_at);
+        let updated = Self::relative_timestamp(&ticket.updated_at);
 
         let meta_els: Vec<Element<'_, BoardMessage>> = vec![
             text(&ticket.id)
@@ -1850,24 +1862,10 @@ impl BoardState {
         };
 
         column![
-            row![
-                text(&ticket.title)
-                    .size(16)
-                    .color(theme::TEXT_PRIMARY)
-                    .font(theme::FONT_BOLD),
-                Space::new().width(Length::Fill),
-                widgets::icon_tooltip_button(
-                    lucide::x::<iced::Theme, iced::Renderer>()
-                        .size(16)
-                        .color(theme::TEXT_SECONDARY),
-                    "close",
-                    Some(BoardMessage::CloseModal),
-                    button::DEFAULT_PADDING,
-                    theme::button_text,
-                    tooltip::Position::Top,
-                ),
-            ]
-            .align_y(Alignment::Center),
+            text(&ticket.title)
+                .size(16)
+                .color(theme::TEXT_PRIMARY)
+                .font(theme::FONT_BOLD),
             metadata_block,
             {
                 let mut badges = vec![
@@ -1987,13 +1985,20 @@ impl BoardState {
                 .style(theme::scrollbar_style),
             )
             .width(Length::Fill)
-            .padding(8)
-            .style(theme::surface_card_style)
+            .padding(10)
+            .style(theme::bubble_style(
+                theme::BG_SURFACE,
+                Some(theme::TEXT_PRIMARY),
+            ))
             .into()
         } else {
             container(selectable_text(&ticket.description, theme::TEXT_PRIMARY).size(13))
-                .padding(8)
-                .style(theme::surface_card_style)
+                .width(Length::Fill)
+                .padding(10)
+                .style(theme::bubble_style(
+                    theme::BG_SURFACE,
+                    Some(theme::TEXT_PRIMARY),
+                ))
                 .into()
         })
     }
@@ -2022,7 +2027,7 @@ impl BoardState {
         .into()
     }
 
-    /// Render the comments list: per-comment role badge, timestamp, content,
+    /// Render the comments list: per-comment chat-style author header, content,
     /// and diagnostics expand/collapse toggle.
     /// Returns `None` when the ticket has no comments.
     fn render_comments<'a>(
@@ -2036,8 +2041,6 @@ impl BoardState {
 
         let mut cmt_col = Column::new().spacing(12);
         for (i, comment) in ticket.comments.iter().enumerate().rev() {
-            let role_colors = theme::role_badge_color(&comment.role);
-
             // For diagnostics comments, optionally show only the summary
             let is_diag = comment.role == crate::agent::role::DIAGNOSTICS_ROLE;
             let is_expanded = expanded.contains(&i);
@@ -2097,17 +2100,23 @@ impl BoardState {
                 None
             };
 
+            let author_el: Element<'_, BoardMessage> =
+                if let Some((icon, color)) = theme::comment_author_icon(&comment.role) {
+                    icon.size(14).color(color).into()
+                } else {
+                    // User comments show the bare user name; "system" and
+                    // legacy labels render as plain muted text.
+                    let label = comment.role.strip_prefix("user:").unwrap_or(&comment.role);
+                    text(label).size(11).color(theme::TEXT_MUTED).into()
+                };
+            let mut header = row![author_el].align_y(Alignment::Center).spacing(6);
+            let ts = theme::format_relative_time(&comment.created_at, chrono::Local::now());
+            if !ts.is_empty() {
+                header = header.push(text(ts).size(11).color(theme::TEXT_MUTED));
+            }
+
             let mut comment_col = Column::new().spacing(4);
-            comment_col = comment_col.push(
-                row![
-                    role_badge(comment.role.clone(), role_colors, 20, [2, 12], false),
-                    Space::new().width(8),
-                    text(theme::format_timestamp(&comment.created_at))
-                        .size(10)
-                        .color(theme::TEXT_SECONDARY),
-                ]
-                .align_y(Alignment::Center),
-            );
+            comment_col = comment_col.push(header);
             comment_col = comment_col.push(comment_content);
             if let Some(btn) = toggle_button {
                 comment_col = comment_col.push(btn);
@@ -2116,8 +2125,11 @@ impl BoardState {
             cmt_col = cmt_col.push(
                 container(comment_col)
                     .width(Length::Fill)
-                    .padding(8)
-                    .style(theme::surface_card_style),
+                    .padding(10)
+                    .style(theme::bubble_style(
+                        theme::BG_SURFACE,
+                        Some(theme::TEXT_PRIMARY),
+                    )),
             );
         }
 

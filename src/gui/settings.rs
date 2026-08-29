@@ -1868,7 +1868,9 @@ impl SettingsState {
                                     tooltip::Position::Top,
                                 ));
                                 left = left.push(widgets::icon_tooltip_button(
-                                    text("Diag").size(11).color(theme::TEXT_MUTED),
+                                    theme::diagnostics_icon()
+                                        .size(11)
+                                        .color(theme::TEXT_PRIMARY),
                                     "Diagnostics commands",
                                     Some(SettingsMessage::WorkspaceMsg(
                                         workspaces::WorkspacesMessage::ShowDiagnostics(
