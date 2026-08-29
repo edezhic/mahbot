@@ -15,8 +15,8 @@ use crate::config::{
     CONFIG, CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY,
     CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
     CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_TTS_ENABLED,
-    CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL, CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER,
-    CONFIG_KEY_WORKER_MODEL, ConfigData, ModelRouting,
+    CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL, ConfigData,
+    ModelRouting,
 };
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
@@ -435,7 +435,6 @@ const TEXT_INPUT_KEYS: &[&str] = &[
     CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_MANAGER_MODEL,
     CONFIG_KEY_WORKER_MODEL,
-    CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
 ];
 
 /// Config keys rendered as discrete controls (toggles / pick lists) that
@@ -2881,18 +2880,11 @@ impl SettingsState {
             CONFIG_KEY_WORKER_MODEL,
             Some("Artist, Analyst, Coder, QA, Reviewer, Maintainer, Sanitation"),
         );
-        let video_transcription_row = self.config_text_field(
-            "Video Transcription",
-            crate::config::DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
-            CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
-            None,
-        );
         section(
             "Models",
             column![
                 manager_row,
                 worker_row,
-                video_transcription_row,
                 Space::new().height(12),
                 text("Image Generation")
                     .size(13)
@@ -3451,7 +3443,7 @@ impl SettingsState {
     fn routing_section(&self) -> Element<'_, SettingsMessage> {
         // The two routable model slots (manager and worker) — saved routing
         // rows for models outside these slots are not rendered (they are inert
-        // orphans). The video-transcription model never consults routing.
+        // orphans).
         let model_names = routing_slots(&self.config);
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();

@@ -11,7 +11,7 @@ pub(crate) mod transcribe;
 
 pub(crate) use reasoning::plaintext_for_display;
 
-use crate::config::{CONFIG, normalize_endpoint_url, resolve_or, trimmed_or_none};
+use crate::config::{CONFIG, normalize_endpoint_url, trimmed_or_none};
 use crate::util::UnwrapPoison;
 pub(crate) use crate::{ChatRequest, ChatResponse, Provider};
 
@@ -331,20 +331,7 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData, background_
     }
 }
 
-/// Rebuild only the media transcriber singleton from the current `CONFIG`.
-///
-/// Used by the settings page's per-field autosave when the video transcription
-/// model slot settles — the media transcriber captures its model at build
-/// time, so a change must rebuild it, but no provider warmup (network call) is
-/// needed: the provider itself is unaffected by this setting.
-pub(crate) fn recreate_media_transcriber() {
-    let config = CONFIG.snapshot();
-    let transcriber = build_media_transcriber(&config);
-    *MEDIA_TRANSCRIBER.write().unwrap_poison() = transcriber;
-    tracing::info!("Media transcriber recreated from updated config");
-}
-
-/// Get the global media transcriber, if a vision model is configured
+/// Get the global media transcriber, if a provider key is configured
 /// (used for video transcription).
 #[must_use]
 pub(crate) fn media_transcriber() -> Option<MediaTranscriber> {
@@ -467,42 +454,19 @@ pub(crate) fn create_provider(api_key: Option<&str>, endpoint: Option<&str>) -> 
     Box::new(base)
 }
 
-/// Build the media transcriber from flat config options.
-#[must_use]
-fn create_transcriber(
-    api_url: Option<&str>,
-    api_key: Option<&str>,
-    model: Option<&str>,
-) -> Option<MediaTranscriber> {
-    api_key.and_then(trimmed_or_none)?;
-    let model = model.and_then(trimmed_or_none)?;
-    let base_url = api_url
-        .unwrap_or(crate::config::DEFAULT_PROVIDER_ENDPOINT)
-        .to_string();
-    Some(MediaTranscriber::new(base_url, model))
-}
-
 /// Build the media transcriber from a config snapshot (synchronous, no I/O).
 ///
-/// The transcriber captures its endpoint and model at build time, so a change
-/// to either config field requires a rebuild. Returns `None` when no API key
-/// is configured (no video transcription possible). Shared by the
-/// boot/`recreate_all` path ([`build_provider_and_transcriber`]) and the
-/// per-field transcription autosave ([`recreate_media_transcriber`]).
+/// The video-transcription model is hardcoded (`VIDEO_TRANSCRIPTION_MODEL`) and
+/// media always targets the default OpenRouter endpoint regardless of a custom
+/// chat endpoint; the request never carries a routing block. Returns `None`
+/// when no API key is configured (no video transcription possible).
 #[must_use]
 fn build_media_transcriber(config: &crate::config::ConfigData) -> Option<MediaTranscriber> {
-    // Media always targets the default OpenRouter endpoint regardless of a
-    // custom chat endpoint. The video-transcription slot never
-    // consults provider routing — the request carries no routing block.
-    let model = resolve_or(
-        config.video_transcription_model.clone(),
-        crate::config::DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
-    );
-    create_transcriber(
-        Some(crate::config::DEFAULT_PROVIDER_ENDPOINT),
-        config.provider_key.as_deref(),
-        Some(model.as_str()),
-    )
+    config.provider_key.as_deref().and_then(trimmed_or_none)?;
+    Some(MediaTranscriber::new(
+        crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string(),
+        crate::config::VIDEO_TRANSCRIPTION_MODEL.to_string(),
+    ))
 }
 
 // ── Tests ─────────────────────────────────────────────────────

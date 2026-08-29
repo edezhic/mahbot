@@ -22,9 +22,9 @@
 //!
 //! `config_kv` table → hardcoded default (`const` in this module)
 //!
-//! Both the fields listed in the `string_config_fields!` invocation and the three
-//! model slots (`manager_model`, `worker_model`, `video_transcription_model`)
-//! live in the `config_kv` table. Their accessor methods (generated on
+//! Both the fields listed in the `string_config_fields!` invocation and the two
+//! model slots (`manager_model`, `worker_model`) live in the `config_kv` table.
+//! Their accessor methods (generated on
 //! [`ConfigReload`]) each follow a per-field annotation:
 //!
 //! * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
@@ -56,14 +56,13 @@
 //!
 //! ### Model slots
 //!
-//! The three model slots share the `config_kv` storage of the ordinary fields
+//! The two model slots share the `config_kv` storage of the ordinary fields
 //! above, but [`ConfigReload::role_model`] maps every role onto exactly one of
 //! them:
 //!
 //! > Manager group (`Role::Manager`, `Role::Assistant`, `Role::Discovery`,
 //! > `Role::Engineer`) → manager slot; every other role (Artist, Analyst,
-//! > Coder, QA, Reviewer, Maintainer, Sanitation) → worker slot. The
-//! > video-transcription slot backs only video transcription — no role uses it.
+//! > Coder, QA, Reviewer, Maintainer, Sanitation) → worker slot.
 //!
 //! Unset slots fall back to their `DEFAULT_*_MODEL` constant.
 //!
@@ -127,7 +126,9 @@ pub(crate) const DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-vision
 // the one-time migration in `migrate_old_default_models`.
 const OLD_DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-pro-0813";
 const OLD_DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
-pub(crate) const DEFAULT_VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.7-flash";
+// Video-transcription model is fixed (not user-configurable) and always
+// targets OpenRouter.
+pub(crate) const VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.8-flash";
 
 const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
 const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
@@ -241,8 +242,6 @@ pub struct ConfigData {
     /// Model slot for all worker roles (Artist, Analyst, Coder, QA,
     /// Reviewer, Maintainer, Sanitation).
     pub worker_model: Option<String>,
-    /// Model slot for video transcription (no role uses it).
-    pub video_transcription_model: Option<String>,
     /// Image generation model.
     pub image_gen_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
@@ -546,7 +545,6 @@ string_config_fields! {
     provider_endpoint_key [non_empty],
     manager_model [or(DEFAULT_MANAGER_MODEL)],
     worker_model [or(DEFAULT_WORKER_MODEL)],
-    video_transcription_model [or(DEFAULT_VIDEO_TRANSCRIPTION_MODEL)],
     image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
     image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
     video_model [or(DEFAULT_VIDEO_MODEL)],
@@ -906,9 +904,9 @@ impl ConfigReload {
             })
     }
 
-    // ── Role model resolution (three slots) ─────────────────────
+    // ── Role model resolution (two slots) ─────────────────────
 
-    /// Resolve the configured model for a role from the three model slots.
+    /// Resolve the configured model for a role from the two model slots.
     ///
     /// The manager group (Manager, Assistant, Discovery, Engineer, Support)
     /// uses the manager slot; every other role (Artist, Analyst, Coder, QA,
@@ -1074,7 +1072,7 @@ async fn seed_fresh_install_defaults_from_flag(
 /// `config_kv` rows that still hold the *previous* manager/worker default
 /// model to the new vision-capable default. Matching is exact on the full
 /// provider-prefixed string, so only rows the user never overrode are
-/// touched; the video-transcription slot and every other key are untouched.
+/// touched; every other key is untouched.
 /// Safe to run on every boot — a no-op once no row matches.
 async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Result<()> {
     let changed_manager = store
@@ -1121,29 +1119,12 @@ pub async fn reload_from_db() -> Result<()> {
     migrate_old_default_models(store).await?;
 
     let kvs = store.get_all_kv().await?;
-    let mut unknown_garbage_keys: Vec<String> = Vec::new();
     for (key, value) in &kvs {
         if !config.set_string_field(key, value) {
             tracing::debug!(key, "Unknown config key, ignoring");
-            // Preserved shared namespaces — leave untouched.
-            if key != crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY
-                && !key.starts_with(crate::channels::telegram::ROLE_PIN_KV_PREFIX)
-            {
-                unknown_garbage_keys.push(key.clone());
-            }
         }
     }
-    if !unknown_garbage_keys.is_empty() {
-        tracing::debug!(keys=?unknown_garbage_keys, "Purging unknown config_kv orphans");
-    }
-    for key in unknown_garbage_keys {
-        match store.delete_kv(&key).await {
-            Ok(()) => tracing::debug!(key, "Purged unknown config_kv orphan"),
-            Err(e) => {
-                tracing::warn!(key, error=%e, "Failed to purge unknown config_kv orphan (transient, ignoring)");
-            }
-        }
-    }
+    purge_unknown_kv_orphans(store, &kvs).await;
 
     let routings = store.get_all_model_routings().await?;
     config.model_routings = routings;
@@ -1155,6 +1136,35 @@ pub async fn reload_from_db() -> Result<()> {
     CONFIG.swap(config);
     tracing::info!("Config reloaded from DB");
     Ok(())
+}
+
+/// Delete `config_kv` rows whose keys are no longer recognized config fields
+/// (e.g. a setting removed in an upgrade), so stale values cannot resurface if
+/// the key is ever reintroduced. Preserved shared namespaces written by other
+/// subsystems — the nightly-discovery marker and Telegram role pins — are left
+/// untouched. Delete failures are logged and tolerated (transient, retried on
+/// the next reload).
+async fn purge_unknown_kv_orphans(store: &crate::config_db::ConfigStore, kvs: &[(String, String)]) {
+    let orphans: Vec<String> = kvs
+        .iter()
+        .filter(|(key, _)| {
+            !ConfigData::STRUCT_FIELDS_DEFAULT.has_string_field(key)
+                && key != crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY
+                && !key.starts_with(crate::channels::telegram::ROLE_PIN_KV_PREFIX)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    if !orphans.is_empty() {
+        tracing::debug!(keys=?orphans, "Purging unknown config_kv orphans");
+    }
+    for key in orphans {
+        match store.delete_kv(&key).await {
+            Ok(()) => tracing::debug!(key, "Purged unknown config_kv orphan"),
+            Err(e) => {
+                tracing::warn!(key, error=%e, "Failed to purge unknown config_kv orphan (transient, ignoring)");
+            }
+        }
+    }
 }
 
 // ── Per-field persistence (settings-page autosave) ─────────────────
@@ -1334,13 +1344,6 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
             }
             write_kv_and_update_config(CONFIG_KEY_IMAGE_GEN_MODEL, &trimmed).await?;
         }
-        // Video transcription model changes rebuild the media transcriber (no
-        // provider warmup — the provider is unaffected by this) — the
-        // transcriber captures the model at build time.
-        CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL => {
-            write_kv_and_update_config(key, &trimmed).await?;
-            crate::providers::recreate_media_transcriber();
-        }
         // Everything else is read dynamically at use time — persist only.
         _ => {
             write_kv_and_update_config(key, &trimmed).await?;
@@ -1379,8 +1382,7 @@ async fn probe_validate_write(key: &str, trimmed: &str) -> Result<ConfigData> {
 /// Persist a settled per-model routing `provider_order` (`""` clears it).
 ///
 /// Returns the canonical order value. Routing applies only to the manager and
-/// worker model slots — the video-transcription model never consults routing,
-/// so persisting a routing row for it is a no-op for the transcriber.
+/// worker model slots.
 pub async fn persist_settled_routing_order(model: &str, order: &str) -> Result<String> {
     let _guard = persist_lock().lock().await;
     let order = trimmed_or_none(order);
@@ -1607,11 +1609,6 @@ mod tests {
             reload.worker_model(),
             DEFAULT_WORKER_MODEL,
             "unset worker_model falls back to default"
-        );
-        assert_eq!(
-            reload.video_transcription_model(),
-            DEFAULT_VIDEO_TRANSCRIPTION_MODEL,
-            "unset video_transcription_model falls back to default"
         );
 
         // ── or: persisted provider_endpoint is honored (custom endpoint) ──
@@ -1989,7 +1986,6 @@ mod tests {
             CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
             CONFIG_KEY_TELEGRAM_BOT_TOKEN,
             CONFIG_KEY_IMAGE_GEN_MODEL,
-            CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL,
             CONFIG_KEY_WAKE_WORD_TEMPLATES,
         ] {
             assert!(
@@ -2116,8 +2112,8 @@ mod tests {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
 
         // Existing-install snapshot at the time of the default swap: both slots
-        // still hold the previous defaults; the video-transcription slot and an
-        // unrelated key must remain untouched.
+        // still hold the previous defaults; a stale video-transcription row and
+        // an unrelated key remain untouched.
         store
             .set_kv(CONFIG_KEY_MANAGER_MODEL, OLD_DEFAULT_MANAGER_MODEL)
             .await
@@ -2127,7 +2123,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .set_kv(CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL, "qwen/qwen3.7-flash")
+            .set_kv("video_transcription_model", "qwen/qwen3.7-flash")
             .await
             .unwrap();
         store
@@ -2157,12 +2153,12 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_kv(CONFIG_KEY_VIDEO_TRANSCRIPTION_MODEL)
+                .get_kv("video_transcription_model")
                 .await
                 .unwrap()
                 .as_deref(),
             Some("qwen/qwen3.7-flash"),
-            "the video-transcription slot must never be touched"
+            "migrate only rewrites manager/worker old-default rows"
         );
         assert_eq!(
             store
@@ -2193,6 +2189,57 @@ mod tests {
                 .as_deref(),
             Some(DEFAULT_WORKER_MODEL),
             "re-running the migration must be a no-op"
+        );
+    }
+
+    /// Regression for the retired `video_transcription_model` slot: a row
+    /// persisted by a pre-hardcode install must be deleted by the reload-time
+    /// orphan purge, so a stale stored value can never resurface if the key is
+    /// ever reintroduced. Known keys and preserved shared namespaces survive.
+    #[tokio::test]
+    async fn purge_unknown_kv_orphans_deletes_stale_video_transcription_row() {
+        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+        store
+            .set_kv("video_transcription_model", "qwen/qwen3.7-flash")
+            .await
+            .unwrap();
+        store
+            .set_kv(CONFIG_KEY_PROVIDER_KEY, "sk-example")
+            .await
+            .unwrap();
+        store
+            .set_kv(
+                crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY,
+                "2026-08-29",
+            )
+            .await
+            .unwrap();
+
+        let kvs = store.get_all_kv().await.unwrap();
+        purge_unknown_kv_orphans(&store, &kvs).await;
+
+        assert_eq!(
+            store.get_kv("video_transcription_model").await.unwrap(),
+            None,
+            "the stale video-transcription row must be purged"
+        );
+        assert_eq!(
+            store
+                .get_kv(CONFIG_KEY_PROVIDER_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sk-example"),
+            "known config keys must survive the purge"
+        );
+        assert_eq!(
+            store
+                .get_kv(crate::workspace::NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("2026-08-29"),
+            "preserved shared namespaces must survive the purge"
         );
     }
 
