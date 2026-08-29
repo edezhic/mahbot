@@ -968,19 +968,6 @@ pub(crate) fn truncate_workspace_notes(s: &str) -> String {
 }
 
 impl WorkspaceStore {
-    /// Run a query that returns zero-or-one workspace row, mapping the result to
-    /// `Ok(Some(ws))` / `Ok(None)` / `Err`.
-    async fn query_one(
-        &self,
-        where_clause: &str,
-        params: impl db::IntoParams + Send + 'static,
-    ) -> Result<Option<Workspace>> {
-        let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE {where_clause}");
-        self.conn
-            .query_optional(&sql, params, workspace_from_row)
-            .await
-    }
-
     /// Run an UPDATE on `workspaces` that sets `set_clause` plus
     /// `updated_at = now` for a single named row — mirrors the ticket-update
     /// helper in `board.rs` to keep placeholder numbering uniform.
@@ -1043,7 +1030,7 @@ impl WorkspaceStore {
     /// List all workspaces ordered by name.
     pub async fn list(&self) -> Result<Vec<Workspace>> {
         self.conn
-            .query_map_strict(
+            .query_map_strict_cached(
                 &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces ORDER BY name"),
                 db::params![],
                 workspace_from_row,
@@ -1074,7 +1061,13 @@ impl WorkspaceStore {
 
     /// Look up a workspace by name.
     pub async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
-        self.query_one("name = ?1", db::params![name]).await
+        self.conn
+            .query_optional_cached(
+                &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE name = ?1"),
+                db::params![name],
+                workspace_from_row,
+            )
+            .await
     }
 
     /// Delete a workspace by name. Context rows are cascaded automatically.

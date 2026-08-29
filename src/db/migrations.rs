@@ -381,6 +381,15 @@ USING fts (title) WITH (tokenizer = 'ngram');";
 const DELTA_BOARD_ACTIVE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_board_active ON tickets \
 (is_archived, priority ASC, created_at DESC);";
 
+/// Index backing the pipeline poll loop's claim and dispatch snapshot queries.
+/// The equality prefix `(workspace_name, phase, is_archived)` serves the
+/// pipeline-occupancy subqueries, both claim statements, and the working-phase
+/// snapshot; the trailing `priority ASC, created_at DESC` matches the
+/// snapshot's ORDER BY so live rows come out index-ordered instead of scanning
+/// thousands of archived rows.
+const DELTA_TICKETS_WORKSPACE_PHASE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_workspace_phase \
+ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);";
+
 /// `grep_telemetry` is the sole 0.4.2→current logs delta.
 const DELTA_GREP_TELEMETRY: &str = "\
 CREATE TABLE IF NOT EXISTS grep_telemetry (
@@ -698,6 +707,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "21",
         target: TargetDb::Core,
         body: MigrationBody::Rust(rewrite_analysis_verdicts),
+    },
+    // Index backing the pipeline poll loop's claim + dispatch snapshot queries.
+    Migration {
+        id: "22",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(DELTA_TICKETS_WORKSPACE_PHASE_INDEX),
     },
 ];
 
@@ -1489,6 +1504,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
             "15",
             "16",
             "19",
+            "22",
         ] {
             assert!(
                 applied_ids(&conn).await.contains(&id.to_string()),

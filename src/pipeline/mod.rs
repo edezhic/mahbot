@@ -346,81 +346,73 @@ async fn pickup_claim(ws: &Workspace) -> Option<(i64, bool)> {
 /// Create a phase job (and spawn its body) for every ticket in a working phase
 /// that has no launched phase job. The unique `(kind, ticket_id)` index makes
 /// the create-once claim atomic.
+///
+/// Uses a single snapshot of the working-phase tickets
+/// ([`board::list_working_tickets`]) per poll tick, then iterates them in
+/// phase-major dispatch order.
 async fn dispatch_working_phases(ws: &Workspace) {
     let conn = &crate::session::store().conn;
-    for phase in [
-        TicketPhase::Analysis,
-        TicketPhase::InDevelopment,
-        TicketPhase::InDiagnostics,
-        TicketPhase::InReview,
-        TicketPhase::InQa,
-        TicketPhase::InSanitation,
-    ] {
-        let tickets = match board()
-            .list_all_tickets(Some(ws.name.as_str()), Some(phase))
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(workspace = %ws.name, phase = %phase, error = %e, "Failed to list phase tickets");
-                continue;
-            }
-        };
-        for ticket in tickets {
-            match crate::jobs::find_phase_job(conn, &ticket.id, phase).await {
-                Ok(Some(job)) => {
-                    // Re-drive a phase job whose body is NOT running: a crash
-                    // or a pause-freeze leaves the job in place with no launched
-                    // agents and no live body. The registry claim is atomic, so
-                    // only one poll tick respawns the body.
-                    let has_agents = crate::jobs::job_has_launched_agents(conn, &job.id)
-                        .await
-                        .unwrap_or(true);
-                    if has_agents {
-                        continue;
-                    }
-                    if !claim_phase_body(&job.id) {
-                        continue;
-                    }
-                    info!(ticket = %ticket.id, phase = %phase, job = %job.id, "Re-driving idle phase job");
-                    spawn_phase_body(phase, Arc::new(ticket), ws.clone(), job.id);
-                    continue;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(ticket = %ticket.id, phase = %phase, error = %e, "Failed to check phase job");
-                    continue;
-                }
-            }
-            let (task, role) = phase_task(&ticket, phase);
-            let job_id = crate::generate_id();
-            // Claim the spawn slot before inserting the job so a concurrent poll
-            // tick cannot re-drive this job_id in the window before the body
-            // writes its first roster row.
-            claim_phase_body(&job_id);
-            if let Err(e) = crate::jobs::spawn_job(
-                conn,
-                &job_id,
-                &task,
-                &ws.name,
-                "",
-                "",
-                role,
-                &[],
-                &crate::jobs::SpawnChild::Phase {
-                    phase,
-                    ticket_id: ticket.id.clone(),
-                },
-            )
-            .await
-            {
-                release_phase_body(&job_id);
-                warn!(ticket = %ticket.id, phase = %phase, error = %e, "Failed to create phase job (concurrent creation is a no-op)");
-                continue;
-            }
-            info!(ticket = %ticket.id, phase = %phase, job = %job_id, "Created phase job — dispatching phase body");
-            spawn_phase_body(phase, Arc::new(ticket), ws.clone(), job_id);
+    let tickets = match board().list_working_tickets(&ws.name).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(workspace = %ws.name, error = %e, "Failed to list working-phase tickets");
+            return;
         }
+    };
+    for (phase, ticket) in tickets {
+        match crate::jobs::find_phase_job(conn, &ticket.id, phase).await {
+            Ok(Some(job)) => {
+                // Re-drive a phase job whose body is NOT running: a crash
+                // or a pause-freeze leaves the job in place with no launched
+                // agents and no live body. The registry claim is atomic, so
+                // only one poll tick respawns the body.
+                let has_agents = crate::jobs::job_has_launched_agents(conn, &job.id)
+                    .await
+                    .unwrap_or(true);
+                if has_agents {
+                    continue;
+                }
+                if !claim_phase_body(&job.id) {
+                    continue;
+                }
+                info!(ticket = %ticket.id, phase = %phase, job = %job.id, "Re-driving idle phase job");
+                spawn_phase_body(phase, Arc::new(ticket), ws.clone(), job.id);
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(ticket = %ticket.id, phase = %phase, error = %e, "Failed to check phase job");
+                continue;
+            }
+        }
+        let (task, role) = phase_task(&ticket, phase);
+        let job_id = crate::generate_id();
+        // Claim the spawn slot before inserting the job so a concurrent poll
+        // tick cannot re-drive this job_id in the window before the body
+        // writes its first roster row.
+        claim_phase_body(&job_id);
+        if let Err(e) = crate::jobs::spawn_job(
+            conn,
+            &job_id,
+            &task,
+            &ws.name,
+            "",
+            "",
+            role,
+            &[],
+            &crate::jobs::SpawnChild::Phase {
+                phase,
+                ticket_id: ticket.id.clone(),
+            },
+        )
+        .await
+        {
+            release_phase_body(&job_id);
+            warn!(ticket = %ticket.id, phase = %phase, error = %e, "Failed to create phase job (concurrent creation is a no-op)");
+            continue;
+        }
+        info!(ticket = %ticket.id, phase = %phase, job = %job_id, "Created phase job — dispatching phase body");
+        spawn_phase_body(phase, Arc::new(ticket), ws.clone(), job_id);
     }
 }
 
@@ -501,28 +493,10 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
 /// The single prompt-driven claim pipeline: Backlog→Analysis (5s grace) and
 /// Queued→InDevelopment (pipeline-occupied enforced).
 async fn run_claim_pipeline(ws: &Workspace) {
-    if let Ok(Some(ticket)) = board()
-        .claim_ticket_in_workspace(
-            TicketPhase::Backlog,
-            TicketPhase::Analysis,
-            &ws.name,
-            crate::pipeline::board::PipelineCheck::Skip,
-            Some(crate::pipeline::board::BoardStore::BACKLOG_CLAIM_GRACE),
-        )
-        .await
-    {
+    if let Ok(Some(ticket)) = board().claim_backlog_for_analysis(&ws.name).await {
         info!(ticket = %ticket.id, workspace = %ws.name, "Claimed Backlog → Analysis");
     }
-    if let Ok(Some(ticket)) = board()
-        .claim_ticket_in_workspace(
-            TicketPhase::Queued,
-            TicketPhase::InDevelopment,
-            &ws.name,
-            crate::pipeline::board::PipelineCheck::Enforce,
-            None,
-        )
-        .await
-    {
+    if let Ok(Some(ticket)) = board().claim_queued_for_development(&ws.name).await {
         info!(ticket = %ticket.id, workspace = %ws.name, "Claimed Queued → InDevelopment");
         let _ = crate::jobs::upsert_engineer_session_pin(
             &crate::session::store().conn,

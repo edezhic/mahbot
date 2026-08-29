@@ -9,7 +9,7 @@
 //! the live model. Global-DB tests are serialized behind [`TEST_LOCK`] because
 //! every global store shares one test root; isolated-store tests run freely.
 
-use crate::pipeline::board::{BoardStore, PipelineCheck, TicketPhase};
+use crate::pipeline::board::{BoardStore, TicketPhase};
 use crate::util::test::{
     create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
     make_ticket,
@@ -35,13 +35,7 @@ async fn claim_backlog_obeys_grace() {
     // Fresh ticket sits inside the grace window → no claim.
     assert!(
         store
-            .claim_ticket_in_workspace(
-                TicketPhase::Backlog,
-                TicketPhase::Analysis,
-                &ws.name,
-                PipelineCheck::Skip,
-                Some(BoardStore::BACKLOG_CLAIM_GRACE),
-            )
+            .claim_backlog_for_analysis(&ws.name)
             .await
             .unwrap()
             .is_none(),
@@ -59,13 +53,7 @@ async fn claim_backlog_obeys_grace() {
         .await
         .unwrap();
     let claimed = store
-        .claim_ticket_in_workspace(
-            TicketPhase::Backlog,
-            TicketPhase::Analysis,
-            &ws.name,
-            PipelineCheck::Skip,
-            Some(BoardStore::BACKLOG_CLAIM_GRACE),
-        )
+        .claim_backlog_for_analysis(&ws.name)
         .await
         .unwrap()
         .expect("aged ticket must be claimed");
@@ -83,13 +71,7 @@ async fn claim_queued_blocks_on_pipeline_occupancy() {
     // No occupied sibling yet → the Queued claim succeeds.
     let first = make_ticket(&store, &ws, "Queued one", TicketPhase::Queued).await;
     let claimed = store
-        .claim_ticket_in_workspace(
-            TicketPhase::Queued,
-            TicketPhase::InDevelopment,
-            &ws.name,
-            PipelineCheck::Enforce,
-            None,
-        )
+        .claim_queued_for_development(&ws.name)
         .await
         .unwrap()
         .expect("Queued ticket must claim without a pipeline-occupied sibling");
@@ -100,13 +82,7 @@ async fn claim_queued_blocks_on_pipeline_occupancy() {
     make_ticket(&store, &ws, "Queued two", TicketPhase::Queued).await;
     assert!(
         store
-            .claim_ticket_in_workspace(
-                TicketPhase::Queued,
-                TicketPhase::InDevelopment,
-                &ws.name,
-                PipelineCheck::Enforce,
-                None,
-            )
+            .claim_queued_for_development(&ws.name)
             .await
             .unwrap()
             .is_none(),
@@ -134,16 +110,13 @@ async fn claim_backlog_honors_prerequisites() {
         .await
         .unwrap();
 
-    // Unmet prereq (its prereq is not in UNBLOCKING_PHASES) → blocked.
+    // Unmet prereq (its prereq is not in UNBLOCKING_PHASES) → blocked. Age the
+    // dependent past the grace window FIRST so this assertion isolates the
+    // prereq rule rather than passing vacuously on the grace cutoff.
+    age_ticket_past_grace(&store, &dependent).await;
     assert!(
         store
-            .claim_ticket_in_workspace(
-                TicketPhase::Backlog,
-                TicketPhase::Analysis,
-                &ws.name,
-                PipelineCheck::Skip,
-                None,
-            )
+            .claim_backlog_for_analysis(&ws.name)
             .await
             .unwrap()
             .is_none(),
@@ -160,17 +133,59 @@ async fn claim_backlog_honors_prerequisites() {
         .await
         .unwrap();
     let claimed = store
-        .claim_ticket_in_workspace(
-            TicketPhase::Backlog,
-            TicketPhase::Analysis,
-            &ws.name,
-            PipelineCheck::Skip,
-            None,
-        )
+        .claim_backlog_for_analysis(&ws.name)
         .await
         .unwrap()
         .expect("dependent must claim once its prereq unblocks");
     assert_eq!(claimed.id, dependent);
+}
+
+/// Queued → InDevelopment honors prerequisites too (the same filter the
+/// Backlog claim applies): a Queued ticket with an unmet prereq stays queued
+/// even with a free pipeline, and claims once the prereq unblocks.
+#[tokio::test]
+async fn claim_queued_honors_prerequisites() {
+    let (store, _dir) = crate::open_test_store!(BoardStore, "board");
+    let ws = ws_named("ws-a");
+
+    // The prereq lives OUTSIDE Queued so the only Queued candidate is the
+    // dependent ticket (a Queued prereq would be claimed itself).
+    let prereq_analysis =
+        make_ticket(&store, &ws, "Prereq (analysis)", TicketPhase::Analysis).await;
+    let dependent = crate::util::test::TicketBuilder::new(&store, &ws)
+        .title("Dependent")
+        .phase(TicketPhase::Queued)
+        .prereqs(std::slice::from_ref(&prereq_analysis))
+        .create()
+        .await
+        .unwrap();
+
+    // Unmet prereq → blocked despite a free pipeline.
+    assert!(
+        store
+            .claim_queued_for_development(&ws.name)
+            .await
+            .unwrap()
+            .is_none(),
+        "Queued ticket with a non-unblocking prereq must not be claimed",
+    );
+
+    // Move the prereq to Done (an unblocking phase) → the dependent claims.
+    store
+        .transition_to(
+            &prereq_analysis,
+            Some(TicketPhase::Analysis),
+            TicketPhase::Done,
+        )
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_queued_for_development(&ws.name)
+        .await
+        .unwrap()
+        .expect("dependent must claim once its prereq unblocks");
+    assert_eq!(claimed.id, dependent);
+    assert_eq!(claimed.phase, TicketPhase::InDevelopment);
 }
 
 /// A phase job is unique per (kind, ticket_id); creating a duplicate is a

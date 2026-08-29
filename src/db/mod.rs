@@ -804,6 +804,116 @@ impl Connection {
         map(&row).map_err(|e| turso::Error::Error(e.to_string()))
     }
 
+    /// Execute a query, returning all matching rows, using the connection's
+    /// prepared-statement cache instead of re-preparing the SQL on every call
+    /// (this includes `UPDATE..RETURNING`, which reads rows back).
+    ///
+    /// # Cache contract
+    ///
+    /// Only SQL whose full text is invariant across calls — call-site string
+    /// literals or compile-time constants — may be routed through this method.
+    /// turso caches compiled programs per connection keyed by the exact SQL
+    /// text and never evicts them, so per-call-composed fragments (dynamic
+    /// IN-lists, interpolated limits, arbitrary user SQL) must keep the plain
+    /// prepare-per-call path instead. All `_cached` methods below share this
+    /// contract.
+    pub async fn query_cached(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
+        let conn = self.lock_and_cleanup().await;
+        Self::query_cached_impl(&conn, sql, params).await
+    }
+
+    /// Core query logic shared by [`Connection::query_cached`]. Operates on an
+    /// already-locked connection, obtaining the statement from turso's
+    /// per-connection prepared-statement cache. Collects all rows into a `Vec`.
+    async fn query_cached_impl(
+        conn: &turso::Connection,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<Vec<Row>> {
+        let mut stmt = conn.prepare_cached(sql).await?;
+        let mut rows = stmt.query(params).await?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(row);
+        }
+        Ok(result)
+    }
+
+    /// Map every row, failing on the first per-row error (unlike
+    /// [`Self::query_map`], which returns per-row results), using the cached
+    /// prepared-statement path (see [`Self::query_cached`] for the cache
+    /// contract).
+    pub async fn query_map_strict_cached<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Vec<T>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let rows = self.query_cached(sql, params).await?;
+        map_rows(&rows, map)
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Execute a query that returns exactly one row, using the cached
+    /// prepared-statement path (see [`Self::query_cached`] for the cache
+    /// contract).
+    pub async fn query_row_cached<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> turso::Result<T>
+    where
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let conn = self.lock_and_cleanup().await;
+        let mut stmt = conn.prepare_cached(sql).await?;
+        let mut rows = stmt.query(params).await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or(turso::Error::QueryReturnedNoRows)?;
+        map(&row).map_err(|e| turso::Error::Error(e.to_string()))
+    }
+
+    /// Execute a query that returns zero or one row, using the cached
+    /// prepared-statement path (see [`Self::query_cached`] for the cache
+    /// contract).
+    ///
+    /// Returns `Ok(Some(val))` if a row is found, `Ok(None)` when no row
+    /// matches (i.e. [`turso::Error::QueryReturnedNoRows`] is caught), or
+    /// `Err` if the query fails for another reason.
+    ///
+    /// This is a convenience wrapper around [`Self::query_row_cached`] that
+    /// eliminates the common `match { Ok(val) => Ok(Some(val)),
+    /// Err(QueryReturnedNoRows) => Ok(None), Err(e) => Err(e.into()) }`
+    /// boilerplate.
+    pub async fn query_optional_cached<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Option<T>>
+    where
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        match self.query_row_cached(sql, params, map).await {
+            Ok(val) => Ok(Some(val)),
+            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Force a WAL checkpoint with TRUNCATE mode.
     ///
     /// Writes all pending WAL content to the main database file and truncates

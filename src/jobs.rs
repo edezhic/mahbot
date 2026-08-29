@@ -525,7 +525,7 @@ pub(crate) async fn find_phase_job(
     ticket_id: &str,
     phase: crate::pipeline::board::TicketPhase,
 ) -> Result<Option<TicketJobRow>> {
-    conn.query_optional(
+    conn.query_optional_cached(
         "SELECT id FROM jobs \
          WHERE ticket_id = ?1 AND kind = ?2 AND status = 'launched' LIMIT 1",
         params![ticket_id, phase.as_ref()],
@@ -621,7 +621,7 @@ pub(crate) async fn list_running_agents_for_ticket(
 /// row). Drives the implementation-iteration re-dispatch guard.
 pub(crate) async fn job_has_launched_agents(conn: &Connection, job_id: &str) -> Result<bool> {
     Ok(conn
-        .query_optional(
+        .query_optional_cached(
             "SELECT 1 FROM agents WHERE job_id = ?1 AND status = 'launched' LIMIT 1",
             params![job_id],
             |_| Ok::<_, anyhow::Error>(1_i64),

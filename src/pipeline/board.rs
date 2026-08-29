@@ -120,6 +120,20 @@ const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InSanitation,
 ];
 
+/// The six phases the poll loop drives with phase jobs, in dispatch order.
+///
+/// Note: this is deliberately NOT the [`TicketPhase`] declaration order —
+/// `InSanitation` is dispatched last, after review and QA. Both the dispatch
+/// snapshot query and its phase-major grouping derive from this constant.
+pub(crate) const WORKING_PHASES: &[TicketPhase] = &[
+    TicketPhase::Analysis,
+    TicketPhase::InDevelopment,
+    TicketPhase::InDiagnostics,
+    TicketPhase::InReview,
+    TicketPhase::InQa,
+    TicketPhase::InSanitation,
+];
+
 /// Phases that unblock dependent tickets.
 ///
 /// When a ticket transitions to one of these phases, any tickets that
@@ -605,23 +619,6 @@ impl PreparedUpdate {
     }
 }
 
-/// Controls whether the pipeline-occupancy check is enforced when claiming tickets.
-///
-/// Pipeline-occupied tickets (those in [`PIPELINE_OCCUPIED_PHASES`]) prevent
-/// multiple tickets from being worked concurrently in the same workspace.
-///
-/// - [`Skip`](Self::Skip): claim the next available ticket without checking
-///   for pipeline occupants (used by parallel phases like analysis, review, QA).
-/// - [`Enforce`](Self::Enforce): only claim if no pipeline-occupied ticket exists
-///   in the workspace (used by serial phases like development, diagnostics, sanitation).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PipelineCheck {
-    /// Skip pipeline occupancy check — claim the next available ticket.
-    Skip,
-    /// Only claim if no pipeline-occupied ticket exists in the workspace.
-    Enforce,
-}
-
 /// Whether to load comments when fetching tickets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LoadComments {
@@ -701,7 +698,7 @@ impl BoardStore {
     /// the same transaction — no TOCTOU window between SELECT and UPDATE.
     ///
     /// Uses `json_each()` for exact prerequisite matching (consistent with
-    /// [`claim_ticket_in_workspace`](Self::claim_ticket_in_workspace)).
+    /// [`claim_backlog_for_analysis`](Self::claim_backlog_for_analysis)).
     async fn rewire_dependents_tx(
         tx: &TxGuard<'_>,
         supersede_id: &str,
@@ -936,102 +933,136 @@ impl BoardStore {
     /// get cancelled (plus a spurious phase-change notification).
     pub(crate) const BACKLOG_CLAIM_GRACE: Duration = Duration::seconds(5);
 
-    /// Claim a ticket scoped to a single workspace and transition it to
-    /// `target_phase`. Always filters by `workspace_name` so only tickets from
-    /// that workspace are eligible.
+    /// Claim a workspace's oldest eligible Backlog ticket and transition it to
+    /// Analysis in a single atomic `UPDATE..RETURNING`. Always filters by
+    /// `workspace_name` so only tickets from that workspace are eligible.
     ///
-    /// Only tickets currently in `current_phase` are eligible for claiming.
-    /// The WHERE clause includes `t1.phase = ?` bound to `current_phase`,
-    /// providing CAS-style atomicity for phase transitions — if no ticket
-    /// matches the current phase, the claim returns `None`.
+    /// Only tickets currently in [`TicketPhase::Backlog`] are eligible. The
+    /// WHERE clause includes `t1.phase = ?3` bound to `Backlog`, providing
+    /// CAS-style atomicity for the phase transition — if no Backlog ticket
+    /// matches, the claim returns `None`.
     ///
-    /// When `claim_grace` is `Some(duration)`, tickets created within that
-    /// duration before the claim are excluded from the candidate set via a SQL
-    /// `created_at <=` cutoff — they stay in `current_phase` until the window
-    /// elapses. The Backlog→Analysis claim passes [`BACKLOG_CLAIM_GRACE`] so
-    /// freshly created tickets are not immediately picked up; all other claims
-    /// pass `None` and are unaffected.
+    /// A `created_at <= ?5` cutoff excludes tickets created within the
+    /// [`BACKLOG_CLAIM_GRACE`] window, so a fresh ticket stays in Backlog a bit
+    /// longer (giving the Manager ~5s after `create_ticket` to move the ticket
+    /// straight to Planning/Queued). Claiming it into Analysis within the
+    /// window would spawn analysts that immediately get cancelled.
     ///
-    /// When `pipeline_check` is [`PipelineCheck::Enforce`], the claim is rejected
-    /// (returns `None`) if any pipeline-occupied ticket exists in the same workspace. The
-    /// occupancy check is part of the same atomic SQL UPDATE statement (no
-    /// separate SELECT + UPDATE window). Pipeline-occupied phases are defined
-    /// in [`PIPELINE_OCCUPIED_PHASES`].
+    /// The prereq filter is part of the same atomic UPDATE (no separate
+    /// SELECT + UPDATE window): a Backlog ticket with an unmet prerequisite is
+    /// excluded via `NOT EXISTS` over `json_each(t1.prerequisites)`, joining to
+    /// each prerequisite ticket and rejecting the candidate unless every
+    /// prerequisite is in an unblocking phase ([`UNBLOCKING_PHASES`]).
     ///
-    /// When `pipeline_check` is [`PipelineCheck::Skip`], the claim uses a
-    /// simple LIMIT 1 subquery with no pipeline gating. This is used for phases
-    /// that should not be blocked by in-flight pipeline tickets (e.g., analysis,
-    /// review, and QA).
-    ///
-    /// The subquery orders by `priority ASC, created_at ASC` so that tickets
-    /// with lower priority (higher urgency) are claimed first, then the oldest
-    /// ticket (earliest created_at) is claimed first.
+    /// The candidate subquery orders by `priority ASC, created_at ASC` so that
+    /// tickets with lower priority (higher urgency) are claimed first, then the
+    /// oldest ticket (earliest created_at) is claimed first.
     ///
     /// Note: the claim SELECT is kept to the tickets table, and the agents
     /// roster is a separate logical table checked by the caller (via the
-    /// phase-job + launched-roster guard). The claim source phases
-    /// (Backlog, Queued) have no running agent.
-    pub(crate) async fn claim_ticket_in_workspace(
+    /// phase-job + launched-roster guard). Backlog tickets have no running agent.
+    pub(crate) async fn claim_backlog_for_analysis(
         &self,
-        current_phase: TicketPhase,
-        target_phase: TicketPhase,
         workspace_name: &str,
-        pipeline_check: PipelineCheck,
-        claim_grace: Option<Duration>,
     ) -> Result<Option<Ticket>> {
         let now = db::now();
-
-        // Filter that excludes tickets with unmet prerequisites.
-        let prereq_filter = format!(
-            "AND NOT EXISTS ( \
-               SELECT 1 FROM json_each(t1.prerequisites) AS je \
-               JOIN tickets t_pre ON t_pre.id = je.value \
-               WHERE t_pre.phase NOT IN ({}) \
-             )",
-            phase_list_sql_fragment(UNBLOCKING_PHASES),
-        );
-
-        let pipeline_occupied_clause = if pipeline_check == PipelineCheck::Enforce {
-            let occupied_sql = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES);
-            format!(
-                "AND NOT EXISTS (SELECT 1 FROM tickets t2 \
-                 WHERE t2.workspace_name = t1.workspace_name \
-                 AND t2.phase IN ({occupied_sql}) \
-                 AND t2.id != t1.id) "
-            )
-        } else {
-            String::new()
-        };
-
-        // Candidate-set age cutoff: excludes tickets created within the grace
-        // window so fresh tickets stay in `current_phase` a bit longer.
-        let grace_clause = if claim_grace.is_some() {
-            "AND t1.created_at <= ?5 "
-        } else {
-            ""
-        };
-
+        let grace_cutoff = (Utc::now() - Self::BACKLOG_CLAIM_GRACE).to_rfc3339();
         let sql = format!(
             "UPDATE tickets SET phase = ?1, updated_at = ?2 \
              WHERE id = (SELECT t1.id FROM tickets t1 \
              WHERE t1.phase = ?3 AND t1.workspace_name = ?4 \
              AND t1.is_archived = 0 \
-             {grace_clause}{pipeline_occupied_clause}{prereq_filter} \
+             AND t1.created_at <= ?5 \
+             AND NOT EXISTS ( \
+                SELECT 1 FROM json_each(t1.prerequisites) AS je \
+                JOIN tickets t_pre ON t_pre.id = je.value \
+                WHERE t_pre.phase NOT IN ({}) \
+             ) \
              ORDER BY t1.priority ASC, t1.created_at ASC LIMIT 1) \
-             RETURNING {TICKET_COLUMNS}"
+             RETURNING {TICKET_COLUMNS}",
+            phase_list_sql_fragment(UNBLOCKING_PHASES),
         );
-
-        let mut params: Vec<Value> = vec![
-            Value::from(target_phase.as_ref()),
-            Value::from(now),
-            Value::from(current_phase.as_ref()),
-            Value::from(workspace_name),
+        let params = db::params![
+            TicketPhase::Analysis.as_ref(),
+            now,
+            TicketPhase::Backlog.as_ref(),
+            workspace_name,
+            grace_cutoff,
         ];
-        if let Some(grace) = claim_grace {
-            params.push(Value::from((Utc::now() - grace).to_rfc3339()));
+        let rows = self.conn.query_cached(&sql, params).await?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(Some(self.ticket_from_row(&row, LoadComments::Yes).await?)),
+            None => Ok(None),
         }
+    }
 
-        let rows = self.conn.query(&sql, params).await?;
+    /// Claim a workspace's oldest eligible Queued ticket and transition it to
+    /// InDevelopment in a single atomic `UPDATE..RETURNING`. Always filters by
+    /// `workspace_name` so only tickets from that workspace are eligible.
+    ///
+    /// Only tickets currently in [`TicketPhase::Queued`] are eligible. The
+    /// WHERE clause includes `t1.phase = ?3` bound to `Queued`, providing
+    /// CAS-style atomicity for the phase transition — if no Queued ticket
+    /// matches, the claim returns `None`.
+    ///
+    /// The prereq filter is part of the same atomic UPDATE (no separate
+    /// SELECT + UPDATE window): a Queued ticket with an unmet prerequisite is
+    /// excluded via `NOT EXISTS` over `json_each(t1.prerequisites)`, rejecting
+    /// the candidate unless every prerequisite is in an unblocking phase
+    /// ([`UNBLOCKING_PHASES`]) — the same filter the Backlog claim applies, so
+    /// a Manager moving a Backlog ticket straight to Queued (or a prereq being
+    /// re-opened after its dependent entered the pipeline) cannot start
+    /// development out of dependency order.
+    ///
+    /// The claim is rejected (returns `None`) when any pipeline-occupied ticket
+    /// exists in the same workspace, enforcing a single ticket at a time per
+    /// workspace in the dev/review/QA pipeline. The occupancy check is part of
+    /// the same atomic SQL UPDATE (no separate SELECT + UPDATE window).
+    /// Pipeline-occupied phases are defined in [`PIPELINE_OCCUPIED_PHASES`]. The
+    /// correlated `NOT EXISTS` subquery also requires `t2.is_archived = 0` so
+    /// archived tickets never occupy the pipeline — a deliberate no-op today,
+    /// since only Done/Cancelled tickets get archived and neither is a pipeline
+    /// phase, but kept for consistency.
+    ///
+    /// The candidate subquery orders by `priority ASC, created_at ASC` so that
+    /// tickets with lower priority (higher urgency) are claimed first, then the
+    /// oldest ticket (earliest created_at) is claimed first.
+    ///
+    /// Note: the claim SELECT is kept to the tickets table, and the agents
+    /// roster is a separate logical table checked by the caller (via the
+    /// phase-job + launched-roster guard). Queued tickets have no running agent.
+    pub(crate) async fn claim_queued_for_development(
+        &self,
+        workspace_name: &str,
+    ) -> Result<Option<Ticket>> {
+        let now = db::now();
+        let sql = format!(
+            "UPDATE tickets SET phase = ?1, updated_at = ?2 \
+             WHERE id = (SELECT t1.id FROM tickets t1 \
+             WHERE t1.phase = ?3 AND t1.workspace_name = ?4 \
+             AND t1.is_archived = 0 \
+             AND NOT EXISTS (SELECT 1 FROM tickets t2 \
+                WHERE t2.workspace_name = t1.workspace_name \
+                AND t2.phase IN ({occupied}) \
+                AND t2.is_archived = 0 \
+                AND t2.id != t1.id) \
+             AND NOT EXISTS ( \
+                SELECT 1 FROM json_each(t1.prerequisites) AS je \
+                JOIN tickets t_pre ON t_pre.id = je.value \
+                WHERE t_pre.phase NOT IN ({unblocking}) \
+             ) \
+             ORDER BY t1.priority ASC, t1.created_at ASC LIMIT 1) \
+             RETURNING {TICKET_COLUMNS}",
+            occupied = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES),
+            unblocking = phase_list_sql_fragment(UNBLOCKING_PHASES),
+        );
+        let params = db::params![
+            TicketPhase::InDevelopment.as_ref(),
+            now,
+            TicketPhase::Queued.as_ref(),
+            workspace_name,
+        ];
+        let rows = self.conn.query_cached(&sql, params).await?;
         match rows.into_iter().next() {
             Some(row) => Ok(Some(self.ticket_from_row(&row, LoadComments::Yes).await?)),
             None => Ok(None),
@@ -1629,6 +1660,57 @@ impl BoardStore {
             LoadComments::No,
         )
         .await
+    }
+
+    /// List the live tickets of a workspace across all working phases
+    /// ([`WORKING_PHASES`]) in one snapshot, grouped phase-major in dispatch
+    /// order with `priority ASC, created_at DESC` within each phase — the
+    /// exact ordering the previous six per-phase
+    /// [`list_all_tickets`](Self::list_all_tickets) queries produced (the
+    /// global `ORDER BY` plus stable per-phase bucketing preserves each
+    /// phase's internal order).
+    ///
+    /// Unlike [`list_all_tickets`](Self::list_all_tickets) (which the GUI
+    /// still uses), this is a single snapshot so the polling dispatch sees
+    /// one consistent view per tick instead of six separate per-phase
+    /// queries.
+    pub(crate) async fn list_working_tickets(
+        &self,
+        workspace_name: &str,
+    ) -> Result<Vec<(TicketPhase, Ticket)>> {
+        // The IN-list placeholders are derived from WORKING_PHASES so the SQL
+        // cannot drift from the constant; the interpolated text stays
+        // invariant across calls, keeping the statement-cache contract.
+        let phase_placeholders = (2..=WORKING_PHASES.len() + 1)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {TICKET_COLUMNS} FROM tickets \
+             WHERE workspace_name = ?1 \
+             AND phase IN ({phase_placeholders}) \
+             AND is_archived = 0 \
+             ORDER BY priority ASC, created_at DESC"
+        );
+        let mut params: Vec<Value> = vec![Value::from(workspace_name)];
+        params.extend(WORKING_PHASES.iter().map(|p| Value::from(p.as_ref())));
+        let rows = self.conn.query_cached(&sql, params).await?;
+        // Bucket each ticket by its index in WORKING_PHASES. Bucketing is
+        // stable, so the global `priority ASC, created_at DESC` order is
+        // preserved within each phase.
+        let mut buckets: Vec<Vec<Ticket>> = vec![Vec::new(); WORKING_PHASES.len()];
+        for row in rows {
+            let ticket = self.ticket_from_row(&row, LoadComments::No).await?;
+            let Some(idx) = WORKING_PHASES.iter().position(|p| *p == ticket.phase) else {
+                continue; // defensive: unreachable via the IN filter
+            };
+            buckets[idx].push(ticket);
+        }
+        let mut out = Vec::with_capacity(buckets.iter().map(Vec::len).sum());
+        for (idx, phase) in WORKING_PHASES.iter().enumerate() {
+            out.extend(buckets[idx].drain(..).map(|ticket| (*phase, ticket)));
+        }
+        Ok(out)
     }
 
     /// Count how many tickets have the given phase, optionally filtered by workspace.
