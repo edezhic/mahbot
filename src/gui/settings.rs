@@ -1724,8 +1724,6 @@ impl SettingsState {
             Space::new().height(16),
             self.models_section(),
             Space::new().height(16),
-            self.generation_section(),
-            Space::new().height(16),
             self.routing_section(),
             Space::new().height(16),
             Self::about_section(),
@@ -2891,7 +2889,46 @@ impl SettingsState {
         );
         section(
             "Models",
-            column![manager_row, worker_row, video_transcription_row].spacing(4),
+            column![
+                manager_row,
+                worker_row,
+                video_transcription_row,
+                Space::new().height(12),
+                text("Image Generation")
+                    .size(13)
+                    .font(iced::Font::MONOSPACE)
+                    .color(theme::ACCENT),
+                Space::new().height(2),
+                model_picker_list(
+                    ModelPickerTarget::ImageGen,
+                    self.config.image_gen_models.as_deref(),
+                    self.config.image_gen_model.as_deref(),
+                    &self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()],
+                    "model name (e.g. google/gemini-...)",
+                    self.field_errors
+                        .get("config:image_gen_models")
+                        .or_else(|| self.field_errors.get("config:image_gen_model"))
+                        .map(String::as_str),
+                ),
+                Space::new().height(12),
+                text("Video Generation")
+                    .size(13)
+                    .font(iced::Font::MONOSPACE)
+                    .color(theme::ACCENT),
+                Space::new().height(2),
+                model_picker_list(
+                    ModelPickerTarget::Video,
+                    self.config.video_models.as_deref(),
+                    self.config.video_model.as_deref(),
+                    &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
+                    "model name (e.g. minimax/hailuo-3)",
+                    self.field_errors
+                        .get("config:video_models")
+                        .or_else(|| self.field_errors.get("config:video_model"))
+                        .map(String::as_str),
+                ),
+            ]
+            .spacing(4),
         )
     }
 
@@ -3311,49 +3348,6 @@ impl SettingsState {
         section("Audio", column)
     }
 
-    // ── Model picker view helper ───────────────────────────────
-
-    fn generation_section(&self) -> Element<'_, SettingsMessage> {
-        section(
-            "Generation",
-            column![
-                text("Image Generation")
-                    .size(13)
-                    .font(iced::Font::MONOSPACE)
-                    .color(theme::ACCENT),
-                Space::new().height(2),
-                model_picker_list(
-                    ModelPickerTarget::ImageGen,
-                    self.config.image_gen_models.as_deref(),
-                    self.config.image_gen_model.as_deref(),
-                    &self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()],
-                    "model name (e.g. google/gemini-...)",
-                    self.field_errors
-                        .get("config:image_gen_models")
-                        .or_else(|| self.field_errors.get("config:image_gen_model"))
-                        .map(String::as_str),
-                ),
-                Space::new().height(12),
-                text("Video Generation")
-                    .size(13)
-                    .font(iced::Font::MONOSPACE)
-                    .color(theme::ACCENT),
-                Space::new().height(2),
-                model_picker_list(
-                    ModelPickerTarget::Video,
-                    self.config.video_models.as_deref(),
-                    self.config.video_model.as_deref(),
-                    &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
-                    "model name (e.g. minimax/hailuo-3)",
-                    self.field_errors
-                        .get("config:video_models")
-                        .or_else(|| self.field_errors.get("config:video_model"))
-                        .map(String::as_str),
-                ),
-            ],
-        )
-    }
-
     fn integrations_section(&self) -> Element<'_, SettingsMessage> {
         // ── Web search provider pick list ──────────────────────────
         // Three options: Auto (None), Firecrawl, Exa
@@ -3533,7 +3527,7 @@ impl SettingsState {
 
 // ── Shared widgets ───────────────────────────────────────────────
 
-/// Section heading with a divider line.
+/// Section heading (accent-colored monospace title above the content).
 fn section<'a>(
     title: &'static str,
     content: Column<'a, SettingsMessage>,
