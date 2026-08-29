@@ -1372,8 +1372,8 @@ pub fn tree_node_button<'a, Message: Clone + 'a>(
 /// modal overlays. The backdrop is a full-screen [`mouse_area`] that emits
 /// `on_backdrop` when clicked.
 ///
-/// Extracted from [`modal_backdrop`] so the 80%-width diff/branch overlays can
-/// compose the same backdrop while claiming only their dialog rectangle.
+/// Extracted from [`modal_backdrop`] so the 80%-width diff overlay can
+/// compose the same backdrop while claiming only its dialog rectangle.
 pub(super) fn modal_backdrop_layer<'a, Message: 'a + Clone>(
     on_backdrop: Message,
     opacity: f32,
@@ -1427,8 +1427,8 @@ pub(super) fn dialog_click_guard<'a, Message: 'a + Clone>(
 /// `content` must be a bounded dialog bubble (not `Length::Fill` on the outer
 /// dimension). [`dialog_click_guard`] claims the content's whole rectangle, so
 /// full-window content would claim the screen and make the backdrop
-/// unreachable — silently breaking outside-click. The 80%-width diff/branch
-/// overlays compose the backdrop directly via [`modal_backdrop_layer`] for
+/// unreachable — silently breaking outside-click. The 80%-width diff
+/// overlay composes the backdrop directly via [`modal_backdrop_layer`] for
 /// exactly this reason.
 ///
 /// # Parameters

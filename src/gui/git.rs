@@ -621,10 +621,10 @@ impl GitState {
 
     // ── View ──────────────────────────────────────────────────────
 
-    /// Render the branch management modal content (search, branch list,
-    /// create section). Does **not** wrap in a `modal_overlay` — that is
-    /// done by the Dashboard so the close message is consistent with the
-    /// rest of the overlay stack.
+    /// Render the branch management dialog content (search, branch list,
+    /// create section). Does **not** wrap in a modal backdrop — the
+    /// Dashboard wraps it in a small centered dialog so the close message
+    /// is consistent with the rest of the overlay stack.
     pub fn view(&self) -> Element<'_, GitMessage> {
         let search_input = super::widgets::single_line_editor(
             &self.branch_search_query.buffer,
@@ -664,7 +664,7 @@ impl GitState {
             .collect();
 
         let list = scrollable(Column::with_children(branch_items).spacing(2))
-            .height(Length::Fill)
+            .height(Length::Fixed(300.0))
             .style(theme::scrollbar_style);
 
         // Error display
@@ -709,7 +709,7 @@ impl GitState {
                 .align_y(Alignment::Center),
         ]
         .spacing(0)
-        .height(Length::Fill)
+        .width(Length::Fill)
         .into()
     }
 }

@@ -1820,10 +1820,13 @@ impl Dashboard {
             widgets::empty_stack_placeholder()
         };
 
-        // ── Branch management modal overlay ─────────────────────────
+        // ── Branch management modal (small centered dialog) ──────────
         let branch_overlay: Element<'_, Message> = if self.git_state.is_modal_open() {
-            let inner = self.git_state.view().map(Message::Git);
-            modal_overlay(inner, Message::Git(git::GitMessage::CloseModal))
+            let dialog = container(self.git_state.view().map(Message::Git))
+                .width(Length::Fixed(480.0))
+                .padding(24)
+                .style(theme::dialog_container_style);
+            widgets::modal_backdrop(dialog, Message::Git(git::GitMessage::CloseModal), 0.5)
         } else {
             widgets::empty_stack_placeholder()
         };
