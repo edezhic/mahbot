@@ -2299,20 +2299,19 @@ fn render_sidebar_toggle<'a>(
 
 impl Dashboard {
     fn sidebar_view(&self) -> Element<'_, Message> {
-        container(
-            column![
-                self.render_sidebar_nav(),
-                Space::new().height(Length::Fill),
-                self.render_maintainer_toggle(),
-                self.render_pause_toggle(),
-            ]
-            .spacing(2),
-        )
-        .width(Length::Fixed(56.0))
-        .height(Length::Fill)
-        .style(theme::surface_container_style)
-        .padding(12)
-        .into()
+        let mut col = column![self.render_sidebar_nav(), Space::new().height(Length::Fill),];
+        // Pipeline toggles only apply to a real (non-Personal) workspace;
+        // hidden entirely for Personal mode / boot state.
+        if self.has_active_workspace() {
+            col = col.push(self.render_maintainer_toggle());
+            col = col.push(self.render_pause_toggle());
+        }
+        container(col.spacing(2))
+            .width(Length::Fixed(56.0))
+            .height(Length::Fill)
+            .style(theme::surface_container_style)
+            .padding(12)
+            .into()
     }
 
     /// Sidebar navigation icons: Home, Editor, Shell (28px). Running Agents
@@ -2359,38 +2358,23 @@ impl Dashboard {
     }
 
     /// Per-workspace Maintainer toggle button.
-    /// Disabled when no workspace is selected (Personal mode).
     fn render_maintainer_toggle(&self) -> Element<'_, Message> {
-        let has_ws = self.has_active_workspace();
-        let maint_icon = widgets::maint_badge(self.maintenance_enabled());
-        let tooltip_text = if !has_ws {
-            "Select a workspace to toggle maintainer"
-        } else if self.maintenance_enabled() {
+        let tooltip_text = if self.maintenance_enabled() {
             "stop maintenance"
         } else {
             "start maintenance"
         };
         render_sidebar_toggle(
-            maint_icon.into(),
+            widgets::maint_badge(self.maintenance_enabled()).into(),
             tooltip_text,
-            if has_ws {
-                Some(Message::Toggle(ToggleKind::Maintenance))
-            } else {
-                None
-            },
+            Some(Message::Toggle(ToggleKind::Maintenance)),
             tooltip::Position::Top,
         )
     }
 
     /// Per-workspace pipeline pause/unpause toggle button.
-    /// Disabled when no workspace is selected (Personal mode).
     fn render_pause_toggle(&self) -> Element<'_, Message> {
-        let has_ws = self.has_active_workspace();
-        let pause_icon = if !has_ws {
-            lucide::pause::<iced::Theme, iced::Renderer>()
-                .size(28)
-                .color(theme::TEXT_FAINT)
-        } else if self.paused() {
+        let pause_icon = if self.paused() {
             lucide::play::<iced::Theme, iced::Renderer>()
                 .size(28)
                 .color(theme::ACCENT)
@@ -2399,9 +2383,7 @@ impl Dashboard {
                 .size(28)
                 .color(theme::TEXT_MUTED)
         };
-        let tooltip_text = if !has_ws {
-            "Select a workspace to pause"
-        } else if self.paused() {
+        let tooltip_text = if self.paused() {
             "Resume pipeline"
         } else {
             "Pause pipeline"
@@ -2409,11 +2391,7 @@ impl Dashboard {
         render_sidebar_toggle(
             pause_icon.into(),
             tooltip_text,
-            if has_ws {
-                Some(Message::Toggle(ToggleKind::Pause))
-            } else {
-                None
-            },
+            Some(Message::Toggle(ToggleKind::Pause)),
             tooltip::Position::Top,
         )
     }
