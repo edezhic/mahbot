@@ -6,7 +6,7 @@
 //! `in_review`, `in_qa`, `in_sanitation`); the ticket's `phase` is the sole
 //! durable running truth. The puller:
 //!
-//! 1. claims `Backlog -> Analysis` and `ReadyForDevelopment -> InDevelopment`,
+//! 1. claims `Backlog -> Analysis` and `Queued -> InDevelopment`,
 //! 2. creates a fresh phase job for any ticket in a working phase that has none
 //!    (atomic via the unique `(kind, ticket_id)` index),
 //! 3. spawns the phase body that runs the stage to completion.
@@ -238,7 +238,7 @@ async fn process_single_workspace(ws: Workspace) {
     // provider key, or returned to pending after provider-class discovery
     // failures) is claimed into its first discovery when the provider is
     // configured. Runs before the claim pipeline: a freshly-claimed workspace
-    // re-arms the analysis pause, so no Backlog/RFD claims race the
+    // re-arms the analysis pause, so no Backlog/Queued claims race the
     // discovery. A successful claim returns the fresh post-claim copy; the
     // pipeline below then runs against the claimed analyzing+paused state
     // instead of the pre-claim poll-round copy.
@@ -498,7 +498,7 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
 }
 
 /// The single prompt-driven claim pipeline: Backlog→Analysis (5s grace) and
-/// ReadyForDevelopment→InDevelopment (pipeline-occupied enforced).
+/// Queued→InDevelopment (pipeline-occupied enforced).
 async fn run_claim_pipeline(ws: &Workspace) {
     if let Ok(Some(ticket)) = board()
         .claim_ticket_in_workspace(
@@ -514,7 +514,7 @@ async fn run_claim_pipeline(ws: &Workspace) {
     }
     if let Ok(Some(ticket)) = board()
         .claim_ticket_in_workspace(
-            TicketPhase::ReadyForDevelopment,
+            TicketPhase::Queued,
             TicketPhase::InDevelopment,
             &ws.name,
             crate::pipeline::board::PipelineCheck::Enforce,
@@ -522,7 +522,7 @@ async fn run_claim_pipeline(ws: &Workspace) {
         )
         .await
     {
-        info!(ticket = %ticket.id, workspace = %ws.name, "Claimed ReadyForDevelopment → InDevelopment");
+        info!(ticket = %ticket.id, workspace = %ws.name, "Claimed Queued → InDevelopment");
         let _ = crate::jobs::upsert_engineer_session_pin(
             &crate::session::store().conn,
             &ticket.id,
@@ -922,7 +922,7 @@ async fn notify_ticket(
     if target_phase == TicketPhase::Failed {
         let failure_details = last_comment_as_failure_details(&ticket.id).await;
         let workspace_status = if breaker_trip {
-            "Beware that all the other tickets have been moved back from Ready for Dev \
+            "Beware that all the other tickets have been moved back from Queued \
              to Planning."
                 .to_string()
         } else if ws.paused {
@@ -1514,23 +1514,23 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
     usize::try_from(bounce_count).unwrap_or(usize::MAX) >= MAX_BOUNCES
 }
 
-/// Move all other ReadyForDevelopment tickets in the workspace to Planning.
-async fn drain_ready_for_development_siblings(ticket: &Ticket) {
+/// Move all other Queued tickets in the workspace to Planning.
+async fn drain_queued_siblings(ticket: &Ticket) {
     match board()
-        .drain_ready_for_development_to_planning(&ticket.workspace_name)
+        .drain_queued_to_planning(&ticket.workspace_name)
         .await
     {
         Ok(updated) if updated > 0 => {
             info!(
                 tickets = updated,
                 workspace = %ticket.workspace_name,
-                "Moved {updated} ReadyForDevelopment ticket(s) to Planning after bounce breaker trip",
+                "Moved {updated} Queued ticket(s) to Planning after bounce breaker trip",
             );
         }
         Ok(_) => {
             debug!(
                 workspace = %ticket.workspace_name,
-                "No ReadyForDevelopment siblings to drain after bounce breaker trip",
+                "No Queued siblings to drain after bounce breaker trip",
             );
         }
         Err(e) => {
@@ -1538,7 +1538,7 @@ async fn drain_ready_for_development_siblings(ticket: &Ticket) {
                 ticket = %ticket.id,
                 workspace = %ticket.workspace_name,
                 error = %e,
-                "Failed to move ReadyForDevelopment tickets to Planning \
+                "Failed to move Queued tickets to Planning \
                  — breaker trip proceeds without moving siblings",
             );
         }
@@ -1594,7 +1594,7 @@ pub(crate) async fn bounce_to_development(
         let conn = &crate::session::store().conn;
         if trip {
             if drains_siblings {
-                drain_ready_for_development_siblings(ticket).await;
+                drain_queued_siblings(ticket).await;
             }
             let _ = crate::jobs::complete_ticket_job(conn, job_id).await;
             info!(

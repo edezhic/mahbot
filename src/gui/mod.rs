@@ -1718,15 +1718,15 @@ impl Dashboard {
                 .into();
                 // Wrap sidebar in a right-click context menu with "Archive done
                 // & cancelled", plus the bulk pause item when a
-                // ready-for-development ticket is listed.
+                // queued ticket is listed.
                 let mut menu_items = vec![menus::MenuItem::new(
                     "Archive done & cancelled".into(),
                     Message::Board(board::BoardMessage::ArchiveAllCompleted),
                 )];
-                if self.board_state.has_visible_rfd_tickets() {
+                if self.board_state.has_visible_queued_tickets() {
                     menu_items.push(menus::MenuItem::new(
-                        "Pause all ready-for-development tickets".into(),
-                        Message::Board(board::BoardMessage::PauseAllReadyForDevelopment),
+                        "Pause all queued tickets".into(),
+                        Message::Board(board::BoardMessage::PauseAllQueued),
                     ));
                 }
                 let sidebar: Element<'_, Message> = ContextMenu::new(sidebar, menu_items).into();
@@ -1966,13 +1966,13 @@ fn section_hint(label: &str) -> Element<'_, Message> {
 }
 
 /// Render the normal ticket list partitioned into groups (In Progress,
-/// Ready, Pending, Completed).
+/// Queued, Pending, Completed).
 fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Message> {
-    let [in_progress, ready, pending, completed] =
+    let [in_progress, queued, pending, completed] =
         board::BoardState::board_sections(&board_state.tickets);
 
     let is_empty =
-        in_progress.is_empty() && ready.is_empty() && pending.is_empty() && completed.is_empty();
+        in_progress.is_empty() && queued.is_empty() && pending.is_empty() && completed.is_empty();
 
     if !board_state.load_state.has_loaded() {
         section_hint("Loading…")
@@ -1983,8 +1983,8 @@ fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Mes
         if !in_progress.is_empty() {
             groups = groups.push(group_section("In Progress", &in_progress, board_state));
         }
-        if !ready.is_empty() {
-            groups = groups.push(group_section("Ready", &ready, board_state));
+        if !queued.is_empty() {
+            groups = groups.push(group_section("Queued", &queued, board_state));
         }
         if !pending.is_empty() {
             groups = groups.push(group_section("Pending", &pending, board_state));

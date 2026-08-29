@@ -264,7 +264,7 @@ impl Tool for UpdateTicketTool {
                 },
                 "phase": {
                     "type": "string",
-                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), planning (paused state awaiting further decision whether to proceed with the ticket or cancel it), ready_for_development (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete). Do NOT manually set other pipeline-managed phases (analysis, in_development, in_diagnostics, in_review, in_qa, in_sanitation) — the board poller handles these automatically and manual transitions will interfere with running agents."
+                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), planning (paused state awaiting further decision whether to proceed with the ticket or cancel it), queued (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete). Do NOT manually set other pipeline-managed phases (analysis, in_development, in_diagnostics, in_review, in_qa, in_sanitation) — the board poller handles these automatically and manual transitions will interfere with running agents."
                 }
             }),
             &["ticket_id", "phase"],
@@ -313,7 +313,7 @@ impl Tool for ListTicketsTool {
             &json!({
                 "phase": {
                     "type": "string",
-                    "description": "Optional phase filter (e.g. 'ready_for_development', 'in_development', 'done', 'cancelled'). When omitted, 'done' and 'cancelled' tickets are excluded — use an explicit phase filter to include them. Use 'search_archived_tickets' to find archived tickets."
+                    "description": "Optional phase filter (e.g. 'queued', 'in_development', 'done', 'cancelled'). When omitted, 'done' and 'cancelled' tickets are excluded — use an explicit phase filter to include them. Use 'search_archived_tickets' to find archived tickets."
                 }
             }),
             &[],

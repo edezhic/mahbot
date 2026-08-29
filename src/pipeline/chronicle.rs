@@ -383,7 +383,7 @@ mod tests {
             Hop {
                 id: "mahbot-A".into(),
                 source: "planning".into(),
-                target: "ready_for_development".into(),
+                target: "queued".into(),
                 at: "2026-08-17T08:02:00+00:00".into(),
             },
         ];
@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(result.matches("• mahbot-B:").count(), 1);
         let hop_a1 = result.find("    backlog → analysis").unwrap();
         let hop_b = result.find("    analysis → planning").unwrap();
-        let hop_a2 = result.find("    planning → ready_for_development").unwrap();
+        let hop_a2 = result.find("    planning → queued").unwrap();
         assert!(hop_a1 < hop_b && hop_b < hop_a2);
     }
 

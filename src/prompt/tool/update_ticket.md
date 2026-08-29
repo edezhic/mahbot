@@ -2,7 +2,7 @@ Transition an existing ticket to a new phase. Requires the ticket `ticket_id`, w
 
 - **backlog** — return the ticket to the start (analysts will re-evaluate it)
 - **planning** — paused state awaiting further decision whether to proceed with the ticket or cancel it
-- **ready_for_development** — send the ticket to the engineer's queue for implementation
+- **queued** — send the ticket to the engineer's queue for implementation
 - **cancelled** — abandon the ticket without completing it (beware that if the ticket already had some work done in it then the workspace will be left in a dirty state even after cancellation).
 - **done** — mark the ticket as complete and successful
 

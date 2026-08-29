@@ -429,6 +429,21 @@ CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(status, next_fire_at);";
 /// stay NULL, which maps to no label.
 const DELTA_CHAT_HISTORY_TIMESTAMP: &str = "ALTER TABLE chat_history ADD COLUMN timestamp TEXT;";
 
+/// Rename the 'ready_for_development' phase value to 'queued'.
+///
+/// The phase rename (ReadyForDevelopment → Queued) changes the stored
+/// snake_case phase string. This data-only migration rewrites the
+/// structured columns that actually carry the phase value: `tickets.phase`
+/// and `ticket_chronicle.source_phase` / `target_phase`. `jobs.kind` is
+/// updated defensively too (it only ever holds working-phase kinds today,
+/// so this is a safe no-op). Free-text comment prose is deliberately
+/// untouched.
+const DELTA_RENAME_READY_FOR_DEVELOPMENT_TO_QUEUED: &str = "\
+UPDATE tickets SET phase = 'queued' WHERE phase = 'ready_for_development';\
+UPDATE ticket_chronicle SET source_phase = 'queued' WHERE source_phase = 'ready_for_development';\
+UPDATE ticket_chronicle SET target_phase = 'queued' WHERE target_phase = 'ready_for_development';\
+UPDATE jobs SET kind = 'queued' WHERE kind = 'ready_for_development';";
+
 /// The id of the one-time consolidation import (a Rust-function migration).
 pub(crate) const CONSOLIDATION_IMPORT_ID: &str = "consolidate_001_import_domain_stores";
 
@@ -670,6 +685,12 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "19",
         target: TargetDb::Core,
         body: MigrationBody::Rust(drop_user_roles_and_seed_onboarding),
+    },
+    // Rename the 'ready_for_development' phase value to 'queued'.
+    Migration {
+        id: "20",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(DELTA_RENAME_READY_FOR_DEVELOPMENT_TO_QUEUED),
     },
 ];
 

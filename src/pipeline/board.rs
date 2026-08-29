@@ -102,7 +102,7 @@ crate::columns! {
 ///
 /// Only one ticket at a time per workspace may be in this pipeline. Any ticket in one of these
 /// phases blocks new Engineer dispatches for that workspace. The Maintainer uses a separate
-/// pre-development threshold (Analysis + Planning + ReadyForDevelopment) and is no longer
+/// pre-development threshold (Analysis + Planning + Queued) and is no longer
 /// directly suppressed by this constant.
 ///
 /// Occupancy is owned by the phase job (a short-lived job whose `kind` is the
@@ -110,7 +110,7 @@ crate::columns! {
 /// live phase job, and that job is the single authority that runs the stage
 /// then advances the ticket to the next phase. `tickets.phase` is both the
 /// displayed pipeline state and the input gate for the claim step
-/// (Backlog → Analysis, ReadyForDevelopment → InDevelopment) — not a mirror
+/// (Backlog → Analysis, Queued → InDevelopment) — not a mirror
 /// of a long-lived job.
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
@@ -283,7 +283,7 @@ impl Ticket {
     /// The output includes these fields (when present):
     ///
     /// - Ticket ID, Title, Description
-    /// - Phase (snake_case — e.g. `ready_for_development`)
+    /// - Phase (snake_case — e.g. `queued`)
     /// - Priority (P0–P4+ label)
     /// - Reporter, Workspace, Created, Updated
     /// - Supersedes, Superseded by, Prerequisites (conditionally when non-empty)
@@ -444,9 +444,9 @@ pub enum TicketPhase {
     Backlog,
     Analysis,
     /// Ticket is waiting for Manager review. Not picked up automatically by any agent —
-    /// the Manager or user must manually advance it to ReadyForDevelopment or cancel it.
+    /// the Manager or user must manually advance it to Queued or cancel it.
     Planning,
-    ReadyForDevelopment,
+    Queued,
     InDevelopment,
     InDiagnostics,
     InSanitation,
@@ -931,7 +931,7 @@ impl BoardStore {
 
     /// Grace window for Backlog→Analysis claims: tickets younger than this are
     /// not claimed into Analysis. Gives the Manager ~5s after create_ticket to
-    /// move the ticket straight to Planning/ReadyForDevelopment — claiming it
+    /// move the ticket straight to Planning/Queued — claiming it
     /// into Analysis within the window would spawn analysts that immediately
     /// get cancelled (plus a spurious phase-change notification).
     pub(crate) const BACKLOG_CLAIM_GRACE: Duration = Duration::seconds(5);
@@ -970,7 +970,7 @@ impl BoardStore {
     /// Note: the claim SELECT is kept to the tickets table, and the agents
     /// roster is a separate logical table checked by the caller (via the
     /// phase-job + launched-roster guard). The claim source phases
-    /// (Backlog, ReadyForDevelopment) have no running agent.
+    /// (Backlog, Queued) have no running agent.
     pub(crate) async fn claim_ticket_in_workspace(
         &self,
         current_phase: TicketPhase,
@@ -1338,7 +1338,7 @@ impl BoardStore {
     ///
     /// Returns `true` if any ticket in the workspace has a pipeline-occupied
     /// phase ([`PIPELINE_OCCUPIED_PHASES`]), or a
-    /// [`ReadyForDevelopment`](TicketPhase::ReadyForDevelopment) ticket,
+    /// [`Queued`](TicketPhase::Queued) ticket,
     /// optionally excluding a specific ticket ID.
     ///
     /// [`has_active_tickets_excluding`] delegates to this helper.
@@ -1359,7 +1359,7 @@ impl BoardStore {
     /// The SQL always binds three positional parameters:
     /// - `?1`: `workspace_name`
     /// - `?2`: `exclude_ticket_id` (may be `None`)
-    /// - `?3`: ReadyForDevelopment phase value
+    /// - `?3`: Queued phase value
     async fn has_active_tickets_internal(
         &self,
         workspace_name: &str,
@@ -1372,10 +1372,10 @@ impl BoardStore {
              AND workspace_name = ?1 AND is_archived = 0 \
              AND (?2 IS NULL OR id != ?2) LIMIT 1",
         );
-        let rfd = TicketPhase::ReadyForDevelopment.as_ref();
+        let queued = TicketPhase::Queued.as_ref();
         let rows = self
             .conn
-            .query(&sql, db::params![workspace_name, exclude_ticket_id, rfd])
+            .query(&sql, db::params![workspace_name, exclude_ticket_id, queued])
             .await?;
         Ok(!rows.is_empty())
     }
@@ -1383,7 +1383,7 @@ impl BoardStore {
     /// Check if the workspace has any active tickets other than the excluded one.
     ///
     /// "Active" means a ticket whose phase is either a pipeline-occupied phase
-    /// (`PIPELINE_OCCUPIED_PHASES`) or [`TicketPhase::ReadyForDevelopment`]
+    /// (`PIPELINE_OCCUPIED_PHASES`) or [`TicketPhase::Queued`]
     /// (unstarted backlog tickets are considered active to suppress Done
     /// notifications until the pipeline is fully drained).
     ///
@@ -1667,22 +1667,19 @@ impl BoardStore {
         prepared.execute_and_cancel(&self.conn).await
     }
 
-    /// Move all non-archived ReadyForDevelopment tickets in the given workspace
+    /// Move all non-archived Queued tickets in the given workspace
     /// to Planning.
     ///
-    /// Used by the circuit breaker to drain sibling ReadyForDevelopment tickets
+    /// Used by the circuit breaker to drain sibling Queued tickets
     /// when a ticket in the same workspace fails.
     ///
     /// Uses a single atomic UPDATE so there is no TOCTOU window between reading
-    /// current ReadyForDevelopment tickets and updating them. Per-sibling
+    /// current Queued tickets and updating them. Per-sibling
     /// notifications are intentionally suppressed — each sibling will discover
     /// its new phase on the next poll cycle via the standard poll loop.
     ///
     /// Returns the number of tickets moved.
-    pub(crate) async fn drain_ready_for_development_to_planning(
-        &self,
-        workspace_name: &str,
-    ) -> Result<u64> {
+    pub(crate) async fn drain_queued_to_planning(&self, workspace_name: &str) -> Result<u64> {
         let now = db::now();
         let updated = self
             .conn
@@ -1692,7 +1689,7 @@ impl BoardStore {
                 db::params![
                     TicketPhase::Planning.as_ref(),
                     now,
-                    TicketPhase::ReadyForDevelopment.as_ref(),
+                    TicketPhase::Queued.as_ref(),
                     workspace_name,
                 ],
             )
@@ -1744,7 +1741,7 @@ impl BoardStore {
     /// Partition tickets into the three kanban columns, in the same order the
     /// GUI board displays them: completed ([`TicketPhase::is_unblocking`]),
     /// pipeline ([`TicketPhase::is_pipeline_occupied`] plus
-    /// `ReadyForDevelopment`), pending (everything else — the safe fallback
+    /// `Queued`), pending (everything else — the safe fallback
     /// for unclassified phases). Archived tickets are excluded.
     ///
     /// Non-completed tickets sort by priority ASC (0 = highest) then
@@ -1765,9 +1762,7 @@ impl BoardStore {
             }
             if ticket.phase.is_unblocking() {
                 completed.push(ticket);
-            } else if ticket.phase.is_pipeline_occupied()
-                || ticket.phase == TicketPhase::ReadyForDevelopment
-            {
+            } else if ticket.phase.is_pipeline_occupied() || ticket.phase == TicketPhase::Queued {
                 pipeline.push(ticket);
             } else {
                 // Unknown future phases silently default to pending — the
@@ -1807,7 +1802,7 @@ impl BoardStore {
     }
 
     /// The four board sections in display order: In Progress (pipeline minus
-    /// ReadyForDevelopment), Ready, Pending, Completed. Shared by the GUI
+    /// Queued), Queued, Pending, Completed. Shared by the GUI
     /// column rendering and the Telegram `/board` listing so the two surfaces
     /// can never diverge. Empty sections are included (callers skip them).
     #[must_use]
@@ -1815,15 +1810,15 @@ impl BoardStore {
         let (pending, pipeline, completed) = Self::partition_board_tickets(tickets);
         let in_progress = pipeline
             .iter()
-            .filter(|t| t.phase != TicketPhase::ReadyForDevelopment)
+            .filter(|t| t.phase != TicketPhase::Queued)
             .copied()
             .collect();
-        let ready = pipeline
+        let queued = pipeline
             .iter()
-            .filter(|t| t.phase == TicketPhase::ReadyForDevelopment)
+            .filter(|t| t.phase == TicketPhase::Queued)
             .copied()
             .collect();
-        [in_progress, ready, pending, completed]
+        [in_progress, queued, pending, completed]
     }
 
     /// Flatten [`Self::board_sections`] into a single display-order list —

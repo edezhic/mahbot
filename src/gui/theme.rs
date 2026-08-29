@@ -238,7 +238,7 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
 pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
         Analysis, Backlog, Cancelled, Done, Failed, InDevelopment, InDiagnostics, InQa, InReview,
-        InSanitation, Planning, ReadyForDevelopment,
+        InSanitation, Planning, Queued,
     };
     match phase {
         // Early phases — cool/muted, neutral
@@ -254,8 +254,8 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
             Color::from_rgb(0.114, 0.216, 0.310),
             Color::from_rgb(0.784, 0.863, 0.949),
         ),
-        // Ready — olive gateway (Manager→Engineer)
-        ReadyForDevelopment => (
+        // Queued — olive gateway (Manager→Engineer)
+        Queued => (
             Color::from_rgb(0.263, 0.224, 0.114),
             Color::from_rgb(0.902, 0.863, 0.784),
         ),

@@ -308,8 +308,8 @@ async fn run_workspace_diagnostics(
 ///   `status = Analyzing`), and rediscovery is the documented unpause path —
 ///   so a successful discovery clears it. While that pause is set, the claim
 ///   pipeline's gate also holds automatic Backlog→Analysis and
-///   ReadyForDevelopment→InDevelopment claims (see `run_claim_pipeline` in
-///   the management module), so queued backlog/RFD tickets wait out the
+///   Queued→InDevelopment claims (see `run_claim_pipeline` in
+///   the management module), so backlog and Queued tickets wait out the
 ///   discovery and are picked up on the next poll cycle after this unpause.
 /// - [`DiscoveryOutcome::Fatal`] (at least one non-provider failure — runtime
 ///   errors, parse failures): sets status to `failed` (terminal, manual

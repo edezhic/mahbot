@@ -73,18 +73,18 @@ async fn claim_backlog_obeys_grace() {
     assert_eq!(claimed.phase, TicketPhase::Analysis);
 }
 
-/// ReadyForDevelopment → InDevelopment is gated on single pipeline occupancy:
+/// Queued → InDevelopment is gated on single pipeline occupancy:
 /// a candidate is blocked exactly while a sibling sits in a pipeline phase.
 #[tokio::test]
-async fn claim_rfd_blocks_on_pipeline_occupancy() {
+async fn claim_queued_blocks_on_pipeline_occupancy() {
     let (store, _dir) = crate::open_test_store!(BoardStore, "board");
     let ws = ws_named("ws-a");
 
-    // No occupied sibling yet → the RFD claim succeeds.
-    let first = make_ticket(&store, &ws, "RFD one", TicketPhase::ReadyForDevelopment).await;
+    // No occupied sibling yet → the Queued claim succeeds.
+    let first = make_ticket(&store, &ws, "Queued one", TicketPhase::Queued).await;
     let claimed = store
         .claim_ticket_in_workspace(
-            TicketPhase::ReadyForDevelopment,
+            TicketPhase::Queued,
             TicketPhase::InDevelopment,
             &ws.name,
             PipelineCheck::Enforce,
@@ -92,16 +92,16 @@ async fn claim_rfd_blocks_on_pipeline_occupancy() {
         )
         .await
         .unwrap()
-        .expect("RFD ticket must claim without a pipeline-occupied sibling");
+        .expect("Queued ticket must claim without a pipeline-occupied sibling");
     assert_eq!(claimed.id, first);
 
-    // `first` is now InDevelopment (a pipeline-occupied phase) → a second RFD
+    // `first` is now InDevelopment (a pipeline-occupied phase) → a second Queued
     // ticket is blocked.
-    make_ticket(&store, &ws, "RFD two", TicketPhase::ReadyForDevelopment).await;
+    make_ticket(&store, &ws, "Queued two", TicketPhase::Queued).await;
     assert!(
         store
             .claim_ticket_in_workspace(
-                TicketPhase::ReadyForDevelopment,
+                TicketPhase::Queued,
                 TicketPhase::InDevelopment,
                 &ws.name,
                 PipelineCheck::Enforce,
@@ -110,7 +110,7 @@ async fn claim_rfd_blocks_on_pipeline_occupancy() {
             .await
             .unwrap()
             .is_none(),
-        "RFD claim must be blocked while a pipeline-occupied sibling exists",
+        "Queued claim must be blocked while a pipeline-occupied sibling exists",
     );
 }
 
@@ -258,7 +258,7 @@ async fn phase_machine_classifications_are_consistent() {
     }
 }
 
-/// The puller claim driver claims Backlog → Analysis and RFD → InDevelopment
+/// The puller claim driver claims Backlog → Analysis and Queued → InDevelopment
 /// for a live (Ready) workspace.
 #[tokio::test]
 async fn run_claim_pipeline_claims_new_work() {
@@ -272,7 +272,7 @@ async fn run_claim_pipeline_claims_new_work() {
         .unwrap();
 
     let backlog_id = make_ticket(store, &ws, "Backlog", TicketPhase::Backlog).await;
-    let rfd_id = make_ticket(store, &ws, "RFD", TicketPhase::ReadyForDevelopment).await;
+    let queued_id = make_ticket(store, &ws, "Queued", TicketPhase::Queued).await;
 
     super::run_claim_pipeline(&ws).await;
 
@@ -281,9 +281,9 @@ async fn run_claim_pipeline_claims_new_work() {
         crate::util::test::expect_ticket_phase(store, &backlog_id).await,
         TicketPhase::Backlog,
     );
-    // RFD has no grace → claims immediately.
+    // Queued has no grace → claims immediately.
     assert_eq!(
-        crate::util::test::expect_ticket_phase(store, &rfd_id).await,
+        crate::util::test::expect_ticket_phase(store, &queued_id).await,
         TicketPhase::InDevelopment,
     );
 }
@@ -627,7 +627,7 @@ async fn age_ticket_past_grace(store: &BoardStore, id: &str) {
 // ── 1. Full pipeline lifecycle ──────────────────────────────────────────
 
 /// Drive a Backlog→Done lifecycle through the real phase bodies and the
-/// per-phase puller claims: analysis → planning → rfd → development →
+/// per-phase puller claims: analysis → planning → queued → development →
 /// diagnostics (skipped) → review (skip-reviewed) → QA → sanitation (dirty
 /// commit).
 
@@ -692,13 +692,9 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         "a completed analysis round deletes the phase job",
     );
 
-    // Manual Planning → ReadyForDevelopment, then puller claim RFD → InDevelopment.
+    // Manual Planning → Queued, then puller claim Queued → InDevelopment.
     store
-        .transition_to(
-            &id,
-            Some(TicketPhase::Planning),
-            TicketPhase::ReadyForDevelopment,
-        )
+        .transition_to(&id, Some(TicketPhase::Planning), TicketPhase::Queued)
         .await
         .unwrap();
     super::run_claim_pipeline(&ws).await;
@@ -1317,16 +1313,16 @@ async fn review_qa_dynamic_count_calibration() {
     );
 }
 
-// ── 4. Bounce breaker trips terminal and drains RFD siblings ────────────
+// ── 4. Bounce breaker trips terminal and drains Queued siblings ────────────
 
 /// When the reviewer bounce budget is exhausted the ticket trips to Failed
-/// (terminal), the phase job is deleted, RFD siblings are drained to Planning,
+/// (terminal), the phase job is deleted, Queued siblings are drained to Planning,
 /// and the workspace is NOT paused (a bounce is not a technical failure).
 
 #[serial_test::serial(provider)]
 #[tokio::test]
 #[expect(clippy::await_holding_lock)]
-async fn bounce_breaker_fails_terminal_and_drains_rfd_without_pausing() {
+async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
@@ -1337,7 +1333,7 @@ async fn bounce_breaker_fails_terminal_and_drains_rfd_without_pausing() {
         .await
         .unwrap();
     let id = make_ticket(store, &ws, "Trip", TicketPhase::InReview).await;
-    let sibling = make_ticket(store, &ws, "Sibling", TicketPhase::ReadyForDevelopment).await;
+    let sibling = make_ticket(store, &ws, "Sibling", TicketPhase::Queued).await;
 
     // Seed the bounce budget at the exhaustion threshold (MAX_BOUNCES = 10).
     store
@@ -1391,7 +1387,7 @@ async fn bounce_breaker_fails_terminal_and_drains_rfd_without_pausing() {
     assert_eq!(
         expect_ticket_phase(store, &sibling).await,
         TicketPhase::Planning,
-        "breaker trip must drain ReadyForDevelopment siblings to Planning",
+        "breaker trip must drain Queued siblings to Planning",
     );
     assert_workspace_paused(&ws, false).await;
 

@@ -16,7 +16,7 @@ use crate::agent::run_default_agent;
 use crate::db;
 use crate::pipeline::board::TicketPhase;
 
-/// Maximum number of tickets allowed in Analysis + Planning + ReadyForDevelopment
+/// Maximum number of tickets allowed in Analysis + Planning + Queued
 /// before the maintainer pauses ticket creation.
 const MAX_PRE_DEV_TICKETS: i64 = 5;
 
@@ -191,7 +191,7 @@ fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
 
 /// Returns `true` if the maintainer should skip because the pre-dev pipeline
 /// has reached `MAX_PRE_DEV_TICKETS` or more tickets (Analysis + Planning +
-/// ReadyForDevelopment).
+/// Queued).
 ///
 /// If the board is unavailable, returns `false` to allow the run through.
 async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
@@ -212,8 +212,8 @@ async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
     let pre_dev_count = {
         let analysis = count_phase(TicketPhase::Analysis).await;
         let planning = count_phase(TicketPhase::Planning).await;
-        let ready = count_phase(TicketPhase::ReadyForDevelopment).await;
-        analysis + planning + ready
+        let queued = count_phase(TicketPhase::Queued).await;
+        analysis + planning + queued
     };
 
     if pre_dev_count >= MAX_PRE_DEV_TICKETS {

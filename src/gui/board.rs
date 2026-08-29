@@ -102,11 +102,11 @@ pub enum BoardMessage {
     /// Result of batch archive operation.
     ArchiveAllCompletedResult(Result<u64, String>),
 
-    /// Batch-pause all ready-for-development tickets (back to planning).
-    PauseAllReadyForDevelopment,
+    /// Batch-pause all queued tickets (back to planning).
+    PauseAllQueued,
 
     /// Result of the batch pause operation.
-    PauseAllReadyForDevelopmentResult(Result<u64, String>),
+    PauseAllQueuedResult(Result<u64, String>),
 
     /// Archive a single ticket (sets is_archived = 1).
     ArchiveTicket(String),
@@ -331,12 +331,12 @@ impl BoardState {
         )
     }
 
-    /// Non-archived `ready_for_development` tickets in the currently displayed
+    /// Non-archived `queued` tickets in the currently displayed
     /// list — the normal `tickets`, or `search_results` when a search is active
     /// (`search_query` non-empty). Mirrors the sidebar's own
     /// `search_query.text().is_empty()` gate so the pause action always targets
     /// what is actually rendered.
-    fn displayed_rfd_tickets(&self) -> impl Iterator<Item = &Ticket> {
+    fn displayed_queued_tickets(&self) -> impl Iterator<Item = &Ticket> {
         let search_active = !self.search_query.text().is_empty();
         let source = if search_active {
             &self.search_results
@@ -345,26 +345,26 @@ impl BoardState {
         };
         source
             .iter()
-            .filter(|t| !t.is_archived && t.phase == TicketPhase::ReadyForDevelopment)
+            .filter(|t| !t.is_archived && t.phase == TicketPhase::Queued)
     }
 
-    /// Whether the "Pause all ready-for-development tickets" context-menu item
-    /// should be offered — at least one non-archived RfD ticket is visible.
-    pub(crate) fn has_visible_rfd_tickets(&self) -> bool {
-        self.displayed_rfd_tickets().next().is_some()
+    /// Whether the "Pause all queued tickets" context-menu item
+    /// should be offered — at least one non-archived Queued ticket is visible.
+    pub(crate) fn has_visible_queued_tickets(&self) -> bool {
+        self.displayed_queued_tickets().next().is_some()
     }
 
     /// Workspaces to drain for the bulk pause. A concrete (non-empty)
     /// `workspace_name` selects that workspace; otherwise (`None` or the
     /// empty-string Personal filter, which must be treated as "no concrete
     /// workspace") the set is the distinct workspaces of the displayed
-    /// non-archived RfD tickets. Each workspace is drained once.
-    fn pause_all_rfd_workspaces(&self) -> Vec<String> {
+    /// non-archived Queued tickets. Each workspace is drained once.
+    fn pause_all_queued_workspaces(&self) -> Vec<String> {
         match self.workspace_name.as_deref() {
             Some(ws) if !ws.is_empty() => vec![ws.to_string()],
             _ => {
                 let mut workspaces: Vec<String> = Vec::new();
-                for ticket in self.displayed_rfd_tickets() {
+                for ticket in self.displayed_queued_tickets() {
                     if !workspaces.contains(&ticket.workspace_name) {
                         workspaces.push(ticket.workspace_name.clone());
                     }
@@ -660,17 +660,17 @@ impl BoardState {
     /// Phase transition actions (ported from Board.tsx `availableActions`)
     fn available_actions(phase: TicketPhase) -> Vec<(&'static str, TicketPhase)> {
         match phase {
-            TicketPhase::ReadyForDevelopment => vec![
+            TicketPhase::Queued => vec![
                 ("⏸ Pause", TicketPhase::Planning),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
             TicketPhase::Planning => vec![
-                ("✅ Ready for Dev", TicketPhase::ReadyForDevelopment),
+                ("✅ Queued", TicketPhase::Queued),
                 ("↩ Back to Backlog", TicketPhase::Backlog),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
             TicketPhase::Failed => vec![
-                ("✅ Ready for Dev", TicketPhase::ReadyForDevelopment),
+                ("✅ Queued", TicketPhase::Queued),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
             TicketPhase::Done | TicketPhase::Cancelled => {
@@ -683,9 +683,9 @@ impl BoardState {
     /// Map an action label to its lucide icon (16px) and tooltip text.
     ///
     /// Keyed off the action label. The keyword chain
-    /// (Cancel → QA → Pause → Dev → Backlog) drives both the icon and the
+    /// (Cancel → QA → Pause → Queued → Backlog) drives both the icon and the
     /// tooltip, so the two can never drift apart. Rework is automatic via
-    /// validation failures — there is no manual "Redo Dev" action anymore.
+    /// validation failures — there is no manual rework action anymore.
     /// The trailing `circle_check`/"move phase" pair is a defensive
     /// catch-all for labels outside [`Self::available_actions`].
     fn action_icon_and_tooltip<'a>(
@@ -700,8 +700,8 @@ impl BoardState {
             (lucide::shield_check(), "send to QA")
         } else if label.contains("Pause") {
             (lucide::pause(), "move to planning")
-        } else if label.contains("Dev") {
-            (lucide::play(), "ready for dev")
+        } else if label.contains("Queued") {
+            (lucide::play(), "queued")
         } else if label.contains("Backlog") {
             (lucide::rotate_ccw(), "back to backlog")
         } else {
@@ -1028,7 +1028,7 @@ impl BoardState {
                         }
                         // Re-dispatch into development is automatic via a
                         // validation non-success (the unified bounce) — there
-                        // is no manual "Redo Dev" action anymore.
+                        // is no manual "Redo Queued" action anymore.
                         board
                             .transition_to(&ticket_id, None, phase)
                             .await
@@ -1227,30 +1227,30 @@ impl BoardState {
                 Task::batch([self.refresh(), toast])
             }
             BoardMessage::ArchiveAllCompletedResult(Err(e))
-            | BoardMessage::PauseAllReadyForDevelopmentResult(Err(e)) => {
+            | BoardMessage::PauseAllQueuedResult(Err(e)) => {
                 Task::done(BoardMessage::Toast(super::ToastMessage::Error(e)))
             }
-            BoardMessage::PauseAllReadyForDevelopment => {
-                let workspaces = self.pause_all_rfd_workspaces();
+            BoardMessage::PauseAllQueued => {
+                let workspaces = self.pause_all_queued_workspaces();
                 Task::perform(
                     async move {
                         let board = crate::pipeline::board::store();
                         let mut total = 0u64;
                         for ws in &workspaces {
-                            match board.drain_ready_for_development_to_planning(ws).await {
+                            match board.drain_queued_to_planning(ws).await {
                                 Ok(moved) => total += moved,
                                 Err(e) => return Err(e.to_string()),
                             }
                         }
                         Ok(total)
                     },
-                    BoardMessage::PauseAllReadyForDevelopmentResult,
+                    BoardMessage::PauseAllQueuedResult,
                 )
             }
-            BoardMessage::PauseAllReadyForDevelopmentResult(Ok(count)) => {
+            BoardMessage::PauseAllQueuedResult(Ok(count)) => {
                 // Count is the total moved across the drained workspace(s). A
                 // search filter only gates visibility, so this may exceed (or
-                // lag) the currently listed RfD tickets.
+                // lag) the currently listed Queued tickets.
                 let toast = Task::done(BoardMessage::Toast(super::ToastMessage::SuccessMsg(
                     format!("Paused {count} ticket{}", if count == 1 { "" } else { "s" }),
                 )));
@@ -1452,7 +1452,7 @@ impl BoardState {
     }
 
     /// Partition tickets into the four board columns in display order:
-    /// In Progress, Ready, Pending, Completed.
+    /// In Progress, Queued, Pending, Completed.
     pub(crate) fn board_sections(tickets: &[Ticket]) -> [Vec<&Ticket>; 4] {
         crate::pipeline::board::BoardStore::board_sections(tickets)
     }
@@ -3205,7 +3205,7 @@ mod tests {
         assert_eq!(ids, ["d1", "d2", "d3", "c1", "c2", "c3"]);
     }
 
-    // ── Pause-all-ready-for-development helper ─────────────────────
+    // ── Pause-all-queued helper ─────────────────────
 
     /// Build a ticket for the pause-helper tests, overriding the phase,
     /// workspace and archived flag.
@@ -3217,117 +3217,97 @@ mod tests {
     }
 
     #[test]
-    fn pause_all_rfd_visibility_uses_normal_list_when_no_search() {
+    fn pause_all_queued_visibility_uses_normal_list_when_no_search() {
         let mut state = make_board_state();
         state.tickets = vec![
-            ticket_in("ws1", "t1", TicketPhase::ReadyForDevelopment, false),
+            ticket_in("ws1", "t1", TicketPhase::Queued, false),
             ticket_in("ws1", "t2", TicketPhase::Backlog, false),
         ];
-        assert!(state.has_visible_rfd_tickets());
+        assert!(state.has_visible_queued_tickets());
     }
 
     #[test]
-    fn pause_all_rfd_visibility_false_without_rfd() {
+    fn pause_all_queued_visibility_false_without_queued() {
         let mut state = make_board_state();
         state.tickets = vec![
             ticket_in("ws1", "t1", TicketPhase::Backlog, false),
             ticket_in("ws1", "t2", TicketPhase::Planning, false),
         ];
-        assert!(!state.has_visible_rfd_tickets());
+        assert!(!state.has_visible_queued_tickets());
     }
 
     #[test]
-    fn pause_all_rfd_visibility_ignores_archived_tickets() {
+    fn pause_all_queued_visibility_ignores_archived_tickets() {
         let mut state = make_board_state();
-        state.tickets = vec![ticket_in(
-            "ws1",
-            "t1",
-            TicketPhase::ReadyForDevelopment,
-            true,
-        )];
-        assert!(!state.has_visible_rfd_tickets());
+        state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, true)];
+        assert!(!state.has_visible_queued_tickets());
     }
 
     #[test]
-    fn pause_all_rfd_visibility_uses_search_results_when_search_active() {
+    fn pause_all_queued_visibility_uses_search_results_when_search_active() {
         let mut state = make_board_state();
-        // The hidden `tickets` list contains an RfD ticket, but the active
+        // The hidden `tickets` list contains a Queued ticket, but the active
         // search shows `search_results`; the item must reflect only what is
         // currently rendered.
-        state.tickets = vec![ticket_in(
-            "ws1",
-            "t1",
-            TicketPhase::ReadyForDevelopment,
-            false,
-        )];
+        state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, false)];
         state.search_query = super::super::common::SingleLineEditorState::new("foo");
         state.search_results = vec![ticket_in("ws1", "t2", TicketPhase::Backlog, false)];
-        assert!(!state.has_visible_rfd_tickets());
+        assert!(!state.has_visible_queued_tickets());
     }
 
     #[test]
-    fn pause_all_rfd_workspaces_concrete_workspace() {
+    fn pause_all_queued_workspaces_concrete_workspace() {
         let mut state = make_board_state();
         state.workspace_name = Some("ws1".into());
-        state.tickets = vec![ticket_in(
-            "ws1",
-            "t1",
-            TicketPhase::ReadyForDevelopment,
-            false,
-        )];
-        assert_eq!(state.pause_all_rfd_workspaces(), vec!["ws1".to_string()]);
+        state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Queued, false)];
+        assert_eq!(state.pause_all_queued_workspaces(), vec!["ws1".to_string()]);
     }
 
     #[test]
-    fn pause_all_rfd_workspaces_empty_string_is_no_concrete() {
+    fn pause_all_queued_workspaces_empty_string_is_no_concrete() {
         let mut state = make_board_state();
         // Personal mode stores `Some("")`; it must be treated as "no concrete
         // workspace" so the drain set is derived from the displayed tickets.
         state.workspace_name = Some(String::new());
         state.tickets = vec![
-            ticket_in("ws1", "t1", TicketPhase::ReadyForDevelopment, false),
-            ticket_in("ws2", "t2", TicketPhase::ReadyForDevelopment, false),
+            ticket_in("ws1", "t1", TicketPhase::Queued, false),
+            ticket_in("ws2", "t2", TicketPhase::Queued, false),
         ];
         assert_eq!(
-            state.pause_all_rfd_workspaces(),
+            state.pause_all_queued_workspaces(),
             vec!["ws1".to_string(), "ws2".to_string()]
         );
     }
 
     #[test]
-    fn pause_all_rfd_workspaces_none_derives_and_dedupes() {
+    fn pause_all_queued_workspaces_none_derives_and_dedupes() {
         let mut state = make_board_state();
         state.workspace_name = None;
         state.tickets = vec![
-            ticket_in("ws1", "t1", TicketPhase::ReadyForDevelopment, false),
-            ticket_in("ws1", "t2", TicketPhase::ReadyForDevelopment, false),
-            ticket_in("ws2", "t3", TicketPhase::ReadyForDevelopment, false),
+            ticket_in("ws1", "t1", TicketPhase::Queued, false),
+            ticket_in("ws1", "t2", TicketPhase::Queued, false),
+            ticket_in("ws2", "t3", TicketPhase::Queued, false),
             ticket_in("ws3", "t4", TicketPhase::Planning, false),
         ];
-        // Distinct workspaces of the displayed non-archived RfD tickets only.
+        // Distinct workspaces of the displayed non-archived Queued tickets only.
         assert_eq!(
-            state.pause_all_rfd_workspaces(),
+            state.pause_all_queued_workspaces(),
             vec!["ws1".to_string(), "ws2".to_string()]
         );
     }
 
     #[test]
-    fn pause_all_rfd_workspaces_uses_search_results_when_search_active() {
+    fn pause_all_queued_workspaces_uses_search_results_when_search_active() {
         let mut state = make_board_state();
         state.workspace_name = None;
-        state.tickets = vec![ticket_in(
-            "hidden",
-            "t1",
-            TicketPhase::ReadyForDevelopment,
-            false,
-        )];
+        state.tickets = vec![ticket_in("hidden", "t1", TicketPhase::Queued, false)];
         state.search_query = super::super::common::SingleLineEditorState::new("foo");
         state.search_results = vec![
-            ticket_in("ws1", "t2", TicketPhase::ReadyForDevelopment, false),
-            ticket_in("ws2", "t3", TicketPhase::ReadyForDevelopment, false),
+            ticket_in("ws1", "t2", TicketPhase::Queued, false),
+            ticket_in("ws2", "t3", TicketPhase::Queued, false),
         ];
         assert_eq!(
-            state.pause_all_rfd_workspaces(),
+            state.pause_all_queued_workspaces(),
             vec!["ws1".to_string(), "ws2".to_string()]
         );
     }

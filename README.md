@@ -26,7 +26,7 @@ Every ticket has a lifecycle with **redundant checks**:
 |-------|----------------|
 | **→ Analysis** | Parallel analysts research the ticket's assumptions & scope |
 | **→ Planning** | Manager sees the analysis and refines/cancels/approved or escalates |
-| **→ Ready** | Awaits in the engineer's queue according to it's priority |
+| **→ Queued** | Awaits in the engineer's queue according to it's priority |
 | **→ Development** | Engineer implements the ticket (or the required fixes) |
 | **→ Diagnostics** | Deterministic verification (format, lint, build, test) |
 | **→ Review** | Agentic verification focused on the code quality |
