@@ -61,8 +61,9 @@
 //! them:
 //!
 //! > Manager group (`Role::Manager`, `Role::Assistant`, `Role::Discovery`,
-//! > `Role::Engineer`) → manager slot; every other role (Artist, Analyst,
-//! > Coder, QA, Reviewer, Maintainer, Sanitation) → worker slot.
+//! > `Role::Engineer`, `Role::Support`, `Role::Maintainer`) → manager slot;
+//! > every other role (Artist, Analyst, Coder, QA, Reviewer, Sanitation) →
+//! > worker slot.
 //!
 //! Unset slots fall back to their `DEFAULT_*_MODEL` constant.
 //!
@@ -237,10 +238,11 @@ pub struct ConfigData {
     /// self-hosted servers are keyless). Only ever sent to the custom endpoint,
     /// never to OpenRouter.
     pub provider_endpoint_key: Option<String>,
-    /// Model slot for the Manager group (Manager, Assistant, Discovery, Engineer, Support).
+    /// Model slot for the Manager group (Manager, Assistant, Discovery,
+    /// Engineer, Support, Maintainer).
     pub manager_model: Option<String>,
     /// Model slot for all worker roles (Artist, Analyst, Coder, QA,
-    /// Reviewer, Maintainer, Sanitation).
+    /// Reviewer, Sanitation).
     pub worker_model: Option<String>,
     /// Image generation model.
     pub image_gen_model: Option<String>,
@@ -908,16 +910,19 @@ impl ConfigReload {
 
     /// Resolve the configured model for a role from the two model slots.
     ///
-    /// The manager group (Manager, Assistant, Discovery, Engineer, Support)
-    /// uses the manager slot; every other role (Artist, Analyst, Coder, QA,
-    /// Reviewer, Maintainer, Sanitation) uses the worker slot. Unset slots
+    /// The manager group (Manager, Assistant, Discovery, Engineer, Support,
+    /// Maintainer) uses the manager slot; every other role (Artist, Analyst,
+    /// Coder, QA, Reviewer, Sanitation) uses the worker slot. Unset slots
     /// fall back to their code default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
         match role {
-            Role::Manager | Role::Assistant | Role::Discovery | Role::Engineer | Role::Support => {
-                self.manager_model()
-            }
+            Role::Manager
+            | Role::Assistant
+            | Role::Discovery
+            | Role::Engineer
+            | Role::Support
+            | Role::Maintainer => self.manager_model(),
             _ => self.worker_model(),
         }
     }
@@ -1666,6 +1671,7 @@ mod tests {
             Role::Discovery,
             Role::Engineer,
             Role::Support,
+            Role::Maintainer,
         ] {
             assert_eq!(reload.role_model(role), "manager-slot-model");
         }
@@ -1675,7 +1681,6 @@ mod tests {
             Role::Qa,
             Role::Reviewer,
             Role::Artist,
-            Role::Maintainer,
             Role::Sanitation,
         ] {
             assert_eq!(reload.role_model(role), "worker-slot-model");

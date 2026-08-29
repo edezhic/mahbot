@@ -2882,13 +2882,13 @@ impl SettingsState {
             "Manager",
             crate::config::DEFAULT_MANAGER_MODEL,
             CONFIG_KEY_MANAGER_MODEL,
-            Some("Manager, Assistant, Discovery, Engineer, Support"),
+            Some("Manager, Assistant, Discovery, Engineer, Support, Maintainer"),
         );
         let worker_row = self.config_text_field(
             "Worker",
             crate::config::DEFAULT_WORKER_MODEL,
             CONFIG_KEY_WORKER_MODEL,
-            Some("Artist, Analyst, Coder, QA, Reviewer, Maintainer, Sanitation"),
+            Some("Artist, Analyst, Coder, QA, Reviewer, Sanitation"),
         );
         section(
             "Models",
