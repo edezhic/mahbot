@@ -669,7 +669,10 @@ impl BoardState {
                 ("↩ Back to Backlog", TicketPhase::Backlog),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
-            TicketPhase::Failed => vec![
+            // Manual override for Backlog/Analysis: skip the planning gate
+            // and send to engineer (cancels in-flight agents via
+            // `transition_to`). Failed tickets re-queue the same way.
+            TicketPhase::Failed | TicketPhase::Backlog | TicketPhase::Analysis => vec![
                 ("✅ Queued", TicketPhase::Queued),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
