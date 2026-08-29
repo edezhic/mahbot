@@ -1822,12 +1822,7 @@ impl SettingsState {
                             .width(Length::FillPortion(10))
                             .align_x(Alignment::Start)
                             .align_y(Alignment::Center),
-                            // Path column (FillPortion: 35)
-                            container(text(&ws_item.path).size(12).color(theme::TEXT_MUTED))
-                                .width(Length::FillPortion(35))
-                                .align_x(Alignment::Start)
-                                .align_y(Alignment::Center),
-                            // Left cluster column (FillPortion: 28) — per-role
+                            // Contexts column (FillPortion: 28) — per-role
                             // context icons, general context, Diag, Notes.
                             {
                                 let mut left = Row::new().spacing(4).align_y(Alignment::Center);
@@ -1898,7 +1893,8 @@ impl SettingsState {
                                     .align_x(Alignment::Start)
                                     .align_y(Alignment::Center)
                             },
-                            // Right column (FillPortion: 12) — Maintainer toggle only.
+                            // Maintainer column (FillPortion: 12) — Maintainer
+                            // toggle only.
                             container(widgets::icon_tooltip_button(
                                 widgets::maint_badge(maintainer_on),
                                 if maintainer_on {
@@ -1919,6 +1915,11 @@ impl SettingsState {
                             .width(Length::FillPortion(12))
                             .align_x(Alignment::End)
                             .align_y(Alignment::Center),
+                            // Path column (FillPortion: 35)
+                            container(text(&ws_item.path).size(12).color(theme::TEXT_MUTED))
+                                .width(Length::FillPortion(35))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center),
                         ]
                         .align_y(Alignment::Center),
                         {
