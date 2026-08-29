@@ -1826,27 +1826,31 @@ impl Dashboard {
 ///
 /// Creates a backdrop that dismisses the modal on click, wraps `inner` in the
 /// standard dialog container style with 16px padding, and centers it at 80%
-/// width using a `FillPortion(1/8/1)` row layout, then delegates to the shared
-/// backdrop helper for the overlay layering.
+/// width using a `FillPortion(1/8/1)` row layout. The dialog rectangle is
+/// click-claimed (via [`widgets::dialog_click_guard`]) so interior clicks do
+/// not fall through to the backdrop, while the surrounding margin still does.
 fn modal_overlay<'a>(
     inner: impl Into<Element<'a, Message>>,
     on_close: Message,
 ) -> Element<'a, Message> {
     let dialog = container(inner)
-        .width(Length::Fill)
         .height(Length::Fill)
         .padding(16)
         .style(theme::dialog_container_style);
 
     let centered = row![
         Space::new().width(Length::FillPortion(1)), // 10% margin
-        dialog.width(Length::FillPortion(8)),       // 80% content
+        widgets::dialog_click_guard(dialog.width(Length::FillPortion(8))), // 80% content
         Space::new().width(Length::FillPortion(1)), // 10% margin
     ]
     .width(Length::Fill)
     .height(Length::Fill);
 
-    widgets::modal_backdrop(centered, on_close, 0.5)
+    iced::widget::stack([
+        widgets::modal_backdrop_layer(on_close, 0.5),
+        centered.into(),
+    ])
+    .into()
 }
 
 /// Render the diff modal (80% width, 100% height, centered).

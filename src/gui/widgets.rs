@@ -1368,16 +1368,68 @@ pub fn tree_node_button<'a, Message: Clone + 'a>(
     btn.into()
 }
 
+/// Build the semi-transparent click-to-dismiss backdrop layer shared by all
+/// modal overlays. The backdrop is a full-screen [`mouse_area`] that emits
+/// `on_backdrop` when clicked.
+///
+/// Extracted from [`modal_backdrop`] so the 80%-width diff/branch overlays can
+/// compose the same backdrop while claiming only their dialog rectangle.
+pub(super) fn modal_backdrop_layer<'a, Message: 'a + Clone>(
+    on_backdrop: Message,
+    opacity: f32,
+) -> Element<'a, Message> {
+    mouse_area(
+        container(text(""))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgba(
+                    0.0, 0.0, 0.0, opacity,
+                ))),
+                ..container::Style::default()
+            }),
+    )
+    .on_press(on_backdrop)
+    .into()
+}
+
+/// Claim clicks over a dialog box so they do not fall through to the modal
+/// backdrop, while leaving the surrounding margin clickable.
+///
+/// The [`mouse_area`] reports [`iced::mouse::Interaction::Idle`] when the cursor
+/// is over the dialog and the content is non-interactive. That non-`None`
+/// interaction levitates the cursor in the parent `Stack`, so the backdrop sees
+/// a levitating cursor and bails instead of closing the modal. Interactive inner
+/// elements still capture their own events first, and the surrounding margin
+/// still reaches the backdrop.
+pub(super) fn dialog_click_guard<'a, Message: 'a + Clone>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    mouse_area(content)
+        .interaction(iced::mouse::Interaction::Idle)
+        .into()
+}
+
 /// Wrap dialog content in a centered modal overlay with a semi-transparent
 /// backdrop that closes on click.
 ///
 /// This is the shared helper for all modal backdrop patterns across the
 /// dashboard. It creates a stack with a click-to-dismiss backdrop and a
-/// centered container for the dialog content.
+/// centered container for the dialog content, wrapped in [`dialog_click_guard`]
+/// so clicks on non-interactive interior areas do not fall through to the
+/// backdrop and close the modal.
 ///
 /// This helper does **not** apply `dialog_container_style` or padding —
 /// callers are responsible for styling their content as needed before
 /// passing it in.
+///
+/// # Content contract
+/// `content` must be a bounded dialog bubble (not `Length::Fill` on the outer
+/// dimension). [`dialog_click_guard`] claims the content's whole rectangle, so
+/// full-window content would claim the screen and make the backdrop
+/// unreachable — silently breaking outside-click. The 80%-width diff/branch
+/// overlays compose the backdrop directly via [`modal_backdrop_layer`] for
+/// exactly this reason.
 ///
 /// # Parameters
 /// - `content`: The dialog body to overlay. Should already be styled
@@ -1390,26 +1442,15 @@ pub fn modal_backdrop<'a, Message: 'a + Clone>(
     on_backdrop: Message,
     opacity: f32,
 ) -> Element<'a, Message> {
-    let backdrop = mouse_area(
-        container(text(""))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(move |_theme: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgba(
-                    0.0, 0.0, 0.0, opacity,
-                ))),
-                ..container::Style::default()
-            }),
-    )
-    .on_press(on_backdrop);
+    let backdrop = modal_backdrop_layer(on_backdrop, opacity);
 
-    let centered = container(content)
+    let centered = container(dialog_click_guard(content))
         .width(Length::Fill)
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill);
 
-    stack([backdrop.into(), centered.into()]).into()
+    stack([backdrop, centered.into()]).into()
 }
 
 /// Zero-size placeholder that keeps an overlay slot's widget type stable
