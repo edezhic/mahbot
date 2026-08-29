@@ -1853,7 +1853,7 @@ impl EditorState {
         }
     }
 
-    pub fn subscription(&self) -> Subscription<EditorMessage> {
+    pub fn subscription(&self, dashboard_modal_open: bool) -> Subscription<EditorMessage> {
         let mut subs: Vec<Subscription<EditorMessage>> = Vec::new();
         if self.selected_workspace_name.is_some() {
             subs.push(
@@ -1876,7 +1876,16 @@ impl EditorState {
             );
         }
         // Always listen for keyboard events — tree navigation may be active.
-        subs.push(keyboard::listen().filter_map(map_editor_shortcut));
+        // When a dashboard-level modal overlay is open the flag is threaded
+        // through so the editor still sees global shortcuts (Cmd+S, Cmd+F, …)
+        // but swallows tree-navigation arrows/Enter behind the modal.
+        // Iced 0.14 `filter_map` demands a non-capturing closure, so the flag
+        // is attached via `with` rather than moved into the closure.
+        subs.push(
+            keyboard::listen()
+                .with(dashboard_modal_open)
+                .filter_map(|(modal_open, event)| map_editor_shortcut(event, modal_open)),
+        );
         Subscription::batch(subs)
     }
 
@@ -4611,7 +4620,7 @@ impl EditorState {
     }
 
     #[must_use]
-    pub fn view(&self) -> Element<'_, EditorMessage> {
+    pub fn view(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         // ── No workspace selected — placeholder ──────────────────────
         if self.selected_workspace_name.is_none() {
             return empty_placeholder(
@@ -4624,7 +4633,7 @@ impl EditorState {
 
         // ── Split layout ─────────────────────────────────────────────
         let tree_panel = self.build_tree_panel();
-        let editor_panel = self.build_editor_panel();
+        let editor_panel = self.build_editor_panel(dashboard_modal_open);
 
         let split = row![tree_panel, editor_panel]
             .spacing(0)
@@ -5108,7 +5117,7 @@ impl EditorState {
 
     // ── Editor panel ──────────────────────────────────────────────
 
-    fn build_editor_panel(&self) -> Element<'_, EditorMessage> {
+    fn build_editor_panel(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         if self.tabs.is_empty() {
             return empty_placeholder(
                 text("Select a file to edit")
@@ -5120,7 +5129,7 @@ impl EditorState {
         let tab_bar = self.build_tab_bar();
         let find_bar = self.build_find_replace_bar();
         let go_to_line = self.build_go_to_line_bar();
-        let editor_widget = self.build_editor_widget();
+        let editor_widget = self.build_editor_widget(dashboard_modal_open);
 
         let mut col = column![tab_bar].spacing(0).width(Length::Fill);
         if let Some(bar) = find_bar {
@@ -5340,7 +5349,7 @@ impl EditorState {
         Some(bar_harness(bar))
     }
 
-    fn build_editor_widget(&self) -> Element<'_, EditorMessage> {
+    fn build_editor_widget(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         let Some(idx) = self.active_tab_idx() else {
             return empty_placeholder(
                 text("No file selected")
@@ -5362,9 +5371,13 @@ impl EditorState {
         let content = &tab_data.content;
         let tree_focused = self.file_tree.tree_focused;
         let find_bar_open = tab_data.find_replace_state.is_some();
-        // Modal overlays own keyboard input entirely — block all editor keys.
-        let modal_overlay_open = self.active_modal.is_some();
-        // Find/replace allows cursor navigation while its text inputs are focused.
+        // Modal overlays own keyboard input entirely — block all editor keys
+        // (editor-internal modals as well as dashboard-level ones: diff modal,
+        // git branch modal, update confirm).
+        let modal_overlay_open = self.active_modal.is_some() || dashboard_modal_open;
+        // When the find/replace bar is open its text inputs own keyboard focus;
+        // block all editor keys so navigation does not move the code cursor
+        // while editing the search/replace fields.
         let ignore_keyboard = tree_focused || modal_overlay_open || find_bar_open;
 
         // Compute match highlight tuples from find/replace state.
@@ -5645,7 +5658,16 @@ impl EditorState {
 /// translate keyboard events into editor actions.  It is extracted to a
 /// standalone function so that `subscription()` focuses on timer setup and
 /// the shortcut logic is independently readable (and potentially testable).
-fn map_editor_shortcut(event: keyboard::Event) -> Option<EditorMessage> {
+///
+/// When `dashboard_modal_open` is `true` (a dashboard-level overlay modal, e.g.
+/// the diff/message, git branch or update-confirm modal, is open over the
+/// editor page), arrow/Enter tree-navigation keys are swallowed so the
+/// file tree behind the modal never navigates.  Global shortcuts above them
+/// (Cmd+S, Cmd+F, Ctrl+B, F3, …) keep working even while a modal is open.
+fn map_editor_shortcut(
+    event: keyboard::Event,
+    dashboard_modal_open: bool,
+) -> Option<EditorMessage> {
     use keyboard::Key;
     let (key, modifiers, physical_key) = super::parse_key_press(event)?;
     let km = super::detect_keyboard_mods(modifiers);
@@ -5741,9 +5763,15 @@ fn map_editor_shortcut(event: keyboard::Event) -> Option<EditorMessage> {
     if modifiers.shift() && matches!(key, Key::Named(keyboard::key::Named::Enter)) {
         return Some(EditorMessage::FindPrev);
     }
-    // Arrow key navigation: when quick-open is active, arrow keys
+    // Arrow/Enter key navigation: when quick-open is active, arrow keys
     // navigate the results list (handled in the update method by
-    // checking quick_open state before tree focus).
+    // checking quick_open state before tree focus). When a dashboard-level
+    // modal overlay is open the file tree sits behind it, so swallow these
+    // keys entirely (guards against a stale `tree_focused`) — the global
+    // shortcuts handled above keep working while the modal is open.
+    if dashboard_modal_open {
+        return None;
+    }
     match &key {
         Key::Named(named) => match named {
             keyboard::key::Named::ArrowUp => Some(EditorMessage::TreeNavUp),

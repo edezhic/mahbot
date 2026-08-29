@@ -3154,6 +3154,12 @@ where
                 if self.focus_id.is_some() && !state.is_focused {
                     return;
                 }
+                // A focused input owns the keyboard exclusively: capture the event so
+                // it never reaches other widgets beneath it in a stack (e.g. the
+                // full-page code editor under a modal's commit field).
+                if self.focus_id.is_some() {
+                    shell.capture_event();
+                }
                 // While an IME composition is active the IME owns the
                 // keyboard: skip all key handling so intermediate composition
                 // keystrokes (which may arrive as `KeyPressed.text` or Named

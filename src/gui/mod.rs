@@ -1655,6 +1655,17 @@ impl Dashboard {
             .is_some_and(|n| !n.is_empty())
     }
 
+    /// Whether a dashboard-level overlay modal is open over the current page.
+    /// Used to gate the editor page's keyboard ownership. The board ticket
+    /// modal is not included: it renders only inside the Home page content
+    /// (never the global overlay stack), so it cannot sit above the editor.
+    ///
+    /// `pending_research_cancel` is likewise excluded: it is rendered inside
+    /// the Running Agents page body, not as an overlay over other pages.
+    fn overlay_modal_open(&self) -> bool {
+        self.show_diff_modal || self.show_update_confirm || self.git_state.is_modal_open()
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, Message> {
         if let Some(err) = &self.boot_error {
@@ -1740,7 +1751,10 @@ impl Dashboard {
             Page::Logs => self.logs_state.view().map(Message::Logs),
             Page::Sessions => self.sessions_state.view().map(Message::Sessions),
             Page::Shell => self.shell_state.view().map(Message::Shell),
-            Page::Editor => self.editor_state.view().map(Message::Editor),
+            Page::Editor => self
+                .editor_state
+                .view(self.overlay_modal_open())
+                .map(Message::Editor),
             Page::Settings => self
                 .settings_state
                 .view(self.selected_user_name.as_deref())
@@ -2090,7 +2104,9 @@ impl Dashboard {
             self.logs_state.subscription().map(Message::Logs),
             self.board_state.subscription().map(Message::Board),
             self.sessions_state.subscription().map(Message::Sessions),
-            self.editor_state.subscription().map(Message::Editor),
+            self.editor_state
+                .subscription(self.overlay_modal_open())
+                .map(Message::Editor),
             self.home_state.subscription().map(Message::Home),
             iced::Subscription::run(shutdown_subscription),
             // Git file-change subscription: drives the event-driven local git
