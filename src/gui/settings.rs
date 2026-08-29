@@ -445,6 +445,32 @@ const TEXT_INPUT_KEYS: &[&str] = &[
 /// persist path.
 const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER];
 
+/// The two routable model slots (manager + worker), resolved to their
+/// trimmed/default model names. This is the set of models represented by
+/// [`SettingsState::routing_section`] — saved routing rows for models outside
+/// these slots are not rendered (they are inert orphans).
+fn routing_slots(config: &ConfigData) -> BTreeSet<String> {
+    let mut models = BTreeSet::new();
+    models.insert(crate::config::resolve_or(
+        config.manager_model.clone(),
+        crate::config::DEFAULT_MANAGER_MODEL,
+    ));
+    models.insert(crate::config::resolve_or(
+        config.worker_model.clone(),
+        crate::config::DEFAULT_WORKER_MODEL,
+    ));
+    models
+}
+
+/// A model's saved provider routing order from a config snapshot.
+fn routing_order_of(config: &ConfigData, model: &str) -> Option<String> {
+    config
+        .model_routings
+        .iter()
+        .find(|mr| mr.model == model)
+        .and_then(|mr| mr.provider_order.clone())
+}
+
 pub struct SettingsState {
     /// Current editable snapshot, loaded from CONFIG each refresh.
     config: ConfigData,
@@ -487,6 +513,11 @@ pub struct SettingsState {
     /// Entries are (re)populated from the config snapshot on [`Self::refresh`];
     /// update handlers insert lazily via [`Self::field_editor_mut`].
     field_editors: HashMap<String, SingleLineEditorState>,
+    /// Shared empty editor used as a never-panicking render fallback by
+    /// [`Self::field_editor`]. Config keys are always pre-populated and routing
+    /// rows are seeded at every manager/worker model mutation, so this is a
+    /// pure safety net: a current model always has a routing row before render.
+    empty_field_editor: SingleLineEditorState,
     /// Which password fields are currently visible.
     password_visible: HashSet<PasswordTarget>,
     /// Whether the custom-endpoint section was revealed by the user this
@@ -562,13 +593,20 @@ fn sync_voice_state(enabled: bool) {
 
 impl SettingsState {
     pub fn new() -> Self {
+        // One snapshot shared by the editable config and the pre-populated
+        // field editors: two independent snapshots could race a concurrent
+        // CONFIG write and seed routing editors for a model set that does not
+        // match `config`, leaving the current model to render the empty
+        // fallback instead of its saved routing order.
+        let snapshot = CONFIG.snapshot();
         Self {
-            config: CONFIG.snapshot(),
+            config: snapshot.clone(),
             field_gen: HashMap::new(),
             in_flight_persists: HashSet::new(),
             pending_persists: HashMap::new(),
             field_errors: HashMap::new(),
-            field_editors: Self::initial_field_editors(&CONFIG.snapshot()),
+            field_editors: Self::initial_field_editors(&snapshot),
+            empty_field_editor: SingleLineEditorState::new(""),
             endpoint_warning: None,
             error: None,
             password_visible: HashSet::new(),
@@ -616,33 +654,18 @@ impl SettingsState {
             let value = config.get_string_field(key).unwrap_or_default().to_string();
             map.insert(field, SingleLineEditorState::new(&value));
         }
-        let mut models = BTreeSet::new();
-        models.insert(crate::config::resolve_or(
-            config.manager_model.clone(),
-            crate::config::DEFAULT_MANAGER_MODEL,
-        ));
-        models.insert(crate::config::resolve_or(
-            config.worker_model.clone(),
-            crate::config::DEFAULT_WORKER_MODEL,
-        ));
-        for model in models {
+        for model in routing_slots(config) {
             let field = format!("routing_order:{model}");
-            let value = config
-                .model_routings
-                .iter()
-                .find(|mr| mr.model == model)
-                .and_then(|mr| mr.provider_order.clone())
-                .unwrap_or_default();
+            let value = routing_order_of(config, &model).unwrap_or_default();
             map.insert(field, SingleLineEditorState::new(&value));
         }
         map
     }
 
     /// Re-create/re-sync the stateless field editors from the current config
-    /// snapshot. Existing editors get `set_text` (so an in-flight external
-    /// refresh is applied); entries for fields not yet rendered are inserted
-    /// with the current value. Routing editors cover the two routable slots
-    /// (manager + worker), the set reflected by [`Self::routing_section`].
+    /// snapshot. Config text editors get `set_text` (so an in-flight external
+    /// refresh is applied); routing editors use insert-if-absent so an
+    /// existing routing row keeps its undo stack / caret across refreshes.
     fn resync_field_editors(&mut self) {
         for key in TEXT_INPUT_KEYS {
             let field = format!("config:{key}");
@@ -656,28 +679,26 @@ impl SettingsState {
                 .and_modify(|e| e.set_text(&value))
                 .or_insert_with(|| SingleLineEditorState::new(&value));
         }
-        let mut models = BTreeSet::new();
-        models.insert(crate::config::resolve_or(
-            self.config.manager_model.clone(),
-            crate::config::DEFAULT_MANAGER_MODEL,
-        ));
-        models.insert(crate::config::resolve_or(
-            self.config.worker_model.clone(),
-            crate::config::DEFAULT_WORKER_MODEL,
-        ));
-        for model in models {
+        self.seed_routing_editors();
+    }
+
+    /// Ensure a routing-order editor exists for the two routable slots
+    /// (manager + worker), the set reflected by [`Self::routing_section`].
+    ///
+    /// Insert-if-absent: an existing routing editor's undo stack and caret are
+    /// never reset, so a model that already has a routing row keeps its editor
+    /// state across refreshes and model-value changes. Values are read from the
+    /// editable snapshot's model routings. Called from every window that can
+    /// change the manager/worker model (staging, persist result, refresh).
+    fn seed_routing_editors(&mut self) {
+        for model in routing_slots(&self.config) {
             let field = format!("routing_order:{model}");
-            let value = self
-                .config
-                .model_routings
-                .iter()
-                .find(|mr| mr.model == model)
-                .and_then(|mr| mr.provider_order.clone())
-                .unwrap_or_default();
+            if self.field_editors.contains_key(&field) {
+                continue;
+            }
+            let value = routing_order_of(&self.config, &model).unwrap_or_default();
             self.field_editors
-                .entry(field)
-                .and_modify(|e| e.set_text(&value))
-                .or_insert_with(|| SingleLineEditorState::new(&value));
+                .insert(field, SingleLineEditorState::new(&value));
         }
     }
 
@@ -687,19 +708,28 @@ impl SettingsState {
     fn resync_field_editor(&mut self, field: &str) {
         if let Some(value) = self.staged_value(field) {
             if let Some(editor) = self.field_editors.get_mut(field) {
+                // A routing-order editor keeps its undo/caret across a
+                // completed persist: only rewrite the text when the canonical
+                // value actually differs from what is already shown (e.g.
+                // whitespace trimmed on save). Rewriting identical text would
+                // drop the undo stack for a model that already has a row.
+                if field.starts_with("routing_order:") && editor.text() == value {
+                    return;
+                }
                 editor.set_text(&value);
             }
         }
     }
 
     /// Borrow the per-field editor for a rendered stateless config field.
-    /// Entries are guaranteed to exist via [`Self::resync_field_editors`]
-    /// (config keys) / the routing pre-population, so this never panics in
-    /// practice.
+    ///
+    /// Config keys are always pre-populated and routing rows are seeded at every
+    /// manager/worker model mutation, so the empty fallback is a pure safety net
+    /// that can never abort a render.
     fn field_editor(&self, key: &str) -> &SingleLineEditorState {
         self.field_editors
             .get(key)
-            .expect("field editor populated on refresh")
+            .unwrap_or(&self.empty_field_editor)
     }
 
     /// Mutable variant of [`Self::field_editor`] used by update handlers. The
@@ -855,12 +885,7 @@ impl SettingsState {
             return self.config.get_string_field(key).map(String::from);
         }
         if let Some(model) = field.strip_prefix("routing_order:") {
-            return self
-                .config
-                .model_routings
-                .iter()
-                .find(|mr| mr.model == model)
-                .and_then(|mr| mr.provider_order.clone());
+            return routing_order_of(&self.config, model);
         }
         None
     }
@@ -934,6 +959,12 @@ impl SettingsState {
             let _ = self
                 .config
                 .set_string_field(key, value.as_deref().unwrap_or_default());
+            // A persist/revert of a manager/worker model updates the routing
+            // key set; seed the routing editor for the applied (trimmed) model
+            // so the routing rows render without a missing-editor panic.
+            if matches!(key, CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL) {
+                self.seed_routing_editors();
+            }
         }
     }
 
@@ -1026,6 +1057,13 @@ impl SettingsState {
             // ── Config field edits ─────────────────────────────
             SettingsMessage::ConfigField { key, value } => {
                 let _ = self.config.set_string_field(key, &value);
+                // A manager/worker model change re-keys the routing rows, so
+                // seed the routing editor for the new (resolved/trimmed) model
+                // before the next render — a mid-keystroke partial name must
+                // render its routing row without a missing-editor panic.
+                if matches!(key, CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL) {
+                    self.seed_routing_editors();
+                }
                 let field = format!("config:{key}");
                 self.field_errors.remove(&field);
                 if TEXT_INPUT_KEYS.contains(&key) {
@@ -3420,15 +3458,7 @@ impl SettingsState {
         // The two routable model slots (manager and worker) — saved routing
         // rows for models outside these slots are not rendered (they are inert
         // orphans). The video-transcription model never consults routing.
-        let mut model_names: BTreeSet<String> = BTreeSet::new();
-        model_names.insert(crate::config::resolve_or(
-            self.config.manager_model.clone(),
-            crate::config::DEFAULT_MANAGER_MODEL,
-        ));
-        model_names.insert(crate::config::resolve_or(
-            self.config.worker_model.clone(),
-            crate::config::DEFAULT_WORKER_MODEL,
-        ));
+        let model_names = routing_slots(&self.config);
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
         // With a custom chat endpoint staged, provider routing is a no-op —
@@ -4457,6 +4487,159 @@ mod tests {
                 "settings key '{key}' is not a config field — TEXT_INPUT_KEYS / IMMEDIATE_KEYS drifted"
             );
         }
+    }
+
+    /// Regression test for the Settings-page crash when editing the Manager /
+    /// Worker model.
+    ///
+    /// The routing-row editor state is keyed by the current manager/worker
+    /// model, but that editor was only created for the models present when the
+    /// page loaded. Typing a different model re-keyed [`SettingsState::routing_section`]
+    /// to a model with no editor, and the render-time lookup panicked. The fix
+    /// seeds routing editors (insert-if-absent) at every manager/worker model
+    /// mutation window and makes the render lookup panic-free.
+    ///
+    /// Exercises the routing render path directly (no voice/audio pipeline) by
+    /// calling `routing_section()` and dropping the returned Element before
+    /// mutating state again.
+    #[test]
+    fn routing_rows_never_panic_when_manager_or_worker_model_edits() {
+        let mut state = SettingsState::new();
+        // Deterministic base snapshot (independent of the live CONFIG's
+        // manager/worker/routings), re-seeded into the editor map below.
+        state.config = ConfigData {
+            manager_model: Some("deepseek/base".into()),
+            worker_model: Some("deepseek/base-worker".into()),
+            model_routings: vec![ModelRouting {
+                model: "saved-routing-model".into(),
+                provider_order: Some("SavedOrder".into()),
+            }],
+            ..ConfigData::STRUCT_FIELDS_DEFAULT
+        };
+        let config = state.config.clone();
+        state.field_editors = SettingsState::initial_field_editors(&config);
+
+        // ── Mid-edit window: a raw/partial model name must render its routing
+        // row (empty = auto-routing) instead of panicking on a missing editor.
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "manager_model",
+            value: "custom-model".into(),
+        });
+        assert_eq!(
+            state
+                .field_editors
+                .get("routing_order:custom-model")
+                .map(|e| e.text()),
+            Some(String::new()),
+            "mid-edit: routing row seeded for the newly-typed model"
+        );
+        let _ = state.routing_section(); // must not panic
+
+        // ── Saved routing order is displayed, not replaced by empty.
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "manager_model",
+            value: "saved-routing-model".into(),
+        });
+        assert_eq!(
+            state
+                .field_editors
+                .get("routing_order:saved-routing-model")
+                .map(|e| e.text()),
+            Some("SavedOrder".into()),
+            "a model with a saved routing order shows that order"
+        );
+        let _ = state.routing_section(); // must not panic
+
+        // ── Post-persist window: the injectable persist result applies the
+        // canonical value and the existing routing editor keeps its text/undo.
+        let manager_gen = state
+            .field_gen
+            .get("config:manager_model")
+            .copied()
+            .unwrap_or(0);
+        let _ = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "config:manager_model".into(),
+            generation: manager_gen,
+            result: Ok(crate::config::PersistOutcome {
+                value: "saved-routing-model".into(),
+                warning: None,
+            }),
+        });
+        assert_eq!(
+            state.config.manager_model.as_deref(),
+            Some("saved-routing-model"),
+            "persist applied the canonical model value"
+        );
+        assert_eq!(
+            state
+                .field_editors
+                .get("routing_order:saved-routing-model")
+                .map(|e| e.text()),
+            Some("SavedOrder".into()),
+            "post-persist: the routing editor is not reset to empty"
+        );
+        let _ = state.routing_section(); // must not panic
+
+        // A routing-order persist whose value already matches the editor must
+        // NOT rewrite the editor (which would drop its undo stack / caret).
+        let _ = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "routing_order:saved-routing-model".into(),
+            generation: 0,
+            result: Ok(crate::config::PersistOutcome {
+                value: "SavedOrder".into(),
+                warning: None,
+            }),
+        });
+        assert_eq!(
+            state
+                .field_editors
+                .get("routing_order:saved-routing-model")
+                .map(|e| e.text()),
+            Some("SavedOrder".into()),
+            "routing-order persist with identical value preserves the editor (undo/caret kept)"
+        );
+        let _ = state.routing_section(); // must not panic
+
+        // ── Clear-to-empty coercion: whitespace falls back to the default
+        // manager model, whose routing row renders without a panic.
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "manager_model",
+            value: "   ".into(),
+        });
+        let default_field = format!("routing_order:{}", crate::config::DEFAULT_MANAGER_MODEL);
+        assert!(
+            state.field_editors.contains_key(&default_field),
+            "clear-to-empty coerces to the default manager model; its routing row is seeded"
+        );
+        let _ = state.routing_section(); // must not panic
+
+        // ── Worker model edit seeds its own routing row; manager==worker
+        // collapses into a single routing row (no duplicates).
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "worker_model",
+            value: "worker-custom".into(),
+        });
+        assert!(
+            state
+                .field_editors
+                .contains_key("routing_order:worker-custom"),
+            "worker model edit seeds its routing row"
+        );
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "manager_model",
+            value: "common-model".into(),
+        });
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: "worker_model",
+            value: "common-model".into(),
+        });
+        let deduped = state
+            .field_editors
+            .keys()
+            .filter(|k| k.starts_with("routing_order:common-model"))
+            .count();
+        assert_eq!(deduped, 1, "manager==worker dedups to a single routing row");
+        let _ = state.routing_section(); // must not panic
     }
 
     /// Custom-endpoint toggle state machine: ON reveals the
