@@ -11,9 +11,9 @@
 //! for solo findings). Per-agent attribution (brackets, "Agent N:" /
 //! "[blocker]" prefixes) and free-form critiques are stripped from comments —
 //! scores + issues are persisted in the verdict store instead. The Analysis
-//! stage shares this renderer, so analyst critiques are dropped too (the
-//! shared `Verdict` schema carries score + issues only — critiques were never
-//! persisted anywhere).
+//! stage shares this renderer, so analyst critiques are dropped too (analysis
+//! uses the score-less `AnalysisVerdict` with per-issue grades; review and QA
+//! use the score-based `Verdict` — critiques were never persisted anywhere).
 //!
 //! Items are referenced by stable numeric ids (global flat numbering across
 //! all agents); validation is strictly structural (id range, duplicate
@@ -30,7 +30,8 @@ use crate::pipeline::board::Ticket;
 use crate::retry::RetryExhausted;
 use crate::util::{panic_message, scrub_credentials};
 use crate::{
-    BlockerVerificationVerdict, ChatMessage, ChatRequest, ChatRequestMeta, Role, Verdict, Workspace,
+    AnalysisVerdict, BlockerVerificationVerdict, ChatMessage, ChatRequest, ChatRequestMeta, Role,
+    Verdict, Workspace,
 };
 
 use super::{
@@ -46,10 +47,35 @@ pub(crate) const DEFAULT_REVIEW_COUNT_HIGH_CHURN: i64 = 2000;
 
 // ── Round data ─────────────────────────────────────────────────────────
 
-/// One valid (parsed) verdict from a parallel round, in agent order.
-pub(crate) struct JointVerdict<'a> {
-    pub agent_index: usize,
-    pub verdict: &'a crate::Verdict,
+/// One valid verdict from a parallel round, unified across review/QA
+/// (score-based Score) and analysis (score-less Graded). The verdict data is
+/// OWNED so the round can be split away from the base_results vec — the
+/// analysis consolidation must run before escalation and be reused afterward.
+pub(crate) enum JointVerdict {
+    Score { verdict: crate::Verdict },
+    Graded { verdict: AnalysisVerdict },
+}
+
+impl JointVerdict {
+    #[must_use]
+    pub(crate) fn is_empty_issues(&self) -> bool {
+        match self {
+            Self::Score { verdict, .. } => verdict.issues_detected.is_empty(),
+            Self::Graded { verdict, .. } => verdict.issues_detected.is_empty(),
+        }
+    }
+
+    /// Passes the round's pass threshold. Review/QA use the numeric score;
+    /// analysis (Graded) has no score in the renderer, so it always "passes"
+    /// the clean-round check (a score-less analysis verdict with an empty
+    /// issues list is simply clean).
+    #[must_use]
+    pub(crate) fn passes(&self, threshold: u8) -> bool {
+        match self {
+            Self::Score { verdict, .. } => verdict.score >= threshold,
+            Self::Graded { .. } => true,
+        }
+    }
 }
 
 /// One failed agent (no response / parse failure) with its rendered dump.
@@ -58,13 +84,11 @@ pub(crate) struct JointFailure {
 }
 
 /// Everything the joint-comment renderer needs about a round.
-pub(crate) struct JointRound<'a> {
+pub(crate) struct JointRound {
     /// Stage name: "Analysis", "Review" or "QA" (comment role = stage name).
-    pub stage: &'a str,
-    /// Number of dispatched agents (N_gate — fail-closed gate denominator).
-    pub dispatched: usize,
+    pub stage: &'static str,
     /// Valid verdicts, one per responding agent.
-    pub verdicts: Vec<JointVerdict<'a>>,
+    pub verdicts: Vec<JointVerdict>,
     /// Failed agents (no response / parse failure).
     pub failures: Vec<JointFailure>,
     /// Code-computed agreement summary line (counts/classification — never
@@ -74,29 +98,26 @@ pub(crate) struct JointRound<'a> {
     /// every valid verdict clears it (a sub-threshold verdict bounces the round
     /// even with an empty issues list).
     pub threshold: u8,
+    /// Per-agent issue texts, indexed by dispatch index (empty for failures /
+    /// no-verdict slots). This is the text-only input to the grouping core.
+    pub issues: Vec<Vec<String>>,
+    /// Per-agent per-issue grade (analysis only; `None` for review/QA and for
+    /// issues that carry no grade).
+    pub grades: Vec<Vec<Option<crate::IssueGrade>>>,
 }
 
-impl JointRound<'_> {
+impl JointRound {
     /// Number of valid verdicts (responding agents with parseable verdicts).
     #[must_use]
     pub fn n_valid(&self) -> usize {
         self.verdicts.len()
     }
-}
 
-// ── Per-agent issue lists (id universe) ─────────────────────────────────
-
-/// Key the per-agent issue lists by the ORIGINAL dispatch index. A failed
-/// agent's slot stays empty. Per-agent duplicates are NOT deduped: two
-/// identical issues from one agent are two distinct item ids in the global
-/// flat numbering, and the model places each exactly once.
-#[must_use]
-pub(crate) fn issues_by_agent(round: &JointRound<'_>) -> Vec<Vec<String>> {
-    let mut by_agent: Vec<Vec<String>> = vec![Vec::new(); round.dispatched];
-    for v in &round.verdicts {
-        by_agent[v.agent_index].clone_from(&v.verdict.issues_detected);
+    /// True when every valid verdict carries no detected issues.
+    #[must_use]
+    pub fn has_no_issues(&self) -> bool {
+        self.verdicts.iter().all(JointVerdict::is_empty_issues)
     }
-    by_agent
 }
 
 // ── Synthesis request ──────────────────────────────────────────────────
@@ -112,7 +133,12 @@ const PIPELINE_GROUPING_MAX_TOKENS: u32 = 16_000;
 /// the general workspace context is prepended by the consensus core. The
 /// system prompt is byte-stable across rounds — repair-round schema selection
 /// lives in the appended user-section instructions.
-fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> ChatRequest {
+fn synthesis_request(
+    round: &JointRound,
+    role: Role,
+    ws: &Workspace,
+    items: &[Vec<String>],
+) -> ChatRequest {
     let system = format!(
         "{}\n\n{}",
         crate::prompt::load_prompt("synthesis/synthesis.md"),
@@ -120,7 +146,7 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
     );
     // Scores are deliberately NOT included: grouping needs issue text only —
     // scores are persisted in the verdict store, never in the comment.
-    let material = crate::consensus::numbered_items_material(&issues_by_agent(round));
+    let material = crate::consensus::numbered_items_material(items);
     let user = format!(
         "{}\n\nStage: {}\nAgent issues (id-numbered):\n{}",
         crate::prompt::load_prompt("synthesis/synthesis_input.md"),
@@ -146,43 +172,22 @@ fn synthesis_request(round: &JointRound<'_>, role: Role, ws: &Workspace) -> Chat
     }
 }
 
-/// Convenience: run the synthesis pass and render the joint comment.
-///
-/// `ticket_id` attaches the synthesis LLM call to the ticket's group in the
-/// Running Agents view (the ticket's own work — joint-verdict synthesis of a
-/// review/QA/analysis round); `ticket_title` is the group header label for
-/// that ticket (purely presentational — the header keeps the ticket name even
-/// when the round's agents have already deregistered and only this synthesis
-/// call remains in the group).
-pub(crate) async fn build_joint_comment(
-    round: &JointRound<'_>,
-    role: Role,
-    ws: &Workspace,
-    ticket_id: &str,
-    ticket_title: &str,
-) -> String {
-    let items = issues_by_agent(round);
-    let outcome = run_synthesis(round, role, ws, ticket_id, ticket_title).await;
-    render_joint_comment(round, &outcome, &crate::consensus::ItemTable::new(&items))
-}
-
 /// Run the repair-mode synthesis pass through the shared consensus core
 /// (1 full call + up to N-1 repair rounds; frozen groups; per-group
 /// acceptance; deterministic remainder placement; narrowed fail-open).
 pub(crate) async fn run_synthesis(
-    round: &JointRound<'_>,
+    round: &JointRound,
     role: Role,
     ws: &Workspace,
     ticket_id: &str,
     ticket_title: &str,
 ) -> crate::consensus::RepairOutcome {
-    let request = synthesis_request(round, role, ws);
-    let items = issues_by_agent(round);
+    let request = synthesis_request(round, role, ws, &round.issues);
     crate::consensus::run_grouping_repair(
         ws,
         "synthesis",
         request,
-        &items,
+        &round.issues,
         Some(crate::agent::registry::ParentKey::Ticket(
             ticket_id.to_string(),
         )),
@@ -209,7 +214,7 @@ pub(crate) async fn run_synthesis(
 /// store.
 #[must_use]
 pub(crate) fn render_joint_comment(
-    round: &JointRound<'_>,
+    round: &JointRound,
     outcome: &crate::consensus::RepairOutcome,
     table: &crate::consensus::ItemTable<'_>,
 ) -> String {
@@ -232,13 +237,13 @@ pub(crate) fn render_joint_comment(
                         out.push_str(" — DISPUTED");
                     }
                     for member in &group.members {
-                        let _ = write!(out, "\n- {}", member_text(table, member));
+                        let _ = write!(out, "\n- {}", member_bullet(round, table, member));
                     }
                 }
                 out.push_str(&crate::consensus::render_ungrouped_section(
                     output,
                     references,
-                    |member, disputed| member_text(table, member) + disputed,
+                    |member, disputed| member_bullet(round, table, member) + disputed,
                 ));
             }
             crate::consensus::RepairOutcome::Fallback => {
@@ -247,7 +252,11 @@ pub(crate) fn render_joint_comment(
                 out.push_str("\n\n**Issues**");
                 for id in 0..table.len() {
                     if let Some((_, text)) = table.resolve(id) {
-                        let _ = write!(out, "\n- {text}");
+                        let line = match issue_grade(round, table, id) {
+                            Some(grade) => format!("{}: {}", grade.as_str(), text),
+                            None => text.to_string(),
+                        };
+                        let _ = write!(out, "\n- {line}");
                     }
                 }
             }
@@ -275,10 +284,7 @@ pub(crate) fn render_joint_comment(
                 // verdict to clear the round threshold: a sub-threshold
                 // verdict with an empty issues list still bounces the round.
                 let clean = round.failures.is_empty()
-                    && round
-                        .verdicts
-                        .iter()
-                        .all(|v| v.verdict.score >= round.threshold);
+                    && round.verdicts.iter().all(|v| v.passes(round.threshold));
                 let summary = if clean || round.n_valid() > 0 {
                     "\n\n### Summary\nNo issues found.".to_string()
                 } else {
@@ -316,6 +322,34 @@ fn member_text(
         || format!("<unknown item id {}>", member.id),
         |(_, text)| text.to_string(),
     )
+}
+
+/// Resolve a flat item id's per-issue grade (analysis only): `None` for
+/// review/QA, for unknown ids, and for issues that carry no grade.
+#[must_use]
+pub(crate) fn issue_grade(
+    round: &JointRound,
+    table: &crate::consensus::ItemTable<'_>,
+    id: usize,
+) -> Option<crate::IssueGrade> {
+    let (agent, item) = table.resolve_index(id)?;
+    round
+        .grades
+        .get(agent)
+        .and_then(|g| g.get(item))
+        .copied()
+        .flatten()
+}
+
+fn member_bullet(
+    round: &JointRound,
+    table: &crate::consensus::ItemTable<'_>,
+    member: &crate::consensus::GroupingMember,
+) -> String {
+    match issue_grade(round, table, member.id) {
+        Some(grade) => format!("{}: {}", grade.as_str(), member_text(table, member)),
+        None => member_text(table, member),
+    }
 }
 
 // ── Calibrated dynamic agent counts ─────────────────────────────────────
@@ -389,6 +423,8 @@ pub(crate) enum ParallelVerdict {
     ParseFailed(RetryExhausted),
     /// Agent produced a successfully-parsed verdict.
     Verdict(Verdict),
+    /// Agent produced a score-less analysis verdict (analysis base round).
+    Analysis(AnalysisVerdict),
     /// Agent produced a blocker-verification verdict (analysis escalation).
     BlockerVerification(BlockerVerificationVerdict),
 }
@@ -396,8 +432,10 @@ pub(crate) enum ParallelVerdict {
 /// Structured-extraction behavior for a parallel round member.
 #[derive(Clone)]
 pub(crate) enum ExtractionMode {
-    /// Standard score+issues verdict (analysis base, review, QA).
+    /// Standard score+issues verdict (review, QA).
     ScoreVerdict,
+    /// Score-less analysis base round (no score; each issue graded).
+    ScorelessVerdict,
     /// Blocker verification (analysis escalation).
     BlockerVerification { blockers: Arc<[String]> },
 }
@@ -471,6 +509,7 @@ pub(crate) fn validate_blocker_verification(
 pub(crate) fn serialize_verdict_outcome(result: &ParallelVerdict) -> String {
     match result {
         ParallelVerdict::Verdict(v) => serde_json::json!({ "verdict": v }).to_string(),
+        ParallelVerdict::Analysis(v) => serde_json::json!({ "verdict": v }).to_string(),
         ParallelVerdict::NoResponse(reason) => {
             serde_json::json!({ "no_response": reason }).to_string()
         }
@@ -490,10 +529,19 @@ pub(crate) fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
         return ParallelVerdict::NoResponse("unreadable stored outcome".to_string());
     };
     if let Some(verdict) = v.get("verdict") {
-        match serde_json::from_value(verdict.clone()) {
-            Ok(v) => ParallelVerdict::Verdict(v),
-            Err(_) => ParallelVerdict::NoResponse("unreadable stored verdict".to_string()),
+        // A numeric `score` is the review/QA shape; score-less graded objects
+        // are analysis verdicts. The two are NOT distinguishable at the type
+        // level for empty-issue rows (`AnalysisVerdict` ignores the unknown
+        // `score` field and accepts `{"issues":[]}`), so the presence of
+        // `score` is the discriminating signal.
+        if verdict.get("score").is_some() {
+            if let Ok(vv) = serde_json::from_value::<crate::Verdict>(verdict.clone()) {
+                return ParallelVerdict::Verdict(vv);
+            }
+        } else if let Ok(av) = serde_json::from_value::<crate::AnalysisVerdict>(verdict.clone()) {
+            return ParallelVerdict::Analysis(av);
         }
+        ParallelVerdict::NoResponse("unreadable stored verdict".to_string())
     } else if let Some(r) = v.get("no_response").and_then(serde_json::Value::as_str) {
         ParallelVerdict::NoResponse(r.to_string())
     } else if let Some(p) = v.get("parse_failed").and_then(serde_json::Value::as_str) {
@@ -514,7 +562,7 @@ pub(crate) fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
 /// synthesis pass.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_round_joint_comment(
-    stage: &str,
+    stage: &'static str,
     results: &[ParallelVerdict],
     threshold: u8,
     role: Role,
@@ -523,15 +571,74 @@ pub(crate) async fn build_round_joint_comment(
     ticket_id: &str,
     ticket_title: &str,
 ) -> String {
-    let mut verdicts: Vec<JointVerdict<'_>> = Vec::new();
+    let (round, outcome) = build_round_grouping(
+        stage,
+        results,
+        threshold,
+        role,
+        header,
+        ws,
+        ticket_id,
+        ticket_title,
+    )
+    .await;
+    render_joint_comment(
+        &round,
+        &outcome,
+        &crate::consensus::ItemTable::new(&round.issues),
+    )
+}
+
+/// Run the grouping pass ONCE for a round, returning the round plus its
+/// synthesis outcome so the caller can reuse both (escalation selection and
+/// final rendering). Skips the LLM grouping pass when every verdict is clean
+/// or when a single verifier's verdict is authoritative; otherwise runs
+/// [`run_synthesis`].
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn build_round_grouping(
+    stage: &'static str,
+    results: &[ParallelVerdict],
+    threshold: u8,
+    role: Role,
+    header: &str,
+    ws: &Workspace,
+    ticket_id: &str,
+    ticket_title: &str,
+) -> (JointRound, crate::consensus::RepairOutcome) {
+    let round = build_joint_round(stage, results, threshold, header);
+    let has_no_issues = round.has_no_issues();
+    let single_verifier_verdict = matches!(role, Role::Reviewer | Role::Qa) && round.n_valid() == 1;
+    if has_no_issues || single_verifier_verdict {
+        (round, crate::consensus::RepairOutcome::Fallback)
+    } else {
+        let outcome = run_synthesis(&round, role, ws, ticket_id, ticket_title).await;
+        (round, outcome)
+    }
+}
+
+/// Build a [`JointRound`] from raw parallel results, cloning any valid verdict
+/// data and leaving failed / no-verdict slots empty in every per-agent table.
+fn build_joint_round(
+    stage: &'static str,
+    results: &[ParallelVerdict],
+    threshold: u8,
+    header: &str,
+) -> JointRound {
+    let mut verdicts: Vec<JointVerdict> = Vec::new();
     let mut failures: Vec<JointFailure> = Vec::new();
+    let mut issues: Vec<Vec<String>> = vec![Vec::new(); results.len()];
+    let mut grades: Vec<Vec<Option<crate::IssueGrade>>> = vec![Vec::new(); results.len()];
     for (i, r) in results.iter().enumerate() {
         match r {
             ParallelVerdict::Verdict(v) => {
-                verdicts.push(JointVerdict {
-                    agent_index: i,
-                    verdict: v,
-                });
+                verdicts.push(JointVerdict::Score { verdict: v.clone() });
+                issues[i].clone_from(&v.issues_detected);
+                grades[i] = vec![None; v.issues_detected.len()];
+            }
+            ParallelVerdict::Analysis(v) => {
+                verdicts.push(JointVerdict::Graded { verdict: v.clone() });
+                issues[i] = v.issues_detected.iter().map(|a| a.text.clone()).collect();
+                grades[i] = v.issues_detected.iter().map(|a| Some(a.grade)).collect();
             }
             ParallelVerdict::NoResponse(reason) => {
                 failures.push(JointFailure {
@@ -546,27 +653,14 @@ pub(crate) async fn build_round_joint_comment(
             ParallelVerdict::BlockerVerification(_) => {}
         }
     }
-    let round = JointRound {
+    JointRound {
         stage,
-        dispatched: results.len(),
         verdicts,
         failures,
         header: header.to_string(),
         threshold,
-    };
-    let has_no_issues = round
-        .verdicts
-        .iter()
-        .all(|v| v.verdict.issues_detected.is_empty());
-    let single_verifier_verdict = matches!(role, Role::Reviewer | Role::Qa) && round.n_valid() == 1;
-    if has_no_issues || single_verifier_verdict {
-        render_joint_comment(
-            &round,
-            &crate::consensus::RepairOutcome::Fallback,
-            &crate::consensus::ItemTable::new(&issues_by_agent(&round)),
-        )
-    } else {
-        build_joint_comment(&round, role, ws, ticket_id, ticket_title).await
+        issues,
+        grades,
     }
 }
 

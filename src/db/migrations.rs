@@ -692,6 +692,13 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Sql(DELTA_RENAME_READY_FOR_DEVELOPMENT_TO_QUEUED),
     },
+    // Rewrite legacy score-based analysis verdict rows to the score-less graded
+    // shape (analysis-only; review/QA and the analyze tool are untouched).
+    Migration {
+        id: "21",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(rewrite_analysis_verdicts),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -937,6 +944,70 @@ async fn run_drop_user_roles_and_seed_onboarding(conn: &Connection) -> anyhow::R
     conn.execute("DROP TABLE IF EXISTS user_roles", ())
         .await
         .context("Failed to drop user_roles")?;
+    Ok(())
+}
+
+fn rewrite_analysis_verdicts<'a>(
+    conn: &'a Connection,
+    _root: &'a Path,
+) -> BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(run_rewrite_analysis_verdicts(conn))
+}
+
+/// One-time data migration: rewrite legacy score-based analysis verdict rows to
+/// the score-less graded shape.
+///
+/// Old analysis slots stored `{"verdict": {score, issues: [string]}}` in
+/// `agents.outcome`; review/QA keeps that shape. This rewrites ONLY rows whose
+/// `kind = 'analyst'` AND whose `outcome` carries a `verdict` with a numeric
+/// `score` and string `issues` — the exact envelope written by the pipeline
+/// verdict serializer. The analyze tool's analyst rows (raw prose) and the
+/// analysis escalation rows (`{"blocker_verification":...}`) never match. Each
+/// issue is graded deterministically: a sub-7 score (the old
+/// `ANALYST_PASS_THRESHOLD`) means the issues were flagged potential blockers,
+/// so they are graded `blocker`; a ≥7 score grades them `minor`. Idempotent and
+/// re-runnable until applied (a rewritten row has no `score`, so a re-run skips
+/// it).
+async fn run_rewrite_analysis_verdicts(conn: &Connection) -> anyhow::Result<()> {
+    let rows = conn
+        .query(
+            "SELECT job_id, agent_id, outcome FROM agents \
+             WHERE kind = 'analyst' AND outcome LIKE '{\"verdict\":%'",
+            (),
+        )
+        .await
+        .context("Failed to read analysis verdict rows for migration")?;
+    for row in rows {
+        let job_id: String = row.get(0)?;
+        let agent_id: String = row.get(1)?;
+        let outcome: String = row.get(2)?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&outcome) else {
+            continue;
+        };
+        let Some(verdict) = value.get("verdict") else {
+            continue;
+        };
+        let Some(score) = verdict.get("score").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(issues) = verdict.get("issues").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        // Old sub-7 scores drove the blocker escalation.
+        let grade = if score < 7 { "blocker" } else { "minor" };
+        let graded: Vec<serde_json::Value> = issues
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(|text| serde_json::json!({ "text": text, "grade": grade }))
+            .collect();
+        let rewritten = serde_json::json!({ "verdict": { "issues": graded } }).to_string();
+        conn.execute(
+            "UPDATE agents SET outcome = ?1 WHERE job_id = ?2 AND agent_id = ?3",
+            params![rewritten, job_id, agent_id],
+        )
+        .await
+        .context("Failed to rewrite analysis verdict row")?;
+    }
     Ok(())
 }
 
@@ -1957,6 +2028,102 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
         for id in ["15", "16"] {
             assert!(applied.contains(&id.to_string()), "missing applied id {id}");
         }
+    }
+
+    /// One-time migration `21` rewrites legacy score-based analysis verdict
+    /// rows (only `kind='analyst'` rows carrying a `verdict` with a numeric
+    /// `score`) to the score-less graded shape. Review/QA (`verifier`) rows
+    /// keep their score shape, and raw-prose analyze-tool rows are untouched.
+    #[tokio::test]
+    async fn migration_21_rewrites_analysis_verdicts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(root, crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        run_migrations(&conn, TargetDb::Core, root)
+            .await
+            .expect("fresh catalog");
+
+        let now = crate::db::now();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, role, workspace_name, created_at, updated_at) \
+             VALUES ('J1', 'analysis', 'analyst', 'ws', ?1, ?2)",
+            params![now.clone(), now.clone()],
+        )
+        .await
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
+             VALUES ('J1', 'A1', 'analyst', 0, 'done', ?1, 'task')",
+            params!["{\"verdict\":{\"score\":5,\"issues\":[\"issue a\",\"issue b\"]}}"],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
+             VALUES ('J1', 'A2', 'analyst', 1, 'done', ?1, 'task')",
+            params!["{\"verdict\":{\"score\":8,\"issues\":[\"note\"]}}"],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
+             VALUES ('J1', 'A3', 'verifier', 2, 'done', ?1, 'task')",
+            params!["{\"verdict\":{\"score\":9,\"issues\":[]}}"],
+        )
+        .await
+        .unwrap();
+
+        run_rewrite_analysis_verdicts(&conn).await.unwrap();
+
+        async fn outcome(conn: &Connection, agent_id: &str) -> String {
+            conn.query(
+                "SELECT outcome FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap()
+        }
+
+        // serde_json (without `preserve_order`) backs its object map with a
+        // `BTreeMap`, so the re-serialized `text`/`grade` keys come out in
+        // sorted order. Assert on the parsed `Value` (order-independent) to
+        // verify the exact graded shape rather than the key ordering.
+        assert_eq!(
+            outcome(&conn, "A1")
+                .await
+                .parse::<serde_json::Value>()
+                .unwrap(),
+            serde_json::json!({
+                "verdict": { "issues": [
+                    { "text": "issue a", "grade": "blocker" },
+                    { "text": "issue b", "grade": "blocker" },
+                ] }
+            })
+        );
+        assert_eq!(
+            outcome(&conn, "A2")
+                .await
+                .parse::<serde_json::Value>()
+                .unwrap(),
+            serde_json::json!({
+                "verdict": { "issues": [ { "text": "note", "grade": "minor" } ] }
+            })
+        );
+        assert_eq!(
+            outcome(&conn, "A3").await,
+            "{\"verdict\":{\"score\":9,\"issues\":[]}}"
+        );
     }
 
     /// The catalog's 0.4.2 baseline must be structurally identical to the

@@ -11,10 +11,9 @@ Return a structured analysis report with:
 3. Assumptions, ambiguities, and missing context
 4. Risks, pitfalls, and side effects
 5. Implementation and test considerations
-6. Readiness verdict with a 0-10 score, blocking issues, and non-blocking notes
+6. Readiness verdict: list each concern you found with a grade (minor / major / blocker)
 
-Score according to general readiness:
-- 1-3: unclear and/or infeasible
-- 4-6: major unanswered product questions
-- 7-9: minor underspecified product changes
-- 10: crystal clear without any unspecified side-effects
+Grade the concerns:
+- minor: a small gap / non-blocking note
+- major: a material problem that should be resolved before development
+- blocker: prevents implementing the ticket as proposed

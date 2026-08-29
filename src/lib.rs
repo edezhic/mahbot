@@ -817,6 +817,43 @@ pub(crate) struct Verdict {
     pub issues_detected: Vec<String>,
 }
 
+/// Qualitative grade attached to one analysis finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IssueGrade {
+    Minor,
+    Major,
+    Blocker,
+}
+
+impl IssueGrade {
+    /// Lowercase label used in the rendered comment ("minor"/"major"/"blocker").
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minor => "minor",
+            Self::Major => "major",
+            Self::Blocker => "blocker",
+        }
+    }
+}
+
+/// One graded issue from an analysis analyst (score-less analysis verdict).
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct AnalysisIssue {
+    pub text: String,
+    pub grade: IssueGrade,
+}
+
+/// Score-less analysis verdict: a list of individually-graded issues. Unlike
+/// the shared `Verdict` (review/QA, score-based), analysis drops the score and
+/// grades each issue minor/major/blocker.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct AnalysisVerdict {
+    #[serde(rename = "issues")]
+    pub issues_detected: Vec<AnalysisIssue>,
+}
+
 /// Whether an aggregated blocker hinders the main implementation path or is a
 /// real but non-blocking risk/edge case. Stored as a snake_case enum; any
 /// human label is emitted only at render time.

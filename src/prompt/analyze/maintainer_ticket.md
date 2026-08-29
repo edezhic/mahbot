@@ -19,8 +19,7 @@ Return a structured research report with:
 2. Evidence gathered (actual LoC counts, complexity before/after, duplication assessment)
 3. Assessment of benefit (does this reduce complexity, eliminate real duplication, or improve clarity?)
 4. Risks and trade-offs (what could break, how hard to review, long-term cost)
-5. Verdict with a 0-10 score:
-   - 1-3: not beneficial / clearly not worth doing
-   - 4-6: somewhat beneficial but implies unspecified product changes
-   - 7-9: clearly beneficial with insignificant product changes
-   - 10: well-justified, zero-risk improvement that should be done
+5. Verdict: list each concern you found with a grade (minor / major / blocker)
+   - minor: the change is beneficial with small, easily-addressed notes
+   - major: the change is only borderline beneficial or carries material risk
+   - blocker: the proposed change is not worth doing / would do real harm

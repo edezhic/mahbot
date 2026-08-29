@@ -2033,17 +2033,29 @@ mod tests {
                     heading: "Alpha".into(),
                     contradiction: false,
                     members: vec![
-                        crate::consensus::GroupingMember { id: 0 },
-                        crate::consensus::GroupingMember { id: 2 },
+                        crate::consensus::GroupingMember {
+                            id: 0,
+                            ..Default::default()
+                        },
+                        crate::consensus::GroupingMember {
+                            id: 2,
+                            ..Default::default()
+                        },
                     ],
                 },
                 crate::consensus::GroupingGroup {
                     heading: "Beta".into(),
                     contradiction: false,
-                    members: vec![crate::consensus::GroupingMember { id: 1 }],
+                    members: vec![crate::consensus::GroupingMember {
+                        id: 1,
+                        ..Default::default()
+                    }],
                 },
             ],
-            ungrouped: vec![crate::consensus::GroupingMember { id: 3 }],
+            ungrouped: vec![crate::consensus::GroupingMember {
+                id: 3,
+                ..Default::default()
+            }],
         };
         let text = render_analyze_groups("q", &output, &[], &table, 2, &outcomes, "");
         assert!(
@@ -2088,8 +2100,14 @@ mod tests {
                 heading: "Alpha".into(),
                 contradiction: true,
                 members: vec![
-                    crate::consensus::GroupingMember { id: 0 },
-                    crate::consensus::GroupingMember { id: 1 },
+                    crate::consensus::GroupingMember {
+                        id: 0,
+                        ..Default::default()
+                    },
+                    crate::consensus::GroupingMember {
+                        id: 1,
+                        ..Default::default()
+                    },
                 ],
             }],
             ungrouped: vec![],
@@ -2123,8 +2141,14 @@ mod tests {
                 heading: "Alpha".into(),
                 contradiction: false,
                 members: vec![
-                    crate::consensus::GroupingMember { id: 0 },
-                    crate::consensus::GroupingMember { id: 1 },
+                    crate::consensus::GroupingMember {
+                        id: 0,
+                        ..Default::default()
+                    },
+                    crate::consensus::GroupingMember {
+                        id: 1,
+                        ..Default::default()
+                    },
                 ],
             }],
             ungrouped: vec![],
@@ -2501,13 +2525,22 @@ mod tests {
             groups: vec![crate::consensus::GroupingGroup {
                 heading: "Safety".into(),
                 contradiction: false,
-                members: vec![crate::consensus::GroupingMember { id: 0 }],
+                members: vec![crate::consensus::GroupingMember {
+                    id: 0,
+                    ..Default::default()
+                }],
             }],
-            ungrouped: vec![crate::consensus::GroupingMember { id: 1 }],
+            ungrouped: vec![crate::consensus::GroupingMember {
+                id: 1,
+                ..Default::default()
+            }],
         };
         let references = vec![crate::consensus::GroupingReference {
             group: 0,
-            member: crate::consensus::GroupingMember { id: 1 },
+            member: crate::consensus::GroupingMember {
+                id: 1,
+                ..Default::default()
+            },
         }];
         let text = render_analyze_groups("q", &output, &references, &table, 2, &outcomes, "");
         assert!(
@@ -2655,7 +2688,10 @@ mod tests {
             contradiction: true,
             members: members
                 .iter()
-                .map(|id| crate::consensus::GroupingMember { id: *id })
+                .map(|id| crate::consensus::GroupingMember {
+                    id: *id,
+                    ..Default::default()
+                })
                 .collect(),
         }
     }

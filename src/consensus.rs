@@ -34,11 +34,21 @@ use crate::{ChatRequest, ChatRequestMeta, Workspace};
 /// One member of a group: a flat global item id (matches the `{id}: {text}`
 /// input list numbering). The source (agent) and text are resolved by the
 /// system via the operation's [`ItemTable`] — never by the model.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// A member is a REPRESENTATIVE for one distinct fact. When several same-fact
+/// item ids were raised, the group lists the first raised id as `id` and the
+/// duplicate same-fact ids in [`Self::collapsed_ids`]. The collapsed ids are
+/// placed by the group (removed from the remainder) but never rendered as
+/// their own members — the representative carries the fact.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupingMember {
     /// Flat global item id, 0-based across all sources combined.
     pub id: usize,
+    /// Duplicate same-fact item ids collapsed under this representative
+    /// (empty/omitted when there are no duplicates).
+    #[serde(default)]
+    pub collapsed_ids: Vec<usize>,
 }
 
 /// A group of related items plus the LLM's contradiction judgment.
@@ -172,12 +182,18 @@ impl<'a> ItemTable<'a> {
 
 /// Distinct cited agent ids of a group, sorted (resolved via the item table;
 /// out-of-range ids are ignored — validation rejects them before rendering).
+/// Collapsed same-fact ids are counted too, so the bracket reflects every
+/// agent behind a representative.
 #[must_use]
 pub(crate) fn distinct_agents(group: &GroupingGroup, table: &ItemTable<'_>) -> Vec<usize> {
     let mut agents: Vec<usize> = group
         .members
         .iter()
-        .filter_map(|m| table.agent(m.id))
+        .flat_map(|m| {
+            std::iter::once(m.id)
+                .chain(m.collapsed_ids.iter().copied())
+                .filter_map(|id| table.agent(id))
+        })
         .collect();
     agents.sort_unstable();
     agents.dedup();
@@ -368,7 +384,11 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
     // must appear in a proposed group or the ungrouped list.
     let mut raw: HashSet<usize> = HashSet::new();
     for g in &groups {
-        raw.extend(g.members.iter().map(|m| m.id));
+        raw.extend(
+            g.members
+                .iter()
+                .flat_map(|m| std::iter::once(m.id).chain(m.collapsed_ids.iter().copied())),
+        );
     }
     raw.extend(ungrouped.iter().map(|m| m.id));
     for id in 0..state.table.len() {
@@ -420,6 +440,9 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
         }
         // Intra-group duplicate ids are rejected (a member may be placed only
         // once per round; already-placed/pinned members are rejected below).
+        // A member's collapsed_ids are validated too: they are placed by the
+        // group but must be in range, unpinned, unplaced, and not duplicate
+        // any other id in the group.
         let mut seen: HashSet<usize> = HashSet::new();
         for member in &group.members {
             if !seen.insert(member.id) {
@@ -435,10 +458,28 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
                 reasons.push("member already placed in a frozen group".to_string());
             }
             cause.get_or_insert(FailureClass::Membership);
+            for &cid in &member.collapsed_ids {
+                if cid == member.id {
+                    reasons.push("collapsed id equals its own member id".to_string());
+                } else if !seen.insert(cid) {
+                    reasons.push("duplicate collapsed id within the group".to_string());
+                } else if state.pinned.contains(&cid) {
+                    reasons.push(
+                        "collapsed id has an accepted contradiction reference and must remain ungrouped"
+                            .to_string(),
+                    );
+                } else if cid >= state.table.len() {
+                    reasons.push(format!("unknown collapsed item id {cid}"));
+                } else if state.placed.contains(&cid) {
+                    reasons.push("collapsed id already placed in a frozen group".to_string());
+                }
+                cause.get_or_insert(FailureClass::Membership);
+            }
         }
         if reasons.is_empty() {
             for member in &group.members {
                 state.placed.insert(member.id);
+                state.placed.extend(member.collapsed_ids.iter().copied());
             }
             if group.contradiction {
                 state.flagged.insert(state.frozen_groups.len());
@@ -651,7 +692,13 @@ fn append_repair_instructions(
     }
     let mut remainder_lines = String::new();
     for id in state.remainder() {
-        let line = render_member_line(&GroupingMember { id }, &state.table);
+        let line = render_member_line(
+            &GroupingMember {
+                id,
+                ..Default::default()
+            },
+            &state.table,
+        );
         if state.pinned.contains(&id) {
             let _ = writeln!(
                 remainder_lines,
@@ -919,7 +966,10 @@ pub(crate) async fn run_grouping_repair(
     let ungrouped: Vec<GroupingMember> = state
         .remainder()
         .into_iter()
-        .map(|id| GroupingMember { id })
+        .map(|id| GroupingMember {
+            id,
+            ..Default::default()
+        })
         .collect();
     tracing::info!(
         purpose,
@@ -1001,9 +1051,15 @@ mod tests {
                 groups: vec![GroupingGroup {
                     heading: "G".to_string(),
                     contradiction: false,
-                    members: vec![GroupingMember { id: 0 }],
+                    members: vec![GroupingMember {
+                        id: 0,
+                        ..Default::default()
+                    }],
                 }],
-                ungrouped: vec![GroupingMember { id: 1 }],
+                ungrouped: vec![GroupingMember {
+                    id: 1,
+                    ..Default::default()
+                }],
                 references: Vec::new(),
             },
             &mut state,
@@ -1140,11 +1196,20 @@ mod tests {
                 groups: vec![GroupingGroup {
                     heading: "G".to_string(),
                     contradiction: false,
-                    members: vec![GroupingMember { id: 0 }],
+                    members: vec![GroupingMember {
+                        id: 0,
+                        ..Default::default()
+                    }],
                 }],
-                ungrouped: vec![GroupingMember { id: 1 }],
+                ungrouped: vec![GroupingMember {
+                    id: 1,
+                    ..Default::default()
+                }],
                 references: vec![GroupingReference {
-                    member: GroupingMember { id: 1 },
+                    member: GroupingMember {
+                        id: 1,
+                        ..Default::default()
+                    },
                     group: 0,
                 }],
             },
@@ -1179,12 +1244,18 @@ mod tests {
                     GroupingGroup {
                         heading: "G".to_string(),
                         contradiction: false,
-                        members: vec![GroupingMember { id: 0 }],
+                        members: vec![GroupingMember {
+                            id: 0,
+                            ..Default::default()
+                        }],
                     },
                     GroupingGroup {
                         heading: "G1".to_string(),
                         contradiction: false,
-                        members: vec![GroupingMember { id: 1 }],
+                        members: vec![GroupingMember {
+                            id: 1,
+                            ..Default::default()
+                        }],
                     },
                 ],
                 ungrouped: Vec::new(),
@@ -1252,5 +1323,78 @@ mod tests {
                 "framings must be pairwise distinct for {prev:?}"
             );
         }
+    }
+
+    /// Collapse semantics: a representative with `collapsed_ids` freezes and
+    /// places every collapsed id (so the remainder excludes them), the
+    /// distinct-agent count includes the collapsed agents, and a round is
+    /// complete when the only coverage of an id is via `collapsed_ids`. A
+    /// collapsed id that ALSO appears as an ungrouped entry is accepted —
+    /// placement wins and the duplicate is dropped silently.
+    #[test]
+    fn collapsed_ids_freeze_place_and_count() {
+        // Three items across three agents: id → agent idx.
+        let items = vec![
+            vec!["a".to_string()],
+            vec!["b".to_string()],
+            vec!["c".to_string()],
+        ];
+        let mut state = RepairState::new(&items);
+
+        // Ids 1 and 2 are covered ONLY via collapsed_ids on representative 0 —
+        // the raw-proposal completeness check must accept the round.
+        let outcome = process_round(
+            RoundInput {
+                summary: Some("s".to_string()),
+                groups: vec![GroupingGroup {
+                    heading: "G".to_string(),
+                    contradiction: false,
+                    members: vec![GroupingMember {
+                        id: 0,
+                        collapsed_ids: vec![1, 2],
+                    }],
+                }],
+                ungrouped: Vec::new(),
+                references: Vec::new(),
+            },
+            &mut state,
+        );
+        assert!(outcome.round_rejection.is_none());
+        assert!(outcome.rejections.is_empty());
+        assert_eq!(outcome.froze, 1);
+        // Collapse placement leaves nothing in the remainder.
+        assert!(state.remainder().is_empty());
+        assert_eq!(
+            distinct_agents(&state.frozen_groups[0], &state.table),
+            vec![0, 1, 2]
+        );
+
+        // A collapsed id that ALSO appears as an ungrouped entry: placement
+        // wins — the duplicate is dropped silently, never a rejection.
+        let items2 = vec![vec!["a".to_string()], vec!["b".to_string()]];
+        let mut state2 = RepairState::new(&items2);
+        let outcome = process_round(
+            RoundInput {
+                summary: Some("s".to_string()),
+                groups: vec![GroupingGroup {
+                    heading: "G".to_string(),
+                    contradiction: false,
+                    members: vec![GroupingMember {
+                        id: 0,
+                        collapsed_ids: vec![1],
+                    }],
+                }],
+                ungrouped: vec![GroupingMember {
+                    id: 1,
+                    ..Default::default()
+                }],
+                references: Vec::new(),
+            },
+            &mut state2,
+        );
+        assert!(outcome.round_rejection.is_none());
+        assert!(outcome.rejections.is_empty());
+        assert_eq!(outcome.froze, 1);
+        assert!(state2.remainder().is_empty());
     }
 }

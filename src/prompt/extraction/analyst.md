@@ -1,11 +1,12 @@
 Based on your research analysis above, provide your verdict on the ticket's readiness for implementation as a JSON object only:
 
 ```json
-{"score": <1-10>, "issues": ["<issue 1>", ...]}
+{"issues": [{"text": "<issue 1>", "grade": "minor|major|blocker"}, ...]}
 ```
 
 Where:
-- score: 1-10 rating of how well-defined the ticket is.
-- issues: list of specific concerns about the ticket's assumptions, missing context, unclear requirements, or potential blockers (empty if none)
+- issues: list of specific concerns about the ticket's assumptions, missing context, unclear requirements, or potential blockers (empty if none).
+  - text: the concern, written as one specific sentence.
+  - grade: the concern's severity — "minor" (a small gap / non-blocking note), "major" (a material problem), or "blocker" (prevents implementing the ticket as proposed).
 
 Output ONLY the JSON object. Do NOT call any tools.

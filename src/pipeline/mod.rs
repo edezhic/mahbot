@@ -53,9 +53,10 @@ use crate::{Role, Workspace, WorkspaceStatus};
 
 pub(crate) use verdict::stage_name;
 pub(crate) use verdict::{
-    AgentSlot, ExtractionMode, ParallelVerdict, build_round_joint_comment,
-    deserialize_verdict_outcome, process_verifier_verdicts, round_member_failed,
-    serialize_verdict_outcome, validate_blocker_verification, validate_verdict_score,
+    AgentSlot, ExtractionMode, JointRound, ParallelVerdict, build_round_grouping,
+    deserialize_verdict_outcome, issue_grade, process_verifier_verdicts, render_joint_comment,
+    round_member_failed, serialize_verdict_outcome, validate_blocker_verification,
+    validate_verdict_score,
 };
 pub(crate) use verdict::{QA_VI, REVIEWER_VI, VerifierInfo};
 
@@ -1240,6 +1241,14 @@ async fn run_parallel_agents(
                                 )
                                 .await
                                 .map(ParallelVerdict::Verdict),
+                            ExtractionMode::ScorelessVerdict => agent
+                                .extract_verdict::<crate::AnalysisVerdict>(
+                                    &extraction_prompt,
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .map(ParallelVerdict::Analysis),
                             ExtractionMode::BlockerVerification { blockers } => {
                                 let blockers = std::sync::Arc::clone(blockers);
                                 let validator = move |v: &crate::BlockerVerificationVerdict| {

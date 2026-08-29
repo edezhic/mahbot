@@ -671,11 +671,11 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = crate::util::test::FakeProvider::new()
             .ok("analyst one")
-            .ok(r#"{"score":8,"issues":[]}"#)
+            .ok(r#"{"issues":[]}"#)
             .ok("analyst two")
-            .ok(r#"{"score":8,"issues":[]}"#)
+            .ok(r#"{"issues":[]}"#)
             .ok("analyst three")
-            .ok(r#"{"score":8,"issues":[]}"#);
+            .ok(r#"{"issues":[]}"#);
         let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
         super::analysis::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
@@ -879,21 +879,19 @@ async fn analysis_escalation_and_blocker_verification() {
     {
         let _lock = crate::util::test::retry_tests_lock();
         let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // 3 base analysts: 2 flag the SAME blocker, 1 passes clean. Then 2
-        // escalation verifiers grade the blocker (enrichment-only: one sees it
-        // as a risk/edge-case, the other as a main-path blocker). The base
-        // joint-comment synthesis falls back deterministically (3 scripted
-        // invalid responses).
+        // 3 base analysts: 2 flag the SAME blocker (grade=blocker), 1 passes
+        // clean. The base consolidation groups both blocker findings; the
+        // escalation then runs 2 verifiers that grade the blocker
+        // (enrichment-only: one sees it as a risk/edge-case, the other as a
+        // main-path blocker).
         let fake = crate::util::test::FakeProvider::new()
             .ok("analyst one")
-            .ok(r#"{"score":5,"issues":["missing error handling"]}"#)
+            .ok(r#"{"issues":[{"text":"missing error handling","grade":"blocker"}]}"#)
             .ok("analyst two")
-            .ok(r#"{"score":5,"issues":["missing error handling"]}"#)
+            .ok(r#"{"issues":[{"text":"missing error handling","grade":"blocker"}]}"#)
             .ok("analyst three")
-            .ok(r#"{"score":8,"issues":[]}"#)
-            .ok("{}")
-            .ok("{}")
-            .ok("{}")
+            .ok(r#"{"issues":[]}"#)
+            .ok(r#"{"summary":"both analysts flag missing error handling.","groups":[{"heading":"Missing error handling","contradiction":false,"members":[{"id":0},{"id":1}]}],"ungrouped":[]}"#)
             .ok("verifier one")
             .ok(r#"{"verdicts":[{"index":0,"kind":"risk_edge_case","severity":"medium","impact":"delays onboarding","reasoning":"present but not blocking"}]}"#)
             .ok("verifier two")
@@ -964,11 +962,11 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     // idx 1/2 Failed (interrupted before they produced a verdict). The stored
     // per-slot tasks are what the resume re-runs them with.
     let conn = &crate::session::store().conn;
-    let done_outcome =
-        super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
-            score: 8,
+    let done_outcome = super::serialize_verdict_outcome(&super::ParallelVerdict::Analysis(
+        crate::AnalysisVerdict {
             issues_detected: Vec::new(),
-        }));
+        },
+    ));
     let fail_outcome =
         super::serialize_verdict_outcome(&super::ParallelVerdict::NoResponse("interrupted".into()));
     let seeds = [
@@ -1015,9 +1013,9 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
         let fake: std::sync::Arc<crate::util::test::FakeProvider> = std::sync::Arc::new(
             crate::util::test::FakeProvider::new()
                 .ok("analyst one")
-                .ok(r#"{"score":8,"issues":[]}"#)
+                .ok(r#"{"issues":[]}"#)
                 .ok("analyst two")
-                .ok(r#"{"score":8,"issues":[]}"#),
+                .ok(r#"{"issues":[]}"#),
         );
         let fake_dyn: std::sync::Arc<dyn crate::Provider> = fake.clone();
         let _fake = crate::util::test::install_fake_provider(fake_dyn);
@@ -1078,19 +1076,24 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     .await;
 
     let conn = &crate::session::store().conn;
-    // Base round (idx 0-2): two sub-threshold analysts flag the SAME blocker,
+    // Base round (idx 0-2): two analysts flag the SAME blocker (grade=blocker),
     // one passes clean. Escalation (idx 3-4): idx 3 already graded the blocker
-    // (Done); idx 4 was interrupted (Failed) and must be re-run.
-    let blocker_verdict =
-        super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
-            score: 5,
-            issues_detected: vec!["missing error handling".to_string()],
-        }));
-    let clean_verdict =
-        super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
-            score: 8,
+    // (Done); idx 4 was interrupted (Failed) and must be re-run. The escalation
+    // task bakes the blocker list (marker + numbered line) so the resume can
+    // re-derive the entries from the stored task.
+    let blocker_verdict = super::serialize_verdict_outcome(&super::ParallelVerdict::Analysis(
+        crate::AnalysisVerdict {
+            issues_detected: vec![crate::AnalysisIssue {
+                text: "missing error handling".to_string(),
+                grade: crate::IssueGrade::Blocker,
+            }],
+        },
+    ));
+    let clean_verdict = super::serialize_verdict_outcome(&super::ParallelVerdict::Analysis(
+        crate::AnalysisVerdict {
             issues_detected: Vec::new(),
-        }));
+        },
+    ));
     let grade_outcome = super::serialize_verdict_outcome(
         &super::ParallelVerdict::BlockerVerification(crate::BlockerVerificationVerdict {
             verdicts: vec![crate::BlockerVerificationItem {
@@ -1104,6 +1107,8 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     );
     let fail_outcome =
         super::serialize_verdict_outcome(&super::ParallelVerdict::NoResponse("interrupted".into()));
+    let escalation_task = "The list below is indexed from 0 — report the outcome for each blocker \
+         using the matching index.\n\nBlocker list:\n0. missing error handling";
     let seeds = [
         (
             0_i64,
@@ -1140,7 +1145,7 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
                 &agent_id,
                 crate::jobs::AgentKind::Analyst,
                 Some(idx),
-                &format!("escalation task {idx}"),
+                escalation_task,
             ),
         )
         .await
@@ -1196,7 +1201,9 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
 
 #[test]
 fn blocker_verification_merge_reduces_two_verifiers_to_one_outcome() {
-    let blockers = vec!["missing error handling".to_string()];
+    let entries = vec![super::analysis::EscalationEntry {
+        text: "missing error handling".to_string(),
+    }];
     let v1 = crate::BlockerVerificationVerdict {
         verdicts: vec![crate::BlockerVerificationItem {
             index: 0,
@@ -1215,7 +1222,7 @@ fn blocker_verification_merge_reduces_two_verifiers_to_one_outcome() {
             reasoning: "core requirement".to_string(),
         }],
     };
-    let resolved = super::analysis::apply_blocker_verification(&blockers, &[&v1, &v2]);
+    let resolved = super::analysis::apply_blocker_verification(&entries, &[&v1, &v2]);
     assert_eq!(resolved.len(), 1);
     let r = &resolved[0];
     assert_eq!(r.text, "missing error handling");
