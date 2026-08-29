@@ -1306,6 +1306,11 @@ impl SettingsState {
                         crate::audio::local_transcriber::spawn_background_init();
                     }
                 }
+                // Wake the voice pipeline so it re-reads config: the 1s
+                // periodic timer is parked while transcription is disabled, and
+                // a runtime re-enable must re-resolve status / auto-start here.
+                // Cheap no-op wake for the enable path too.
+                crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::ConfigChanged);
                 Task::perform(
                     async move {
                         let store = crate::config_db::store();
@@ -1390,6 +1395,11 @@ impl SettingsState {
                 },
                 SettingsMessage::TtsToggleResult,
                 |enabled| {
+                    if enabled {
+                        // Open the OS audio output device so the Test TTS button
+                        // and playback work immediately without a restart.
+                        let _ = crate::audio::tts::ensure_audio_output();
+                    }
                     // Toggle ON with uncached models triggers download (handles
                     // ModelState::Failed retries too, matching voice's auto-retry).
                     if enabled && !crate::audio::tts::try_load_cached() {

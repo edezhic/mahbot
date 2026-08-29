@@ -889,15 +889,14 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
 /// the token fires here (the drain only works while the iced
 /// runtime lives).
 pub async fn run_drain_watch() {
-    use crate::shutdown::{aborting, force_cancel, shutdown, shutdown_token};
+    use crate::shutdown::{force_cancel, shutdown, shutdown_token};
     use std::time::Instant;
 
     // Wait for the drain to begin (or an already-fired token).
-    loop {
-        if aborting() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    let token = shutdown_token();
+    tokio::select! {
+        () = crate::shutdown::drain_wait() => {}
+        () = token.cancelled() => return,
     }
     if shutdown_token().is_cancelled() {
         return;

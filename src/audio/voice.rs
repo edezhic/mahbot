@@ -775,6 +775,11 @@ pub enum VoiceCommand {
     StopRecordingSend,
     /// Stop the mic-button recording and discard the captured audio.
     StopRecordingDiscard,
+    /// Voice-relevant config changed externally (e.g. the Settings
+    /// transcription toggle). Used to wake the pipeline loop when the periodic
+    /// timer is parked because transcription is disabled — the loop re-reads
+    /// config and re-resolves status / auto-start here.
+    ConfigChanged,
     Shutdown,
 }
 
@@ -3294,6 +3299,39 @@ pub async fn run_voice_pipeline() {
                     Some(VoiceCommand::StopRecordingDiscard) => {
                         ctx.handle_stop_manual_recording(false).await;
                     }
+                    Some(VoiceCommand::ConfigChanged) => {
+                        // A runtime transcription re-enable must re-resolve the
+                        // status and re-arm auto-start here: the periodic timer
+                        // is parked while transcription is disabled, so this
+                        // wake replaces the 1s tick that normally drives the
+                        // LoadingModels→Listening and auto-start recovery.
+                        if !is_transcription_disabled()
+                            && matches!(get_status(), VoiceStatus::Disabled)
+                        {
+                            // Auto-start was deferred at boot when transcription
+                            // was disabled; re-arm voice so it reaches Listening
+                            // once the ASR model loads.
+                            if ctx.auto_start_pending {
+                                set_enabled(true);
+                            }
+                            // Covers the "voice toggled on while transcription
+                            // was disabled" case: voice is enabled but the
+                            // pending auto-start was cleared by the rejected
+                            // StartListening, so re-arm it.
+                            if is_enabled() && !ctx.is_listening {
+                                ctx.auto_start_pending = true;
+                            }
+                            set_status(resolved_model_status(
+                                crate::audio::local_transcriber::is_loaded(),
+                                crate::audio::local_transcriber::is_failed(),
+                                is_enabled(),
+                            ));
+                            // Fire StartListening immediately if models are ready;
+                            // otherwise the pending flag keeps it armed so the
+                            // (re-armed) periodic tick starts it once loaded.
+                            ctx.check_auto_start();
+                        }
+                    }
                     Some(VoiceCommand::Shutdown) | None => break,
                 }
             }
@@ -3357,7 +3395,18 @@ pub async fn run_voice_pipeline() {
             // transcriber finishes loading or transitions to Ready/Failed
             // after the initial select! entry.  check_auto_start runs in the
             // post-select section below so we don't duplicate it here.
-            () = tokio::time::sleep(Duration::from_secs(1)) => {
+            //
+            // While transcription is disabled nothing can change, so the timer
+            // pends instead of ticking every second; it is re-armed by any
+            // loop wake (e.g. VoiceCommand::ConfigChanged from the Settings
+            // toggle), since select! rebuilds this future every iteration.
+            () = async {
+                if is_transcription_disabled() {
+                    std::future::pending::<()>().await;
+                } else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            } => {
                 // ── Transcriber state transition ──
                 // Light polling.  A transcriber failure surfaces ModelError
                 // from ANY status (pre-existing behavior — e.g. an

@@ -2105,7 +2105,7 @@ impl Dashboard {
             self.board_state.subscription().map(Message::Board),
             self.sessions_state.subscription().map(Message::Sessions),
             self.editor_state
-                .subscription(self.overlay_modal_open())
+                .subscription(self.page == Page::Editor, self.overlay_modal_open())
                 .map(Message::Editor),
             self.home_state.subscription().map(Message::Home),
             iced::Subscription::run(shutdown_subscription),
@@ -2145,15 +2145,11 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
         // Wait for the drain flag OR the token (a drain always precedes the
         // token in the two-signal protocol, but the token may fire without a
         // drain on force-cancel paths).
-        loop {
-            if crate::shutdown::is_draining() {
+        tokio::select! {
+            () = crate::shutdown::drain_wait() => {
                 let _ = output.try_send(Message::DrainStarted);
-                break;
             }
-            if token.is_cancelled() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            () = token.cancelled() => {}
         }
         token.cancelled().await;
         let _ = output.try_send(Message::Shutdown);

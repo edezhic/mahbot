@@ -91,8 +91,13 @@ async fn bootstrap_mahbot() -> Result<()> {
 
     // Try to load TTS models from cache; if not available, spawn background download.
     // Only run when TTS is enabled in config to avoid unnecessary ~400 MB download.
-    if mahbot::audio::tts::is_config_enabled() && !mahbot::audio::tts::try_load_cached() {
-        mahbot::audio::tts::spawn_download();
+    if mahbot::audio::tts::is_config_enabled() {
+        // Open the OS audio output device for a TTS-enabled boot (matches the
+        // pre-change behavior where init_global opened it unconditionally).
+        let _ = mahbot::audio::tts::ensure_audio_output();
+        if !mahbot::audio::tts::try_load_cached() {
+            mahbot::audio::tts::spawn_download();
+        }
     }
 
     BOOT_LOG_STORE

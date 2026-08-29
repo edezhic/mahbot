@@ -49,6 +49,14 @@ const CHANNEL_CAPACITY: usize = 1024;
 /// per-cycle read for a large transaction; the prune keeps the table small).
 const DRAIN_BATCH: i64 = 1000;
 
+/// Fast poll interval while CDC rows are flowing.
+const DRAIN_POLL: Duration = Duration::from_millis(100);
+
+/// Idle poll interval cap, reached after successive empty drains. Board-transition
+/// latency is covered by the synchronous flushes in `notify_ticket` / the Manager
+/// path, so the drainer may back off when idle.
+const DRAIN_IDLE_POLL: Duration = Duration::from_secs(1);
+
 /// The engine-managed CDC table name (created when capture is enabled).
 pub(crate) const CDC_TABLE: &str = "turso_cdc";
 
@@ -289,7 +297,9 @@ pub(crate) async fn enable_capture(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// Spawn the background drain loop (once per process), pumping [`drain_once`]
-/// every ~100ms.
+/// at an adaptive cadence: fast (`DRAIN_POLL`) while rows are flowing, backing
+/// off exponentially up to `DRAIN_IDLE_POLL` when idle. Board-transition latency
+/// is covered by the synchronous flushes in `notify_ticket` / the Manager path.
 ///
 /// The connection is the post-heal boot connection (the one every domain store
 /// shares via the `DOMAIN_CONN` cell); heals only occur during the boot open,
@@ -302,11 +312,21 @@ pub(crate) fn spawn_drainer(conn: Connection) {
     }
     let _ = STARTED.set(());
     tokio::spawn(async move {
+        let mut interval = DRAIN_POLL;
         loop {
-            if let Err(e) = drain_once(&conn).await {
-                tracing::warn!(error = %e, "ticket CDC drain failed");
+            let saw_rows = match drain_once(&conn).await {
+                Ok(seen) => seen,
+                Err(e) => {
+                    tracing::warn!(error = %e, "ticket CDC drain failed");
+                    true
+                }
+            };
+            if saw_rows {
+                interval = DRAIN_POLL;
+            } else {
+                interval = (interval * 2).min(DRAIN_IDLE_POLL);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(interval).await;
         }
     });
 }
@@ -327,12 +347,17 @@ pub(crate) fn spawn_drainer(conn: Connection) {
 /// could interleave their prune with another drain's full-table prune, letting a
 /// freshly-captured row whose `change_id` restarted low (after `turso_cdc` was
 /// fully pruned) be deleted before it was ever processed.
+///
+/// Returns `Ok(true)` when the batch saw rows (including rows skipped by decode
+/// or the materializer-failure break), `Ok(false)` when it was empty.
 static DRAIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
+pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<bool> {
     let _drain_guard = DRAIN_LOCK.lock().await;
     let rows = conn
-        .query(
+        .query_cached(
+            // prepare_cached caches by SQL text, so the same formatted string
+            // still hits the engine's per-connection statement cache.
             &format!(
                 "SELECT change_id, change_time, change_type, \
                  table_name, id, before, after \
@@ -342,7 +367,7 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
         )
         .await?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     // Cache table_info per batch for multi-row transactions.
     let mut infos: HashMap<String, TableInfo> = HashMap::new();
@@ -414,13 +439,13 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
         }
     }
     if prune_up_to >= 0 {
-        conn.execute(
+        conn.execute_cached(
             &format!("DELETE FROM {CDC_TABLE} WHERE change_id <= ?1"),
             params![prune_up_to],
         )
         .await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Decode a single CDC row into a [`ChangeEvent`].

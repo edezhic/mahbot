@@ -567,6 +567,19 @@ impl Connection {
         conn.execute(sql, params).await
     }
 
+    /// Execute a write via the engine's prepared-statement cache (turso's
+    /// `execute` re-parses SQL on every call; hot loops use this instead). See
+    /// [`Self::query_cached`] for the cache contract.
+    pub(crate) async fn execute_cached(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+    ) -> turso::Result<u64> {
+        let conn = self.lock_and_cleanup().await;
+        let mut stmt = conn.prepare_cached(sql).await?;
+        stmt.execute(params).await
+    }
+
     pub(crate) async fn execute_batch(&self, sql: &str) -> turso::Result<()> {
         let conn = self.lock_and_cleanup().await;
         conn.execute_batch(sql).await

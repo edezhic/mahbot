@@ -20,24 +20,36 @@ fn global_shutdown() -> &'static CancellationToken {
     GLOBAL_SHUTDOWN.get_or_init(CancellationToken::new)
 }
 
-/// Global graceful-drain flag: set by the first shutdown signal
-/// (SIGINT / window-close / self-update). Distinct from the cancellation
-/// token — during the drain the token is NOT fired, so in-flight LLM calls
-/// (which race the token around the HTTP send) survive to complete their
-/// current round. Background loops fold this flag into their sleep/shutdown
-/// races; the second signal maps to force-cancel.
-static DRAINING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Global graceful-drain state: a `watch` channel of `bool` set by the first
+/// shutdown signal (SIGINT / window-close / self-update). Distinct from the
+/// cancellation token — during the drain the token is NOT fired, so in-flight
+/// LLM calls (which race the token around the HTTP send) survive to complete
+/// their current round. Background loops fold this flag into their
+/// sleep/shutdown races; the second signal maps to force-cancel.
+static DRAIN: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
+
+/// The process-lifetime drain sender.
+fn drain_sender() -> &'static tokio::sync::watch::Sender<bool> {
+    DRAIN.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
+
+/// A receiver tracking the current drain value. Each call subscribes fresh, so
+/// a waiter that registers before a drain begins is notified the instant it
+/// flips; one that registers after reads the current value immediately.
+fn drain_receiver() -> tokio::sync::watch::Receiver<bool> {
+    drain_sender().subscribe()
+}
 
 /// Mark the daemon as draining (graceful-shutdown window). Idempotent.
 pub fn drain_begin() {
-    DRAINING.store(true, std::sync::atomic::Ordering::SeqCst);
+    drain_sender().send_replace(true);
     info!("Draining: in-flight work completes before exit");
 }
 
 /// Whether the graceful-drain window is active.
 #[must_use]
 pub fn is_draining() -> bool {
-    DRAINING.load(std::sync::atomic::Ordering::SeqCst)
+    *drain_sender().borrow()
 }
 
 /// Whether the daemon is aborting: the shutdown token fired OR the graceful
@@ -59,7 +71,7 @@ pub fn force_cancel() {
 /// one-way); tests use this to restore isolation after asserting drain
 /// behavior.
 pub fn drain_clear() {
-    DRAINING.store(false, std::sync::atomic::Ordering::SeqCst);
+    drain_sender().send_replace(false);
 }
 
 /// Get a clone of the global shutdown token.
@@ -117,13 +129,16 @@ pub async fn sleep_or_shutdown_or_drain(duration: Duration) -> bool {
     }
 }
 
-/// Completes when the drain flag flips. Polled inside
-/// [`sleep_or_shutdown_or_drain`] every select round; the 100 ms poll cadence
-/// is negligible against 10-minute cleanup loops. Also used by the
-/// leader-stagger wait so a graceful drain releases followers immediately.
+/// Completes when the drain flag flips. Event-driven: waits on the drain watch
+/// channel rather than polling. Borrowing before awaiting makes it race-free —
+/// a drain that began before this waiter registered resolves immediately, and
+/// it is cancel-safe for `select!` use.
 pub(crate) async fn drain_wait() {
-    while !is_draining() {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut rx = drain_receiver();
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            return; // sender is a process-lifetime static — unreachable
+        }
     }
 }
 

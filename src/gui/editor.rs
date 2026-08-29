@@ -1853,9 +1853,15 @@ impl EditorState {
         }
     }
 
-    pub fn subscription(&self, dashboard_modal_open: bool) -> Subscription<EditorMessage> {
+    /// Periodic timers (Tick, RefreshFileTree, CheckFileChanges) only run
+    /// while the Editor page is visible.
+    pub fn subscription(
+        &self,
+        page_visible: bool,
+        dashboard_modal_open: bool,
+    ) -> Subscription<EditorMessage> {
         let mut subs: Vec<Subscription<EditorMessage>> = Vec::new();
-        if self.selected_workspace_name.is_some() {
+        if page_visible && self.selected_workspace_name.is_some() {
             subs.push(
                 iced::time::every(Duration::from_secs(TICK_INTERVAL_SECS))
                     .map(|_| EditorMessage::Tick),

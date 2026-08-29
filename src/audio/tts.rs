@@ -187,6 +187,10 @@ struct AudioOutputWrapper {
 }
 
 static AUDIO_OUTPUT: OnceLock<AudioOutputWrapper> = OnceLock::new();
+/// Serializes lazy device-opens in [`ensure_audio_output()`] so a best-effort
+/// (and relatively costly) `open_default_sink` call is never raced by
+/// concurrent players attempting to open the device at once.
+static AUDIO_OUTPUT_OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Test-only counter of `speak()` calls. Incremented at the very start of
 /// `speak()`, before the `is_enabled()` guard. Used by `test_init_listener_*`
@@ -283,14 +287,51 @@ pub fn models_ready() -> bool {
 /// Returns `true` if the audio output device was successfully initialized.
 ///
 /// This checks whether `DeviceSinkBuilder::open_default_sink()` succeeded
-/// during [`init_global()`]. Models may be loaded ([`models_ready()`]) but
+/// via [`ensure_audio_output()`]. Models may be loaded ([`models_ready()`]) but
 /// audio output may still be unavailable (e.g., headless system, no speakers,
 /// CoreAudio initialization failure).
 ///
-/// The check is performed once at startup — runtime device disconnection
-/// after initialization is not reflected.
+/// The device is opened lazily on demand ([`ensure_audio_output()`]); this
+/// passive check reflects whether that open has succeeded. Runtime device
+/// disconnection after initialization is not reflected.
 #[must_use]
 pub fn audio_output_ready() -> bool {
+    AUDIO_OUTPUT.get().is_some()
+}
+
+/// Open the OS audio output device on demand (idempotent, best-effort).
+/// Returns whether output is ready. Called lazily so a disabled TTS
+/// subsystem never opens the device: at boot after config load (when
+/// enabled), on the Settings enable toggle, and before playback.
+///
+/// On failure this warns and leaves [`AUDIO_OUTPUT`] unset (playback disabled),
+/// matching the previous [`init_global()`] behavior. A later call retries a
+/// previously-failed open.
+#[must_use]
+pub fn ensure_audio_output() -> bool {
+    if AUDIO_OUTPUT.get().is_some() {
+        return true;
+    }
+    // Serialize concurrent opens and re-check inside the guard: another thread
+    // may have won the race and populated AUDIO_OUTPUT already.
+    let _guard = AUDIO_OUTPUT_OPEN_LOCK.lock().unwrap_poison();
+    if AUDIO_OUTPUT.get().is_some() {
+        return true;
+    }
+    match DeviceSinkBuilder::open_default_sink() {
+        Ok(sink) => {
+            let mixer = sink.mixer().clone();
+            if AUDIO_OUTPUT
+                .set(AudioOutputWrapper { _sink: sink, mixer })
+                .is_err()
+            {
+                warn!("TTS: audio output already initialized by another caller");
+            }
+        }
+        Err(e) => {
+            warn!("TTS: failed to initialize audio output — playback will be disabled: {e}");
+        }
+    }
     AUDIO_OUTPUT.get().is_some()
 }
 
@@ -358,6 +399,12 @@ pub fn speak(text: &str) {
     if text.trim().is_empty() || !is_enabled() {
         return;
     }
+    // Playback cannot work without an output device; opening (or retrying a
+    // previously-failed open) here keeps the device closed until TTS actually
+    // needs it.
+    if !ensure_audio_output() {
+        return;
+    }
     // Cancel any previous playback before starting new synthesis.
     // The subscription below happens BEFORE the spawn so that this cancel
     // signal reaches the old task before the new task subscribes.
@@ -417,18 +464,10 @@ pub fn init_global() -> Result<()> {
         .set(dl_tx)
         .map_err(|_| anyhow!("DOWNLOAD_EVENTS already initialized"))?;
 
-    // Initialize rodio audio output (best-effort: may fail on headless systems)
-    match DeviceSinkBuilder::open_default_sink() {
-        Ok(sink) => {
-            let mixer = sink.mixer().clone();
-            AUDIO_OUTPUT
-                .set(AudioOutputWrapper { _sink: sink, mixer })
-                .map_err(|_| anyhow!("AUDIO_OUTPUT already initialized"))?;
-        }
-        Err(e) => {
-            warn!("TTS: failed to initialize audio output — playback will be disabled: {e}");
-        }
-    }
+    // The OS audio output device is intentionally NOT opened here — a disabled
+    // TTS subsystem must never touch the device. It is opened lazily on demand
+    // via [`ensure_audio_output()`] (after config load, on the enable toggle,
+    // and before playback).
 
     Ok(())
 }
