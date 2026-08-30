@@ -42,6 +42,10 @@ const BUBBLE_BODY_RATIO: f32 = 0.75;
 /// collapse.
 const COLLAPSE_COMMIT_DELAY: Duration = Duration::from_millis(350);
 
+/// Max characters for the card title (user/workspace name) before an
+/// ellipsis is appended — the card column is 350px wide.
+const CARD_TITLE_MAX_CHARS: usize = 32;
+
 /// Shared transcript render context: the flat session ledger, its per-entry
 /// markdown bodies, the element expansion set, the collapse-measurement
 /// cache, and the single text measurement width (bubble body width, used for
@@ -98,9 +102,13 @@ pub(crate) enum SessionsMessage {
 
 #[derive(Debug, Clone)]
 struct CachedSessionItem {
-    key: String,
-    /// Rendered key text for the session label.
-    label: String,
+    agent_id: String,
+    /// Agent role parsed from the metadata role string; `None` renders the
+    /// title without an icon.
+    role: Option<crate::Role>,
+    /// User name when present (Some and non-empty), otherwise the workspace
+    /// name (may be empty if both are absent).
+    title: String,
     /// Pre-formatted message count string.
     msg_count_label: String,
     /// Pre-formatted compact token count (same format as the Running Agents
@@ -362,15 +370,32 @@ impl SessionsState {
     /// changes. `view()` builds widgets from this data on every frame, applying
     /// the `selected_progress` animation at widget-construction time.
     fn rebuild_session_cache(&mut self) {
+        let now = chrono::Local::now();
         let items: Vec<CachedSessionItem> = self
             .sessions
             .iter()
-            .map(|s| CachedSessionItem {
-                key: s.agent_id.clone(),
-                label: s.agent_id.clone(),
-                msg_count_label: format!("{} msgs", s.message_count),
-                token_label: s.token_length.map(theme::format_compact_tokens),
-                timestamp_label: theme::format_timestamp(&s.last_activity.to_rfc3339()),
+            .map(|s| {
+                let role = s
+                    .role
+                    .as_deref()
+                    .and_then(|r| r.parse::<crate::Role>().ok());
+                let name = s
+                    .user_name
+                    .as_deref()
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| s.workspace_name.as_deref().filter(|n| !n.is_empty()))
+                    .unwrap_or("");
+                CachedSessionItem {
+                    agent_id: s.agent_id.clone(),
+                    role,
+                    title: crate::util::truncate(name, CARD_TITLE_MAX_CHARS),
+                    msg_count_label: format!("{} msgs", s.message_count),
+                    token_label: s.token_length.map(theme::format_compact_tokens),
+                    timestamp_label: theme::format_relative_time(
+                        &s.last_activity.to_rfc3339(),
+                        now,
+                    ),
+                }
             })
             .collect();
         self.cached_session_items = if items.is_empty() { None } else { Some(items) };
@@ -398,7 +423,20 @@ impl SessionsState {
             let selected_progress = *self.selected_anim.value();
             if let Some(ref cached) = self.cached_session_items {
                 for item in cached {
-                    let is_selected = self.selected_session.as_deref() == Some(&item.key);
+                    let is_selected = self.selected_session.as_deref() == Some(&item.agent_id);
+
+                    let mut title_row = iced::widget::Row::new()
+                        .spacing(6)
+                        .align_y(Alignment::Center);
+                    if let Some(role) = item.role {
+                        title_row = title_row.push(
+                            theme::role_icon(&role)
+                                .size(13)
+                                .color(theme::role_badge_color_for(&role).0),
+                        );
+                    }
+                    title_row = title_row
+                        .push(text(item.title.clone()).size(13).color(theme::TEXT_PRIMARY));
 
                     let sess_row: Element<'_, SessionsMessage> = ContextMenu::new(
                         container(
@@ -407,18 +445,16 @@ impl SessionsState {
                                     button(
                                         container(
                                             column![
-                                                text(&item.label)
-                                                    .size(13)
-                                                    .color(theme::TEXT_PRIMARY),
+                                                title_row,
                                                 {
                                                     // Meta row: message count, then the
                                                     // token length when one was ever
                                                     // recorded (older sessions show no
                                                     // token value), then the timestamp.
                                                     // The 8px `Space` separators (with
-                                                    // the row's 4px spacing) preserve
-                                                    // the original msg-count → timestamp
-                                                    // gap exactly.
+                                                    // the row's 4px spacing) preserve the
+                                                    // original msg-count → timestamp gap
+                                                    // exactly.
                                                     let mut meta_row = row![
                                                         text(&item.msg_count_label)
                                                             .size(11)
@@ -440,6 +476,9 @@ impl SessionsState {
                                                             .color(theme::TEXT_MUTED),
                                                     )
                                                 },
+                                                text(&item.agent_id)
+                                                    .size(11)
+                                                    .color(theme::TEXT_MUTED),
                                             ]
                                             .spacing(2),
                                         )
@@ -471,7 +510,9 @@ impl SessionsState {
                                         ),
                                     )
                                     .style(theme::button_text)
-                                    .on_press(SessionsMessage::SelectSession(item.key.clone())),
+                                    .on_press(
+                                        SessionsMessage::SelectSession(item.agent_id.clone())
+                                    ),
                                 ]
                                 .align_y(Alignment::Center),
                             ]
@@ -481,7 +522,7 @@ impl SessionsState {
                         vec![MenuItem::with_icon(
                             iced_fonts::lucide::advanced_text::trash,
                             "Delete".into(),
-                            SessionsMessage::DeleteSession(item.key.clone()),
+                            SessionsMessage::DeleteSession(item.agent_id.clone()),
                         )],
                     )
                     .into();

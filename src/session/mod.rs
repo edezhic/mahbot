@@ -113,12 +113,13 @@ crate::columns! {
     }
 }
 
-// Session list with metadata (4-column SELECT: sm.agent_id, sm.last_activity,
-// sm.message_count, sm.token_length). Counts are read from the denormalized
-// metadata column — NOT from a JOIN over the `sessions` message table (the
-// list query runs every second while the Sessions page is visible; scanning
-// the full message table per refresh was the largest repeated query in the
-// system). The count is maintained in the same transaction as message writes
+// Session list with metadata (7-column SELECT: sm.agent_id, sm.last_activity,
+// sm.message_count, sm.token_length, sm.role, sm.user_name, sm.workspace_name).
+// Counts are read from the denormalized metadata column — NOT from a JOIN over
+// the `sessions` message table (the list query runs on Sessions-page navigation
+// and from the dead-session recovery poller; scanning the full message table
+// per refresh was the largest repeated query in the system). The count is
+// maintained in the same transaction as message writes
 // (see `insert_messages_in_transaction`) and backfilled once by migration
 // 002 for pre-migration stores.
 crate::columns! {
@@ -127,6 +128,9 @@ crate::columns! {
         LAST_ACTIVITY  => "sm.last_activity",
         MESSAGE_COUNT  => "sm.message_count",
         TOKEN_LENGTH   => "sm.token_length",
+        ROLE           => "sm.role",
+        USER_NAME      => "sm.user_name",
+        WORKSPACE_NAME => "sm.workspace_name",
     }
 }
 
@@ -165,6 +169,11 @@ pub(crate) struct SessionMetadata {
     /// last successful agent LLM call), if ever recorded. Older sessions are
     /// intentionally never backfilled — `None` renders no token value.
     pub token_length: Option<u64>,
+    /// Session context columns (see `SessionContext`); `None` when the row was
+    /// written without context (transient/background sessions).
+    pub role: Option<String>,
+    pub user_name: Option<String>,
+    pub workspace_name: Option<String>,
 }
 
 /// Context data stored alongside a session for recovery purposes.
@@ -194,6 +203,9 @@ fn session_metadata_from_row(
     activity_str: &str,
     count: i64,
     token_length: Option<i64>,
+    role: Option<String>,
+    user_name: Option<String>,
+    workspace_name: Option<String>,
 ) -> Result<SessionMetadata> {
     let last_activity = db::parse_utc_timestamp(activity_str).with_context(|| {
         format!("invalid last_activity {activity_str:?} for session {agent_id}")
@@ -203,6 +215,9 @@ fn session_metadata_from_row(
         last_activity,
         message_count: usize::try_from(count).unwrap_or(0),
         token_length: token_length.and_then(|t| u64::try_from(t).ok()),
+        role,
+        user_name,
+        workspace_name,
     })
 }
 
@@ -339,9 +354,9 @@ where
 /// The message count is read from the denormalized `session_metadata.message_count`
 /// column (maintained in the same transaction as message writes, backfilled by
 /// migration 002) — the historical LEFT JOIN + GROUP BY over the full `sessions`
-/// table was the largest repeated query in the system (this list refreshes every
-/// second while the Sessions page is visible) and has been removed. Ordering and
-/// filtering are unchanged.
+/// table was the largest repeated query in the system (this list refreshes on
+/// Sessions-page navigation and from the dead-session recovery poller) and has
+/// been removed. Ordering and filtering are unchanged.
 async fn list_sessions_where(
     conn: &db::Connection,
     where_clause: &str,
@@ -363,6 +378,9 @@ async fn list_sessions_where(
                 &row.get::<String>(COL_SL_LAST_ACTIVITY)?,
                 row.get::<i64>(COL_SL_MESSAGE_COUNT)?,
                 row.get::<Option<i64>>(COL_SL_TOKEN_LENGTH)?,
+                row.get::<Option<String>>(COL_SL_ROLE)?,
+                row.get::<Option<String>>(COL_SL_USER_NAME)?,
+                row.get::<Option<String>>(COL_SL_WORKSPACE_NAME)?,
             )
         },
         warn_context,
