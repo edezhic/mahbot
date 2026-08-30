@@ -23,7 +23,7 @@ mod render;
 
 // Shared components re-exported for the Sessions page (full view) and the
 // Running Agents page (compact projection).
-pub(crate) use render::{MAX_TOOL_TOOLTIP_WIDTH, tool_block, truncate_at_boundary};
+pub(crate) use render::{MAX_TOOL_TOOLTIP_WIDTH, ToolBlockView, tool_block, truncate_at_boundary};
 
 /// One entry of the flat session ledger: a regular message (system/user/
 /// assistant, optionally carrying a thinking block) or one assistant

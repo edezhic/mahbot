@@ -47,14 +47,9 @@ use iced::advanced::graphics::text::cosmic_text;
 
 use crate::gui::media_markers;
 use crate::gui::text_rendering::with_font_system;
+#[cfg(test)]
 use crate::gui::theme::MARKDOWN_TEXT_SIZE;
 use crate::util::file_name_or_path;
-
-/// Body text size of the transcript markdown — derived from
-/// [`theme::MARKDOWN_TEXT_SIZE`], the single source of truth shared with
-/// the actual renderer (`theme::markdown_settings`), so a theme font-size
-/// change cannot silently drift the measured wrap count from the render.
-const BODY_FONT_SIZE: f32 = MARKDOWN_TEXT_SIZE;
 
 /// Line budget: any message rendering more than this many wrapped lines is
 /// collapsed to a [`MAX_PREVIEW_LINES`]-line preview by default.
@@ -80,18 +75,21 @@ pub(crate) const WRAP_SAFETY_MARGIN_PX: f32 = 36.0;
 /// would otherwise spill past the 3-line budget visually).
 const MAX_PREVIEW_LINE_CHARS: usize = 600;
 
-/// Markdown heading sizes relative to the body size, matching iced 0.14's
-/// `markdown::Settings` scale exactly (h1 = 2.0×, h2 = 1.75×, h3 = 1.5×,
-/// h4 = 1.25×, h5/h6 = body). Derived from [`MARKDOWN_TEXT_SIZE`] so the
-/// measurement stays in lockstep with the renderer.
-const HEADING_SIZES: [f32; 6] = [
-    MARKDOWN_TEXT_SIZE * 2.0,
-    MARKDOWN_TEXT_SIZE * 1.75,
-    MARKDOWN_TEXT_SIZE * 1.5,
-    MARKDOWN_TEXT_SIZE * 1.25,
-    BODY_FONT_SIZE,
-    BODY_FONT_SIZE,
-];
+/// Markdown heading sizes relative to the measurement body size, matching
+/// iced 0.14's `markdown::Settings` scale exactly (h1 = 2.0×, h2 = 1.75×,
+/// h3 = 1.5×, h4 = 1.25×, h5/h6 = body). Derived from the caller's `font_size`
+/// so heading wrap stays in lockstep with the renderer's scaled headings
+/// (narration bodies scale from the larger narration size).
+const fn heading_sizes(font_size: f32) -> [f32; 6] {
+    [
+        font_size * 2.0,
+        font_size * 1.75,
+        font_size * 1.5,
+        font_size * 1.25,
+        font_size,
+        font_size,
+    ]
+}
 
 /// Tab width used when shaping (matches cosmic-text's default).
 const TAB_WIDTH: u16 = 4;
@@ -125,6 +123,7 @@ fn preview_line_char_budget(
     font_sys: &mut cosmic_text::FontSystem,
     attrs: &Attrs,
     avail: f32,
+    size: f32,
 ) -> usize {
     let mut probe = BufferLine::new(
         "M",
@@ -134,7 +133,7 @@ fn preview_line_char_budget(
     );
     let advance = probe
         .shape(font_sys, TAB_WIDTH)
-        .layout(BODY_FONT_SIZE, Some(1_000.0), Wrap::None, None, None)
+        .layout(size, Some(1_000.0), Wrap::None, None, None)
         .first()
         .map_or(0.0, |l| l.w);
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -168,6 +167,10 @@ pub(crate) struct MessageMeasure {
     /// different length, so the entry is re-measured instead of showing a
     /// stale preview until the session is reopened.
     pub(crate) content_len: usize,
+    /// Body font size (px) the measurement was computed at. A width-bucket
+    /// re-measure via [`re_measure`] carries it forward, so a narration body
+    /// measured at the narration size keeps that size on a resize.
+    pub(crate) font_size: f32,
 }
 
 /// Quantize a text width into a bucket so sub-pixel layout jitter does not
@@ -187,25 +190,30 @@ pub(crate) fn width_bucket(width: f32) -> u32 {
 /// preprocessing and image placeholder reduction happen here. The source is
 /// owned as [`Arc<str>`] so a width-bucket change can re-measure without
 /// copying the (potentially hundreds of KB) display text again.
+/// `font_size` is the body size the text renders at (body or narration),
+/// used for wrap and preview-line-budget shaping and heading scaling.
 pub(crate) fn measure_message(
     display_text: impl Into<Arc<str>>,
     width: f32,
     content_len: usize,
+    font_size: f32,
 ) -> MessageMeasure {
     let source = display_text.into();
     let processed: Arc<str> = placeholder_media(&media_markers::preprocess(&source)).into();
-    measure_processed(source, processed, width, content_len)
+    measure_processed(source, processed, width, content_len, font_size)
 }
 
 /// Re-measure a cached entry at a new width, reusing the cached processed
 /// display text so a width-bucket change does not re-run media
-/// preprocessing (two full String copies + regex passes per message).
+/// preprocessing (two full String copies + regex passes per message). The
+/// cached [`MessageMeasure::font_size`] is carried forward.
 pub(crate) fn re_measure(cached: &MessageMeasure, width: f32) -> MessageMeasure {
     measure_processed(
         cached.source.clone(),
         cached.processed.clone(),
         width,
         cached.content_len,
+        cached.font_size,
     )
 }
 
@@ -217,11 +225,14 @@ fn measure_processed(
     processed: Arc<str>,
     width: f32,
     content_len: usize,
+    font_size: f32,
 ) -> MessageMeasure {
     let bucket = width_bucket(width);
     let text = &processed;
     let avail = (width - WRAP_SAFETY_MARGIN_PX).max(1.0);
 
+    // Family-only attrs: italic shares the mono glyph advance, so a style
+    // change is unnecessary for measurement.
     let attrs = Attrs::new().family(Family::Name("JetBrains Mono"));
     let mut total_lines = 0u32;
     let mut preview = String::new();
@@ -235,7 +246,7 @@ fn measure_processed(
         // in the preview (or, for unwrapped code lines, spill past the
         // 3-line budget visually). Measured from the body font's glyph
         // advance rather than hardcoded.
-        let preview_line_chars = preview_line_char_budget(font_sys, &attrs, avail);
+        let preview_line_chars = preview_line_char_budget(font_sys, &attrs, avail, font_size);
         let mut line = BufferLine::new(
             "",
             LineEnding::None,
@@ -289,9 +300,9 @@ fn measure_processed(
                         // Wrappable line: shape it and lay it out at its
                         // rendered font size (headings render larger than
                         // the body, so they are measured at their own size).
-                        let size = heading_size(src_line)
-                            .or_else(|| setext_heading_size(src_line, next_line))
-                            .unwrap_or(BODY_FONT_SIZE);
+                        let size = heading_size(src_line, font_size)
+                            .or_else(|| setext_heading_size(src_line, next_line, font_size))
+                            .unwrap_or(font_size);
                         // Bound the shaped text: a source line longer than
                         // `shape_ceiling(avail, need)` bytes holds more than
                         // `need * avail` characters (UTF-8 ≤ 4 bytes/char),
@@ -399,6 +410,7 @@ fn measure_processed(
         source,
         processed,
         content_len,
+        font_size,
     }
 }
 
@@ -451,15 +463,16 @@ fn fence_has_only_trailing_whitespace(line: &str) -> bool {
     trimmed[run..].chars().all(char::is_whitespace)
 }
 
-/// ATX heading line → rendered font size (iced `markdown::Settings` sizes).
-/// Returns `None` for non-heading lines.
+/// ATX heading line → rendered font size (iced `markdown::Settings` sizes),
+/// scaled from the measurement's `font_size`. Returns `None` for non-heading
+/// lines.
 ///
 /// CommonMark allows up to three spaces of indentation before an ATX
 /// heading; the indent is stripped before the `#` scan so `'  # heading'`
 /// (a valid heading) is measured at heading size. Measuring it at body size
 /// would under-count a long indented heading and could leave an over-budget
 /// message expanded — the one direction the collapse bias forbids.
-fn heading_size(line: &str) -> Option<f32> {
+fn heading_size(line: &str, font_size: f32) -> Option<f32> {
     let trimmed = line.trim_start_matches(' ');
     // CommonMark: at most three leading spaces; a tab (4 columns) already
     // exceeds that and never starts an ATX heading.
@@ -471,7 +484,7 @@ fn heading_size(line: &str) -> Option<f32> {
     if !(1..=6).contains(&hashes) {
         return None;
     }
-    (bytes.get(hashes) == Some(&b' ')).then(|| HEADING_SIZES[hashes - 1])
+    (bytes.get(hashes) == Some(&b' ')).then(|| heading_sizes(font_size)[hashes - 1])
 }
 
 /// Setext heading line → rendered font size: a paragraph line immediately
@@ -490,7 +503,7 @@ fn heading_size(line: &str) -> Option<f32> {
 /// symmetric with the ATX rule in [`heading_size`], so `'title\n  ==='` is a
 /// valid heading and must measure at heading size — body-size measurement
 /// would under-collapse a long indented title.
-fn setext_heading_size(current: &str, next: Option<&str>) -> Option<f32> {
+fn setext_heading_size(current: &str, next: Option<&str>, font_size: f32) -> Option<f32> {
     if current.is_empty() {
         return None;
     }
@@ -507,10 +520,10 @@ fn setext_heading_size(current: &str, next: Option<&str>) -> Option<f32> {
         return None;
     }
     // CommonMark (and pulldown-cmark's scan_setext_heading) maps `=` to H1
-    // and `-` to H2; HEADING_SIZES is ordered H1..H6.
+    // and `-` to H2; `heading_sizes` is ordered H1..H6.
     body.bytes()
         .all(|b| b == ch)
-        .then(|| HEADING_SIZES[usize::from(ch == b'-')])
+        .then(|| heading_sizes(font_size)[usize::from(ch == b'-')])
 }
 
 /// Replace markdown image syntax (`![alt](url)`) with a short text
@@ -563,6 +576,9 @@ mod tests {
             guard.load_font(std::borrow::Cow::Borrowed(include_bytes!(
                 "../JetBrainsMono-Regular.ttf"
             )));
+            guard.load_font(std::borrow::Cow::Borrowed(include_bytes!(
+                "../JetBrainsMono-Italic.ttf"
+            )));
         });
     }
 
@@ -572,7 +588,7 @@ mod tests {
 
     fn measure(text: &str) -> MessageMeasure {
         ensure_fonts_loaded();
-        measure_message(text, TEST_WIDTH, text.len())
+        measure_message(text, TEST_WIDTH, text.len(), MARKDOWN_TEXT_SIZE)
     }
 
     fn assert_preview_lines(preview: &str, expected: usize) {
@@ -747,31 +763,44 @@ mod tests {
         // (2.0×), "-" → H2 (1.75×). An inverted mapping under-counts a long
         // "=" title at H2 size and can leave an over-budget message expanded
         // — the forbidden direction — so pin the mapping directly (no font
-        // system needed; the sizes are constants).
+        // system needed; the sizes are derived from `MARKDOWN_TEXT_SIZE`).
+        let sizes = heading_sizes(MARKDOWN_TEXT_SIZE);
         assert_eq!(
-            setext_heading_size("title", Some("===")),
-            Some(HEADING_SIZES[0])
+            setext_heading_size("title", Some("==="), MARKDOWN_TEXT_SIZE),
+            Some(sizes[0])
         );
         assert_eq!(
-            setext_heading_size("title", Some("---")),
-            Some(HEADING_SIZES[1])
+            setext_heading_size("title", Some("---"), MARKDOWN_TEXT_SIZE),
+            Some(sizes[1])
         );
         // Up to three leading spaces are allowed on the underline (symmetric
         // with the ATX rule); 4+ is not a setext underline.
         assert_eq!(
-            setext_heading_size("title", Some("  ===")),
-            Some(HEADING_SIZES[0])
+            setext_heading_size("title", Some("  ==="), MARKDOWN_TEXT_SIZE),
+            Some(sizes[0])
         );
-        assert_eq!(setext_heading_size("title", Some("    ===")), None);
+        assert_eq!(
+            setext_heading_size("title", Some("    ==="), MARKDOWN_TEXT_SIZE),
+            None
+        );
         // Trailing whitespace after the run is fine; mixed characters, a
         // blank underline, or a blank title are not.
         assert_eq!(
-            setext_heading_size("title", Some("---  ")),
-            Some(HEADING_SIZES[1])
+            setext_heading_size("title", Some("---  "), MARKDOWN_TEXT_SIZE),
+            Some(sizes[1])
         );
-        assert_eq!(setext_heading_size("title", Some("=-=")), None);
-        assert_eq!(setext_heading_size("title", Some("")), None);
-        assert_eq!(setext_heading_size("", Some("===")), None);
+        assert_eq!(
+            setext_heading_size("title", Some("=-="), MARKDOWN_TEXT_SIZE),
+            None
+        );
+        assert_eq!(
+            setext_heading_size("title", Some(""), MARKDOWN_TEXT_SIZE),
+            None
+        );
+        assert_eq!(
+            setext_heading_size("", Some("==="), MARKDOWN_TEXT_SIZE),
+            None
+        );
     }
 
     #[test]

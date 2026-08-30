@@ -28,6 +28,9 @@ const JETBRAINS_MONO_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Regul
 /// JetBrainsMono-Bold.ttf embedded for header text in the Iced dashboard.
 const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Bold.ttf");
 
+/// JetBrainsMono-Italic.ttf embedded for italic narration text in the Iced dashboard.
+const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Italic.ttf");
+
 /// INFO-log retention window (hours): the log-cleanup loop deletes INFO
 /// entries older than this. Independent of the session-purge cutoff.
 const LOG_RETENTION_HOURS: i64 = 8;
@@ -600,6 +603,7 @@ fn main() -> Result<()> {
     .font(iced_fonts::LUCIDE_FONT_BYTES)
     .font(JETBRAINS_MONO_FONT_BYTES)
     .font(JETBRAINS_MONO_BOLD_FONT_BYTES)
+    .font(JETBRAINS_MONO_ITALIC_FONT_BYTES)
     .default_font(JETBRAINS_MONO)
     .subscription(Dashboard::subscription)
     .theme(Dashboard::theme)

@@ -1,21 +1,27 @@
 //! Shared dashboard widgets: styled pick_list, PickOption type, FileTree state struct
 //! and build_tree_panel for shared file-tree panel rendering.
 
-use std::borrow::Cow;
-use std::collections::HashSet;
-use std::path::Path;
-use std::time::Duration;
-
+use super::theme;
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::overlay;
+use iced::advanced::renderer;
+use iced::advanced::widget::Operation;
+use iced::advanced::widget::tree::{self, Tree};
+use iced::advanced::{Clipboard, Shell, Widget};
+use iced::mouse;
 use iced::widget::{
     self, Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable,
     stack, text, tooltip,
 };
-use iced::{Alignment, Color, Element, Length, Padding, Task};
-
-use iced_selection;
-
-use super::theme;
+use iced::{
+    Alignment, Color, Element, Event, Length, Padding, Point, Rectangle, Size, Task, Vector,
+};
 use iced_fonts::lucide;
+use iced_selection;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// An option for [`fn@pick_list`] with separate value and display label.
 ///
@@ -1475,6 +1481,326 @@ pub fn empty_stack_placeholder<'a, Message: 'a>() -> Element<'a, Message> {
         .into()
 }
 
+/// Wrap `content` so a completed click (press+release without a selection
+/// drag) inside it publishes `on_click`, while selection gestures publish
+/// `on_cancel`: the second click of a multi-click sequence (a word/line
+/// selection), or a drag starting inside the content. `on_cancel` lets a
+/// consumer that defers its toggle past [`DOUBLE_CLICK_WINDOW`] drop it, so
+/// selection never fights a pending toggle; a third+ click publishes
+/// nothing. A click the child answers with a message of its own — e.g. a
+/// markdown link click — publishes `on_cancel` only when a click sequence
+/// was already in progress.
+#[must_use]
+pub fn click_to_toggle<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_click: Message,
+    on_cancel: Message,
+) -> Element<'a, Message> {
+    ClickToggle {
+        content: content.into(),
+        on_click,
+        on_cancel,
+    }
+    .into()
+}
+
+/// Outcome of a press+release pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickKind {
+    Click,
+    Drag,
+    MultiClick,
+}
+
+/// Max cursor travel (px) between press and release for the pair to count as
+/// a click rather than a drag selection. Matches iced_selection's 6 px click
+/// slop so both widgets classify a sloppy press the same way.
+const CLICK_DRAG_MAX_DISTANCE: f32 = 6.0;
+/// Max gap between consecutive clicks for the second+ click to be a
+/// double/triple click (word/line selection, not a toggle).
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
+
+/// Classify a press+release pair by cursor travel and time since the last click.
+///
+/// The [`DOUBLE_CLICK_WINDOW`] boundary is inclusive: a gap of exactly 300 ms
+/// still counts as a multi-click.
+fn classify_click(distance: f32, since_last_click: Option<Duration>) -> ClickKind {
+    if distance > CLICK_DRAG_MAX_DISTANCE {
+        return ClickKind::Drag;
+    }
+    if since_last_click.is_some_and(|elapsed| elapsed <= DOUBLE_CLICK_WINDOW) {
+        return ClickKind::MultiClick;
+    }
+    ClickKind::Click
+}
+
+/// Per-widget state persisted across frames via iced's `Tree`.
+#[derive(Default, Clone)]
+struct ClickToggleState {
+    press: Option<Point>,
+    last_click: Option<Instant>,
+    /// Completed (non-drag) clicks ending at this widget, reset by a drag.
+    click_count: u32,
+    /// Whether the in-progress drag gesture already published a cancel.
+    drag_canceled: bool,
+}
+
+struct ClickToggle<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer> {
+    content: Element<'a, Message, Theme, Renderer>,
+    on_click: Message,
+    on_cancel: Message,
+}
+
+impl<'a, Message, Theme, Renderer> From<ClickToggle<'a, Message, Theme, Renderer>>
+    for Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a + Clone,
+    Theme: 'a,
+    Renderer: 'a + renderer::Renderer,
+{
+    fn from(widget: ClickToggle<'a, Message, Theme, Renderer>) -> Self {
+        Self::new(widget)
+    }
+}
+
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for ClickToggle<'_, Message, Theme, Renderer>
+where
+    Renderer: renderer::Renderer,
+    Message: Clone,
+{
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<ClickToggleState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(ClickToggleState::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        // Run the child with its own message buffer so we can tell whether the
+        // child produced a message of its own for this event (e.g. a markdown
+        // link click publishing `LinkClicked` on release) — such a click
+        // already carries meaning and must not ALSO toggle the block. Merging
+        // back preserves the child's capture/redraw/layout requests.
+        let mut child_messages = Vec::new();
+        let mut child_shell = Shell::new(&mut child_messages);
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            &mut child_shell,
+            viewport,
+        );
+        let child_published = !child_shell.is_empty();
+        shell.merge(child_shell, std::convert::identity);
+
+        self.handle_mouse(tree, event, layout, cursor, shell, child_published);
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        let content_interaction = self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        );
+
+        match (content_interaction, cursor.is_over(layout.bounds())) {
+            (mouse::Interaction::None, true) => mouse::Interaction::Pointer,
+            _ => content_interaction,
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        renderer_style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            renderer_style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<Message: Clone, Theme, Renderer> ClickToggle<'_, Message, Theme, Renderer> {
+    fn handle_mouse(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+        child_published: bool,
+    ) {
+        let state: &mut ClickToggleState = tree.state.downcast_mut();
+
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if cursor.is_over(layout.bounds())
+                    && let Some(position) = cursor.position()
+                {
+                    state.press = Some(position);
+                    state.drag_canceled = false;
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                // A drag starting inside the content is a selection gesture:
+                // cancel a deferred toggle before it could commit
+                // mid-selection.
+                if let (Some(press_position), Some(position)) = (state.press, cursor.position())
+                    && position.distance(press_position) > CLICK_DRAG_MAX_DISTANCE
+                {
+                    self.publish_cancel_once(state, shell);
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                let Some(press_position) = state.press.take() else {
+                    return;
+                };
+                let Some(release_position) = cursor.position() else {
+                    return;
+                };
+
+                let kind = classify_click(
+                    release_position.distance(press_position),
+                    state.last_click.map(|t| t.elapsed()),
+                );
+
+                // A drag means selection, not clicking: reset the multi-click
+                // sequence and cancel any deferred toggle.
+                if kind == ClickKind::Drag {
+                    state.last_click = None;
+                    state.click_count = 0;
+                    self.publish_cancel_once(state, shell);
+                    return;
+                }
+                // A click the child answered itself (e.g. a markdown link) is
+                // not part of our toggle sequence — but it still ends a
+                // pending toggle from an earlier click.
+                if child_published {
+                    if state.click_count > 0 {
+                        shell.publish(self.on_cancel.clone());
+                    }
+                    state.last_click = None;
+                    state.click_count = 0;
+                    return;
+                }
+
+                // `kind` is Click or MultiClick here (Drag returned above).
+                state.click_count = if kind == ClickKind::Click {
+                    1
+                } else {
+                    state.click_count + 1
+                };
+                state.last_click = Some(Instant::now());
+
+                match state.click_count {
+                    1 => shell.publish(self.on_click.clone()),
+                    // Second click of a multi-click: a word/line selection.
+                    2 => shell.publish(self.on_cancel.clone()),
+                    // Triple+ click: word/line selection owns it.
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Publish `on_cancel` once per drag gesture (a deferred toggle must not
+    /// commit mid-selection).
+    fn publish_cancel_once(&self, state: &mut ClickToggleState, shell: &mut Shell<'_, Message>) {
+        if !state.drag_canceled {
+            state.drag_canceled = true;
+            shell.publish(self.on_cancel.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2248,5 +2574,30 @@ mod tests {
                 tree.scroll_y
             );
         }
+    }
+
+    #[test]
+    fn classify_click_kinds() {
+        // Short press, no previous click.
+        assert_eq!(classify_click(0.0, None), ClickKind::Click);
+        assert_eq!(classify_click(6.0, None), ClickKind::Click);
+        // Big distance is always a drag, regardless of timing.
+        assert_eq!(classify_click(6.1, None), ClickKind::Drag);
+        assert_eq!(classify_click(100.0, Some(Duration::ZERO)), ClickKind::Drag);
+        // Tiny distance within 300ms of the last click.
+        assert_eq!(
+            classify_click(1.0, Some(Duration::from_millis(299))),
+            ClickKind::MultiClick
+        );
+        // Tiny distance with a 301ms gap.
+        assert_eq!(
+            classify_click(1.0, Some(Duration::from_millis(301))),
+            ClickKind::Click
+        );
+        // Exactly at the 300ms boundary is an inclusive MultiClick.
+        assert_eq!(
+            classify_click(1.0, Some(DOUBLE_CLICK_WINDOW)),
+            ClickKind::MultiClick
+        );
     }
 }

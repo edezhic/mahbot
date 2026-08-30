@@ -251,29 +251,56 @@ pub const FONT_REGULAR: iced::Font = iced::Font {
     ..iced::Font::DEFAULT
 };
 
+/// Italic variant of JetBrains Mono (narration text).
+pub const FONT_ITALIC: iced::Font = iced::Font {
+    family: iced::font::Family::Name("JetBrains Mono"),
+    style: iced::font::Style::Italic,
+    ..iced::Font::DEFAULT
+};
+
 /// Body text size (px) of the transcript markdown renderer
-/// (`markdown_settings`). The sessions-page collapse measurement
-/// (`session_view::preview`) derives its body and heading sizes from this
-/// constant, so a theme font-size change cannot silently drift the measured
-/// wrap count away from the actual render.
+/// (`markdown_settings`). The sessions-page collapse measurement measures
+/// body elements at this size (narration at [`NARRATION_TEXT_SIZE`]), so a
+/// theme font-size change cannot silently drift the measured wrap count away
+/// from the actual render.
 pub const MARKDOWN_TEXT_SIZE: f32 = 13.0;
+
+/// Narration text size (px) — the italic narration line on Running Agents
+/// cards and the narration body on the Sessions transcript. The
+/// sessions-page collapse measurement measures narration at this size.
+pub const NARRATION_TEXT_SIZE: f32 = 14.0;
 
 /// Markdown rendering settings consistent with the Flexoki dark theme.
 #[must_use]
 pub fn markdown_settings() -> iced::widget::markdown::Settings {
+    markdown_settings_with(FONT_REGULAR, MARKDOWN_TEXT_SIZE)
+}
+
+/// Markdown rendering settings for narration bodies: italic face at
+/// [`NARRATION_TEXT_SIZE`].
+#[must_use]
+pub fn narration_markdown_settings() -> iced::widget::markdown::Settings {
+    markdown_settings_with(FONT_ITALIC, NARRATION_TEXT_SIZE)
+}
+
+/// Markdown rendering settings with an explicit body face and text size.
+/// Fenced code blocks always stay in the regular face (never italic) while
+/// the body and inline code take the passed `font`.
+#[must_use]
+fn markdown_settings_with(font: iced::Font, text_size: f32) -> iced::widget::markdown::Settings {
     let style = iced::widget::markdown::Style {
-        font: FONT_REGULAR,
+        font,
         inline_code_highlight: iced::widget::markdown::Highlight {
             background: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.15).into(),
             border: iced::border::rounded(4),
         },
         inline_code_padding: iced::padding::left(1).right(1),
         inline_code_color: TEXT_PRIMARY,
-        inline_code_font: FONT_REGULAR,
+        inline_code_font: font,
         code_block_font: FONT_REGULAR,
         link_color: ACCENT,
     };
-    iced::widget::markdown::Settings::with_text_size(MARKDOWN_TEXT_SIZE, style)
+    iced::widget::markdown::Settings::with_text_size(text_size, style)
 }
 
 // ── Ticket phase colors ───────────────────────────────────────────

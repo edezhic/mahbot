@@ -5,15 +5,13 @@
 use iced::widget::{Column, Row, container, text, tooltip};
 use iced::{Alignment, Element, Length};
 
-use iced_fonts::lucide;
-
 use crate::agent::registry::RunningTool;
 use crate::gui::theme;
 use crate::gui::widgets;
 
 /// Max display length (Unicode chars) of a single argument VALUE in the
 /// one-line key-value pairs summary. Hover tooltip always shows full value.
-const MAX_TOOL_VALUE_CHARS: usize = 52;
+const MAX_TOOL_VALUE_CHARS: usize = 104;
 
 /// Max display length of the whole key-value pairs line (values already
 /// per-value truncated). Cut at a pair boundary with "…".
@@ -65,28 +63,48 @@ pub(crate) fn truncate_at_boundary(s: &str, max_chars: usize) -> String {
 
 /// Single-line display form of a value: control characters (newlines, tabs)
 /// collapsed to spaces, then truncated to [`MAX_TOOL_VALUE_CHARS`] chars at a
-/// word/path-delimiter boundary with "…" when cut.
-fn value_display(value: &str) -> String {
+/// word/path-delimiter boundary with "…" when cut. The bool reports whether
+/// the value was char-cut (drives the hover tooltip).
+fn value_display(value: &str) -> (String, bool) {
     let single_line: String = value
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    truncate_at_boundary(&single_line, MAX_TOOL_VALUE_CHARS)
+    let was_char_cut = single_line.chars().count() > MAX_TOOL_VALUE_CHARS;
+    let display = truncate_at_boundary(&single_line, MAX_TOOL_VALUE_CHARS);
+    (display, was_char_cut)
 }
 
-/// Render the row's key-value pairs line: `name: value` pairs, comma-
-/// separated, each value collapsed to a single line and truncated at a
+/// One-line args summary plus whether it omits any information (drives the
+/// hover tooltip): a per-value char cut, the whole-line cap cut, or — in the
+/// compact view — a hidden single argument name. Renders `name: value` pairs,
+/// comma-separated, each value collapsed to a single line and truncated at a
 /// word/path-delimiter boundary to [`MAX_TOOL_VALUE_CHARS`] chars. The whole
 /// line is capped at [`MAX_TOOL_PAIRS_LINE_CHARS`] chars, cut at a pair
-/// boundary with "…".
-fn tool_pairs_line(pairs: &[(String, String)]) -> String {
-    let rendered: Vec<String> = pairs
+/// boundary with "…". In the compact view a single argument renders just the
+/// value, omitting the argument name.
+fn tool_pairs_summary(tool: &RunningTool, view: ToolBlockView) -> (String, bool) {
+    let compact = view == ToolBlockView::Compact;
+    if tool.args.is_empty() {
+        return (String::new(), false);
+    }
+    if compact && tool.args.len() == 1 {
+        let (display, _) = value_display(&tool.args[0].1);
+        return (display, true);
+    }
+    let mut omits = false;
+    let rendered: Vec<String> = tool
+        .args
         .iter()
-        .map(|(k, v)| format!("{k}: {}", value_display(v)))
+        .map(|(k, v)| {
+            let (display, cut) = value_display(v);
+            omits |= cut;
+            format!("{k}: {display}")
+        })
         .collect();
     let joined = rendered.join(", ");
     if joined.chars().count() <= MAX_TOOL_PAIRS_LINE_CHARS {
-        return joined;
+        return (joined, omits);
     }
     // Over budget: keep whole pairs while they fit (leaving room for the
     // trailing "…"), then mark the cut.
@@ -103,9 +121,12 @@ fn tool_pairs_line(pairs: &[(String, String)]) -> String {
     if out.is_empty() {
         // Even the first pair alone does not fit — truncate at a delimiter
         // boundary so the cut lands at a sensible wrap point.
-        truncate_at_boundary(&rendered[0], MAX_TOOL_PAIRS_LINE_CHARS)
+        (
+            truncate_at_boundary(&rendered[0], MAX_TOOL_PAIRS_LINE_CHARS),
+            true,
+        )
     } else {
-        format!("{out}…")
+        (format!("{out}…"), true)
     }
 }
 
@@ -136,76 +157,77 @@ fn tool_tooltip<Message: 'static>(tool: &RunningTool) -> Element<'static, Messag
     container(content).max_width(MAX_TOOL_TOOLTIP_WIDTH).into()
 }
 
-/// One shared tool block: lucide `wrench` glyph + bold tool name + one-line
-/// key-value args summary (boundary-truncated), with a hover tooltip showing
-/// the tool name and every full unscrubbed argument pair (sorted by value
-/// length ascending, shortest at top). Values are RAW and unscrubbed in both
-/// views — a deliberate, user-approved decision (local-first GUI; the durable
-/// stats logs stay scrubbed).
+/// Which session surface renders a tool block. `Compact` is the Running
+/// Agents card line (plain text, glyph-wrapped so long unbroken values fold; a
+/// single-argument tool renders just the value, omitting the argument name).
+/// `Full` is the Sessions transcript bubble (selectable text, word/glyph
+/// wrapping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolBlockView {
+    Compact,
+    Full,
+}
+
+/// One shared tool block: bold tool name + one-line key-value args summary
+/// (boundary-truncated), with a hover tooltip showing the tool name and every
+/// full unscrubbed argument pair (sorted by value length ascending, shortest
+/// at top). Values are RAW and unscrubbed in both views — a deliberate,
+/// user-approved decision (local-first GUI; the durable stats logs stay
+/// scrubbed).
 ///
-/// When `wrap` is true the args line word-or-glyph-wraps at the
-/// parent-constrained width instead of clipping on unbroken tokens; Running
-/// Agents passes false.
+/// The tooltip is only shown when the rendered line omits information — a
+/// per-value cut, the whole-line cap cut, or a hidden single argument name in
+/// the compact view. Zero-arg tools and fully visible full-view lines get no
+/// tooltip.
 pub(crate) fn tool_block<Message: 'static>(
     tool: &RunningTool,
-    selectable: bool,
-    wrap: bool,
+    view: ToolBlockView,
 ) -> Element<'static, Message> {
-    let icon: Element<'static, Message> = lucide::wrench::<iced::Theme, iced::Renderer>()
-        .size(11)
-        .color(theme::TEXT_MUTED)
-        .into();
-
-    let name: Element<'static, Message> = if selectable {
-        widgets::selectable_text(tool.name.clone(), theme::TEXT_PRIMARY)
+    let name: Element<'static, Message> = match view {
+        ToolBlockView::Full => widgets::selectable_text(tool.name.clone(), theme::TEXT_PRIMARY)
             .size(11)
             .font(theme::FONT_BOLD)
-            .into()
-    } else {
-        text(tool.name.clone())
+            .into(),
+        ToolBlockView::Compact => text(tool.name.clone())
             .size(11)
             .font(theme::FONT_BOLD)
             .color(theme::TEXT_PRIMARY)
-            .into()
+            .into(),
     };
 
-    let align_y = if wrap {
-        Alignment::Start
-    } else {
-        Alignment::Center
+    let align_y = match view {
+        ToolBlockView::Compact => Alignment::Center,
+        ToolBlockView::Full => Alignment::Start,
     };
-    let mut line = Row::new().spacing(4).align_y(align_y).push(icon);
-    line = line.push(name);
+    let mut line = Row::new().spacing(4).align_y(align_y).push(name);
 
-    if !tool.args.is_empty() {
-        let args: Element<'static, Message> = if selectable {
-            let mut txt =
-                widgets::selectable_text(tool_pairs_line(&tool.args), theme::TEXT_SECONDARY)
-                    .size(11);
-            if wrap {
-                txt = txt
-                    .width(Length::Fill)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph);
-            }
-            txt.into()
-        } else {
-            let mut txt = text(tool_pairs_line(&tool.args))
+    let (args_text, omits) = tool_pairs_summary(tool, view);
+    if !args_text.is_empty() {
+        let args: Element<'static, Message> = match view {
+            ToolBlockView::Full => widgets::selectable_text(args_text, theme::TEXT_SECONDARY)
                 .size(11)
-                .color(theme::TEXT_SECONDARY);
-            if wrap {
-                txt = txt
-                    .width(Length::Fill)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph);
-            }
-            txt.into()
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .into(),
+            // Wrap at glyph level so a long unbroken value (path, URL) folds
+            // instead of overflowing the card edge.
+            ToolBlockView::Compact => text(args_text)
+                .size(11)
+                .color(theme::TEXT_SECONDARY)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .into(),
         };
         line = line.push(args);
     }
 
-    tooltip(line, tool_tooltip(tool), tooltip::Position::Top)
-        .gap(4)
-        .style(theme::tooltip_style)
-        .into()
+    if omits {
+        tooltip(line, tool_tooltip(tool), tooltip::Position::Top)
+            .gap(4)
+            .style(theme::tooltip_style)
+            .into()
+    } else {
+        line.into()
+    }
 }
 
 #[cfg(test)]
@@ -231,74 +253,127 @@ mod tests {
 
     #[test]
     fn value_display_truncates_at_delimiter_boundary() {
-        // A path under the (doubled) cap is unchanged.
+        // A path under the cap is unchanged (and not flagged as cut).
         assert_eq!(
             value_display("/Users/egordezic/Desktop/foo.rs"),
-            "/Users/egordezic/Desktop/foo.rs"
+            ("/Users/egordezic/Desktop/foo.rs".to_string(), false)
         );
         // Control chars collapse to spaces.
-        assert_eq!(value_display("a\nb"), "a b");
+        assert_eq!(value_display("a\nb"), ("a b".to_string(), false));
         // Unbroken long token hard-cuts at [`MAX_TOOL_VALUE_CHARS`].
         assert_eq!(
-            value_display(&"a".repeat(60)),
-            format!("{}…", "a".repeat(MAX_TOOL_VALUE_CHARS))
+            value_display(&"a".repeat(110)),
+            (format!("{}…", "a".repeat(MAX_TOOL_VALUE_CHARS)), true)
         );
         // A value over the cap cuts at a `/` delimiter boundary.
-        let long_path = format!("{}/{}", "a".repeat(20), "b".repeat(40));
+        let long_path = format!("{}/{}", "a".repeat(60), "b".repeat(60));
         assert_eq!(
             value_display(&long_path),
-            format!("{}…", "a".repeat(20) + "/")
+            (format!("{}…", "a".repeat(60) + "/"), true)
         );
     }
 
     #[test]
-    fn tool_pairs_line_truncates_at_pair_boundary() {
-        // Under the line cap: returned verbatim.
-        let short = vec![("path".to_string(), "a.rs".to_string())];
-        assert_eq!(tool_pairs_line(&short), "path: a.rs");
+    fn tool_pairs_summary_truncates_at_pair_boundary() {
+        // Under the line cap: returned verbatim, nothing omitted.
+        let short = RunningTool {
+            name: "read_file".to_string(),
+            args: vec![("path".to_string(), "a.rs".to_string())],
+        };
+        assert_eq!(
+            tool_pairs_summary(&short, ToolBlockView::Full),
+            ("path: a.rs".to_string(), false)
+        );
 
         // Over the line cap: whole pairs kept while they fit, then a trailing
         // "…" marks the cut; the excluded final pair never appears.
-        let pairs = vec![
-            (
-                "path".to_string(),
-                "/Users/egordezic/Desktop/project/aaa/foo_long.rs".to_string(),
-            ),
-            (
-                "offset".to_string(),
-                "/Users/egordezic/Desktop/project/bbb/bar_long.rs".to_string(),
-            ),
-            (
-                "limit".to_string(),
-                "/Users/egordezic/Desktop/project/ccc/baz_long.rs".to_string(),
-            ),
-            (
-                "query".to_string(),
-                "/Users/egordezic/Desktop/project/ddd/qux_long.rs".to_string(),
-            ),
-            (
-                "sort".to_string(),
-                "/Users/egordezic/Desktop/project/eee/quux_long.rs".to_string(),
-            ),
-            (
-                "desc".to_string(),
-                "/Users/egordezic/Desktop/project/fff/corge_long.rs".to_string(),
-            ),
-        ];
-        let line = tool_pairs_line(&pairs);
+        let tool = RunningTool {
+            name: "read_file".to_string(),
+            args: vec![
+                (
+                    "path".to_string(),
+                    "/Users/egordezic/Desktop/project/aaa/foo_long.rs".to_string(),
+                ),
+                (
+                    "offset".to_string(),
+                    "/Users/egordezic/Desktop/project/bbb/bar_long.rs".to_string(),
+                ),
+                (
+                    "limit".to_string(),
+                    "/Users/egordezic/Desktop/project/ccc/baz_long.rs".to_string(),
+                ),
+                (
+                    "query".to_string(),
+                    "/Users/egordezic/Desktop/project/ddd/qux_long.rs".to_string(),
+                ),
+                (
+                    "sort".to_string(),
+                    "/Users/egordezic/Desktop/project/eee/quux_long.rs".to_string(),
+                ),
+                (
+                    "desc".to_string(),
+                    "/Users/egordezic/Desktop/project/fff/corge_long.rs".to_string(),
+                ),
+            ],
+        };
+        let (line, omits) = tool_pairs_summary(&tool, ToolBlockView::Full);
         assert!(line.chars().count() <= MAX_TOOL_PAIRS_LINE_CHARS);
         assert!(line.ends_with('…'));
         assert!(line.contains("path"));
         assert!(!line.contains("desc"), "excluded pair must not appear");
+        assert!(omits, "line cut must report omission");
     }
 
     #[test]
-    fn tool_pairs_line_fallback_truncates_first_pair_at_boundary() {
+    fn tool_pairs_summary_fallback_truncates_first_pair_at_boundary() {
         // A single pair longer than the line cap: when the first pair contains
         // no delimiter it is hard-cut exactly at the cap (with "…"), never left
         // overflowing the line.
-        let pairs = vec![("k".repeat(220), "v".to_string())];
-        let line = tool_pairs_line(&pairs);
+        let tool = RunningTool {
+            name: "read_file".to_string(),
+            args: vec![("k".repeat(220), "v".to_string())],
+        };
+        let (line, omits) = tool_pairs_summary(&tool, ToolBlockView::Full);
         assert_eq!(line, format!("{}…", "k".repeat(MAX_TOOL_PAIRS_LINE_CHARS)));
+        assert!(omits, "line cut must report omission");
+    }
+
+    #[test]
+    fn tool_pairs_summary_omits_only_when_information_is_hidden() {
+        // (a) Compact single short arg → omits true, text is just the value
+        // (the argument name is hidden).
+        let single = RunningTool {
+            name: "read_file".to_string(),
+            args: vec![("path".to_string(), "a.rs".to_string())],
+        };
+        assert_eq!(
+            tool_pairs_summary(&single, ToolBlockView::Compact),
+            ("a.rs".to_string(), true)
+        );
+
+        // (b) Full view short args → omits false (nothing hidden).
+        assert_eq!(
+            tool_pairs_summary(&single, ToolBlockView::Full),
+            ("path: a.rs".to_string(), false)
+        );
+
+        // (c) Full view with one over-cap value → omits true (per-value cut).
+        let over_cap = RunningTool {
+            name: "read_file".to_string(),
+            args: vec![("path".to_string(), "a".repeat(120))],
+        };
+        let (line, omits) = tool_pairs_summary(&over_cap, ToolBlockView::Full);
+        assert!(omits);
+        assert!(line.ends_with('…'));
+
+        // (d) Empty args → omits false, empty text.
+        let empty = RunningTool {
+            name: "read_file".to_string(),
+            args: Vec::new(),
+        };
+        assert_eq!(
+            tool_pairs_summary(&empty, ToolBlockView::Full),
+            (String::new(), false)
+        );
     }
 }

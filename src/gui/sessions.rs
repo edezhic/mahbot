@@ -8,8 +8,7 @@ use crate::ChatMessage;
 use crate::session::SessionMetadata;
 
 use iced::widget::{
-    Column, Id, Row, Space, button, column, container, markdown, mouse_area, responsive, row,
-    scrollable, text,
+    Column, Id, Space, button, column, container, markdown, responsive, row, scrollable, text,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -35,6 +34,14 @@ use super::widgets::selectable_text;
 /// width to the actual bubble body (container padding + a safety margin).
 const BUBBLE_BODY_RATIO: f32 = 0.75;
 
+/// Delay before a click-scheduled collapse of an expanded element actually
+/// applies: the widget's double-click window (300 ms) plus a small margin, so
+/// a canceling second click published at the window boundary always arrives
+/// before the commit. A click inside the margin (beyond the double-click
+/// window) is a deliberate second click and re-affirms the still-scheduled
+/// collapse.
+const COLLAPSE_COMMIT_DELAY: Duration = Duration::from_millis(350);
+
 /// Shared transcript render context: the flat session ledger, its per-entry
 /// markdown bodies, the element expansion set, the collapse-measurement
 /// cache, and the single text measurement width (bubble body width, used for
@@ -55,8 +62,20 @@ pub(crate) enum SessionsMessage {
     SessionMessages(String, Vec<ChatMessage>),
     SessionError(String),
     /// Toggle an element's collapsed preview / full content, keyed by
-    /// (entry index, element index within entry).
+    /// (entry index, element index within entry). Expanding applies
+    /// immediately; collapsing is deferred past the double-click window (see
+    /// `SessionsState::update`) and confirmed by [`SessionsMessage::ToggleCommit`].
     ToggleExpand(usize, usize),
+
+    /// The second click of a double-click on a collapsible element: a
+    /// word/line selection, so any collapse scheduled by the first click is
+    /// dropped.
+    ToggleCancel(usize, usize),
+
+    /// Apply a collapse previously scheduled by [`SessionsMessage::ToggleExpand`]
+    /// once the double-click window has passed without a canceling second
+    /// click.
+    ToggleCommit(usize, usize),
     AnimTick(Instant),
 
     /// Scroll position changed in the transcript viewport.
@@ -106,6 +125,12 @@ pub(crate) struct SessionsState {
     /// 1 = thinking block, 2+j = result block of call `j`. Cleared on
     /// session switch.
     expanded: HashSet<(usize, usize)>,
+    /// Expanded elements whose click-scheduled collapse is waiting out the
+    /// double-click window (keyed like `expanded`). The second click of a
+    /// double-click removes the entry — the double-click belongs to word/line
+    /// selection — and a later [`SessionsMessage::ToggleCommit`] applies the
+    /// collapse only if the entry survived. Cleared on session switch.
+    pending_collapses: HashSet<(usize, usize)>,
     /// Per-element collapse measurement cache, keyed like `expanded`.
     /// Session entries are append-only, so an existing entry stays valid and
     /// only new elements are measured lazily. Mutated during layout (the
@@ -136,6 +161,7 @@ impl SessionsState {
             entry_md: Vec::new(),
             selected_loading: false,
             expanded: HashSet::new(),
+            pending_collapses: HashSet::new(),
             measure_cache: RefCell::new(HashMap::new()),
             selected_anim: Animated::transition(
                 0.0f32,
@@ -194,6 +220,7 @@ impl SessionsState {
                 self.selected_anim.set_target(1.0_f32);
                 self.selected_loading = true;
                 self.expanded.clear();
+                self.pending_collapses.clear();
                 // The measurement cache is cleared in SessionMessages when the
                 // new session's messages actually arrive. The loading frames in
                 // between show "Loading..." (old messages are not rendered),
@@ -223,8 +250,10 @@ impl SessionsState {
                     self.entries = session_view::build_ledger(&messages);
                     self.entry_md = session_view::parse_entry_bodies(&self.entries);
                     // Fresh session load: reset the measurement cache (the
-                    // previous session's keys are index-stale).
+                    // previous session's keys are index-stale) and any pending
+                    // collapse from the old ledger.
                     self.measure_cache.borrow_mut().clear();
+                    self.pending_collapses.clear();
                     self.selected_loading = false;
                     // Snap to bottom so the user sees the most recent messages
                     // immediately.
@@ -248,12 +277,17 @@ impl SessionsState {
                 self.auto_scroll_enabled = at_bottom;
                 Task::none()
             }
-            SessionsMessage::ToggleExpand(i, j) => {
-                let key = (i, j);
-                if self.expanded.contains(&key) {
-                    self.expanded.remove(&key);
-                } else {
-                    self.expanded.insert(key);
+            SessionsMessage::ToggleExpand(i, j) => self.handle_toggle_expand(i, j),
+            SessionsMessage::ToggleCancel(i, j) => {
+                // Double-click word/line selection: the scheduled collapse is
+                // dropped and the block stays put.
+                self.pending_collapses.remove(&(i, j));
+                Task::none()
+            }
+            SessionsMessage::ToggleCommit(i, j) => {
+                // Apply the collapse only if no double-click canceled it.
+                if self.pending_collapses.remove(&(i, j)) {
+                    self.expanded.remove(&(i, j));
                 }
                 Task::none()
             }
@@ -291,6 +325,25 @@ impl SessionsState {
         }
     }
 
+    /// Click-to-toggle of one collapsible element: expanding applies
+    /// immediately; collapsing is scheduled and confirmed by a delayed
+    /// [`SessionsMessage::ToggleCommit`]. The widget's second-click message
+    /// ([`SessionsMessage::ToggleCancel`]) drops a scheduled collapse so a
+    /// word/line-selection double-click never moves the block.
+    fn handle_toggle_expand(&mut self, i: usize, j: usize) -> Task<SessionsMessage> {
+        let key = (i, j);
+        if self.expanded.contains(&key) {
+            self.pending_collapses.insert(key);
+            Task::perform(
+                async { tokio::time::sleep(COLLAPSE_COMMIT_DELAY).await },
+                move |()| SessionsMessage::ToggleCommit(i, j),
+            )
+        } else {
+            self.expanded.insert(key);
+            Task::none()
+        }
+    }
+
     /// Clear the currently selected session and ALL per-session transcript
     /// state, returning the transcript column to its placeholder.
     fn clear_selection(&mut self) {
@@ -299,6 +352,7 @@ impl SessionsState {
         self.entry_md.clear();
         self.selected_loading = false;
         self.expanded.clear();
+        self.pending_collapses.clear();
         self.auto_scroll_enabled = false;
         self.measure_cache.borrow_mut().clear();
         self.selected_anim.set_target(0.0);
@@ -572,65 +626,51 @@ fn bubble_row(
     .into()
 }
 
-/// Bottom-positioned chevron toggle for a collapsed/expanded long element.
-/// Does not count toward the line budget.
-fn toggle_button<'a>(is_expanded: bool, key: (usize, usize)) -> Element<'a, SessionsMessage> {
-    let (icon, label) = if is_expanded {
-        (
-            lucide::chevron_up::<iced::Theme, iced::Renderer>().size(12),
-            " Show less",
-        )
-    } else {
-        (
-            lucide::chevron_down::<iced::Theme, iced::Renderer>().size(12),
-            " Show more",
-        )
-    };
-    button(
-        row![
-            icon.color(theme::TEXT_MUTED),
-            text(label).size(10).color(theme::TEXT_MUTED),
-        ]
-        .spacing(2)
-        .align_y(Alignment::Center),
-    )
-    .style(theme::button_text)
-    .on_press(SessionsMessage::ToggleExpand(key.0, key.1))
-    .into()
-}
-
 /// Resolve the collapse measurement for an element at the current
 /// `text_width`, measuring on cache miss (cached per element and width; the
 /// session ledger is append-only, so a cached entry stays valid). Returns the
 /// wrapped-line count and — only when
 /// `need_preview` is set (the element is currently collapsed) — its 3-line
 /// plain-text preview, so expanded elements do not pay a per-frame preview
-/// clone.
+/// clone. `font_size` is the body size the element renders at (body or
+/// narration).
 ///
-/// Stale-fingerprint semantics: a cache hit with the same width bucket and
-/// `content_len` is reused; the same `content_len` at a different bucket is
-/// re-measured via [`re_measure`]; otherwise a fresh measurement runs.
+/// Stale-fingerprint semantics: a cache hit with the same width bucket,
+/// `content_len`, and `font_size` is reused; the same content at a different
+/// bucket (or size) is re-measured via [`re_measure`]; otherwise a fresh
+/// measurement runs.
+#[expect(
+    clippy::float_cmp,
+    reason = "font sizes are theme constants passed verbatim; exact identity is intended"
+)]
 fn element_measurement(
     measure_cache: &RefCell<HashMap<(usize, usize), MessageMeasure>>,
     key: (usize, usize),
     text_width: f32,
     need_preview: bool,
     content: &str,
+    font_size: f32,
 ) -> (u32, Option<String>) {
     let bucket = width_bucket(text_width);
     let content_len = content.len();
     let mut cache = measure_cache.borrow_mut();
     let cache_hit = cache.get(&key);
-    let stale = cache_hit.is_none_or(|m| m.width_bucket != bucket || m.content_len != content_len);
+    let stale = cache_hit.is_none_or(|m| {
+        m.width_bucket != bucket || m.content_len != content_len || m.font_size != font_size
+    });
     if stale {
         // Cache miss: measure. A pure width change reuses the cached
         // processed display text (an `Arc` clone); otherwise measure from the
         // caller's plain-text content.
         let m = match cache_hit {
-            Some(m) if m.width_bucket != bucket && m.content_len == content_len => {
+            Some(m)
+                if m.width_bucket != bucket
+                    && m.content_len == content_len
+                    && m.font_size == font_size =>
+            {
                 re_measure(m, text_width)
             }
-            _ => measure_message(content, text_width, content_len),
+            _ => measure_message(content, text_width, content_len, font_size),
         };
         cache.insert(key, m);
     }
@@ -645,19 +685,67 @@ fn element_measurement(
     )
 }
 
+/// The collapsed-preview-versus-full content of a collapsible element: when
+/// it can collapse and is collapsed, a [`MAX_PREVIEW_LINES`]-line preview
+/// (in `size`/`font`) with a small "ellipsis" marker for the hidden content;
+/// otherwise the caller's `expanded` element. Callers wrap the result in
+/// [`click_toggle`] — never nesting two toggle areas (a nested double-toggle
+/// cancels out).
+fn collapsible_text_block(
+    collapses: bool,
+    is_expanded: bool,
+    preview: Option<String>,
+    color: iced::Color,
+    size: f32,
+    font: iced::Font,
+    expanded: Element<'_, SessionsMessage>,
+) -> Element<'_, SessionsMessage> {
+    if collapses && !is_expanded {
+        let preview = preview.expect("a collapsing element always has a preview");
+        row![
+            selectable_text(preview, color).size(size).font(font),
+            lucide::ellipsis::<iced::Theme, iced::Renderer>()
+                .size(11)
+                .color(theme::TEXT_MUTED),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Start)
+        .into()
+    } else {
+        expanded
+    }
+}
+
+/// Wrap an element in the click-to-toggle area when it can collapse (a short
+/// click anywhere toggles, drag selection keeps working).
+fn click_toggle(
+    key: (usize, usize),
+    active: bool,
+    el: Element<'_, SessionsMessage>,
+) -> Element<'_, SessionsMessage> {
+    if active {
+        widgets::click_to_toggle(
+            el,
+            SessionsMessage::ToggleExpand(key.0, key.1),
+            SessionsMessage::ToggleCancel(key.0, key.1),
+        )
+    } else {
+        el
+    }
+}
+
 /// A plain-text collapsible element with the 3-line measured collapse rule:
 /// when it renders more than [`MAX_PREVIEW_LINES`] wrapped lines and is not
-/// expanded, a plain 3-line preview (wrapped in a click-to-expand button) is
-/// shown with a bottom chevron toggle; otherwise the full selectable text
-/// (with a leading icon when given) plus the toggle. `leading_icon` is used
-/// for the result block (`arrow_down_to_line`); thinking keeps its own header
-/// and passes `None`.
+/// expanded, a 3-line preview (with an "ellipsis" marker) is shown; otherwise
+/// the full selectable text. The whole element is click-to-toggle when it can
+/// collapse, so the selectable text stays drag-selectable. The measurement
+/// stays at [`theme::MARKDOWN_TEXT_SIZE`] (the text renders at 11px) — the
+/// err-toward-collapsing bias.
 fn plain_collapsible<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
     content: &'a str,
     color: iced::Color,
-    leading_icon: Option<Element<'a, SessionsMessage>>,
 ) -> Element<'a, SessionsMessage> {
     let is_expanded = ctx.expanded.contains(&key);
     let (wrapped_lines, preview) = element_measurement(
@@ -666,45 +754,40 @@ fn plain_collapsible<'a>(
         ctx.text_width,
         !is_expanded,
         content,
+        theme::MARKDOWN_TEXT_SIZE,
     );
     let collapses = wrapped_lines > MAX_PREVIEW_LINES;
-    let mut col = Column::new().spacing(2).width(Length::Fill);
-
-    if collapses && !is_expanded {
-        let preview = preview.expect("a collapsing element always has a preview");
-        let mut inner = Row::new().spacing(4).align_y(Alignment::Start);
-        if let Some(icon) = leading_icon {
-            inner = inner.push(icon);
-        }
-        inner = inner.push(selectable_text(preview, color).size(11));
-        col = col.push(
-            button(inner)
-                .style(theme::button_text)
-                .on_press(SessionsMessage::ToggleExpand(key.0, key.1))
-                .width(Length::Fill),
-        );
-    } else {
-        let mut inner = Row::new().spacing(4).align_y(Alignment::Start);
-        if let Some(icon) = leading_icon {
-            inner = inner.push(icon);
-        }
-        inner = inner.push(selectable_text(content, color).size(11));
-        col = col.push(inner);
-    }
-    if collapses {
-        col = col.push(toggle_button(is_expanded, key));
-    }
-    col.into()
+    let el = collapsible_text_block(
+        collapses,
+        is_expanded,
+        preview,
+        color,
+        11.0,
+        theme::FONT_REGULAR,
+        selectable_text(content, color).size(11).into(),
+    );
+    click_toggle(key, collapses, el)
 }
 
 /// The collapsible Thinking block: lucide `brain` + "Thinking" header above a
-/// [`plain_collapsible`] body with the same 3-line collapse, measured at the
-/// bubble body width.
+/// 3-line-collapse body measured at the bubble body width. The measurement
+/// stays at [`theme::MARKDOWN_TEXT_SIZE`] (the body renders at 11px) — the
+/// err-toward-collapsing bias.
 fn thinking_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
     content: &'a str,
 ) -> Element<'a, SessionsMessage> {
+    let is_expanded = ctx.expanded.contains(&key);
+    let (wrapped_lines, preview) = element_measurement(
+        ctx.measure_cache,
+        key,
+        ctx.text_width,
+        !is_expanded,
+        content,
+        theme::MARKDOWN_TEXT_SIZE,
+    );
+    let collapses = wrapped_lines > MAX_PREVIEW_LINES;
     let header = row![
         lucide::brain::<iced::Theme, iced::Renderer>()
             .size(11)
@@ -713,70 +796,88 @@ fn thinking_block<'a>(
     ]
     .spacing(4)
     .align_y(Alignment::Center);
-    let body = plain_collapsible(ctx, key, content, theme::TEXT_MUTED, None);
-    column![header, body].spacing(4).into()
+    let body = collapsible_text_block(
+        collapses,
+        is_expanded,
+        preview,
+        theme::TEXT_MUTED,
+        11.0,
+        theme::FONT_REGULAR,
+        selectable_text(content, theme::TEXT_MUTED).size(11).into(),
+    );
+    let whole: Element<'a, SessionsMessage> = column![header, body].spacing(4).into();
+    click_toggle(key, collapses, whole)
 }
 
 /// The message/narration body with the 3-line collapse rule: a collapsed
 /// element shows a plain clickable preview; an expanded (or short) element
 /// shows the markdown body parsed from `md`. `content` is the plain text used
 /// for the collapse measurement (at the bubble body width); `md` is the parsed
-/// markdown for the expanded view.
+/// markdown for the expanded view. Narration bodies render italic at
+/// [`theme::NARRATION_TEXT_SIZE`]; user/assistant bodies stay at
+/// [`theme::MARKDOWN_TEXT_SIZE`] regular.
 fn body_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
     content: &'a str,
     md: Option<&'a [markdown::Item]>,
+    is_narration: bool,
 ) -> Element<'a, SessionsMessage> {
     let is_expanded = ctx.expanded.contains(&key);
+    let size = if is_narration {
+        theme::NARRATION_TEXT_SIZE
+    } else {
+        theme::MARKDOWN_TEXT_SIZE
+    };
     let (wrapped_lines, preview) = element_measurement(
         ctx.measure_cache,
         key,
         ctx.text_width,
         !is_expanded,
         content,
+        size,
     );
     let collapses = wrapped_lines > MAX_PREVIEW_LINES;
-    let mut col = Column::new().spacing(2).width(Length::Fill);
-
-    if collapses && !is_expanded {
-        let preview = preview.expect("a collapsing body always has a preview");
-        col = col.push(
-            button(selectable_text(preview, theme::TEXT_PRIMARY).size(theme::MARKDOWN_TEXT_SIZE))
-                .style(theme::button_text)
-                .on_press(SessionsMessage::ToggleExpand(key.0, key.1))
-                .width(Length::Fill),
-        );
-    } else if let Some(md) = md {
-        let md_el: Element<'a, SessionsMessage> =
-            media_markers::selectable_markdown_view(md, theme::markdown_settings())
-                .map(SessionsMessage::LinkClicked);
-        col = col.push(md_el);
+    let font = if is_narration {
+        theme::FONT_ITALIC
     } else {
-        col =
-            col.push(selectable_text(content, theme::TEXT_PRIMARY).size(theme::MARKDOWN_TEXT_SIZE));
-    }
-    if collapses {
-        col = col.push(toggle_button(is_expanded, key));
-    }
-    col.into()
+        theme::FONT_REGULAR
+    };
+    let expanded: Element<'a, SessionsMessage> = if let Some(md) = md {
+        let settings = if is_narration {
+            theme::narration_markdown_settings()
+        } else {
+            theme::markdown_settings()
+        };
+        media_markers::selectable_markdown_view(md, settings).map(SessionsMessage::LinkClicked)
+    } else {
+        selectable_text(content, theme::TEXT_PRIMARY)
+            .size(size)
+            .font(font)
+            .into()
+    };
+    let el = collapsible_text_block(
+        collapses,
+        is_expanded,
+        preview,
+        theme::TEXT_PRIMARY,
+        size,
+        font,
+        expanded,
+    );
+    click_toggle(key, collapses, el)
 }
 
-/// The tool-call result block: lucide `arrow_down_to_line` prefix over the
-/// result content with the 3-line collapse. The result content is plain
-/// selectable text (tool output is not markdown). Results render inside the
-/// assistant bubble, so they measure at the bubble body width.
+/// The tool-call result block: plain collapsible text at [`theme::TEXT_SECONDARY`]
+/// (11px) with the 3-line collapse — no leading icon (results are recognizable
+/// from context; "(no result)" keeps its arrow below). Results render inside
+/// the assistant bubble, so they measure at the bubble body width.
 fn result_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
     result: &'a str,
 ) -> Element<'a, SessionsMessage> {
-    let icon: Element<'a, SessionsMessage> =
-        lucide::arrow_down_to_line::<iced::Theme, iced::Renderer>()
-            .size(11)
-            .color(theme::TEXT_MUTED)
-            .into();
-    plain_collapsible(ctx, key, result, theme::TEXT_SECONDARY, Some(icon))
+    plain_collapsible(ctx, key, result, theme::TEXT_SECONDARY)
 }
 
 /// Render one session round as a single assistant bubble containing the
@@ -796,7 +897,7 @@ fn render_tool_round<'a>(
         bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), reasoning));
     }
     if let Some(narration) = narration {
-        bubble_col = bubble_col.push(body_block(ctx, (i, 0), narration, md));
+        bubble_col = bubble_col.push(body_block(ctx, (i, 0), narration, md, true));
     }
 
     for (j, call) in calls.iter().enumerate() {
@@ -804,21 +905,29 @@ fn render_tool_round<'a>(
         // Only a result that actually collapses makes the tool block a click
         // target (toggling a short result's expansion would be a no-op).
         let collapses = call.result.as_deref().is_some_and(|result| {
-            let (wrapped_lines, _) =
-                element_measurement(ctx.measure_cache, key, ctx.text_width, false, result);
+            let (wrapped_lines, _) = element_measurement(
+                ctx.measure_cache,
+                key,
+                ctx.text_width,
+                false,
+                result,
+                theme::MARKDOWN_TEXT_SIZE,
+            );
             wrapped_lines > MAX_PREVIEW_LINES
         });
-        // The tool block is wrapped in a transparent mouse_area (not a
-        // button) so the shared tool block's hover tooltip keeps working;
-        // clicking anywhere toggles the associated result's collapse.
-        let tool_block = container(session_view::tool_block(&call.tool, true, true))
-            .width(Length::Fill)
-            .padding([2, 4]);
+        // The tool block is wrapped in a click-to-toggle (not a button) so the
+        // shared tool block's hover tooltip keeps working; a short click
+        // anywhere toggles the associated result's collapse, and dragging over
+        // the selectable tool-args text selects instead. click_to_toggle also
+        // never captures the pointer, so the tooltip stays.
+        let tool_block = container(session_view::tool_block(
+            &call.tool,
+            session_view::ToolBlockView::Full,
+        ))
+        .width(Length::Fill)
+        .padding([2, 4]);
         if collapses {
-            let tool_clickable: Element<'a, SessionsMessage> = mouse_area(tool_block)
-                .on_press(SessionsMessage::ToggleExpand(key.0, key.1))
-                .into();
-            bubble_col = bubble_col.push(tool_clickable);
+            bubble_col = bubble_col.push(click_toggle(key, true, tool_block.into()));
         } else {
             bubble_col = bubble_col.push(tool_block);
         }
@@ -867,7 +976,7 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMe
                 bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), thinking));
             }
             if let Some(content) = content {
-                bubble_col = bubble_col.push(body_block(ctx, (i, 0), content, md));
+                bubble_col = bubble_col.push(body_block(ctx, (i, 0), content, md, false));
             }
             if thinking.is_some() || content.is_some() {
                 bubble_row(*role, assistant, bubble_col)

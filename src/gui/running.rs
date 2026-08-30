@@ -12,13 +12,15 @@
 //! status) — the GUI refreshes as activity happens, not on a fixed cadence.
 //!
 //! Truthfulness rules:
-//! - The top status line shows what is running right now: the live activity
-//!   phase label (a non-tool LLM call), else the current trace group's visible
-//!   narration (the assistant's short reasoning text) when available, else a
-//!   static "thinking…" indicator. The narration, and the "thinking…" placeholder
-//!   when a group can carry it, render only on the collapsed card — the expanded
-//!   card lets the current group's label carry them (the LIVE "thinking…" shows
-//!   only when no group exists yet). The currently-executing tool(s) are the
+//! - The top status row shows what is running right now, in both the collapsed
+//!   and expanded card: the live activity phase label (a non-tool LLM call),
+//!   else the latest narration across the trace groups (the assistant's short
+//!   reasoning text) when any exists, else a static "thinking…" placeholder
+//!   shown only until the first narration arrives. The narration renders at
+//!   14px italic, never truncated — the full reasoning text stays a hover
+//!   tooltip — and wraps within the row. Group labels always render with their
+//!   own narration. The token count and elapsed run time are always
+//!   right-aligned on the top row. The currently-executing tool(s) are the
 //!   "current toolcalls" and render at the bottom of the card. The transcript
 //!   cannot see an in-flight tool or a non-tool LLM phase (those are only
 //!   committed after execution / produce no message respectively), so this is
@@ -52,7 +54,8 @@ use std::collections::HashSet;
 use crate::ChatRole;
 use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey, RunningTool};
 use crate::gui::session_view::{
-    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, build_ledger, tool_block, truncate_at_boundary,
+    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, ToolBlockView, build_ledger, tool_block,
+    truncate_at_boundary,
 };
 use crate::gui::theme;
 use crate::gui::widgets;
@@ -74,14 +77,6 @@ use crate::Workspace;
 /// label (the question/task text). Truncated at a word/path-delimiter boundary
 /// with "…" (see [`truncate_at_boundary`]).
 const MAX_GROUP_LABEL_CHARS: usize = 104;
-
-/// Maximum display length (Unicode chars) of the visible narration (the
-/// assistant's short reasoning text) on the LIVE state line and its
-/// trace-group label. Truncated at a word/path-delimiter boundary with "…" so
-/// a long narration cannot push the rest of its row (e.g. the metrics) out of
-/// the card. Sized for the 13px narration font: 88 mono chars span the same
-/// pixels as the original 104-char cap did at 11px.
-const MAX_NARRATION_CHARS: usize = 88;
 
 /// Maximum width (px) of a metric hover tooltip body. Much narrower than
 /// [`MAX_TOOL_TOOLTIP_WIDTH`] (tuned for multi-arg tool calls) since a metric
@@ -619,23 +614,19 @@ fn workspace_label_for(
     }
 }
 
-/// Render one running-agent card: role icon (left rail), top status line,
-/// trace groups, and the token / elapsed metrics (right-aligned on the top
-/// row, or right-aligned on the current group's label row when the live line
-/// is empty on an expanded card). The whole card is clickable to expand/collapse
-/// the trace groups.
+/// Render one running-agent card: role icon (left rail), top status row (with
+/// the token / elapsed metrics right-aligned), trace groups, and the current
+/// toolcalls. The whole card is clickable to expand/collapse the trace groups.
 ///
-/// Top status line: the live activity phase label, else the current trace
-/// group's visible narration (the assistant's short reasoning text) when
-/// available, else a static "thinking…" placeholder. The narration, and the
-/// "thinking…" placeholder when a group can carry it, render only on the
-/// collapsed card — the expanded card lets the current group's label carry them
-/// so the reasoning flows in order with the tool-call groups (the LIVE
-/// "thinking…" shows when no group exists yet). The currently-executing tools
-/// are the "current toolcalls" and render at the bottom. Trace groups come from
-/// the live transcript snapshot (the unpersisted tail included): the current
-/// (latest) group in the collapsed card, plus up to 5 previous groups when
-/// expanded.
+/// Top status row — rendered identically in the collapsed and expanded card:
+/// the live activity phase label, else the latest narration across the trace
+/// groups, else a "thinking…" placeholder shown only until the first narration
+/// arrives. The narration renders at 14px italic, never truncated (the full
+/// reasoning is a hover tooltip) and wraps within the row; the group labels
+/// always render their own narration. The currently-executing tools are the
+/// "current toolcalls" and render at the bottom. Trace groups come from the
+/// live transcript snapshot (the unpersisted tail included): the current
+/// (latest) group, plus up to 5 previous groups when expanded.
 fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, RunningMessage> {
     let h = &card.handle;
     // Color resolution via the canonical string helper (handles derivative
@@ -646,7 +637,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     let icon = theme::role_icon(&role).size(20).color(fg);
     let elapsed = format_elapsed(h.started_at);
 
-    // The live transcript snapshot feeds both the LIVE line narration and the
+    // The live transcript snapshot feeds both the top-row narration and the
     // trace groups below, so fetch it once up front.
     let snapshot = crate::session::TRANSCRIPT_REGISTRY.snapshot(&h.agent_id);
     let groups = snapshot
@@ -654,90 +645,69 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         .map(|s| derive_trace_groups(&build_ledger(&s.history)))
         .unwrap_or_default();
 
-    let status = live_status(h, &groups);
-    // Reasoning behind the current group's narration — surfaced on hover
-    // wherever the collapsed LIVE line carries the narration text.
-    let current_reasoning = groups.last().and_then(|g| g.reasoning.as_deref());
-    // The current group's narration label is suppressed only when the top
-    // status line already carries that text (a narration or "thinking…") AND
-    // the card is collapsed; in the expanded card the current group's label
-    // carries it instead, keeping the reasoning in order below.
-    let current_label_suppressed =
-        !expanded && matches!(status, LiveStatus::Narration(_) | LiveStatus::Thinking);
-    // The live status slot on the top row: the live activity phase label, else
-    // the current trace group's narration (collapsed cards only), else the
-    // "thinking…" placeholder. Status verbs stay accent; the narration renders
-    // neutral. When the slot is empty the top row is omitted (expanded card
-    // with trace groups) and the metrics render on the current group's label
-    // row instead.
-    let live: Option<Element<'static, RunningMessage>> = match status {
-        LiveStatus::Tools => None, // the "current toolcalls" render at the bottom
-        LiveStatus::Activity(activity) => Some(
-            text(activity.to_owned())
-                .size(13)
-                .color(theme::ACCENT)
-                .into(),
-        ),
-        LiveStatus::Narration(narration) => {
-            if expanded {
-                None
-            } else {
-                let label = text(truncate_at_boundary(narration, MAX_NARRATION_CHARS))
+    let token_count = snapshot.as_ref().and_then(|s| s.token_count);
+    let tools_running = !h.current_tools.is_empty();
+
+    // The top status row renders in both states: what the agent is doing on
+    // the left, metrics pinned right. Activity (a non-tool LLM phase) wins;
+    // otherwise the latest narration across the trace groups (a fresh group
+    // after a user turn falls back to the previous group's narration, so no
+    // stale "thinking…" lingers once any narration exists); otherwise the
+    // "thinking…" placeholder, shown only until the first narration arrives.
+    let status_text: Element<'static, RunningMessage> = if let Some(activity) = &h.activity {
+        text(activity.to_owned())
+            .size(13)
+            .color(theme::ACCENT)
+            .into()
+    } else {
+        match groups.iter().rev().find(|g| !g.narration.is_empty()) {
+            Some(group) => reasoning_tooltip(
+                group.reasoning.as_deref(),
+                narration_text(&group.narration).into(),
+            ),
+            // The placeholder reveals the current group's reasoning on hover,
+            // same as a narration label.
+            None => reasoning_tooltip(
+                groups.last().and_then(|g| g.reasoning.as_deref()),
+                text("thinking…")
                     .size(13)
-                    .font(theme::FONT_BOLD)
-                    .color(theme::TEXT_SECONDARY);
-                Some(reasoning_tooltip(current_reasoning, label.into()))
-            }
-        }
-        LiveStatus::Thinking => {
-            // The expanded card lets the group's "thinking…" label carry this,
-            // so the LIVE indicator shows only when no group exists yet. An
-            // empty narration with reasoning still gets the hover tooltip.
-            if !expanded || groups.is_empty() {
-                let label = text("thinking…").size(13).color(theme::ACCENT);
-                Some(reasoning_tooltip(current_reasoning, label.into()))
-            } else {
-                None
-            }
+                    .color(theme::TEXT_SECONDARY)
+                    .into(),
+            ),
         }
     };
-
-    let token_count = snapshot.as_ref().and_then(|s| s.token_count);
 
     let mut content = Column::new()
         .spacing(6)
         .align_x(Alignment::Start)
         .width(Length::Fill);
-    // On an expanded card with trace groups and no live status line, skip the
-    // top row entirely (it would read as a blank line above the activity): the
-    // groups come first and the metrics ride right-aligned on the current
-    // group's label row. Otherwise the top row carries the live status line
-    // (when present) beside the right-aligned metrics.
-    let metrics_on_label = live.is_none() && expanded && !groups.is_empty();
-    if !metrics_on_label {
-        content = content.push(row_with_metrics(
-            live,
+    // The top status row carries the status text (left) and metrics (right) in
+    // both the collapsed and expanded card; the column wraps the narration so
+    // it stays within the space left of the metrics.
+    content = content.push(
+        row![
+            column![status_text].width(Length::Fill),
             render_metrics(token_count, &elapsed),
-        ));
-    }
+        ]
+        .width(Length::Fill)
+        .spacing(8)
+        .align_y(Alignment::Center),
+    );
     // Trace groups from the live snapshot (current unless the agent has no
     // transcript yet). Content-only assistant messages (final answers) are
     // deliberately omitted — only tool-call assistant messages form groups.
     if !groups.is_empty() {
-        let label_metrics = metrics_on_label.then(|| render_metrics(token_count, &elapsed));
-        for group in
-            render_visible_groups(&groups, expanded, current_label_suppressed, label_metrics)
-        {
+        for group in render_visible_groups(&groups, expanded) {
             content = content.push(group);
         }
     }
     // The currently-executing tools are the "current toolcalls" and render at
     // the very bottom of the card, below the committed trace groups, in either
     // view.
-    if let LiveStatus::Tools = status {
+    if tools_running {
         let mut tools = Column::new().spacing(4).align_x(Alignment::Start);
         for tool in &h.current_tools {
-            tools = tools.push(tool_block(tool, false, false));
+            tools = tools.push(tool_block(tool, ToolBlockView::Compact));
         }
         content = content.push(tools);
     }
@@ -769,29 +739,21 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     .into()
 }
 
-/// Render a Fill-width row carrying `content` (when present, wrapped in a
-/// Fill-width column so long text wraps within the remaining space; otherwise
-/// a Fill spacer) with `metrics` pinned to the row's right edge.
-fn row_with_metrics(
-    content: Option<Element<'static, RunningMessage>>,
-    metrics: Element<'static, RunningMessage>,
-) -> Element<'static, RunningMessage> {
-    let mut row = Row::new()
-        .width(Length::Fill)
-        .spacing(8)
-        .align_y(Alignment::Center);
-    match content {
-        Some(content) => row = row.push(column![content].width(Length::Fill)),
-        None => row = row.push(Space::new().width(Length::Fill)),
-    }
-    row.push(metrics).into()
+/// The narration typography shared by the card's top status row and the
+/// trace-group labels: italic at [`theme::NARRATION_TEXT_SIZE`], never
+/// truncated — the full reasoning stays a hover tooltip — and wrapping
+/// within the row.
+fn narration_text(narration: &str) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
+    text(narration.to_owned())
+        .size(theme::NARRATION_TEXT_SIZE)
+        .font(theme::FONT_ITALIC)
+        .color(theme::TEXT_SECONDARY)
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
 }
 
 /// Render the card's metrics row: the live session-token count (when known)
-/// and the elapsed run time, each as a compact labeled tooltip. Rendered at
-/// the right edge of the top row, or right-aligned on the current group's
-/// label row when an expanded card has no live status line (see
-/// [`render_agent_card`]).
+/// and the elapsed run time, each as a compact labeled tooltip. Rendered
+/// right-aligned on the card's top status row (see [`render_agent_card`]).
 fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, RunningMessage> {
     let mut metrics = Row::new().spacing(8).align_y(Alignment::Center);
     // The live token count comes from the published transcript snapshot (the
@@ -827,16 +789,11 @@ fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, R
 
 /// Render the visible trace groups for a card: the current (latest) group
 /// always (last, chronologically), plus up to 5 previous groups when the card
-/// is expanded. Returns owned elements. The current group's narration label is
-/// omitted when `current_label_suppressed` is set (see [`render_agent_card`]).
-/// `label_metrics` renders on the current group's label row only (previous
-/// groups never carry metrics) — used when an expanded card's live status line
-/// is empty (see [`render_agent_card`]).
+/// is expanded. Returns owned elements. Every group renders its narration
+/// label (see [`render_trace_group`]).
 fn render_visible_groups(
     groups: &[TraceGroup],
     expanded: bool,
-    current_label_suppressed: bool,
-    label_metrics: Option<Element<'static, RunningMessage>>,
 ) -> Vec<Element<'static, RunningMessage>> {
     let mut rendered = Vec::new();
     let (current, previous) = groups
@@ -845,58 +802,42 @@ fn render_visible_groups(
     if expanded {
         // The 5 most-recent previous groups, oldest first, then current.
         for group in previous.iter().rev().take(5).rev() {
-            rendered.push(render_trace_group(group, false, true, None));
+            rendered.push(render_trace_group(group, false));
         }
     }
     // Current group: newest round expanded, earlier rounds collapsed.
-    rendered.push(render_trace_group(
-        current,
-        true,
-        !current_label_suppressed,
-        label_metrics,
-    ));
+    rendered.push(render_trace_group(current, true));
     rendered
 }
 
 /// Render one trace group. `expand_current` renders the newest round's calls
 /// expanded (current group); otherwise every call collapses to a name-only
-/// line (previous groups). `show_label` renders the narration label (the short
-/// reasoning text, or the "thinking…" placeholder when empty); hovering the
-/// label reveals the group's full decoded Reasoning when it carried one. When
-/// `label_metrics` is [`Some`] the label row also carries the metrics,
-/// right-aligned (see [`render_agent_card`]); otherwise the label renders
-/// alone.
+/// line (previous groups). The group's narration label always renders (the
+/// short reasoning text, or the "thinking…" placeholder when empty); hovering
+/// the label reveals the group's full decoded Reasoning when it carried one.
 fn render_trace_group(
     group: &TraceGroup,
     expand_current: bool,
-    show_label: bool,
-    label_metrics: Option<Element<'static, RunningMessage>>,
 ) -> Element<'static, RunningMessage> {
-    debug_assert!(
-        label_metrics.is_none() || show_label,
-        "label metrics have nowhere to render without the label row"
-    );
     let mut column = Column::new().spacing(4).align_x(Alignment::Start);
-    if show_label {
-        let label: Element<'static, RunningMessage> = if group.narration.is_empty() {
+    let label: Element<'static, RunningMessage> = if group.narration.is_empty() {
+        // A group that has not committed its narration yet opens with the
+        // placeholder; it is deliberately neutral (never accent), and still
+        // reveals the group's reasoning on hover.
+        reasoning_tooltip(
+            group.reasoning.as_deref(),
             text("thinking…")
                 .size(13)
                 .color(theme::TEXT_SECONDARY)
-                .into()
-        } else {
-            text(truncate_at_boundary(&group.narration, MAX_NARRATION_CHARS))
-                .size(13)
-                .font(theme::FONT_BOLD)
-                .color(theme::TEXT_SECONDARY)
-                .into()
-        };
-        let label = reasoning_tooltip(group.reasoning.as_deref(), label);
-        if let Some(metrics) = label_metrics {
-            column = column.push(row_with_metrics(Some(label), metrics));
-        } else {
-            column = column.push(label);
-        }
-    }
+                .into(),
+        )
+    } else {
+        reasoning_tooltip(
+            group.reasoning.as_deref(),
+            narration_text(&group.narration).into(),
+        )
+    };
+    column = column.push(label);
 
     if expand_current {
         let (newest, earlier) = group
@@ -911,7 +852,7 @@ fn render_trace_group(
             );
         }
         for call in newest {
-            column = column.push(tool_block(call, false, false));
+            column = column.push(tool_block(call, ToolBlockView::Compact));
         }
     } else {
         column = column.push(
@@ -1076,44 +1017,6 @@ fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup> {
         groups.push(group);
     }
     groups
-}
-
-/// What the top status line shows for a running-agent card. Drives both the
-/// rendered status and whether the current trace group's narration label is
-/// suppressed (see [`render_agent_card`]). The [`LiveStatus::Tools`] variant
-/// does not render here — the caller renders the executing tools as the
-/// "current toolcalls" at the bottom of the card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveStatus<'a> {
-    /// One or more tools are executing (rendered as tool blocks).
-    Tools,
-    /// A non-tool LLM phase is running (activity label).
-    Activity(&'a str),
-    /// The current trace group's narration (the assistant's short reasoning).
-    Narration(&'a str),
-    /// No tool, no activity, no narration → static "thinking…".
-    Thinking,
-}
-
-/// Determine the LIVE state line's status for a card: the currently-executing
-/// tool(s) if any, else the live activity phase label, else the current trace
-/// group's narration when available, else the "thinking…" placeholder. The
-/// narration is the assistant's short decoded `content` — never the long
-/// `Reasoning` block.
-fn live_status<'a>(h: &'a AgentHandle, groups: &'a [TraceGroup]) -> LiveStatus<'a> {
-    if !h.current_tools.is_empty() {
-        LiveStatus::Tools
-    } else if let Some(activity) = &h.activity {
-        LiveStatus::Activity(activity.as_str())
-    } else if let Some(narration) = groups
-        .last()
-        .map(|g| g.narration.as_str())
-        .filter(|n| !n.is_empty())
-    {
-        LiveStatus::Narration(narration)
-    } else {
-        LiveStatus::Thinking
-    }
 }
 
 /// Render a one-line metric tooltip body in a narrow, styled container: the
@@ -1812,56 +1715,6 @@ mod tests {
             "read file x2, list files",
             "underscores become spaces; `xN` counts collapsed repetitions; first-appearance order"
         );
-    }
-
-    #[test]
-    fn live_status_selects_tools_activity_narration_or_thinking() {
-        // A running tool takes precedence over activity/narration.
-        let mut tools = agent_handle("a", "engineer", None, "ws1", None);
-        tools.current_tools = vec![RunningTool::from_tool_call(&crate::ToolCall {
-            id: "1".into(),
-            name: "read_file".into(),
-            arguments: serde_json::json!({"path": "a.rs"}),
-        })];
-        assert_eq!(live_status(&tools, &[]), LiveStatus::Tools);
-
-        // No tool, an activity phase label when present.
-        let mut activity = agent_handle("a", "engineer", None, "ws1", None);
-        activity.activity = Some("analyzing".to_string());
-        assert_eq!(
-            live_status(&activity, &[]),
-            LiveStatus::Activity("analyzing")
-        );
-
-        // Idle + a non-empty narration → the current/latest group's narration.
-        let idle = agent_handle("a", "engineer", None, "ws1", None);
-        let groups = derive_trace_groups(&build_ledger(&[assistant_tool_call(
-            "Reading the file",
-            &[("read", serde_json::json!({"path": "a.rs"}))],
-        )]));
-        assert_eq!(
-            live_status(&idle, &groups),
-            LiveStatus::Narration("Reading the file")
-        );
-
-        // Multi-group transcript: the LAST group's narration is shown.
-        let groups = derive_trace_groups(&build_ledger(&[
-            assistant_tool_call(
-                "Editing it",
-                &[("edit", serde_json::json!({"path": "b.rs"}))],
-            ),
-            assistant_tool_call(
-                "Reading again",
-                &[("read", serde_json::json!({"path": "c.rs"}))],
-            ),
-        ]));
-        assert_eq!(
-            live_status(&idle, &groups),
-            LiveStatus::Narration("Reading again")
-        );
-
-        // Idle + no narration → the "thinking…" placeholder.
-        assert_eq!(live_status(&idle, &[]), LiveStatus::Thinking);
     }
 
     #[test]
