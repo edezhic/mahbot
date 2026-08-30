@@ -17,7 +17,7 @@ Batteries included:
 - __General assistant__ adaptive agent for Q&A, research, prototyping and basically any other purposes
 - __Specialized artist__ agent for image & video generation/editing as a little treat on top
 
-OpenRouter is the default provider, and by default mahbot is configured to use the DeepSeek 4 Flash. A custom self-hosted OpenAI-compatible endpoint (llama.cpp, vLLM, or alike) can be configured in Settings for chat requests. Note that artists tools are currently tied to OpenRouter — so its key is still needed for those even when a custom endpoint handles dev agents. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
+OpenRouter is the default provider; manager-side roles default to GLM 5.3 Flash and worker-side roles to DeepSeek 4 Flash. A custom self-hosted OpenAI-compatible endpoint (llama.cpp, vLLM, or alike) can be configured in Settings for chat requests. Note that artists tools are currently tied to OpenRouter — so its key is still needed for those even when a custom endpoint handles dev agents. Also, should work quite well with smaller models like Qwen 3.8 27b, and local + open-source mode is the primary long-term focus.
 
 ## The Pipeline
 

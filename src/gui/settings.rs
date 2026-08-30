@@ -3481,12 +3481,15 @@ impl SettingsState {
             };
             let order_error = self.field_errors.get(&order_field).map(String::as_str);
             // Placeholder is a hint only: "DeepSeek" shows for
-            // models whose ID starts with the lowercase `deepseek/` prefix
-            // (OpenRouter model IDs use lowercase vendor prefixes), and no
-            // placeholder for every other model. An empty field always means
-            // auto-routing — the hint can show while routing is auto.
+            // models whose ID starts with the lowercase `deepseek/` prefix and
+            // "z-ai" for `z-ai/` (OpenRouter model IDs use lowercase vendor
+            // prefixes), with no placeholder for every other model. An empty
+            // field always means auto-routing — the hint can show while
+            // routing is auto.
             let placeholder = if model_name.starts_with("deepseek/") {
                 "DeepSeek"
+            } else if model_name.starts_with("z-ai/") {
+                "z-ai"
             } else {
                 ""
             };

@@ -120,12 +120,12 @@ use tokio::fs;
 
 pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 
-pub(crate) const DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
+pub(crate) const DEFAULT_MANAGER_MODEL: &str = "z-ai/glm-5.3-flash";
 pub(crate) const DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
 
 // The previous compiled defaults for the manager/worker slots, kept only for
 // the one-time migration in `migrate_old_default_models`.
-const OLD_DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-pro-0813";
+const OLD_DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
 const OLD_DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
 // Video-transcription model is fixed (not user-configurable) and always
 // targets OpenRouter.
@@ -1001,6 +1001,20 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
         && !crate::db::legacy_store_db_path(mahbot_dir, "config").exists()
 }
 
+/// Provider routing a default model seeds on fresh installs: `deepseek/*`
+/// models route through the DeepSeek provider, `z-ai/*` models through the
+/// z-ai provider; any other default model gets no routing override
+/// (OpenRouter auto-routes).
+fn default_model_routing(model: &str) -> Option<&'static str> {
+    if model.starts_with("deepseek/") {
+        Some("DeepSeek")
+    } else if model.starts_with("z-ai/") {
+        Some("z-ai")
+    } else {
+        None
+    }
+}
+
 /// Seed the fresh-install defaults into a brand-new config database
 ///
 /// A fresh install must not load or download any audio model until the user
@@ -1036,25 +1050,23 @@ async fn seed_fresh_install_defaults(
     store
         .set_kv(CONFIG_KEY_VIDEO_MODELS, FRESH_INSTALL_VIDEO_MODELS)
         .await?;
-    // default model slots hosted by DeepSeek route through the
-    // DeepSeek provider on fresh installs. The rows are explicit and editable
-    // (clearing the field in the Settings UI returns the model to auto).
-    // Derived from the default-model constants filtered by the lowercase
-    // `deepseek/` prefix so the seed follows the defaults if they ever change;
-    // every other default model gets no routing override (OpenRouter
-    // auto-routes). The video-transcription default gets no routing seed —
-    // routing applies only to the manager and worker model slots. Existing
-    // installs receive zero writes — the `fresh` guard above already returned
-    // for them.
+    // Default model slots with a known provider route through it on fresh
+    // installs. The rows are explicit and editable (clearing the field in the
+    // Settings UI returns the model to auto). Derived from the default-model
+    // constants via `default_model_routing` so the seed follows the defaults
+    // if they ever change; the video-transcription default gets no routing
+    // seed — routing applies only to the manager and worker model slots.
+    // Existing installs receive zero writes — the `fresh` guard above already
+    // returned for them.
     for default_model in [DEFAULT_MANAGER_MODEL, DEFAULT_WORKER_MODEL] {
-        if default_model.starts_with("deepseek/") {
+        if let Some(provider) = default_model_routing(default_model) {
             store
-                .save_model_routing(default_model, Some("DeepSeek"))
+                .save_model_routing(default_model, Some(provider))
                 .await?;
         }
     }
     tracing::info!(
-        "Fresh config database: seeded fresh-install defaults (audio transcription off; image/video generation model sets; DeepSeek routing for deepseek/* default models)"
+        "Fresh config database: seeded fresh-install defaults (audio transcription off; image/video generation model sets; provider routing for deepseek/* and z-ai/* default models)"
     );
     Ok(())
 }
@@ -1075,10 +1087,11 @@ async fn seed_fresh_install_defaults_from_flag(
 
 /// One-time idempotent migration: rewrite persisted
 /// `config_kv` rows that still hold the *previous* manager/worker default
-/// model to the new vision-capable default. Matching is exact on the full
+/// model to the current default. Matching is exact on the full
 /// provider-prefixed string, so only rows the user never overrode are
-/// touched; every other key is untouched.
-/// Safe to run on every boot — a no-op once no row matches.
+/// touched; every other key is untouched. The manager rewrite also seeds the
+/// routing row for the new default (so migrated installs behave like fresh
+/// installs). Safe to run on every boot — a no-op once no row matches.
 async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Result<()> {
     let changed_manager = store
         .migrate_kv_if_equals(
@@ -1094,11 +1107,18 @@ async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Re
             DEFAULT_WORKER_MODEL,
         )
         .await?;
+    if changed_manager > 0
+        && let Some(provider) = default_model_routing(DEFAULT_MANAGER_MODEL)
+    {
+        store
+            .save_model_routing(DEFAULT_MANAGER_MODEL, Some(provider))
+            .await?;
+    }
     if changed_manager > 0 || changed_worker > 0 {
         tracing::info!(
             manager_rows = changed_manager,
             worker_rows = changed_worker,
-            "Migrated stored old default models to the vision-capable default"
+            "Migrated stored old default models to the current defaults"
         );
     }
     Ok(())
@@ -2076,10 +2096,12 @@ mod tests {
         );
         assert_eq!(
             fresh_store.get_all_model_routings().await.unwrap(),
-            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("DeepSeek"))],
-            "a fresh config database must seed a single DeepSeek routing row for \
-             the vision-capable default model shared by the manager and worker \
-             slots (others get none)"
+            vec![
+                model_routing(DEFAULT_WORKER_MODEL, Some("DeepSeek")),
+                model_routing(DEFAULT_MANAGER_MODEL, Some("z-ai")),
+            ],
+            "a fresh config database must seed routing rows for default models \
+             with a known provider (others get none)"
         );
 
         // ── Existing install: the store file already exists ──
@@ -2109,9 +2131,10 @@ mod tests {
     }
 
     /// One-time migration: persisted `config_kv` rows holding the previous
-    /// manager/worker default model are rewritten to the new vision-capable
-    /// default, and only those rows (and only when they match the exact old
-    /// default) are touched. Re-running is a no-op.
+    /// manager/worker default model are rewritten to the current default, and
+    /// only those rows (and only when they match the exact old default) are
+    /// touched; the manager rewrite also seeds the new default's routing row.
+    /// Re-running is a no-op.
     #[tokio::test]
     async fn migrate_old_default_models_rewrites_only_stale_slot_rows() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
@@ -2174,6 +2197,11 @@ mod tests {
             Some("sk-example"),
             "unrelated config keys must never be touched"
         );
+        assert_eq!(
+            store.get_all_model_routings().await.unwrap(),
+            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("z-ai"))],
+            "migrating the manager slot to the new default must upsert its routing row"
+        );
 
         // Idempotent: a second run changes nothing.
         migrate_old_default_models(&store).await.unwrap();
@@ -2194,6 +2222,11 @@ mod tests {
                 .as_deref(),
             Some(DEFAULT_WORKER_MODEL),
             "re-running the migration must be a no-op"
+        );
+        assert_eq!(
+            store.get_all_model_routings().await.unwrap(),
+            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("z-ai"))],
+            "re-running the migration must not add or drop the migrated routing row"
         );
     }
 
@@ -2285,6 +2318,10 @@ mod tests {
                 .as_deref(),
             Some("user/private-model"),
             "a genuine user override must be preserved"
+        );
+        assert!(
+            store.get_all_model_routings().await.unwrap().is_empty(),
+            "no routing writes may happen when nothing was migrated"
         );
     }
 }
