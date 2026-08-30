@@ -15,13 +15,14 @@ Path restrictions: paths must be within the project workspace, or within common 
 
 The read tool can access dependency source code from common package manager cache directories, including:
 
-- **Rust**: `~/.cargo/registry/src/`, `~/.cargo/git/checkouts/`
+- **Rust**: `~/.cargo/registry/src/`, `~/.cargo/git/checkouts/`, rustup toolchains `~/.rustup/toolchains/` (std sources)
 - **Python**: `~/.local/lib/`, `~/Library/Python/`, `/usr/local/lib/`, `/usr/lib/`, conda, poetry, pipenv, uv, rye directories
-- **JavaScript/TypeScript**: bun, pnpm, npm global cache directories
-- **Go**: `~/go/pkg/mod/`
+- **Java/JVM**: Maven `~/.m2/repository/`, Gradle `~/.gradle/caches/` (caches only — not the whole `~/.gradle`), JDK headers via `$JAVA_HOME/include` or the system JVM locations (headers only)
+- **JavaScript/TypeScript**: bun, pnpm, npm global caches, `~/.npm`, nvm/volta/yarn caches
+- **Go**: module cache `~/go/pkg/mod/` (or `$GOMODCACHE`/`$GOPATH`), GOROOT sources (`$GOROOT/src`, `/usr/local/go`, Homebrew)
 - **Ruby**: `~/.gem/`, `~/.bundle/`
 - **PHP**: `~/.composer/`
-- **C/C++**: `~/.conan/`, `~/.conan2/`, Homebrew Cellar, Chocolatey, MSYS2/MinGW, Windows SDK, MSVC
+- **C/C++**: `~/.conan/`, `~/.conan2/`, Homebrew Cellar, system + Homebrew headers (`/usr/include`, `/usr/local/include`, `include/`, `opt/`, `Frameworks/`), Chocolatey, MSYS2/MinGW, Windows SDK, MSVC, Xcode / Command Line Tools SDK roots
 - **Swift**: SwiftPM cache and Xcode DerivedData
 - **Dart/Flutter**: `~/.pub-cache/`
 - **Elixir/Erlang**: `~/.hex/`, `~/.mix/`
@@ -33,4 +34,10 @@ The read tool can access dependency source code from common package manager cach
 - **Nix**: `/nix/store/` (read-only)
 - **System**: MacPorts (`/opt/local/`), pipx (`~/.local/pipx/`)
 
+When `CARGO_HOME`, `RUSTUP_HOME`, `GOMODCACHE`, `GOPATH`, `GRADLE_USER_HOME`, `JAVA_HOME`, or `GOROOT` is set, the relocated root is honored alongside the HOME default. `XDG_CACHE_HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME` are honored for the `~/.cache/`, `~/.config/`, `~/.local/share/`, `~/.local/state/` entries.
+
 To discover the exact path for a specific dependency, use the shell tool's `ls` to list package directories (the search tool is workspace-scoped and won't find packages in dependency caches). For example: `ls ~/.cargo/registry/src/*/` to find all cached crate sources.
+
+## Protected credentials
+
+Some paths are denied even though they exist, with the distinct "Path is a protected credential location" error — `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.docker`, `~/.kube`, and private-key files (`id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `*.ppk`) anywhere, including inside the workspace. Credential-bearing config files (`.env`, `.pem`/`.cer`/`.crt` certs, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, Maven `settings.xml`/`settings-security.xml`, Gradle `gradle.properties`/`init.gradle*`, cargo `credentials.toml`) are scrubbed for credentials rather than denied — where they are readable at all (workspace files or paths inside the allowlisted roots); e.g. `~/.m2/settings.xml` and `~/.gradle/gradle.properties` sit outside the read allowlist and are simply not readable.

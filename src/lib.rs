@@ -1127,9 +1127,10 @@ pub(crate) trait Tool: Send + Sync {
     ///    - The search tool returns source code content where credential patterns
     ///      are harmless and should be shown accurately to the model.
     ///
-    /// 3. **Context-sensitive** — read tool. Scrubs only when the file path
-    ///    matches `is_sensitive_file_path` (config, credential, or key files).
-    ///    Non-sensitive files (regular source code) are returned as-is.
+    /// 3. **Context-sensitive** — read tool. The read tool scrubs internally in
+    ///    `read_resolved` based on the *resolved* path (see `scrub_if_sensitive`)
+    ///    and returns `false` here, because an args-only decision cannot see
+    ///    symlink targets or typo-recovered files (same pattern as shell).
     ///
     /// **If your tool performs internal credential scrubbing**, override this
     /// method to return `false` so the agent-level pass does not double-scrub.

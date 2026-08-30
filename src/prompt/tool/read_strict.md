@@ -1,4 +1,4 @@
-Read file contents with line numbers, limited to the personal workspace. This workspace-only variant rejects any path outside the workspace: dependency-source caches, temp spill files, `/tmp`, and other system paths are not accessible. Relative paths resolve from the workspace.
+Read file contents with line numbers, limited to the personal workspace. This workspace-only variant rejects any path outside the workspace: dependency-source caches, temp spill files, `/tmp`, and other system paths are not accessible. Relative paths resolve from the workspace. Hard credential denials still apply: protected credential locations and private-key files (`id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`, `*.ppk`) are rejected even inside the workspace, while credential-bearing config files are readable but scrubbed for credentials.
 
 When the path is a directory, the tool lists its contents (using `ls -lA`) instead of returning an error. The directory listing groups subdirectories and files with sizes and an extension summary. Note that `mode`, `offset`, and `limit` parameters only apply to file reads — they are silently ignored when a directory is passed.
 

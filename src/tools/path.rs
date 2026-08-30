@@ -394,6 +394,74 @@ fn is_grandparent_temp_root(path: &Path) -> bool {
         .is_some_and(is_os_temp_root)
 }
 
+/// Credential directories that are hard-denied for reading, in every read
+/// variant (including the workspace-strict one) and regardless of any
+/// allowlist. `~/.config/...` entries also generate an `$XDG_CONFIG_HOME`
+/// variant via [`xdg_variant_path`].
+const DENIED_CREDENTIAL_RAW_DIRS: &[&str] = &[
+    "~/.ssh/",
+    "~/.aws/",
+    "~/.gnupg/",
+    "~/.config/gcloud/",
+    "~/.docker/",
+    "~/.kube/",
+];
+
+/// Private-key file names that are denied anywhere (even inside the workspace).
+const DENIED_PRIVATE_KEY_NAMES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+
+/// Expanded credential-deny roots (with XDG variants for `~/.config/...`).
+///
+/// Each root is registered in both its raw expanded form and its
+/// canonicalized form (via [`add_path_with_canonical`]) so the
+/// post-canonicalization deny re-check in [`resolve_read_target`] also
+/// matches when `$HOME`/`$XDG_CONFIG_HOME` contains a symlink component.
+///
+/// The deny is location-based: the lexical pre-check denies every read
+/// through a credential path (`~/.ssh/config`) even when the directory is a
+/// symlink created after startup. Only a symlink target reached via its own
+/// allowlisted path (e.g. directly under `/tmp`) can be read — the caller
+/// explicitly using a different, allowed path.
+static DENIED_CREDENTIAL_DIRS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
+    let mut dirs = Vec::new();
+    for raw in DENIED_CREDENTIAL_RAW_DIRS {
+        let entry = raw.trim_end_matches('/');
+        let expanded = crate::util::expand_tilde(entry);
+        add_path_with_canonical(&mut dirs, expanded);
+        if let Some(xdg_path) = xdg_variant_path(entry) {
+            add_path_with_canonical(&mut dirs, PathBuf::from(xdg_path));
+        }
+    }
+    dirs
+});
+
+/// Whether `path` hits a hard credential denial: a protected credential
+/// directory, or a private-key file name at any depth.
+///
+/// Lexical only (expand_tilde + normalize, no I/O): the caller's
+/// post-canonicalization re-check in [`resolve_read_target`] re-runs this on
+/// the resolved path, which is what catches symlinks into denied locations.
+///
+/// Residual risk (accepted): the shell tool has no read-path gate, so
+/// credential protection is complete only for the read tool.
+#[must_use]
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "the file name is lowercased first, so the comparison is case-insensitive"
+)]
+fn is_denied_credential_path(path: &str) -> bool {
+    if is_path_under_roots(Path::new(path), &DENIED_CREDENTIAL_DIRS) {
+        return true;
+    }
+    crate::util::expand_tilde(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|name| {
+            DENIED_PRIVATE_KEY_NAMES.contains(&name.as_str()) || name.ends_with(".ppk")
+        })
+}
+
 /// Check that a path is allowed by the read-path security policy.
 ///
 /// When `strict` is `true`, the ONLY allowed paths are those within the
@@ -405,6 +473,12 @@ fn is_grandparent_temp_root(path: &Path) -> bool {
 /// headers, etc.), or be a spill file on an OS temp root (allowed
 /// unconditionally).
 fn check_path_read_allowed(path: &str, workspace_root: &Path, strict: bool) -> anyhow::Result<()> {
+    // Hard credential denial wins over the allowlist and applies to the
+    // strict workspace-only variant too. Runs pre- and post-canonicalization.
+    if is_denied_credential_path(path) {
+        anyhow::bail!("Path is a protected credential location and cannot be read: {path}");
+    }
+
     if strict {
         if is_path_safe_for_workspace(path, workspace_root) {
             return Ok(());
@@ -472,11 +546,19 @@ const XDG_SUBDIR_TO_ENV: &[(&str, &str)] = &[
 /// Returns `None` if the path doesn't start with a known XDG subdirectory,
 /// or if the corresponding env var is unset.
 fn xdg_variant_path(tilde_path: &str) -> Option<String> {
+    xdg_variant_path_with(|var| std::env::var(var).ok(), tilde_path)
+}
+
+/// Pure, getter-driven variant of [`xdg_variant_path`]: reads environment
+/// values through `get` so tests can drive it without mutating the process
+/// environment. Production passes `|var| std::env::var(var).ok()`.
+#[must_use]
+fn xdg_variant_path_with(get: impl Fn(&str) -> Option<String>, tilde_path: &str) -> Option<String> {
     for (xdg_subdir, env_var) in XDG_SUBDIR_TO_ENV {
         if let Some(suffix) = tilde_path
             .strip_prefix("~/")
             .and_then(|p| p.strip_prefix(xdg_subdir))
-            && let Ok(xdg_dir) = std::env::var(env_var)
+            && let Some(xdg_dir) = get(env_var)
         {
             let xdg_dir = xdg_dir.trim_end_matches('/');
             return Some(format!("{xdg_dir}/{suffix}"));
@@ -485,7 +567,63 @@ fn xdg_variant_path(tilde_path: &str) -> Option<String> {
     None
 }
 
-/// All paths from the ticket that should be allowed for reading.
+/// Toolchain roots whose HOME-based default prefix can be relocated by an
+/// environment variable, mapped to the subpaths allowed beneath them.
+/// An empty subpath means the whole variable prefix is allowed.
+const ENV_TOOLCHAIN_ROOTS: &[(&str, &[&str])] = &[
+    ("CARGO_HOME", &["registry/src/", "git/checkouts/"]),
+    ("RUSTUP_HOME", &["toolchains/"]),
+    ("GOMODCACHE", &[""]),
+    ("GOPATH", &["pkg/mod/"]),
+    ("GRADLE_USER_HOME", &["caches/"]),
+    ("JAVA_HOME", &["include/"]),
+    ("GOROOT", &["src/"]),
+];
+
+/// Pure, I/O-free construction of env-derived read-allowed paths.
+/// For each `(var, subpaths)` in [`ENV_TOOLCHAIN_ROOTS`], when `get(var)`
+/// yields a non-empty value, emits `<value>/<subpath>` for each subpath
+/// (an empty subpath yields the bare, trailing-slash-trimmed value).
+/// The env getter is injected so tests can drive it without mutating the
+/// process environment; production passes `|var| std::env::var(var).ok()`.
+#[must_use]
+fn env_derived_allowed_paths(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut paths = Vec::new();
+    for &(var, subpaths) in ENV_TOOLCHAIN_ROOTS {
+        let Some(value) = get(var) else {
+            continue;
+        };
+        let value = value.trim_end_matches('/');
+        if value.is_empty() {
+            continue;
+        }
+        for &subpath in subpaths {
+            if subpath.is_empty() {
+                paths.push(value.to_string());
+            } else {
+                paths.push(format!("{value}/{subpath}"));
+            }
+        }
+    }
+    paths
+}
+
+/// Enumerate `<root>/<child>/<suffix>` JVM header roots at init. The system
+/// JVM locations are scoped to `include/` headers only (never the whole JDK
+/// tree), so the individual JDK directories must be enumerated one level.
+/// Nothing is added when the root doesn't exist (fail closed).
+fn jvm_include_roots(root: &str, suffix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::io::Result::ok)
+        .map(|entry| entry.path().join(suffix))
+        .collect()
+}
+
+/// Extra read-allowed roots: dependency caches, toolchain and SDK sources,
+/// package-manager stores.
 /// Paths starting with `~` are expanded at init time. Paths that don't
 /// exist on the current platform are harmless (they fail canonicalization
 /// and just get added as-is, never matching any read request).
@@ -493,6 +631,7 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     // ── Rust (Cargo) ────────────────────────────────────────
     "~/.cargo/registry/src/",
     "~/.cargo/git/checkouts/",
+    "~/.rustup/toolchains/",
     // ── Python ──────────────────────────────────────────────
     "~/.local/lib/",
     "~/Library/Python/",
@@ -524,8 +663,27 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     "~/Library/pnpm/",
     "~/AppData/Local/pnpm/",
     "~/AppData/Roaming/npm/",
+    "~/.npm/",
+    "~/.nvm/",
+    "~/.volta/",
+    "~/.cache/yarn/",
+    "~/Library/Caches/Yarn/",
+    "~/AppData/Local/Yarn/",
+    "~/.pnpm-store/",
     // ── Go ──────────────────────────────────────────────────
     "~/go/pkg/mod/",
+    "/usr/local/go/",
+    "/opt/homebrew/opt/go/",
+    "/usr/local/opt/go/",
+    // ── JVM ─────────────────────────────────────────────────
+    // Note: JDK `src.zip` is intentionally NOT readable — archives are not
+    // extracted by the read tool, so don't advertise it in docs.
+    "~/.m2/repository/",
+    "~/.gradle/caches/",
+    // System JVM locations (`/Library/Java/JavaVirtualMachines/`,
+    // `/usr/lib/jvm/`) are NOT whole-tree allowlisted — they are scoped to
+    // `include/` headers only via init-time enumeration in EXTRA_READ_ALLOWED
+    // (see `jvm_include_roots`).
     // ── Ruby ────────────────────────────────────────────────
     "~/.gem/",
     "~/.local/share/gem/",
@@ -541,11 +699,21 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     "/usr/local/Cellar/",
     "/opt/homebrew/Cellar/",
     "/usr/local/Homebrew/Library/Taps/",
+    "/usr/include/",
+    "/usr/local/include/",
+    "/opt/homebrew/include/",
+    "/opt/homebrew/opt/",
+    "/opt/homebrew/Frameworks/",
+    "/usr/local/opt/",
+    "/usr/local/Frameworks/",
     r"C:\ProgramData\chocolatey\lib\",
     r"C:\msys64\mingw64\include\",
     r"C:\msys64\ucrt64\include\",
     r"C:\msys64\clang64\include\",
     r"C:\msys64\usr\include\",
+    // ── SDK roots ────────────────────────────────────────────
+    "/Applications/Xcode.app/Contents/Developer/",
+    "/Library/Developer/CommandLineTools/",
     // ── Windows SDK / MSVC ──────────────────────────────────
     r"C:\Program Files (x86)\Windows Kits\",
     r"C:\Program Files\Microsoft Visual Studio\",
@@ -556,6 +724,7 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     "~/.pub-cache/",
     // ── Elixir / Erlang ─────────────────────────────────────
     "~/.hex/",
+    "~/.mix/",
     // ── Haskell ─────────────────────────────────────────────
     "~/.cabal/",
     "~/.local/state/cabal/",
@@ -619,7 +788,9 @@ static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
 /// is unset, `~`-prefixed entries are skipped. Entries that follow XDG Base
 /// Directory conventions (`~/.cache/`, `~/.local/share/`, `~/.local/state/`,
 /// `~/.config/`) also generate variants using the corresponding `$XDG_*`
-/// environment variable when set.
+/// environment variable when set. Toolchain roots whose prefix can be
+/// relocated by an environment variable (see [`ENV_TOOLCHAIN_ROOTS`]) are
+/// likewise emitted from the variable value when set.
 static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     let mut dirs = ALLOWED_TEMP_ROOTS.clone();
 
@@ -640,6 +811,23 @@ static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
         } else {
             add_path_with_canonical(&mut dirs, PathBuf::from(raw_path));
         }
+    }
+
+    // Env-relocated toolchain roots (whole-prefix replacement, e.g.
+    // $CARGO_HOME/registry/src when CARGO_HOME is set).
+    for raw_path in env_derived_allowed_paths(|var| std::env::var(var).ok()) {
+        add_path_with_canonical(&mut dirs, PathBuf::from(raw_path));
+    }
+
+    // System JVM `include/` header roots: enumerated one level at init so the
+    // JDK trees are scoped to headers only, not whole-directory allowlisted.
+    // Nothing is added when the root is absent (fail closed).
+    for header_root in
+        jvm_include_roots("/Library/Java/JavaVirtualMachines", "Contents/Home/include")
+            .into_iter()
+            .chain(jvm_include_roots("/usr/lib/jvm", "include"))
+    {
+        add_path_with_canonical(&mut dirs, header_root);
     }
 
     dirs
@@ -1167,6 +1355,304 @@ mod tests {
                 check_path_read_allowed(tilde_input, &workspace, false).is_ok(),
                 "~-prefixed dependency path should be allowed for read"
             );
+        }
+    }
+
+    // ── Env-derived & credential-deny tests ────────────────────────────
+
+    #[test]
+    fn env_derived_allowed_paths_pure() {
+        // Unset/unknown vars are skipped.
+        assert!(env_derived_allowed_paths(|_| None).is_empty());
+
+        // CARGO_HOME with subpaths.
+        let paths = env_derived_allowed_paths(|var| match var {
+            "CARGO_HOME" => Some("/opt/cargo".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            paths,
+            vec![
+                "/opt/cargo/registry/src/".to_string(),
+                "/opt/cargo/git/checkouts/".to_string(),
+            ]
+        );
+
+        // Trailing slash on the value is trimmed before joining subpaths.
+        let paths = env_derived_allowed_paths(|var| match var {
+            "CARGO_HOME" => Some("/opt/cargo/".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            paths,
+            vec![
+                "/opt/cargo/registry/src/".to_string(),
+                "/opt/cargo/git/checkouts/".to_string(),
+            ]
+        );
+
+        // Empty subpath → the bare, trailing-slash-trimmed value.
+        let paths = env_derived_allowed_paths(|var| match var {
+            "GOMODCACHE" => Some("/modcache".to_string()),
+            _ => None,
+        });
+        assert_eq!(paths, vec!["/modcache".to_string()]);
+
+        // Non-empty subpath appends the subpath to the value.
+        let paths = env_derived_allowed_paths(|var| match var {
+            "GOROOT" => Some("/go".to_string()),
+            _ => None,
+        });
+        assert_eq!(paths, vec!["/go/src/".to_string()]);
+
+        // Empty value is skipped.
+        assert!(
+            env_derived_allowed_paths(|var| match var {
+                "GOMODCACHE" => Some(String::new()),
+                _ => None,
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn xdg_variant_path_with_pure() {
+        let get = |var: &str| match var {
+            "XDG_CACHE_HOME" => Some("/xdg".to_string()),
+            _ => None,
+        };
+
+        // XDG subpath maps to the env-derived path.
+        assert_eq!(
+            xdg_variant_path_with(get, "~/.cache/pypoetry/"),
+            Some("/xdg/pypoetry/".to_string())
+        );
+
+        // Non-XDG path returns None.
+        assert_eq!(xdg_variant_path_with(get, "~/.cargo/registry/src/"), None);
+
+        // Unset var returns None.
+        assert_eq!(xdg_variant_path_with(|_| None, "~/.cache/foo/"), None);
+    }
+
+    #[test]
+    fn credential_deny_paths() {
+        struct Case {
+            name: &'static str,
+            path: &'static str,
+            denied: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "ssh_id_rsa",
+                path: "~/.ssh/id_rsa",
+                denied: true,
+            },
+            Case {
+                name: "ssh_dir_itself",
+                path: "~/.ssh",
+                denied: true,
+            },
+            Case {
+                name: "ssh_config_nonkey",
+                path: "~/.ssh/config",
+                denied: true,
+            },
+            Case {
+                name: "aws_credentials",
+                path: "~/.aws/credentials",
+                denied: true,
+            },
+            Case {
+                name: "gnupg_secring",
+                path: "~/.gnupg/secring.gpg",
+                denied: true,
+            },
+            Case {
+                name: "gcloud_credentials",
+                path: "~/.config/gcloud/credentials.db",
+                denied: true,
+            },
+            Case {
+                name: "docker_config",
+                path: "~/.docker/config.json",
+                denied: true,
+            },
+            Case {
+                name: "kube_config",
+                path: "~/.kube/config",
+                denied: true,
+            },
+            Case {
+                name: "bare_id_rsa",
+                path: "id_rsa",
+                denied: true,
+            },
+            Case {
+                name: "nested_id_ed25519",
+                path: "secrets/id_ed25519",
+                denied: true,
+            },
+            Case {
+                name: "server_ppk",
+                path: "keys/server.ppk",
+                denied: true,
+            },
+            Case {
+                name: "case_insensitive",
+                path: "ID_RSA",
+                denied: true,
+            },
+            Case {
+                name: "sshx_private_key_name_denied",
+                path: "~/.sshx/id_rsa",
+                denied: true,
+            },
+            Case {
+                // Component-safe directory prefix: `.sshx` is NOT `.ssh`, so
+                // a non-key file under it is not credential-denied.
+                name: "sshx_component_safe",
+                path: "~/.sshx/config",
+                denied: false,
+            },
+            Case {
+                name: "notes_txt",
+                path: "notes.txt",
+                denied: false,
+            },
+            Case {
+                name: "public_key_ok",
+                path: "id_rsa.pub",
+                denied: false,
+            },
+            Case {
+                name: "relative_src",
+                path: "src/main.rs",
+                denied: false,
+            },
+        ];
+
+        for case in &cases {
+            assert_eq!(
+                is_denied_credential_path(case.path),
+                case.denied,
+                "case: {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn check_path_read_allowed_credential_denial() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().to_path_buf();
+
+        let denied_abs = ["~/.ssh/id_rsa", "~/.aws/credentials", "~/.kube/config"];
+        let denied_rel = ["sub/id_rsa", "id_ed25519"];
+
+        for strict in [true, false] {
+            for path in denied_abs {
+                let err = check_path_read_allowed(path, &workspace, strict).unwrap_err();
+                assert!(
+                    err.to_string().contains("protected credential"),
+                    "strict={strict}: {path} should be credential-denied: {err}"
+                );
+            }
+
+            // A private-key file name inside the workspace is denied too,
+            // even though the path itself is workspace-safe.
+            for path in denied_rel {
+                let err = check_path_read_allowed(path, &workspace, strict).unwrap_err();
+                assert!(
+                    err.to_string().contains("protected credential"),
+                    "strict={strict}: workspace private key {path} should be denied: {err}"
+                );
+            }
+
+            // No over-blocking: a normal workspace file is still allowed.
+            assert!(
+                check_path_read_allowed("src/main.rs", &workspace, strict).is_ok(),
+                "strict={strict}: normal workspace file should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn check_path_read_allowed_new_dependency_roots() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().to_path_buf();
+
+        let allowed = [
+            "~/.rustup/toolchains/1.98.0/lib/rustlib/src/rust/library/core/src/lib.rs",
+            "~/.m2/repository/org/example/foo/1.0/foo-1.0.jar",
+            "~/.gradle/caches/modules-2/files-2.1/org.example/foo/1.0/foo-1.0.jar",
+            "~/.npm/_cacache/content-v2/sha512/ab/foo",
+            "~/.nvm/versions/node/v22/lib/node_modules/foo/index.js",
+            "~/.volta/tools/image/node/current/bin/node",
+            "~/.mix/archives/foo-1.0.ez",
+            "/usr/include/stdio.h",
+            "/opt/homebrew/include/zlib.h",
+            "/opt/homebrew/opt/openssl/include/openssl/ssl.h",
+            "/usr/local/include/foo.h",
+            "/usr/local/go/src/fmt/print.go",
+            "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/stdio.h",
+        ];
+        for path in allowed {
+            assert!(
+                check_path_read_allowed(path, &workspace, false).is_ok(),
+                "expected allowed: {path}"
+            );
+        }
+
+        // System JVM locations are allowlisted via init-time I/O enumeration
+        // (scoped to `include/` headers only, never the whole JDK tree), so a
+        // lexically-nonexistent JDK name can no longer be asserted as allowed.
+        // If the system JVM root exists, verify the enumerated header for every
+        // child passes; otherwise skip (the test must not depend on a specific
+        // JDK being installed).
+        if let Ok(entries) = std::fs::read_dir("/Library/Java/JavaVirtualMachines") {
+            for entry in entries.filter_map(std::io::Result::ok) {
+                let header = entry
+                    .path()
+                    .join("Contents/Home/include/jni.h")
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(
+                    check_path_read_allowed(&header, &workspace, false).is_ok(),
+                    "expected enumerated JVM header allowed: {header}"
+                );
+            }
+        }
+
+        // Gradle root (outside caches/) is NOT covered — the allowlist is
+        // deliberately caches-only because the root holds credential files.
+        let err =
+            check_path_read_allowed("~/.gradle/gradle.properties", &workspace, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Path not allowed by security policy"),
+            "~/.gradle/gradle.properties should fall through to the generic error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_path_read_allowed_credential_symlink_target() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().to_path_buf();
+
+        // Post-canonicalization shape: an absolute $HOME-based path, exactly
+        // what resolve_read_target passes after canonicalization.
+        if let Ok(home) = std::env::var("HOME") {
+            let abs = PathBuf::from(&home).join(".ssh/id_rsa");
+            let abs_str = abs.to_string_lossy().to_string();
+            for strict in [true, false] {
+                let err = check_path_read_allowed(&abs_str, &workspace, strict).unwrap_err();
+                assert!(
+                    err.to_string().contains("protected credential"),
+                    "strict={strict}: post-canonicalization credential path should be denied: {err}"
+                );
+            }
         }
     }
 

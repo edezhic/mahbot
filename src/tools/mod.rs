@@ -222,8 +222,8 @@ use crate::util::scrub_credentials;
 ///
 /// ```text
 /// agent::execute_tool
-///   └─ scrub_tool_output(tool, args, output)     (tools/mod.rs)
-///        ├─ tool.should_scrub_output(args)        (lib.rs, per-tool override)
+///   └─ scrub_tool_output(tool, args, output)   (tools/mod.rs)
+///        ├─ tool.should_scrub_output(args)      (lib.rs, per-tool override)
 ///        │    ├─ returns true  → scrub_credentials(output)  (util/mod.rs)
 ///        │    └─ returns false → output as-is
 /// ```
