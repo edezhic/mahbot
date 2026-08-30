@@ -335,10 +335,10 @@ pub enum Message {
     /// selection is the resolved name ("" = "Personal" default).
     BootWorkspaces(HashMap<String, Workspace>, String),
     /// Full workspace map reloaded from the store (CDC workspaces event,
-    /// stream lag, toggle completion, or a settings add/delete) and the
-    /// resolved selection ("" = "Personal" default, when the
-    /// previously-selected workspace vanished or was never set).
-    WorkspacesReloaded(HashMap<String, Workspace>, String),
+    /// stream lag, toggle completion, or a settings add/delete). The handler
+    /// re-resolves the live selection against this fresh map — "" = "Personal"
+    /// default when the selected workspace vanished or none was set.
+    WorkspacesReloaded(HashMap<String, Workspace>),
     Home(home::HomeMessage),
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
@@ -867,7 +867,7 @@ impl Dashboard {
                     self.push_toast(format!("{label} for {ws_name}"), ToastKind::Success),
                     // Immediate post-toggle refresh; the CDC stream provides
                     // the durable confirmation later.
-                    self.reload_workspace_map(),
+                    Self::reload_workspace_map(),
                 ])
             }
             Err(e) => self.push_toast(format!("{}: {e}", kind.label_err()), ToastKind::Error),
@@ -1044,7 +1044,7 @@ impl Dashboard {
         let tasks = [
             intercept_task,
             Some(settings_task),
-            needs_global_reload.then(|| self.reload_workspace_map()),
+            needs_global_reload.then(Self::reload_workspace_map),
         ];
 
         Task::batch(tasks.into_iter().flatten())
@@ -1431,19 +1431,27 @@ impl Dashboard {
                 self.finish_toggle(kind, result, &ws_name, intended_state)
             }
             // A workspaces-table row changed (or the stream lagged/baseline
-            // fired) — one full map reload. The reload itself resolves the
-            // selection fallback, so no propagation here beyond the reload.
-            Message::WorkspacesCdcChanged => self.reload_workspace_map(),
-            Message::WorkspacesReloaded(workspaces, resolved) => {
+            // fired) — one full map reload; the handler below resolves the
+            // selection fallback against the fresh map.
+            Message::WorkspacesCdcChanged => Self::reload_workspace_map(),
+            Message::WorkspacesReloaded(workspaces) => {
                 self.workspaces = workspaces;
                 self.sync_settings_lists_from_map();
 
-                // Selection fallback: only propagate when the resolved
-                // selection differs from the current one — propagate is heavy
+                // Re-resolve the LIVE selection against the fresh map instead of
+                // a value captured when the reload was triggered: that snapshot
+                // can be stale (e.g. the boot CDC baseline reload runs before
+                // the persisted selection is applied). A selected workspace that
+                // no longer exists falls back to the "Personal" default.
+                // Propagate only on an actual fallback — propagate is heavy
                 // (board refresh + home reload) and must not run on every CDC
                 // event.
-                let current = self.selected_workspace_name.clone().unwrap_or_default();
-                if current != resolved {
+                let resolved = resolve_workspace_selection(
+                    &self.workspaces,
+                    self.selected_workspace_name.as_deref(),
+                );
+                let current = self.selected_workspace_name.as_deref().unwrap_or_default();
+                if current != resolved.as_str() {
                     self.selected_workspace_name = (!resolved.is_empty()).then(|| resolved.clone());
                     return self.propagate_workspace_selection(&resolved);
                 }
@@ -1640,11 +1648,13 @@ impl Dashboard {
     }
 
     /// Reload the full workspace map from storage (e.g. after add/delete on
-    /// the Workspaces page or a post-toggle refresh). Preserves current
-    /// selection if it still exists; otherwise falls back to "Personal".
-    fn reload_workspace_map(&self) -> Task<Message> {
-        let prev_selection = self.selected_workspace_name.clone();
-        Task::perform(load_workspace_map(prev_selection), std::convert::identity)
+    /// the Workspaces page or a post-toggle refresh). Preserves the live
+    /// selection if it still exists in the fresh map; otherwise the
+    /// [`Message::WorkspacesReloaded`] handler falls back to "Personal".
+    /// Resolution is done at apply time from the live selection, so a reload
+    /// triggered before the boot selection is applied cannot clobber it.
+    fn reload_workspace_map() -> Task<Message> {
+        Task::perform(load_workspace_map(), std::convert::identity)
     }
 
     /// Return the selected workspace name, or `None` if no shared workspace
@@ -3077,14 +3087,15 @@ fn save_window_state(
 }
 
 /// Reload the full workspace map from the store after boot (CDC workspaces
-/// event, stream lag, toggle completion, or a settings add/delete), resolving
-/// the selection via [`resolve_workspace_selection`].
+/// event, stream lag, toggle completion, or a settings add/delete). The
+/// [`Message::WorkspacesReloaded`] handler re-resolves the live selection at
+/// apply time.
 ///
 /// On a transient read failure (the ticket's one scoped retry exception), it
 /// retries once after a short delay; if the retry also fails, it returns
 /// [`Message::Nop`] so the current (non-empty) map is preserved rather than
 /// wiped.
-async fn load_workspace_map(prev_selection: Option<String>) -> Message {
+async fn load_workspace_map() -> Message {
     // Transient read failure: retry once after a short delay, then give up
     // and keep the current map.
     let mut attempt = 0;
@@ -3102,8 +3113,7 @@ async fn load_workspace_map(prev_selection: Option<String>) -> Message {
             }
         }
     };
-    let restored = resolve_workspace_selection(&workspaces, prev_selection.as_deref());
-    Message::WorkspacesReloaded(workspaces, restored)
+    Message::WorkspacesReloaded(workspaces)
 }
 
 /// Read the full workspace map from the store (one row per name).
@@ -3238,17 +3248,42 @@ mod tests {
             ("ws1".to_string(), ws("ws1")),
             ("ws3".to_string(), ws("ws3")),
         ]);
-        let _ = dash.update(Message::WorkspacesReloaded(new_map, String::new()));
+        let _ = dash.update(Message::WorkspacesReloaded(new_map));
         assert_eq!(dash.selected_workspace_name, None);
         assert!(dash.workspaces.contains_key("ws1"));
         assert!(dash.workspaces.contains_key("ws3"));
         assert!(!dash.workspaces.contains_key("ws2"));
 
-        // A reload whose map still contains the selection → unchanged.
+        // A reload whose map still contains the selection → unchanged. This is
+        // the live re-resolution: the selection is preserved regardless of what
+        // the trigger-time snapshot was — the boot-race regression where a
+        // reload triggered while the selection was still None must not reset it.
         dash.selected_workspace_name = Some("ws3".to_string());
         let new_map2 = HashMap::from([("ws3".to_string(), ws("ws3"))]);
-        let _ = dash.update(Message::WorkspacesReloaded(new_map2, "ws3".to_string()));
+        let _ = dash.update(Message::WorkspacesReloaded(new_map2));
         assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws3"));
+    }
+
+    #[test]
+    fn workspaces_reloaded_preserves_boot_restored_selection() {
+        // Models the exact boot race: a CDC baseline reload was triggered while
+        // the selection was still None, but lands after `finish_boot` applied
+        // the persisted selection ("mahbot"). Re-resolving from the live
+        // selection keeps it instead of wiping it to Personal.
+        let mut dash = ready_dashboard();
+        dash.selected_workspace_name = Some("mahbot".to_string());
+        let map = HashMap::from([("mahbot".to_string(), ws("mahbot"))]);
+        let _ = dash.update(Message::WorkspacesReloaded(map));
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("mahbot"));
+    }
+
+    #[test]
+    fn resolve_workspace_selection_keeps_valid_falls_back_personal() {
+        let map = HashMap::from([("ws1".to_string(), ws("ws1"))]);
+        assert_eq!(resolve_workspace_selection(&map, Some("ws1")), "ws1");
+        assert_eq!(resolve_workspace_selection(&map, Some("gone")), "");
+        assert_eq!(resolve_workspace_selection(&map, Some("")), "");
+        assert_eq!(resolve_workspace_selection(&map, None), "");
     }
 
     #[test]
@@ -3258,7 +3293,7 @@ mod tests {
             ("beta".to_string(), ws("beta")),
             ("alpha".to_string(), ws("alpha")),
         ]);
-        let _ = dash.update(Message::WorkspacesReloaded(map, String::new()));
+        let _ = dash.update(Message::WorkspacesReloaded(map));
 
         // Settings workspace list = map values sorted by name.
         let ws_names: Vec<&str> = dash
