@@ -3463,7 +3463,13 @@ impl SettingsState {
                 .into(),
             );
         }
-        for model_name in &model_names {
+        for (i, model_name) in model_names.iter().enumerate() {
+            // `section_impl` clamps the content spacing to 4px, so a 4px
+            // spacer row between pairs yields the 12px group gap while each
+            // label sits tight (2px) above its own input.
+            if i > 0 {
+                rows.push(Space::new().height(4).into());
+            }
             let display_name = model_name.clone();
             let order_model = model_name.clone();
             let order_field = format!("routing_order:{model_name}");
@@ -3508,7 +3514,6 @@ impl SettingsState {
                     .font(iced::Font::MONOSPACE)
                     .size(13)
                     .color(theme::TEXT_SECONDARY),
-                Space::new().height(4),
                 order_input,
             ]
             .spacing(2);
