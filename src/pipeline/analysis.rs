@@ -302,7 +302,7 @@ fn escalation_groups(
     // scanning representative then collapsed ids. `None` when none is blocker.
     let first_blocker = |members: &[crate::consensus::GroupingMember]| {
         for member in members {
-            for id in std::iter::once(member.id).chain(member.collapsed_ids.iter().copied()) {
+            for id in member.ids() {
                 if issue_grade(round, &table, id) == Some(crate::IssueGrade::Blocker) {
                     return Some(id);
                 }

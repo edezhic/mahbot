@@ -51,6 +51,15 @@ pub(crate) struct GroupingMember {
     pub collapsed_ids: Vec<usize>,
 }
 
+impl GroupingMember {
+    /// The representative id followed by every collapsed id, in order — the
+    /// full set of item ids this member owns/places. Order is meaningful:
+    /// the representative id comes first (its text is preferred for display).
+    pub(crate) fn ids(&self) -> impl Iterator<Item = usize> + '_ {
+        std::iter::once(self.id).chain(self.collapsed_ids.iter().copied())
+    }
+}
+
 /// A group of related items plus the LLM's contradiction judgment.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,11 +198,7 @@ pub(crate) fn distinct_agents(group: &GroupingGroup, table: &ItemTable<'_>) -> V
     let mut agents: Vec<usize> = group
         .members
         .iter()
-        .flat_map(|m| {
-            std::iter::once(m.id)
-                .chain(m.collapsed_ids.iter().copied())
-                .filter_map(|id| table.agent(id))
-        })
+        .flat_map(|m| m.ids().filter_map(|id| table.agent(id)))
         .collect();
     agents.sort_unstable();
     agents.dedup();
@@ -387,7 +392,7 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
         raw.extend(
             g.members
                 .iter()
-                .flat_map(|m| std::iter::once(m.id).chain(m.collapsed_ids.iter().copied())),
+                .flat_map(crate::consensus::GroupingMember::ids),
         );
     }
     raw.extend(ungrouped.iter().map(|m| m.id));
@@ -478,8 +483,7 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
         }
         if reasons.is_empty() {
             for member in &group.members {
-                state.placed.insert(member.id);
-                state.placed.extend(member.collapsed_ids.iter().copied());
+                state.placed.extend(member.ids());
             }
             if group.contradiction {
                 state.flagged.insert(state.frozen_groups.len());
