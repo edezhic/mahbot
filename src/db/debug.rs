@@ -70,10 +70,12 @@ const BLOCKLIST: &[&str] = &[
 
 /// SQL punctuation characters used for word-boundary tokenization.
 /// Splitting on these ensures whole-word matching — a column named
-/// `created_at` is not blocked by the `CREATE` keyword.
+/// `created_at` is not blocked by the `CREATE` keyword. Quote characters
+/// (`'`, `"`, `[`, `]`) are NOT included: [`scan_sql`] consumes them in its
+/// string/identifier arms before they reach the punctuation arm, and the `--`
+/// `/*` comment starts are likewise handled before it.
 const SQL_PUNCTUATION: &[char] = &[
-    '(', ')', ';', ',', '.', '*', '+', '-', '/', '=', '<', '>', '!', '|', '&', '~', '\'', '"', '[',
-    ']', '{', '}', ':',
+    '(', ')', ';', ',', '.', '*', '+', '-', '/', '=', '<', '>', '!', '|', '&', '~', '{', '}', ':',
 ];
 
 /// PRAGMA names allowed by the read-only validator.
@@ -1271,21 +1273,29 @@ fn resolve_db_list(name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>> {
 
 /// Reject any SQL containing mutation keywords (whole-word, case-insensitive)
 /// or a PRAGMA not on the read-only allowlist.
+///
+/// String literals, `--`/`/* */` comments, and quoted identifiers (`"x"`,
+/// `[x]`, `` `x` ``) are stripped before keyword matching, so a mutation keyword
+/// inside them is ignored rather than rejected. Anything surviving in SQL
+/// position is matched fail-closed.
 pub(crate) fn validate_read_only(sql: &str) -> Result<()> {
-    let tokens = tokenize_sql(sql);
+    let tokens = scan_sql(sql).map_err(|e| anyhow!("query rejected: {e}"))?;
     for (idx, token) in tokens.iter().enumerate() {
-        let upper = token.to_uppercase();
-        if BLOCKLIST.contains(&upper.as_str()) {
-            bail!("query rejected: contains blocked keyword '{token}'");
+        if !token.quoted {
+            let upper = token.text.to_uppercase();
+            if BLOCKLIST.contains(&upper.as_str()) {
+                bail!("query rejected: contains blocked keyword '{}'", token.text);
+            }
         }
-        if upper == "PRAGMA" {
+        if token.text.eq_ignore_ascii_case("PRAGMA") {
             let Some(name) = tokens.get(idx + 1) else {
                 bail!("query rejected: incomplete PRAGMA statement");
             };
-            if !SAFE_PRAGMAS.contains(&name.to_lowercase().as_str()) {
+            if !SAFE_PRAGMAS.contains(&name.text.to_lowercase().as_str()) {
                 bail!(
-                    "query rejected: PRAGMA '{name}' is not on the read-only allowlist \
-                     (mutating PRAGMAs are blocked; the connection is read-only)"
+                    "query rejected: PRAGMA '{}' is not on the read-only allowlist \
+                     (mutating PRAGMAs are blocked; the connection is read-only)",
+                    name.text
                 );
             }
         }
@@ -1293,15 +1303,153 @@ pub(crate) fn validate_read_only(sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// Split SQL into whole-word tokens on whitespace and SQL punctuation.
+/// A SQL token produced by [`scan_sql`]. `quoted` marks tokens that came from
+/// a quoted identifier (`"x"`, `[x]`, `` `x` ``) — their content never matches
+/// the mutation-keyword blocklist.
+struct SqlToken {
+    text: String,
+    quoted: bool,
+}
+
+/// Split SQL into whole-word tokens, stripping string literals, comments, and
+/// quoted identifiers before keyword matching.
 ///
 /// Punctuation characters are discarded (they can never match a blocklist
-/// keyword). Adjacent punctuation creates empty tokens which are filtered.
-fn tokenize_sql(sql: &str) -> Vec<String> {
-    sql.split(|c: char| c.is_whitespace() || SQL_PUNCTUATION.contains(&c))
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
+/// keyword). A quoted identifier still yields one token (with `quoted: true`)
+/// so PRAGMA names can be resolved through it.
+fn scan_sql(sql: &str) -> Result<Vec<SqlToken>, String> {
+    fn flush_word(tokens: &mut Vec<SqlToken>, word: &mut String) {
+        if !word.is_empty() {
+            tokens.push(SqlToken {
+                text: std::mem::take(word),
+                quoted: false,
+            });
+        }
+    }
+
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+
+        // `--` line comment: skip to the next newline or end of input.
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            flush_word(&mut tokens, &mut word);
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // `/* ... */` block comment.
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            flush_word(&mut tokens, &mut word);
+            i += 2;
+            let mut closed = false;
+            while i < chars.len() {
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    i += 2;
+                    closed = true;
+                    break;
+                }
+                i += 1;
+            }
+            if !closed {
+                return Err("unterminated /* comment".to_string());
+            }
+            continue;
+        }
+
+        // Single-quoted string literal — consumed entirely, no token.
+        if c == '\'' {
+            flush_word(&mut tokens, &mut word);
+            i += 1;
+            loop {
+                if i >= chars.len() {
+                    return Err("unterminated string literal".to_string());
+                }
+                if chars[i] == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        i += 2; // doubled quote == escaped quote
+                        continue;
+                    }
+                    i += 1; // closing quote
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Double-quoted / backtick quoted identifier — one quoted token.
+        if c == '"' || c == '`' {
+            flush_word(&mut tokens, &mut word);
+            let quote = c;
+            i += 1;
+            let mut inner = String::new();
+            loop {
+                if i >= chars.len() {
+                    return Err("unterminated quoted identifier".to_string());
+                }
+                if chars[i] == quote {
+                    if chars.get(i + 1) == Some(&quote) {
+                        inner.push(quote);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                inner.push(chars[i]);
+                i += 1;
+            }
+            tokens.push(SqlToken {
+                text: inner,
+                quoted: true,
+            });
+            continue;
+        }
+
+        // Bracket-quoted identifier — one quoted token, no escape doubling.
+        if c == '[' {
+            flush_word(&mut tokens, &mut word);
+            i += 1;
+            let mut inner = String::new();
+            loop {
+                if i >= chars.len() {
+                    return Err("unterminated [bracket] identifier".to_string());
+                }
+                if chars[i] == ']' {
+                    i += 1;
+                    break;
+                }
+                inner.push(chars[i]);
+                i += 1;
+            }
+            tokens.push(SqlToken {
+                text: inner,
+                quoted: true,
+            });
+            continue;
+        }
+
+        // Whitespace or SQL punctuation ends the current word.
+        if c.is_whitespace() || SQL_PUNCTUATION.contains(&c) {
+            flush_word(&mut tokens, &mut word);
+            i += 1;
+            continue;
+        }
+
+        // Anything else: append to the current word.
+        word.push(c);
+        i += 1;
+    }
+    flush_word(&mut tokens, &mut word);
+    Ok(tokens)
 }
 
 /// Format a single `turso::core` result row as pipe-delimited values.
@@ -1397,6 +1545,8 @@ mod tests {
             "UPDATE users SET name='x'",
             "VACUUM",
             "BEGIN",
+            "ANALYZE",
+            "analyze",
             "PRAGMA wal_checkpoint(TRUNCATE)",
         ] {
             assert!(validate_read_only(sql).is_err(), "should reject: {sql}");
@@ -1412,9 +1562,34 @@ mod tests {
             "PRAGMA integrity_check(1)",
             "PRAGMA table_info(tickets)",
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+            "SELECT * FROM tool_calls WHERE tool_name = 'analyze'",
+            "SELECT 'DROP TABLE tickets' AS note",
+            "-- DROP TABLE tickets\nSELECT 1",
+            "/* DELETE FROM logs */ SELECT 1",
+            "SELECT \"UPDATE\" FROM t",
+            "SELECT [drop] FROM t",
+            "SELECT 'it''s analyze time' FROM t",
         ] {
             assert!(validate_read_only(sql).is_ok(), "should accept: {sql}");
         }
+    }
+
+    #[test]
+    fn unterminated_literals_and_comments_are_rejected() {
+        for sql in [
+            "SELECT 'analyze",
+            "SELECT 1 /* note",
+            "SELECT \"drop",
+            "SELECT [drop",
+        ] {
+            assert!(validate_read_only(sql).is_err(), "should reject: {sql}");
+        }
+    }
+
+    #[test]
+    fn quoted_pragma_names_still_resolve() {
+        assert!(validate_read_only("PRAGMA [table_info](tickets)").is_ok());
+        assert!(validate_read_only("PRAGMA [wal_checkpoint]").is_err());
     }
 
     #[test]
@@ -1431,11 +1606,20 @@ mod tests {
 
     #[test]
     fn tokenizer_splits_sql_punctuation() {
-        let tokens = tokenize_sql("SELECT a, b FROM t WHERE x='y'");
-        assert!(tokens.contains(&"SELECT".to_string()));
-        assert!(tokens.contains(&"b".to_string()));
-        assert!(tokens.contains(&"y".to_string()));
-        assert!(!tokens.contains(&String::new()));
+        let tokens = scan_sql("SELECT a, b FROM t WHERE x='y'").expect("valid SQL");
+        let unquoted: Vec<&str> = tokens
+            .iter()
+            .filter(|t| !t.quoted)
+            .map(|t| t.text.as_str())
+            .collect();
+        for tok in ["SELECT", "a", "b", "FROM", "t", "WHERE", "x"] {
+            assert!(unquoted.contains(&tok), "missing unquoted token: {tok}");
+        }
+        assert!(!unquoted.contains(&"y"), "string literal leaked as token");
+        assert!(
+            tokens.iter().all(|t| !t.text.is_empty()),
+            "tokens must not be empty"
+        );
     }
 
     /// End-to-end: `run_debug_with_args` opens a real (temporary) store
