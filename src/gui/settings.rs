@@ -2223,239 +2223,216 @@ impl SettingsState {
                     .into()
                 };
 
-                let user_row = container(
-                    column![
-                        row![
-                            // Name + permissions column (FillPortion: 20)
-                            {
-                                let user_elem: Element<'_, SettingsMessage> = if let Some(p) =
-                                    user.permissions.as_deref().filter(|p| !p.is_empty())
-                                {
-                                    row![
-                                        text(&user.name).size(14).color(theme::TEXT_PRIMARY),
-                                        text(p).size(12).color(theme::TEXT_MUTED),
-                                    ]
-                                    .spacing(4)
-                                    .align_y(Alignment::Center)
-                                    .into()
+                let telegram_binding = user.channels.iter().find(|c| c.channel == "telegram");
+                let telegram_elem: Element<'_, SettingsMessage> =
+                    if us.bind_target.as_deref() == Some(&user.name) {
+                        // Inline binding input open
+                        let mut row_elements: Vec<Element<'_, SettingsMessage>> = vec![
+                            text("Telegram:")
+                                .size(12)
+                                .color(theme::TEXT_SECONDARY)
+                                .into(),
+                            Space::new().width(8).into(),
+                            widgets::single_line_editor(
+                                &us.bind_input.buffer,
+                                "@username",
+                                false,
+                                Length::Fixed(270.0),
+                                Some(Id::from(format!("bind_input:{}", user.name))),
+                                |action| {
+                                    SettingsMessage::UserMsg(users::UsersMessage::BindInputChanged(
+                                        action,
+                                    ))
+                                },
+                            ),
+                            Space::new().width(8).into(),
+                        ];
+                        row_elements.push(
+                            button(text(if us.binding { "Binding..." } else { "Bind" }).size(11))
+                                .style(theme::button_primary)
+                                .on_press_maybe(if us.bind_input.text().trim().is_empty() {
+                                    None
                                 } else {
-                                    text(&user.name).size(14).color(theme::TEXT_PRIMARY).into()
-                                };
-                                container(user_elem)
-                                    .width(Length::FillPortion(20))
-                                    .align_x(Alignment::Start)
-                                    .align_y(Alignment::Center)
-                            },
-                            // Workspace column (FillPortion: 20)
-                            {
-                                let ws_value = user.selected_workspace.as_deref().unwrap_or("");
-                                let ws_selected = us
-                                    .workspace_options
-                                    .iter()
-                                    .find(|o| o.value == ws_value)
-                                    .cloned();
-                                container(
-                                    tooltip(
-                                        pick_list(
-                                            us.workspace_options.as_slice(),
-                                            ws_selected,
-                                            |opt| {
-                                                SettingsMessage::UserMsg(
-                                                    users::UsersMessage::UpdateWorkspace(
-                                                        user.name.clone(),
-                                                        opt.value,
-                                                    ),
-                                                )
-                                            },
-                                        )
-                                        .style(widgets::pick_list_style)
-                                        .padding([4, 8])
-                                        .width(Length::Fixed(200.0)),
-                                        text("Active workspace").size(11),
-                                        tooltip::Position::Top,
-                                    )
-                                    .style(theme::tooltip_style),
-                                )
-                                .width(Length::FillPortion(20))
-                                .align_x(Alignment::Start)
-                                .align_y(Alignment::Center)
-                            },
-                            // Role column (FillPortion: 15) — active role
-                            // picker (permission-derived pool)
-                            {
-                                let role_picker: Element<'_, SettingsMessage> = match us
-                                    .active_role_options
-                                    .get(&user.name)
-                                {
-                                    Some(options) if !options.is_empty() => {
-                                        let role_selected = user
-                                            .selected_role
-                                            .as_ref()
-                                            .and_then(|name| {
-                                                options.iter().find(|o| o.value == *name)
-                                            })
-                                            .cloned()
-                                            .or_else(|| {
-                                                // No (or stale) stored selection —
-                                                // mirror resolve_active_role's default
-                                                // (the first pool role).
-                                                options.first().cloned()
-                                            });
-                                        tooltip(
-                                            pick_list(options.as_slice(), role_selected, |opt| {
-                                                SettingsMessage::UserMsg(
-                                                    users::UsersMessage::UpdateRole(
-                                                        user.name.clone(),
-                                                        opt.value,
-                                                    ),
-                                                )
-                                            })
-                                            .style(widgets::pick_list_style)
-                                            .padding([4, 8])
-                                            .width(Length::Fixed(150.0)),
-                                            text("Active role").size(11),
-                                            tooltip::Position::Top,
-                                        )
-                                        .style(theme::tooltip_style)
-                                        .into()
-                                    }
-                                    _ => text("none").size(12).color(theme::TEXT_MUTED).into(),
-                                };
-                                container(role_picker)
-                                    .width(Length::FillPortion(15))
-                                    .align_x(Alignment::Start)
-                                    .align_y(Alignment::Center)
-                            },
-                            // Actions column (FillPortion: 12) — switch icon
-                            container({
-                                let mut actions = Row::new().align_y(Alignment::Center);
-                                actions = actions.push(switch_icon);
-                                actions
-                            })
-                            .width(Length::FillPortion(12))
-                            .align_x(Alignment::End)
-                            .align_y(Alignment::Center),
-                        ]
-                        .align_y(Alignment::Center),
-                        // Second row: Telegram channel binding
-                        {
-                            let telegram_binding =
-                                user.channels.iter().find(|c| c.channel == "telegram");
-                            if us.bind_target.as_deref() == Some(&user.name) {
-                                // Inline binding input open
-                                let mut row_elements: Vec<Element<'_, SettingsMessage>> = vec![
-                                    text("Telegram:")
-                                        .size(12)
-                                        .color(theme::TEXT_SECONDARY)
-                                        .into(),
-                                    Space::new().width(8).into(),
-                                    widgets::single_line_editor(
-                                        &us.bind_input.buffer,
-                                        "@username",
-                                        false,
-                                        Length::Fixed(270.0),
-                                        Some(Id::from(format!("bind_input:{}", user.name))),
-                                        |action| {
-                                            SettingsMessage::UserMsg(
-                                                users::UsersMessage::BindInputChanged(action),
-                                            )
-                                        },
-                                    ),
-                                    Space::new().width(8).into(),
-                                ];
-                                row_elements.push(
-                                    button(
-                                        text(if us.binding { "Binding..." } else { "Bind" })
-                                            .size(11),
-                                    )
-                                    .style(theme::button_primary)
-                                    .on_press_maybe(if us.bind_input.text().trim().is_empty() {
-                                        None
-                                    } else {
-                                        Some(SettingsMessage::UserMsg(
-                                            users::UsersMessage::SubmitBind(user.name.clone()),
-                                        ))
-                                    })
-                                    .into(),
-                                );
-                                row_elements.push(
-                                    button(text("Cancel").size(11))
-                                        .style(theme::button_secondary)
-                                        .on_press(SettingsMessage::UserMsg(
-                                            users::UsersMessage::CloseBindInput,
-                                        ))
-                                        .into(),
-                                );
-                                Row::with_children(row_elements)
-                                    .spacing(4)
-                                    .align_y(Alignment::Center)
-                            } else if let Some(binding) = telegram_binding {
-                                // Already bound — show channel info and unbind button
-                                let display = binding.identifier.as_str();
-                                row![
-                                    Space::new().width(26),
-                                    lucide::link::<iced::Theme, iced::Renderer>()
-                                        .size(11)
-                                        .color(theme::ACCENT),
-                                    Space::new().width(6),
-                                    text("Telegram:").size(12).color(theme::TEXT_MUTED),
-                                    Space::new().width(6),
-                                    text(display).size(12).color(theme::TEXT_SECONDARY),
-                                    Space::new().width(4),
-                                    if us.binding {
-                                        let e: Element<'_, SettingsMessage> = text("Unbinding...")
-                                            .size(11)
-                                            .color(theme::TEXT_MUTED)
-                                            .into();
-                                        e
-                                    } else {
-                                        widgets::icon_tooltip_button(
-                                            lucide::x::<iced::Theme, iced::Renderer>()
-                                                .size(11)
-                                                .color(theme::TEXT_MUTED),
-                                            "Unlink Telegram",
-                                            Some(SettingsMessage::UserMsg(
-                                                users::UsersMessage::UnbindChannel(
-                                                    user.name.clone(),
-                                                    binding.identifier.clone(),
-                                                ),
-                                            )),
-                                            button::DEFAULT_PADDING,
-                                            theme::button_text,
-                                            tooltip::Position::Top,
-                                        )
-                                    },
-                                ]
-                                .align_y(Alignment::Center)
+                                    Some(SettingsMessage::UserMsg(users::UsersMessage::SubmitBind(
+                                        user.name.clone(),
+                                    )))
+                                })
+                                .into(),
+                        );
+                        row_elements.push(
+                            button(text("Cancel").size(11))
+                                .style(theme::button_secondary)
+                                .on_press(SettingsMessage::UserMsg(
+                                    users::UsersMessage::CloseBindInput,
+                                ))
+                                .into(),
+                        );
+                        Row::with_children(row_elements)
+                            .spacing(4)
+                            .align_y(Alignment::Center)
+                            .into()
+                    } else if let Some(binding) = telegram_binding {
+                        // Already bound — show channel info and unbind button
+                        let display = binding.identifier.as_str();
+                        row![
+                            lucide::link::<iced::Theme, iced::Renderer>()
+                                .size(11)
+                                .color(theme::ACCENT),
+                            Space::new().width(6),
+                            text("Telegram:").size(12).color(theme::TEXT_MUTED),
+                            Space::new().width(6),
+                            text(display).size(12).color(theme::TEXT_SECONDARY),
+                            Space::new().width(4),
+                            if us.binding {
+                                let e: Element<'_, SettingsMessage> = text("Unbinding...")
+                                    .size(11)
+                                    .color(theme::TEXT_MUTED)
+                                    .into();
+                                e
                             } else {
-                                // No Telegram binding — show bind button
-                                row![
-                                    Space::new().width(26),
-                                    lucide::link::<iced::Theme, iced::Renderer>()
+                                widgets::icon_tooltip_button(
+                                    lucide::x::<iced::Theme, iced::Renderer>()
                                         .size(11)
                                         .color(theme::TEXT_MUTED),
-                                    Space::new().width(6),
-                                    text("Not bound").size(12).color(theme::TEXT_MUTED),
-                                    Space::new().width(6),
-                                    button(row![
-                                        lucide::plus::<iced::Theme, iced::Renderer>()
-                                            .size(11)
-                                            .color(theme::ACCENT),
-                                        Space::new().width(3),
-                                        text("Bind Telegram").size(11),
-                                    ])
-                                    .style(theme::button_primary)
-                                    .on_press(
-                                        SettingsMessage::UserMsg(
-                                            users::UsersMessage::OpenBindInput(user.name.clone()),
-                                        )
-                                    ),
-                                ]
-                                .align_y(Alignment::Center)
+                                    "Unlink Telegram",
+                                    Some(SettingsMessage::UserMsg(
+                                        users::UsersMessage::UnbindChannel(
+                                            user.name.clone(),
+                                            binding.identifier.clone(),
+                                        ),
+                                    )),
+                                    button::DEFAULT_PADDING,
+                                    theme::button_text,
+                                    tooltip::Position::Top,
+                                )
+                            },
+                        ]
+                        .align_y(Alignment::Center)
+                        .into()
+                    } else {
+                        // No Telegram binding — show bind button
+                        button(
+                            row![
+                                lucide::link::<iced::Theme, iced::Renderer>()
+                                    .size(11)
+                                    .color(theme::BG_BASE),
+                                Space::new().width(3),
+                                text("Bind Telegram").size(11),
+                            ]
+                            .align_y(Alignment::Center),
+                        )
+                        .style(theme::button_primary)
+                        .on_press(SettingsMessage::UserMsg(
+                            users::UsersMessage::OpenBindInput(user.name.clone()),
+                        ))
+                        .into()
+                    };
+
+                let user_row = container(
+                    row![
+                        // Name + permissions + Telegram (FillPortion: 40)
+                        {
+                            let mut segment =
+                                row![text(&user.name).size(14).color(theme::TEXT_PRIMARY)]
+                                    .spacing(8)
+                                    .align_y(Alignment::Center);
+                            if let Some(p) = user.permissions.as_deref().filter(|p| !p.is_empty()) {
+                                segment = segment.push(text(p).size(12).color(theme::TEXT_MUTED));
                             }
+                            container(segment.push(telegram_elem))
+                                .width(Length::FillPortion(40))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center)
                         },
+                        // Workspace column (FillPortion: 20)
+                        {
+                            let ws_value = user.selected_workspace.as_deref().unwrap_or("");
+                            let ws_selected = us
+                                .workspace_options
+                                .iter()
+                                .find(|o| o.value == ws_value)
+                                .cloned();
+                            container(
+                                tooltip(
+                                    pick_list(
+                                        us.workspace_options.as_slice(),
+                                        ws_selected,
+                                        |opt| {
+                                            SettingsMessage::UserMsg(
+                                                users::UsersMessage::UpdateWorkspace(
+                                                    user.name.clone(),
+                                                    opt.value,
+                                                ),
+                                            )
+                                        },
+                                    )
+                                    .style(widgets::pick_list_style)
+                                    .padding([4, 8])
+                                    .width(Length::Fixed(100.0)),
+                                    text("Active workspace").size(11),
+                                    tooltip::Position::Top,
+                                )
+                                .style(theme::tooltip_style),
+                            )
+                            .width(Length::FillPortion(20))
+                            .align_x(Alignment::Start)
+                            .align_y(Alignment::Center)
+                        },
+                        // Role column (FillPortion: 15) — active role
+                        // picker (permission-derived pool)
+                        {
+                            let role_picker: Element<'_, SettingsMessage> = match us
+                                .active_role_options
+                                .get(&user.name)
+                            {
+                                Some(options) if !options.is_empty() => {
+                                    let role_selected = user
+                                        .selected_role
+                                        .as_ref()
+                                        .and_then(|name| options.iter().find(|o| o.value == *name))
+                                        .cloned()
+                                        .or_else(|| {
+                                            // No (or stale) stored selection —
+                                            // mirror resolve_active_role's default
+                                            // (the first pool role).
+                                            options.first().cloned()
+                                        });
+                                    tooltip(
+                                        pick_list(options.as_slice(), role_selected, |opt| {
+                                            SettingsMessage::UserMsg(
+                                                users::UsersMessage::UpdateRole(
+                                                    user.name.clone(),
+                                                    opt.value,
+                                                ),
+                                            )
+                                        })
+                                        .style(widgets::pick_list_style)
+                                        .padding([4, 8])
+                                        .width(Length::Fixed(120.0)),
+                                        text("Active role").size(11),
+                                        tooltip::Position::Top,
+                                    )
+                                    .style(theme::tooltip_style)
+                                    .into()
+                                }
+                                _ => text("none").size(12).color(theme::TEXT_MUTED).into(),
+                            };
+                            container(role_picker)
+                                .width(Length::FillPortion(15))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center)
+                        },
+                        // Actions column (FillPortion: 12) — switch icon
+                        container({
+                            let mut actions = Row::new().align_y(Alignment::Center);
+                            actions = actions.push(switch_icon);
+                            actions
+                        })
+                        .width(Length::FillPortion(12))
+                        .align_x(Alignment::End)
+                        .align_y(Alignment::Center),
                     ]
-                    .spacing(4),
+                    .align_y(Alignment::Center),
                 )
                 .padding(8)
                 .style(theme::surface_card_style);
