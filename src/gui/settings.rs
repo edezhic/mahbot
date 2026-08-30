@@ -1796,6 +1796,22 @@ impl SettingsState {
             for ws_item in &ws.workspaces {
                 let (status_color, status_bg) = theme::workspace_status_color(ws_item.status);
                 let maintainer_on = ws_item.maintenance_enabled;
+                let paused = ws_item.paused;
+                let (pause_icon, pause_tooltip) = if paused {
+                    (
+                        lucide::play::<iced::Theme, iced::Renderer>()
+                            .size(11)
+                            .color(theme::ACCENT),
+                        "Resume pipeline",
+                    )
+                } else {
+                    (
+                        lucide::pause::<iced::Theme, iced::Renderer>()
+                            .size(11)
+                            .color(theme::TEXT_MUTED),
+                        "Pause pipeline",
+                    )
+                };
 
                 let ws_row = container(
                     column![
@@ -1805,21 +1821,56 @@ impl SettingsState {
                                 .width(Length::FillPortion(15))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center),
-                            // Status column (FillPortion: 10)
+                            // Status column (FillPortion: 18) — status pill,
+                            // maintainer toggle, pause/unpause toggle.
                             container(
-                                tooltip(
-                                    widgets::badge_pill(
-                                        ws_item.status.to_string(),
-                                        (status_bg, status_color),
-                                        11,
-                                        [2, 8],
+                                row![
+                                    tooltip(
+                                        widgets::badge_pill(
+                                            ws_item.status.to_string(),
+                                            (status_bg, status_color),
+                                            11,
+                                            [2, 8],
+                                        ),
+                                        text("Status").size(11),
+                                        tooltip::Position::Top,
+                                    )
+                                    .style(theme::tooltip_style),
+                                    widgets::icon_tooltip_button(
+                                        widgets::maint_badge(maintainer_on),
+                                        if maintainer_on {
+                                            "stop maintenance"
+                                        } else {
+                                            "start maintenance"
+                                        },
+                                        Some(SettingsMessage::WorkspaceMsg(
+                                            workspaces::WorkspacesMessage::ToggleMaintainer(
+                                                ws_item.name.clone(),
+                                                !maintainer_on,
+                                            ),
+                                        )),
+                                        button::DEFAULT_PADDING,
+                                        theme::button_text,
+                                        tooltip::Position::Top,
                                     ),
-                                    text("Status").size(11),
-                                    tooltip::Position::Top,
-                                )
-                                .style(theme::tooltip_style),
+                                    widgets::icon_tooltip_button(
+                                        pause_icon,
+                                        pause_tooltip,
+                                        Some(SettingsMessage::WorkspaceMsg(
+                                            workspaces::WorkspacesMessage::TogglePaused(
+                                                ws_item.name.clone(),
+                                                !paused,
+                                            ),
+                                        )),
+                                        button::DEFAULT_PADDING,
+                                        theme::button_text,
+                                        tooltip::Position::Top,
+                                    ),
+                                ]
+                                .spacing(4)
+                                .align_y(Alignment::Center),
                             )
-                            .width(Length::FillPortion(10))
+                            .width(Length::FillPortion(18))
                             .align_x(Alignment::Start)
                             .align_y(Alignment::Center),
                             // Contexts column (FillPortion: 28) — per-role
@@ -1893,31 +1944,9 @@ impl SettingsState {
                                     .align_x(Alignment::Start)
                                     .align_y(Alignment::Center)
                             },
-                            // Maintainer column (FillPortion: 12) — Maintainer
-                            // toggle only.
-                            container(widgets::icon_tooltip_button(
-                                widgets::maint_badge(maintainer_on),
-                                if maintainer_on {
-                                    "stop maintenance"
-                                } else {
-                                    "start maintenance"
-                                },
-                                Some(SettingsMessage::WorkspaceMsg(
-                                    workspaces::WorkspacesMessage::ToggleMaintainer(
-                                        ws_item.name.clone(),
-                                        !maintainer_on,
-                                    ),
-                                )),
-                                button::DEFAULT_PADDING,
-                                theme::button_text,
-                                tooltip::Position::Top,
-                            ),)
-                            .width(Length::FillPortion(12))
-                            .align_x(Alignment::End)
-                            .align_y(Alignment::Center),
-                            // Path column (FillPortion: 35)
+                            // Path column (FillPortion: 39)
                             container(text(&ws_item.path).size(12).color(theme::TEXT_MUTED))
-                                .width(Length::FillPortion(35))
+                                .width(Length::FillPortion(39))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center),
                         ]
