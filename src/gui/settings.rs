@@ -1717,11 +1717,11 @@ impl SettingsState {
             Space::new().height(16),
             self.integrations_section(),
             Space::new().height(16),
+            self.routing_section(),
+            Space::new().height(16),
             self.audio_section(),
             Space::new().height(16),
             self.models_section(),
-            Space::new().height(16),
-            self.routing_section(),
             Space::new().height(16),
             Self::about_section(),
         ];
