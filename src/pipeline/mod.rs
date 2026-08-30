@@ -1705,7 +1705,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         true,
     )
     .await;
-    finalize_resumed_verifier_round(ticket, ws, vi, job_id, is_reviewer, results, paused).await;
+    finish_verifier_dispatch(ticket, ws, vi, job_id, is_reviewer, results, paused).await;
 }
 
 /// Fresh verifier dispatch (empty roster): build a new roster, sync the phase
@@ -1770,11 +1770,13 @@ async fn fresh_dispatch_verifiers(
         false,
     )
     .await;
-    finalize_resumed_verifier_round(ticket, ws, vi, job_id, is_reviewer, results, paused).await;
+    finish_verifier_dispatch(ticket, ws, vi, job_id, is_reviewer, results, paused).await;
 }
 
-/// Shared verifier-round tail for fresh and resumed dispatch.
-async fn finalize_resumed_verifier_round(
+/// Shared tail of verifier dispatch (fresh and resumed) after the parallel
+/// agents finish: guards the job phase, honours pause-freeze, then finalizes
+/// the round's verdicts.
+async fn finish_verifier_dispatch(
     ticket: Arc<Ticket>,
     ws: Workspace,
     vi: VerifierInfo,
