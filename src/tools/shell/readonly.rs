@@ -13,9 +13,12 @@
 //! validating every output redirect and every temp-gated mutator path against
 //! the tracked current directory and temp-variable bindings.
 //!
-//! The command verb always comes from the tree's authoritative `command_name`
-//! field, so substitution-formed verbs (`$(echo rm)`, backtick verbs) are
-//! structurally rejected. Known parser gaps (herestrings, extglob, unquoted
+//! The command verb comes from the tree's authoritative `command_name` field;
+//! substitution-formed verbs (`$(echo rm)`, backtick verbs) are structurally
+//! rejected, except a variable bound earlier in the same invocation to a
+//! literal value (`BIN=git; "$BIN" status`) — the resolved literal is
+//! re-validated through the full gate pipeline (see
+//! [`resolve_var_command_word`]). Known parser gaps (herestrings, extglob, unquoted
 //! `%(` in git --format, `<>` redirects, multiple heredocs per line, escaped
 //! `$()` in unquoted heredoc bodies, unterminated quotes/heredocs) over-reject
 //! fail-closed — the denial messages hint the plainer spellings. Retained
@@ -23,6 +26,7 @@
 //! [`crate::tools::shell::scan`]; this module only uses word-level helpers on
 //! words reconstructed from the syntax tree.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Parser};
@@ -701,6 +705,13 @@ fn collect_command_words(cmd: Node, w: &W) -> (Vec<String>, Vec<String>) {
                     }
                 }
             }
+            "command_substitution" => {
+                // Standalone (unquoted) substitutions expand to argv words
+                // (`sed $(echo -i) file`) and must stay visible to the flag
+                // scans; the walker still validates their body separately
+                // (`walk_word_substitutions`).
+                push_word(&mut words, node_text(child, w));
+            }
             "variable_assignment" => {
                 // Kept in the word list too — resolve_verb/apply_env_bindings
                 // expect leading assignments at the front (`TMPDIR=/tmp time
@@ -781,33 +792,46 @@ fn check_words(
         return Ok(());
     }
     let negated = flags.negated || flags.time_external;
+    // When the verb word resolves to a variable bound to a literal earlier in
+    // this invocation (`BIN=git; "$BIN" -c x diff`), the segment is rebuilt
+    // with the resolved value so the blocklist/git/flag dispatch below sees
+    // the command exactly as if it were written literally. `None` = the verb
+    // word was already literal and its (possibly quoted) spelling is kept.
+    let mut verb_rewrite: Option<(usize, String)> = None;
     let (verb_idx, verb) = match resolve_verb(words, negated) {
         VerbResolution::Informational | VerbResolution::None => {
             apply_env_bindings(words, state, None)?;
             return Ok(());
         }
         VerbResolution::Verb {
+            idx,
             class: VerbClass::Unprovable,
-            ..
         } => {
-            if !is_bare_substitution_segment(words) {
-                let cmd = originals.join(" ");
-                return reject(
-                    &cmd,
-                    "the command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).",
-                    "write the command name literally (e.g. `cd`, `rm`) so it can be validated.",
-                );
+            // A standalone `$(...)`/backtick at command position executes in
+            // a subshell and was already validated by the walker — keep the
+            // existing carve-out first.
+            if is_bare_substitution_segment(words) {
+                apply_env_bindings(words, state, None)?;
+                return Ok(());
             }
-            apply_env_bindings(words, state, None)?;
-            return Ok(());
+            let Some(resolved) = resolve_var_command_word(words[idx], state) else {
+                let cmd = originals.join(" ");
+                return reject(&cmd, UNPROVABLE_VERB_WHY, UNPROVABLE_VERB_HINT);
+            };
+            verb_rewrite = Some((idx, resolved.clone()));
+            (idx, Cow::Owned(resolved))
         }
         VerbResolution::Verb {
             idx,
             class: VerbClass::Literal(v),
-        } => (idx, v),
+        } => (idx, Cow::Borrowed(v)),
     };
-    if matches!(verb, "cd" | "pushd" | "popd") {
-        process_cd_words(words, verb_idx, verb, state);
+    // Matched on the resolved verb itself: cd/pushd/popd are builtins with no
+    // path form, so a path-valued binding can never invoke them — its dispatch
+    // falls through to the basename checks below and cwd tracking never
+    // engages (fail-closed).
+    if matches!(verb.as_ref(), "cd" | "pushd" | "popd") {
+        process_cd_words(words, verb_idx, &verb, state);
         return Ok(());
     }
     if verb == "eval" {
@@ -821,7 +845,7 @@ fn check_words(
     // group's words as the command's, and a stray `}` command follows) —
     // bash accepts the group and runs its body, so it must not fall through
     // as an unmodeled command either.
-    if matches!(verb, "{" | "}") {
+    if matches!(verb.as_ref(), "{" | "}") {
         let cmd = originals.join(" ");
         return reject(
             &cmd,
@@ -830,7 +854,7 @@ fn check_words(
         );
     }
     if matches!(
-        verb,
+        verb.as_ref(),
         ")" | "fi" | "done" | "esac" | "then" | "do" | "elif" | "else" | ";;" | ";&" | ";;&"
     ) {
         let cmd = originals.join(" ");
@@ -843,25 +867,42 @@ fn check_words(
         );
     }
 
-    apply_env_bindings(words, state, Some((verb_idx, verb)))?;
+    apply_env_bindings(words, state, Some((verb_idx, &verb)))?;
 
-    let segment = originals.join(" ");
+    let mut segment = if let Some((idx, value)) = &verb_rewrite {
+        segment_with_word_replaced(words, *idx, value)
+    } else {
+        originals.join(" ")
+    };
 
     // Effective command: strip shell prefixes and env assignments for the
     // blocklist dispatch.
-    let first_word = super::first_command_word(&segment);
+    let first_word = super::first_command_word(&segment).to_string();
     if first_word.is_empty() {
         return Ok(());
     }
-    let first_word = match classify_verb_word(first_word) {
-        VerbClass::Literal(v) => v,
-        VerbClass::Unprovable => {
-            return reject(
-                &segment,
-                "the command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).",
-                "write the command name literally (e.g. `rm`, `touch`) so it can be validated.",
-            );
-        }
+    let first_word = match classify_verb_word(&first_word) {
+        VerbClass::Literal(v) => v.to_string(),
+        VerbClass::Unprovable => match resolve_var_command_word(&first_word, state) {
+            Some(resolved) => {
+                // `env HOME=/tmp/x "$BIN" ...`: site 1 saw a literal forwarding
+                // prefix and never hit the variable. Rewrite the variable word
+                // so the git/mutator/flag predicates (which scan `segment`) see
+                // the literal verb, then re-derive the dispatch basename from
+                // the rebuilt segment. The word is located by the exact
+                // spelling `classify_verb_word` rejected; if it cannot be found
+                // (e.g. a basename-normalized first_word), reject fail-closed
+                // rather than dispatch on a partially rewritten segment.
+                match words.iter().position(|w| *w == first_word) {
+                    Some(idx) => {
+                        segment = segment_with_word_replaced(words, idx, &resolved);
+                        super::first_command_word(&segment).to_string()
+                    }
+                    None => return reject(&segment, UNPROVABLE_VERB_WHY, UNPROVABLE_VERB_HINT),
+                }
+            }
+            None => return reject(&segment, UNPROVABLE_VERB_WHY, UNPROVABLE_VERB_HINT),
+        },
     };
 
     // 'mktemp' creates a temp directory and outputs its path — always allowed.
@@ -871,17 +912,17 @@ fn check_words(
 
     // Temp-gated mutator dispatch (scratch, temp, unconditional).
     for check in MUTATOR_CHECKS {
-        if !check.verbs.contains(&first_word) {
+        if !check.verbs.contains(&first_word.as_str()) {
             continue;
         }
         if check
             .rejects
-            .is_none_or(|reject| reject(&segment, first_word, state))
+            .is_none_or(|reject| reject(&segment, first_word.as_str(), state))
         {
             let (education, fallback) = check.suggestions;
             return reject(
                 &segment,
-                &check.rejection.replace("{verb}", first_word),
+                &check.rejection.replace("{verb}", first_word.as_str()),
                 if has_unresolved_var_path(&segment, state) {
                     education
                 } else {
@@ -2932,6 +2973,32 @@ fn classify_verb_word(w: &str) -> VerbClass<'_> {
     VerbClass::Literal(w)
 }
 
+/// Resolve a variable-formed command word (`"$BIN"`, `$BIN`, `${BIN}`) to a
+/// provably literal command name from this invocation's variable bindings.
+/// Only bindings whose value is a single, plain, substitution-free word count
+/// (`BIN=cargo`); substitution-derived (`BIN=$(which cargo)`), transitive
+/// (`X=rm; Y="$X"` — the stored value still contains `$X` because poisoned
+/// vars do not resolve), whitespace/glob-bearing, and unknown bindings stay
+/// unprovable (fail-closed). This adds no capability beyond indirection over
+/// a literal: a literal-path command word is accepted today.
+fn resolve_var_command_word(word: &str, state: &ValidationState) -> Option<String> {
+    // Strip one balanced outer quote pair; the remainder must be exactly one
+    // bare variable reference (`$NAME`/`${NAME}`). Single quotes are literal
+    // text (`'$BIN'` names a command literally spelled `$BIN`), and
+    // mixed/unbalanced quotes are unprovable — neither resolves.
+    let Some((content, false)) = scan::strip_outer_quotes(word) else {
+        return None;
+    };
+    let value = state.vars.get(pure_var_name(content)?)?.value.as_deref()?;
+    if value.is_empty()
+        || value.contains(['$', '`', '\\', '\'', '"', '*', '?', '['])
+        || value.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// True when the command's words are exactly one bare substitution span at
 /// command position (a standalone `$(...)`/backtick — its content executes in
 /// a subshell and was already validated by the walker).
@@ -2944,6 +3011,21 @@ fn is_bare_substitution_segment(words: &[&str]) -> bool {
     }
     let s = first.trim();
     scan::substitution_span(s, 0).is_some_and(|(_, next)| next == s.len() && !s.starts_with("${"))
+}
+
+/// The shared rejection texts of both unprovable-verb sites in [`check_words`]
+/// (AST verb resolution and the prefix-stripped text dispatch).
+const UNPROVABLE_VERB_WHY: &str = "the command verb cannot be proven safe (concatenated quotes, escapes, or substitution-formed).";
+const UNPROVABLE_VERB_HINT: &str =
+    "write the command name literally (e.g. `cd`, `rm`) so it can be validated.";
+
+/// Rebuild the segment text with the word at `idx` replaced by `value` — used
+/// when a variable command word resolves to a literal, so every downstream
+/// predicate sees the command exactly as if written literally.
+fn segment_with_word_replaced(words: &[&str], idx: usize, value: &str) -> String {
+    let mut parts: Vec<&str> = words.to_vec();
+    parts[idx] = value;
+    parts.join(" ")
 }
 
 // ── Keep-set dispatch tables ─────────────────────────────────────────────
@@ -3066,8 +3148,8 @@ const FLAG_CHECKS: &[FlagCheck] = &[
     FlagCheck {
         verb: "tar",
         predicate: is_tar_mutating,
-        rejection: "`tar` is only allowed in list mode (`-t`/`--list`) — extraction/creation modifies files.",
-        suggestion: "use `tar -tf archive.tar.gz` to list contents, or `tar -xzf archive.tar.gz -C /tmp` to extract to temp.",
+        rejection: "`tar` is only allowed in list mode (`-t`/`--list`, including dash-less forms like `tar tzf`) — extraction/creation modifies files.",
+        suggestion: "use `tar -tzf archive.tar.gz` (or `tar tzf` / `tar --list`) to list archive contents; extraction is not allowed, even into temp directories.",
     },
     FlagCheck {
         verb: "base64",
@@ -3466,32 +3548,387 @@ fn has_cluster_char(command: &str, mutation: &[char], value_taking: &[char]) -> 
         })
 }
 
+/// Is `w` a `sed` in-place flag candidate at the flag position?
+///
+/// Position-aware and fail-closed: a word counts as the in-place flag only
+/// when it could reach argv as `-i`/`-I`/`--in-place` (or a combined cluster
+/// carrying `i`/`I`). The old scan treated ANY word matching an unprovable
+/// pattern as the candidate, which rejected benign print-mode sed
+/// (`sed -n "$(grep -n pat f),+25p" file`, `sed -n '1,25p' "$D/src/lib.rs"`).
+/// The branches below are deliberately conservative (any substitution inside
+/// a dash-word is a candidate) but no longer reject every substitution word
+/// in an operand/script position. `state` resolves bound variable values at
+/// pure-expansion positions.
+fn sed_inplace_candidate(w: &str, state: &ValidationState) -> bool {
+    let p = shell_word(w);
+
+    // A word that reaches argv as a '-'-prefixed flag token.
+    if p.starts_with('-') {
+        // A substitution anywhere in a dash-word could hide `-i` (e.g. `-$(echo i)`).
+        if word_has_substitution(w) {
+            return true;
+        }
+        if p.starts_with("--i") {
+            return true; // GNU long in-place abbreviations
+        }
+        if !p.starts_with("--") && p.contains(['i', 'I']) {
+            return true; // -i, -i.bak, -I, clusters
+        }
+        return false; // literal flag provably not in-place (-n, -e, ...)
+    }
+
+    // ANSI-C `$'...'`/`$"..."` tokens with escapes are unprovable flag candidates.
+    if is_unprovable_flag_token(w) {
+        return true;
+    }
+
+    // Field-split capability: anything not wrapped entirely in balanced quotes
+    // whose expansion could split a standalone flag into argv
+    // (`sed s/a/b/ $f`, `sed $(grep x f),+25p f`, `sed file$(echo 'a -i') f`).
+    let fully_quoted = scan::strip_outer_quotes(w).is_some_and(|(inner, _)| inner.len() < w.len());
+    if !fully_quoted && (unquoted_span_could_field_split_flag(w) || contains_bare_var(w)) {
+        return true;
+    }
+
+    // Whole-word substitution with a provable value: fold it and re-apply the
+    // flag test (`sed "$(echo -i)" file` must reject; `sed "$(echo -n)" file`
+    // may pass).
+    if let Some(folded) = sed_whole_word_substitution_fold(w) {
+        return literal_word_is_inplace_flag(&shell_word(&folded));
+    }
+
+    // Whole-word substitution with an unprovable value:
+    //  - quoted with literal affixes (`"$(grep -n pat f),+25p"`, `"$D/src/lib.rs"`)
+    //    — the leading expansion's output is judged per-case below: a bare
+    //    `grep -n` producer (output never starts with `-`) is an accepted
+    //    residual, as is a leading bare var that provably expands empty when
+    //    the resulting affix is address/range-shaped (the accepted
+    //    `"$D/src/lib.rs"` residual); anything else that could start with
+    //    '-' is rejected.
+    //  - quoted PURE expansion (`"$X"`, `"$(...)"`, `` "`...`" ``) — the value
+    //    occupies the whole word, so its position cannot be proven (it could
+    //    be the `-i` flag itself): reject unless a bound literal proves it
+    //    is not a flag.
+    //  - unquoted — the position cannot be proven: reject.
+    if word_has_substitution(w) || contains_bare_var(w) {
+        let Some((inner, single)) = scan::strip_outer_quotes(w) else {
+            return true; // mixed/unbalanced quotes: unprovable
+        };
+        if single {
+            return false; // literal `$` text — no expansion, provable operand
+        }
+        if !fully_quoted {
+            return true; // unquoted expansion word: position unprovable
+        }
+        if let Some(name) = pure_var_name(inner) {
+            // Pure `"$X"`/`${X}`: the bound value occupies the whole word.
+            // Substitution-derived (`X=$(...)`), transitive (`X=-i; Y="$X"`),
+            // and mktemp bindings store unprovable raw text (containing `$`)
+            // or no value — reject; only plain literal values are decidable.
+            return match state.vars.get(name).and_then(|b| b.value.as_deref()) {
+                Some(v) if !v.contains(['$', '`']) => var_value_is_inplace_flag(v),
+                _ => true,
+            };
+        }
+        if is_pure_special_var(inner) {
+            return true; // `"$@"`/`"$*"`/`"$?"`… — value unprovable (`set -- -i`)
+        }
+        if scan::substitution_span(inner, 0).is_some_and(|(_, end)| end == inner.len()) {
+            return true; // pure `"$(...)"`/backtick: value unprovable
+        }
+        // Literal affixes around a LEADING expansion: the expansion's value
+        // leads the word, so the combined word could be dash-leading
+        // (`"$(echo -i)foo"`, `"$D/src/lib.rs"` with `D=-i`). A provable
+        // leading value is checked combined with the affix. An unprovable
+        // leading SUBSTITUTION is tolerated only when its output provably
+        // never starts with `-` (a bare `grep -n`, the accepted
+        // `"$(grep -n pat f),+25p"` residual) AND the affix is itself
+        // address-shaped or empty — the producer output can be empty (no
+        // matches), leaving the affix as the whole word
+        // (`"$(grep -n nomatch f)-i"`). For bare variables only the affix
+        // SHAPE decides when the var is unbound or bound empty (it provably
+        // expands empty, so the rest leads): an address/range shape (digit,
+        // `,`, `/`, `+`, `'`, `{`) keeps the accepted unbound
+        // `"$D/src/lib.rs"` residual an operand, while any other rest could
+        // ride a dash-leading expansion value into a flag. An expansion that
+        // does not lead the word (`"s/a/$var/"`) can never make the word
+        // dash-leading: pass.
+        if let Some((name, rest)) = leading_bare_var(inner) {
+            return match state
+                .vars
+                .get(name)
+                .and_then(|b| b.value.as_deref())
+                .filter(|v| !v.is_empty())
+            {
+                // Plain literal: the binding layer may have path-resolved it
+                // (`D=-i` stores `<cwd>/-i`), so the component-aware test
+                // applies to the combined word.
+                Some(v) if !v.contains(['$', '`']) => {
+                    var_value_is_inplace_flag(&format!("{v}{rest}"))
+                }
+                // Substitution-derived/poisoned raw values still contain `$`
+                // — unprovable, and they could deliver a dash-leading value.
+                Some(_) => true,
+                // Unbound or bound empty: the expansion provably expands
+                // empty, so the REST leads the word. If it begins with a
+                // substitution, `sed_producer_affix_is_operand` decides;
+                // otherwise the literal rest shape does: an address/range
+                // shape keeps the accepted `"$D/src/lib.rs"` residual an
+                // operand, while any other rest could ride a dash-leading
+                // value into a flag → candidate.
+                None => match scan::substitution_span(rest, 0) {
+                    Some((body, end)) => !sed_producer_affix_is_operand(body, &rest[end..]),
+                    None => !sed_affix_starts_address(rest),
+                },
+            };
+        }
+        if let Some((body, end)) = scan::substitution_span(inner, 0) {
+            let rest = &inner[end..];
+            return match sed_echo_fold(body) {
+                // The fold is a literal field prefix (no path resolution), so
+                // the plain flag test applies.
+                Some(folded) => literal_word_is_inplace_flag(&format!("{folded}{rest}")),
+                // Unprovable leading expansion: `sed_producer_affix_is_operand`
+                // decides.
+                None => !sed_producer_affix_is_operand(body, rest),
+            };
+        }
+        return false; // no leading expansion: the word cannot become dash-leading
+    }
+
+    false
+}
+
+/// `Some(NAME)` when `s` (quote-stripped) is exactly one variable reference —
+/// `$NAME` or `${NAME}` with a valid name — else `None`.
+fn pure_var_name(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('$')?;
+    let name = match rest.strip_prefix('{') {
+        Some(braced) => braced.strip_suffix('}')?,
+        None => rest,
+    };
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then_some(name)
+}
+
+/// True when `s` (quote-stripped) is exactly one special parameter reference
+/// (`$@`, `$*`, `$?`, `$$`, `$!`, `$#`, positional `$0`–`$10`) — its value is
+/// not tracked by the binding layer, so it is unprovable.
+fn is_pure_special_var(s: &str) -> bool {
+    s.strip_prefix('$').is_some_and(|rest| {
+        !rest.is_empty()
+            && rest.len() <= 2
+            && rest
+                .chars()
+                .all(|c| matches!(c, '@' | '*' | '?' | '$' | '!' | '#' | '0'..='9'))
+    })
+}
+
+/// Split `s` into a leading bare variable reference (`$NAME`/`${NAME}`) and
+/// the literal remainder, if it starts with one.
+fn leading_bare_var(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix('$')?;
+    if let Some(braced) = rest.strip_prefix('{') {
+        let end = braced.find('}')?;
+        let name = &braced[..end];
+        (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .then_some((name, &braced[end + 1..]))
+    } else {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        (!rest.is_empty() && end > 0).then_some((&rest[..end], &rest[end..]))
+    }
+}
+
+/// Flag test for a provably literal word: is it an in-place sed flag?
+fn literal_word_is_inplace_flag(value: &str) -> bool {
+    if !value.starts_with('-') {
+        return false;
+    }
+    value.starts_with("--i") || (!value.starts_with("--") && value.contains(['i', 'I']))
+}
+
+/// True when `s` (the literal affix after a leading expansion) shape-provably
+/// starts a sed address/range — a first character that can never begin a
+/// flag: digit, `,`, `/`, `+`, `'`, `{`. `$` is deliberately excluded: it is
+/// both the last-line address and a variable-reference prefix (fail-closed).
+fn sed_affix_starts_address(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_digit() || matches!(c, ',' | '/' | '+' | '\'' | '{'))
+}
+
+/// True when the command substitution `body` provably produces non-dash-leading
+/// output: plain `grep` (any leading path) with at least one `-n`/
+/// `--line-number` and NO other dash-leading token. Such output never starts
+/// with `-` — lines are `linenum:line`, or `path:linenum:line` with a
+/// dash-free path prefix (`--`, option values like `--label=-i`, recursion
+/// over dash-leading paths, and value-taking flags consuming the `-n` are all
+/// rejected by the no-other-options rule, including quoted spellings like
+/// `'-e'`). This is the sound form of the accepted
+/// `sed -n "$(grep -n pat f),+25p"` allowance. Callers must additionally
+/// require an address-shaped/empty affix: the output can be EMPTY (no
+/// matches), leaving the affix as the whole word
+/// (`"$(grep -n nomatch f)-i"` expands to `-i`). Accepted fail-closed
+/// residuals: literal `$`/backtick inside double quotes
+/// (`grep -n "cost$"` — indistinguishable from an expansion), and other
+/// producers, other options, pipelines, expansions — all unprovable → false
+/// (fail-closed).
+fn sed_body_outputs_line_numbers(body: &str) -> bool {
+    // A quoted word preceding the producer hides the real command
+    // (`'foo' grep -n pat f` runs `foo`, not `grep`) → reject.
+    if body.trim_start().starts_with(['\'', '"']) {
+        return false;
+    }
+    // Scan the body, erasing quoted spans (their content is literal argv
+    // text, not shell structure — `grep -n '(a|b)' f`). Per span:
+    //  - content starting with `-` is still one option-shaped argv word
+    //    (`grep '-e' -n pat`: the `-e` consumes the `-n`) → reject;
+    //  - inside DOUBLE quotes `$`/backtick are live expansions
+    //    (`"$(echo -e)"` could consume the `-n`) → reject; inside single
+    //    quotes they are literal (`'cost$'` anchor) → safe.
+    // Unquoted `$`/backtick are expansions → rejected via the residual scan.
+    // Unbalanced quotes are unprovable → false.
+    let mut residual = String::with_capacity(body.len());
+    let mut open_quote: Option<char> = None;
+    let mut quoted = String::new();
+    for c in body.chars() {
+        match open_quote {
+            Some(q) => {
+                if c == q {
+                    open_quote = None;
+                    if quoted.starts_with('-') || (q == '"' && quoted.contains(['$', '`'])) {
+                        return false;
+                    }
+                    quoted.clear();
+                } else {
+                    quoted.push(c);
+                }
+                residual.push(' ');
+            }
+            None if c == '\'' || c == '"' => {
+                open_quote = Some(c);
+                residual.push(' ');
+            }
+            None => residual.push(c),
+        }
+    }
+    if open_quote.is_some() {
+        return false; // unbalanced quotes → unprovable
+    }
+
+    // Any residual shell structure (expansions, separators/pipes/redirects,
+    // parens, newline) makes the output unprovable.
+    if residual.chars().any(|c| {
+        matches!(
+            c,
+            '$' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n'
+        )
+    }) {
+        return false;
+    }
+    let toks: Vec<&str> = residual.split_whitespace().collect();
+    let Some(first) = toks.first().copied() else {
+        return false;
+    };
+    if first.rsplit('/').next() != Some("grep") {
+        return false;
+    }
+    // Beyond the producer word: at least one `-n`/`--line-number` and nothing
+    // else dash-leading (subsumes `--`, value-taking flags consuming the
+    // `-n`, `--label=` output-prefix forging, recursion, flag clusters).
+    let mut saw_n = false;
+    for t in &toks[1..] {
+        match *t {
+            "-n" | "--line-number" => saw_n = true,
+            t if t.starts_with('-') => return false,
+            _ => {}
+        }
+    }
+    saw_n
+}
+
+/// Shared tolerance predicate for both affixed-leading-expansion arms: a
+/// producer whose output never starts with `-` (`grep -n`) combined with an
+/// address-shaped/empty affix keeps the word a provable operand/range. The
+/// affix check is mandatory even behind a proven producer — the output can be
+/// empty (no matches), leaving the affix as the whole word.
+fn sed_producer_affix_is_operand(body: &str, affix: &str) -> bool {
+    sed_body_outputs_line_numbers(body) && (affix.is_empty() || sed_affix_starts_address(affix))
+}
+
+/// Same test over a stored variable VALUE: the binding layer path-resolves
+/// relative raw values against the tracked cwd (`X=-i` stores `<cwd>/-i`), so
+/// the raw `-`-leading spelling survives as a path component. Any dash-leading
+/// component carrying `i`/`I` counts as the flag (fail-closed).
+fn var_value_is_inplace_flag(value: &str) -> bool {
+    value.split('/').any(literal_word_is_inplace_flag)
+}
+
+/// Fold a whole-word substitution to its provable output when the word is
+/// exactly one substitution span that `echo`s literal tokens. Reuses
+/// [`simple_echo_output`] first (which deliberately does not fold
+/// `-`-prefixed tokens); the sed gate additionally folds `echo -i`-style
+/// bodies so a provable `-i` value is rejected (and `echo -n` is not).
+/// Returns `None` for any other body (unprovable) or non-whole-word words.
+fn sed_whole_word_substitution_fold(w: &str) -> Option<String> {
+    // Strip a balanced outer quote so `"$(echo -i)"` and `$(echo -i)` parse alike.
+    let inner = scan::strip_outer_quotes(w).map_or(w, |(c, _)| c);
+    let (body, end) = scan::substitution_span(inner, 0)?;
+    if end != inner.len() {
+        return None; // not a whole-word substitution (trailing literal after close)
+    }
+    sed_echo_fold(body)
+}
+
+/// Fold one substitution BODY to its provable output when it is an `echo` of
+/// literal safe-char tokens. `None` = unprovable.
+fn sed_echo_fold(body: &str) -> Option<String> {
+    if let Some(out) = simple_echo_output(body) {
+        return Some(out);
+    }
+    // `echo -i`-style: same safe-char guard as [`simple_echo_output`] but
+    // allowing `-`-prefixed literal tokens, so a single provable flag field
+    // folds to its value.
+    let body = body.trim();
+    let (cmd, args) = body.split_once(char::is_whitespace)?;
+    if cmd != "echo" {
+        return None;
+    }
+    let toks: Vec<&str> = args.split_whitespace().collect();
+    if toks.is_empty()
+        || toks.iter().any(|t| {
+            !t.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '.' | '/' | '+' | ':' | '@' | '%' | '=' | ',' | '-')
+            })
+        })
+    {
+        return None;
+    }
+    Some(toks.join(" "))
+}
+
 /// Check if `sed` has an in-place flag in a way that mutates files outside temp.
 /// When all file operands after the flag are under temp, returns `false` (allow).
 fn has_sed_mutation(command: &str, state: &ValidationState) -> bool {
     let parts: Vec<&str> = scan::split_words_keeping_substitutions(command);
-    // In-place flag position: any single-dash flag containing `i`/`I`
-    // (-i, -iSUFFIX, -I, -nix/-Ei clusters; no other sed short flag has
-    // i/I), or the GNU long form `--in-place[=SUFFIX]` at any unique
-    // abbreviation (`--i` is the shortest; no other GNU sed long option
-    // starts with `i`). Over-rejection is intentional (fail-closed):
-    // attached `-e`/`-f`/`-l` args containing `i` (e.g. `-e's/x/i/'`) and
-    // operands literally named like a flag (`sed -- -info.txt`) are
-    // rejected too. Tokens are normalized as the shell delivers them
-    // ([`shell_word`]), and `$'...'`/`$"..."` tokens with escapes are
-    // unprovable flag candidates ([`is_unprovable_flag_token`]). The flag
-    // POSITION fails closed on ANY substitution word — even one provably not
-    // `-i` (`sed $(echo foo) file`) — unlike awk's `-i` OPERAND gate, which
-    // folds provable echoes (`awk -i $(echo otherlib) file` stays allowed):
-    // a substitution here could hide the `-i` itself, and sed's operands are
-    // temp-gated after the flag (no proof of read-only otherwise).
-    let i_pos = parts.iter().position(|part| {
-        let p = shell_word(part);
-        (p.starts_with('-') && !p.starts_with("--") && p.contains(['i', 'I']))
-            || p.starts_with("--i")
-            || is_unprovable_flag_token(part)
-            || unprovable_flag_word(part, &p)
-    });
+    // In-place flag position ([`sed_inplace_candidate`]): any single-dash flag
+    // containing `i`/`I` (-i, -iSUFFIX, -I, -nix/-Ei clusters; no other sed
+    // short flag has i/I), or the GNU long form `--in-place[=SUFFIX]` at any
+    // unique abbreviation (`--i` is the shortest; no other GNU sed long option
+    // starts with `i`). Over-rejection is intentional (fail-closed): attached
+    // `-e`/`-f`/`-l` args containing `i` (e.g. `-e's/x/i/'`) and operands
+    // literally named like a flag (`sed -- -info.txt`) are rejected too.
+    // Tokens are normalized as the shell delivers them ([`shell_word`]), and
+    // `$'...'`/`$"..."` tokens with escapes are unprovable flag candidates
+    // ([`is_unprovable_flag_token`]). The position is evaluated by
+    // [`sed_inplace_candidate`]: it does NOT fail closed on every substitution
+    // word (unlike awk's `-i` OPERAND gate, which folds provable echoes —
+    // `awk -i $(echo otherlib) file` stays allowed) — a substitution can hide
+    // the `-i` itself only when it is not provably a non-flag value.
+    let i_pos = parts
+        .iter()
+        .position(|part| sed_inplace_candidate(part, state));
     let Some(i_pos) = i_pos else {
         return false; // no in-place flag → not a sed mutation
     };
@@ -3771,37 +4208,124 @@ fn has_wget_mutation(command: &str, state: &ValidationState) -> bool {
 /// `-tvf` combines `t` (list) with `v` (verbose) and `f` (file)).
 const TAR_SAFE_CHARS: &[char] = &['v', 'f', 'z', 'j', 'J'];
 
-/// Check if tar is using only `-t`/`--list` (list) mode. Handles combined flags.
+/// Long options that execute programs or mutate archives/paths even when a
+/// list operation is also present (`tar tzf f --use-compress-program=CMD`
+/// decompresses through CMD in list mode; `--delete` rewrites the archive).
+/// The generic long-option fall-through in [`is_tar_list_only`] must never
+/// see these. Matching covers GNU unambiguous abbreviations down to four
+/// characters (`--use` → `--use-compress-program`); an option that must not
+/// be caught despite being a prefix of a denylisted one is exempted in the
+/// scan (`--checkpoint`).
+const TAR_EXEC_LONG_OPTIONS: &[&str] = &[
+    "--to-command",           // runs CMD per member (extract mode)
+    "--use-compress-program", // external compressor runs CMD
+    "--checkpoint-action",    // arbitrary actions, incl. exec
+    "--checkpoint-exec",      // checkpoint exec spelling variant
+    "--delete",               // rewrites the archive in place
+    "--extract",
+    "--get",
+    "--create",
+    "--append",
+    "--update",
+    "--concatenate",
+    "--catenate",
+    "--remove-files",
+    "--unlink-first",
+    "--info-script", // runs CMD at each volume change (-F)
+    "--new-volume-script",
+    "--rmt-command", // remote archive transport command
+    "--rsh-command", // remote archive transport command
+];
+
+/// Benign long options that are prefixes of [`TAR_EXEC_LONG_OPTIONS`] entries
+/// and must fall through to the generic handling instead.
+const TAR_BENIGN_LONG_OPTIONS: &[&str] = &["--checkpoint"];
+
+/// Check if tar is using only `-t`/`--list` (list) mode, including the
+/// BSD/GNU dash-less operation clusters (`tar tzf f`, `tar tvf a.tar`).
+/// Handles combined flags.
 ///
 /// This is the **whitelist** for [`is_tar_mutating`]'s negative detection
 /// strategy. Add new safe/list-only operations (e.g. `--diff`/`--compare`)
 /// here rather than adding blacklist checks to [`is_tar_mutating`].
 fn is_tar_list_only(command: &str) -> bool {
     let parts: Vec<&str> = scan::split_words_keeping_substitutions(command);
-    // Find the operation flag/option
-    for part in &parts {
-        // --list is always safe
-        if *part == "--list" {
-            return true;
+    // Locate the tar verb first: the first word whose shell-delivered form is
+    // `tar` or ends with `/tar`. The segment may carry `env`/`sudo`/assignment
+    // prefixes (FlagCheck predicates receive the full segment), so the verb is
+    // not necessarily the first part.
+    let Some(verb_idx) = parts.iter().position(|w| {
+        let p = shell_word(w);
+        p == "tar" || p.ends_with("/tar")
+    }) else {
+        return false; // no tar verb found — reject (conservative)
+    };
+
+    let mut saw_list = false;
+    for (i, part) in parts.iter().enumerate() {
+        if i <= verb_idx {
+            continue; // the verb and any prefix words before it
         }
-        if part.starts_with('-') && !part.starts_with("--") {
-            // Skip non-operation flags
-            if part.len() == 2 && TAR_SAFE_CHARS.contains(&part.chars().nth(1).unwrap()) {
+        let p = shell_word(part);
+        // Exec/mutating long options reject even alongside a list operation.
+        // The exact match covers short spellings (`--get`); the ≥4-char prefix
+        // match covers GNU unambiguous abbreviations (`--use` →
+        // `--use-compress-program`), with benign prefixes exempted
+        // (`--checkpoint` vs `--checkpoint-action`).
+        let name = p.split('=').next().unwrap_or(&p);
+        if !TAR_BENIGN_LONG_OPTIONS.contains(&name)
+            && (TAR_EXEC_LONG_OPTIONS.contains(&name)
+                || (name.len() >= 4 && TAR_EXEC_LONG_OPTIONS.iter().any(|o| o.starts_with(name))))
+        {
+            return false;
+        }
+        // --list records a list operation, but keep scanning: every later
+        // operation-letter word must also be exactly "t" (`tar --list -x`
+        // rejects).
+        if p == "--list" {
+            saw_list = true;
+            continue;
+        }
+        // Single-dash clusters, unchanged semantics.
+        if p.starts_with('-') && !p.starts_with("--") {
+            // Skip non-operation flags.
+            if p.len() == 2 && TAR_SAFE_CHARS.contains(&p.chars().nth(1).unwrap()) {
                 continue;
             }
-            // Check if this contains only 't' (and maybe v/f/z/j/J) as operation flags
-            let ops: String = part
+            // Check if this contains only 't' (and maybe v/f/z/j/J) as operation flags.
+            let ops: String = p
                 .chars()
                 .skip(1) // skip leading '-'
                 .filter(|c| !TAR_SAFE_CHARS.contains(c))
                 .collect();
             if !ops.is_empty() {
-                return ops == "t";
+                if ops != "t" {
+                    return false;
+                }
+                saw_list = true;
+            }
+            continue;
+        }
+        // Dash-less operation cluster: ONLY the word immediately after the tar
+        // verb, ONLY if it is non-empty and entirely ASCII lowercase letters.
+        // Filter the safe chars; if a non-empty operation remains it must be
+        // exactly "t" (`tar tzf f`), otherwise reject (`tar czf`). All-safe
+        // chars (`tar f x.tar`) carry no operation → not provably list.
+        if i == verb_idx + 1 && !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase()) {
+            let ops: String = p.chars().filter(|c| !TAR_SAFE_CHARS.contains(c)).collect();
+            if !ops.is_empty() {
+                if ops != "t" {
+                    return false;
+                }
+                saw_list = true;
             }
         }
+        // Other long options (`--diff`, `--exclude`, `--checkpoint`, …) and
+        // non-operation operands contribute no operation letters; they fall
+        // through without setting saw_list (the documented unknown-long-option
+        // residual, minus the exec/mutating list above).
     }
-    // No operation flag found — reject (conservative)
-    false
+    saw_list
 }
 
 /// Check if `tar` is in mutating mode (i.e., will extract/create).
@@ -4218,10 +4742,14 @@ fn check_git_output_flag(trimmed: &str, subcommand: &str) -> Result<(), String> 
 /// Reject git invocations that can execute programs via flag/config/env
 /// channels invisible to the subcommand allowlist. Runs FIRST in
 /// [`check_git_segment`] — before the extension allowlist, whose allowlisted
-/// forms would otherwise bypass the scan. Fail-closed: repo-redirect globals
-/// (`-C`/`--git-dir`/`--work-tree`) are rejected too, so an agent-written
-/// hostile repo config cannot be reached via redirect. Accepted residual: a
-/// repo with pre-existing hostile config (`.git/config` diff.external/
+/// forms would otherwise bypass the scan. Fail-closed: config-injecting
+/// globals (`-c` and its attached/clustered forms, `--config-env`,
+/// `--config-file`) and the repo-redirect long globals (`--git-dir`,
+/// `--work-tree`) are rejected, so an agent-written hostile repo config cannot
+/// be reached via redirect. The short `-C` repo redirect is now ALLOWED (its
+/// value is a plain directory, not config) — the hostile-repo-config residual
+/// risk via `-C` is accepted and unchanged in kind. Accepted residual: a repo
+/// with pre-existing hostile config (`.git/config` diff.external/
 /// filter.*/core.fsmonitor, .gitattributes textconv, global LFS filters) can
 /// still exec drivers from plain `git diff`/`status` — trusted-workspace
 /// model, out of scope here.
@@ -4239,21 +4767,27 @@ fn check_git_exec_vectors(trimmed: &str) -> Result<(), String> {
     }
     // Global-region flags between `git` and the subcommand. Position-sensitive:
     // `git log -c` / `git diff -c` (combined diff) live in the subcommand
-    // region and stay allowed. `-c` injects config that executes programs;
-    // `-C` redirects the repo (attached/clustered forms `-cfoo`, `-pc`, `-pC`
-    // included). Long globals redirect the repo or inject config.
+    // region and stay allowed. `-c` injects config that executes programs
+    // (attached/clustered forms `-cfoo`, `-pc` included); `-C` redirects the
+    // repo (attached/clustered forms `-C/tmp/repo`, `-pC` included) and is now
+    // ALLOWED — it is a plain directory, not config. Long globals redirect the
+    // repo or inject config.
     let sub_idx = super::find_first_non_flag_index(&words[git_idx + 1..], true)
         .map_or(words.len(), |i| git_idx + 1 + i);
     let base = words.get(sub_idx).copied().unwrap_or("");
     for w in &words[git_idx + 1..sub_idx] {
         let wq = shell_word(w);
-        if wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains(['c', 'C']) {
+        if wq.starts_with('-') && !wq.starts_with("--") && wq[1..].contains('c') {
             return reject(
                 trimmed,
-                "`-c`/`-C` git global options are not allowed in read-only mode — they inject config or redirect the repository, both of which can execute programs.",
-                "run git without global `-c`/`-C` options (use `cd` to change directory).",
+                "`-c` git global options are not allowed in read-only mode — they inject config that can execute programs.",
+                "run git without global `-c` options (use `cd` to change directory).",
             );
         }
+        // Long globals redirect the repo or inject config; GNU unambiguous
+        // abbreviations (`--git-di=/evil`) resolve to the same options, so a
+        // ≥6-char name that is a prefix of a protected option rejects too.
+        let name = wq.split('=').next().unwrap_or(&wq);
         for opt in [
             "--git-dir",
             "--work-tree",
@@ -4261,7 +4795,7 @@ fn check_git_exec_vectors(trimmed: &str) -> Result<(), String> {
             "--config-file",
             "--exec-path",
         ] {
-            if wq == opt || wq.starts_with(&format!("{opt}=")) {
+            if name == opt || (name.len() >= 6 && opt.starts_with(name)) {
                 return reject(
                     trimmed,
                     &format!(
@@ -4970,6 +5504,35 @@ mod tests {
             ("tar -xzf archive.tar.gz", false),
             ("tar -czf archive.tar.gz dir/", false),
             ("tar --list -f archive.tar.gz", true),
+            // tar dash-less list clusters (BSD/GNU)
+            ("tar tzf archive.tar.gz", true),
+            ("tar tvf archive.tar.gz", true),
+            ("tar tf archive.tar.gz", true),
+            ("tar t archive.tar", true),
+            // tar extraction/creation — always rejected
+            ("tar xzf archive.tar.gz", false),
+            ("tar czf archive.tar.gz dir/", false),
+            ("tar xf archive.tar", false),
+            ("tar x archive.tar", false),
+            ("tar czf", false),
+            // hardening: later operation letters still must be exactly "t"
+            ("tar --list -x archive.tar.gz", false),
+            // exec/mutating long options reject even in list mode, including
+            // GNU unambiguous abbreviations down to four characters
+            ("tar tzf archive.tar.gz --use-compress-program=cmd", false),
+            ("tar -tzf archive.tar.gz --use=cmd", false),
+            ("tar --list --delete archive.tar", false),
+            ("tar --list --to-command=cmd archive.tar", false),
+            ("tar --list --checkpoint-action=exec=cmd archive.tar", false),
+            ("tar tzf f --info-script=cmd", false),
+            ("tar tzf f --rsh-command=cmd", false),
+            ("tar --list archive.tar", true),
+            ("tar tzf archive.tar.gz --exclude='*.log'", true), // benign long option
+            ("tar -tzf archive.tar.gz --checkpoint=10", true),  // benign progress option
+            // all-safe dash-less cluster stays rejected: not provably list
+            ("tar f archive.tar", false),
+            // sudo/env-prefixed form routes through the same whitelist
+            ("sudo tar tzf archive.tar.gz", true),
             // base64
             ("base64 -d file.txt", true),
             ("base64 -d -o out.bin file.txt", false),
@@ -4988,6 +5551,108 @@ mod tests {
             ("base64 -o /tmp/x --output /tmp/y file", true),
             ("base64 --output=/tmp/x file", true),
             ("base64 --output=out file", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// Sed print-mode operands must not be mistaken for the in-place flag
+    /// position, while substitutions that could deliver `-i` still reject.
+    #[test]
+    fn sed_print_mode_regressions() {
+        let cases = [
+            // quoted words with literal affixes are provably operand/script
+            ("sed -n \"$(grep -n pat file),+25p\" file", true),
+            ("sed -n '1,25p' \"$D/src/lib.rs\"", true),
+            // pure quoted expansions occupy the whole word — position
+            // unprovable unless the bound value proves otherwise
+            ("sed \"$(echo -i)\" 's/a/b/' file", false),
+            ("sed \"$(printf '%s' -i)\" 's/a/b/' file", false),
+            ("sed -e \"$(grep x file)\" file", false),
+            ("sed \"$X\" 's/a/b/' file", false),       // unbound
+            ("sed 's/a/b/' \"$f\"", false),            // unbound operand
+            ("X=-i; sed \"$X\" 's/a/b/' file", false), // bound to the flag
+            ("X=-n; sed \"$X\" file", true),           // bound, provably not -i
+            ("F=file.txt; sed 's/a/b/' \"$F\"", true), // bound literal operand
+            // the bound value LEADS an affixed word — a flag-leading value
+            // makes the combined word the in-place flag
+            ("D=-i; sed -n '1,25p' \"$D/src/lib.rs\"", false),
+            ("D=/tmp/x; sed -n '1,25p' \"$D/src/lib.rs\"", true),
+            ("sed \"$(echo -i)foo\" file", false),
+            // a dash-led literal affix becomes the flag when the leading
+            // expansion yields empty (or an untracked value)
+            ("D=$(echo -i); sed -n '1,25p' \"$D/src/lib.rs\"", false),
+            ("sed \"$(echo)-i\" file", false),
+            ("sed \"$D-i\" file", false),
+            ("D=$(mktemp -d); sed -n '1,25p' \"$D/src/lib.rs\"", true),
+            // braced spelling routes through the same binding lookup
+            ("D=-i; sed -n '1,25p' \"${D}/src/lib.rs\"", false),
+            // an unprovable leading substitution is tolerated only when its
+            // output never starts with `-` (a bare `grep -n` producer)
+            // AND the affix is address-shaped/empty — otherwise any affix
+            // could ride a dash-leading value into a flag
+            ("sed \"$(printf '%s' -i)foo\" file", false),
+            ("sed \"$D$(echo -i)/src\" file", false),
+            // a provable non-line-numbered producer is rejected even with an
+            // address-shaped affix (they combine into `-i`+suffix)
+            ("sed \"$(printf '%s' -i),+25p\" 's/l/L/' t.txt", false),
+            ("sed \"$(printf '%s' -i)/src\" 's/l/L/' t.txt", false),
+            ("sed \"$(printf '%s' -i)5\" 's/l/L/' t.txt", false),
+            // the producer output can be EMPTY (no matches), so a dash-led
+            // or expansion-led affix becomes the whole word even behind a
+            // proven producer
+            (
+                "sed \"$(grep -n nomatch file)-i\" 's/a/b/' notes.txt",
+                false,
+            ),
+            ("X=; sed \"$X$(grep -n nomatch f)-i\" 's/a/b/' f", false),
+            ("sed \"$(grep -n pat file)$(echo -i)\" 's/a/b/' f", false),
+            // the producer body must be a bare `grep -n` with no other
+            // dash-leading token: a value-taking flag can consume the `-n`
+            // (`-e -n`), `--label=` can forge the output prefix, recursion
+            // prints dash-leading paths, and rg's path prefixes are unprovable
+            ("sed \"$(grep -e -n file)+25p\" 's/a/b/' t", false),
+            ("sed \"$(grep --label=-i -n pat f)+25p\" 's/a/b/' t", false),
+            ("sed \"$(grep -rn pat f)+25p\" 's/a/b/' t", false),
+            // a quoted option word is still one argv word: `'-e'` consumes
+            // the `-n` just like an unquoted one; rg's path prefixes and
+            // nested expansions stay unprovable
+            ("sed \"$(grep '-e' -n pat)+25p\" 's/a/b/' t", false),
+            ("sed \"$(grep '-f' -n patfile)+25p\" 's/a/b/' t", false),
+            ("sed -n \"$(rg -n pat file),+25p\"", false),
+            ("sed -n \"$(grep -n \"$pat\" file),+25p\"", false),
+            // single-quoted `$`/backtick are literal (regex anchors stay
+            // usable); a quoted word with leading whitespace is an operand,
+            // not an option
+            ("sed -n \"$(grep -n 'cost$' file),+25p\"", true),
+            ("sed -n \"$(grep -n ' -e' file),+25p\"", true),
+            // a quoted word before the producer hides the real command
+            ("sed -n \"$('foo' grep -n pat file),+25p\"", false),
+            // a dash-led affix becomes the flag when the leading expansion
+            // yields an EMPTY-bound value (the var vanishes, the affix leads)
+            ("X=; sed \"$X$(echo -i)foo\" 's/l/L/' t.txt", false),
+            ("X=; sed \"$X$(echo -i)/src\" 's/l/L/' t.txt", false),
+            // an empty-bound var behaves like unbound: a literal address
+            // affix stays an operand
+            ("X=; sed -n '1,25p' \"$X/src/lib.rs\"", true),
+            // ... but a substitution-leading rest is judged by whether it
+            // provably yields non-dash-leading output with an
+            // address-shaped/empty suffix
+            ("X=; sed -n '1,25p' \"$X$(grep -n pat file),+25p\"", true),
+            // grep without -n outputs raw file content (could be dash-leading)
+            ("sed -n \"$(grep pat file),+25p\"", false),
+            // quoted metacharacters inside the producer body stay a single
+            // pattern arg
+            ("sed -n \"$(grep -n '(a|b)' file),+25p\"", true),
+            // untracked values: special parameters and non-literal bindings
+            ("set -- -i; sed \"$@\" 's/a/b/' file", false),
+            ("X=$(echo -i); sed \"$X\" 's/a/b/' file", false),
+            ("X=-i; Y=\"$X\"; sed \"$Y\" 's/a/b/' file", false),
+            // unquoted whole-word substitutions are position-unprovable
+            ("sed $(echo '-i') file", false),
+            ("sed $(grep -n pat file) file", false),
+            // a substitution inside a dash-word hides -i
+            ("sed \"-$(echo i)\" file", false),
         ];
 
         run_cases(&cases);
@@ -5447,9 +6112,9 @@ mod tests {
             ("git -c user.name=me log", false),
             ("git -cfoo=bar status", false), // attached form
             ("git -pc status", false),       // cluster
-            ("git -C /tmp/repo status", false),
-            ("git -C/tmp/repo diff", false),   // attached form
-            ("git -pC /tmp/repo diff", false), // cluster
+            ("git -c x diff", false),        // -c injects config even with a trivial value
+            ("git -C /tmp/repo -c diff.external=/bin/echo diff", false), // -C repo redirect + -c config injection
+            ("git -pC /tmp/repo diff", false), // cluster (still over-rejected at subcommand extraction)
             // ── repo-redirect / config-injection long globals ──
             ("git --git-dir=/tmp/evil/.git diff", false),
             ("git --git-dir /tmp/evil status", false),
@@ -5457,6 +6122,12 @@ mod tests {
             ("git --config-env=core.fsmonitor=F status", false),
             ("git --config-file=/tmp/evil status", false),
             ("git --exec-path=/tmp/evil request-pull", false),
+            ("git --exec-path=/x status", false),
+            // GNU unambiguous abbreviations resolve to the same options
+            ("git --git-di=/tmp/evil status", false),
+            ("git --work-tre=/tmp/evil status", false),
+            ("git --config-en=core.fsmonitor=F status", false),
+            ("git --exec-pa=/tmp/evil request-pull", false),
             // ── exec flags (anywhere in the command; --no-* forms stay allowed) ──
             ("git diff --ext-diff", false),
             ("git diff --no-index --ext-diff /tmp/a /tmp/b", false),
@@ -5511,7 +6182,6 @@ mod tests {
             ("git help --m git", false),
             // ── full-path git (basename allowlist bypass) ──
             ("/usr/bin/git push", false),
-            ("/usr/bin/git -C /tmp status", false),
             // ── documented fail-closed over-rejections ──
             ("git grep -e '--ext-diff' pattern", false), // literal pattern
             ("git grep -e '-Ofoo' pattern", false),      // literal pattern
@@ -5582,6 +6252,14 @@ mod tests {
             // paginate globals (no c/C)
             ("git -p log", true),
             ("git -P log", true),
+            // -C repo redirect is now ALLOWED (its value is a plain directory,
+            // not config); the hostile-repo-config residual is unchanged and
+            // accepted, exactly as for a plain `git status` on a hostile repo.
+            ("git -C /tmp/repo status", true),
+            ("git -C/tmp/repo diff", true), // attached spelling — git itself errors on it, harmless
+            ("git -C /tmp/c-word status", true), // the -C value is never scanned for -c
+            ("git -C /tmp/repo log --oneline -5", true),
+            ("env GIT_PAGER=cat git -C /tmp/repo status", true),
             // GIT_PAGER carve-out (pager never spawns on piped stdout)
             ("GIT_PAGER=less git log", true),
             // quoted args that only look like flags (no backslash escapes)
@@ -5603,6 +6281,7 @@ mod tests {
             // absolute / relative paths
             ("/usr/bin/git init", false),
             ("/usr/bin/git status", true),
+            ("/usr/bin/git -C /tmp status", true), // -C repo redirect now allowed
             ("./git init", false),
             ("./git log", true),
             // quoted git and quotes inside the final path component are
@@ -5619,6 +6298,56 @@ mod tests {
             ("env /usr/bin/git push", false),
             // combined short-flag cluster through the same gate
             ("/usr/bin/git branch -df feature", false),
+        ];
+
+        run_cases(&cases);
+    }
+
+    /// A variable bound earlier in the invocation to a literal can stand in as
+    /// the command word (`BIN=git; "$BIN" status`); the resolved value flows
+    /// through the full gate exactly as if the command word were written
+    /// literally. Variable forms reach the guard at two sites — the verb
+    /// resolution (site 1, plain `"$BIN" ...`) and the stripped first-command
+    /// word (site 2, `env HOME=/tmp/x "$BIN" ...`). Substitution-derived,
+    /// transitive (`Y="$X"` where the stored value still contains `$X`),
+    /// unbound, loop-variable, and whitespace/glob-bearing bindings all stay
+    /// fail-closed.
+    #[test]
+    fn variable_command_word_bindings() {
+        let cases = [
+            // ── resolve a literal-bound variable as the command word ──
+            ("BIN=cargo; \"$BIN\" --list", true),
+            ("BIN=git; \"$BIN\" status", true),
+            ("BIN=git; \"${BIN}\" status", true), // braced form
+            ("BIN=git; ${BIN} status", true),     // unquoted form
+            ("BIN=/bin/echo; \"$BIN\" hi", true),
+            ("BIN=cargo; env HOME=/tmp/x \"$BIN\" --version", true), // site 2
+            // export binds too
+            ("export BIN=git; \"$BIN\" status", true),
+            // combines both features: resolved git + -C repo redirect
+            ("BIN=git; \"$BIN\" -C /tmp/repo status", true),
+            // literal temp-path rm stays allowed (indirection over a literal)
+            ("BIN=rm; \"$BIN\" -rf /tmp/x", true),
+            // ── fail-closed residuals ──
+            ("\"$BIN\" --list", false),                     // unbound
+            ("BIN=$(which cargo); \"$BIN\" --list", false), // substitution-derived
+            ("X=rm; Y=\"$X\"; \"$Y\" --version", false),    // transitive (poisoned var)
+            ("BIN=rm; \"$BIN\" -rf /__mahbot_readonly_test_ws__", false), // resolved mutator, non-temp
+            ("BIN=touch; \"$BIN\" /__mahbot_readonly_test_ws__/x", false), // resolved scratch mutator
+            ("BIN=git; \"$BIN\" -c diff.external=/bin/echo status", false), // resolved git still gated
+            // site-2 (prefix-wrapped) stays gated too — the segment is rebuilt
+            // so the git/mutator dispatcher sees the literal command name.
+            ("BIN=git; env HOME=/tmp/x \"$BIN\" status", true),
+            ("BIN=git; env HOME=/tmp/x \"$BIN\" commit -m x", false), // git mutation via env-wrapped var
+            ("BIN=rm; env HOME=/tmp/x \"$BIN\" -rf /tmp/x", true),    // site-2 temp rm
+            (
+                "BIN=rm; env HOME=/tmp/x \"$BIN\" -rf /__mahbot_readonly_test_ws__",
+                false,
+            ),
+            ("for f in a b; do \"$f\"; done", false), // loop vars are not bound
+            // single quotes are literal text — `'$BIN'` names a command
+            // literally spelled `$BIN`, nothing to resolve
+            ("BIN=git; '$BIN' status", false),
         ];
 
         run_cases(&cases);
@@ -6049,7 +6778,7 @@ mod tests {
             ("tee /tmp/x 3<< 'EOF'\nbody\nEOF", true),
             // ── Command substitutions in heredoc bodies ─────────────
             // Real bash executes `$(...)`/backticks inside UNQUOTED heredoc
-            // bodies, so those spans must remain scanned (reviewer round).
+            // bodies, so those spans must remain scanned.
             ("cat <<EOF\n$(touch workspace_file)\nEOF", false),
             ("cat <<EOF\n$(echo hi > workspace_file)\nEOF", false),
             ("cat <<EOF\n`touch workspace_file`\nEOF", false),
@@ -6182,10 +6911,9 @@ mod tests {
     // ── Phase 1.3×2 integration: substitution × cd/export state ──────────
 
     /// Substitutions must be validated with the state at their segment's
-    /// position — prior segments' `cd`/export bindings apply (reviewer round:
-    /// the upfront whole-string scan validated every substitution against the
-    /// initial state, leaving the poisoned-export bypass open and rejecting
-    /// legit temp writes after a `cd`).
+    /// position — prior segments' `cd`/export bindings apply. Validating every
+    /// substitution against the initial state would leave the poisoned-export
+    /// bypass open and reject legit temp writes after a `cd`.
     #[test]
     fn substitution_state_acceptance() {
         let cases = [
