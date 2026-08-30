@@ -295,8 +295,6 @@ pub(crate) struct RepairState<'a> {
     /// can never be placed in a group, so the DISPUTED render stays visible
     /// and `accepted_refs` never goes stale.
     pinned: HashSet<usize>,
-    /// Frozen groups already flagged contradiction — do-not-re-flag targets.
-    flagged: HashSet<usize>,
     /// First accepted summary (never revised).
     summary: Option<String>,
 }
@@ -309,7 +307,6 @@ impl<'a> RepairState<'a> {
             placed: HashSet::new(),
             references: Vec::new(),
             pinned: HashSet::new(),
-            flagged: HashSet::new(),
             summary: None,
         }
     }
@@ -485,9 +482,6 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
             for member in &group.members {
                 state.placed.extend(member.ids());
             }
-            if group.contradiction {
-                state.flagged.insert(state.frozen_groups.len());
-            }
             state.frozen_groups.push(group);
             outcome.froze += 1;
         } else {
@@ -527,7 +521,7 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
             );
             continue;
         }
-        if state.flagged.contains(&reference.group) {
+        if state.frozen_groups[reference.group].contradiction {
             continue; // cosmetic duplicate — never a rejection
         }
         if state
