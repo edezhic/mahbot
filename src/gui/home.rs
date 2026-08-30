@@ -23,10 +23,6 @@ use super::widgets::PickOption;
 /// Maximum number of message IDs to keep in the dedup set before pruning.
 const DEDUP_PRUNE_THRESHOLD: usize = 500;
 
-/// Gap between chat message bubbles, reused as the bottom padding of the
-/// Home chat input so the composer matches the inter-bubble spacing.
-const CHAT_BUBBLE_GAP: f32 = 12.0;
-
 /// Scrollable ID for the chat message list, used for snap-to-end after
 /// history loads.
 pub(super) const CHAT_SCROLL_ID: Id = Id::new("home_chat_scroll");
@@ -882,7 +878,7 @@ impl HomeState {
             container(
                 scrollable(
                     Column::with_children(children)
-                        .spacing(CHAT_BUBBLE_GAP)
+                        .spacing(super::widgets::CHAT_VERTICAL_RHYTHM)
                         .padding(8),
                 )
                 .id(CHAT_SCROLL_ID)
@@ -1019,8 +1015,7 @@ impl HomeState {
         // Composer strip matches the BG_BASE chat pane so the empty space around
         // the rounded bubble blends with the page instead of showing a gray panel;
         // the 8px horizontal padding matches the message-bubble column padding,
-        // and the bottom padding matches the inter-bubble gap so the composer
-        // doesn't hug the pane's bottom edge.
+        // and the bottom padding matches the shared chat vertical rhythm.
         // The bubble itself keeps its own elevated styling.
         let input_area: Element<'_, HomeMessage> = container(super::widgets::chat_composer(
             &self.editor_content,
@@ -1042,7 +1037,7 @@ impl HomeState {
             },
         ))
         .style(theme::base_container_style)
-        .padding(iced::Padding::from([0, 8]).bottom(CHAT_BUBBLE_GAP))
+        .padding(iced::Padding::from([0, 8]).bottom(super::widgets::CHAT_VERTICAL_RHYTHM))
         .width(Length::Fill)
         .into();
 

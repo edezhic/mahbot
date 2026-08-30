@@ -398,6 +398,11 @@ pub fn tab_scrollable<'a, Message: 'a>(
         .into()
 }
 
+/// Unified chat vertical rhythm: the composer's horizontal inset, reused
+/// as the Home inter-bubble gap, the Home composer's bottom padding, and
+/// the Sessions transcript inter-entry spacing.
+pub const CHAT_VERTICAL_RHYTHM: f32 = 8.0;
+
 /// Options for [`chat_composer`] that differ between the Home and Board
 /// pages. Bundled so the shared signature does not grow with page-specific
 /// knobs.

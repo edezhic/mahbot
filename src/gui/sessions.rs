@@ -969,7 +969,7 @@ fn render_transcript<'a>(
             .color(theme::TEXT_MUTED)
             .into();
     }
-    let mut items = Column::new().spacing(6);
+    let mut items = Column::new().spacing(widgets::CHAT_VERTICAL_RHYTHM);
     for i in 0..ctx.entries.len() {
         items = items.push(render_entry(ctx, i));
     }
