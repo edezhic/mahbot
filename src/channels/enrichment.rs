@@ -1152,10 +1152,10 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_non_artist_image_compressed_to_jpeg_data_uri() {
-        // Real 1500x1000 PNG: the longest side exceeds the 1024 px cap, so the
+        // Real 1100x800 PNG: the longest side exceeds the 1024 px cap, so the
         // ingestion-time re-encode must downscale it to a bounded JPEG while
         // the workspace copy stays the full-resolution original.
-        let source_bytes = real_png(1500, 1000);
+        let source_bytes = real_png(1100, 800);
         let tg_dir = std::env::temp_dir().join(crate::util::TELEGRAM_FILES_DIR);
         tokio::fs::create_dir_all(&tg_dir).await.unwrap();
         let tmp = tg_dir.join(format!("test_enrich_compress_{}.png", std::process::id()));

@@ -713,12 +713,14 @@ mod tests {
         let sessions = Arc::new(BackgroundSessions::default());
 
         let path = sessions
-            .launch("sleep 1", ws.as_path())
+            .launch("sleep 0.7", ws.as_path())
             .await
             .expect("launch succeeds");
 
         // Still running shortly after launch: no annotation, not finished.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The 250 ms launch probe elapses first, so the 50 ms check must land
+        // before the 700 ms command exits (400 ms margin).
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let out = read_file(&path);
         assert!(!out.contains("[exit status:"), "output before exit: {out}");
         assert!(

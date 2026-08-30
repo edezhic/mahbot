@@ -198,6 +198,12 @@ static AUDIO_OUTPUT_OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 pub(crate) static SPEAK_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Test-only: when set, [`ensure_audio_output()`] returns `false` without
+/// touching the OS audio device, so tests exercise dispatch logic without
+/// risking an environment-dependent device-open stall.
+#[cfg(test)]
+static TEST_AUDIO_DEVICE_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
 // ── TTS JSON config ───────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +318,10 @@ pub fn ensure_audio_output() -> bool {
     if AUDIO_OUTPUT.get().is_some() {
         return true;
     }
+    #[cfg(test)]
+    if TEST_AUDIO_DEVICE_SUPPRESSED.load(Ordering::Acquire) {
+        return false;
+    }
     // Serialize concurrent opens and re-check inside the guard: another thread
     // may have won the race and populated AUDIO_OUTPUT already.
     let _guard = AUDIO_OUTPUT_OPEN_LOCK.lock().unwrap_poison();
@@ -381,6 +391,27 @@ pub fn retry_download() -> bool {
 #[cfg(test)]
 pub(crate) fn test_set_state(state: u8) {
     STATE.store(ModelState::from_u8(state), Ordering::Release);
+}
+
+/// Test-only RAII guard: suppresses OS audio-device opens for its lifetime
+/// ([`ensure_audio_output()`] returns `false`), so a panicking test cannot
+/// leak the suppression into later tests.
+#[cfg(test)]
+struct SuppressAudioDeviceGuard;
+
+#[cfg(test)]
+impl SuppressAudioDeviceGuard {
+    fn new() -> Self {
+        TEST_AUDIO_DEVICE_SUPPRESSED.store(true, Ordering::Release);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SuppressAudioDeviceGuard {
+    fn drop(&mut self) {
+        TEST_AUDIO_DEVICE_SUPPRESSED.store(false, Ordering::Release);
+    }
 }
 
 /// Speak `text` with the default voice (M1).
@@ -2321,23 +2352,27 @@ mod tests {
         // Reset speak counter
         SPEAK_COUNT.store(0, Ordering::Release);
 
+        // Suppress OS audio-device open so this test exercises dispatch logic
+        // without touching the real CoreAudio device (environment-dependent stall).
+        let _audio_suppression = SuppressAudioDeviceGuard::new();
+
         // Start the listener
         init_listener();
 
         // Give the listener time to subscribe before we send
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         // Broadcast a matching event (Agent direction, gui channel, assistant role)
         broadcast_test_event(crate::ChatDirection::Agent, "gui", Some("assistant"));
 
         // Wait for the listener to process (up to 500ms total)
         let mut spoke = false;
-        for _ in 0..5 {
+        for _ in 0..25 {
             if SPEAK_COUNT.load(Ordering::Acquire) > 0 {
                 spoke = true;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
         assert!(
@@ -2345,7 +2380,8 @@ mod tests {
             "speak() should have been called after matching ChatEvent::Message"
         );
 
-        // Restore global state for other tests
+        // Restore global state for other tests (audio-device suppression is
+        // lifted by the guard's drop)
         STATE.store(prev_state, Ordering::Release);
     }
 
@@ -2371,7 +2407,9 @@ mod tests {
         // Broadcast the same matching event
         broadcast_test_event(crate::ChatDirection::Agent, "gui", Some("assistant"));
 
-        // Wait enough time for processing
+        // Wait enough time for processing (negative test — the wait is a
+        // conservative restore of the original 200 ms so a wrongly-called
+        // speak() is still observed even under heavy scheduling delay)
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         assert_eq!(

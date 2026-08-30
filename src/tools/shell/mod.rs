@@ -3720,7 +3720,7 @@ mod tests {
         let result = run_command_with_timeout(
             &mut cmd,
             Duration::from_secs(30),
-            Duration::from_millis(600),
+            Duration::from_millis(150),
         )
         .await;
         let ShellRunResult::DrainTimedOut {
@@ -3742,7 +3742,7 @@ mod tests {
         let msg = format_drain_timeout_error(
             "test",
             elapsed,
-            Duration::from_millis(600),
+            Duration::from_millis(150),
             None,
             &stdout,
             &stderr,
@@ -3777,7 +3777,7 @@ mod tests {
     #[tokio::test]
     async fn output_drain_completes_for_short_lived_background_job() {
         let dir = TempDir::new().expect("tempdir");
-        let mut cmd = build_shell_command("echo done; sleep 1 &", dir.path());
+        let mut cmd = build_shell_command("echo done; sleep 0.2 &", dir.path());
         let result =
             run_command_with_timeout(&mut cmd, Duration::from_secs(30), Duration::from_secs(5))
                 .await;
@@ -3800,7 +3800,7 @@ mod tests {
         let result = run_command_with_timeout(
             &mut cmd,
             Duration::from_secs(30),
-            Duration::from_millis(600),
+            Duration::from_millis(150),
         )
         .await;
         let ShellRunResult::DrainTimedOut { stdout, .. } = result else {

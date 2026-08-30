@@ -1131,9 +1131,10 @@ mod tests {
         )
         .unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Poll instead of a fixed sleep: the writer shares this runtime and
+        // its DB work can lag under load (see `wait_for_total`).
         drop(tx);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_for_total(&store, 2, std::time::Duration::from_secs(2)).await;
 
         let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
         assert_eq!(total, 2);

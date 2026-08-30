@@ -2307,22 +2307,23 @@ mod reference_image_tests {
 
     #[tokio::test]
     async fn over_cap_is_compressed_under_cap() {
+        const CAP: u64 = 500_000;
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("big.png");
-        let bytes = noisy_png(1376, 768);
+        let bytes = noisy_png(512, 512);
         assert!(
-            bytes.len() as u64 > 1_500_000,
+            bytes.len() as u64 > CAP,
             "noise PNG should exceed the cap (got {} bytes)",
             bytes.len()
         );
         std::fs::write(&path, &bytes).unwrap();
 
-        let img = load_reference_image(&path, 1_500_000).await.unwrap();
+        let img = load_reference_image(&path, CAP).await.unwrap();
         assert!(img.data_uri().starts_with("data:image/jpeg;base64,"));
         let decoded = STANDARD
             .decode(img.data_uri().split(',').nth(1).unwrap())
             .unwrap();
-        assert!(decoded.len() as u64 <= 1_500_000);
+        assert!(decoded.len() as u64 <= CAP);
     }
 
     #[tokio::test]

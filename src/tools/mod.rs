@@ -1054,7 +1054,7 @@ mod tests {
         const BUDGET: usize = 150_000;
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("ref.png");
-        std::fs::write(&path, crate::util::test::noisy_png(512, 512)).unwrap();
+        std::fs::write(&path, crate::util::test::noisy_png(384, 384)).unwrap();
         let mut refs = vec![
             crate::util::load_reference_image(&path, MAX_REFERENCE_IMAGE_BYTES)
                 .await
@@ -1066,7 +1066,7 @@ mod tests {
             "prompt": "test",
             "input_references": reference_json(&refs),
         });
-        // The per-image cap passes a 512×512 ref through unchanged (~1 MB
+        // The per-image cap passes a 384×384 ref through unchanged (~590 KB
         // base64 body); a small budget forces the aggregate ladder.
         assert!(serde_json::to_vec(&body).unwrap().len() > BUDGET);
         fit_request_body_budget(&mut body, &mut refs, BUDGET).unwrap();
@@ -1085,7 +1085,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let big = tmp.path().join("big.png");
         let small = tmp.path().join("small.png");
-        std::fs::write(&big, crate::util::test::noisy_png(640, 640)).unwrap();
+        std::fs::write(&big, crate::util::test::noisy_png(512, 512)).unwrap();
         std::fs::write(&small, crate::util::test::noisy_png(128, 128)).unwrap();
         let mut refs = vec![
             crate::util::load_reference_image(&big, MAX_REFERENCE_IMAGE_BYTES)

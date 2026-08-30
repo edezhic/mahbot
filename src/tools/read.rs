@@ -2364,7 +2364,7 @@ impl Baz {}
         let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
         assert_eq!(ret, 0, "mkfifo should succeed");
 
-        let result = read_fifo(&fifo_path, Duration::from_millis(300)).await;
+        let result = read_fifo(&fifo_path, Duration::from_millis(100)).await;
         let err = result.expect_err("no-writer FIFO must error");
         assert!(
             err.to_string().contains("no writer"),
