@@ -1795,9 +1795,10 @@ impl BoardState {
 
     /// Relative timestamp label falling back to the absolute format when the
     /// stored timestamp is unparseable ([`theme::format_relative_time`]
-    /// yields an empty string then).
-    fn relative_timestamp(ts: &str) -> String {
-        let relative = theme::format_relative_time(ts, chrono::Local::now());
+    /// yields an empty string then). Callers comparing multiple labels should
+    /// pass one shared `now` so the outcome is deterministic within a render.
+    fn relative_timestamp(ts: &str, now: chrono::DateTime<chrono::Local>) -> String {
+        let relative = theme::format_relative_time(ts, now);
         if relative.is_empty() {
             theme::format_timestamp(ts)
         } else {
@@ -1814,10 +1815,15 @@ impl BoardState {
         let actions = Self::available_actions(ticket.phase);
         let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
 
-        let created = Self::relative_timestamp(&ticket.created_at);
-        let updated = Self::relative_timestamp(&ticket.updated_at);
+        let now = chrono::Local::now();
+        let created = Self::relative_timestamp(&ticket.created_at, now);
+        let updated = Self::relative_timestamp(&ticket.updated_at, now);
 
-        let meta_els: Vec<Element<'_, BoardMessage>> = vec![
+        // Hide the updated label only when created renders non-empty and both
+        // display strings are identical (same relative bucket).
+        let show_updated = created.is_empty() || created != updated;
+
+        let mut meta_els: Vec<Element<'_, BoardMessage>> = vec![
             text(&ticket.id)
                 .size(12)
                 .color(theme::TEXT_SECONDARY)
@@ -1827,12 +1833,16 @@ impl BoardState {
                 .size(12)
                 .color(theme::TEXT_SECONDARY)
                 .into(),
-            text(" · ").size(12).color(theme::TEXT_SECONDARY).into(),
-            text(format!("Updated: {updated}"))
-                .size(12)
-                .color(theme::TEXT_SECONDARY)
-                .into(),
         ];
+        if show_updated {
+            meta_els.extend([
+                text(" · ").size(12).color(theme::TEXT_SECONDARY).into(),
+                text(format!("Updated: {updated}"))
+                    .size(12)
+                    .color(theme::TEXT_SECONDARY)
+                    .into(),
+            ]);
+        }
 
         let mut secondary: Vec<String> = Vec::new();
         if !ticket.prerequisites.is_empty() {
