@@ -342,7 +342,6 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
         "Reviewer",
         "failed",
         &job_id,
-        &ws,
     )
     .await;
 
@@ -407,7 +406,6 @@ async fn bounce_breaker_trips_to_failed() {
         "Reviewer",
         "failed",
         &job_id,
-        &ws,
     )
     .await;
 

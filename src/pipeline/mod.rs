@@ -1533,7 +1533,6 @@ async fn drain_queued_siblings(ticket: &Ticket) {
 /// to Failed (terminal); the phase job is deleted and the puller re-drives.
 /// On a non-exhausting bounce the ticket goes back to InDevelopment and the
 /// phase job is deleted so the puller creates a fresh engineer attempt.
-#[expect(clippy::too_many_arguments)]
 pub(crate) async fn bounce_to_development(
     ticket: &Ticket,
     source: TicketPhase,
@@ -1542,7 +1541,6 @@ pub(crate) async fn bounce_to_development(
     failure_role: &str,
     failure_comment: &str,
     job_id: &str,
-    _ws: &Workspace,
 ) -> FinalizeOutcome {
     let trip = bounce_exhausted(ticket.bounce_count);
     let target = if trip {

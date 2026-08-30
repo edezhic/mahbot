@@ -786,7 +786,6 @@ pub(crate) async fn process_verifier_verdicts(
         stage_name(verifier.role),
         &joint_comment,
         job_id,
-        ws,
     )
     .await;
     matches!(outcome, FinalizeOutcome::Applied)

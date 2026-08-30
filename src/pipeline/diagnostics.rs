@@ -105,12 +105,7 @@ async fn conclude_diagnostics_success(
 }
 
 /// Conclude a failed diagnostics run — unified bounce back to development.
-async fn conclude_diagnostics_failure(
-    ticket: &Ticket,
-    job_id: &str,
-    comment: &str,
-    ws: &Workspace,
-) {
+async fn conclude_diagnostics_failure(ticket: &Ticket, job_id: &str, comment: &str) {
     bounce_to_development(
         ticket,
         TicketPhase::InDiagnostics,
@@ -119,7 +114,6 @@ async fn conclude_diagnostics_failure(
         DIAGNOSTICS_ROLE,
         comment,
         job_id,
-        ws,
     )
     .await;
 }
@@ -163,7 +157,7 @@ async fn dispatch_diagnostics(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) 
                 )
                 .await;
             } else {
-                conclude_diagnostics_failure(&ticket, job_id, &comment, &ws).await;
+                conclude_diagnostics_failure(&ticket, job_id, &comment).await;
             }
         }
         Ok(_) => {

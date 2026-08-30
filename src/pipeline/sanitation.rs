@@ -340,7 +340,6 @@ async fn process_sanitation_verdict(
             Role::Sanitation.as_str(),
             &comment,
             job_id,
-            ws,
         )
         .await;
     }
