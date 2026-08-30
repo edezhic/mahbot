@@ -3,9 +3,9 @@ Read file contents with line numbers. Preferred over shell `cat` for reading fil
 When the path is a directory, the tool lists its contents (using `ls -lA`) instead of returning an error. The directory listing groups subdirectories and files with sizes and an extension summary. Note that `mode`, `offset`, and `limit` parameters only apply to file reads — they are silently ignored when a directory is passed.
 
 Modes:
-- `content` (default): Outputs an entire file or a range (using `offset`+`limit`) with line numbers. Handles any file type; binary files are read with lossy UTF-8 conversion. When the path is a directory, lists the directory contents.
-- `symbols`: Lists all AST-level symbols (functions, structs, impl blocks, etc.) with line ranges. Supports Rust, JavaScript/TypeScript, and Python files. Use this to get a quick overview of a file's structure.
-- `zoom`: Extract a single symbol's full source by name (requires `symbol` parameter). Use with the output of `symbols` mode to drill into specific definitions.
+- `content` (default): Outputs a file or a range (using `offset`+`limit`) with line numbers. Large outputs are truncated to a small budget (~5 KB) — for big files, read in slices with `offset`/`limit`, or navigate via `symbols`/`zoom`. Handles any file type; binary files are read with lossy UTF-8 conversion. When the path is a directory, lists the directory contents.
+- `symbols`: Lists all AST-level symbols (functions, structs, impl blocks, etc.) with line ranges — the quickest way to map a large file's structure without reading it whole. Works for supported code formats only (Rust, JS/TS, Python, Go, C, Ruby, SQL, Markdown, JSON, TOML, CSS, HTML, shell), not arbitrary formats.
+- `zoom`: Extract a single symbol's full source by name (requires `symbol` parameter). Same supported-formats limit as `symbols`. Use with the output of `symbols` mode to drill into specific definitions.
 
 When a content-mode path is a raster image (PNG, JPEG, or WebP), the tool reads and attaches it to the conversation as a native image the model can inspect, instead of returning lossy text. Other binary formats that cannot be decoded (e.g. GIF, BMP, HEIC) are reported as unsupported. Reading the same image twice returns a reference to the already-attached image rather than adding it again.
 

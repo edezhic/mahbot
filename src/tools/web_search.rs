@@ -403,11 +403,11 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The web search query"
+                    "description": "The web search query. Mutually exclusive with `expand` — pass exactly one per call."
                 },
                 "expand": {
                     "type": "integer",
-                    "description": "The expand id of a previous search result to retrieve full cached content. Provide this to expand a result instead of running a new search."
+                    "description": "Expand ID of a result from a previous search in this same session; retrieves its full cached text instead of running a new search."
                 }
             },
             "oneOf": [

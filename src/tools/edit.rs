@@ -31,7 +31,7 @@ impl Tool for EditTool {
             &json!({
                 "path": {
                     "type": "string",
-                    "description": "Path to the file. Relative paths resolve from workspace; absolute paths are validated against the workspace boundary."
+                    "description": "Path to the file (required on every call). Relative paths resolve from workspace; absolute paths are validated against the workspace boundary."
                 },
                 "old_string": {
                     "type": "string",

@@ -196,7 +196,7 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             "mode": {
                 "type": "string",
                 "enum": ["content", "symbols", "zoom"],
-                "description": "Read mode. 'content' (default): line-numbered file read, or — for a raster image (PNG, JPEG, WebP) — attaches it to the conversation as a native image rather than reading text. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name.",
+                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image rather than reading text. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
                 "default": "content"
             },
             "symbol": {
