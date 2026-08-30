@@ -412,8 +412,6 @@ pub enum SettingsMessage {
     TtsToggleResult(u64, Result<(), String>),
     /// Retry TTS model download after a permanent failure.
     TtsRetryModels,
-    /// Test TTS by speaking a test phrase aloud.
-    TtsTest,
     /// Request a toast notification from the dashboard.
     Toast(super::ToastMessage),
 }
@@ -1396,8 +1394,7 @@ impl SettingsState {
                 SettingsMessage::TtsToggleResult,
                 |enabled| {
                     if enabled {
-                        // Open the OS audio output device so the Test TTS button
-                        // and playback work immediately without a restart.
+                        // Open the OS audio output device so playback works immediately without a restart.
                         let _ = crate::audio::tts::ensure_audio_output();
                     }
                     // Toggle ON with uncached models triggers download (handles
@@ -1417,15 +1414,6 @@ impl SettingsState {
             ),
             SettingsMessage::TtsRetryModels => {
                 let _ = crate::audio::tts::retry_download();
-                Task::none()
-            }
-            SettingsMessage::TtsTest => {
-                if !crate::audio::tts::audio_output_ready() {
-                    return Task::done(SettingsMessage::Toast(super::ToastMessage::Warning(
-                        "Audio output device not available".to_string(),
-                    )));
-                }
-                crate::audio::tts::speak("This is a test of the text to speech system.");
                 Task::none()
             }
             SettingsMessage::StartVoiceEnrollment => {
@@ -3096,7 +3084,7 @@ impl SettingsState {
             }),
         );
 
-        // ── Row 3: Text to Speech (toggle + inline status + Test in one row) ──
+        // ── Row 3: Text to Speech (toggle + inline status in one row) ──
         let tts_enabled = self.config.tts_enabled.as_deref() == Some("true");
         let tts_ready = crate::audio::tts::models_ready();
         let tts_failed = crate::audio::tts::download_failed();
@@ -3130,22 +3118,12 @@ impl SettingsState {
         } else {
             Text::new("Downloading models…").size(13).into()
         };
-        let test_btn = button(Text::new("   Test TTS   ").size(13))
-            .style(theme::button_primary)
-            .padding(4)
-            .on_press_maybe(if tts_enabled && tts_ready {
-                Some(SettingsMessage::TtsTest)
-            } else {
-                None
-            });
         let tts_row = field_row(
             "Text to Speech",
             row![
                 toggler(tts_enabled).on_toggle(SettingsMessage::TtsToggle),
                 Space::new().width(12),
                 tts_status,
-                Space::new().width(12),
-                test_btn,
             ]
             .align_y(Alignment::Center)
             .into(),
