@@ -3,7 +3,7 @@
 //! both the Sessions page (full view) and the Running Agents page (compact).
 
 use iced::widget::{Column, Row, container, text, tooltip};
-use iced::{Alignment, Element};
+use iced::{Alignment, Element, Length};
 
 use iced_fonts::lucide;
 
@@ -142,9 +142,14 @@ fn tool_tooltip<Message: 'static>(tool: &RunningTool) -> Element<'static, Messag
 /// length ascending, shortest at top). Values are RAW and unscrubbed in both
 /// views — a deliberate, user-approved decision (local-first GUI; the durable
 /// stats logs stay scrubbed).
+///
+/// When `wrap` is true the args line word-or-glyph-wraps at the
+/// parent-constrained width instead of clipping on unbroken tokens; Running
+/// Agents passes false.
 pub(crate) fn tool_block<Message: 'static>(
     tool: &RunningTool,
     selectable: bool,
+    wrap: bool,
 ) -> Element<'static, Message> {
     let icon: Element<'static, Message> = lucide::wrench::<iced::Theme, iced::Renderer>()
         .size(11)
@@ -164,19 +169,35 @@ pub(crate) fn tool_block<Message: 'static>(
             .into()
     };
 
-    let mut line = Row::new().spacing(4).align_y(Alignment::Center).push(icon);
+    let align_y = if wrap {
+        Alignment::Start
+    } else {
+        Alignment::Center
+    };
+    let mut line = Row::new().spacing(4).align_y(align_y).push(icon);
     line = line.push(name);
 
     if !tool.args.is_empty() {
         let args: Element<'static, Message> = if selectable {
-            widgets::selectable_text(tool_pairs_line(&tool.args), theme::TEXT_SECONDARY)
-                .size(11)
-                .into()
+            let mut txt =
+                widgets::selectable_text(tool_pairs_line(&tool.args), theme::TEXT_SECONDARY)
+                    .size(11);
+            if wrap {
+                txt = txt
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph);
+            }
+            txt.into()
         } else {
-            text(tool_pairs_line(&tool.args))
+            let mut txt = text(tool_pairs_line(&tool.args))
                 .size(11)
-                .color(theme::TEXT_SECONDARY)
-                .into()
+                .color(theme::TEXT_SECONDARY);
+            if wrap {
+                txt = txt
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph);
+            }
+            txt.into()
         };
         line = line.push(args);
     }

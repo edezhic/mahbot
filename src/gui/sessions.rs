@@ -37,15 +37,14 @@ const BUBBLE_BODY_RATIO: f32 = 0.75;
 
 /// Shared transcript render context: the flat session ledger, its per-entry
 /// markdown bodies, the element expansion set, the collapse-measurement
-/// cache, and the two measurement widths (bubble body width for bubble
-/// content, full transcript width for full-width tool-round elements).
+/// cache, and the single text measurement width (bubble body width, used for
+/// all collapsible-element measurement).
 struct TranscriptCtx<'a> {
     entries: &'a [SessionEntry],
     entry_md: &'a [Option<Vec<markdown::Item>>],
     expanded: &'a HashSet<(usize, usize)>,
     measure_cache: &'a RefCell<HashMap<(usize, usize), MessageMeasure>>,
     text_width: f32,
-    full_width: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -534,20 +533,19 @@ impl SessionsState {
                 let measure_cache = &self.measure_cache;
                 let scrollable_id = self.scrollable_id.clone();
                 responsive(move |size| {
-                    // The transcript container adds 8px padding per side. Bubble
-                    // bodies measure at 3/4 of the row (FillPortion 3 of a 3:1
-                    // row) minus the bubble's own 10px padding per side, folded
-                    // in with a +4px safety margin, err toward collapse; tool
-                    // rounds render full-width and measure at the inner width.
-                    let full_width = (size.width - 16.0).max(0.0);
-                    let text_width = (full_width * BUBBLE_BODY_RATIO - 24.0).max(0.0);
+                    // The transcript container adds 8px padding per side. Every
+                    // transcript round (message or tool round) renders as a chat
+                    // bubble; all content measures at the bubble body width = 3/4
+                    // of the transcript row minus the bubble's 10px padding per
+                    // side, folded in with a +4px safety margin that errs toward
+                    // collapse.
+                    let text_width = ((size.width - 16.0) * BUBBLE_BODY_RATIO - 24.0).max(0.0);
                     let ctx = TranscriptCtx {
                         entries,
                         entry_md,
                         expanded,
                         measure_cache,
                         text_width,
-                        full_width,
                     };
                     container(render_transcript(&ctx, &scrollable_id))
                         .width(Length::Fill)
@@ -729,14 +727,18 @@ fn element_measurement(
 fn plain_collapsible<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
-    measure_width: f32,
     content: &'a str,
     color: iced::Color,
     leading_icon: Option<Element<'a, SessionsMessage>>,
 ) -> Element<'a, SessionsMessage> {
     let is_expanded = ctx.expanded.contains(&key);
-    let (wrapped_lines, preview) =
-        element_measurement(ctx.measure_cache, key, measure_width, !is_expanded, content);
+    let (wrapped_lines, preview) = element_measurement(
+        ctx.measure_cache,
+        key,
+        ctx.text_width,
+        !is_expanded,
+        content,
+    );
     let collapses = wrapped_lines > MAX_PREVIEW_LINES;
     let mut col = Column::new().spacing(2).width(Length::Fill);
 
@@ -768,12 +770,11 @@ fn plain_collapsible<'a>(
 }
 
 /// The collapsible Thinking block: lucide `brain` + "Thinking" header above a
-/// [`plain_collapsible`] body with the same 3-line collapse. `measure_width`
-/// is the width the body actually renders at (bubble body or full transcript).
+/// [`plain_collapsible`] body with the same 3-line collapse, measured at the
+/// bubble body width.
 fn thinking_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
-    measure_width: f32,
     content: &'a str,
 ) -> Element<'a, SessionsMessage> {
     let header = row![
@@ -784,25 +785,29 @@ fn thinking_block<'a>(
     ]
     .spacing(4)
     .align_y(Alignment::Center);
-    let body = plain_collapsible(ctx, key, measure_width, content, theme::TEXT_MUTED, None);
+    let body = plain_collapsible(ctx, key, content, theme::TEXT_MUTED, None);
     column![header, body].spacing(4).into()
 }
 
 /// The message/narration body with the 3-line collapse rule: a collapsed
 /// element shows a plain clickable preview; an expanded (or short) element
 /// shows the markdown body parsed from `md`. `content` is the plain text used
-/// for the collapse measurement (at `measure_width`); `md` is the parsed
+/// for the collapse measurement (at the bubble body width); `md` is the parsed
 /// markdown for the expanded view.
 fn body_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
-    measure_width: f32,
     content: &'a str,
     md: Option<&'a [markdown::Item]>,
 ) -> Element<'a, SessionsMessage> {
     let is_expanded = ctx.expanded.contains(&key);
-    let (wrapped_lines, preview) =
-        element_measurement(ctx.measure_cache, key, measure_width, !is_expanded, content);
+    let (wrapped_lines, preview) = element_measurement(
+        ctx.measure_cache,
+        key,
+        ctx.text_width,
+        !is_expanded,
+        content,
+    );
     let collapses = wrapped_lines > MAX_PREVIEW_LINES;
     let mut col = Column::new().spacing(2).width(Length::Fill);
 
@@ -831,8 +836,8 @@ fn body_block<'a>(
 
 /// The tool-call result block: lucide `arrow_down_to_line` prefix over the
 /// result content with the 3-line collapse. The result content is plain
-/// selectable text (tool output is not markdown). Results render full-width,
-/// so they measure at the full transcript width.
+/// selectable text (tool output is not markdown). Results render inside the
+/// assistant bubble, so they measure at the bubble body width.
 fn result_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
@@ -843,19 +848,12 @@ fn result_block<'a>(
             .size(11)
             .color(theme::TEXT_MUTED)
             .into();
-    plain_collapsible(
-        ctx,
-        key,
-        ctx.full_width,
-        result,
-        theme::TEXT_SECONDARY,
-        Some(icon),
-    )
+    plain_collapsible(ctx, key, result, theme::TEXT_SECONDARY, Some(icon))
 }
 
-/// Render one session round: the narration bubble (with its reasoning block
-/// inline when present), then one tool block per call with its collapsible
-/// result beneath.
+/// Render one session round as a single assistant bubble containing the
+/// reasoning block, the narration body, and one tool block per call with its
+/// collapsible result beneath.
 fn render_tool_round<'a>(
     ctx: &TranscriptCtx<'a>,
     i: usize,
@@ -864,20 +862,13 @@ fn render_tool_round<'a>(
     calls: &'a [ToolCallEntry],
 ) -> Element<'a, SessionsMessage> {
     let md = ctx.entry_md.get(i).and_then(|m| m.as_deref());
-    let mut col = Column::new().spacing(4);
+    let mut bubble_col = Column::new().spacing(4);
 
+    if let Some(reasoning) = reasoning {
+        bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), reasoning));
+    }
     if let Some(narration) = narration {
-        // Assistant bubble: reasoning sits inside the bubble when present.
-        let mut bubble_col = Column::new().spacing(4);
-        if let Some(reasoning) = reasoning {
-            bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), ctx.text_width, reasoning));
-        }
-        bubble_col = bubble_col.push(body_block(ctx, (i, 0), ctx.text_width, narration, md));
-        col = col.push(bubble_row(crate::ChatRole::Assistant, true, bubble_col));
-    } else if let Some(reasoning) = reasoning {
-        // No narration body: the reasoning block stands alone (full-width)
-        // above the tools.
-        col = col.push(thinking_block(ctx, (i, 1), ctx.full_width, reasoning));
+        bubble_col = bubble_col.push(body_block(ctx, (i, 0), narration, md));
     }
 
     for (j, call) in calls.iter().enumerate() {
@@ -886,32 +877,32 @@ fn render_tool_round<'a>(
         // target (toggling a short result's expansion would be a no-op).
         let collapses = call.result.as_deref().is_some_and(|result| {
             let (wrapped_lines, _) =
-                element_measurement(ctx.measure_cache, key, ctx.full_width, false, result);
+                element_measurement(ctx.measure_cache, key, ctx.text_width, false, result);
             wrapped_lines > MAX_PREVIEW_LINES
         });
         // The tool block is wrapped in a transparent mouse_area (not a
         // button) so the shared tool block's hover tooltip keeps working;
         // clicking anywhere toggles the associated result's collapse.
-        let tool_block = container(session_view::tool_block(&call.tool, true))
+        let tool_block = container(session_view::tool_block(&call.tool, true, true))
             .width(Length::Fill)
             .padding([2, 4]);
         if collapses {
             let tool_clickable: Element<'a, SessionsMessage> = mouse_area(tool_block)
                 .on_press(SessionsMessage::ToggleExpand(key.0, key.1))
                 .into();
-            col = col.push(tool_clickable);
+            bubble_col = bubble_col.push(tool_clickable);
         } else {
-            col = col.push(tool_block);
+            bubble_col = bubble_col.push(tool_block);
         }
 
         match call.result.as_deref() {
             Some(result) if !result.is_empty() => {
-                col = col.push(result_block(ctx, key, result));
+                bubble_col = bubble_col.push(result_block(ctx, key, result));
             }
             // Empty or missing ToolResult record: the old view's explicit
             // "(no result)" indicator.
             _ => {
-                col = col.push(
+                bubble_col = bubble_col.push(
                     row![
                         lucide::arrow_down_to_line::<iced::Theme, iced::Renderer>()
                             .size(11)
@@ -925,11 +916,14 @@ fn render_tool_round<'a>(
         }
     }
 
-    col.into()
+    // One bubble for the whole round, same container as assistant text rounds
+    // (right-aligned, 75% width, author label above).
+    bubble_row(crate::ChatRole::Assistant, true, bubble_col)
 }
 
-/// Render one ledger entry as a chat-bubble row (Message) or a round of
-/// tool blocks (ToolRound).
+/// Render one ledger entry as a chat-bubble row: a `Message` renders its own
+/// bubble, and a `ToolRound` renders a single assistant bubble containing the
+/// round's reasoning, narration, and tool calls with their results.
 fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMessage> {
     let md = ctx.entry_md.get(i).and_then(|m| m.as_deref());
     let entry = &ctx.entries[i];
@@ -942,10 +936,10 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMe
             let assistant = matches!(role, crate::ChatRole::Assistant);
             let mut bubble_col = Column::new().spacing(4);
             if let Some(thinking) = thinking {
-                bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), ctx.text_width, thinking));
+                bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), thinking));
             }
             if let Some(content) = content {
-                bubble_col = bubble_col.push(body_block(ctx, (i, 0), ctx.text_width, content, md));
+                bubble_col = bubble_col.push(body_block(ctx, (i, 0), content, md));
             }
             if thinking.is_some() || content.is_some() {
                 bubble_row(*role, assistant, bubble_col)

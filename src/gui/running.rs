@@ -734,7 +734,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     if let LiveStatus::Tools = status {
         let mut tools = Column::new().spacing(4).align_x(Alignment::Start);
         for tool in &h.current_tools {
-            tools = tools.push(tool_block(tool, false));
+            tools = tools.push(tool_block(tool, false, false));
         }
         content = content.push(tools);
     }
@@ -908,7 +908,7 @@ fn render_trace_group(
             );
         }
         for call in newest {
-            column = column.push(tool_block(call, false));
+            column = column.push(tool_block(call, false, false));
         }
     } else {
         column = column.push(
