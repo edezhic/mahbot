@@ -33,6 +33,7 @@ pub mod providers;
 pub(crate) mod research_cancel;
 pub mod research_cleanup;
 pub(crate) mod retry;
+pub(crate) mod runtime_events;
 pub mod search_engine;
 pub mod self_update;
 pub mod session;

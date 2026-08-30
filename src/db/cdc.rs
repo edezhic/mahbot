@@ -19,6 +19,13 @@
 //! subscribers, so a non-lossy subscriber (e.g. the chronicle) observes every
 //! tickets transition even when a broadcast receiver lags.
 //!
+//! The event DTOs ([`ChangeEvent`] and friends) are `pub` because
+//! [`ChangeEvent`] is part of the public GUI message surface
+//! (`gui::board::BoardMessage::TicketChanged`); the module itself is
+//! `pub(crate)`, so they are not nameable from outside the crate. The bin
+//! never touches `cdc` directly: warm-up goes through the `gui::init_*_tx()`
+//! wrappers.
+//!
 //! ## Pinned-engine caveat (turso `=0.7.2`)
 //!
 //! - CDC is per-connection and mutually exclusive with MVCC (mahbot is WAL, so
@@ -214,7 +221,17 @@ impl TableInfo {
 /// Cache of per-table [`TableInfo`], keyed by table name.
 static TABLE_INFO: OnceLock<Mutex<HashMap<String, TableInfo>>> = OnceLock::new();
 
-/// Registry of generic (non-tickets) per-table broadcast senders.
+/// Registry of generic per-table broadcast senders.
+///
+/// The drainer derives `subscribed_tables` from this map's keys and
+/// [`broadcast_event`] sends via it, so every consumed non-tickets table MUST
+/// have an entry here. The "workspaces" / "users" / "user_channels" tables have
+/// dedicated sender slots (for the GUI subscription helper) initialised through
+/// [`init_table_sender`], which keeps the slot and this map on the SAME channel —
+/// if they ever diverged, the drainer would prune rows without broadcasting (it
+/// derives `subscribed_tables` from [`TABLES`] keys and sends via the map).
+/// "tickets" is special-cased in [`subscribe`]/[`broadcast_event`] and does not
+/// use this map.
 static TABLES: OnceLock<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChangeEvent>>>> =
     OnceLock::new();
 
@@ -236,6 +253,74 @@ pub(crate) fn ticket_sender() -> &'static tokio::sync::broadcast::Sender<ChangeE
 pub(crate) fn ticket_sender_lock() -> &'static OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>>
 {
     &TICKET_SENDER
+}
+
+// Dedicated per-table sender slots for the GUI subscription helper. Each is
+// kept on the SAME channel as its [`TABLES`] registry entry (see
+// [`init_table_sender`] for the invariant).
+static WORKSPACE_SENDER: OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> = OnceLock::new();
+static USER_SENDER: OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> = OnceLock::new();
+static USER_CHANNEL_SENDER: OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> = OnceLock::new();
+
+/// Initialise the dedicated sender slot for `table` and register the SAME
+/// channel in [`TABLES`] so the drainer's `subscribed_tables` (derived from the
+/// [`TABLES`] keys) and [`broadcast_event`] (which sends via [`TABLES`]) see a
+/// subscriber. Both the dedicated slot and the registry MUST be the same channel:
+/// if they ever diverged, the drainer would prune rows without broadcasting. The
+/// slot is first-writer-wins (idempotent); the registry entry is (re)written to
+/// the slot's channel so the two can never drift.
+fn init_table_sender(
+    table: &'static str,
+    slot: &'static OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>>,
+) {
+    let tx = slot
+        .get_or_init(|| tokio::sync::broadcast::channel(CHANNEL_CAPACITY).0)
+        .clone();
+    TABLES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_poison()
+        .insert(table.to_string(), tx);
+}
+
+/// Warm the workspaces CDC sender before the iced application runs (same
+/// immediately-ending-stream rationale as the board sender) so the GUI's
+/// workspaces subscription always has a source. Called from `main`.
+pub(crate) fn init_workspace_tx() {
+    init_table_sender("workspaces", &WORKSPACE_SENDER);
+}
+
+/// Warm the users CDC sender before the iced application runs (same
+/// immediately-ending-stream rationale as the board sender). Called from `main`.
+pub(crate) fn init_users_tx() {
+    init_table_sender("users", &USER_SENDER);
+}
+
+/// Warm the user_channels CDC sender before the iced application runs (same
+/// immediately-ending-stream rationale as the board sender). Called from `main`.
+pub(crate) fn init_user_channels_tx() {
+    init_table_sender("user_channels", &USER_CHANNEL_SENDER);
+}
+
+/// The workspaces-table sender as a `OnceLock`, for `gui::common::broadcast_stream_producer`.
+#[must_use]
+pub(crate) fn workspace_sender_lock()
+-> &'static OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> {
+    &WORKSPACE_SENDER
+}
+
+/// The users-table sender as a `OnceLock`, for `gui::common::broadcast_stream_producer`.
+#[must_use]
+pub(crate) fn users_sender_lock() -> &'static OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>>
+{
+    &USER_SENDER
+}
+
+/// The user_channels-table sender as a `OnceLock`, for `gui::common::broadcast_stream_producer`.
+#[must_use]
+pub(crate) fn user_channels_sender_lock()
+-> &'static OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> {
+    &USER_CHANNEL_SENDER
 }
 
 /// A synchronous subscriber invoked by the drainer for each tickets change
@@ -263,9 +348,10 @@ pub(crate) fn register_ticket_materializer(
 
 /// Subscribe to change events for `table`. Multiple subscribers on the same table
 /// are independent; the sender is created on first subscribe. This is the general
-/// multi-table subscription entry point (currently only the tickets stream has
-/// production subscribers via the broadcast Sender); generic non-ticket tables
-/// will use it once a consumer exists, so it is kept crate-visible.
+/// multi-table subscription entry point (currently the tickets stream plus the
+/// three dedicated-sender tables — "workspaces", "users", "user_channels" — have
+/// production subscribers); generic non-ticket tables will use it once a consumer
+/// exists, so it is kept crate-visible.
 #[allow(dead_code)]
 pub(crate) fn subscribe(table: &str) -> tokio::sync::broadcast::Receiver<ChangeEvent> {
     if table == "tickets" {
@@ -619,5 +705,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining[0].get_value(0).unwrap().as_integer(), Some(&0));
+    }
+
+    #[test]
+    fn dedicated_cdc_senders_match_registry_channels() {
+        init_workspace_tx();
+        init_users_tx();
+        init_user_channels_tx();
+        let map = TABLES.get().expect("registry").lock().unwrap();
+        for (name, slot) in [
+            ("workspaces", workspace_sender_lock()),
+            ("users", users_sender_lock()),
+            ("user_channels", user_channels_sender_lock()),
+        ] {
+            let registered = map.get(name).expect("registered in TABLES");
+            let dedicated = slot.get().expect("warmed");
+            assert!(
+                registered.same_channel(dedicated),
+                "{name}: registry and dedicated sender must be the same channel \
+                 or the drainer prunes rows without broadcasting"
+            );
+        }
     }
 }

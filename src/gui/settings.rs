@@ -1503,9 +1503,9 @@ impl SettingsState {
             }
             SettingsMessage::AddWorkspaceResult(Ok(_ws)) => {
                 self.close_add_workspace_modal();
-                self.workspaces_state
-                    .refresh()
-                    .map(SettingsMessage::WorkspaceMsg)
+                // The list refresh is handled by the Dashboard's shared-map
+                // reload on this same result (see process_settings_message).
+                Task::none()
             }
             SettingsMessage::AddWorkspaceResult(Err(e)) => {
                 self.add_workspace_adding = false;
@@ -1784,9 +1784,7 @@ impl SettingsState {
 
         rows = widgets::push_error_banner(rows, ws.load_state.error());
 
-        if ws.load_state.loading() && !ws.load_state.has_loaded() {
-            rows = rows.push(widgets::loading_text());
-        } else if ws.workspaces.is_empty() {
+        if ws.workspaces.is_empty() {
             rows = rows.push(
                 text("No workspaces configured. Add one below.")
                     .size(12)
@@ -2198,9 +2196,7 @@ impl SettingsState {
 
         rows = widgets::push_error_banner(rows, us.load_state.error());
 
-        if us.load_state.loading() && !us.load_state.has_loaded() {
-            rows = rows.push(widgets::loading_text());
-        } else if us.users.is_empty() {
+        if us.users.is_empty() {
             rows = rows.push(
                 text("No users configured. Add one below.")
                     .size(12)
@@ -3027,8 +3023,9 @@ impl SettingsState {
         );
 
         // ── Row 2: Wake Word Detection (toggle gated on Transcription + live status) ──
-        // Live status: re-rendered every second by the dashboard tick, so the
-        // pipeline state (listening / enrolling / model error …) is current.
+        // Live status: voice status changes are broadcast as runtime-change
+        // events, so the rendered pipeline state (listening / enrolling /
+        // model error …) is current after each coalesced event.
         let wake_status: Element<'_, SettingsMessage> = match status.clone() {
             crate::audio::voice::VoiceStatus::Disabled => Text::new("Disabled")
                 .size(13)

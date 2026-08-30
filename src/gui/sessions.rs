@@ -59,10 +59,6 @@ pub(crate) enum SessionsMessage {
     ToggleExpand(usize, usize),
     AnimTick(Instant),
 
-    /// Auto-refresh the currently selected session's transcript.
-    AutoRefreshMessages,
-    /// Result of an auto-refresh message load.
-    AutoRefreshResult(String, Vec<ChatMessage>),
     /// Scroll position changed in the transcript viewport.
     ScrollChanged(scrollable::Viewport),
 
@@ -111,10 +107,9 @@ pub(crate) struct SessionsState {
     /// session switch.
     expanded: HashSet<(usize, usize)>,
     /// Per-element collapse measurement cache, keyed like `expanded`.
-    /// Survives the 1-second auto-refresh — session entries are append-only,
-    /// so an existing entry stays valid and only new elements are measured
-    /// lazily. Mutated during layout (the bubble width is only known there),
-    /// hence `RefCell`.
+    /// Session entries are append-only, so an existing entry stays valid and
+    /// only new elements are measured lazily. Mutated during layout (the
+    /// bubble width is only known there), hence `RefCell`.
     measure_cache: RefCell<HashMap<(usize, usize), MessageMeasure>>,
     /// Animated transition for selected row background.
     selected_anim: Animated<f32>,
@@ -123,16 +118,12 @@ pub(crate) struct SessionsState {
     /// animation is applied at widget-construction time outside the cache.
     cached_session_items: Option<Vec<CachedSessionItem>>,
 
-    // ── Auto-refresh fields ──────────────────────────────────────
+    // ── Transcript viewport fields ───────────────────────────────
     /// Stable scrollable ID for the transcript area, preserves scroll position
     /// across widget rebuilds.
     scrollable_id: Id,
     /// Whether auto-scroll-to-bottom is enabled (user is at or near the bottom).
     auto_scroll_enabled: bool,
-    /// Whether the Sessions page is currently visible (controls subscription).
-    page_active: bool,
-    /// Guard to prevent overlapping auto-refresh tasks.
-    messages_refreshing: bool,
 }
 
 impl SessionsState {
@@ -153,34 +144,18 @@ impl SessionsState {
             cached_session_items: None,
             scrollable_id: Id::new("session_transcript_scroll"),
             auto_scroll_enabled: false,
-            page_active: false,
-            messages_refreshing: false,
         }
     }
 
     pub(crate) fn subscription(&self) -> iced::Subscription<SessionsMessage> {
-        // Emit a 1-second timer for auto-refresh when the page is active and
-        // a session is selected. Frame ticks are subscribed only while the
-        // selection fade is animating — an always-on frames() subscription
-        // closes a self-sustaining redraw loop (redraw → AnimTick → redraw).
-        let mut subs: Vec<iced::Subscription<SessionsMessage>> = Vec::new();
-        if self.page_active && self.selected_session.is_some() {
-            subs.push(
-                iced::time::every(Duration::from_secs(1))
-                    .map(|_| SessionsMessage::AutoRefreshMessages),
-            );
-        }
+        // Frame ticks are subscribed only while the selection fade is
+        // animating — an always-on frames() subscription closes a
+        // self-sustaining redraw loop (redraw → AnimTick → redraw).
         if self.selected_anim.is_animating() {
-            subs.push(window::frames().map(SessionsMessage::AnimTick));
+            window::frames().map(SessionsMessage::AnimTick)
+        } else {
+            iced::Subscription::none()
         }
-        iced::Subscription::batch(subs)
-    }
-
-    /// Notify the sessions state whether the Sessions page is currently visible.
-    /// This controls the auto-refresh subscription — when the page is hidden,
-    /// polling stops.
-    pub(crate) fn set_page_active(&mut self, active: bool) {
-        self.page_active = active;
     }
 
     pub(crate) fn refresh() -> Task<SessionsMessage> {
@@ -197,7 +172,6 @@ impl SessionsState {
         )
     }
 
-    #[expect(clippy::too_many_lines)]
     pub(crate) fn update(&mut self, msg: SessionsMessage) -> Task<SessionsMessage> {
         match msg {
             SessionsMessage::AnimTick(instant) => {
@@ -231,8 +205,7 @@ impl SessionsState {
                 // previous transcript collapsed (cosmetic, error-path only).
                 // Do NOT set auto_scroll_enabled here — let ScrollChanged
                 // determine it from the user's scroll behavior. The initial
-                // snap to bottom happens eagerly in SessionMessages instead
-                // of being delayed to the next auto-refresh tick.
+                // snap to bottom happens eagerly in SessionMessages.
                 Task::perform(
                     async move {
                         let store = crate::session::store();
@@ -254,8 +227,7 @@ impl SessionsState {
                     self.measure_cache.borrow_mut().clear();
                     self.selected_loading = false;
                     // Snap to bottom so the user sees the most recent messages
-                    // immediately, rather than waiting for the next auto-refresh
-                    // tick (which would cause a delayed jump).
+                    // immediately.
                     return iced::widget::operation::snap_to_end(self.scrollable_id.clone());
                 }
                 Task::none()
@@ -263,50 +235,7 @@ impl SessionsState {
             SessionsMessage::SessionError(e) => {
                 self.load_state.fail(e);
                 self.selected_loading = false;
-                self.messages_refreshing = false;
                 Task::none()
-            }
-            SessionsMessage::AutoRefreshMessages => {
-                // Guard: skip if a refresh is already in-flight or no session selected.
-                if self.messages_refreshing {
-                    return Task::none();
-                }
-                let Some(key) = self.selected_session.clone() else {
-                    return Task::none();
-                };
-                self.messages_refreshing = true;
-                Task::perform(
-                    async move {
-                        let store = crate::session::store();
-                        let messages = store.load(&key).await;
-                        Ok::<_, String>((key, messages))
-                    },
-                    |res| match res {
-                        Ok((key, messages)) => SessionsMessage::AutoRefreshResult(key, messages),
-                        Err(e) => SessionsMessage::SessionError(e),
-                    },
-                )
-            }
-            SessionsMessage::AutoRefreshResult(key, messages) => {
-                // Stale guard: ignore results for a different (deselected/overwritten) session.
-                if self.selected_session.as_deref() != Some(&key) {
-                    self.messages_refreshing = false;
-                    return Task::none();
-                }
-                // Rebuild the ledger from the (append-only) message list.
-                self.entries = session_view::build_ledger(&messages);
-                self.entry_md = session_view::parse_entry_bodies(&self.entries);
-                // Incremental cache: session entries are append-only, so keep
-                // existing measurements and only add entries for new elements
-                // lazily.
-                self.messages_refreshing = false;
-
-                // Auto-scroll to bottom when the user is already at the bottom.
-                if self.auto_scroll_enabled {
-                    iced::widget::operation::snap_to_end(self.scrollable_id.clone())
-                } else {
-                    Task::none()
-                }
             }
             SessionsMessage::ScrollChanged(viewport) => {
                 let bounds = viewport.bounds();
@@ -370,7 +299,6 @@ impl SessionsState {
         self.entry_md.clear();
         self.selected_loading = false;
         self.expanded.clear();
-        self.messages_refreshing = false;
         self.auto_scroll_enabled = false;
         self.measure_cache.borrow_mut().clear();
         self.selected_anim.set_target(0.0);
@@ -673,8 +601,8 @@ fn toggle_button<'a>(is_expanded: bool, key: (usize, usize)) -> Element<'a, Sess
 
 /// Resolve the collapse measurement for an element at the current
 /// `text_width`, measuring on cache miss (cached per element and width; the
-/// session ledger is append-only, so a cached entry stays valid across the
-/// 1-second auto-refresh). Returns the wrapped-line count and — only when
+/// session ledger is append-only, so a cached entry stays valid). Returns the
+/// wrapped-line count and — only when
 /// `need_preview` is set (the element is currently collapsed) — its 3-line
 /// plain-text preview, so expanded elements do not pay a per-frame preview
 /// clone.

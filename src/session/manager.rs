@@ -22,6 +22,7 @@ use futures_util::future::join_all;
 
 use crate::pipeline::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
+use crate::runtime_events::RuntimeEvent;
 use crate::workspace::truncate_workspace_notes;
 
 use crate::agent::skills;
@@ -243,6 +244,9 @@ impl Session {
                 token_count: self.token_length,
             };
             holder.store(Arc::new(snapshot));
+            // Live transcript content changed → the Running Agents cards /
+            // footer need a re-render.
+            crate::runtime_events::publish(RuntimeEvent::Registries);
         }
     }
 

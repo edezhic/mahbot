@@ -58,6 +58,7 @@ use crate::audio::wake_word::{
 };
 use crate::config::{CONFIG, CONFIG_KEY_WAKE_WORD_TEMPLATES};
 use crate::db;
+use crate::runtime_events::RuntimeEvent;
 use crate::util::UnwrapPoison;
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -572,7 +573,7 @@ fn resolved_model_status(
 // Voice pipeline status (shared between pipeline task and GUI)
 
 /// Voice pipeline status.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VoiceStatus {
     Disabled,
     LoadingModels,
@@ -652,7 +653,7 @@ impl QualityLevel {
 }
 
 /// Per-utterance quality assessment result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UtteranceQuality {
     /// Composite quality score 0.0–1.0 (weighted combination of all factors).
     pub score: f32,
@@ -866,12 +867,24 @@ pub fn set_enabled(enabled: bool) {
     let mut state = voice_state().write().unwrap_poison();
     state.enabled = enabled;
     if !enabled {
-        state.status = VoiceStatus::Disabled;
+        set_status_and_notify(&mut state, VoiceStatus::Disabled);
     }
 }
 
 pub fn set_status(status: VoiceStatus) {
-    voice_state().write().unwrap_poison().status = status;
+    set_status_and_notify(&mut voice_state().write().unwrap_poison(), status);
+}
+
+/// Write a new pipeline status, broadcasting [`RuntimeEvent::VoiceStatus`] only
+/// when the value actually changed. The GUI coalesces the broadcast stream, but
+/// enrollment variants update per sample and would emit continuously — a
+/// no-op write is still worth skipping so the re-render only fires on a real
+/// status transition.
+fn set_status_and_notify(state: &mut VoicePipelineState, status: VoiceStatus) {
+    if state.status != status {
+        state.status = status;
+        crate::runtime_events::publish(RuntimeEvent::VoiceStatus);
+    }
 }
 
 /// The currently active wake word enrollment (prototype + calibration).

@@ -576,6 +576,15 @@ fn main() -> Result<()> {
     // subscription also has a source; otherwise it ends on the first frame and
     // the board freezes at the initial snapshot (Iced never re-spawns it).
     mahbot::gui::init_board_change_tx();
+    // Warm the CDC senders for the workspaces/users/user_channels subscriptions
+    // before the app runs (same immediately-ending-stream rationale as the
+    // board sender above).
+    mahbot::gui::init_workspace_tx();
+    mahbot::gui::init_users_tx();
+    mahbot::gui::init_user_channels_tx();
+    // The runtime-change broadcast (agent registry / transcript / voice status)
+    // must have a source before the iced app runs, same convention.
+    mahbot::gui::init_runtime_event_tx();
 
     iced::application(
         move || {

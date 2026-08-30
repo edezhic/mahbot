@@ -8,6 +8,11 @@
 //! [`AGENT_REGISTRY`]. The call tracking is purely observational — it carries
 //! no cancellation semantics and never affects call behavior, retries, or
 //! results.
+//!
+//! Every mutation that changes the live view (agent/call lifecycle, in-flight
+//! tool or activity instrumentation) publishes
+//! [`RuntimeEvent::Registries`](crate::runtime_events::RuntimeEvent::Registries)
+//! so the GUI re-renders — see the per-method broadcast points below.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,6 +20,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::runtime_events::{RuntimeEvent, publish};
 use crate::util::UnwrapPoison;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -260,6 +266,7 @@ impl AgentRegistry {
                 activity: None,
             },
         );
+        publish(RuntimeEvent::Registries);
         generation
     }
 
@@ -295,6 +302,7 @@ impl AgentRegistry {
                         args,
                     },
                 });
+                publish(RuntimeEvent::Registries);
             }
         }
         RunningToolGuard {
@@ -313,6 +321,7 @@ impl AgentRegistry {
             && let Some(pos) = entry.current_tools.iter().position(|t| t.id == tool_id)
         {
             entry.current_tools.remove(pos);
+            publish(RuntimeEvent::Registries);
         }
     }
 
@@ -338,6 +347,7 @@ impl AgentRegistry {
                 && entry.generation == generation
             {
                 entry.activity = Some(label.to_string());
+                publish(RuntimeEvent::Registries);
             }
         }
         ActivityGuard {
@@ -354,6 +364,7 @@ impl AgentRegistry {
             && entry.generation == generation
         {
             entry.activity = None;
+            publish(RuntimeEvent::Registries);
         }
     }
 
@@ -367,6 +378,7 @@ impl AgentRegistry {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.remove(agent_id) {
             entry.cancel_token.cancel();
+            publish(RuntimeEvent::Registries);
         }
     }
 
@@ -525,6 +537,7 @@ impl AgentRegistry {
             && entry.generation == generation
         {
             map.remove(agent_id);
+            publish(RuntimeEvent::Registries);
         }
     }
 }
@@ -634,6 +647,7 @@ impl NonAgentCallRegistry {
                 run_lifetime,
             },
         );
+        publish(RuntimeEvent::Registries);
         NonAgentCallGuard { id, registry: self }
     }
 
@@ -656,10 +670,23 @@ impl NonAgentCallRegistry {
     /// minutes mid-LLM-call).
     pub fn remove_by_parent_key(&self, parent: &ParentKey) {
         let parent = parent.clone();
-        self.inner
-            .lock()
-            .unwrap_poison()
-            .retain(|_, h| h.parent_key.as_ref() != Some(&parent));
+        let mut map = self.inner.lock().unwrap_poison();
+        let before = map.len();
+        map.retain(|_, h| h.parent_key.as_ref() != Some(&parent));
+        if map.len() != before {
+            publish(RuntimeEvent::Registries);
+        }
+    }
+
+    /// Remove a single in-flight call by id. Internal — the guard drop's sole
+    /// removal point, so a guard that already lost its entry to
+    /// [`Self::remove_by_parent_key`] is a no-op (and never re-broadcasts a
+    /// removal the bulk path already published).
+    fn remove_one(&self, id: u64) {
+        let removed = self.inner.lock().unwrap_poison().remove(&id).is_some();
+        if removed {
+            publish(RuntimeEvent::Registries);
+        }
     }
 }
 
@@ -671,7 +698,7 @@ pub(crate) struct NonAgentCallGuard {
 
 impl Drop for NonAgentCallGuard {
     fn drop(&mut self) {
-        self.registry.inner.lock().unwrap_poison().remove(&self.id);
+        self.registry.remove_one(self.id);
     }
 }
 

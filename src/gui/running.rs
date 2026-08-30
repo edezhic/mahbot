@@ -7,8 +7,9 @@
 //! (`AGENT_REGISTRY` and `NON_AGENT_CALLS`) plus the live transcript snapshots
 //! (`TRANSCRIPT_REGISTRY`), so it reflects the live in-memory conversation
 //! including the unpersisted tail. No database reads, no schema changes, no
-//! new subscriptions, no history retained between ticks. The existing 1-second
-//! UI tick re-renders the page, so the view refreshes at that cadence for free.
+//! history retained between ticks. Re-renders are driven by coalesced runtime
+//! change events (agent/non-agent registries, live transcript content, voice
+//! status) — the GUI refreshes as activity happens, not on a fixed cadence.
 //!
 //! Truthfulness rules:
 //! - The top status line shows what is running right now: the live activity
@@ -65,7 +66,9 @@ use iced::{Alignment, Element, Length};
 
 use iced_fonts::lucide;
 
-use super::{Message, WorkspaceInfo};
+use super::Message;
+
+use crate::Workspace;
 
 /// Maximum display length (Unicode chars) of an analyze/research group header
 /// label (the question/task text). Truncated at a word/path-delimiter boundary
@@ -121,10 +124,10 @@ pub(crate) enum RunningMessage {
 ///
 /// `expanded` is the dashboard's set of expanded agent cards, keyed by
 /// (agent_id, generation). Stale keys are pruned by the dashboard's
-/// [`process_tick`](super::Dashboard::process_tick) against the freshly-listed
-/// agents; rendering here only reads the set.
+/// `RuntimeChanged` handler against the freshly-listed agents; rendering here
+/// only reads the set.
 pub(crate) fn view(
-    workspaces: &HashMap<String, WorkspaceInfo>,
+    workspaces: &HashMap<String, Workspace>,
     pending_cancel: Option<&str>,
     expanded: &HashSet<(String, u64)>,
 ) -> Element<'static, Message> {
@@ -396,7 +399,7 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
 /// research runs → singletons → unattributed) via [`DisplayGroup::sort_key`].
 fn build_sections(
     groups: Vec<DisplayGroup>,
-    workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
+    workspaces: &std::collections::HashMap<String, Workspace>,
 ) -> Vec<WorkspaceSection> {
     let mut sections: Vec<WorkspaceSection> = Vec::new();
     for group in groups {
@@ -605,7 +608,7 @@ fn fallback_workspace_label(workspace: &str) -> String {
 /// "workspace" for an empty name.
 fn workspace_label_for(
     name: &str,
-    workspaces: &std::collections::HashMap<String, WorkspaceInfo>,
+    workspaces: &std::collections::HashMap<String, Workspace>,
 ) -> String {
     if name.is_empty() {
         "workspace".to_string()
@@ -1589,7 +1592,12 @@ mod tests {
         let mut ws_map = std::collections::HashMap::new();
         ws_map.insert(
             "ws2".to_string(),
-            WorkspaceInfo::test_new("/ws/ws2".to_string(), false, false),
+            Workspace {
+                path: "/ws/ws2".to_string(),
+                paused: false,
+                maintenance_enabled: false,
+                ..Default::default()
+            },
         );
         let agents = vec![
             agent_handle(

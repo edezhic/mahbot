@@ -51,14 +51,14 @@ pub enum BoardMessage {
     TicketUpserted(Ticket),
     TicketDetails(Box<Ticket>),
     DetailError(String),
-    /// Periodic re-fetch of the open ticket detail (see
+    /// CDC-driven re-fetch of the open ticket detail (see
     /// [`BoardState::refresh_selected_ticket`]). Carries the comment
     /// generation captured at dispatch so stale callbacks (modal closed
     /// or ticket switched while in flight) are dropped. Unlike
     /// `TicketDetails`, this is non-destructive: an in-progress comment
     /// draft survives.
     TicketDetailsRefreshed(u64, Box<Ticket>),
-    /// Periodic re-fetch of the open ticket detail failed. Carries the
+    /// CDC-driven re-fetch of the open ticket detail failed. Carries the
     /// generation for the same stale-callback detection as
     /// `TicketDetailsRefreshed`. Kept separate from `DetailError` so a
     /// stale refresh error cannot clear `selected_loading` mid-open.
@@ -386,8 +386,10 @@ impl BoardState {
     ///   watermark: `change_id` is a WAL `NewRowid` that restarts after
     ///   `turso_cdc` is fully pruned, so a watermark would silently drop deltas.
     /// - If the changed ticket is the open detail modal and its `updated_at`
-    ///   moved, the modal detail is re-refreshed (comments live on a separate
-    ///   table the board list does not load).
+    ///   moved, the modal detail is re-refreshed. Comment inserts bump
+    ///   `tickets.updated_at` (see `add_comment_tx`), so a tickets delta fires
+    ///   for comment activity and this re-refresh covers it; the board LIST
+    ///   does not load comment content (`LoadComments::No`).
     fn apply_ticket_change(&mut self, event: &crate::db::cdc::ChangeEvent) -> Task<BoardMessage> {
         use crate::db::cdc::ChangeType;
         let Some(id) = event.ticket_id().map(str::to_string) else {
@@ -552,15 +554,15 @@ impl BoardState {
         }
     }
 
-    /// Re-fetch the currently open ticket detail (periodic refresh).
+    /// Re-fetch the currently open ticket detail (CDC-driven refresh).
     ///
     /// Fired alongside the ticket-list refresh so an open ticket window
     /// always shows the latest phase/comments without close/reopen.
     /// No-ops while the initial modal load is in flight, while a comment
     /// send is in progress (the DB snapshot would predate the optimistic
     /// comment push — `CommentSent` refetches on completion), or while a
-    /// previous periodic refresh is still in flight (so an older snapshot
-    /// cannot land after a newer one on slow reads).
+    /// previous refresh is still in flight (so an older snapshot cannot
+    /// land after a newer one on slow reads).
     ///
     /// Carries the comment generation captured at dispatch; the
     /// [`BoardMessage::TicketDetailsRefreshed`] handler drops stale
@@ -601,9 +603,9 @@ impl BoardState {
     /// - a commit hash that appeared or changed triggers a fresh stats
     ///   fetch (gated on the new hash being `Some`, so a hash can never
     ///   leave the loading state stuck),
-    /// - an unchanged hash keeps the already-loaded stats (the periodic
-    ///   refresh runs every second — unconditional fetches would hammer
-    ///   the git CLI and flash "Loading commit stats" each tick),
+    /// - an unchanged hash keeps the already-loaded stats (the refresh is
+    ///   event-driven — unconditional fetches would hammer the git CLI and
+    ///   flash "Loading commit stats" each refresh),
     /// - no hash clears stale stats and any stuck loading flag.
     ///
     /// Returns the task to run (stats fetch or none). Callers must have
@@ -953,7 +955,7 @@ impl BoardState {
             }
             BoardMessage::TicketDetailsRefreshed(generation, ticket) => {
                 let ticket = *ticket;
-                // The fetch completed — allow the next periodic refresh.
+                // The fetch completed — allow the next refresh.
                 self.detail_refresh_in_flight = false;
                 // Stale callback: the modal closed or the user switched
                 // tickets while this fetch was in flight.
@@ -979,7 +981,7 @@ impl BoardState {
                     return Task::none();
                 }
                 // Keep the last known good detail visible; the next
-                // periodic refresh retries. Unlike `DetailError`, this
+                // refresh retries. Unlike `DetailError`, this
                 // never clears `selected_loading`.
                 self.detail_error = Some(e);
                 Task::none()
@@ -1352,10 +1354,10 @@ impl BoardState {
                         // Debounce: wait 300ms before executing the FTS query
                         // so rapid typing doesn't trigger per-keystroke DB hits.
                         //
-                        // Effective latency is 300–1300ms depending on Tick
-                        // timing (the 1-second Iced Tick that drives view
-                        // updates acts as the lower bound for the next render
-                        // after results arrive). In-flight tasks from earlier
+                        // Effective latency is ~300ms plus the render after
+                        // results arrive — the results render as soon as their
+                        // message is delivered, so the debounce is the dominant
+                        // wait. In-flight tasks from earlier
                         // keystrokes are NOT cancelled — they run to completion
                         // and their results are discarded by the generation
                         // counter guard below. For typical typing speeds this
@@ -2438,11 +2440,11 @@ mod tests {
         assert_eq!(
             state.comment_input.text(),
             "draft comment",
-            "an in-progress comment draft must survive the periodic refresh"
+            "an in-progress comment draft must survive the refresh"
         );
         assert_eq!(
             state.comment_generation, gen_before,
-            "periodic refresh must not bump the generation (would invalidate in-flight callbacks)"
+            "the refresh must not bump the generation (would invalidate in-flight callbacks)"
         );
         assert!(!state.sending_comment);
         assert!(!state.commit_stats_loading);
@@ -2597,13 +2599,13 @@ mod tests {
         ));
         assert!(!state.detail_refresh_in_flight);
 
-        // Initial modal load in flight → no periodic refresh dispatched.
+        // Initial modal load in flight → no refresh dispatched.
         let mut state = make_board_state();
         state.selected_loading = true;
         let _task = state.refresh_selected_ticket();
         assert!(!state.detail_refresh_in_flight);
 
-        // Comment send in flight → no periodic refresh dispatched.
+        // Comment send in flight → no refresh dispatched.
         let mut state = make_board_state();
         state.sending_comment = true;
         let _task = state.refresh_selected_ticket();
@@ -2867,10 +2869,10 @@ mod tests {
     #[test]
     fn test_request_cancel_eligibility_source_precedence() {
         // The eligibility check uses the freshest synchronous state:
-        // `selected_ticket` (a fresh fetch, per-second refresh even during
-        // search), then search results (the exact cards the user sees while
-        // a search is active), then the board list. A stale lower-priority
-        // source must not decide the modal.
+        // `selected_ticket` (a fresh fetch, kept current by the CDC-driven
+        // detail refresh even during search), then search results (the exact
+        // cards the user sees while a search is active), then the board list.
+        // A stale lower-priority source must not decide the modal.
         let mut state = make_board_state(); // selected_ticket: T-1, Backlog, no assignee
         state.tickets = vec![make_ticket("T-1", TicketPhase::InDevelopment)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));

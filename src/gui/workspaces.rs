@@ -53,8 +53,6 @@ pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)] // ContextKind is deliberately pub(crate) (see gui/mod.rs Message)
 pub enum WorkspacesMessage {
-    Refreshed(Vec<Workspace>),
-    RefreshError(String),
     DeleteWorkspace(String),
     ConfirmDelete(String),
     CancelDelete,
@@ -176,22 +174,6 @@ impl WorkspacesState {
         }
     }
 
-    #[allow(clippy::unused_self)]
-    pub fn refresh(&self) -> Task<WorkspacesMessage> {
-        Task::perform(
-            async {
-                crate::workspace::store()
-                    .list()
-                    .await
-                    .map_err(|e| e.to_string())
-            },
-            |res| match res {
-                Ok(ws_list) => WorkspacesMessage::Refreshed(ws_list),
-                Err(e) => WorkspacesMessage::RefreshError(e),
-            },
-        )
-    }
-
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: WorkspacesMessage) -> Task<WorkspacesMessage> {
         // Allow match_same_arms: separate error variants that happen to share the
@@ -199,15 +181,6 @@ impl WorkspacesState {
         // info). Narrowing per-arm would duplicate the handler across variants.
         #[expect(clippy::match_same_arms)]
         match msg {
-            WorkspacesMessage::Refreshed(ws_list) => {
-                self.workspaces = ws_list;
-                self.load_state.finish_loading();
-                Task::none()
-            }
-            WorkspacesMessage::RefreshError(e) => {
-                self.load_state.fail(e);
-                Task::none()
-            }
             WorkspacesMessage::DeleteWorkspace(name) => {
                 self.delete_target = Some(name);
                 Task::none()
@@ -229,10 +202,12 @@ impl WorkspacesState {
                 self.delete_target = None;
                 Task::none()
             }
+            // Successful mutations are refreshed by the Dashboard's shared-map
+            // reload (see process_settings_message) — no local store read.
             WorkspacesMessage::DeleteResult(Ok(())) => {
                 self.deleting = false;
                 self.load_state.clear_error();
-                self.refresh()
+                Task::none()
             }
             WorkspacesMessage::DeleteResult(Err(e)) => {
                 self.deleting = false;
@@ -248,7 +223,7 @@ impl WorkspacesState {
                 },
                 WorkspacesMessage::ReanalyzeResult,
             ),
-            WorkspacesMessage::ReanalyzeResult(Ok(())) => self.refresh(),
+            WorkspacesMessage::ReanalyzeResult(Ok(())) => Task::none(),
             WorkspacesMessage::ReanalyzeResult(Err(e)) => {
                 self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
@@ -262,7 +237,7 @@ impl WorkspacesState {
                 },
                 WorkspacesMessage::ToggleResult,
             ),
-            WorkspacesMessage::ToggleResult(Ok(())) => self.refresh(),
+            WorkspacesMessage::ToggleResult(Ok(())) => Task::none(),
             WorkspacesMessage::ToggleResult(Err(e)) => {
                 self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
@@ -279,15 +254,12 @@ impl WorkspacesState {
                     move |result| WorkspacesMessage::PauseResult(name2, paused, result),
                 )
             }
-            WorkspacesMessage::PauseResult(name, paused, Ok(())) => Task::batch([
-                self.refresh(),
-                Task::done(WorkspacesMessage::Toast(super::ToastMessage::SuccessMsg(
-                    format!(
-                        "Pipeline {} for {name}",
-                        if paused { "paused" } else { "resumed" }
-                    ),
+            WorkspacesMessage::PauseResult(name, paused, Ok(())) => Task::done(
+                WorkspacesMessage::Toast(super::ToastMessage::SuccessMsg(format!(
+                    "Pipeline {} for {name}",
+                    if paused { "paused" } else { "resumed" }
                 ))),
-            ]),
+            ),
             WorkspacesMessage::PauseResult(_, _, Err(e)) => {
                 self.load_state.fail(e.clone());
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
@@ -433,7 +405,7 @@ impl WorkspacesState {
                 self.diagnostics_busy = false;
                 self.diagnostics_edit_buffers.remove(&name);
                 self.diagnostics_modal = None;
-                self.refresh()
+                Task::none()
             }
             WorkspacesMessage::DiagnosticsSaved(_name, Err(e)) => {
                 self.diagnostics_busy = false;
@@ -459,7 +431,7 @@ impl WorkspacesState {
                 self.diagnostics_busy = false;
                 self.diagnostics_modal = None;
                 self.diagnostics_edit_buffers.remove(&name);
-                self.refresh()
+                Task::none()
             }
             WorkspacesMessage::RediscoverDiagnosticsResult(_name, Err(e)) => {
                 self.diagnostics_busy = false;
@@ -551,7 +523,7 @@ impl WorkspacesState {
                 self.notes_open.remove(&name);
                 self.notes_editor_content.remove(&name);
                 self.notes_undo.remove(&name);
-                self.refresh()
+                Task::none()
             }
             WorkspacesMessage::NotesSaved(_name, Err(e)) => {
                 self.load_state.fail(e.clone());

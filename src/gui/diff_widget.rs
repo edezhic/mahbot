@@ -21,8 +21,8 @@
 //!
 //! ## Shape cache and viewport culling
 //!
-//! Shaping a large diff is expensive, and the UI rebuilds every second
-//! (auto-refresh tick) plus on many interactions. The shaped
+//! Shaping a large diff is expensive, and the UI rebuilds on the diff
+//! modal's auto-refresh tick plus on many interactions. The shaped
 //! [`cosmic_text::Buffer`] is therefore cached in widget state, keyed on a
 //! content fingerprint plus the text-area width (see [`ShapeCacheKey`]);
 //! unchanged content reuses the cached buffer instead of re-shaping. `draw()`

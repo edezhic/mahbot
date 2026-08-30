@@ -3,6 +3,7 @@
 use iced::Task;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 use super::editor_widget::{CursorState, EditorAction, EditorBuffer};
@@ -488,6 +489,82 @@ where
     )
 }
 
+/// Coalescing broadcast-stream producer: collapses bursts of broadcast events
+/// into a single trailing message per `window`. The first event anchors a
+/// deadline; every event arriving before it (including a `Lagged` slot, which
+/// means events were lost and counts as "changed") is absorbed; at the
+/// deadline exactly one message is emitted via `make_msg`. A `Lagged` error is
+/// treated as an event, never as end-of-stream. Ends only when the channel
+/// closes. Used for high-frequency GUI refresh signals (agent registry /
+/// transcript content / voice status) where only "something changed" matters.
+pub(crate) fn coalesced_broadcast_producer<Msg, T>(
+    capacity: usize,
+    source: &'static std::sync::OnceLock<tokio::sync::broadcast::Sender<T>>,
+    window: Duration,
+    make_msg: impl Fn() -> Msg + Send + 'static,
+) -> impl futures_util::Stream<Item = Msg>
+where
+    Msg: Send + 'static,
+    T: Clone + Send + 'static,
+{
+    iced::stream::channel(
+        capacity,
+        move |output: iced::futures::channel::mpsc::Sender<Msg>| async move {
+            let Some(rx) = source.get().and_then(|tx| {
+                if tx.receiver_count() > 100 {
+                    None
+                } else {
+                    Some(tx.subscribe())
+                }
+            }) else {
+                return;
+            };
+            coalesce_loop(rx, output, window, make_msg).await;
+        },
+    )
+}
+
+/// The coalescing body of [`coalesced_broadcast_producer`], extracted so it can
+/// be driven directly in tests without an iced stream channel.
+async fn coalesce_loop<Msg, T, F>(
+    mut rx: broadcast::Receiver<T>,
+    mut output: iced::futures::channel::mpsc::Sender<Msg>,
+    window: Duration,
+    make_msg: F,
+) where
+    Msg: Send,
+    T: Clone + Send,
+    F: Fn() -> Msg + Send,
+{
+    loop {
+        // First event anchors a batch. A Lagged slot means events were lost and
+        // still counts as a change, so it anchors a batch too.
+        match rx.recv().await {
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                let deadline = tokio::time::Instant::now() + window;
+                loop {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(deadline) => {
+                            let _ = futures_util::SinkExt::send(&mut output, make_msg()).await;
+                            break;
+                        }
+                        recv = rx.recv() => {
+                            match recv {
+                                // Absorb into the current batch; keep batching
+                                // until the deadline fires.
+                                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                // Source gone — no more changes will arrive.
+                                Err(broadcast::error::RecvError::Closed) => return,
+                            }
+                        }
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
 /// Apply a text-editor action to a buffer: edit actions snapshot the
 /// pre-edit state for undo, then the action is performed. The editor widget
 /// publishes every action (cursor movement, click positioning, edit), so
@@ -753,5 +830,38 @@ mod tests {
         assert!(result.is_err() && !fired, "in-flight first: silent noop");
         let (fired, result) = run_guard(&text, true, false);
         assert!(result.is_err() && fired, "toast fires over-limit first");
+    }
+
+    #[tokio::test]
+    async fn coalesce_loop_batches_burst() {
+        use futures_util::StreamExt;
+
+        let (tx, rx) = broadcast::channel::<()>(16);
+        let (out_tx, mut out_rx) = iced::futures::channel::mpsc::channel::<u32>(16);
+        let window = Duration::from_millis(50);
+        let handle = tokio::spawn(coalesce_loop(rx, out_tx, window, || 1u32));
+
+        // A burst of 5 events within one window collapses to a single message.
+        for _ in 0..5 {
+            let _ = tx.send(());
+        }
+        let first = tokio::time::timeout(Duration::from_secs(1), out_rx.next())
+            .await
+            .expect("burst should flush within the timeout");
+        assert_eq!(first, Some(1));
+
+        // A single event after a flush is still delivered (a deregister
+        // coalesced with transcript traffic must not be lost).
+        let _ = tx.send(());
+        let second = tokio::time::timeout(Duration::from_secs(1), out_rx.next())
+            .await
+            .expect("trailing event should flush within the timeout");
+        assert_eq!(second, Some(1));
+
+        // Drop the only source to close the channel; the loop then ends.
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("loop should end when the source closes");
     }
 }

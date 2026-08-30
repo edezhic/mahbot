@@ -63,16 +63,6 @@ crate::columns! {
     }
 }
 
-// ── Workspace state list column constants ────────────────────────────
-
-crate::columns! {
-    WS_STATE_COLUMNS [WSST] {
-        NAME         => "name",
-        PAUSED       => "paused",
-        MAINTENANCE_ENABLED => "maintenance",
-    }
-}
-
 /// Generation counter metadata: DB column name and log label.
 #[derive(Clone, Copy)]
 struct GenerationColumn {
@@ -1036,27 +1026,6 @@ impl WorkspaceStore {
                 workspace_from_row,
             )
             .await
-    }
-
-    /// Lightweight fetch of only name, paused, and maintenance_enabled columns.
-    /// Used by the GUI sidebar's periodic state refresh — avoids fetching
-    /// all workspace columns when only toggle state is needed.
-    pub async fn list_states(&self) -> Result<Vec<(String, bool, bool)>> {
-        let rows = self
-            .conn
-            .query(
-                &format!("SELECT {WS_STATE_COLUMNS} FROM workspaces ORDER BY name"),
-                db::params![],
-            )
-            .await?;
-        let mut states = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let name: String = row.get(COL_WSST_NAME)?;
-            let paused: bool = row.get(COL_WSST_PAUSED)?;
-            let maintenance_enabled: bool = row.get(COL_WSST_MAINTENANCE_ENABLED)?;
-            states.push((name, paused, maintenance_enabled));
-        }
-        Ok(states)
     }
 
     /// Look up a workspace by name.
@@ -2069,39 +2038,6 @@ mod tests {
             ws.notes,
             "é".repeat(MAX_WORKSPACE_NOTES_CHARS),
             "Notes content should match truncated (multi-byte, no broken chars)"
-        );
-    }
-
-    #[tokio::test]
-    async fn list_states_returns_name_paused_maintenance() {
-        let (store, _tmp) = test_store().await;
-
-        // Insert two workspaces with different toggle states.
-        insert_direct(&store, "alice", "/tmp/alice", true, false, 0, 0).await;
-        store.set_maintenance_enabled("alice", false).await.unwrap();
-
-        insert_direct(&store, "bob", "/tmp/bob", false, false, 0, 0).await;
-        store.set_maintenance_enabled("bob", true).await.unwrap();
-
-        let states = store.list_states().await.expect("list_states");
-        assert_eq!(states.len(), 2, "Should return both workspaces");
-
-        // Build a map for assertion.
-        let mut map: std::collections::HashMap<&str, (bool, bool)> =
-            std::collections::HashMap::new();
-        for (name, paused, maintenance_enabled) in &states {
-            map.insert(name.as_str(), (*paused, *maintenance_enabled));
-        }
-
-        assert_eq!(
-            map.get("alice").copied(),
-            Some((true, false)),
-            "Alice: paused=true, maintenance_enabled=false"
-        );
-        assert_eq!(
-            map.get("bob").copied(),
-            Some((false, true)),
-            "Bob: paused=false, maintenance_enabled=true"
         );
     }
 

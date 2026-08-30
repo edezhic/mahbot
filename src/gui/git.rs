@@ -45,12 +45,19 @@ fn file_change_tx() -> &'static tokio::sync::broadcast::Sender<()> {
 /// subprocess batch per interval.
 const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(300);
 
-/// Interval between periodic remote syncs (behind/ahead + `git fetch`).
-const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Interval between periodic remote syncs (behind/ahead + `git fetch`). The
+/// standalone remote-sync subscription fires [`GitMessage::PeriodicSyncTick`]
+/// at this cadence.
+pub(crate) const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Non-blocking retry window for registering the file-change watch while the
 /// watcher is not ready (initial scan) or the engine is not yet created.
 const WATCH_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
+/// Non-blocking retry cadence, within the bounded [`WATCH_RETRY_WINDOW`], for
+/// the scoped self-rescheduling watch-retry timer (matches the previous
+/// per-tick retry cadence).
+const WATCH_RETRY_POLL: Duration = Duration::from_secs(1);
 
 /// Git state owned by the Dashboard.
 ///
@@ -100,16 +107,19 @@ pub struct GitState {
     /// coalescing bursts of file-change events.
     last_local_refresh: Option<Instant>,
     /// A file-change event arrived during the throttle window and a local
-    /// refresh is still owed; fired by the next tick once the window elapses.
+    /// refresh is still owed; fired by the scoped deferred-refresh timer once
+    /// the window elapses.
     local_refresh_pending: bool,
     /// When the last remote sync (behind/ahead + fetch) ran. Only updated by an
-    /// actual remote sync — a workspace switch alone does not defer the timer.
+    /// actual remote sync — a workspace switch alone does not defer the periodic
+    /// timer.
     last_remote_refresh: Option<Instant>,
     /// The active file-change watch subscription id. `Some` only when a watch
     /// was successfully registered on the current workspace's picker.
     watch_id: Option<WatchId>,
     /// Registration of the file-change watch failed (watcher not ready, or the
-    /// engine not created yet) — retried non-blocking on each tick.
+    /// engine not created yet) — retried non-blocking by a scoped
+    /// self-rescheduling timer within [`WATCH_RETRY_WINDOW`].
     watch_pending: bool,
     /// Bounded window for [`Self::watch_pending`] retries; after it elapses the
     /// watch is abandoned in favour of the timer fallback.
@@ -150,6 +160,25 @@ pub enum GitMessage {
     /// Carries the repo path so the footer refresh is applied only when it
     /// matches the currently-viewed workspace.
     PipelineCommit(PathBuf),
+
+    // ── Self-driven timers ──────────────────────────────────────
+    /// Periodic 60s tick from the standalone remote-sync subscription. Runs the
+    /// behind/ahead + `git fetch` sync and also refreshes the local footer — the
+    /// recovery path for ref-only/commit-only changes (bare commit, fetch, push,
+    /// `checkout -c`) that produce no file-change event. Runs for every
+    /// workspace, watched or not.
+    PeriodicSyncTick,
+    /// Fired by the scoped self-rescheduling timer armed when a file-change event
+    /// was deferred by the 300ms local-refresh throttle. Fires the owed local
+    /// refresh, or reschedules itself when a newer event restarted the throttle
+    /// window. A stale timer firing with no owed refresh is a no-op.
+    DeferredLocalRefresh,
+    /// Fired by the scoped self-rescheduling 1s retry timer while a file-change
+    /// watch registration is pending (watcher not ready / engine not created).
+    /// Retries within the bounded [`WATCH_RETRY_WINDOW`]; abandons the watch in
+    /// favour of the periodic timer when the window elapses. No-op when nothing
+    /// is pending.
+    WatchRetryTick,
 
     // ── Branch listing ──────────────────────────────────────────
     /// Result of listing local branches.
@@ -261,7 +290,7 @@ impl GitState {
     /// Clear all cached git info (diff stats, branch, behind/ahead, modal).
     /// Does **not** clear `workspace_path`, `workspace_name`, the watch state,
     /// or the refresh throttle/timer state — those are managed explicitly by
-    /// [`Self::set_workspace_path`] / [`Self::update_tick`]. Bumps both
+    /// [`Self::set_workspace_path`] and the periodic/deferred timers. Bumps both
     /// generations so refresh results still in flight for the previous state
     /// are discarded as stale.
     pub fn clear(&mut self) {
@@ -281,8 +310,8 @@ impl GitState {
     /// Set the workspace name and filesystem path, and trigger an eager refresh
     /// of git info (diff stats, branch, behind/ahead for the new workspace).
     /// Clears all cached state first and re-registers the file-change watch for
-    /// the new workspace (best-effort; retried by the tick if the watcher is
-    /// not ready yet).
+    /// the new workspace (best-effort; retried by a self-rescheduling timer if
+    /// the watcher is not ready yet).
     ///
     /// `name` is `None` for Personal/unnamed workspaces, which have no search
     /// engine subscribe to and therefore fall back to the periodic timer.
@@ -306,8 +335,9 @@ impl GitState {
         self.local_refresh_pending = false;
         self.watch_pending = false;
         self.watch_retry_deadline = None;
-        // Register the file-change watch (best-effort, retried on tick).
-        self.try_register_watch();
+        // Register the file-change watch (best-effort; retried by a
+        // self-rescheduling timer while the watcher is not ready yet).
+        let watch_task = self.try_register_watch();
         match &self.workspace_path {
             Some(p) => {
                 // Mark the local throttle as just-refreshed so a watcher echo of
@@ -317,9 +347,10 @@ impl GitState {
                 Task::batch([
                     Self::refresh_local(p.clone(), self.local_generation),
                     Self::refresh_remote(p.clone(), self.remote_generation, false),
+                    watch_task,
                 ])
             }
-            None => Task::none(),
+            None => watch_task,
         }
     }
 
@@ -370,6 +401,94 @@ impl GitState {
                 // not trigger a needless git subprocess batch.
                 if self.workspace_path.as_deref() == Some(path.as_path()) {
                     self.refresh_after_git_op()
+                } else {
+                    Task::none()
+                }
+            }
+
+            // ── Self-driven timers (replacing the dashboard tick) ───
+            GitMessage::PeriodicSyncTick => {
+                // Periodic remote sync (behind/ahead + fetch). The timer also
+                // refreshes the local footer (diff stats + branch) so
+                // ref-only/commit-only changes that never reach the file
+                // watcher still surface here, for every workspace. Clearing an
+                // owed event-driven refresh avoids a redundant deferred-local
+                // refresh firing right after the periodic one.
+                let now = Instant::now();
+                if self
+                    .last_remote_refresh
+                    .is_none_or(|t| now.duration_since(t) >= REMOTE_REFRESH_INTERVAL)
+                {
+                    self.last_remote_refresh = Some(now);
+                    self.local_generation += 1;
+                    self.remote_generation += 1;
+                    self.last_local_refresh = Some(now);
+                    self.local_refresh_pending = false;
+                    if let Some(path) = self.workspace_path.clone() {
+                        Task::batch([
+                            Self::refresh_local(path.clone(), self.local_generation),
+                            Self::refresh_remote(path, self.remote_generation, true),
+                        ])
+                    } else {
+                        Task::none()
+                    }
+                } else {
+                    Task::none()
+                }
+            }
+            GitMessage::DeferredLocalRefresh => {
+                // Overlapping timers are safe: the pending flag makes a stale
+                // firing a no-op, so only the timer responsible for the owed
+                // refresh acts.
+                if !self.local_refresh_pending {
+                    return Task::none();
+                }
+                let now = Instant::now();
+                match self.fire_local_refresh(now) {
+                    Some(task) => task,
+                    None if self.workspace_path.is_none() => {
+                        // No workspace to refresh — the owed refresh is
+                        // unreachable.
+                        self.local_refresh_pending = false;
+                        Task::none()
+                    }
+                    None => {
+                        // A newer event restarted the throttle window —
+                        // reschedule.
+                        let remaining = LOCAL_REFRESH_MIN_INTERVAL
+                            .saturating_sub(
+                                now.duration_since(
+                                    self.last_local_refresh
+                                        .expect("window not elapsed implies throttle set"),
+                                ),
+                            )
+                            .max(Duration::from_millis(1));
+                        Task::perform(
+                            // Sleep constructed lazily at first poll (inside
+                            // the async block) — creating it eagerly here
+                            // would panic off the tokio runtime context.
+                            async move { tokio::time::sleep(remaining).await },
+                            |()| GitMessage::DeferredLocalRefresh,
+                        )
+                    }
+                }
+            }
+            GitMessage::WatchRetryTick => {
+                // A stale retry firing with nothing pending is a no-op.
+                if !self.watch_pending {
+                    return Task::none();
+                }
+                let now = Instant::now();
+                // Once the bounded retry window elapses (or is unanchored),
+                // abandon the watch in favour of the periodic timer fallback.
+                if self.watch_retry_deadline.is_none_or(|d| now >= d) {
+                    self.watch_pending = false;
+                    self.watch_retry_deadline = None;
+                    return Task::none();
+                }
+                let task = self.try_register_watch();
+                if self.watch_pending {
+                    task
                 } else {
                     Task::none()
                 }
@@ -559,66 +678,6 @@ impl GitState {
         }
     }
 
-    // ── Tick ──────────────────────────────────────────────────────
-
-    /// Called every second from the Dashboard's [`super::Message::Tick`]
-    /// handler.
-    ///
-    /// Fires a coalesced event-driven local refresh when its throttle window
-    /// has elapsed, and runs the periodic remote sync (behind/ahead + `git
-    /// fetch`) every [`REMOTE_REFRESH_INTERVAL`]. The periodic timer also
-    /// refreshes the local footer — it is the recovery path for ref-only/
-    /// commit-only changes (a bare commit, fetch, push or `checkout -c` from
-    /// HEAD) that produce no file-change event, so it runs for every workspace,
-    /// watched or not.
-    pub fn update_tick(&mut self) -> Task<GitMessage> {
-        let now = Instant::now();
-        let mut tasks: Vec<Task<GitMessage>> = Vec::new();
-
-        // Retry a watch registration that failed (watcher not ready, or the
-        // engine not created yet) — non-blocking, within a bounded window.
-        if self.watch_pending {
-            if self.watch_retry_deadline.is_some_and(|d| now < d) {
-                self.try_register_watch();
-            } else {
-                self.watch_pending = false;
-                self.watch_retry_deadline = None;
-            }
-        }
-
-        // Periodic remote sync (behind/ahead + fetch). The timer also refreshes
-        // the local footer (diff stats + branch) so ref-only/commit-only changes
-        // that never reach the file watcher still surface here, for every
-        // workspace. Clearing an owed event-driven refresh avoids a redundant
-        // local refresh later in this same tick.
-        if self
-            .last_remote_refresh
-            .is_none_or(|t| now.duration_since(t) >= REMOTE_REFRESH_INTERVAL)
-        {
-            self.last_remote_refresh = Some(now);
-            self.local_generation += 1;
-            self.remote_generation += 1;
-            self.last_local_refresh = Some(now);
-            self.local_refresh_pending = false;
-            if let Some(path) = self.workspace_path.clone() {
-                tasks.push(Self::refresh_local(path.clone(), self.local_generation));
-                tasks.push(Self::refresh_remote(path, self.remote_generation, true));
-            }
-        }
-
-        // Fire a coalesced event-driven local refresh once its throttle window
-        // elapses — the periodic refresh above only runs every
-        // [`REMOTE_REFRESH_INTERVAL`], not every tick, so an owed file-change
-        // refresh is honoured here.
-        if self.local_refresh_pending
-            && let Some(task) = self.fire_local_refresh(now)
-        {
-            tasks.push(task);
-        }
-
-        Task::batch(tasks)
-    }
-
     // ── View ──────────────────────────────────────────────────────
 
     /// Render the branch management dialog content (search, branch list,
@@ -728,6 +787,18 @@ async fn with_ws_path<T>(
     }
 }
 
+/// Self-rescheduling task that fires [`GitMessage::WatchRetryTick`] after
+/// [`WATCH_RETRY_POLL`] — the non-blocking retry cadence for a pending watch
+/// registration.
+fn watch_retry_task() -> Task<GitMessage> {
+    // Sleep built lazily at first poll — eager construction would panic off
+    // the tokio runtime context (see the deferred-refresh timer).
+    Task::perform(
+        async move { tokio::time::sleep(WATCH_RETRY_POLL).await },
+        |()| GitMessage::WatchRetryTick,
+    )
+}
+
 impl GitState {
     /// Spawn two parallel async tasks to refresh the local working-tree state
     /// (diff stats + current branch). Results carry `generation` and are applied
@@ -791,17 +862,30 @@ impl GitState {
 
     /// Handle a workspace file-change event: coalesce bursts into at most one
     /// local refresh per [`LOCAL_REFRESH_MIN_INTERVAL`]. If the throttle window
-    /// has elapsed, refresh now; otherwise mark the refresh as owed and let the
-    /// next tick fire it.
+    /// has elapsed, refresh now; otherwise mark the refresh as owed and arm a
+    /// scoped deferred-refresh timer to fire it once the window elapses.
     fn on_file_changed(&mut self) -> Task<GitMessage> {
         let now = Instant::now();
         match self.fire_local_refresh(now) {
             Some(task) => task,
             None if self.workspace_path.is_some() => {
                 // The throttle window has not elapsed — mark the refresh as owed
-                // and let the next tick fire it (after the window elapses).
+                // and arm a scoped deferred-refresh timer to fire it once the
+                // window elapses.
                 self.local_refresh_pending = true;
-                Task::none()
+                let remaining = LOCAL_REFRESH_MIN_INTERVAL
+                    .saturating_sub(
+                        now.duration_since(
+                            self.last_local_refresh
+                                .expect("window not elapsed implies throttle set"),
+                        ),
+                    )
+                    .max(Duration::from_millis(1));
+                Task::perform(
+                    // Sleep built lazily at first poll (see watch_retry_task).
+                    async move { tokio::time::sleep(remaining).await },
+                    |()| GitMessage::DeferredLocalRefresh,
+                )
             }
             None => Task::none(),
         }
@@ -811,7 +895,7 @@ impl GitState {
     /// has elapsed: record the throttle, clear any owed refresh, bump the local
     /// generation, and spawn the refresh task. Returns [`None`] when the window
     /// has not elapsed (or there is no workspace path), leaving any owed refresh
-    /// pending for a later tick.
+    /// pending for the scoped deferred-refresh timer.
     fn fire_local_refresh(&mut self, now: Instant) -> Option<Task<GitMessage>> {
         if self
             .last_local_refresh
@@ -866,15 +950,16 @@ impl GitState {
 
     /// Register the file-change watch on the current workspace's picker. Reuses
     /// an existing engine — never creates one as a side effect. A `WatcherNotReady`
-    /// (initial scan) or missing engine sets [`Self::watch_pending`] so the tick
-    /// retries non-blocking within a bounded window; any other failure falls back
-    /// to the timer.
-    fn try_register_watch(&mut self) {
+    /// (initial scan) or missing engine sets [`Self::watch_pending`] and returns a
+    /// self-rescheduling retry timer that fires [`GitMessage::WatchRetryTick`] after
+    /// [`WATCH_RETRY_POLL`], within a bounded window; any other failure falls back
+    /// to the periodic timer.
+    fn try_register_watch(&mut self) -> Task<GitMessage> {
         self.watch_pending = false;
 
         let (Some(name), Some(_path)) = (&self.workspace_name, &self.workspace_path) else {
             // Personal/unnamed or no filesystem path — timer fallback.
-            return;
+            return Task::none();
         };
         let Some(entry) = crate::search_engine::get_engine_by_name(name) else {
             // Engine not created yet; retry once it appears (eager scan/search).
@@ -884,7 +969,7 @@ impl GitState {
             if self.watch_retry_deadline.is_none() {
                 self.watch_retry_deadline = Some(Instant::now() + WATCH_RETRY_WINDOW);
             }
-            return;
+            return watch_retry_task();
         };
 
         let picker = entry.picker.clone();
@@ -900,16 +985,19 @@ impl GitState {
             Ok(id) => {
                 self.watch_id = Some(id);
                 self.watch_retry_deadline = None;
+                Task::none()
             }
             Err(FffError::WatcherNotReady) => {
                 self.watch_pending = true;
                 if self.watch_retry_deadline.is_none() {
                     self.watch_retry_deadline = Some(Instant::now() + WATCH_RETRY_WINDOW);
                 }
+                watch_retry_task()
             }
             Err(_) => {
                 // WatcherDisabled or another error — rely on the timer fallback.
                 self.watch_retry_deadline = None;
+                Task::none()
             }
         }
     }
@@ -1079,20 +1167,20 @@ mod tests {
     // ── Periodic remote sync and timer fallback ──────────────────
 
     #[test]
-    fn test_update_tick_runs_remote_sync_no_watch_fallback() {
+    fn test_periodic_sync_tick_runs_full_refresh_no_watch_fallback() {
         let mut s = GitState::new();
         s.workspace_path = Some(PathBuf::from("/nonexistent"));
-        // No watch and no prior remote sync → the timer runs a full refresh.
+        // No watch and no prior remote sync → the periodic timer runs a full refresh.
         let before_local = s.local_generation;
         let before_remote = s.remote_generation;
-        let _ = s.update_tick();
+        let _ = s.update(GitMessage::PeriodicSyncTick);
         assert_eq!(s.local_generation, before_local + 1);
         assert_eq!(s.remote_generation, before_remote + 1);
         assert!(s.last_remote_refresh.is_some());
     }
 
     #[test]
-    fn test_update_tick_watched_runs_full_refresh_on_timer() {
+    fn test_periodic_sync_watched_runs_full_refresh() {
         let mut s = GitState::new();
         s.workspace_path = Some(PathBuf::from("/nonexistent"));
         // Simulate an active watch: no pending local refresh and no prior
@@ -1100,7 +1188,7 @@ mod tests {
         s.watch_id = Some(WatchId(1));
         let before_local = s.local_generation;
         let before_remote = s.remote_generation;
-        let _ = s.update_tick();
+        let _ = s.update(GitMessage::PeriodicSyncTick);
         // The periodic timer is the recovery path for ref-only/commit-only
         // changes (which produce no file-change event), so it refreshes local
         // (diff stats + branch) and remote (behind/ahead + fetch) even for a
@@ -1112,21 +1200,74 @@ mod tests {
     }
 
     #[test]
-    fn test_update_tick_fires_pending_local_after_window() {
+    fn test_deferred_local_refresh_fires_after_window() {
         let mut s = GitState::new();
         s.workspace_path = Some(PathBuf::from("/nonexistent"));
-        s.watch_id = Some(WatchId(1));
         s.local_refresh_pending = true;
         s.last_local_refresh = Some(Instant::now() - Duration::from_secs(2));
-        // A recent remote sync keeps the periodic branch quiet this tick, so
-        // only the owed event-driven local refresh fires.
+        // A recent remote sync means the periodic timer is quiet — only the owed
+        // event-driven local refresh acts, leaving the remote generation alone.
         s.last_remote_refresh = Some(Instant::now());
         let before_local = s.local_generation;
         let before_remote = s.remote_generation;
-        let _ = s.update_tick();
+        let _ = s.update(GitMessage::DeferredLocalRefresh);
+        // The throttle window has elapsed — the owed event-driven local refresh
+        // fires (local generation bumps). The remote generation is untouched.
         assert!(!s.local_refresh_pending);
         assert_eq!(s.local_generation, before_local + 1);
         assert_eq!(s.remote_generation, before_remote);
+    }
+
+    #[test]
+    fn test_deferred_local_refresh_within_window_reschedules() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        // Simulate an event deferred within the throttle window.
+        s.last_local_refresh = Some(Instant::now());
+        s.local_refresh_pending = true;
+        let before = s.local_generation;
+        let _ = s.update(GitMessage::DeferredLocalRefresh);
+        // A newer event restarted the throttle window — the owed refresh stays
+        // pending and the timer reschedules itself (the returned Task is opaque).
+        assert!(s.local_refresh_pending);
+        assert_eq!(s.local_generation, before);
+    }
+
+    #[test]
+    fn test_deferred_local_refresh_without_pending_is_noop() {
+        let mut s = GitState::new();
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        // Stale timestamps but nothing owed — a stale timer firing is a no-op.
+        s.last_local_refresh = Some(Instant::now() - Duration::from_secs(10));
+        let before = s.local_generation;
+        let _ = s.update(GitMessage::DeferredLocalRefresh);
+        assert!(!s.local_refresh_pending);
+        assert_eq!(s.local_generation, before);
+    }
+
+    // ── Watch registration retry loop ─────────────────────────────
+
+    #[test]
+    fn test_watch_retry_loop_rearms_while_pending() {
+        let mut s = GitState::new();
+        s.workspace_name = Some("no-such-engine".into());
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        // First registration attempt: no engine under that name → pending,
+        // the 30s window is anchored, and a re-arm task is scheduled.
+        let _ = s.try_register_watch();
+        assert!(s.watch_pending);
+        assert!(s.watch_retry_deadline.is_some());
+        // A retry tick before the deadline re-attempts; the engine is still
+        // missing, so the loop re-arms (the returned task is the next timer).
+        let _ = s.update(GitMessage::WatchRetryTick);
+        assert!(s.watch_pending);
+        assert!(s.watch_retry_deadline.is_some());
+        // Deadline elapsed → the loop abandons the watch in favour of the
+        // periodic timer fallback and stops re-arming.
+        s.watch_retry_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let _ = s.update(GitMessage::WatchRetryTick);
+        assert!(!s.watch_pending);
+        assert!(s.watch_retry_deadline.is_none());
     }
 
     #[test]

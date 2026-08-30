@@ -45,6 +45,7 @@ use iced::window;
 use iced::{Alignment, Color, Element, Length, Task};
 
 use crate::Role;
+use crate::Workspace;
 use crate::audio::voice::VoiceStatus;
 
 use self::menus::ContextMenu;
@@ -64,8 +65,16 @@ pub const JETBRAINS_MONO: iced::Font = iced::Font {
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::broadcast;
+
+use futures_util::StreamExt;
+
+/// Coalescing window for runtime-change re-renders. Bounds re-render frequency
+/// for per-message / per-tool-call broadcasts while keeping the Running Agents
+/// cards and footer responsive.
+const RUNTIME_REFRESH_COALESCE: Duration = Duration::from_millis(250);
 
 // ── Global log broadcast for live streaming ──────────────────────
 
@@ -94,6 +103,32 @@ pub fn init_git_commit_tx() {
 /// from `main` before `iced::application(...).run()`.
 pub fn init_board_change_tx() {
     let _ = crate::db::cdc::ticket_sender();
+}
+
+/// Warm the CDC workspaces-table sender before the iced application runs (same
+/// convention as [`init_board_change_tx`]) so the workspaces CDC subscription
+/// always has a source. Called from `main`.
+pub fn init_workspace_tx() {
+    crate::db::cdc::init_workspace_tx();
+}
+
+/// Warm the CDC users-table sender before the iced application runs (same
+/// convention as [`init_board_change_tx`]). Called from `main`.
+pub fn init_users_tx() {
+    crate::db::cdc::init_users_tx();
+}
+
+/// Warm the CDC user_channels-table sender before the iced application runs
+/// (same convention as [`init_board_change_tx`]). Called from `main`.
+pub fn init_user_channels_tx() {
+    crate::db::cdc::init_user_channels_tx();
+}
+
+/// Initialise the runtime-change broadcast before the iced application runs
+/// (same convention as [`init_board_change_tx`]) so the dashboard's
+/// runtime-change subscription always has a source. Called from `main`.
+pub fn init_runtime_event_tx() {
+    crate::runtime_events::init_runtime_event_tx();
 }
 
 // ── Navigation pages ─────────────────────────────────────────────
@@ -148,12 +183,17 @@ pub enum ToastKind {
     Error,
 }
 
+/// Stable toast id source — monotonically increasing, never reused, so a
+/// toast's expiry timer cannot dismiss a later toast that reused its slot.
+static NEXT_TOAST_ID: AtomicU64 = AtomicU64::new(0);
+
 /// A floating toast notification.
 #[derive(Debug, Clone)]
 pub struct Toast {
+    /// Stable id used to dismiss the toast when its expiry timer fires.
+    pub id: u64,
     pub message: String,
     pub kind: ToastKind,
-    pub created_at: Instant,
 }
 
 /// Message emitted by a page to request a toast from the dashboard.
@@ -170,9 +210,9 @@ pub enum ToastMessage {
 impl Toast {
     fn new(message: String, kind: ToastKind) -> Self {
         Self {
+            id: NEXT_TOAST_ID.fetch_add(1, Ordering::Relaxed),
             message,
             kind,
-            created_at: Instant::now(),
         }
     }
 
@@ -248,7 +288,18 @@ pub enum Message {
     /// MahBot finished async startup (or failed). On success, [`BOOT_LOG_STORE`] is set.
     Boot(Result<(), String>),
     Navigation(Page),
-    Tick,
+    /// A toast's expiry timer fired — dismiss the toast by its stable id.
+    /// Dismissing an already-expired/unknown id is a safe no-op.
+    ToastExpired(u64),
+    /// Coalesced notification that the agent/non-agent registries, live
+    /// transcript content, or voice status changed — triggers a re-render.
+    RuntimeChanged,
+    /// A workspaces-table row changed (or the CDC stream lagged/baseline
+    /// fired) — triggers one full map reload via `load_workspace_map`.
+    WorkspacesCdcChanged,
+    /// A users-table or user_channels-table row changed (or the CDC stream
+    /// lagged) — triggers a full users re-list on the Settings page.
+    UsersCdcChanged,
     /// Shutdown signaled — close the dashboard window so `run()` returns.
     /// Triggered by the shutdown token (self-update restart, SIGTERM/SIGINT).
     Shutdown,
@@ -275,17 +326,19 @@ pub enum Message {
     /// Toggle the selected workspace's pipeline pause or maintainer state.
     Toggle(ToggleKind),
     /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
-    /// On success, workspace state is refreshed from DB; on error an error toast is shown.
+    /// On success, the workspace map is reloaded from the store; on error an error toast is shown.
     ToggleResult(ToggleKind, Result<(), String>, String, bool),
-    /// Periodic refresh of workspace paused/maintenance state from DB.
-    /// Carries (name, paused, maintenance_enabled) tuples to merge into
-    /// the existing `workspaces` map without overwriting paths.
-    WorkspaceStatesRefreshed(Vec<(String, bool, bool)>),
     /// No-op — produced by refresh helpers on transient DB errors to avoid
     /// sending empty state maps that would wipe cached toggle state.
     Nop,
-    /// Workspace info and restored selection loaded during boot.
-    BootWorkspaces(HashMap<String, WorkspaceInfo>, Option<String>),
+    /// Workspace info and restored selection loaded during boot. The
+    /// selection is the resolved name ("" = "Personal" default).
+    BootWorkspaces(HashMap<String, Workspace>, String),
+    /// Full workspace map reloaded from the store (CDC workspaces event,
+    /// stream lag, toggle completion, or a settings add/delete) and the
+    /// resolved selection ("" = "Personal" default, when the
+    /// previously-selected workspace vanished or was never set).
+    WorkspacesReloaded(HashMap<String, Workspace>, String),
     Home(home::HomeMessage),
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
@@ -480,31 +533,6 @@ pub(crate) fn parse_key_press(
 /// Log store created during boot; read when handling [`Message::Boot`].
 pub static BOOT_LOG_STORE: OnceLock<LogStore> = OnceLock::new();
 
-/// Per-workspace metadata held in memory for fast sidebar lookup.
-/// Populated during boot from the DB and updated periodically via
-/// [`Message::WorkspaceStatesRefreshed`] (which only refreshes booleans).
-/// The struct stays `pub(crate)` because the Running Agents page takes the
-/// map for registered-workspace checks (the "(external)" marker).
-#[derive(Debug, Clone)]
-pub(crate) struct WorkspaceInfo {
-    path: String,
-    paused: bool,
-    maintenance_enabled: bool,
-}
-
-#[cfg(test)]
-impl WorkspaceInfo {
-    /// Test-only constructor — the Running Agents page tests build a
-    /// registered-workspace map without sidebar metadata.
-    pub(crate) fn test_new(path: String, paused: bool, maintenance_enabled: bool) -> Self {
-        Self {
-            path,
-            paused,
-            maintenance_enabled,
-        }
-    }
-}
-
 pub struct Dashboard {
     ready: bool,
     boot_error: Option<String>,
@@ -517,8 +545,11 @@ pub struct Dashboard {
     /// Toast notification stack.
     toasts: Vec<Toast>,
 
-    /// Per-workspace info (path, paused, maintenance_enabled), keyed by name.
-    workspaces: HashMap<String, WorkspaceInfo>,
+    /// Full per-workspace records (path, paused, maintenance, metadata),
+    /// keyed by name. Populated during boot and updated via CDC-driven
+    /// [`Message::WorkspacesReloaded`], which rebuilds the whole map from the
+    /// store (no incremental boolean patching).
+    workspaces: HashMap<String, Workspace>,
     /// Currently selected workspace name from the global picker.
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
@@ -550,7 +581,7 @@ pub struct Dashboard {
     pending_research_cancel: Option<String>,
     /// Running Agents page expanded-card state, keyed by (agent_id, generation)
     /// so a recycled agent_id never inherits a stale expansion. Pruned against
-    /// the live agent list on the Running Agents tick.
+    /// the live agent list on each [`Message::RuntimeChanged`] registry event.
     running_expanded: HashSet<(String, u64)>,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
@@ -652,8 +683,8 @@ impl Dashboard {
         }
     }
 
-    /// Returns the [`WorkspaceInfo`] for the currently selected workspace, if any.
-    fn selected_workspace_info(&self) -> Option<&WorkspaceInfo> {
+    /// Returns the [`Workspace`] for the currently selected workspace, if any.
+    fn selected_workspace_info(&self) -> Option<&Workspace> {
         self.selected_workspace_name
             .as_ref()
             .and_then(|name| self.workspaces.get(name))
@@ -715,10 +746,13 @@ impl Dashboard {
     /// Apply workspace configuration loaded during boot.
     fn apply_boot_workspaces(
         &mut self,
-        workspaces: HashMap<String, WorkspaceInfo>,
+        workspaces: HashMap<String, Workspace>,
         restored_name: &str,
     ) -> Task<Message> {
         self.workspaces = workspaces;
+        // Sync the Settings workspace list + users picker options from the
+        // freshly-loaded map (no separate DB read).
+        self.sync_settings_lists_from_map();
         // Pre-set Home's selected_user from persisted window state
         // so UsersLoaded doesn't auto-select the first user when
         // a previous user was saved.
@@ -749,9 +783,6 @@ impl Dashboard {
     /// Navigate to a page, refreshing page-specific state as needed.
     fn navigate_to(&mut self, page: Page) -> Task<Message> {
         self.page = page;
-        // Notify sessions state when navigating to/from Sessions page
-        // so the auto-refresh timer starts/stops accordingly.
-        self.sessions_state.set_page_active(page == Page::Sessions);
         match page {
             // Logs and Shell maintain their own internal state; Editor
             // receives workspace state via WorkspaceSelected from the
@@ -767,43 +798,34 @@ impl Dashboard {
             Page::Sessions => sessions::SessionsState::refresh().map(Message::Sessions),
             Page::Settings => {
                 self.settings_state.refresh();
-                self.refresh_settings_lists(false)
+                // Workspace list + users picker options come from the shared
+                // map; only the users list needs a DB refresh on navigation.
+                self.sync_settings_lists_from_map();
+                self.refresh_settings_users()
             }
         }
     }
 
-    /// Refresh Settings workspace/user lists, gating each list independently
-    /// on its in-flight load. `gate_loading` is set by the per-second tick,
-    /// since refresh() does not self-gate; navigation passes `false` to keep
-    /// its original unconditional refresh (no load_state marking). Does not
-    /// absorb the config snapshot (`settings_state.refresh()`).
-    fn refresh_settings_lists(&mut self, gate_loading: bool) -> Task<Message> {
-        let ws = if gate_loading && self.settings_state.workspaces_state.load_state.loading() {
-            Task::none()
-        } else {
-            if gate_loading {
-                self.settings_state
-                    .workspaces_state
-                    .load_state
-                    .start_loading();
-            }
-            self.settings_state
-                .workspaces_state
-                .refresh()
-                .map(|msg| Message::Settings(settings::SettingsMessage::WorkspaceMsg(msg)))
-        };
-        let us = if gate_loading && self.settings_state.users_state.load_state.loading() {
-            Task::none()
-        } else {
-            if gate_loading {
-                self.settings_state.users_state.load_state.start_loading();
-            }
-            self.settings_state
-                .users_state
-                .refresh()
-                .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)))
-        };
-        Task::batch([ws, us])
+    /// Refresh the Settings users list. The workspace list is not read here —
+    /// it is synced from the dashboard's shared workspace map. Does not absorb
+    /// the config snapshot (`settings_state.refresh()`).
+    fn refresh_settings_users(&self) -> Task<Message> {
+        self.settings_state
+            .users_state
+            .refresh()
+            .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)))
+    }
+
+    /// Sync the Settings lists from the shared workspace map: the workspace
+    /// section list (sorted by name, matching the store's `ORDER BY name`) and
+    /// the users-page workspace picker options. No DB read — the map is the
+    /// single source of truth.
+    fn sync_settings_lists_from_map(&mut self) {
+        let mut list: Vec<Workspace> = self.workspaces.values().cloned().collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        self.settings_state.workspaces_state.workspaces = list;
+        self.settings_state.users_state.workspace_options =
+            workspace_pick_options(&self.workspaces);
     }
 
     /// Toggle the selected workspace's pause or maintainer state.
@@ -813,11 +835,10 @@ impl Dashboard {
             ToggleKind::Maintenance => self.maintenance_enabled(),
         };
         let Some(ws_name) = self.active_workspace_name() else {
-            self.toasts.push(Toast::new(
+            return self.push_toast(
                 "No workspace selected — select a workspace first".to_string(),
                 ToastKind::Warning,
-            ));
-            return Task::none();
+            );
         };
         let new_state = !current_state;
         let ws_name_clone = ws_name.clone();
@@ -842,76 +863,37 @@ impl Dashboard {
                 } else {
                     kind.label_off()
                 };
-                self.toasts.push(Toast::new(
-                    format!("{label} for {ws_name}"),
-                    ToastKind::Success,
-                ));
-                refresh_workspace_states_task()
+                Task::batch([
+                    self.push_toast(format!("{label} for {ws_name}"), ToastKind::Success),
+                    // Immediate post-toggle refresh; the CDC stream provides
+                    // the durable confirmation later.
+                    self.reload_workspace_map(),
+                ])
             }
-            Err(e) => {
-                self.toasts.push(Toast::new(
-                    format!("{}: {e}", kind.label_err()),
-                    ToastKind::Error,
-                ));
-                Task::none()
-            }
+            Err(e) => self.push_toast(format!("{}: {e}", kind.label_err()), ToastKind::Error),
         }
     }
 
-    /// Process a periodic tick: expire old toasts, refresh workspace state,
-    /// poll the visible page, and update git state.
-    fn process_tick(&mut self) -> Task<Message> {
-        // Auto-dismiss expired toasts
-        let now = Instant::now();
-        self.toasts
-            .retain(|t| now.duration_since(t.created_at) < t.duration());
+    /// Push a toast with a kind-specific expiry timer. The timer is a
+    /// fire-and-forget task that emits [`Message::ToastExpired`] with the
+    /// toast's stable id when it fires.
+    fn push_toast(&mut self, message: String, kind: ToastKind) -> Task<Message> {
+        self.spawn_toast(Toast::new(message, kind))
+    }
 
-        // Auto-refresh workspace paused/maintenance state every tick.
-        // Only runs when a workspace is selected — the toggle result
-        // handler already re-reads authoritative state after writes.
-        let ws_refresh = if self.has_active_workspace() {
-            refresh_workspace_states_task()
-        } else {
-            Task::none()
-        };
+    /// Push a toast from a [`ToastMessage`] (see [`Self::push_toast`]).
+    fn push_toast_msg(&mut self, msg: &ToastMessage) -> Task<Message> {
+        self.spawn_toast(Toast::from_toast_msg(msg))
+    }
 
-        let page_task = match self.page {
-            Page::Home => {
-                // The board ticket list is driven by CDC change-stream deltas
-                // (see `board_change_subscription`), not a full re-poll. The tick
-                // only refreshes the open-ticket detail as a fallback/health
-                // check (comments are not part of the board delta).
-                let detail_refresh = self
-                    .board_state
-                    .refresh_selected_ticket()
-                    .map(Message::Board);
-                Task::batch([detail_refresh])
-            }
-            Page::Sessions if !self.sessions_state.load_state.loading() => {
-                self.sessions_state.load_state.start_loading();
-                sessions::SessionsState::refresh().map(Message::Sessions)
-            }
-            Page::Settings => self.refresh_settings_lists(true),
-            // Running Agents reads the live registries at render time — the
-            // 1-second tick re-render is its only refresh mechanism. The tick
-            // also prunes stale expanded-card keys (a finished agent, or a
-            // replacement generation of a recycled agent_id).
-            Page::RunningAgents => {
-                running::prune_expanded(
-                    &mut self.running_expanded,
-                    &crate::agent::registry::AGENT_REGISTRY.list(),
-                );
-                Task::none()
-            }
-            _ => Task::none(),
-        };
-
-        // ── Git state refresh (periodic remote sync + throttle) ───
-        // The every-second local refresh is event-driven (via the file-change
-        // subscription); the tick only runs the throttle/periodic remote work.
-        let git_tasks = self.git_state.update_tick().map(Message::Git);
-
-        Task::batch([ws_refresh, page_task, git_tasks])
+    fn spawn_toast(&mut self, toast: Toast) -> Task<Message> {
+        let id = toast.id;
+        let duration = toast.duration();
+        self.toasts.push(toast);
+        Task::perform(
+            async move { tokio::time::sleep(duration).await },
+            move |()| Message::ToastExpired(id),
+        )
     }
 
     /// Handle Escape key: dismiss modals in priority order (self-update
@@ -1034,11 +1016,24 @@ impl Dashboard {
             }
         }
 
+        // Any successful Settings-side workspace mutation (add, delete,
+        // reanalyze, toggles, diagnostics/notes edits) refreshes the shared
+        // workspace map from one full DB read — the map is the single source
+        // of truth, and syncing the Settings workspace list from it (see
+        // [`Self::sync_settings_lists_from_map`]) gives the page its immediate
+        // post-op feedback. The workspaces sub-state itself never reads the
+        // store.
         let needs_global_reload = matches!(
             msg,
-            settings::SettingsMessage::WorkspaceMsg(workspaces::WorkspacesMessage::DeleteResult(
-                Ok(())
-            )) | settings::SettingsMessage::AddWorkspaceResult(Ok(_))
+            settings::SettingsMessage::WorkspaceMsg(
+                workspaces::WorkspacesMessage::DeleteResult(Ok(()))
+                    | workspaces::WorkspacesMessage::ReanalyzeResult(Ok(()))
+                    | workspaces::WorkspacesMessage::ToggleResult(Ok(()))
+                    | workspaces::WorkspacesMessage::PauseResult(_, _, Ok(()))
+                    | workspaces::WorkspacesMessage::DiagnosticsSaved(_, Ok(()))
+                    | workspaces::WorkspacesMessage::RediscoverDiagnosticsResult(_, Ok(()))
+                    | workspaces::WorkspacesMessage::NotesSaved(_, Ok(()))
+            ) | settings::SettingsMessage::AddWorkspaceResult(Ok(_))
         );
 
         let settings_task = self.settings_state.update(msg).map(Message::Settings);
@@ -1049,7 +1044,7 @@ impl Dashboard {
         let tasks = [
             intercept_task,
             Some(settings_task),
-            needs_global_reload.then(|| self.reload_workspace_options()),
+            needs_global_reload.then(|| self.reload_workspace_map()),
         ];
 
         Task::batch(tasks.into_iter().flatten())
@@ -1092,8 +1087,7 @@ impl Dashboard {
                     ),
                     Err(e) => ToastMessage::Error(format!("research cancel failed: {e}")),
                 };
-                self.toasts.push(Toast::from_toast_msg(&toast));
-                Task::none()
+                self.push_toast_msg(&toast)
             }
             running::RunningMessage::ToggleAgentExpanded {
                 agent_id,
@@ -1121,8 +1115,7 @@ impl Dashboard {
         // as_link_url() for details.
         if self.ready {
             if let Some(tm) = message.as_toast() {
-                self.toasts.push(Toast::from_toast_msg(tm));
-                return Task::none();
+                return self.push_toast_msg(tm);
             }
 
             if let Some(url) = message.as_link_url() {
@@ -1135,7 +1128,7 @@ impl Dashboard {
             // ── Pre-ready handlers (execute regardless of ready state) ──
             Message::Boot(result) => self.finish_boot(result),
             Message::BootWorkspaces(workspaces, restored_name) => {
-                self.apply_boot_workspaces(workspaces, restored_name.as_deref().unwrap_or(""))
+                self.apply_boot_workspaces(workspaces, &restored_name)
             }
             Message::CloseRequested(_) => {
                 if crate::self_update::update_in_progress()
@@ -1174,10 +1167,12 @@ impl Dashboard {
                     && crate::self_update::update_in_progress()
                     && crate::self_update::update_is_finalizing()
                 {
-                    self.toasts.push(Toast::new(
+                    let toast = self.push_toast(
                         "Update complete — restarting…".to_string(),
                         ToastKind::Warning,
-                    ));
+                    );
+                    self.draining = true;
+                    return toast;
                 }
                 self.draining = true;
                 Task::none()
@@ -1205,7 +1200,18 @@ impl Dashboard {
             _ if !self.ready => Task::none(),
 
             // ── Post-ready handlers (no per-arm guards needed) ──
-            Message::Tick => self.process_tick(),
+            Message::ToastExpired(id) => {
+                // Dismissing an already-expired/unknown id is a safe no-op.
+                self.toasts.retain(|t| t.id != id);
+                Task::none()
+            }
+            Message::RuntimeChanged => {
+                running::prune_expanded(
+                    &mut self.running_expanded,
+                    &crate::agent::registry::AGENT_REGISTRY.list(),
+                );
+                Task::none()
+            }
             Message::Home(msg) => {
                 // Intercept RequestWorkspaceChange: the Home page detected
                 // that the selected user's DB workspace differs from the
@@ -1368,30 +1374,33 @@ impl Dashboard {
                 // Transient confirmation that the build/install has kicked off —
                 // condensed from the mode-specific Telegram update notifications
                 // ("building from source…" / "installing from crates.io…").
-                self.toasts.push(Toast::new(
+                let toast = self.push_toast(
                     "Update started — building/installing…".to_string(),
                     ToastKind::Success,
-                ));
-                Task::perform(
-                    async {
-                        match crate::self_update::execute_update().await {
-                            Ok(()) => Ok("ok".to_string()),
-                            Err(e) => {
-                                // Report to the first admin (Telegram) as well as
-                                // the GUI toast, preserving the prior behavior
-                                // where the update path notified on failure.
-                                // `execute_update` no longer notifies; each caller
-                                // is the single failure reporter.
-                                let msg = format!("❌ Update failed:\n{e:#}");
-                                let target =
-                                    crate::self_update::resolve_admin_telegram_target().await;
-                                crate::self_update::notify_admin(&msg, target.as_deref()).await;
-                                Err(msg)
+                );
+                Task::batch([
+                    toast,
+                    Task::perform(
+                        async {
+                            match crate::self_update::execute_update().await {
+                                Ok(()) => Ok("ok".to_string()),
+                                Err(e) => {
+                                    // Report to the first admin (Telegram) as well as
+                                    // the GUI toast, preserving the prior behavior
+                                    // where the update path notified on failure.
+                                    // `execute_update` no longer notifies; each caller
+                                    // is the single failure reporter.
+                                    let msg = format!("❌ Update failed:\n{e:#}");
+                                    let target =
+                                        crate::self_update::resolve_admin_telegram_target().await;
+                                    crate::self_update::notify_admin(&msg, target.as_deref()).await;
+                                    Err(msg)
+                                }
                             }
-                        }
-                    },
-                    Message::UpdateResult,
-                )
+                        },
+                        Message::UpdateResult,
+                    ),
+                ])
             }
             Message::CancelUpdate => {
                 self.show_update_confirm = false;
@@ -1405,15 +1414,15 @@ impl Dashboard {
                 // `execute_update` already cleared the shared in-progress
                 // flag, so the exit guards below no longer wait.
                 if let Err(err) = result {
-                    self.toasts
-                        .push(Toast::from_toast_msg(&ToastMessage::Error(err)));
+                    let toast = self.push_toast_msg(&ToastMessage::Error(err));
                     if self.exit_requested_during_update {
                         // A genuine window close was requested while the update
                         // owned the exit; it failed, so run the normal exit
                         // checkpoint.
                         self.exit_requested_during_update = false;
-                        return self.save_and_exit();
+                        return Task::batch([toast, self.save_and_exit()]);
                     }
+                    return toast;
                 }
                 Task::none()
             }
@@ -1421,26 +1430,29 @@ impl Dashboard {
             Message::ToggleResult(kind, result, ws_name, intended_state) => {
                 self.finish_toggle(kind, result, &ws_name, intended_state)
             }
-            Message::WorkspaceStatesRefreshed(states) => {
-                for (name, paused, maintenance_enabled) in states {
-                    if let Some(info) = self.workspaces.get_mut(&name) {
-                        info.paused = paused;
-                        info.maintenance_enabled = maintenance_enabled;
-                    } else {
-                        // New workspace appeared since boot — create a placeholder
-                        // entry; the next BootWorkspaces will fill the path.
-                        self.workspaces.insert(
-                            name,
-                            WorkspaceInfo {
-                                path: String::new(),
-                                paused,
-                                maintenance_enabled,
-                            },
-                        );
-                    }
+            // A workspaces-table row changed (or the stream lagged/baseline
+            // fired) — one full map reload. The reload itself resolves the
+            // selection fallback, so no propagation here beyond the reload.
+            Message::WorkspacesCdcChanged => self.reload_workspace_map(),
+            Message::WorkspacesReloaded(workspaces, resolved) => {
+                self.workspaces = workspaces;
+                self.sync_settings_lists_from_map();
+
+                // Selection fallback: only propagate when the resolved
+                // selection differs from the current one — propagate is heavy
+                // (board refresh + home reload) and must not run on every CDC
+                // event.
+                let current = self.selected_workspace_name.clone().unwrap_or_default();
+                if current != resolved {
+                    self.selected_workspace_name = (!resolved.is_empty()).then(|| resolved.clone());
+                    return self.propagate_workspace_selection(&resolved);
                 }
                 Task::none()
             }
+            // A users-table / user_channels-table row changed (or the stream
+            // lagged) — re-list the Settings users page. Full re-list is its
+            // own recovery.
+            Message::UsersCdcChanged => self.refresh_settings_users(),
             Message::Nop => Task::none(),
             Message::RoleAndPoolLoaded { role, pool } => {
                 self.selected_user_role = role;
@@ -1627,15 +1639,12 @@ impl Dashboard {
         ])
     }
 
-    /// Reload workspace options from storage (e.g. after add/delete on the
-    /// Workspaces page). Preserves current selection if it still exists;
-    /// otherwise falls back to the first available workspace.
-    fn reload_workspace_options(&self) -> Task<Message> {
+    /// Reload the full workspace map from storage (e.g. after add/delete on
+    /// the Workspaces page or a post-toggle refresh). Preserves current
+    /// selection if it still exists; otherwise falls back to "Personal".
+    fn reload_workspace_map(&self) -> Task<Message> {
         let prev_selection = self.selected_workspace_name.clone();
-        Task::perform(
-            load_workspace_options(prev_selection),
-            std::convert::identity,
-        )
+        Task::perform(load_workspace_map(prev_selection), std::convert::identity)
     }
 
     /// Return the selected workspace name, or `None` if no shared workspace
@@ -2073,7 +2082,6 @@ impl Dashboard {
         }
         iced::Subscription::batch([
             window_events,
-            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
             window::close_requests().map(Message::CloseRequested),
             keyboard::listen().filter_map(|event| {
                 use keyboard::Key;
@@ -2118,9 +2126,25 @@ impl Dashboard {
             // Git pipeline-commit subscription: refreshes the footer promptly
             // after a pipeline auto-commit (ref-only change the watcher misses).
             iced::Subscription::run(git_commit_subscription),
+            // Standalone 60s remote-sync subscription (replaces the tick duty;
+            // also the recovery path for ref-only/commit-only changes).
+            iced::time::every(git::REMOTE_REFRESH_INTERVAL)
+                .map(|_| Message::Git(git::GitMessage::PeriodicSyncTick)),
             // Board change-stream subscription: drives the board ticket list from
             // CDC deltas instead of a 1s full re-poll.
             iced::Subscription::run(board_change_subscription),
+            // Workspaces change-stream subscription: a full map reload whenever
+            // a workspaces row changes (or the stream lags / the baseline fires).
+            iced::Subscription::run(workspaces_cdc_subscription),
+            // Users / user_channels change-stream subscriptions: re-list the
+            // Settings users page when a users/user_channels row changes (or
+            // the stream lags — full re-list is its own recovery).
+            iced::Subscription::run(users_cdc_subscription),
+            iced::Subscription::run(user_channels_cdc_subscription),
+            // Runtime-change subscription: coalesces agent/non-agent registry,
+            // live transcript, and voice-status broadcasts into a single
+            // re-render, driving the Running Agents page and footer.
+            iced::Subscription::run(runtime_change_subscription),
             // TTS download progress subscription (always active while ready).
             iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
             // Diff modal subscription (keyboard shortcuts, auto-refresh).
@@ -2181,6 +2205,24 @@ fn tts_download_subscription()
                 }
             })
         },
+    )
+}
+
+/// Subscription that emits [`Message::RuntimeChanged`] (coalesced) when any
+/// runtime source the GUI renders directly changes: agent/non-agent registries,
+/// live transcript content, or voice status. The [`RuntimeEvent`] broadcast is
+/// initialized in `main` before the iced application runs (matching the
+/// [`LOG_BROADCAST`] convention); an uninitialized source would yield an
+/// immediately-ending stream, which iced's subscription tracker does not
+/// re-spawn. A burst of per-message / per-tool-call events collapses into a
+/// single trailing [`Message::RuntimeChanged`] per [`RUNTIME_REFRESH_COALESCE`]
+/// window — only "something changed" matters for a re-render.
+fn runtime_change_subscription() -> impl futures_util::Stream<Item = Message> {
+    common::coalesced_broadcast_producer(
+        128,
+        &crate::runtime_events::RUNTIME_EVENTS,
+        RUNTIME_REFRESH_COALESCE,
+        || Message::RuntimeChanged,
     )
 }
 
@@ -2247,6 +2289,76 @@ fn board_change_subscription() -> impl futures_util::Stream<Item = Message> {
                     None => board::BoardMessage::BoardRefreshNeeded,
                 });
                 let _ = futures_util::SinkExt::send(output, msg).await;
+            })
+        },
+    )
+}
+
+/// Subscription that emits [`Message::WorkspacesCdcChanged`] for a full
+/// workspace-map reload. The source is the shared [`crate::db::cdc`] workspaces
+/// sender, warmed in `main` before the iced app runs (same immediately-ending-
+/// stream rationale as the board sender — Iced does not re-spawn an ended
+/// subscription).
+///
+/// The stream opens with one synthetic BASELINE event, so a full read happens
+/// at stream start regardless of upstream activity. Because this subscription
+/// only exists in the post-boot (`ready`) branch of [`Dashboard::subscription`],
+/// the baseline is delivered after the `Boot` arm has set `ready` — it can
+/// never be swallowed by the pre-boot no-op catch-all. Every received delta AND
+/// a lagged channel map to the same message (a full reload is its own Lagged
+/// recovery).
+fn workspaces_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
+    use iced::futures::channel::mpsc;
+    futures_util::stream::once(async { Message::WorkspacesCdcChanged }).chain(
+        common::broadcast_stream_producer(
+            128,
+            crate::db::cdc::workspace_sender_lock(),
+            |output: &mut mpsc::Sender<Message>, _event: Option<crate::db::cdc::ChangeEvent>| {
+                Box::pin(async move {
+                    // Awaited send (backpressure): a dropped reload trigger
+                    // would leave the sidebar stale until the next event.
+                    let _ =
+                        futures_util::SinkExt::send(output, Message::WorkspacesCdcChanged).await;
+                })
+            },
+        ),
+    )
+}
+
+/// Subscription that emits [`Message::UsersCdcChanged`] when a users-table row
+/// changes or the stream lags. Both cases map to the same message — a full
+/// users re-list is its own Lagged recovery. Source is the shared
+/// [`crate::db::cdc`] users sender, warmed in `main` before the iced app runs.
+fn users_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
+    use iced::futures::channel::mpsc;
+    common::broadcast_stream_producer(
+        128,
+        crate::db::cdc::users_sender_lock(),
+        |output: &mut mpsc::Sender<Message>, _event: Option<crate::db::cdc::ChangeEvent>| {
+            Box::pin(async move {
+                // Awaited send: a dropped trigger would leave the list stale
+                // until the next event (same rationale as the board stream).
+                let _ = futures_util::SinkExt::send(output, Message::UsersCdcChanged).await;
+            })
+        },
+    )
+}
+
+/// Subscription that emits [`Message::UsersCdcChanged`] when a user_channels
+/// row changes or the stream lags — the Settings users page re-lists on either
+/// (a channel bind/unbind updates the user_channels table). Source is the shared
+/// [`crate::db::cdc`] user_channels sender, warmed in `main` before the iced app
+/// runs.
+fn user_channels_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
+    use iced::futures::channel::mpsc;
+    common::broadcast_stream_producer(
+        128,
+        crate::db::cdc::user_channels_sender_lock(),
+        |output: &mut mpsc::Sender<Message>, _event: Option<crate::db::cdc::ChangeEvent>| {
+            Box::pin(async move {
+                // Awaited send: a dropped trigger would leave the list stale
+                // until the next event (same rationale as the board stream).
+                let _ = futures_util::SinkExt::send(output, Message::UsersCdcChanged).await;
             })
         },
     )
@@ -2964,64 +3076,85 @@ fn save_window_state(
     }
 }
 
-/// Lightweight async task that re-reads all workspace paused and maintenance
-/// states from the DB, returning a [`Message::WorkspaceStatesRefreshed`].
+/// Reload the full workspace map from the store after boot (CDC workspaces
+/// event, stream lag, toggle completion, or a settings add/delete), resolving
+/// the selection via [`resolve_workspace_selection`].
 ///
-/// This is a targeted refresh of only the boolean toggle state — unlike
-/// [`load_workspace_options`] it does not rebuild the workspace picker list,
-/// trigger page re-propagation, or load users.
-fn refresh_workspace_states_task() -> Task<Message> {
-    Task::perform(
-        async {
-            let store = crate::workspace::store();
-            match store.list_states().await {
-                Ok(states) => Message::WorkspaceStatesRefreshed(states),
-                Err(e) => {
-                    tracing::warn!("Failed to refresh workspace states: {e}");
-                    // Keep existing cached state — don't loop back into the
-                    // periodic tick handler.  The next real 1-second Tick will
-                    // re-attempt the refresh.
-                    Message::Nop
+/// On a transient read failure (the ticket's one scoped retry exception), it
+/// retries once after a short delay; if the retry also fails, it returns
+/// [`Message::Nop`] so the current (non-empty) map is preserved rather than
+/// wiped.
+async fn load_workspace_map(prev_selection: Option<String>) -> Message {
+    // Transient read failure: retry once after a short delay, then give up
+    // and keep the current map.
+    let mut attempt = 0;
+    let workspaces = loop {
+        match read_workspace_map().await {
+            Ok(map) => break map,
+            Err(e) => {
+                tracing::warn!(error = %e, attempt = attempt + 1, "Failed to load workspaces");
+                if attempt == 0 {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    return Message::Nop;
                 }
             }
-        },
-        std::convert::identity,
-    )
+        }
+    };
+    let restored = resolve_workspace_selection(&workspaces, prev_selection.as_deref());
+    Message::WorkspacesReloaded(workspaces, restored)
 }
 
-/// Load workspace path and state maps from the workspace store, resolving
-/// `prev_selection` against the loaded list. Falls back to an empty-string
-/// "Personal" default when `prev_selection` is absent or stale.
-/// Returns a `BootWorkspaces` message ready for use with `Task::perform`.
+/// Read the full workspace map from the store (one row per name).
+async fn read_workspace_map() -> anyhow::Result<HashMap<String, Workspace>> {
+    let list = crate::workspace::store().list().await?;
+    Ok(list.into_iter().map(|ws| (ws.name.clone(), ws)).collect())
+}
+
+/// Resolve the restored workspace selection against a freshly loaded map:
+/// the previous selection is kept when it still exists ("" = "Personal", always
+/// valid); anything else falls back to the "Personal" default.
+#[must_use]
+fn resolve_workspace_selection(
+    map: &HashMap<String, Workspace>,
+    prev_selection: Option<&str>,
+) -> String {
+    match prev_selection {
+        Some(name) if name.is_empty() || map.contains_key(name) => name.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Load the full workspace map during boot. Degrades to an empty map on a
+/// read failure (the boot path must complete) — the resolved selection is
+/// preserved rather than wiped. Returns a [`Message::BootWorkspaces`]
+/// ready for use with `Task::perform`.
 async fn load_workspace_options(prev_selection: Option<String>) -> Message {
-    let store = crate::workspace::store();
-    let mut workspaces = HashMap::new();
-    let mut restored_name = None;
+    let workspaces = read_workspace_map().await.unwrap_or_default();
+    let restored = resolve_workspace_selection(&workspaces, prev_selection.as_deref());
+    Message::BootWorkspaces(workspaces, restored)
+}
 
-    if let Ok(ws_list) = store.list().await {
-        for ws in &ws_list {
-            workspaces.insert(
-                ws.name.clone(),
-                WorkspaceInfo {
-                    path: ws.path.clone(),
-                    paused: ws.paused,
-                    maintenance_enabled: ws.maintenance_enabled,
-                },
-            );
-        }
+/// Build the Settings users-page workspace picker options from the shared
+/// workspace map: "Personal" prepended, then map values sorted by name. The
+/// labels match those previously produced by the same `store.list()` rows.
+#[must_use]
+fn workspace_pick_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
+    let mut options = Vec::with_capacity(map.len() + 1);
+    options.push(widgets::PickOption {
+        value: String::new(),
+        label: "Personal".to_string(),
+    });
+    let mut values: Vec<&Workspace> = map.values().collect();
+    values.sort_by(|a, b| a.name.cmp(&b.name));
+    for ws in values {
+        options.push(widgets::PickOption {
+            value: ws.name.clone(),
+            label: ws.display_name(),
+        });
     }
-
-    if let Some(ref name) = prev_selection {
-        // Empty string means "Personal" — always valid.
-        if name.is_empty() || workspaces.contains_key(name.as_str()) {
-            restored_name = Some(name.clone());
-        }
-    }
-    if restored_name.is_none() {
-        restored_name = Some(String::new());
-    }
-
-    Message::BootWorkspaces(workspaces, restored_name)
+    options
 }
 
 /// Open a URL in the system browser (fire-and-forget).
@@ -3067,5 +3200,91 @@ fn resolve_dashboard_workspace_path(
             "Workspace path not found in map — sending empty selection"
         );
         (String::new(), None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal [`Workspace`] with a name + derived path for map fixtures.
+    fn ws(name: &str) -> Workspace {
+        Workspace {
+            name: name.to_string(),
+            path: format!("/p/{name}"),
+            ..Default::default()
+        }
+    }
+
+    /// A ready dashboard so post-ready handlers (e.g. `WorkspacesReloaded`)
+    /// run instead of the `!ready` guard.
+    fn ready_dashboard() -> Dashboard {
+        let mut dash = Dashboard::loading();
+        dash.ready = true;
+        dash
+    }
+
+    #[test]
+    fn workspaces_reloaded_replaces_map_and_falls_back_on_delete() {
+        let mut dash = ready_dashboard();
+        dash.workspaces = HashMap::from([
+            ("ws1".to_string(), ws("ws1")),
+            ("ws2".to_string(), ws("ws2")),
+        ]);
+        dash.selected_workspace_name = Some("ws2".to_string());
+
+        // A reload whose map lacks ws2 → selection falls back to Personal.
+        let new_map = HashMap::from([
+            ("ws1".to_string(), ws("ws1")),
+            ("ws3".to_string(), ws("ws3")),
+        ]);
+        let _ = dash.update(Message::WorkspacesReloaded(new_map, String::new()));
+        assert_eq!(dash.selected_workspace_name, None);
+        assert!(dash.workspaces.contains_key("ws1"));
+        assert!(dash.workspaces.contains_key("ws3"));
+        assert!(!dash.workspaces.contains_key("ws2"));
+
+        // A reload whose map still contains the selection → unchanged.
+        dash.selected_workspace_name = Some("ws3".to_string());
+        let new_map2 = HashMap::from([("ws3".to_string(), ws("ws3"))]);
+        let _ = dash.update(Message::WorkspacesReloaded(new_map2, "ws3".to_string()));
+        assert_eq!(dash.selected_workspace_name.as_deref(), Some("ws3"));
+    }
+
+    #[test]
+    fn workspaces_reloaded_syncs_settings_lists() {
+        let mut dash = ready_dashboard();
+        let map = HashMap::from([
+            ("beta".to_string(), ws("beta")),
+            ("alpha".to_string(), ws("alpha")),
+        ]);
+        let _ = dash.update(Message::WorkspacesReloaded(map, String::new()));
+
+        // Settings workspace list = map values sorted by name.
+        let ws_names: Vec<&str> = dash
+            .settings_state
+            .workspaces_state
+            .workspaces
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(ws_names, vec!["alpha", "beta"]);
+
+        // Users picker options = Personal prepended, then display_name labels
+        // sorted by name.
+        let options = &dash.settings_state.users_state.workspace_options;
+        assert_eq!(options.len(), 3);
+        assert_eq!(
+            (options[0].value.as_str(), options[0].label.as_str()),
+            ("", "Personal")
+        );
+        assert_eq!(
+            (options[1].value.as_str(), options[1].label.as_str()),
+            ("alpha", "alpha")
+        );
+        assert_eq!(
+            (options[2].value.as_str(), options[2].label.as_str()),
+            ("beta", "beta")
+        );
     }
 }

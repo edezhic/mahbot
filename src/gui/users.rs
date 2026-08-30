@@ -41,7 +41,7 @@ async fn update_user_field(sender: String, value: String, is_role: bool) -> Resu
 
 #[derive(Debug, Clone)]
 pub enum UsersMessage {
-    Refreshed(Vec<UserRecord>, Vec<super::widgets::PickOption>),
+    Refreshed(Vec<UserRecord>),
     RefreshError(String),
     UpdateRole(String, String),
     UpdateWorkspace(String, String),
@@ -121,27 +121,10 @@ impl UsersState {
             async {
                 let store = user_store()?;
                 let users = store.list_users().await.map_err(|e| e.to_string())?;
-
-                // Also load workspace options — prepend "Personal" for NULL.
-                let mut ws_options = Vec::new();
-                ws_options.push(super::widgets::PickOption {
-                    value: String::new(),
-                    label: "Personal".to_string(),
-                });
-                if let Ok(ws_list) = crate::workspace::store().list().await {
-                    for ws in ws_list {
-                        let display = ws.display_name();
-                        ws_options.push(super::widgets::PickOption {
-                            value: ws.name,
-                            label: display,
-                        });
-                    }
-                }
-
-                Ok::<_, String>((users, ws_options))
+                Ok::<_, String>(users)
             },
             |res| match res {
-                Ok((users, ws_options)) => UsersMessage::Refreshed(users, ws_options),
+                Ok(users) => UsersMessage::Refreshed(users),
                 Err(e) => UsersMessage::RefreshError(e),
             },
         )
@@ -150,11 +133,11 @@ impl UsersState {
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: UsersMessage) -> Task<UsersMessage> {
         match msg {
-            UsersMessage::Refreshed(users, ws_options) => {
+            UsersMessage::Refreshed(users) => {
                 self.users = users;
-                self.load_state.finish_loading();
 
-                self.workspace_options = ws_options;
+                // workspace_options is synchronized from the dashboard's shared
+                // workspace map (see gui/mod.rs) rather than read here.
 
                 // Build role options from Role::iter()
                 self.role_options = Role::iter()
