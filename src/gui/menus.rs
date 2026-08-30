@@ -14,16 +14,6 @@
 //! containers. This widget uses [`Widget::overlay`] and the [`Overlay`]
 //! trait to render the menu above the entire widget tree, avoiding clipping.
 //!
-//! ```ignore
-//! ContextMenu::new(
-//!     underlay_element,
-//!     vec![
-//!         ("Close".into(), MyMessage::Close),
-//!         ("Close Others".into(), MyMessage::CloseOthers),
-//!     ],
-//! )
-//! ```
-//!
 //! Right-clicking the underlay opens the menu at the cursor position.
 //! Clicking a menu item fires its action and dismisses the menu.
 //! Clicking outside or pressing Escape also dismisses the menu.

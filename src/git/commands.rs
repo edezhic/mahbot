@@ -360,15 +360,6 @@ pub async fn run_git_check_ignore(
 /// This is a pure parsing function with no I/O — callers run `git status`
 /// themselves and pass the captured stdout here.
 ///
-/// # Example
-///
-/// ```ignore
-/// assert!(!has_unstaged_changes(""));
-/// assert!(!has_unstaged_changes("M  Cargo.toml\nA  src/lib.rs\n"));
-/// assert!(has_unstaged_changes(" M src/lib.rs"));
-/// assert!(has_unstaged_changes("?? new_file.txt"));
-/// assert!(has_unstaged_changes("MM src/lib.rs"));
-/// ```
 #[must_use]
 pub fn has_unstaged_changes(porcelain: &str) -> bool {
     porcelain.lines().any(|line| {

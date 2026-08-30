@@ -153,18 +153,6 @@ pub(crate) fn ensure_base_url(url: &str) -> String {
 /// Fallbacks are explicitly pinned to `false` in the emitted JSON — the
 /// Allow Fallbacks option was removed from the settings and the runtime.
 ///
-/// # Example
-///
-/// ```ignore
-/// let routing = provider_routing_json("openai,   anthropic  ");
-/// assert_eq!(
-///     routing,
-///     Some(serde_json::json!({
-///         "order": ["openai", "anthropic"],
-///         "allow_fallbacks": false,
-///     })),
-/// );
-/// ```
 pub(crate) fn provider_routing_json(order: &str) -> Option<serde_json::Value> {
     let providers: Vec<&str> = order
         .split(',')

@@ -9,9 +9,6 @@
 
 /// Join literal strings with `", "` separator.
 ///
-/// ```ignore
-/// assert_eq!(__columns_join!("a", "b", "c"), "a, b, c");
-/// ```
 #[macro_export]
 macro_rules! __columns_join {
     ($first:literal $(, $rest:literal)* $(,)?) => {
@@ -47,32 +44,10 @@ macro_rules! __columns_gen {
 /// Generate a column-string constant and matching column-index constants from
 /// a single source-of-truth list.
 ///
-/// # Syntax
-///
-/// ```ignore
-/// columns! {
-///     /// Optional doc comment (attached to the column string constant).
-///     COLUMNS_NAME [PREFIX] {
-///         FIELD_NAME => "sql_column_expression",
-///         ANOTHER   => "another_column",
-///     }
-/// }
-/// ```
-///
 /// # Expansion
 ///
-/// For input
-/// ```ignore
-/// columns! {
-///     pub(crate) const MY_COLUMNS [mc] {
-///         FOO => "foo",
-///         BAR => "bar",
-///     }
-/// }
-/// ```
-///
-/// expands to:
-/// - `pub(crate) const MY_COLUMNS: &str = "foo, bar";`
+/// `columns!(MY_COLUMNS [MC] { FOO => "foo", BAR => "bar" })` expands to:
+/// - `const MY_COLUMNS: &str = "foo, bar";`
 /// - `const COL_MC_FOO: usize = 0;`
 /// - `const COL_MC_BAR: usize = 1;`
 ///
@@ -102,17 +77,6 @@ macro_rules! columns {
 /// singleton accessor (`store()`).
 ///
 /// Eliminates ~64 lines of boilerplate per store module.
-///
-/// # Syntax
-///
-/// ```ignore
-/// define_store! {
-///     /// Doc comment for the global static.
-///     pub static STORE_NAME: StoreType,
-///     post_open = ensure_admin_user,  // optional; omitted when not needed
-///     expect = "custom panic message",
-/// }
-/// ```
 ///
 /// The `post_open` field is optional.  When present, it names an
 /// `async fn(&self) -> anyhow::Result<()>` method that is called after

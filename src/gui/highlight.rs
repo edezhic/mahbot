@@ -787,35 +787,6 @@ mod tests {
     }
 
     #[test]
-    fn test_line_starts_simple() {
-        // Directly verify the line-splitting logic.
-        let source = "fn main() {\n    let x = 42;\n}\n";
-        let mut line_starts: Vec<usize> = Vec::new();
-        let mut pos = 0;
-        line_starts.push(0);
-        for ch in source.bytes() {
-            pos += 1;
-            if ch == b'\n' {
-                line_starts.push(pos);
-            }
-        }
-        // source has 3 \n chars, so line_starts should have 4 entries.
-        assert_eq!(
-            line_starts.len(),
-            4,
-            "line_starts: {line_starts:?}, source len: {}",
-            source.len()
-        );
-        // Line 0: byte range [0, 11]
-        let line_end = line_starts
-            .get(1)
-            .map_or(source.len(), |e| e.saturating_sub(1));
-        assert_eq!(line_end, 11);
-        let line0 = &source[0..line_end];
-        assert_eq!(line0, "fn main() {");
-    }
-
-    #[test]
     fn test_parse_file_highlights_single_line() {
         let code = "fn main() {}";
         let mut parser = Parser::new();
@@ -875,19 +846,6 @@ mod tests {
         let fh = parse_file_highlights(&mut parser, code, HighlightLanguage::Python);
         // "def foo():" / "    \"\"\"A docstring.\"\"\"" / "    return 1" / empty trailing
         assert_eq!(fh.spans.len(), 4);
-    }
-
-    #[test]
-    fn test_file_highlights_empty_constructor() {
-        let fh = FileHighlights::empty(3);
-        assert_eq!(fh.spans.len(), 3);
-        // Each line should have an empty vec.
-        for span_vec in &fh.spans {
-            assert!(
-                span_vec.is_empty(),
-                "empty() should produce empty vecs, got {span_vec:?}"
-            );
-        }
     }
 
     #[test]

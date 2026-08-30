@@ -1164,17 +1164,6 @@ impl BoardStore {
     /// current timestamp and the ticket id as the final parameters, keeping the
     /// parameter ordering consistent across all `UPDATE tickets` producers.
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let prep = Self::build_ticket_update_with_updated_at(
-    ///     "priority = ?",
-    ///     vec![Value::from(2)],
-    ///     "ticket-456",
-    /// );
-    /// // SQL:  "UPDATE tickets SET priority = ?, updated_at = ? WHERE id = ?"
-    /// // params: [2, now, ticket-456]
-    /// ```
     fn build_ticket_update_with_updated_at(
         set_clause: &str,
         set_params: Vec<db::Value>,

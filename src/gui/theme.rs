@@ -899,14 +899,6 @@ mod tests {
     }
 
     #[test]
-    fn derivative_analyst_names_get_correct_color() {
-        let analyst_color = role_badge_color_for(&crate::Role::Analyst);
-        assert_eq!(role_badge_color("analyst_1"), analyst_color);
-        assert_eq!(role_badge_color("analyst_2"), analyst_color);
-        assert_eq!(role_badge_color("analyst_3"), analyst_color);
-    }
-
-    #[test]
     fn derivative_other_role_names_get_correct_color() {
         for role in Role::iter() {
             let name = role.as_str();

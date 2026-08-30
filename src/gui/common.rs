@@ -281,18 +281,6 @@ impl<T> PaginatedTabState<T> {
 /// calls [`trigger`](Self::trigger) on input changes, and calls
 /// [`should_process`](Self::should_process) in the response handler.
 ///
-/// # Pattern
-///
-/// ```ignore
-/// // In the input handler:
-/// self.debounce.trigger(300).map(MyMessage::DebouncedRefresh)
-///
-/// // In the response handler:
-/// if self.debounce.should_process(generation) {
-///     return self.refresh();
-/// }
-/// Task::none()
-/// ```
 #[derive(Debug, Clone)]
 pub(crate) struct DebounceState {
     /// Monotonically increasing (modulo overflow) counter.  Each

@@ -1797,7 +1797,7 @@ mod tests {
     /// Tests that analyze dispatches analysts and returns the consolidated result.
     /// Requires an LLM provider to be configured.
     #[tokio::test]
-    #[ignore = "requires LLM provider"]
+    #[ignore = "requires LLM provider; runs only when explicitly invoked"]
     async fn test_analyze_analyst() {
         let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
         let ws = test_ws("/tmp/test_ws");

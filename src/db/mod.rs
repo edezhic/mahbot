@@ -345,14 +345,6 @@ pub(crate) fn sanitize_fts_query(query: &str) -> String {
 /// Returns an empty string for `count == 0`. Callers MUST guard against
 /// empty lists to avoid producing invalid SQL like `WHERE id IN ()`.
 ///
-/// # Example
-///
-/// ```ignore
-/// // Internal utility — use `sql_in_placeholders(3)` from crate::db
-/// assert_eq!("?, ?, ?", vec!["?"; 3].join(", "));
-/// assert_eq!("", vec!["?"; 0].join(", "));
-/// ```
-///
 /// Note: libSQL/SQLite binds `Vec<Value>` positionally regardless of whether
 /// the SQL uses `?` or `?N`, so numbered placeholders (`?1, ?2, ...`) are
 /// never necessary — use this helper everywhere.

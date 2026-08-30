@@ -584,13 +584,6 @@ pub fn list_voice_styles() -> Vec<String> {
 /// generation targeting the voice pipeline (which expects 16 kHz), pass
 /// `target_sample_rate = 16000` to avoid an intermediate resampling step.
 ///
-/// # Example
-///
-/// ```ignore
-/// // Synthesize at voice pipeline rate (16 kHz)
-/// let pcm = tts::synthesize("hello world", "M1.json", 42, 16000)?;
-/// assert_eq!(pcm.len(), 16000 /* ≈1 second at 16kHz */);
-/// ```
 pub fn synthesize(
     text: &str,
     voice_style: &str,
