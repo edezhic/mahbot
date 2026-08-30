@@ -266,6 +266,77 @@ fn test_byte_offset_to_line_col() {
     }
 }
 
+/// Fluent builder for an [`EditorState`] with tab fixtures; modifiers
+/// apply to the tab just added.
+struct EditorFixture(EditorState);
+
+impl EditorFixture {
+    fn new() -> Self {
+        Self(EditorState::new())
+    }
+
+    /// Adds a tab holding `text` (starting saved) and makes it active.
+    fn tab(mut self, path: &str, text: &str) -> Self {
+        self.0.tabs.push(Tab {
+            path: path.to_string(),
+            file_name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            is_dirty: false,
+            line_ending: LineEnding::Lf,
+        });
+        self.0.tab_contents.insert(
+            path.to_string(),
+            TabData {
+                content: EditorBuffer::with_text(text, None),
+                undo_stack: RefCell::new(UndoStack::new()),
+                find_replace_state: None,
+                saved_text_hash: hash_text(text),
+            },
+        );
+        self.0.active_tab_index = self.0.tabs.len() - 1;
+        self
+    }
+
+    /// `count` empty unsaved tabs under `/tmp` (tab-switch fixture).
+    fn tabs(self, count: usize, active: usize) -> Self {
+        assert!(active < count, "active out of range");
+        let mut f = (0..count).fold(self, |f, i| {
+            f.tab(&format!("/tmp/test_{i}.rs"), "").unsaved()
+        });
+        f.0.active_tab_index = active;
+        f
+    }
+
+    /// Marks the active tab's content unsaved.
+    fn unsaved(mut self) -> Self {
+        self.active_tab_data().saved_text_hash = 0;
+        self
+    }
+
+    /// Installs a case-sensitive find/replace state on the active tab.
+    fn find_replace(mut self, query: &str, matches: Vec<Range<usize>>, match_idx: usize) -> Self {
+        self.active_tab_data().find_replace_state = Some(FindReplaceState {
+            query: crate::gui::common::SingleLineEditorState::new(query),
+            replace: crate::gui::common::SingleLineEditorState::new(""),
+            matches,
+            current_match_idx: match_idx,
+            case_sensitive: true,
+        });
+        self
+    }
+
+    fn active_tab_data(&mut self) -> &mut TabData {
+        let path = self.0.tabs[self.0.active_tab_index].path.clone();
+        self.0
+            .tab_contents
+            .get_mut(&path)
+            .expect("active tab has TabData")
+    }
+
+    fn build(self) -> EditorState {
+        self.0
+    }
+}
+
 // ── Tree keyboard navigation focus state tests ──────────────────
 
 /// Helper to create a minimal EditorState with a simple tree.
@@ -773,10 +844,15 @@ fn test_parse_git_status_porcelain() {
 
 #[test]
 fn test_is_find_bar_open() {
-    let state =
-        make_editor_with_find_state("fn hello() {}", "hello", std::iter::once(4..9).collect(), 0);
+    let state = EditorFixture::new()
+        .tab("/test.rs", "fn hello() {}")
+        .unsaved()
+        .find_replace("hello", std::iter::once(4..9).collect(), 0)
+        .build();
     assert!(state.is_find_bar_open());
-    let state = make_editor_with_single_tab("fn hello() {}");
+    let state = EditorFixture::new()
+        .tab("/test.rs", "fn hello() {}")
+        .build();
     assert!(!state.is_find_bar_open());
     let state = EditorState::new();
     assert!(!state.is_find_bar_open());
@@ -890,7 +966,7 @@ fn test_find_replace_auto_advance() {
 
     let path = "/test.rs".to_string();
     for c in cases {
-        let mut state = make_editor_with_single_tab(c.text);
+        let mut state = EditorFixture::new().tab("/test.rs", c.text).build();
         if let Some(tab) = state.tab_contents.get_mut(&path) {
             tab.find_replace_state = Some(FindReplaceState {
                 query: crate::gui::common::SingleLineEditorState::new(c.query),
@@ -933,44 +1009,14 @@ fn test_find_replace_auto_advance() {
     }
 }
 
-/// Helper to create an [`EditorState`] with a single tab at `/test.rs`
-/// that has an active [`FindReplaceState`].
-fn make_editor_with_find_state(
-    text: &str,
-    query: &str,
-    matches: Vec<Range<usize>>,
-    current_match_idx: usize,
-) -> EditorState {
-    let mut state = EditorState::new();
-    state.tabs.push(Tab {
-        path: "/test.rs".to_string(),
-        file_name: "test.rs".to_string(),
-        is_dirty: false,
-        line_ending: LineEnding::Lf,
-    });
-    state.active_tab_index = 0;
-    state.tab_contents.insert(
-        "/test.rs".to_string(),
-        TabData {
-            content: EditorBuffer::with_text(text, None),
-            undo_stack: RefCell::new(UndoStack::new()),
-            find_replace_state: Some(FindReplaceState {
-                query: crate::gui::common::SingleLineEditorState::new(query),
-                replace: crate::gui::common::SingleLineEditorState::new(""),
-                matches,
-                current_match_idx,
-                case_sensitive: true,
-            }),
-            saved_text_hash: 0,
-        },
-    );
-    state
-}
-
 #[test]
 fn test_navigate_find_match_wraps() {
     for direction in [FindDirection::Next, FindDirection::Prev] {
-        let mut state = make_editor_with_find_state("a b c", " ", vec![1..2, 3..4], 0);
+        let mut state = EditorFixture::new()
+            .tab("/test.rs", "a b c")
+            .unsaved()
+            .find_replace(" ", vec![1..2, 3..4], 0)
+            .build();
         for want in [1, 0] {
             let _ = state.navigate_find_match(direction);
             let s = state.tab_contents.get("/test.rs").unwrap();
@@ -982,7 +1028,11 @@ fn test_navigate_find_match_wraps() {
 
 #[test]
 fn test_navigate_find_match_no_matches() {
-    let mut state = make_editor_with_find_state("no matches", "zzz", vec![], 0);
+    let mut state = EditorFixture::new()
+        .tab("/test.rs", "no matches")
+        .unsaved()
+        .find_replace("zzz", vec![], 0)
+        .build();
 
     // Navigating with no matches should not crash.
     let _ = state.navigate_find_match(FindDirection::Next);
@@ -995,7 +1045,7 @@ fn test_navigate_find_match_no_matches() {
 #[test]
 fn test_navigate_find_match_only_affects_find_tab() {
     // Tab without find state should not be affected.
-    let mut state = make_editor_with_single_tab("hello");
+    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
 
     // Should not panic.
     let _ = state.navigate_find_match(FindDirection::Next);
@@ -1178,30 +1228,9 @@ fn test_select_file_sets_tree_focused_when_not_focused() {
 
 // ── Focus gating and find/replace cursor tests ───────────────────
 
-fn make_editor_with_single_tab(text: &str) -> EditorState {
-    let mut state = EditorState::new();
-    state.tabs.push(Tab {
-        path: "/test.rs".to_string(),
-        file_name: "test.rs".to_string(),
-        is_dirty: false,
-        line_ending: LineEnding::Lf,
-    });
-    state.active_tab_index = 0;
-    state.tab_contents.insert(
-        "/test.rs".to_string(),
-        TabData {
-            content: EditorBuffer::with_text(text, None),
-            undo_stack: RefCell::new(UndoStack::new()),
-            find_replace_state: None,
-            saved_text_hash: hash_text(text),
-        },
-    );
-    state
-}
-
 #[test]
 fn test_undo_noop_when_quick_open_active() {
-    let mut state = make_editor_with_single_tab("hello");
+    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
     let path = "/test.rs".to_string();
     if let Some(tab_data) = state.tab_contents.get_mut(&path) {
         tab_data
@@ -1308,7 +1337,7 @@ fn test_tree_nav_suppressed_during_goto_line_overlay() {
 
 #[test]
 fn test_find_replace_all_preserves_cursor() {
-    let mut state = make_editor_with_single_tab("ab cd ab");
+    let mut state = EditorFixture::new().tab("/test.rs", "ab cd ab").build();
     let path = "/test.rs".to_string();
     if let Some(tab_data) = state.tab_contents.get_mut(&path) {
         tab_data.content.move_to(0, 5);
@@ -1328,7 +1357,7 @@ fn test_find_replace_all_preserves_cursor() {
 
 #[test]
 fn test_quick_open_toggle_blocked_when_goto_line_open() {
-    let mut state = make_editor_with_single_tab("hello");
+    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
     state.active_modal = Some(ModalKind::GotoLine);
     let _ = state.update(EditorMessage::QuickOpenToggle);
     assert!(!matches!(state.active_modal, Some(ModalKind::QuickOpen(_))));
@@ -1336,7 +1365,7 @@ fn test_quick_open_toggle_blocked_when_goto_line_open() {
 
 #[test]
 fn test_quick_open_toggle_closes_when_already_open() {
-    let mut state = make_editor_with_single_tab("hello");
+    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
     state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
         filter: crate::gui::common::SingleLineEditorState::new("foo"),
         selected_index: 0,
@@ -1348,7 +1377,7 @@ fn test_quick_open_toggle_closes_when_already_open() {
 
 #[test]
 fn test_global_search_toggle_blocked_when_quick_open_open() {
-    let mut state = make_editor_with_single_tab("hello");
+    let mut state = EditorFixture::new().tab("/test.rs", "hello").build();
     state.selected_workspace_name = Some("ws".to_string());
     state.selected_workspace_path = Some("/tmp/ws".to_string());
     state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
@@ -1919,36 +1948,6 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
     );
 }
 
-/// Creates an [`EditorState`] with `count` tabs, each with a unique path and
-/// file name. The active tab is set to `active`. The caller must ensure
-/// `active < count`.
-fn make_editor_with_tabs(count: usize, active: usize) -> EditorState {
-    assert!(
-        active < count,
-        "active tab index must be less than tab count"
-    );
-    let mut state = EditorState::new();
-    for i in 0..count {
-        state.tabs.push(Tab {
-            path: format!("/tmp/test_{i}.rs"),
-            file_name: format!("test_{i}.rs"),
-            is_dirty: false,
-            line_ending: LineEnding::Lf,
-        });
-        state.tab_contents.insert(
-            format!("/tmp/test_{i}.rs"),
-            TabData {
-                content: EditorBuffer::with_text("", None),
-                undo_stack: RefCell::new(UndoStack::new()),
-                find_replace_state: None,
-                saved_text_hash: 0,
-            },
-        );
-    }
-    state.active_tab_index = active;
-    state
-}
-
 #[test]
 fn test_switch_tab_relative() {
     struct Case {
@@ -2003,7 +2002,7 @@ fn test_switch_tab_relative() {
         },
     ];
     for case in cases {
-        let mut state = make_editor_with_tabs(case.tabs, case.start);
+        let mut state = EditorFixture::new().tabs(case.tabs, case.start).build();
         let _ = state.switch_tab_relative(case.direction);
         assert_eq!(state.active_tab_index, case.expected, "{}", case.name);
     }
@@ -2012,7 +2011,7 @@ fn test_switch_tab_relative() {
 #[test]
 fn test_switch_tab_relative_two_tabs() {
     // With exactly two tabs, Next and Prev toggle between them.
-    let mut state = make_editor_with_tabs(2, 0);
+    let mut state = EditorFixture::new().tabs(2, 0).build();
     let _ = state.switch_tab_relative(TabDirection::Next);
     assert_eq!(state.active_tab_index, 1);
 

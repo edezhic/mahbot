@@ -646,7 +646,6 @@ async fn age_ticket_past_grace(store: &BoardStore, id: &str) {
 
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_commit() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -680,8 +679,6 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     )
     .await;
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = crate::util::test::FakeProvider::new()
             .ok("analyst one")
             .ok(r#"{"issues":[]}"#)
@@ -689,7 +686,7 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
             .ok(r#"{"issues":[]}"#)
             .ok("analyst three")
             .ok(r#"{"issues":[]}"#);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::analysis::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -728,12 +725,10 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     )
     .await;
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = crate::util::test::FakeProvider::new()
             .ok("implemented the ticket")
             .ok(r#"{"items":["did the thing"],"summary":"done"}"#);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::development::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -800,10 +795,8 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     let job_id = crate::generate_id();
     spawn_phase_job(&job_id, &ws, &id, TicketPhase::InQa, crate::Role::Qa, "qa").await;
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = fake_clean_verifiers(1);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::qa::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -832,12 +825,10 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     )
     .await;
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = crate::util::test::FakeProvider::new()
             .ok("sanitation inspected")
             .ok(r#"{"pass":true,"garbage_files":[],"rationale":"clean"}"#);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::sanitation::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -867,7 +858,6 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
 
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn analysis_escalation_and_blocker_verification() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -890,8 +880,6 @@ async fn analysis_escalation_and_blocker_verification() {
     .await;
 
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // 3 base analysts: 2 flag the SAME blocker (grade=blocker), 1 passes
         // clean. The base consolidation groups both blocker findings; the
         // escalation then runs 2 verifiers that grade the blocker
@@ -909,7 +897,7 @@ async fn analysis_escalation_and_blocker_verification() {
             .ok(r#"{"verdicts":[{"index":0,"kind":"risk_edge_case","severity":"medium","impact":"delays onboarding","reasoning":"present but not blocking"}]}"#)
             .ok("verifier two")
             .ok(r#"{"verdicts":[{"index":0,"kind":"main_path_blocker","severity":"high","impact":"blocks the main path","reasoning":"core requirement"}]}"#);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::analysis::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -949,7 +937,6 @@ async fn analysis_escalation_and_blocker_verification() {
 /// verdict is reconstructed without an LLM call).
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -1019,8 +1006,6 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     }
 
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // Only the 2 not-Done slots are re-run: each consumes a turn response
         // and a verdict extraction. The Done slot is reconstructed (0 calls).
         let fake: std::sync::Arc<crate::util::test::FakeProvider> = std::sync::Arc::new(
@@ -1030,8 +1015,7 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
                 .ok("analyst two")
                 .ok(r#"{"issues":[]}"#),
         );
-        let fake_dyn: std::sync::Arc<dyn crate::Provider> = fake.clone();
-        let _fake = crate::util::test::install_fake_provider(fake_dyn);
+        let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
         super::analysis::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -1066,7 +1050,6 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
 /// re-appending (so no duplicate-idx escalation rows accumulate).
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -1169,8 +1152,6 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     }
 
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // Only the not-Done escalation slot (idx 4) is re-run: turn + verdict
         // extraction. The joint-comment synthesis falls back on the `{}`
         // scripted responses (base verdicts carry issues, so it is not clean).
@@ -1181,8 +1162,7 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
             .ok("{}")
             .ok("{}");
         let fake = std::sync::Arc::new(fake);
-        let fake_dyn: std::sync::Arc<dyn crate::Provider> = fake.clone();
-        let _fake = crate::util::test::install_fake_provider(fake_dyn);
+        let _seam = crate::util::test::install_retry_seam_dyn(fake);
         super::analysis::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -1253,7 +1233,6 @@ fn blocker_verification_merge_reduces_two_verifiers_to_one_outcome() {
 
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn review_qa_dynamic_count_calibration() {
     use crate::pipeline::verdict::{
         DEFAULT_REVIEW_COUNT_HIGH_CHURN, DEFAULT_REVIEW_COUNT_LOW_CHURN,
@@ -1316,10 +1295,8 @@ async fn review_qa_dynamic_count_calibration() {
     )
     .await;
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = fake_clean_verifiers(1);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::qa::run(
             std::sync::Arc::new(expect_ticket(store, &qa_id).await),
             ws2.clone(),
@@ -1341,7 +1318,6 @@ async fn review_qa_dynamic_count_calibration() {
 
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -1377,14 +1353,12 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
     .await;
 
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // Zero-change repo → reviewer count 1 → a single sub-threshold verdict
         // trips the breaker (only the agent-turn + extraction are consumed).
         let fake = crate::util::test::FakeProvider::new()
             .ok("reviewer checked")
             .ok(r#"{"score":5,"issues":["bug"]}"#);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::review::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -1423,7 +1397,6 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
 
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -1447,8 +1420,6 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     )
     .await;
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // Every analyst turn + every extraction attempt fails to produce a
         // verdict → `extracted_count == 0` → reset for a fresh attempt.
         let fake = crate::util::test::FakeProvider::new()
@@ -1464,7 +1435,7 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
             .ok("not json")
             .ok("not json")
             .ok("not json");
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::analysis::run(
             std::sync::Arc::new(expect_ticket(store, &aid).await),
             ws.clone(),
@@ -1497,10 +1468,8 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     // The puller re-creates a fresh Analysis job and re-drives it to completion
     // (so no lingering phase-body task consumes the next provider script).
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = fake_clean_verifiers(3);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::dispatch_working_phases(&ws).await;
         assert!(
             expect_phase_job(store, &aid, TicketPhase::Analysis)
@@ -1583,12 +1552,10 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     // The puller re-creates a fresh InDevelopment job on a paused workspace and
     // re-drives it (the re-created body consumes this script).
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = crate::util::test::FakeProvider::new()
             .ok("implemented")
             .ok(r#"{"items":["done"],"summary":"ok"}"#);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::dispatch_working_phases(&ws).await;
         assert!(
             expect_phase_job(store, &eid, TicketPhase::InDevelopment)
@@ -1622,7 +1589,6 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
 
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -1646,8 +1612,6 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
 
     let before = expect_ticket(store, &id).await;
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = crate::util::test::FakeProvider::new()
             .ok("not json")
             .ok("not json")
@@ -1661,7 +1625,7 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
             .ok("not json")
             .ok("not json")
             .ok("not json");
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::analysis::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),
@@ -1704,7 +1668,6 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
 
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn cancel_requested_engineer_goes_to_cancelled() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -1727,15 +1690,13 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
     .await;
 
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // The engineer's first provider outcome is a tool call (empty-args read
         // errors), keeping the agent in-flight until the test cancels it.
         let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
         for _ in 0..9 {
             fake = fake.ok_tool_call("read");
         }
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
 
         let ticket = expect_ticket(store, &id).await;
         let handle = tokio::spawn(super::development::run(
@@ -1784,7 +1745,6 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
 
 #[serial_test::serial(provider)]
 #[tokio::test]
-#[expect(clippy::await_holding_lock)]
 async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
     let _guard = TEST_LOCK.lock().await;
     init_management_test_stores().await;
@@ -1799,15 +1759,13 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
     spawn_phase_job(&job_id, &ws, &id, TicketPhase::InQa, crate::Role::Qa, "qa").await;
 
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // The QA verifier's first outcome is a tool call (errors), holding it
         // in-flight until the workspace pause lands.
         let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
         for _ in 0..9 {
             fake = fake.ok_tool_call("read");
         }
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
 
         let ticket = expect_ticket(store, &id).await;
         let handle = tokio::spawn(super::qa::run(
@@ -1855,10 +1813,8 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         .await
         .unwrap();
     {
-        let _lock = crate::util::test::retry_tests_lock();
-        let _retry = crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let fake = fake_clean_verifiers(1);
-        let _fake = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
         super::qa::run(
             std::sync::Arc::new(expect_ticket(store, &id).await),
             ws.clone(),

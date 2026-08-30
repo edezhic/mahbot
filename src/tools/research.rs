@@ -3611,16 +3611,12 @@ mod tests {
     /// (role/user/channel persisted on the job row, never the Manager).
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn resume_research_run_continues_at_synthesis_stage() {
         crate::util::test::init_management_test_stores().await;
-        let _lock = crate::util::test::retry_tests_lock();
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         // One synthesis call (the only LLM work left at stage=Synthesis).
         let fake = crate::util::test::FakeProvider::new()
             .ok("final synthesized report for the resumed run");
-        let _provider_guard = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
+        let _seam = crate::util::test::install_retry_seam(fake);
 
         let ws = crate::workspace::test_ws("/tmp/test_ws_research_resume");
         let job_id = "research_job_resume_1";

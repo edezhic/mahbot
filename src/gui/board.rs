@@ -2146,29 +2146,7 @@ mod tests {
     fn make_board_state() -> BoardState {
         let mut state = BoardState::new();
         state.current_user_name = Some("admin".into());
-        state.selected_ticket = Some(Ticket {
-            id: "T-1".into(),
-            title: "Test ticket".into(),
-            description: String::new(),
-            phase: TicketPhase::Backlog,
-            workspace_name: "test_ws".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            comments: Vec::new(),
-            prerequisites: Vec::new(),
-            supersedes: None,
-            superseded_by: None,
-            commit_hash: None,
-            lines_added: None,
-            lines_removed: None,
-            reporter: "test".into(),
-            is_archived: false,
-            priority: 0,
-            reviewed_head: None,
-            reviewed_tree: None,
-            done_at: None,
-            bounce_count: 0,
-        });
+        state.selected_ticket = Some(TicketFixture::new("T-1", TicketPhase::Backlog).build());
         state
     }
 
@@ -2316,29 +2294,9 @@ mod tests {
         state.comment_focused = true;
 
         let gen_before = state.comment_generation;
-        let ticket = Ticket {
-            id: "T-2".into(),
-            title: "New ticket".into(),
-            description: String::new(),
-            phase: TicketPhase::Backlog,
-            workspace_name: "test_ws".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            comments: Vec::new(),
-            prerequisites: Vec::new(),
-            supersedes: None,
-            superseded_by: None,
-            commit_hash: None,
-            lines_added: None,
-            lines_removed: None,
-            reporter: "test".into(),
-            is_archived: false,
-            priority: 0,
-            reviewed_head: None,
-            reviewed_tree: None,
-            done_at: None,
-            bounce_count: 0,
-        };
+        let ticket = TicketFixture::new("T-2", TicketPhase::Backlog)
+            .title("New ticket")
+            .build();
         let _task = state.update(BoardMessage::TicketDetails(Box::new(ticket)));
 
         assert!(
@@ -2361,41 +2319,85 @@ mod tests {
 
     // ── TicketDetailsRefreshed (periodic refresh of the open modal) ─
 
-    fn make_ticket(id: &str, phase: TicketPhase) -> Ticket {
-        Ticket {
-            id: id.into(),
-            title: "Test ticket".into(),
-            description: String::new(),
-            phase,
-            workspace_name: "test_ws".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            comments: Vec::new(),
-            prerequisites: Vec::new(),
-            supersedes: None,
-            superseded_by: None,
-            commit_hash: None,
-            lines_added: None,
-            lines_removed: None,
-            reporter: "test".into(),
-            is_archived: false,
-            priority: 0,
-            reviewed_head: None,
-            reviewed_tree: None,
-            done_at: None,
-            bounce_count: 0,
+    /// In-memory ticket fixture, distinct from the DB-insert helpers
+    /// (`TicketBuilder` / `make_ticket`) in `util::test`.
+    struct TicketFixture(Ticket);
+
+    impl TicketFixture {
+        fn new(id: &str, phase: TicketPhase) -> Self {
+            Self(Ticket {
+                id: id.into(),
+                title: "Test ticket".into(),
+                description: String::new(),
+                phase,
+                workspace_name: "test_ws".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                comments: Vec::new(),
+                prerequisites: Vec::new(),
+                supersedes: None,
+                superseded_by: None,
+                commit_hash: None,
+                lines_added: None,
+                lines_removed: None,
+                reporter: "test".into(),
+                is_archived: false,
+                priority: 0,
+                reviewed_head: None,
+                reviewed_tree: None,
+                done_at: None,
+                bounce_count: 0,
+            })
         }
+
+        fn title(mut self, title: &str) -> Self {
+            self.0.title = title.into();
+            self
+        }
+
+        fn workspace(mut self, workspace: &str) -> Self {
+            self.0.workspace_name = workspace.into();
+            self
+        }
+
+        fn archived(mut self, archived: bool) -> Self {
+            self.0.is_archived = archived;
+            self
+        }
+
+        fn created_at(mut self, created_at: &str) -> Self {
+            self.0.created_at = created_at.into();
+            self
+        }
+
+        fn done_at(mut self, done_at: Option<&str>) -> Self {
+            self.0.done_at = done_at.map(str::to_string);
+            self
+        }
+
+        fn comment(mut self, role: &str, content: &str, created_at: &str) -> Self {
+            self.0.comments.push(crate::pipeline::board::TicketComment {
+                role: role.into(),
+                content: content.into(),
+                created_at: created_at.into(),
+            });
+            self
+        }
+
+        fn build(self) -> Ticket {
+            self.0
+        }
+    }
+
+    fn make_ticket(id: &str, phase: TicketPhase) -> Ticket {
+        TicketFixture::new(id, phase).build()
     }
 
     /// Same-ticket refresh carrying a new phase plus an engineer comment.
     fn refreshed_ticket(phase: TicketPhase) -> Ticket {
-        let mut ticket = make_ticket("T-1", phase);
-        ticket.comments = vec![crate::pipeline::board::TicketComment {
-            role: "engineer".into(),
-            content: "fixed the flaky test".into(),
-            created_at: "2026-01-01T00:00:05Z".into(),
-        }];
-        ticket
+        TicketFixture::new("T-1", phase)
+            .comment("engineer", "fixed the flaky test", "2026-01-01T00:00:05Z")
+            .build()
     }
 
     #[test]
@@ -2604,29 +2606,11 @@ mod tests {
     fn test_escape_first_blurs_then_closes() {
         let mut state = make_board_state();
         state.comment_focused = true;
-        state.selected_ticket = Some(Ticket {
-            id: "T-1".into(),
-            title: "Test".into(),
-            description: String::new(),
-            phase: TicketPhase::Backlog,
-            workspace_name: "test_ws".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            comments: Vec::new(),
-            prerequisites: Vec::new(),
-            supersedes: None,
-            superseded_by: None,
-            commit_hash: None,
-            lines_added: None,
-            lines_removed: None,
-            reporter: "test".into(),
-            is_archived: false,
-            priority: 0,
-            reviewed_head: None,
-            reviewed_tree: None,
-            done_at: None,
-            bounce_count: 0,
-        });
+        state.selected_ticket = Some(
+            TicketFixture::new("T-1", TicketPhase::Backlog)
+                .title("Test")
+                .build(),
+        );
 
         // First Escape: focused → blur (clear flag), modal stays open
         let _task = state.update(BoardMessage::Escape);
@@ -2647,14 +2631,6 @@ mod tests {
         );
     }
 
-    // ── Mid-pipeline cancel confirmation ─────────────────────────
-
-    fn ticket_with(id: &str, phase: TicketPhase) -> Ticket {
-        Ticket {
-            ..make_ticket(id, phase)
-        }
-    }
-
     // ── CDC change-stream delta application ───────────────────────
 
     #[test]
@@ -2662,7 +2638,7 @@ mod tests {
         let mut state = BoardState::new();
         state.board_generation = 2;
         let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![ticket_with("T-1", TicketPhase::Backlog)],
+            tickets: vec![make_ticket("T-1", TicketPhase::Backlog)],
             generation: 1,
         });
         assert!(
@@ -2677,7 +2653,7 @@ mod tests {
         state.board_generation = 2;
         state.load_state.start_loading();
         let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![ticket_with("T-1", TicketPhase::Backlog)],
+            tickets: vec![make_ticket("T-1", TicketPhase::Backlog)],
             generation: 2,
         });
         assert_eq!(state.tickets.len(), 1);
@@ -2688,9 +2664,9 @@ mod tests {
     fn refreshed_replace_on_switch_drops_previous_workspace_tickets() {
         let mut state = BoardState::new();
         state.replace_on_refresh = true;
-        state.tickets = vec![ticket_with("T-old", TicketPhase::Backlog)];
+        state.tickets = vec![make_ticket("T-old", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::Refreshed {
-            tickets: vec![ticket_with("T-new", TicketPhase::Analysis)],
+            tickets: vec![make_ticket("T-new", TicketPhase::Analysis)],
             generation: 0,
         });
         assert_eq!(
@@ -2708,7 +2684,7 @@ mod tests {
         // A ticket a delta updated (would be kept as absent), later removed by a
         // delta that the lagged broadcast dropped. A lag recovery must replace
         // the board so the recovered snapshot (which omits it) can drop it.
-        state.tickets = vec![ticket_with("T-1", TicketPhase::Done)];
+        state.tickets = vec![make_ticket("T-1", TicketPhase::Done)];
         let _task = state.update(BoardMessage::BoardRefreshNeeded);
         assert!(
             state.replace_on_refresh,
@@ -2720,14 +2696,14 @@ mod tests {
     fn refreshed_merge_keeps_newer_updated_at_and_does_not_readd_removed() {
         let mut state = BoardState::new();
         state.replace_on_refresh = true;
-        let mut ticket = ticket_with("T-1", TicketPhase::Backlog);
+        let mut ticket = make_ticket("T-1", TicketPhase::Backlog);
         ticket.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
         state.tickets = vec![ticket];
         // Simulate a workspace switch already consumed: now a same-workspace
         // recovery refresh merges.
         state.replace_on_refresh = false;
         // A newer snapshot updates the stale cached ticket.
-        let mut newer = ticket_with("T-1", TicketPhase::Analysis);
+        let mut newer = make_ticket("T-1", TicketPhase::Analysis);
         newer.updated_at = "2026-08-27T04:00:01.000000+00:00".into();
         let _task = state.update(BoardMessage::Refreshed {
             tickets: vec![newer],
@@ -2742,7 +2718,7 @@ mod tests {
         // A removed ticket is not re-added by a stale snapshot.
         state.replace_on_refresh = false;
         state.delta_removed_ids.insert("T-2".into());
-        let mut removed = ticket_with("T-2", TicketPhase::Done);
+        let mut removed = make_ticket("T-2", TicketPhase::Done);
         removed.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
         let _task = state.update(BoardMessage::Refreshed {
             tickets: vec![removed],
@@ -2757,7 +2733,7 @@ mod tests {
         // ambiguous — the snapshot may predate its creation/delta), so a
         // delta-created ticket survives an older snapshot that omits it.
         state.replace_on_refresh = false;
-        let mut created = ticket_with("T-3", TicketPhase::Backlog);
+        let mut created = make_ticket("T-3", TicketPhase::Backlog);
         created.updated_at = "2026-08-27T04:00:00.000000+00:00".into();
         state.tickets = vec![created];
         let _task = state.update(BoardMessage::Refreshed {
@@ -2809,7 +2785,7 @@ mod tests {
             "a ticket not in the selected workspace must be dropped"
         );
 
-        let ticket = ticket_with("T-1", TicketPhase::InDevelopment);
+        let ticket = make_ticket("T-1", TicketPhase::InDevelopment);
         state.apply_ticket_upsert(ticket.clone());
         assert_eq!(state.tickets.len(), 1);
         // Idempotent upsert by id — no duplicate.
@@ -2829,7 +2805,7 @@ mod tests {
         // confirmation modal opens.
         // (No detail modal open, so the list is the eligibility source.)
         let mut state = BoardState::new();
-        state.tickets = vec![ticket_with("T-1", TicketPhase::InDevelopment)];
+        state.tickets = vec![make_ticket("T-1", TicketPhase::InDevelopment)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert_eq!(
             state.pending_cancel.as_deref(),
@@ -2842,7 +2818,7 @@ mod tests {
         assert!(state.pending_cancel.is_none());
 
         // A plain cancel (non-pipeline phase) never opens the modal.
-        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog)];
+        state.tickets = vec![make_ticket("T-1", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert!(
             state.pending_cancel.is_none(),
@@ -2851,7 +2827,7 @@ mod tests {
 
         // Confirming closes the modal (the PerformAction task carries the
         // actual transition).
-        state.tickets = vec![ticket_with("T-1", TicketPhase::InDevelopment)];
+        state.tickets = vec![make_ticket("T-1", TicketPhase::InDevelopment)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         let _task = state.update(BoardMessage::ConfirmCancel("T-1".into()));
         assert!(state.pending_cancel.is_none());
@@ -2860,7 +2836,7 @@ mod tests {
         // comment input is focused — with the detail modal open showing a
         // pipeline-occupied ticket.
         let mut state = make_board_state();
-        state.selected_ticket = Some(ticket_with("T-1", TicketPhase::InDevelopment));
+        state.selected_ticket = Some(make_ticket("T-1", TicketPhase::InDevelopment));
         state.comment_focused = true;
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         let _task = state.update(BoardMessage::Escape);
@@ -2886,7 +2862,7 @@ mod tests {
         // a search is active), then the board list. A stale lower-priority
         // source must not decide the modal.
         let mut state = make_board_state(); // selected_ticket: T-1, Backlog, no assignee
-        state.tickets = vec![ticket_with("T-1", TicketPhase::InDevelopment)];
+        state.tickets = vec![make_ticket("T-1", TicketPhase::InDevelopment)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert!(
             state.pending_cancel.is_none(),
@@ -2895,8 +2871,8 @@ mod tests {
 
         // Detail says pipeline-occupied while the list is stale → modal opens.
         let mut state = make_board_state();
-        state.selected_ticket = Some(ticket_with("T-1", TicketPhase::InDiagnostics));
-        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog)];
+        state.selected_ticket = Some(make_ticket("T-1", TicketPhase::InDiagnostics));
+        state.tickets = vec![make_ticket("T-1", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert_eq!(
             state.pending_cancel.as_deref(),
@@ -2908,8 +2884,8 @@ mod tests {
         // list refresh is paused), so they are consulted before the list.
         let mut state = make_board_state();
         state.selected_ticket = None;
-        state.search_results = vec![ticket_with("T-1", TicketPhase::InQa)];
-        state.tickets = vec![ticket_with("T-1", TicketPhase::Backlog)];
+        state.search_results = vec![make_ticket("T-1", TicketPhase::InQa)];
+        state.tickets = vec![make_ticket("T-1", TicketPhase::Backlog)];
         let _task = state.update(BoardMessage::RequestCancel("T-1".into()));
         assert_eq!(
             state.pending_cancel.as_deref(),
@@ -3013,29 +2989,11 @@ mod tests {
     #[test]
     fn test_search_empty_input_clears_results() {
         let mut state = make_board_state();
-        state.search_results = vec![Ticket {
-            id: "T-1".into(),
-            title: "Old result".into(),
-            description: String::new(),
-            phase: TicketPhase::Backlog,
-            workspace_name: "test_ws".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            comments: Vec::new(),
-            prerequisites: Vec::new(),
-            supersedes: None,
-            superseded_by: None,
-            commit_hash: None,
-            lines_added: None,
-            lines_removed: None,
-            reporter: "test".into(),
-            is_archived: false,
-            priority: 0,
-            reviewed_head: None,
-            reviewed_tree: None,
-            done_at: None,
-            bounce_count: 0,
-        }];
+        state.search_results = vec![
+            TicketFixture::new("T-1", TicketPhase::Backlog)
+                .title("Old result")
+                .build(),
+        ];
         state.search_generation = 5;
 
         let _task = state.update(BoardMessage::SearchInputChanged(EditorAction::Paste(
@@ -3072,29 +3030,11 @@ mod tests {
 
         // A stale result (generation 50 < current 99) should be ignored
         let _task = state.update(BoardMessage::SearchResults(
-            vec![Ticket {
-                id: "T-stale".into(),
-                title: "Stale".into(),
-                description: String::new(),
-                phase: TicketPhase::Backlog,
-                workspace_name: "test_ws".into(),
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-                comments: Vec::new(),
-                prerequisites: Vec::new(),
-                supersedes: None,
-                superseded_by: None,
-                commit_hash: None,
-                lines_added: None,
-                lines_removed: None,
-                reporter: "test".into(),
-                is_archived: false,
-                priority: 0,
-                reviewed_head: None,
-                reviewed_tree: None,
-                done_at: None,
-                bounce_count: 0,
-            }],
+            vec![
+                TicketFixture::new("T-stale", TicketPhase::Backlog)
+                    .title("Stale")
+                    .build(),
+            ],
             50,
         ));
 
@@ -3111,29 +3051,11 @@ mod tests {
         state.search_generation = 42;
 
         let _task = state.update(BoardMessage::SearchResults(
-            vec![Ticket {
-                id: "T-fresh".into(),
-                title: "Fresh result".into(),
-                description: String::new(),
-                phase: TicketPhase::Backlog,
-                workspace_name: "test_ws".into(),
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-                comments: Vec::new(),
-                prerequisites: Vec::new(),
-                supersedes: None,
-                superseded_by: None,
-                commit_hash: None,
-                lines_added: None,
-                lines_removed: None,
-                reporter: "test".into(),
-                is_archived: false,
-                priority: 0,
-                reviewed_head: None,
-                reviewed_tree: None,
-                done_at: None,
-                bounce_count: 0,
-            }],
+            vec![
+                TicketFixture::new("T-fresh", TicketPhase::Backlog)
+                    .title("Fresh result")
+                    .build(),
+            ],
             42,
         ));
 
@@ -3145,29 +3067,11 @@ mod tests {
     fn test_search_cleared_resets_query_and_results() {
         let mut state = make_board_state();
         state.search_query.set_text("something");
-        state.search_results = vec![Ticket {
-            id: "T-1".into(),
-            title: "Result".into(),
-            description: String::new(),
-            phase: TicketPhase::Backlog,
-            workspace_name: "test_ws".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            comments: Vec::new(),
-            prerequisites: Vec::new(),
-            supersedes: None,
-            superseded_by: None,
-            commit_hash: None,
-            lines_added: None,
-            lines_removed: None,
-            reporter: "test".into(),
-            is_archived: false,
-            priority: 0,
-            reviewed_head: None,
-            reviewed_tree: None,
-            done_at: None,
-            bounce_count: 0,
-        }];
+        state.search_results = vec![
+            TicketFixture::new("T-1", TicketPhase::Backlog)
+                .title("Result")
+                .build(),
+        ];
         state.search_generation = 7;
 
         let _task = state.update(BoardMessage::SearchCleared);
@@ -3179,21 +3083,17 @@ mod tests {
 
     // ── Completed-column ordering ──────────────────────────────────
 
-    /// Build a ticket for sort tests from the shared base literal.
+    /// Build a ticket for sort tests; defaults match the board-state fixture.
     fn test_ticket(
         id: &str,
         phase: TicketPhase,
         created_at: &str,
         done_at: Option<&str>,
     ) -> Ticket {
-        let base = make_board_state().selected_ticket.unwrap();
-        Ticket {
-            id: id.into(),
-            phase,
-            created_at: created_at.into(),
-            done_at: done_at.map(str::to_string),
-            ..base
-        }
+        TicketFixture::new(id, phase)
+            .created_at(created_at)
+            .done_at(done_at)
+            .build()
     }
 
     #[test]
@@ -3226,13 +3126,13 @@ mod tests {
 
     // ── Pause-all-queued helper ─────────────────────
 
-    /// Build a ticket for the pause-helper tests, overriding the phase,
-    /// workspace and archived flag.
+    /// Build a ticket for the pause-helper tests in `workspace`, optionally
+    /// archived.
     fn ticket_in(workspace: &str, id: &str, phase: TicketPhase, archived: bool) -> Ticket {
-        let mut ticket = make_ticket(id, phase);
-        ticket.workspace_name = workspace.into();
-        ticket.is_archived = archived;
-        ticket
+        TicketFixture::new(id, phase)
+            .workspace(workspace)
+            .archived(archived)
+            .build()
     }
 
     #[test]

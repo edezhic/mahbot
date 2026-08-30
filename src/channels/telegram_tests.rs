@@ -1625,41 +1625,14 @@ async fn acquire_mirror_lock() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-/// A spy channel that records sent messages in a shared Vec.
-struct SpyChannel {
-    sent: Arc<Mutex<Vec<SendMessage>>>,
-}
-
-#[async_trait]
-impl crate::Channel for SpyChannel {
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        self.sent.lock().unwrap_poison().push(message.clone());
-        Ok(())
-    }
-
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "telegram"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 /// Set up the channel registry with a spy Telegram channel and return a
 /// shared sent-messages buffer. Idempotent — safe to call from every test.
 fn setup_spy_channel() -> &'static Arc<Mutex<Vec<SendMessage>>> {
     static SPY_SENT: OnceLock<Arc<Mutex<Vec<SendMessage>>>> = OnceLock::new();
     SPY_SENT.get_or_init(|| {
-        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (spy, sent) = crate::util::test::SpyChannel::new("telegram");
         let registry = crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
-        registry.register(Arc::new(SpyChannel {
-            sent: Arc::clone(&sent),
-        }) as Arc<dyn crate::Channel>);
+        registry.register(Arc::new(spy) as Arc<dyn crate::Channel>);
         sent
     })
 }

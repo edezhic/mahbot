@@ -358,6 +358,94 @@ pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeP
     }
 }
 
+// ── Combined retry+provider test seam ────────────────────
+
+/// RAII guard for [`install_retry_seam`]: holds [`retry_tests_lock`], the
+/// tiny retry-policy override, and the fake provider until dropped, so all
+/// three restore at scope exit (including on panic). Fields are ordered so
+/// the drop restores provider → policy → lock (reverse of install).
+///
+/// Holding the guard across `.await` is intentional — the lock serializes
+/// the process-global test seams — and wrapping it in this struct
+/// deliberately keeps `clippy::await_holding_lock` from firing.
+#[must_use]
+pub(crate) struct RetrySeam {
+    _fake: FakeProviderGuard,
+    _retry: RetryPolicyGuard,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Scoped install of the full retry-provider test seam: acquires
+/// [`retry_tests_lock`], installs [`crate::retry::tiny_test_policy`], and
+/// installs `provider` as the global provider. Everything restores when the
+/// returned [`RetrySeam`] drops.
+pub(crate) fn install_retry_seam(provider: impl crate::Provider + 'static) -> RetrySeam {
+    install_retry_seam_dyn(Arc::new(provider))
+}
+
+/// [`install_retry_seam`] for an already-arc'd provider.
+pub(crate) fn install_retry_seam_dyn(provider: Arc<dyn crate::Provider>) -> RetrySeam {
+    let lock = retry_tests_lock();
+    let retry = install_test_retry_policy(crate::retry::tiny_test_policy());
+    let fake = install_fake_provider(provider);
+    RetrySeam {
+        _fake: fake,
+        _retry: retry,
+        _lock: lock,
+    }
+}
+
+/// Recording [`crate::Channel`] test double: every sent message is pushed
+/// into a shared buffer, `listen` is a no-op.
+///
+/// `name` is required because the registry keys channels by name and
+/// silently drops duplicate registrations — call sites pass distinct names
+/// to avoid cross-test collisions.
+pub(crate) struct SpyChannel {
+    name: &'static str,
+    sent: Arc<std::sync::Mutex<Vec<crate::SendMessage>>>,
+}
+
+impl SpyChannel {
+    /// Returns the spy and its shared sent-messages buffer.
+    #[must_use]
+    pub(crate) fn new(
+        name: &'static str,
+    ) -> (Self, Arc<std::sync::Mutex<Vec<crate::SendMessage>>>) {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                name,
+                sent: Arc::clone(&sent),
+            },
+            sent,
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::Channel for SpyChannel {
+    async fn send(&self, message: &crate::SendMessage) -> anyhow::Result<()> {
+        self.sent.lock().unwrap_poison().push(message.clone());
+        Ok(())
+    }
+
+    async fn listen(
+        &self,
+        _tx: tokio::sync::mpsc::Sender<crate::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Install a caller-owned logs store for `record_llm_*` stat writes for the
 /// duration of the returned guard (mirrors [`install_fake_provider`]).
 ///

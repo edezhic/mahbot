@@ -1146,34 +1146,6 @@ mod tests {
     /// parallel test (e.g. telegram_tests) may have already registered.
     const TEST_SPY_CHANNEL: &str = "__test_spy_channel";
 
-    /// A spy channel that records sent messages in a shared [`Vec`].
-    struct TestSpyChannel {
-        sent: Arc<std::sync::Mutex<Vec<SendMessage>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::Channel for TestSpyChannel {
-        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-            self.sent.lock().unwrap_poison().push(message.clone());
-            Ok(())
-        }
-
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<crate::ChannelMessage>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn name(&self) -> &'static str {
-            TEST_SPY_CHANNEL
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
     /// Set up DB stores + channel registry for response-delivery tests.
     async fn setup_response_test_infra() {
         crate::util::test::init_management_test_stores().await;
@@ -1386,10 +1358,8 @@ mod tests {
             .expect("bind admin to gui channel");
 
         // Register a spy channel under a unique name so it is always ours.
-        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
-        crate::channel_registry().register(Arc::new(TestSpyChannel {
-            sent: Arc::clone(&sent),
-        }) as Arc<dyn crate::Channel>);
+        let (spy, sent) = crate::util::test::SpyChannel::new(TEST_SPY_CHANNEL);
+        crate::channel_registry().register(Arc::new(spy) as Arc<dyn crate::Channel>);
         store
             .bind_channel("admin", TEST_SPY_CHANNEL, "admin")
             .await
