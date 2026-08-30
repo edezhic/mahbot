@@ -3422,7 +3422,7 @@ impl SettingsState {
         )
     }
 
-    /// About section — embedded version and install/update mode.
+    /// About block — version and install mode on one line.
     fn about_section() -> Element<'static, SettingsMessage> {
         // Bind the classification once per render — `update_mode()` performs
         // filesystem probes and must not run twice per frame.
@@ -3431,30 +3431,17 @@ impl SettingsState {
             crate::self_update::UpdateMode::LocalCheckout => "local checkout",
             crate::self_update::UpdateMode::Registry => "crates.io install",
         };
-        let mode_note = match mode {
-            crate::self_update::UpdateMode::LocalCheckout => {
-                "Self-update builds from the local source checkout."
-            }
-            crate::self_update::UpdateMode::Registry => {
-                "Self-update checks crates.io and installs the latest version."
-            }
-        };
-        section(
-            "About",
-            column![
-                row![
-                    text(format!("MahBot v{}", crate::self_update::VERSION))
-                        .size(13)
-                        .color(theme::TEXT_MUTED),
-                ],
-                row![
-                    text(format!("Install mode: {mode_label}"))
-                        .size(11)
-                        .color(theme::TEXT_FAINT)
-                ],
-                row![text(mode_note).size(11).color(theme::TEXT_FAINT),],
-            ],
-        )
+        row![
+            text(format!("MahBot v{}", crate::self_update::VERSION))
+                .size(13)
+                .color(theme::TEXT_MUTED),
+            text(format!("Install mode: {mode_label}"))
+                .size(11)
+                .color(theme::TEXT_FAINT)
+        ]
+        .spacing(8.0)
+        .align_y(Alignment::Center)
+        .into()
     }
 
     fn routing_section(&self) -> Element<'_, SettingsMessage> {

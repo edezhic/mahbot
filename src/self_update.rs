@@ -58,7 +58,7 @@ use tracing::{error, info, warn};
 ///
 /// Cargo sets this from the `version` field in `Cargo.toml` for every build —
 /// including `cargo install` builds from crates.io — so it is the authoritative
-/// version of the running binary. The GUI surfaces it (Settings → About) and
+/// version of the running binary. The GUI surfaces it on the Settings page and
 /// registry-mode self-update compares against it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
