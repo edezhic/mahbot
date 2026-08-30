@@ -6,13 +6,15 @@ Prefer documented package scripts, Makefile targets, and CI workflow commands ov
 
 For each category below, identify the minimal shell command that works from the workspace root. If no such tooling exists for a category, note it as absent.
 
+Prefer the cheapest command that still runs every real check. If a tool's default invocation builds, links, or runs targets that hold no tests or are never exercised, substitute the equivalent scoped command that runs only what the project actually uses — but only if it still exercises every real test and check the default would; otherwise keep the default.
+
 1. **format** — auto-formatter command (e.g., `cargo fmt`, `prettier --write .`, `black .`)
 2. **format-check** — format verification without changes (e.g., `cargo fmt -- --check`, `prettier --check .`, `black --check .`)
 3. **lint** — linter, idempotent (e.g., `cargo clippy -- -D warnings`, `eslint .`, `ruff check .`)
 4. **lint-fix** — auto-fix lint issues (e.g., `cargo clippy --fix --allow-dirty`, `eslint --fix .`, `ruff check --fix .`)
 5. **type-check** — type checking without full compilation (e.g., `cargo check`, `tsc --noEmit`, `mypy .`)
 6. **build** — full build command (e.g., `cargo build`, `npm run build`, `make`)
-7. **unit-test** — run unit tests, fast (e.g., `cargo test`, `pytest`, `npm test`)
+7. **unit-test** — run unit tests, fast (e.g., `pytest`, `npm test`)
 
 ## Multi-Language Projects
 
