@@ -17,3 +17,5 @@ Grade the concerns:
 - minor: a small gap / non-blocking note
 - major: a material problem that should be resolved before development
 - blocker: prevents implementing the ticket as proposed
+
+Beware that the ticket author does not need to specify exact implementation details(interfaces etc), and exact tech spec is not expected from him. Unless exact specification is implied by the ticket's expectations - do not grade missing details as major/blocker-level concerns.
