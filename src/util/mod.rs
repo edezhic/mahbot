@@ -2015,42 +2015,33 @@ mod verify_sha256_tests {
     }
 
     #[test]
-    fn matching_hash_passes() {
+    fn verify_sha256_cases() {
+        // Matching and mismatching hashes over a written file.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.bin");
         std::fs::write(&path, b"test data").unwrap();
         let hash = sha256_hex(b"test data");
-        assert!(verify_sha256(&path, &hash).is_ok());
-    }
+        assert!(
+            verify_sha256(&path, &hash).is_ok(),
+            "matching hash should pass"
+        );
+        assert!(
+            verify_sha256(&path, &sha256_hex(b"other data")).is_err(),
+            "mismatching hash should fail"
+        );
 
-    #[test]
-    fn mismatching_hash_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.bin");
-        std::fs::write(&path, b"different data").unwrap();
-        let hash = sha256_hex(b"test data");
-        assert!(verify_sha256(&path, &hash).is_err());
-    }
-
-    #[test]
-    fn empty_hash_skips_verification() {
         // Empty expected hash → Ok without opening the file (skip semantics).
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nonexistent.bin");
         assert!(
             verify_sha256(&missing, "").is_ok(),
-            "empty SHA256 expected hash should skip verification"
+            "empty hash should skip verification"
         );
-    }
-
-    #[test]
-    fn file_not_found_with_non_empty_hash_fails() {
-        // The file-not-found error path: requires a non-empty expected hash
-        // (the empty-hash skip above returns Ok before any file I/O).
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("nonexistent.bin");
-        let hash = sha256_hex(b"anything");
-        assert!(verify_sha256(&missing, &hash).is_err());
+        // The not-found error path requires a non-empty expected hash.
+        assert!(
+            verify_sha256(&missing, &sha256_hex(b"anything")).is_err(),
+            "missing file with non-empty hash should fail"
+        );
     }
 }
 

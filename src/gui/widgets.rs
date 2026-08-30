@@ -1862,67 +1862,46 @@ mod tests {
     }
 
     #[test]
-    fn tree_row_natural_width_plain_file_row() {
-        // Depth 1 (guide 2 chars) + 14px icon + 4px gap + 11-char name.
-        let w =
-            tree_row_natural_width(2, TREE_FONT_SIZE, "src/main.rs", TREE_FONT_SIZE, None, None);
-        assert!(close(w, 127.2));
-    }
-
-    #[test]
-    fn tree_row_natural_width_dir_loading_suffix() {
-        // Root dir row: 15px icon + 4px gap + "src  Loading…" (13 glyphs).
-        let w = tree_row_natural_width(
-            0,
-            TREE_ICON_SIZE,
-            "src  Loading…",
-            TREE_FONT_SIZE,
-            None,
-            None,
-        );
-        assert!(close(w, 128.2));
-    }
-
-    #[test]
-    fn tree_row_natural_width_error_file_suffix() {
-        // Error file row: name + 4px gap + "[⚠]" at 11px.
-        let w = tree_row_natural_width(
-            0,
-            TREE_FONT_SIZE,
-            "broken.txt",
-            TREE_FONT_SIZE,
-            Some(("[⚠]", 11.0)),
-            None,
-        );
-        assert!(close(w, 125.8));
-    }
-
-    #[test]
-    fn tree_row_natural_width_diff_counts() {
-        // Diff file row: name + "+123 -45" at 10px + 6px trailing gap.
-        let w = tree_row_natural_width(
-            0,
-            TREE_FONT_SIZE,
-            "lib.rs",
-            TREE_FONT_SIZE,
-            None,
-            Some(("+123", "-45")),
-        );
-        assert!(close(w, 122.4));
-    }
-
-    #[test]
-    fn tree_row_natural_width_diff_binary_count() {
-        // 8-char name + "binary" at 10px + 6px trailing gap.
-        let w = tree_row_natural_width(
-            0,
-            TREE_FONT_SIZE,
-            "data.bin",
-            TREE_FONT_SIZE,
-            None,
-            Some(("binary", "")),
-        );
-        assert!(close(w, 127.2));
+    fn tree_row_natural_width_cases() {
+        struct Case {
+            label: &'static str,
+            guide_chars: usize,
+            icon_size: f32,
+            name: &'static str,
+            name_suffix: Option<(&'static str, f32)>,
+            counts: Option<(&'static str, &'static str)>,
+            expected: f32,
+        }
+        #[rustfmt::skip] // compact one-line cases, matching the file's other case tables
+        let cases = [
+            // Depth 1 (guide 2 chars) + 14px icon + 4px gap + 11-char name.
+            Case { label: "plain_file_row", guide_chars: 2, icon_size: TREE_FONT_SIZE, name: "src/main.rs", name_suffix: None, counts: None, expected: 127.2 },
+            // Root dir row: 15px icon + 4px gap + "src  Loading…" (13 glyphs).
+            Case { label: "dir_loading_suffix", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "src  Loading…", name_suffix: None, counts: None, expected: 128.2 },
+            // Error file row: name + 4px gap + "[⚠]" at 11px.
+            Case { label: "error_file_suffix", guide_chars: 0, icon_size: TREE_FONT_SIZE, name: "broken.txt", name_suffix: Some(("[⚠]", 11.0)), counts: None, expected: 125.8 },
+            // Diff file row: name + "+123 -45" at 10px + 6px trailing gap.
+            Case { label: "diff_counts", guide_chars: 0, icon_size: TREE_FONT_SIZE, name: "lib.rs", name_suffix: None, counts: Some(("+123", "-45")), expected: 122.4 },
+            // 8-char name + "binary" at 10px + 6px trailing gap.
+            Case { label: "diff_binary_count", guide_chars: 0, icon_size: TREE_FONT_SIZE, name: "data.bin", name_suffix: None, counts: Some(("binary", "")), expected: 127.2 },
+        ];
+        for case in cases {
+            let w = tree_row_natural_width(
+                case.guide_chars,
+                case.icon_size,
+                case.name,
+                TREE_FONT_SIZE,
+                case.name_suffix,
+                case.counts,
+            );
+            assert!(
+                close(w, case.expected),
+                "case {}: expected {}, got {}",
+                case.label,
+                case.expected,
+                w
+            );
+        }
     }
 
     /// Epsilon-equality for the pure-arithmetic width tests (0.001px is far
@@ -2215,129 +2194,54 @@ mod tests {
 
     /// Helper: build a FileTree with `n` flat file entries, a known viewport
     /// height, and `scroll_y` set to a given offset.
-    fn tree_with_viewport(n: usize, scroll_y: f32, viewport_h: f32) -> FileTree {
+    fn tree_with_viewport(n: usize, scroll_y: f32, viewport_h: Option<f32>) -> FileTree {
         let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
         tree.visible_tree_nodes = (0..n).map(|i| (format!("file_{i}.rs"), false)).collect();
         tree.scroll_y = scroll_y;
-        tree.viewport_h = Some(viewport_h);
+        tree.viewport_h = viewport_h;
         tree
     }
 
     #[test]
-    fn scroll_into_view_row_fully_visible_no_scroll() {
-        // Viewport: y=40..440 (400px tall, starting at row index ~2)
-        // Focus on index 3. Row spans y=54..72 (3 * 18 = 54).
-        // Viewport bottom is 440. Row is fully within 40..440.
-        let mut tree = tree_with_viewport(30, 40.0, 400.0);
-        tree.tree_focus_index = 3; // 3 * ~18.2 = ~54.6
-
-        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
-
-        // scroll_y unchanged — no scroll needed.
-        assert!(
-            (tree.scroll_y - 40.0).abs() < 0.01,
-            "scroll_y should remain 40"
-        );
-    }
-
-    #[test]
-    fn scroll_into_view_row_below_viewport_advances_one_row() {
-        // Viewport: y=0..200 (200px tall)
-        // Focus on index 15 (y~273). Row bottom ~291.2.
-        // Row is below viewport bottom (200).
-        let mut tree = tree_with_viewport(30, 0.0, 200.0);
-        tree.tree_focus_index = 15; // 15 * ~18.2 = ~273
-
-        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
-
-        // scroll_y advanced by one row height (~18.2px).
-        assert!(
-            (tree.scroll_y - 18.2_f32).abs() < 0.01,
-            "scroll_y should advance by ~18.2, got {}",
-            tree.scroll_y
-        );
-    }
-
-    #[test]
-    fn scroll_into_view_row_above_viewport_brings_to_top() {
-        // Viewport: y=100..500 (400px tall)
-        // Focus on index 3 (y~54.6). Row bottom ~72.8.
-        // Row bottom (~72.8) is above viewport top (100).
-        let mut tree = tree_with_viewport(30, 100.0, 400.0);
-        tree.tree_focus_index = 3; // 3 * ~18.2 = ~54.6
-
-        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
-
-        // scroll_y set to focus_y (~54.6) — bring row to top.
-        assert!(
-            (tree.scroll_y - 54.6).abs() < 0.01,
-            "scroll_y should be ~54.6, got {}",
-            tree.scroll_y
-        );
-    }
-
-    #[test]
-    fn scroll_into_view_partially_visible_at_top_edge_no_scroll() {
-        // Viewport: y=50..450 (400px tall)
-        // Focus on index 2 (y~36.4). Row bottom ~54.6.
-        // Row bottom (~54.6) is below viewport top (50) → partially visible.
-        let mut tree = tree_with_viewport(30, 50.0, 400.0);
-        tree.tree_focus_index = 2; // 2 * ~18.2 = ~36.4
-
-        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
-
-        // scroll_y unchanged — row is partially visible at top edge.
-        assert!(
-            (tree.scroll_y - 50.0).abs() < 0.01,
-            "scroll_y should remain 50, got {}",
-            tree.scroll_y
-        );
-    }
-
-    #[test]
-    fn scroll_into_view_unknown_viewport_falls_back_to_snap() {
-        // viewport_h is None — should fall back to SnapToTop.
-        let mut tree = tree_with_viewport(30, 10.0, 0.0);
-        tree.viewport_h = None;
-        tree.tree_focus_index = 10; // 10 * ~18.2 = ~182
-
-        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
-
-        // Falls back to absolute scroll: scroll_y = focus_y ≈ 182.
-        assert!(
-            (tree.scroll_y - 182.0).abs() < 0.01,
-            "scroll_y should snap to ~182, got {}",
-            tree.scroll_y
-        );
-    }
-
-    #[test]
-    fn scroll_snap_to_top_sets_scroll_y() {
-        let mut tree = tree_with_viewport(30, 0.0, 400.0);
-        tree.tree_focus_index = 8; // 8 * ~18.2 = ~145.6
-
-        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::SnapToTop);
-
-        // SnapToTop sets scroll_y to focus_y.
-        assert!(
-            (tree.scroll_y - 145.6).abs() < 0.01,
-            "scroll_y should be ~145.6, got {}",
-            tree.scroll_y
-        );
-    }
-
-    #[test]
-    fn scroll_into_view_empty_tree_noop() {
-        let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
-        tree.viewport_h = Some(400.0);
-
+    fn scroll_to_tree_focus_positions_viewport() {
+        struct Case {
+            label: &'static str,
+            n: usize,
+            scroll_y: f32,
+            viewport_h: Option<f32>,
+            focus: usize,
+            mode: ScrollMode,
+            expected: f32,
+        }
+        #[rustfmt::skip] // compact one-line cases, matching the file's other case tables
+        let cases = [
+            // Viewport y=40..440, focus idx 3 (row y≈54..72) fully within → unchanged.
+            Case { label: "fully_visible", n: 30, scroll_y: 40.0, viewport_h: Some(400.0), focus: 3, mode: ScrollMode::ScrollIntoView, expected: 40.0 },
+            // Viewport 0..200, focus idx 15 (y≈273) below bottom → advance one row (~18.2).
+            Case { label: "below_viewport", n: 30, scroll_y: 0.0, viewport_h: Some(200.0), focus: 15, mode: ScrollMode::ScrollIntoView, expected: 18.2 },
+            // Viewport 100..500, focus idx 3 (y≈54.6) above top → scroll_y = focus_y.
+            Case { label: "above_viewport", n: 30, scroll_y: 100.0, viewport_h: Some(400.0), focus: 3, mode: ScrollMode::ScrollIntoView, expected: 54.6 },
+            // Viewport 50..450, focus idx 2 row bottom ≈54.6 straddles top → unchanged.
+            Case { label: "top_edge_partial", n: 30, scroll_y: 50.0, viewport_h: Some(400.0), focus: 2, mode: ScrollMode::ScrollIntoView, expected: 50.0 },
+            // viewport_h None → SnapToTop fallback: scroll_y = focus_y ≈ 182.
+            Case { label: "no_viewport_snap", n: 30, scroll_y: 10.0, viewport_h: None, focus: 10, mode: ScrollMode::ScrollIntoView, expected: 182.0 },
+            // SnapToTop: scroll_y = focus_y (8 * 18.2 ≈ 145.6).
+            Case { label: "snap_to_top", n: 30, scroll_y: 0.0, viewport_h: Some(400.0), focus: 8, mode: ScrollMode::SnapToTop, expected: 145.6 },
+            // Empty tree: early-returns Task::none(); scroll_y unchanged.
+            Case { label: "empty_tree", n: 0, scroll_y: 0.0, viewport_h: Some(400.0), focus: 0, mode: ScrollMode::ScrollIntoView, expected: 0.0 },
+        ];
         // Must bind (not discard) because iced::Task is #[must_use].
-        let _task = scroll_to_tree_focus::<()>(&mut tree, ScrollMode::ScrollIntoView);
-
-        // The task type is opaque, but we can verify it's not panicking
-        // and that scroll_y stays at its default.
-        assert!((tree.scroll_y - 0.0).abs() < 0.01);
-        // The function returns Task::none() for empty trees.
-        // We can't easily inspect Task contents, so we just check no crash.
+        for case in cases {
+            let mut tree = tree_with_viewport(case.n, case.scroll_y, case.viewport_h);
+            tree.tree_focus_index = case.focus;
+            let _task = scroll_to_tree_focus::<()>(&mut tree, case.mode);
+            assert!(
+                (tree.scroll_y - case.expected).abs() < 0.01,
+                "case {}: scroll_y expected {}, got {}",
+                case.label,
+                case.expected,
+                tree.scroll_y
+            );
+        }
     }
 }

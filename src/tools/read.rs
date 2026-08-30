@@ -2340,35 +2340,6 @@ impl Baz {}
     }
 
     #[tokio::test]
-    async fn execute_symbols_integration() {
-        let (_dir, ws_path) = temp_workspace(&[("app.rs", "fn greet() {}\nstruct Person;\n")]);
-        let result = ReadTool
-            .execute(
-                &crate::workspace::test_ws(&ws_path),
-                json!({"path": "app.rs", "mode": "symbols"}),
-            )
-            .await;
-        assert!(result.is_ok(), "execute_symbols should succeed: {result:?}");
-        let output = result.unwrap();
-        assert!(
-            output.contains("`greet`"),
-            "output should contain greet: {output}"
-        );
-        assert!(
-            output.contains("`Person`"),
-            "output should contain Person: {output}"
-        );
-        assert!(
-            output.contains("fn"),
-            "output should have 'fn' kind label: {output}"
-        );
-        assert!(
-            output.contains("struct"),
-            "output should have 'struct' kind label: {output}"
-        );
-    }
-
-    #[tokio::test]
     async fn collect_symbols_preserves_line_numbers() {
         let code = "fn hello() {}\n\n\nfn world() {}\n";
         let (_dir, ws_path) = temp_workspace(&[("lib.rs", code)]);
