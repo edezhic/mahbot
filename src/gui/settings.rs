@@ -789,8 +789,8 @@ impl SettingsState {
     /// Whether a genuinely non-default custom chat endpoint is staged or
     /// persisted in the editable snapshot (normalized — trivial variants of
     /// the default OpenRouter URL never count). Single predicate for the
-    /// OpenRouter-key highlight, the toggle state, and the Provider Routing
-    /// annotation, so UI state can never diverge from the
+    /// OpenRouter-key highlight, the toggle state, and the OpenRouter
+    /// Provider Routing annotation, so UI state can never diverge from the
     /// normalized runtime endpoint.
     fn custom_endpoint_active_ui(&self) -> bool {
         crate::config::is_custom_endpoint(&crate::config::effective_chat_endpoint(&self.config))
@@ -3520,7 +3520,7 @@ impl SettingsState {
             });
         }
 
-        section("Provider Routing", Column::from_iter(rows))
+        section("OpenRouter Provider Routing", Column::from_iter(rows))
     }
 }
 
