@@ -2215,7 +2215,6 @@ impl Dashboard {
             self.shell_state.subscription().map(Message::Shell),
             self.logs_state.subscription().map(Message::Logs),
             self.board_state.subscription().map(Message::Board),
-            self.sessions_state.subscription().map(Message::Sessions),
             self.editor_state
                 .subscription(self.overlay_modal_open())
                 .map(Message::Editor),

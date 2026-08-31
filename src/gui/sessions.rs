@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::ChatMessage;
 use crate::session::SessionMetadata;
@@ -12,10 +12,6 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Task};
 
-use iced_anim::Animated;
-use iced_anim::transition::Easing;
-
-use iced::window;
 use iced_fonts::lucide;
 
 use super::ToastMessage;
@@ -80,7 +76,6 @@ pub(crate) enum SessionsMessage {
     /// once the double-click window has passed without a canceling second
     /// click.
     ToggleCommit(usize, usize),
-    AnimTick(Instant),
 
     /// Scroll position changed in the transcript viewport.
     ScrollChanged(scrollable::Viewport),
@@ -144,11 +139,8 @@ pub(crate) struct SessionsState {
     /// only new elements are measured lazily. Mutated during layout (the
     /// bubble width is only known there), hence `RefCell`.
     measure_cache: RefCell<HashMap<(usize, usize), MessageMeasure>>,
-    /// Animated transition for selected row background.
-    selected_anim: Animated<f32>,
     /// Cached session list display data. Rebuilt only when `sessions` changes.
-    /// `view()` builds widgets from this data on every frame; `selected_progress`
-    /// animation is applied at widget-construction time outside the cache.
+    /// `view()` builds widgets from this data on every frame.
     cached_session_items: Option<Vec<CachedSessionItem>>,
 
     // ── Transcript viewport fields ───────────────────────────────
@@ -171,24 +163,9 @@ impl SessionsState {
             expanded: HashSet::new(),
             pending_collapses: HashSet::new(),
             measure_cache: RefCell::new(HashMap::new()),
-            selected_anim: Animated::transition(
-                0.0f32,
-                Easing::EASE_OUT.with_duration(Duration::from_millis(theme::ANIM_SELECTED_MS)),
-            ),
             cached_session_items: None,
             scrollable_id: Id::new("session_transcript_scroll"),
             auto_scroll_enabled: false,
-        }
-    }
-
-    pub(crate) fn subscription(&self) -> iced::Subscription<SessionsMessage> {
-        // Frame ticks are subscribed only while the selection fade is
-        // animating — an always-on frames() subscription closes a
-        // self-sustaining redraw loop (redraw → AnimTick → redraw).
-        if self.selected_anim.is_animating() {
-            window::frames().map(SessionsMessage::AnimTick)
-        } else {
-            iced::Subscription::none()
         }
     }
 
@@ -208,10 +185,6 @@ impl SessionsState {
 
     pub(crate) fn update(&mut self, msg: SessionsMessage) -> Task<SessionsMessage> {
         match msg {
-            SessionsMessage::AnimTick(instant) => {
-                self.selected_anim.tick(instant);
-                Task::none()
-            }
             SessionsMessage::Refreshed(sessions) => {
                 self.sessions = sessions;
                 self.rebuild_session_cache();
@@ -224,8 +197,6 @@ impl SessionsState {
             }
             SessionsMessage::SelectSession(key) => {
                 self.selected_session = Some(key.clone());
-                // Trigger selected animation
-                self.selected_anim.set_target(1.0_f32);
                 self.selected_loading = true;
                 self.expanded.clear();
                 self.pending_collapses.clear();
@@ -363,12 +334,10 @@ impl SessionsState {
         self.pending_collapses.clear();
         self.auto_scroll_enabled = false;
         self.measure_cache.borrow_mut().clear();
-        self.selected_anim.set_target(0.0);
     }
 
     /// Rebuild the cached session list display data. Called when `self.sessions`
-    /// changes. `view()` builds widgets from this data on every frame, applying
-    /// the `selected_progress` animation at widget-construction time.
+    /// changes. `view()` builds widgets from this data on every frame.
     fn rebuild_session_cache(&mut self) {
         let now = chrono::Local::now();
         let items: Vec<CachedSessionItem> = self
@@ -419,10 +388,8 @@ impl SessionsState {
         } else {
             // Session list on the left side — built from cached display data.
             // The cache is rebuilt only when `self.sessions` changes (in
-            // `Refreshed`). The `selected_progress` animation is applied at
-            // widget-construction time every frame.
+            // `Refreshed`); cards are rebuilt from it on every frame.
             let mut session_list = Column::new().spacing(theme::SPACE_4);
-            let selected_progress = *self.selected_anim.value();
             if let Some(ref cached) = self.cached_session_items {
                 for item in cached {
                     let is_selected = self.selected_session.as_deref() == Some(&item.agent_id);
@@ -437,10 +404,15 @@ impl SessionsState {
                                 .color(theme::role_badge_color_for(&role).0),
                         );
                     }
+                    let title_color = if is_selected {
+                        theme::ACCENT
+                    } else {
+                        theme::TEXT_PRIMARY
+                    };
                     title_row = title_row.push(
                         text(item.title.clone())
                             .size(theme::TEXT_13)
-                            .color(theme::TEXT_PRIMARY),
+                            .color(title_color),
                     );
 
                     let sess_row: Element<'_, SessionsMessage> = ContextMenu::new(
@@ -452,33 +424,28 @@ impl SessionsState {
                                             column![
                                                 title_row,
                                                 {
-                                                    // Meta row: message count, then the
-                                                    // token length when one was ever
-                                                    // recorded (older sessions show no
-                                                    // token value), then the timestamp.
-                                                    // The 8px `Space` separators (with
-                                                    // the row's 4px spacing) preserve the
-                                                    // original msg-count → timestamp gap
-                                                    // exactly.
-                                                    let mut meta_row = row![
-                                                        text(&item.msg_count_label)
-                                                            .size(theme::TEXT_11)
-                                                            .color(theme::TEXT_SECONDARY)
-                                                    ]
-                                                    .spacing(theme::SPACE_4);
+                                                    // Meta row: messages left / tokens center /
+                                                    // time right, spread via two Fill gaps
+                                                    // across the card. Sessions that never
+                                                    // recorded a token length leave the center
+                                                    // empty.
+                                                    let mut meta_row = iced::widget::Row::new()
+                                                        .width(Length::Fill)
+                                                        .push(
+                                                            text(&item.msg_count_label)
+                                                                .size(theme::TEXT_11)
+                                                                .color(theme::TEXT_SECONDARY),
+                                                        )
+                                                        .push(Space::new().width(Length::Fill));
                                                     if let Some(token) = &item.token_label {
-                                                        meta_row = meta_row
-                                                            .push(
-                                                                Space::new().width(theme::SPACE_8),
-                                                            )
-                                                            .push(
-                                                                text(token)
-                                                                    .size(theme::TEXT_11)
-                                                                    .color(theme::TEXT_SECONDARY),
-                                                            );
+                                                        meta_row = meta_row.push(
+                                                            text(token)
+                                                                .size(theme::TEXT_11)
+                                                                .color(theme::TEXT_SECONDARY),
+                                                        );
                                                     }
                                                     meta_row
-                                                        .push(Space::new().width(theme::SPACE_8))
+                                                        .push(Space::new().width(Length::Fill))
                                                         .push(
                                                             text(&item.timestamp_label)
                                                                 .size(theme::TEXT_11)
@@ -487,42 +454,21 @@ impl SessionsState {
                                                 },
                                                 text(&item.agent_id)
                                                     .size(theme::TEXT_11)
-                                                    .color(theme::TEXT_SECONDARY),
+                                                    .color(theme::TEXT_MUTED),
                                             ]
+                                            .width(Length::Fill)
                                             .spacing(theme::SPACE_2),
                                         )
                                         .padding(theme::PAD_6)
-                                        .width(Length::Fill)
-                                        .style(
-                                            move |_theme: &iced::Theme| container::Style {
-                                                background: {
-                                                    let t = if is_selected {
-                                                        selected_progress
-                                                    } else {
-                                                        0.0f32
-                                                    };
-                                                    if t > 0.01 {
-                                                        Some(iced::Background::Color(
-                                                            iced::Color::from_rgba(
-                                                                theme::ACCENT_DIM.r,
-                                                                theme::ACCENT_DIM.g,
-                                                                theme::ACCENT_DIM.b,
-                                                                theme::ACCENT_DIM.a * t,
-                                                            ),
-                                                        ))
-                                                    } else {
-                                                        None
-                                                    }
-                                                },
-                                                ..container::Style::default()
-                                            }
-                                        ),
+                                        .width(Length::Fill),
                                     )
+                                    .width(Length::Fill)
                                     .style(theme::button_text)
                                     .on_press(
                                         SessionsMessage::SelectSession(item.agent_id.clone())
                                     ),
                                 ]
+                                .width(Length::Fill)
                                 .align_y(Alignment::Center),
                             ]
                             .spacing(theme::SPACE_2),
