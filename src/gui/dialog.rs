@@ -27,7 +27,7 @@ pub fn dialog_title<'a>(
     title: impl Into<String>,
 ) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
     text(title.into())
-        .size(16)
+        .size(theme::TEXT_16)
         .color(theme::TEXT_PRIMARY)
         .font(theme::FONT_BOLD)
 }
@@ -37,11 +37,11 @@ pub fn dialog_title<'a>(
 pub fn dialog_body<'a, Message: 'a>(
     paragraphs: impl IntoIterator<Item = impl Into<String>>,
 ) -> Element<'a, Message> {
-    let mut col = column![].spacing(8);
+    let mut col = column![].spacing(theme::SPACE_8);
     for paragraph in paragraphs {
         col = col.push(
             text(paragraph.into())
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::TEXT_SECONDARY)
                 .width(Length::Fill),
         );
@@ -87,7 +87,7 @@ pub fn dialog_footer_row<'a, Message: 'a>(
     let mut footer = row![Space::new().width(Length::Fill)].align_y(Alignment::Center);
     for (i, btn) in buttons.into_iter().enumerate() {
         if i > 0 {
-            footer = footer.push(Space::new().width(8));
+            footer = footer.push(Space::new().width(theme::SPACE_8));
         }
         footer = footer.push(btn);
     }
@@ -105,7 +105,7 @@ pub fn confirm_dialog<'a, Message: Clone + 'a>(
     actions: impl IntoIterator<Item = DialogAction<'a, Message>>,
 ) -> container::Container<'a, Message> {
     let footer = dialog_footer_row(actions.into_iter().map(|action| {
-        button(text(action.label).size(13))
+        button(text(action.label).size(theme::TEXT_13))
             .style(action.style)
             .on_press(action.on_press)
             .into()

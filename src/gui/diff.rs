@@ -775,7 +775,7 @@ impl DiffState {
             container(
                 row![
                     text(format!("Viewing commit {short_hash}"))
-                        .size(12)
+                        .size(theme::TEXT_12)
                         .color(theme::TEXT_SECONDARY),
                     Space::new().width(Length::Fill),
                     back_btn,
@@ -783,7 +783,7 @@ impl DiffState {
                 .align_y(Alignment::Center),
             )
             .width(Length::Fill)
-            .padding([8, 12])
+            .padding([theme::PAD_8, theme::PAD_12])
         } else if show_commit_bar {
             let commit_input = super::widgets::single_line_editor(
                 &self.commit_message.buffer,
@@ -801,9 +801,9 @@ impl DiffState {
             let commit_disabled = msg_empty || self.committing;
 
             let commit_btn = button(if self.committing {
-                text("Committing…").size(12)
+                text("Committing…").size(theme::TEXT_12)
             } else {
-                text("Commit").size(12)
+                text("Commit").size(theme::TEXT_12)
             })
             .on_press_maybe(if commit_disabled {
                 None
@@ -813,10 +813,11 @@ impl DiffState {
             .style(theme::button_secondary);
 
             container(
-                row![commit_input, Space::new().width(8), commit_btn].align_y(Alignment::Center),
+                row![commit_input, Space::new().width(theme::SPACE_8), commit_btn]
+                    .align_y(Alignment::Center),
             )
             .width(Length::Fill)
-            .padding([8, 12])
+            .padding([theme::PAD_8, theme::PAD_12])
         } else {
             // Empty spacer to maintain layout consistency.
             container(Space::new().width(Length::Fill).height(0))
@@ -825,15 +826,15 @@ impl DiffState {
         let status: Element<'_, DiffMessage> = if let Some(ref err) = self.error {
             widgets::error_banner(err)
         } else if let Some(ref s) = self.status_message {
-            container(text(s).size(13).color(theme::TEXT_SECONDARY))
-                .padding([8, 12])
+            container(text(s).size(theme::TEXT_13).color(theme::TEXT_SECONDARY))
+                .padding([theme::PAD_8, theme::PAD_12])
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(theme::base_container_style)
                 .into()
         } else if self.diff_loading && !self.diff_has_loaded {
             container(widgets::loading_text())
-                .padding([8, 12])
+                .padding([theme::PAD_8, theme::PAD_12])
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .style(theme::base_container_style)
@@ -841,10 +842,10 @@ impl DiffState {
         } else if self.selected_workspace_name.is_none() {
             container(
                 text("Select a workspace to view its diff.")
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .color(theme::TEXT_MUTED),
             )
-            .padding([8, 12])
+            .padding([theme::PAD_8, theme::PAD_12])
             .width(Length::Fill)
             .height(Length::Fill)
             .style(theme::base_container_style)
@@ -857,11 +858,11 @@ impl DiffState {
                         .color(theme::STATUS_SUCCESS),
                     Space::new().height(8),
                     text("Working tree clean.")
-                        .size(14)
+                        .size(theme::TEXT_14)
                         .color(theme::TEXT_SECONDARY),
                 ]
                 .align_x(Alignment::Center)
-                .spacing(4),
+                .spacing(theme::SPACE_4),
             )
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1071,11 +1072,14 @@ impl DiffState {
 
         // Line count labels
         let counts: Element<'_, DiffMessage> = match counts_slot(file) {
-            CountsSlot::Binary => text("binary").size(10).color(theme::TEXT_SECONDARY).into(),
+            CountsSlot::Binary => text("binary")
+                .size(theme::TEXT_10)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
             CountsSlot::Stats { added, removed } => {
                 widgets::diff_stats_row(added, removed, 10.0).into()
             }
-            CountsSlot::Unchanged => text("").size(10).into(),
+            CountsSlot::Unchanged => text("").size(theme::TEXT_10).into(),
         };
 
         let name_color = if is_selected {
@@ -1185,14 +1189,19 @@ impl DiffState {
             rows.push(
                 container(
                     row![
-                        header_icon.to_text().size(12).color(FILE_HEADER_COLOR),
-                        Space::new().width(6),
-                        text(header_label).size(12).color(FILE_HEADER_COLOR),
+                        header_icon
+                            .to_text()
+                            .size(theme::TEXT_12)
+                            .color(FILE_HEADER_COLOR),
+                        Space::new().width(theme::SPACE_6),
+                        text(header_label)
+                            .size(theme::TEXT_12)
+                            .color(FILE_HEADER_COLOR),
                     ]
                     .align_y(Alignment::Center),
                 )
                 .width(Length::Fill)
-                .padding([6, 4])
+                .padding([theme::PAD_6, theme::PAD_4])
                 .style(move |_t: &iced::Theme| iced::widget::container::Style {
                     background: Some(iced::Background::Color(theme::DIFF_FILE_HEADER_BG)),
                     ..Default::default()
@@ -1206,10 +1215,10 @@ impl DiffState {
                     rows.push(
                         container(
                             text(format!("Binary file: {}", file.path))
-                                .size(13)
+                                .size(theme::TEXT_13)
                                 .color(theme::TEXT_MUTED),
                         )
-                        .padding([2, 4])
+                        .padding([theme::PAD_2, theme::PAD_4])
                         .into(),
                     );
                     continue;
@@ -1218,10 +1227,10 @@ impl DiffState {
                     rows.push(
                         container(
                             text(format!("File too large: {}, {sz} bytes", file.path))
-                                .size(13)
+                                .size(theme::TEXT_13)
                                 .color(theme::TEXT_MUTED),
                         )
-                        .padding([2, 4])
+                        .padding([theme::PAD_2, theme::PAD_4])
                         .into(),
                     );
                     continue;
@@ -1243,10 +1252,10 @@ impl DiffState {
                     text(format!(
                         "\u{26a0} Diff truncated (max {MAX_DIFF_LINES} lines / {MAX_HUNKS} hunks)",
                     ))
-                    .size(12)
+                    .size(theme::TEXT_12)
                     .color(theme::STATUS_WARNING),
                 )
-                .padding([8, 4])
+                .padding([theme::PAD_8, theme::PAD_4])
                 .into(),
             );
         }

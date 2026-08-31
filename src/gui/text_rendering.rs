@@ -17,12 +17,14 @@ use iced::{Color, Point, Rectangle};
 
 use crate::util::UnwrapPoison;
 
+use super::theme;
+
 // ── Constants ───────────────────────────────────────────────────────
 
 /// Font metrics used for text rendering (editor buffer, diff viewer).
 #[must_use]
 pub fn font_metrics() -> cosmic_text::Metrics {
-    cosmic_text::Metrics::relative(14.0, 1.3)
+    cosmic_text::Metrics::relative(theme::TEXT_14, 1.3)
 }
 
 /// Maximum file size in bytes for which to apply syntax highlighting via
@@ -35,7 +37,7 @@ pub(crate) const MAX_HIGHLIGHT_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Font size for line numbers in the gutter.
 /// Matches the diff page styling (JetBrains Mono 11px).
-pub(crate) const GUTTER_FONT_SIZE: f32 = 11.0;
+pub(crate) const GUTTER_FONT_SIZE: f32 = theme::TEXT_11;
 
 /// Maximum visual lines per source line as a safety limit against
 /// pathological single lines (e.g. no-whitespace megabyte).

@@ -14,7 +14,9 @@ use iced_fonts::lucide;
 use super::common::MAX_INPUT_CHARS;
 use super::dialog;
 use super::theme;
-use super::widgets::{self, badge_pill, diff_stats_row, selectable_text};
+use super::widgets::{
+    self, PILL_COMPACT, PILL_MODAL, PillMetrics, badge_pill, diff_stats_row, selectable_text,
+};
 
 /// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
@@ -725,7 +727,7 @@ impl BoardState {
         actions: &[(&'static str, TicketPhase)],
         is_disabled: bool,
     ) -> Row<'a, BoardMessage> {
-        let mut icon_row = Row::new().spacing(4);
+        let mut icon_row = Row::new().spacing(theme::SPACE_4);
         for (label, phase) in actions {
             let is_cancel = label.contains("Cancel");
             let (icon, tooltip_text) = Self::action_icon_and_tooltip(label);
@@ -770,29 +772,29 @@ impl BoardState {
     }
 
     /// Phase badge pill (ticket cards, modal header); colors from [`theme::ticket_phase_color`].
-    fn phase_badge<'a>(
-        phase: TicketPhase,
-        text_size: u32,
-        padding: [u16; 2],
-    ) -> Element<'a, BoardMessage> {
+    fn phase_badge<'a>(phase: TicketPhase, metrics: PillMetrics) -> Element<'a, BoardMessage> {
         let (fg, bg) = theme::ticket_phase_color(phase);
-        let pill = badge_pill(phase.display_name(), (fg, bg), text_size, padding);
-        tooltip(pill, text("Current phase").size(11), tooltip::Position::Top)
-            .style(theme::tooltip_style)
-            .into()
+        let pill = badge_pill(phase.display_name(), (fg, bg), metrics);
+        tooltip(
+            pill,
+            text("Current phase").size(theme::TEXT_11),
+            tooltip::Position::Top,
+        )
+        .style(theme::tooltip_style)
+        .into()
     }
 
     /// Priority chip pill; colors from [`theme::ticket_priority_color`].
-    fn priority_badge<'a>(
-        priority: i64,
-        text_size: u32,
-        padding: [u16; 2],
-    ) -> Element<'a, BoardMessage> {
+    fn priority_badge<'a>(priority: i64, metrics: PillMetrics) -> Element<'a, BoardMessage> {
         let (fg, bg) = theme::ticket_priority_color(priority);
-        let pill = badge_pill(format!("P{priority}"), (fg, bg), text_size, padding);
-        tooltip(pill, text("Priority").size(11), tooltip::Position::Top)
-            .style(theme::tooltip_style)
-            .into()
+        let pill = badge_pill(format!("P{priority}"), (fg, bg), metrics);
+        tooltip(
+            pill,
+            text("Priority").size(theme::TEXT_11),
+            tooltip::Position::Top,
+        )
+        .style(theme::tooltip_style)
+        .into()
     }
 
     /// Bounce-count badge (icon + count + tooltip, matching the prereq indicator
@@ -800,8 +802,8 @@ impl BoardState {
     /// below `BOUNCE_BADGE_WARNING_THRESHOLD`, then the prereq warning yellow.
     fn bounce_badge<'a>(
         bounce_count: i64,
-        icon_size: u32,
-        text_size: u32,
+        icon_size: f32,
+        text_size: f32,
     ) -> Option<Element<'a, BoardMessage>> {
         if bounce_count <= 0 {
             return None;
@@ -818,7 +820,7 @@ impl BoardState {
                 .color(color),
             text(format!("{bounce_count}")).size(text_size).color(color),
         ]
-        .spacing(2)
+        .spacing(theme::SPACE_2)
         .align_y(Alignment::Center);
         let tooltip_text = format!(
             "Validation bounces: {bounce_count} (max {})",
@@ -827,7 +829,7 @@ impl BoardState {
         Some(
             tooltip(
                 indicator,
-                text(tooltip_text).size(11),
+                text(tooltip_text).size(theme::TEXT_11),
                 tooltip::Position::Top,
             )
             .style(theme::tooltip_style)
@@ -1480,30 +1482,32 @@ impl BoardState {
         let (unfulfilled_count, unfulfilled_ids) = self.unfulfilled_prereq_count(ticket);
 
         let mut badge_row = row![
-            Self::priority_badge(ticket.priority, 10, [1, 6]),
-            Self::phase_badge(ticket.phase, 10, [1, 6]),
+            Self::priority_badge(ticket.priority, PILL_COMPACT),
+            Self::phase_badge(ticket.phase, PILL_COMPACT),
         ]
-        .spacing(6);
+        .spacing(theme::SPACE_6);
 
-        if let Some(bounce) = Self::bounce_badge(ticket.bounce_count, 12, 10) {
+        if let Some(bounce) =
+            Self::bounce_badge(ticket.bounce_count, theme::TEXT_12, theme::TEXT_10)
+        {
             badge_row = badge_row.push(bounce);
         }
 
         if unfulfilled_count > 0 {
             let tooltip_text = format!("Blocked by: {}", unfulfilled_ids.join(", "));
             let pause_icon = lucide::pause::<iced::Theme, iced::Renderer>()
-                .size(12)
+                .size(theme::TEXT_12)
                 .color(theme::STATUS_WARNING);
             let count_text = text(format!("{unfulfilled_count}"))
-                .size(10)
+                .size(theme::TEXT_10)
                 .color(theme::STATUS_WARNING);
             let indicator = row![pause_icon, count_text]
-                .spacing(2)
+                .spacing(theme::SPACE_2)
                 .align_y(Alignment::Center);
             badge_row = badge_row.push(
                 tooltip(
                     indicator,
-                    text(tooltip_text).size(11),
+                    text(tooltip_text).size(theme::TEXT_11),
                     tooltip::Position::Top,
                 )
                 .style(theme::tooltip_style),
@@ -1517,7 +1521,9 @@ impl BoardState {
             let added = ticket.lines_added.unwrap_or(0);
             let removed = ticket.lines_removed.unwrap_or(0);
             let stats_parts = row![
-                text("\u{2387} ").size(10).color(theme::TEXT_SECONDARY),
+                text("\u{2387} ")
+                    .size(theme::TEXT_10)
+                    .color(theme::TEXT_SECONDARY),
                 diff_stats_row::<BoardMessage>(added, removed, 10.0),
             ]
             .spacing(0)
@@ -1529,7 +1535,7 @@ impl BoardState {
                     commit_hash: hash.clone(),
                     workspace_name: ws_name.clone(),
                 }),
-                [2, 6],
+                [theme::PAD_2, theme::PAD_6],
                 theme::button_text,
                 tooltip::Position::Top,
             );
@@ -1564,16 +1570,20 @@ impl BoardState {
             tooltip(
                 button(
                     column![
-                        text(&ticket.title).size(13).color(theme::TEXT_PRIMARY),
-                        text(&ticket.id).size(10).color(theme::TEXT_SECONDARY),
+                        text(&ticket.title)
+                            .size(theme::TEXT_13)
+                            .color(theme::TEXT_PRIMARY),
+                        text(&ticket.id)
+                            .size(theme::TEXT_10)
+                            .color(theme::TEXT_SECONDARY),
                     ]
-                    .spacing(2),
+                    .spacing(theme::SPACE_2),
                 )
-                .padding(iced::Padding::new(8.0).bottom(2.0))
+                .padding(iced::Padding::new(theme::PAD_8).bottom(theme::PAD_2))
                 .width(Length::Fill)
                 .style(theme::button_text)
                 .on_press(BoardMessage::OpenModal(ticket.id.clone())),
-                text("open ticket details").size(11),
+                text("open ticket details").size(theme::TEXT_11),
                 tooltip::Position::Top,
             )
             .style(theme::tooltip_style)
@@ -1581,7 +1591,12 @@ impl BoardState {
         ];
 
         // Badge + optional prereq indicator + icon row (below the clickable area)
-        card_children.push(badge_row.align_y(Alignment::Center).padding([0, 8]).into());
+        card_children.push(
+            badge_row
+                .align_y(Alignment::Center)
+                .padding([0.0, theme::PAD_8])
+                .into(),
+        );
 
         let card = Column::from_vec(card_children)
             .spacing(0)
@@ -1615,11 +1630,11 @@ impl BoardState {
                 let dialog = dialog::dialog_shell(
                     column![
                         text("Loading details\u{2026}")
-                            .size(16)
+                            .size(theme::TEXT_16)
                             .color(theme::TEXT_SECONDARY),
                         Space::new().height(12),
                         text("Fetching ticket information\u{2026}")
-                            .size(13)
+                            .size(theme::TEXT_13)
                             .color(theme::TEXT_SECONDARY),
                     ]
                     .align_x(Alignment::Center),
@@ -1634,14 +1649,14 @@ impl BoardState {
                 let dialog = dialog::dialog_shell(
                     column![
                         text("Failed to load ticket")
-                            .size(16)
+                            .size(theme::TEXT_16)
                             .color(theme::STATUS_ERROR),
                         Space::new().height(12),
-                        text(err).size(13).color(theme::TEXT_SECONDARY),
+                        text(err).size(theme::TEXT_13).color(theme::TEXT_SECONDARY),
                         Space::new().height(16),
                         button(
                             text("Close")
-                                .size(13)
+                                .size(theme::TEXT_13)
                                 .color(theme::TEXT_PRIMARY)
                                 .align_x(Alignment::Center),
                         )
@@ -1727,7 +1742,7 @@ impl BoardState {
     fn modal_detail(&self) -> Element<'_, BoardMessage> {
         let Some(ticket) = &self.selected_ticket else {
             return text("No ticket selected.")
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::TEXT_MUTED)
                 .into();
         };
@@ -1755,7 +1770,7 @@ impl BoardState {
             sections.push(Space::new().height(12).into());
             sections.push(
                 text("Comments:")
-                    .size(15)
+                    .size(theme::TEXT_16)
                     .color(theme::TEXT_SECONDARY)
                     .into(),
             );
@@ -1763,8 +1778,11 @@ impl BoardState {
         }
 
         // ── Scrollable content area ──────────────────────────────
-        let scrollable_content =
-            widgets::vscroll(Column::from_vec(sections).spacing(4).width(Length::Fill));
+        let scrollable_content = widgets::vscroll(
+            Column::from_vec(sections)
+                .spacing(theme::SPACE_4)
+                .width(Length::Fill),
+        );
 
         // ── Comment input area (pinned at the bottom) ────────────
         let input_area = self.render_comment_input();
@@ -1807,20 +1825,26 @@ impl BoardState {
 
         let mut meta_els: Vec<Element<'_, BoardMessage>> = vec![
             text(&ticket.id)
-                .size(12)
+                .size(theme::TEXT_12)
                 .color(theme::TEXT_SECONDARY)
                 .into(),
-            text(" · ").size(12).color(theme::TEXT_SECONDARY).into(),
+            text(" · ")
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
             text(format!("Created: {created}"))
-                .size(12)
+                .size(theme::TEXT_12)
                 .color(theme::TEXT_SECONDARY)
                 .into(),
         ];
         if show_updated {
             meta_els.extend([
-                text(" · ").size(12).color(theme::TEXT_SECONDARY).into(),
+                text(" · ")
+                    .size(theme::TEXT_12)
+                    .color(theme::TEXT_SECONDARY)
+                    .into(),
                 text(format!("Updated: {updated}"))
-                    .size(12)
+                    .size(theme::TEXT_12)
                     .color(theme::TEXT_SECONDARY)
                     .into(),
             ]);
@@ -1847,35 +1871,39 @@ impl BoardState {
             first_row
         } else {
             let second_row: Element<'_, BoardMessage> = text(secondary.join(" · "))
-                .size(12)
+                .size(theme::TEXT_12)
                 .color(theme::TEXT_SECONDARY)
                 .into();
-            column![first_row, second_row].spacing(2).into()
+            column![first_row, second_row]
+                .spacing(theme::SPACE_2)
+                .into()
         };
 
         column![
             text(&ticket.title)
-                .size(16)
+                .size(theme::TEXT_16)
                 .color(theme::TEXT_PRIMARY)
                 .font(theme::FONT_BOLD),
             metadata_block,
             {
                 let mut badges = vec![
-                    Self::priority_badge(ticket.priority, 12, [2, 8]),
-                    Self::phase_badge(ticket.phase, 12, [2, 8]),
+                    Self::priority_badge(ticket.priority, PILL_MODAL),
+                    Self::phase_badge(ticket.phase, PILL_MODAL),
                 ];
-                if let Some(bounce) = Self::bounce_badge(ticket.bounce_count, 14, 12) {
+                if let Some(bounce) =
+                    Self::bounce_badge(ticket.bounce_count, theme::TEXT_14, theme::TEXT_12)
+                {
                     badges.push(bounce);
                 }
                 badges.push(Space::new().width(Length::Fill).into());
                 badges.push(icon_row.into());
                 Row::from_vec(badges)
                     .align_y(Alignment::Center)
-                    .spacing(8)
-                    .padding([4, 0])
+                    .spacing(theme::SPACE_8)
+                    .padding([theme::PAD_4, 0.0])
             },
         ]
-        .spacing(4)
+        .spacing(theme::SPACE_4)
         .into()
     }
 
@@ -1891,7 +1919,7 @@ impl BoardState {
         if loading {
             return Some(
                 column![Space::new().height(8), widgets::loading_text(),]
-                    .spacing(4)
+                    .spacing(theme::SPACE_4)
                     .into(),
             );
         }
@@ -1904,32 +1932,36 @@ impl BoardState {
         let mut summary_parts: Vec<Element<'_, BoardMessage>> = Vec::new();
         summary_parts.push(
             text(format!("{hash:.8}"))
-                .size(11)
+                .size(theme::TEXT_11)
                 .color(theme::TEXT_SECONDARY)
                 .into(),
         );
-        summary_parts.push(Space::new().width(6).into());
+        summary_parts.push(Space::new().width(theme::SPACE_6).into());
         summary_parts.push(
             text(format!(
                 "{file_count} file{} changed",
                 if file_count == 1 { "" } else { "s" }
             ))
-            .size(11)
+            .size(theme::TEXT_11)
             .color(theme::TEXT_SECONDARY)
             .into(),
         );
         summary_parts
             .push(diff_stats_row::<BoardMessage>(total_additions, total_deletions, 11.0).into());
-        let summary_header = container(row(summary_parts).spacing(4).align_y(Alignment::Center))
-            .padding([4, 8])
-            .width(Length::Fill);
+        let summary_header = container(
+            row(summary_parts)
+                .spacing(theme::SPACE_4)
+                .align_y(Alignment::Center),
+        )
+        .padding([theme::PAD_4, theme::PAD_8])
+        .width(Length::Fill);
 
         // File stat rows — hide zero-valued sides
-        let mut file_col = Column::new().spacing(2);
+        let mut file_col = Column::new().spacing(theme::SPACE_2);
         for f in &stats.files {
             file_col = file_col.push(
                 row![
-                    container(text(&f.path).size(11).font(theme::FONT_REGULAR))
+                    container(text(&f.path).size(theme::TEXT_11).font(theme::FONT_REGULAR))
                         .width(Length::Fixed(400.0))
                         .clip(true),
                     Space::new().width(Length::Fill),
@@ -1943,10 +1975,10 @@ impl BoardState {
             column![
                 summary_header,
                 container(file_col)
-                    .padding([4, 8])
+                    .padding([theme::PAD_4, theme::PAD_8])
                     .style(theme::surface_card_style),
             ]
-            .spacing(4)
+            .spacing(theme::SPACE_4)
             .into(),
         )
     }
@@ -1969,21 +2001,23 @@ impl BoardState {
                 Length::Shrink,
             ))
             .width(Length::Fill)
-            .padding([10, 2])
+            .padding([theme::PAD_10, theme::PAD_2])
             .style(theme::bubble_style(
                 theme::BG_SURFACE,
                 Some(theme::TEXT_PRIMARY),
             ))
             .into()
         } else {
-            container(selectable_text(&ticket.description, theme::TEXT_PRIMARY).size(13))
-                .width(Length::Fill)
-                .padding(10)
-                .style(theme::bubble_style(
-                    theme::BG_SURFACE,
-                    Some(theme::TEXT_PRIMARY),
-                ))
-                .into()
+            container(
+                selectable_text(&ticket.description, theme::TEXT_PRIMARY).size(theme::TEXT_13),
+            )
+            .width(Length::Fill)
+            .padding(theme::PAD_10)
+            .style(theme::bubble_style(
+                theme::BG_SURFACE,
+                Some(theme::TEXT_PRIMARY),
+            ))
+            .into()
         })
     }
 
@@ -2023,7 +2057,7 @@ impl BoardState {
             return None;
         }
 
-        let mut cmt_col = Column::new().spacing(12);
+        let mut cmt_col = Column::new().spacing(theme::SPACE_12);
         for (i, comment) in ticket.comments.iter().enumerate().rev() {
             // For diagnostics comments, optionally show only the summary
             let is_diag = comment.role == crate::agent::role::DIAGNOSTICS_ROLE;
@@ -2043,14 +2077,14 @@ impl BoardState {
                     summary.unwrap_or(&comment.content).trim(),
                     theme::TEXT_PRIMARY,
                 )
-                .size(13)
+                .size(theme::TEXT_13)
                 .into()
             } else if let Some((_, items)) = comments_md.iter().find(|(idx, _)| *idx == i) {
                 iced_selection::markdown::view(items, theme::markdown_settings())
                     .map(BoardMessage::LinkClicked)
             } else {
                 selectable_text(&comment.content, theme::TEXT_PRIMARY)
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .into()
             };
 
@@ -2058,12 +2092,12 @@ impl BoardState {
             let toggle_button: Option<Element<'_, BoardMessage>> = if is_diag {
                 let (icon, label) = if is_expanded {
                     (
-                        lucide::chevron_up::<iced::Theme, iced::Renderer>().size(12),
+                        lucide::chevron_up::<iced::Theme, iced::Renderer>().size(theme::TEXT_12),
                         " Collapse",
                     )
                 } else {
                     (
-                        lucide::chevron_down::<iced::Theme, iced::Renderer>().size(12),
+                        lucide::chevron_down::<iced::Theme, iced::Renderer>().size(theme::TEXT_12),
                         " Show full output",
                     )
                 };
@@ -2071,9 +2105,11 @@ impl BoardState {
                     button(
                         row![
                             icon.color(theme::TEXT_SECONDARY),
-                            text(label).size(11).color(theme::TEXT_SECONDARY),
+                            text(label)
+                                .size(theme::TEXT_11)
+                                .color(theme::TEXT_SECONDARY),
                         ]
-                        .spacing(2)
+                        .spacing(theme::SPACE_2)
                         .align_y(Alignment::Center),
                     )
                     .style(theme::button_text)
@@ -2086,20 +2122,25 @@ impl BoardState {
 
             let author_el: Element<'_, BoardMessage> =
                 if let Some((icon, color)) = theme::comment_author_icon(&comment.role) {
-                    icon.size(14).color(color).into()
+                    icon.size(theme::TEXT_14).color(color).into()
                 } else {
                     // User comments show the bare user name; "system" and
                     // legacy labels render as plain muted text.
                     let label = comment.role.strip_prefix("user:").unwrap_or(&comment.role);
-                    text(label).size(11).color(theme::TEXT_SECONDARY).into()
+                    text(label)
+                        .size(theme::TEXT_11)
+                        .color(theme::TEXT_SECONDARY)
+                        .into()
                 };
-            let mut header = row![author_el].align_y(Alignment::Center).spacing(6);
+            let mut header = row![author_el]
+                .align_y(Alignment::Center)
+                .spacing(theme::SPACE_6);
             let ts = theme::format_relative_time(&comment.created_at, chrono::Local::now());
             if !ts.is_empty() {
-                header = header.push(text(ts).size(11).color(theme::TEXT_SECONDARY));
+                header = header.push(text(ts).size(theme::TEXT_11).color(theme::TEXT_SECONDARY));
             }
 
-            let mut comment_col = Column::new().spacing(4);
+            let mut comment_col = Column::new().spacing(theme::SPACE_4);
             comment_col = comment_col.push(header);
             comment_col = comment_col.push(comment_content);
             if let Some(btn) = toggle_button {
@@ -2109,7 +2150,7 @@ impl BoardState {
             cmt_col = cmt_col.push(
                 container(comment_col)
                     .width(Length::Fill)
-                    .padding(10)
+                    .padding(theme::PAD_10)
                     .style(theme::bubble_style(
                         theme::BG_SURFACE,
                         Some(theme::TEXT_PRIMARY),

@@ -143,7 +143,7 @@ pub(crate) fn view(
             theme::TEXT_MUTED,
         )
     } else {
-        let mut content = Column::new().spacing(20);
+        let mut content = Column::new().spacing(theme::SPACE_20);
         for section in &sections {
             content = content.push(render_section(section, expanded));
         }
@@ -155,7 +155,7 @@ pub(crate) fn view(
     let page: Element<'_, RunningMessage> = container(body)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(24)
+        .padding(theme::PAGE_PADDING)
         .style(theme::base_container_style)
         .into();
     // Confirm-dialog overlay: the page content is stack child 0, the dialog
@@ -425,7 +425,7 @@ fn render_section(
     section: &WorkspaceSection,
     expanded: &HashSet<(String, u64)>,
 ) -> Element<'static, RunningMessage> {
-    let mut groups = Column::new().spacing(10);
+    let mut groups = Column::new().spacing(theme::SPACE_10);
     for group in &section.groups {
         groups = groups.push(render_group(group, expanded));
     }
@@ -489,23 +489,33 @@ fn render_group(
     } else {
         title.clone()
     };
-    header_parts.push(text(header).size(12).color(theme::TEXT_SECONDARY).into());
+    header_parts.push(
+        text(header)
+            .size(theme::TEXT_12)
+            .color(theme::TEXT_SECONDARY)
+            .into(),
+    );
     if group.run_lifetime {
-        header_parts.push(text("run active").size(11).color(theme::ACCENT).into());
+        header_parts.push(
+            text("run active")
+                .size(theme::TEXT_11)
+                .color(theme::ACCENT)
+                .into(),
+        );
     }
     // Manual cancel: danger-styled button on RESEARCH-run group headers only.
     // The run key is carried by the message, never rendered as text.
     if group.kind == GroupKind::Research {
         header_parts.push(Space::new().width(Length::Fill).into());
         header_parts.push(
-            button(text("Cancel run").size(11))
+            button(text("Cancel run").size(theme::TEXT_11))
                 .style(theme::button_danger)
                 .on_press(RunningMessage::CancelRequest(group.key.clone()))
                 .into(),
         );
     }
 
-    let mut items = Column::new().spacing(6);
+    let mut items = Column::new().spacing(theme::SPACE_6);
     for item in &group.items {
         match item {
             DisplayItem::Agent(card) => {
@@ -521,11 +531,11 @@ fn render_group(
 
     column![
         Row::with_children(header_parts)
-            .spacing(8)
+            .spacing(theme::SPACE_8)
             .align_y(Alignment::Center),
         items,
     ]
-    .spacing(6)
+    .spacing(theme::SPACE_6)
     .into()
 }
 
@@ -607,7 +617,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     // needs a typed Role, so parse with the same Engineer fallback as before.
     let (fg, _bg) = theme::role_badge_color(&h.role);
     let role: crate::Role = h.role.parse().unwrap_or(crate::Role::Engineer);
-    let icon = theme::role_icon(&role).size(20).color(fg);
+    let icon = theme::role_icon(&role).size(theme::TEXT_24).color(fg);
     let elapsed = format_elapsed(h.started_at);
 
     // The live transcript snapshot feeds both the top-row narration and the
@@ -629,7 +639,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     // "thinking…" placeholder, shown only until the first narration arrives.
     let status_text: Element<'static, RunningMessage> = if let Some(activity) = &h.activity {
         text(activity.to_owned())
-            .size(13)
+            .size(theme::TEXT_13)
             .color(theme::ACCENT)
             .into()
     } else {
@@ -643,7 +653,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
             None => reasoning_tooltip(
                 groups.last().and_then(|g| g.reasoning.as_deref()),
                 text("thinking…")
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .color(theme::TEXT_SECONDARY)
                     .into(),
             ),
@@ -651,7 +661,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     };
 
     let mut content = Column::new()
-        .spacing(6)
+        .spacing(theme::SPACE_6)
         .align_x(Alignment::Start)
         .width(Length::Fill);
     // The top status row carries the status text (left) and metrics (right) in
@@ -663,7 +673,7 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
             render_metrics(token_count, &elapsed),
         ]
         .width(Length::Fill)
-        .spacing(8)
+        .spacing(theme::SPACE_8)
         .align_y(Alignment::Center),
     );
     // Trace groups from the live snapshot (current unless the agent has no
@@ -678,7 +688,9 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     // the very bottom of the card, below the committed trace groups, in either
     // view.
     if tools_running {
-        let mut tools = Column::new().spacing(4).align_x(Alignment::Start);
+        let mut tools = Column::new()
+            .spacing(theme::SPACE_4)
+            .align_x(Alignment::Start);
         for tool in &h.current_tools {
             tools = tools.push(tool_block(tool, ToolBlockView::Compact));
         }
@@ -700,12 +712,12 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     // height and the "empty space below the glyph" comes from the taller
     // content column.
     let card_body = row![column![icon], content]
-        .spacing(8)
+        .spacing(theme::SPACE_8)
         .align_y(Alignment::Start);
     mouse_area(
         container(card_body)
             .width(Length::Fill)
-            .padding(8)
+            .padding(theme::PAD_8)
             .style(theme::surface_card_style),
     )
     .on_press(on_press)
@@ -728,7 +740,9 @@ fn narration_text(narration: &str) -> iced::widget::Text<'static, iced::Theme, i
 /// and the elapsed run time, each as a compact labeled tooltip. Rendered
 /// right-aligned on the card's top status row (see [`render_agent_card`]).
 fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, RunningMessage> {
-    let mut metrics = Row::new().spacing(8).align_y(Alignment::Center);
+    let mut metrics = Row::new()
+        .spacing(theme::SPACE_8)
+        .align_y(Alignment::Center);
     // The live token count comes from the published transcript snapshot (the
     // registry no longer carries a session_tokens mirror). It renders as a
     // compact count; hovering reveals the label and the exact unrounded value.
@@ -736,12 +750,12 @@ fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, R
         metrics = metrics.push(
             tooltip(
                 text(theme::format_compact_tokens(token_count))
-                    .size(11)
+                    .size(theme::TEXT_11)
                     .color(theme::TEXT_SECONDARY),
                 render_metric_tooltip(format!("Session tokens: {token_count}")),
                 tooltip::Position::Top,
             )
-            .gap(4)
+            .gap(theme::SPACE_4)
             .style(theme::tooltip_style),
         );
     }
@@ -749,12 +763,12 @@ fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, R
     metrics = metrics.push(
         tooltip(
             text(elapsed.to_owned())
-                .size(11)
+                .size(theme::TEXT_11)
                 .color(theme::TEXT_SECONDARY),
             render_metric_tooltip("Elapsed run time since the agent started".to_string()),
             tooltip::Position::Top,
         )
-        .gap(4)
+        .gap(theme::SPACE_4)
         .style(theme::tooltip_style),
     );
     metrics.into()
@@ -792,7 +806,9 @@ fn render_trace_group(
     group: &TraceGroup,
     expand_current: bool,
 ) -> Element<'static, RunningMessage> {
-    let mut column = Column::new().spacing(4).align_x(Alignment::Start);
+    let mut column = Column::new()
+        .spacing(theme::SPACE_4)
+        .align_x(Alignment::Start);
     let label: Element<'static, RunningMessage> = if group.narration.is_empty() {
         // A group that has not committed its narration yet opens with the
         // placeholder; it is deliberately neutral (never accent), and still
@@ -800,7 +816,7 @@ fn render_trace_group(
         reasoning_tooltip(
             group.reasoning.as_deref(),
             text("thinking…")
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::TEXT_SECONDARY)
                 .into(),
         )
@@ -820,7 +836,7 @@ fn render_trace_group(
         if !earlier.is_empty() {
             column = column.push(
                 text(collapsed_calls_line(earlier))
-                    .size(10)
+                    .size(theme::TEXT_10)
                     .color(theme::TEXT_SECONDARY),
             );
         }
@@ -830,7 +846,7 @@ fn render_trace_group(
     } else {
         column = column.push(
             text(collapsed_calls_line(&group.rounds))
-                .size(10)
+                .size(theme::TEXT_10)
                 .color(theme::TEXT_SECONDARY),
         );
     }
@@ -849,14 +865,14 @@ fn reasoning_tooltip<'a>(
     };
     let tooltip_content: Element<'static, RunningMessage> = container(
         text(reasoning.to_string())
-            .size(11)
+            .size(theme::TEXT_11)
             .color(theme::TEXT_SECONDARY)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
     )
     .max_width(MAX_TOOL_TOOLTIP_WIDTH)
     .into();
     tooltip(label, tooltip_content, tooltip::Position::Top)
-        .gap(4)
+        .gap(theme::SPACE_4)
         .style(theme::tooltip_style)
         .into()
 }
@@ -999,7 +1015,7 @@ fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup> {
 fn render_metric_tooltip(label: String) -> Element<'static, RunningMessage> {
     container(
         text(label)
-            .size(11)
+            .size(theme::TEXT_11)
             .color(theme::TEXT_PRIMARY)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
     )
@@ -1018,13 +1034,17 @@ fn render_call_row(call: &CallRow) -> Element<'static, RunningMessage> {
 
     row![
         lucide::zap::<iced::Theme, iced::Renderer>()
-            .size(16)
+            .size(theme::TEXT_16)
             .color(theme::ACCENT),
-        text(purpose).size(12).color(theme::TEXT_SECONDARY),
+        text(purpose)
+            .size(theme::TEXT_12)
+            .color(theme::TEXT_SECONDARY),
         Space::new().width(Length::Fill),
-        text(elapsed).size(11).color(theme::TEXT_SECONDARY),
+        text(elapsed)
+            .size(theme::TEXT_11)
+            .color(theme::TEXT_SECONDARY),
     ]
-    .spacing(6)
+    .spacing(theme::SPACE_6)
     .align_y(Alignment::Center)
     .into()
 }

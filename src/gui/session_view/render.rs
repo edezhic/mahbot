@@ -139,16 +139,16 @@ fn tool_tooltip<Message: 'static>(tool: &RunningTool) -> Element<'static, Messag
     let mut pairs = tool.args.clone();
     pairs.sort_by_key(|(_, v)| v.chars().count());
 
-    let mut content = Column::new().spacing(2).push(
+    let mut content = Column::new().spacing(theme::SPACE_2).push(
         text(tool.name.clone())
-            .size(11)
+            .size(theme::TEXT_11)
             .font(theme::FONT_BOLD)
             .color(theme::TEXT_PRIMARY),
     );
     for (k, v) in &pairs {
         content = content.push(
             text(format!("{k}: {v}"))
-                .size(11)
+                .size(theme::TEXT_11)
                 .font(crate::gui::JETBRAINS_MONO)
                 .color(theme::TEXT_SECONDARY)
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
@@ -185,11 +185,11 @@ pub(crate) fn tool_block<Message: 'static>(
 ) -> Element<'static, Message> {
     let name: Element<'static, Message> = match view {
         ToolBlockView::Full => widgets::selectable_text(tool.name.clone(), theme::TEXT_PRIMARY)
-            .size(11)
+            .size(theme::TEXT_11)
             .font(theme::FONT_BOLD)
             .into(),
         ToolBlockView::Compact => text(tool.name.clone())
-            .size(11)
+            .size(theme::TEXT_11)
             .font(theme::FONT_BOLD)
             .color(theme::TEXT_PRIMARY)
             .into(),
@@ -199,20 +199,23 @@ pub(crate) fn tool_block<Message: 'static>(
         ToolBlockView::Compact => Alignment::Center,
         ToolBlockView::Full => Alignment::Start,
     };
-    let mut line = Row::new().spacing(4).align_y(align_y).push(name);
+    let mut line = Row::new()
+        .spacing(theme::SPACE_4)
+        .align_y(align_y)
+        .push(name);
 
     let (args_text, omits) = tool_pairs_summary(tool, view);
     if !args_text.is_empty() {
         let args: Element<'static, Message> = match view {
             ToolBlockView::Full => widgets::selectable_text(args_text, theme::TEXT_SECONDARY)
-                .size(11)
+                .size(theme::TEXT_11)
                 .width(Length::Fill)
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
             // Wrap at glyph level so a long unbroken value (path, URL) folds
             // instead of overflowing the card edge.
             ToolBlockView::Compact => text(args_text)
-                .size(11)
+                .size(theme::TEXT_11)
                 .color(theme::TEXT_SECONDARY)
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
@@ -222,7 +225,7 @@ pub(crate) fn tool_block<Message: 'static>(
 
     if omits {
         tooltip(line, tool_tooltip(tool), tooltip::Position::Top)
-            .gap(4)
+            .gap(theme::SPACE_4)
             .style(theme::tooltip_style)
             .into()
     } else {

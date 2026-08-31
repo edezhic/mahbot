@@ -242,7 +242,7 @@ impl ShellState {
             let term_container = container(term_view)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .padding(8)
+                .padding(theme::PAD_8)
                 .style(theme::base_container_style);
 
             // Wrap in a right-click context menu.
@@ -305,7 +305,7 @@ impl ShellState {
         container(
             column![
                 text(title)
-                    .size(24)
+                    .size(theme::TEXT_24)
                     .color(title_color)
                     .font(theme::FONT_BOLD),
                 Space::new().height(8),
@@ -316,7 +316,7 @@ impl ShellState {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(8)
+        .padding(theme::PAD_8)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
         .style(theme::base_container_style)
@@ -335,15 +335,15 @@ impl ShellState {
             } else {
                 theme::TEXT_FAINT
             };
-            let name_text = text(&tab.label).size(12).color(name_color);
+            let name_text = text(&tab.label).size(theme::TEXT_12).color(name_color);
 
             let tab_row = row![
                 name_text,
                 widgets::tab_close_button(is_active, ShellMessage::TabClosed(i))
             ]
-            .spacing(2)
+            .spacing(theme::SPACE_2)
             .align_y(Alignment::Center)
-            .padding([8, 8]);
+            .padding(theme::PAD_8);
 
             let tab_btn = button(tab_row)
                 .on_press(ShellMessage::TabSelected(i))
@@ -355,12 +355,12 @@ impl ShellState {
 
         let new_tab_btn = button(
             lucide::plus::<iced::Theme, iced::Renderer>()
-                .size(14)
+                .size(theme::TEXT_14)
                 .color(theme::TEXT_SECONDARY),
         )
         .on_press(ShellMessage::NewTab)
         .style(theme::button_transparent)
-        .padding([8, 8]);
+        .padding(theme::PAD_8);
 
         tab_buttons.push(new_tab_btn.into());
 

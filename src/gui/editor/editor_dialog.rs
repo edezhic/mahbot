@@ -67,13 +67,13 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
             } else {
                 iced::Color::TRANSPARENT
             };
-            let label = text(path_owned).size(12).color(if is_selected {
+            let label = text(path_owned).size(theme::TEXT_12).color(if is_selected {
                 theme::ACCENT
             } else {
                 theme::TEXT_SECONDARY
             });
             let entry = container(label)
-                .padding([4, 4])
+                .padding(theme::PAD_4)
                 .width(Length::Fill)
                 .style(result_entry_style(bg));
             button(entry)
@@ -91,14 +91,14 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
         if qo.filter.text().is_empty() && qo.results.is_empty() {
             Some(
                 text("Type to filter files…")
-                    .size(12)
+                    .size(theme::TEXT_12)
                     .color(theme::TEXT_FAINT)
                     .into(),
             )
         } else if qo.results.is_empty() {
             Some(
                 text("No matches found")
-                    .size(12)
+                    .size(theme::TEXT_12)
                     .color(theme::TEXT_SECONDARY)
                     .into(),
             )
@@ -107,13 +107,13 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
         };
 
     let content: Element<'_, EditorMessage> = if let Some(hint) = empty_hint {
-        column![search_elem, hint].spacing(4).into()
+        column![search_elem, hint].spacing(theme::SPACE_4).into()
     } else {
         column![
             search_elem,
             widgets::vscroll_sized(results_column, Length::Fill, Length::Fixed(300.0)),
         ]
-        .spacing(4)
+        .spacing(theme::SPACE_4)
         .into()
     };
 
@@ -131,10 +131,15 @@ fn dialog_button(
     style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
     on_press: EditorMessage,
 ) -> Element<'_, EditorMessage> {
-    button(text(label).size(13).color(color).align_x(Alignment::Center))
-        .style(style)
-        .on_press(on_press)
-        .into()
+    button(
+        text(label)
+            .size(theme::TEXT_13)
+            .color(color)
+            .align_x(Alignment::Center),
+    )
+    .style(style)
+    .on_press(on_press)
+    .into()
 }
 
 /// Build the close-save-discard dialog overlay.
@@ -148,9 +153,9 @@ pub(super) fn build_close_dialog(
         dialog::confirm_dialog(
             row![
                 lucide::triangle_alert::<iced::Theme, iced::Renderer>()
-                    .size(16)
+                    .size(theme::TEXT_16)
                     .color(theme::STATUS_WARNING),
-                Space::new().width(8),
+                Space::new().width(theme::SPACE_8),
                 dialog::dialog_title("Unsaved changes"),
             ]
             .align_y(Alignment::Center),
@@ -198,9 +203,9 @@ pub(super) fn build_delete_confirm_dialog(
         dialog::confirm_dialog(
             row![
                 lucide::triangle_alert::<iced::Theme, iced::Renderer>()
-                    .size(16)
+                    .size(theme::TEXT_16)
                     .color(theme::STATUS_WARNING),
-                Space::new().width(8),
+                Space::new().width(theme::SPACE_8),
                 dialog::dialog_title(title),
             ]
             .align_y(Alignment::Center),
@@ -241,7 +246,7 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
     widgets::modal_backdrop(
         dialog::dialog_shell(
             column![
-                text(label).size(14).color(theme::TEXT_PRIMARY),
+                text(label).size(theme::TEXT_14).color(theme::TEXT_PRIMARY),
                 input,
                 dialog::dialog_footer_row([
                     dialog_button(
@@ -258,7 +263,7 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
                     ),
                 ]),
             ]
-            .spacing(12)
+            .spacing(theme::SPACE_12)
             .width(Length::Fill),
             400.0,
             24.0,
@@ -297,20 +302,22 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
     // Status/hint line below the input.
     let status_elem: Element<'static, EditorMessage> = match &gs.status {
         GlobalSearchStatus::Idle => text("Type to search across workspace files")
-            .size(12)
+            .size(theme::TEXT_12)
             .color(theme::TEXT_FAINT)
             .into(),
         GlobalSearchStatus::Searching => row![
-            text("Searching…").size(12).color(theme::TEXT_MUTED),
+            text("Searching…")
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_MUTED),
             Space::new().width(Length::Fill),
         ]
         .into(),
         GlobalSearchStatus::NoResults => text("No matches found")
-            .size(12)
+            .size(theme::TEXT_12)
             .color(theme::TEXT_SECONDARY)
             .into(),
         GlobalSearchStatus::Error(e) => text(format!("Search error: {e}"))
-            .size(12)
+            .size(theme::TEXT_12)
             .color(theme::STATUS_ERROR)
             .into(),
         GlobalSearchStatus::Done => {
@@ -319,7 +326,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
                 "{count} result{}",
                 if count == 1 { "" } else { "s" }
             ))
-            .size(12)
+            .size(theme::TEXT_12)
             .color(theme::TEXT_SECONDARY)
             .into()
         }
@@ -351,7 +358,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
             };
 
             let path_label = text(path_text)
-                .size(12)
+                .size(theme::TEXT_12)
                 .color(accent)
                 .font(theme::FONT_BOLD);
 
@@ -387,18 +394,18 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
                     };
 
                     row![
-                        text(pre).size(12).color(text_color),
+                        text(pre).size(theme::TEXT_12).color(text_color),
                         text(matched)
-                            .size(12)
+                            .size(theme::TEXT_12)
                             .color(theme::ACCENT_LIGHT)
                             .font(theme::FONT_BOLD),
-                        text(post).size(12).color(text_color),
+                        text(post).size(theme::TEXT_12).color(text_color),
                     ]
                     .spacing(0)
                     .into()
                 } else {
                     text(trimmed)
-                        .size(12)
+                        .size(theme::TEXT_12)
                         .color(if is_selected {
                             theme::TEXT_PRIMARY
                         } else {
@@ -407,10 +414,10 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
                         .into()
                 };
 
-            let entry_content = column![path_label, snippet_label].spacing(1);
+            let entry_content = column![path_label, snippet_label].spacing(theme::SPACE_1);
 
             let entry = container(entry_content)
-                .padding([4, 4])
+                .padding(theme::PAD_4)
                 .width(Length::Fill)
                 .style(result_entry_style(bg));
 
@@ -428,14 +435,16 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
     let has_results = !gs.results.is_empty();
 
     let content: Element<'_, EditorMessage> = if !has_results {
-        column![search_elem, status_elem].spacing(4).into()
+        column![search_elem, status_elem]
+            .spacing(theme::SPACE_4)
+            .into()
     } else {
         column![
             search_elem,
             status_elem,
             widgets::vscroll_sized(results_column, Length::Fill, Length::Fixed(400.0)),
         ]
-        .spacing(4)
+        .spacing(theme::SPACE_4)
         .into()
     };
 

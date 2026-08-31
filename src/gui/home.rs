@@ -709,12 +709,16 @@ impl HomeState {
             } else {
                 "No messages yet. Type something below to start."
             };
-            container(text(empty_hint).color(theme::TEXT_SECONDARY).size(13))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .style(theme::base_container_style)
+            container(
+                text(empty_hint)
+                    .color(theme::TEXT_SECONDARY)
+                    .size(theme::TEXT_13),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(theme::base_container_style)
         } else {
             // Build message bubbles with typing indicator.
             let mut children: Vec<Element<'_, HomeMessage>> = self
@@ -727,7 +731,7 @@ impl HomeState {
                         let label: Element<'_, HomeMessage> = container(
                             text("─ Session cleared ─")
                                 .color(theme::TEXT_MUTED)
-                                .size(12),
+                                .size(theme::TEXT_12),
                         )
                         .center_x(Length::Fill)
                         .into();
@@ -744,8 +748,8 @@ impl HomeState {
                             label,
                             rule::horizontal(1).style(divider_rule),
                         ]
-                        .spacing(4)
-                        .padding(8)
+                        .spacing(theme::SPACE_4)
+                        .padding(theme::PAD_8)
                         .width(Length::Fill);
 
                         return divider.into();
@@ -756,7 +760,7 @@ impl HomeState {
                     // Render markdown content
                     let content: Element<'_, HomeMessage> = if msg.md_items.is_empty() {
                         super::widgets::selectable_text(&msg.content, theme::TEXT_PRIMARY)
-                            .size(13)
+                            .size(theme::TEXT_13)
                             .into()
                     } else {
                         super::media_markers::selectable_markdown_view(
@@ -786,23 +790,30 @@ impl HomeState {
                         });
                         if let Some(role) = maybe_role {
                             let (icon_color, _) = theme::role_badge_color_for(&role);
-                            let icon = theme::role_icon(&role).size(14).color(icon_color);
-                            let mut icon_row = row![icon].align_y(Alignment::Center).spacing(6);
+                            let icon = theme::role_icon(&role)
+                                .size(theme::TEXT_14)
+                                .color(icon_color);
+                            let mut icon_row = row![icon]
+                                .align_y(Alignment::Center)
+                                .spacing(theme::SPACE_6);
                             if let Some(ts) = msg.timestamp.as_deref() {
                                 let label = theme::format_relative_time(ts, chrono::Local::now());
                                 if !label.is_empty() {
-                                    icon_row = icon_row
-                                        .push(text(label).size(11).color(theme::TEXT_SECONDARY));
+                                    icon_row = icon_row.push(
+                                        text(label)
+                                            .size(theme::TEXT_11)
+                                            .color(theme::TEXT_SECONDARY),
+                                    );
                                 }
                             }
-                            column![icon_row, content].spacing(4).into()
+                            column![icon_row, content].spacing(theme::SPACE_4).into()
                         } else {
                             content
                         }
                     };
 
                     let bubble = container(bubble_body)
-                        .padding(10)
+                        .padding(theme::PAD_10)
                         .style(theme::bubble_style(
                             if is_user {
                                 theme::BG_ELEVATED
@@ -840,7 +851,7 @@ impl HomeState {
                 };
                 let typing_dots = text(dots).size(20).color(theme::TEXT_MUTED);
                 let typing_bubble = container(typing_dots)
-                    .padding(10)
+                    .padding(theme::PAD_10)
                     .style(theme::bubble_style(theme::BG_SURFACE, None))
                     .width(Length::FillPortion(3));
 
@@ -854,36 +865,40 @@ impl HomeState {
                 } else {
                     "▲ Load older messages"
                 };
-                let load_btn = button(text(load_text).size(12).color(theme::TEXT_SECONDARY))
-                    .style(move |_t: &iced::Theme, _status| {
-                        use iced::widget::button;
-                        button::Style {
-                            background: Some(iced::Background::Color(theme::BG_SURFACE)),
-                            border: iced::Border {
-                                radius: 4.0.into(),
-                                width: 0.0,
-                                color: iced::Color::TRANSPARENT,
-                            },
-                            text_color: theme::TEXT_SECONDARY,
-                            ..button::Style::default()
-                        }
-                    })
-                    .width(Length::Fill)
-                    .on_press_maybe(if self.loading_older {
-                        None
-                    } else {
-                        Some(HomeMessage::LoadOlderMessages)
-                    });
+                let load_btn = button(
+                    text(load_text)
+                        .size(theme::TEXT_12)
+                        .color(theme::TEXT_SECONDARY),
+                )
+                .style(move |_t: &iced::Theme, _status| {
+                    use iced::widget::button;
+                    button::Style {
+                        background: Some(iced::Background::Color(theme::BG_SURFACE)),
+                        border: iced::Border {
+                            radius: 4.0.into(),
+                            width: 0.0,
+                            color: iced::Color::TRANSPARENT,
+                        },
+                        text_color: theme::TEXT_SECONDARY,
+                        ..button::Style::default()
+                    }
+                })
+                .width(Length::Fill)
+                .on_press_maybe(if self.loading_older {
+                    None
+                } else {
+                    Some(HomeMessage::LoadOlderMessages)
+                });
                 // The 4px is the pill's design accent on top of the bubbles'
                 // inset (8 pre-rework column padding, now the wrapper's) —
                 // kept untrimmed so the pill stays 4px deeper than bubbles.
-                children.insert(0, container(load_btn).padding(4).into());
+                children.insert(0, container(load_btn).padding(theme::PAD_4).into());
             }
 
             container(super::widgets::vscroll_tracked(
                 Column::with_children(children)
                     .spacing(super::widgets::CHAT_VERTICAL_RHYTHM)
-                    .padding([8, 0]),
+                    .padding([theme::PAD_8, 0.0]),
                 Length::Fill,
                 Length::Fill,
                 CHAT_SCROLL_ID,
@@ -924,10 +939,10 @@ impl HomeState {
         let role_icon = match active_role {
             Some(role) => {
                 let (fg, _) = theme::role_badge_color_for(&role);
-                theme::role_icon(&role).size(15).color(fg)
+                theme::role_icon(&role).size(theme::TEXT_14).color(fg)
             }
             None => lucide::bot::<iced::Theme, iced::Renderer>()
-                .size(15)
+                .size(theme::TEXT_14)
                 .color(theme::TEXT_MUTED),
         };
         // Personal-workspace picker hides the Manager role — routing maps
@@ -944,7 +959,7 @@ impl HomeState {
                     .then_some(HomeMessage::RoleMenuToggled),
             )
             .style(theme::icon_button_style(false))
-            .padding(3);
+            .padding(theme::PAD_3);
 
         // ── Role dropdown (overlay, above the composer) ────────────
         // The role list floats above the whole widget tree via
@@ -981,7 +996,7 @@ impl HomeState {
         controls.push(
             tooltip(
                 role_btn,
-                text("switch agent").size(11),
+                text("switch agent").size(theme::TEXT_11),
                 tooltip::Position::Top,
             )
             .style(theme::tooltip_style)
@@ -989,25 +1004,27 @@ impl HomeState {
         );
 
         let mic_btn = tooltip(
-            button(lucide::mic::<iced::Theme, iced::Renderer>().size(14).color(
-                if recording_unavailable {
-                    theme::TEXT_MUTED
-                } else {
-                    theme::TEXT_SECONDARY
-                },
-            ))
+            button(
+                lucide::mic::<iced::Theme, iced::Renderer>()
+                    .size(theme::TEXT_14)
+                    .color(if recording_unavailable {
+                        theme::TEXT_MUTED
+                    } else {
+                        theme::TEXT_SECONDARY
+                    }),
+            )
             .on_press_maybe(
                 (self.selected_user.is_some() && !recording_unavailable)
                     .then_some(HomeMessage::StartVoiceRecording),
             )
             .style(theme::icon_button_style(recording_unavailable))
-            .padding(3),
+            .padding(theme::PAD_3),
             text(if transcription_disabled {
                 "voice recording unavailable — local transcription is disabled"
             } else {
                 "record voice message"
             })
-            .size(11),
+            .size(theme::TEXT_11),
             tooltip::Position::Top,
         )
         .style(theme::tooltip_style);
@@ -1038,7 +1055,9 @@ impl HomeState {
             },
         ))
         .style(theme::base_container_style)
-        .padding(iced::Padding::from([0, 8]).bottom(super::widgets::CHAT_VERTICAL_RHYTHM))
+        .padding(
+            iced::Padding::from([0.0, theme::PAD_8]).bottom(super::widgets::CHAT_VERTICAL_RHYTHM),
+        )
         .width(Length::Fill)
         .into();
 
@@ -1047,16 +1066,16 @@ impl HomeState {
         // "Transcribing…" indicator (no stop controls — the ASR is finalizing).
         let recording_popup: Element<'_, HomeMessage> = if recording {
             let status_label = text("Recording voice message…")
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::STATUS_ERROR);
-            let send_btn = button(text("Stop + Send").size(12))
+            let send_btn = button(text("Stop + Send").size(theme::TEXT_12))
                 .on_press(HomeMessage::StopVoiceRecordingSend)
                 .style(theme::button_secondary)
-                .padding(5);
-            let discard_btn = button(text("Stop + Discard").size(12))
+                .padding(theme::PAD_5);
+            let discard_btn = button(text("Stop + Discard").size(theme::TEXT_12))
                 .on_press(HomeMessage::StopVoiceRecordingDiscard)
                 .style(theme::button_secondary)
-                .padding(5);
+                .padding(theme::PAD_5);
             container(
                 row![
                     status_label,
@@ -1064,10 +1083,10 @@ impl HomeState {
                     send_btn,
                     discard_btn
                 ]
-                .spacing(8)
+                .spacing(theme::SPACE_8)
                 .align_y(Alignment::Center),
             )
-            .padding(8)
+            .padding(theme::PAD_8)
             .style(theme::surface_container_style)
             .width(Length::Fill)
             .into()
@@ -1075,14 +1094,14 @@ impl HomeState {
             container(
                 row![
                     text("Transcribing voice message…")
-                        .size(13)
+                        .size(theme::TEXT_13)
                         .color(theme::TEXT_MUTED),
                     Space::new().width(Length::Fill),
                 ]
-                .spacing(8)
+                .spacing(theme::SPACE_8)
                 .align_y(Alignment::Center),
             )
-            .padding(8)
+            .padding(theme::PAD_8)
             .style(theme::surface_container_style)
             .width(Length::Fill)
             .into()

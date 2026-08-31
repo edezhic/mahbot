@@ -1689,7 +1689,7 @@ impl EditorState {
             .code_mode(false)
             .enter(EnterBehavior::Submit)
             .placeholder("")
-            .padding(2.0)
+            .padding(theme::PAD_2)
             .background(Some(iced::Color::TRANSPARENT))
             .id(Id::from(format!("rename_input_{}", node.full_path)));
         let input: Element<'a, EditorMessage> =
@@ -1702,9 +1702,12 @@ impl EditorState {
         // EditorWidget to keep widget nesting shallow.
         if let Some(ref err) = rt.error {
             Some(
-                column![input, text(err).size(10).color(theme::STATUS_ERROR)]
-                    .spacing(0)
-                    .into(),
+                column![
+                    input,
+                    text(err).size(theme::TEXT_10).color(theme::STATUS_ERROR)
+                ]
+                .spacing(0)
+                .into(),
             )
         } else {
             Some(input)
@@ -5008,8 +5011,8 @@ impl EditorState {
                                 weight: name_weight,
                                 ..theme::FONT_REGULAR
                             }),
-                        Space::new().width(4),
-                        text("[⚠]").size(11).color(theme::STATUS_ERROR),
+                        Space::new().width(theme::SPACE_4),
+                        text("[⚠]").size(theme::TEXT_11).color(theme::STATUS_ERROR),
                     ]
                     .align_y(Alignment::Center)
                     .into()
@@ -5101,9 +5104,9 @@ impl EditorState {
             } else {
                 theme::TEXT_FAINT
             };
-            let name_text = text(&tab.file_name).size(12).color(name_color);
+            let name_text = text(&tab.file_name).size(theme::TEXT_12).color(name_color);
 
-            let mut tab_row = row![].spacing(2).align_y(Alignment::Center);
+            let mut tab_row = row![].spacing(theme::SPACE_2).align_y(Alignment::Center);
             if let Some(dot) = dirty_dot {
                 tab_row = tab_row.push(dot);
             }
@@ -5112,7 +5115,7 @@ impl EditorState {
                 EditorMessage::TabClosed(i),
             ));
 
-            let tab_btn = button(tab_row.padding([8, 8]))
+            let tab_btn = button(tab_row.padding(theme::PAD_8))
                 .on_press(EditorMessage::TabSelected(i))
                 .style(theme::tab_button_style(is_active))
                 .padding(0);
@@ -5198,25 +5201,33 @@ impl EditorState {
             String::new()
         };
 
-        let prev_btn = button(text("‹").size(14).color(theme::TEXT_SECONDARY))
+        let prev_btn = button(text("‹").size(theme::TEXT_14).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::FindPrev)
             .style(theme::button_transparent)
-            .padding([2, 8]);
+            .padding([theme::PAD_2, theme::PAD_8]);
 
-        let next_btn = button(text("›").size(14).color(theme::TEXT_SECONDARY))
+        let next_btn = button(text("›").size(theme::TEXT_14).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::FindNext)
             .style(theme::button_transparent)
-            .padding([2, 8]);
+            .padding([theme::PAD_2, theme::PAD_8]);
 
-        let replace_btn = button(text("Replace").size(11).color(theme::TEXT_SECONDARY))
-            .on_press(EditorMessage::FindReplace)
-            .style(theme::button_transparent)
-            .padding([2, 6]);
+        let replace_btn = button(
+            text("Replace")
+                .size(theme::TEXT_11)
+                .color(theme::TEXT_SECONDARY),
+        )
+        .on_press(EditorMessage::FindReplace)
+        .style(theme::button_transparent)
+        .padding([theme::PAD_2, theme::PAD_6]);
 
-        let replace_all_btn = button(text("All").size(11).color(theme::TEXT_SECONDARY))
-            .on_press(EditorMessage::FindReplaceAll)
-            .style(theme::button_transparent)
-            .padding([2, 6]);
+        let replace_all_btn = button(
+            text("All")
+                .size(theme::TEXT_11)
+                .color(theme::TEXT_SECONDARY),
+        )
+        .on_press(EditorMessage::FindReplaceAll)
+        .style(theme::button_transparent)
+        .padding([theme::PAD_2, theme::PAD_6]);
 
         // Case sensitivity toggle: "Aa" label, highlighted when active.
         let case_label_color = if state.case_sensitive {
@@ -5224,25 +5235,27 @@ impl EditorState {
         } else {
             theme::TEXT_SECONDARY
         };
-        let case_btn = button(text("Aa").size(11).color(case_label_color))
+        let case_btn = button(text("Aa").size(theme::TEXT_11).color(case_label_color))
             .on_press(EditorMessage::FindToggleCaseSensitivity)
             .style(theme::button_transparent)
-            .padding([2, 6]);
+            .padding([theme::PAD_2, theme::PAD_6]);
 
         let bar = row![
             search_input,
             replace_input,
             prev_btn,
-            text(match_label).size(12).color(theme::TEXT_SECONDARY),
+            text(match_label)
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY),
             next_btn,
             Space::new().width(Length::Fixed(4.0)),
             case_btn,
             replace_btn,
             replace_all_btn,
         ]
-        .spacing(4)
+        .spacing(theme::SPACE_4)
         .align_y(Alignment::Center)
-        .padding([4, 8]);
+        .padding([theme::PAD_4, theme::PAD_8]);
 
         Some(bar_harness(bar))
     }
@@ -5266,20 +5279,22 @@ impl EditorState {
             },
         );
 
-        let go_btn = button(text("Go").size(12).color(theme::TEXT_SECONDARY))
+        let go_btn = button(text("Go").size(theme::TEXT_12).color(theme::TEXT_SECONDARY))
             .on_press(EditorMessage::GoToLineGo)
             .style(theme::button_transparent)
-            .padding([2, 8]);
+            .padding([theme::PAD_2, theme::PAD_8]);
 
         let bar = row![
-            text("Go to line:").size(12).color(theme::TEXT_SECONDARY),
-            Space::new().width(4),
+            text("Go to line:")
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY),
+            Space::new().width(theme::SPACE_4),
             line_input,
             go_btn,
         ]
-        .spacing(4)
+        .spacing(theme::SPACE_4)
         .align_y(Alignment::Center)
-        .padding([4, 8]);
+        .padding([theme::PAD_4, theme::PAD_8]);
 
         Some(bar_harness(bar))
     }
@@ -5367,7 +5382,7 @@ impl EditorState {
         bracket_pair: Option<super::editor_widget::BracketPair>,
     ) -> Element<'a, EditorMessage> {
         let editor = super::editor_widget::EditorWidget::new(content)
-            .padding(8.0)
+            .padding(theme::PAD_8)
             .ignore_keyboard(ignore_keyboard)
             .matches(matches, match_current_idx)
             .bracket_pair(bracket_pair)

@@ -1787,10 +1787,10 @@ impl Dashboard {
                     text("MahBot failed to start")
                         .size(20)
                         .color(theme::STATUS_ERROR),
-                    text(err).size(14).color(theme::TEXT_SECONDARY),
+                    text(err).size(theme::TEXT_14).color(theme::TEXT_SECONDARY),
                 ]
-                .spacing(12)
-                .padding(24),
+                .spacing(theme::SPACE_12)
+                .padding(theme::PAGE_PADDING),
             )
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1802,10 +1802,12 @@ impl Dashboard {
         if !self.ready {
             return container(
                 column![
-                    text("MahBot").size(24).color(theme::ACCENT),
-                    text("Starting…").size(16).color(theme::TEXT_MUTED),
+                    text("MahBot").size(theme::TEXT_24).color(theme::ACCENT),
+                    text("Starting…")
+                        .size(theme::TEXT_16)
+                        .color(theme::TEXT_MUTED),
                 ]
-                .spacing(16)
+                .spacing(theme::SPACE_16)
                 .align_x(Alignment::Center),
             )
             .width(Length::Fill)
@@ -1895,15 +1897,17 @@ impl Dashboard {
         let overlay: Element<'_, Message> = if self.toasts.is_empty() {
             widgets::empty_stack_placeholder()
         } else {
-            let mut toast_col = Column::new().spacing(6).align_x(Alignment::Center);
+            let mut toast_col = Column::new()
+                .spacing(theme::SPACE_6)
+                .align_x(Alignment::Center);
             for toast in &self.toasts {
                 let (color, _bg) = match toast.kind {
                     ToastKind::Success => (theme::STATUS_SUCCESS, theme::BG_ELEVATED),
                     ToastKind::Warning => (theme::STATUS_WARNING, theme::BG_ELEVATED),
                     ToastKind::Error => (theme::STATUS_ERROR, theme::BG_ELEVATED),
                 };
-                let pill = container(text(&toast.message).size(12).color(color))
-                    .padding([6, 14])
+                let pill = container(text(&toast.message).size(theme::TEXT_12).color(color))
+                    .padding([theme::PAD_6, theme::PAD_14])
                     .style(move |_theme: &iced::Theme| container::Style {
                         background: Some(iced::Background::Color(theme::BG_ELEVATED)),
                         border: iced::Border {
@@ -1962,7 +1966,7 @@ fn modal_overlay<'a>(
 ) -> Element<'a, Message> {
     let dialog = container(inner)
         .height(Length::Fill)
-        .padding(16)
+        .padding(theme::PAD_16)
         .style(theme::dialog_container_style);
 
     let centered = row![
@@ -1994,29 +1998,25 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
         let hash = diff_state.commit_short_hash().unwrap_or("????????");
         column![
             widgets::section_heading(msg),
-            text(hash).size(12).color(theme::TEXT_SECONDARY),
+            text(hash).size(theme::TEXT_12).color(theme::TEXT_SECONDARY),
         ]
-        .spacing(2)
+        .spacing(theme::SPACE_2)
         .padding(iced::Padding {
-            top: 0.0,
-            right: 0.0,
-            bottom: 12.0,
-            left: 0.0,
+            bottom: theme::PAD_12,
+            ..iced::Padding::ZERO
         })
         .into()
     } else {
         column![
             widgets::section_heading("Uncommitted changes"),
             text("Working tree diff \u{2014} press Escape to close")
-                .size(11)
+                .size(theme::TEXT_11)
                 .color(theme::TEXT_SECONDARY),
         ]
-        .spacing(4)
+        .spacing(theme::SPACE_4)
         .padding(iced::Padding {
-            top: 0.0,
-            right: 0.0,
-            bottom: 12.0,
-            left: 0.0,
+            bottom: theme::PAD_12,
+            ..iced::Padding::ZERO
         })
         .into()
     };
@@ -2045,10 +2045,10 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         |action| Message::Board(board::BoardMessage::SearchInputChanged(action)),
     );
     let clear_btn = widgets::icon_tooltip_button(
-        text("×").size(14),
+        text("×").size(theme::TEXT_14),
         "clear search",
         Some(Message::Board(board::BoardMessage::SearchCleared)),
-        4,
+        theme::PAD_4,
         theme::button_text,
         tooltip::Position::Top,
     );
@@ -2058,8 +2058,8 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         search_row_children.push(clear_btn);
     }
     let search_row = Row::with_children(search_row_children)
-        .spacing(4)
-        .padding([0, 8])
+        .spacing(theme::SPACE_4)
+        .padding([0.0, theme::PAD_8])
         .align_y(Alignment::Center);
 
     // ── Body: search results or normal ticket groups ────────────────
@@ -2078,7 +2078,7 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     .spacing(0);
 
     container(content)
-        .padding([8, 4])
+        .padding([theme::PAD_8, theme::PAD_4])
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::surface_container_style)
@@ -2089,10 +2089,12 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
 fn section_hint(label: &str) -> Element<'_, Message> {
     column![
         Space::new().height(8),
-        text(label).size(12).color(theme::TEXT_SECONDARY),
+        text(label)
+            .size(theme::TEXT_12)
+            .color(theme::TEXT_SECONDARY),
     ]
-    .spacing(4)
-    .padding(8)
+    .spacing(theme::SPACE_4)
+    .padding(theme::PAD_8)
     .into()
 }
 
@@ -2110,7 +2112,7 @@ fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Mes
     } else if is_empty {
         section_hint("No tickets")
     } else {
-        let mut groups = Column::new().spacing(8);
+        let mut groups = Column::new().spacing(theme::SPACE_8);
         if !in_progress.is_empty() {
             groups = groups.push(group_section("In Progress", &in_progress, board_state));
         }
@@ -2132,7 +2134,7 @@ fn render_search_results(board_state: &board::BoardState) -> Element<'_, Message
     if board_state.search_results.is_empty() {
         section_hint("No matching tickets")
     } else {
-        let mut cards = Column::new().spacing(2);
+        let mut cards = Column::new().spacing(theme::SPACE_2);
         for ticket in &board_state.search_results {
             cards = cards.push(board_state.render_ticket_card(ticket).map(Message::Board));
         }
@@ -2146,9 +2148,11 @@ fn group_section<'a>(
     tickets: &[&'a Ticket],
     board_state: &'a board::BoardState,
 ) -> Element<'a, Message> {
-    let header = text(label).size(11).color(theme::TEXT_SECONDARY);
+    let header = text(label)
+        .size(theme::TEXT_11)
+        .color(theme::TEXT_SECONDARY);
 
-    let mut cards = Column::new().spacing(2);
+    let mut cards = Column::new().spacing(theme::SPACE_2);
     for ticket in tickets {
         cards = cards.push(board_state.render_ticket_card(ticket).map(Message::Board));
     }
@@ -2496,13 +2500,13 @@ fn render_sidebar_toggle<'a>(
             container(icon)
                 .width(Length::Fill)
                 .center_x(Length::Fill)
-                .padding([4, 0]),
+                .padding([theme::PAD_4, 0.0]),
         )
         .width(Length::Fill)
         .padding(0)
         .style(theme::button_text)
         .on_press_maybe(action),
-        text(tooltip_text).size(11),
+        text(tooltip_text).size(theme::TEXT_11),
         position,
     )
     .style(theme::tooltip_style)
@@ -2518,11 +2522,11 @@ impl Dashboard {
             col = col.push(self.render_maintainer_toggle());
             col = col.push(self.render_pause_toggle());
         }
-        container(col.spacing(2))
+        container(col.spacing(theme::SPACE_2))
             .width(Length::Fixed(56.0))
             .height(Length::Fill)
             .style(theme::surface_container_style)
-            .padding(12)
+            .padding(theme::PAD_12)
             .into()
     }
 
@@ -2533,7 +2537,7 @@ impl Dashboard {
     /// Uses Position::Right — iced snaps Top tooltips into the viewport,
     /// overlapping the topmost sidebar button.
     fn render_sidebar_nav(&self) -> Element<'_, Message> {
-        let mut col = Column::new().spacing(2);
+        let mut col = Column::new().spacing(theme::SPACE_2);
         for page in Page::sidebar_pages() {
             let is_active = self.page == *page;
             // Editor, Shell require any workspace (shared or personal with a user selected).
@@ -2681,7 +2685,7 @@ impl Dashboard {
             (theme::ACCENT, tooltip, true)
         };
         let update_icon = lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-            .size(24)
+            .size(theme::TEXT_24)
             .color(update_color);
         Some(widgets::icon_tooltip_button(
             update_icon,
@@ -2691,7 +2695,7 @@ impl Dashboard {
             } else {
                 None
             },
-            3,
+            theme::PAD_3,
             theme::button_text,
             tooltip::Position::Top,
         ))
@@ -2712,13 +2716,13 @@ impl Dashboard {
                 icon,
                 page.label(),
                 Some(Message::Navigation(*page)),
-                3,
+                theme::PAD_3,
                 theme::button_text,
                 tooltip::Position::Top,
             ));
         }
         Row::with_children(icons)
-            .spacing(6)
+            .spacing(theme::SPACE_6)
             .align_y(Alignment::Center)
             .into()
     }
@@ -2746,17 +2750,17 @@ impl Dashboard {
         };
         let branch_content = row![
             lucide::git_branch::<iced::Theme, iced::Renderer>()
-                .size(24)
+                .size(theme::TEXT_24)
                 .color(theme::ACCENT),
-            text(truncated).size(16).color(theme::ACCENT),
+            text(truncated).size(theme::TEXT_16).color(theme::ACCENT),
         ]
-        .spacing(6)
+        .spacing(theme::SPACE_6)
         .align_y(Alignment::Center);
         Some(widgets::icon_tooltip_button(
             branch_content,
             "active branch",
             Some(Message::Git(git::GitMessage::OpenModal)),
-            3,
+            theme::PAD_3,
             theme::button_text,
             tooltip::Position::Top,
         ))
@@ -2778,36 +2782,36 @@ impl Dashboard {
             if ahead > 0 {
                 parts.push(
                     lucide::arrow_up::<iced::Theme, iced::Renderer>()
-                        .size(16)
+                        .size(theme::TEXT_16)
                         .color(theme::TEXT_SECONDARY)
                         .into(),
                 );
                 parts.push(
                     text(format!("{ahead}"))
-                        .size(16)
+                        .size(theme::TEXT_16)
                         .color(theme::TEXT_SECONDARY)
                         .into(),
                 );
             }
             if behind > 0 {
                 if ahead > 0 {
-                    parts.push(Space::new().width(8).into());
+                    parts.push(Space::new().width(theme::SPACE_8).into());
                 }
                 parts.push(
                     lucide::arrow_down::<iced::Theme, iced::Renderer>()
-                        .size(16)
+                        .size(theme::TEXT_16)
                         .color(theme::TEXT_SECONDARY)
                         .into(),
                 );
                 parts.push(
                     text(format!("{behind}"))
-                        .size(16)
+                        .size(theme::TEXT_16)
                         .color(theme::TEXT_SECONDARY)
                         .into(),
                 );
             }
             Row::with_children(parts)
-                .spacing(2)
+                .spacing(theme::SPACE_2)
                 .align_y(Alignment::Center)
                 .into()
         };
@@ -2818,11 +2822,11 @@ impl Dashboard {
         };
         let sync_content = row![
             lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                .size(24)
+                .size(theme::TEXT_24)
                 .color(sync_icon_color),
             sync_text_label,
         ]
-        .spacing(6)
+        .spacing(theme::SPACE_6)
         .align_y(Alignment::Center);
         Some(widgets::icon_tooltip_button(
             sync_content,
@@ -2832,7 +2836,7 @@ impl Dashboard {
             } else {
                 Some(Message::Git(git::GitMessage::Sync))
             },
-            3,
+            theme::PAD_3,
             theme::button_text,
             tooltip::Position::Top,
         ))
@@ -2852,7 +2856,7 @@ impl Dashboard {
             )?,
             "uncommitted changes",
             Some(Message::OpenDiffModal(None)),
-            3,
+            theme::PAD_3,
             theme::button_text,
             tooltip::Position::Top,
         ))
@@ -2877,7 +2881,7 @@ impl Dashboard {
         }
         Some(
             Row::with_children(elements)
-                .spacing(6)
+                .spacing(theme::SPACE_6)
                 .align_y(Alignment::Center)
                 .into(),
         )
@@ -2902,17 +2906,20 @@ impl Dashboard {
         for (role_str, count) in &role_counts {
             let role: crate::Role = role_str.parse().unwrap_or(crate::Role::Engineer);
             let (color, _bg) = theme::role_badge_color_for(&role);
-            let icon = theme::role_icon(&role).size(24).color(color);
+            let icon = theme::role_icon(&role).size(theme::TEXT_24).color(color);
             let content: Element<'_, Message> = if *count > 1 {
                 container(
-                    row![icon, text(format!("×{count}")).size(15).color(color)]
-                        .spacing(3)
-                        .align_y(Alignment::Center),
+                    row![
+                        icon,
+                        text(format!("×{count}")).size(theme::TEXT_14).color(color)
+                    ]
+                    .spacing(theme::SPACE_3)
+                    .align_y(Alignment::Center),
                 )
-                .padding([0, 3])
+                .padding([0.0, theme::PAD_3])
                 .into()
             } else {
-                container(icon).padding([0, 3]).into()
+                container(icon).padding([0.0, theme::PAD_3]).into()
             };
             icons.push(widgets::icon_tooltip_button(
                 content,
@@ -2925,7 +2932,7 @@ impl Dashboard {
         }
         Some(
             Row::with_children(icons)
-                .spacing(12)
+                .spacing(theme::SPACE_12)
                 .align_y(Alignment::Center)
                 .into(),
         )
@@ -2945,14 +2952,16 @@ impl Dashboard {
         let content = container(
             row![
                 lucide::zap::<iced::Theme, iced::Renderer>()
-                    .size(24)
+                    .size(theme::TEXT_24)
                     .color(color),
-                text(format!("×{}", handles.len())).size(15).color(color),
+                text(format!("×{}", handles.len()))
+                    .size(theme::TEXT_14)
+                    .color(color),
             ]
-            .spacing(3)
+            .spacing(theme::SPACE_3)
             .align_y(Alignment::Center),
         )
-        .padding([0, 3]);
+        .padding([0.0, theme::PAD_3]);
         // Tooltip lists the in-flight kinds as static human-readable labels —
         // raw snake_case kind names never surface. Map to labels FIRST, then
         // dedup: two unknown kinds share the generic fallback label, so
@@ -2983,9 +2992,13 @@ impl Dashboard {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (progress * 100.0).round() as u32;
         let label = format!("TTS: {file_name} {pct}%");
-        container(text(label).size(12).color(theme::TEXT_SECONDARY))
-            .padding([0, 12])
-            .into()
+        container(
+            text(label)
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY),
+        )
+        .padding([0.0, theme::PAD_12])
+        .into()
     }
 
     /// Render a compact voice status indicator in the footer bar.
@@ -3024,9 +3037,13 @@ impl Dashboard {
             VoiceStatus::Enrolled => "🔊 ✅ Enrolled".into(),
             VoiceStatus::Error(msg) => format!("🔊 Error: {msg}"),
         };
-        container(text(label).size(12).color(theme::TEXT_SECONDARY))
-            .padding([0, 12])
-            .into()
+        container(
+            text(label)
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY),
+        )
+        .padding([0.0, theme::PAD_12])
+        .into()
     }
 
     /// 42px footer bar — nav items (left) and active agents (right).
@@ -3044,7 +3061,7 @@ impl Dashboard {
         }
 
         let left = Row::with_children(left_elements)
-            .spacing(6)
+            .spacing(theme::SPACE_6)
             .align_y(Alignment::Center);
 
         // TTS download progress and voice status indicator (center of footer bar)
@@ -3052,7 +3069,7 @@ impl Dashboard {
             self.render_tts_download_progress(),
             Self::render_voice_status(),
         ]
-        .spacing(8)
+        .spacing(theme::SPACE_8)
         .align_y(Alignment::Center);
 
         let right = Row::with_children(
@@ -3061,12 +3078,12 @@ impl Dashboard {
                 .flatten()
                 .collect::<Vec<_>>(),
         )
-        .spacing(12)
+        .spacing(theme::SPACE_12)
         .align_y(Alignment::Center);
 
         let footer_row = row![left, center, Space::new().width(Length::Fill), right]
             .align_y(Alignment::Center)
-            .padding([3, 18]);
+            .padding([theme::PAD_3, theme::PAD_18]);
 
         container(footer_row)
             .align_y(Alignment::Center)

@@ -94,22 +94,22 @@ fn model_entry_row(
 ) -> Element<'static, SettingsMessage> {
     let indicator = if is_active {
         lucide::circle_check::<iced::Theme, iced::Renderer>()
-            .size(12)
+            .size(theme::TEXT_12)
             .color(theme::ACCENT)
     } else {
         lucide::circle::<iced::Theme, iced::Renderer>()
-            .size(12)
+            .size(theme::TEXT_12)
             .color(theme::TEXT_SECONDARY)
     };
     let model_btn = button(
         row![
             indicator,
-            Space::new().width(4),
-            text(model.clone()).size(12)
+            Space::new().width(theme::SPACE_4),
+            text(model.clone()).size(theme::TEXT_12)
         ]
         .align_y(Alignment::Center),
     )
-    .padding(4)
+    .padding(theme::PAD_4)
     .style(theme::button_secondary)
     .on_press(SettingsMessage::ModelPicker {
         target,
@@ -121,7 +121,7 @@ fn model_entry_row(
         // Fill height: exactly the model-row height (the row's tallest child).
         let remove_btn = button(
             lucide::x::<iced::Theme, iced::Renderer>()
-                .size(24)
+                .size(theme::TEXT_24)
                 .color(theme::TEXT_SECONDARY),
         )
         .width(24)
@@ -132,7 +132,9 @@ fn model_entry_row(
             target,
             action: ModelPickerAction::RemoveModel(model),
         });
-        entry = entry.push(Space::new().width(4)).push(remove_btn);
+        entry = entry
+            .push(Space::new().width(theme::SPACE_4))
+            .push(remove_btn);
     }
     entry.align_y(Alignment::Center).into()
 }
@@ -177,7 +179,7 @@ fn model_picker_list<'a>(
     let items: Vec<Element<'a, SettingsMessage>> = if models.is_empty() {
         vec![
             text("No models configured yet.")
-                .size(12)
+                .size(theme::TEXT_12)
                 .color(theme::TEXT_SECONDARY)
                 .into(),
         ]
@@ -204,16 +206,16 @@ fn model_picker_list<'a>(
             Some(Id::from(format!("model_picker:{}", target.idx()))),
             on_add_input,
         ),
-        Space::new().width(4),
-        button(text("Add").size(11))
-            .padding(4)
+        Space::new().width(theme::SPACE_4),
+        button(text("Add").size(theme::TEXT_11))
+            .padding(theme::PAD_4)
             .style(theme::button_secondary)
             .on_press(on_add),
     ]
     .align_y(Alignment::Center);
 
     let mut col = column![
-        Column::from_iter(items).spacing(2),
+        Column::from_iter(items).spacing(theme::SPACE_2),
         Space::new().height(4),
         add_row,
     ];
@@ -1754,7 +1756,8 @@ impl SettingsState {
 
         if let Some(ref err) = self.error {
             content = content.push(Space::new().height(8));
-            content = content.push(container(text(err).color(theme::STATUS_ERROR)).padding([8, 0]));
+            content = content
+                .push(container(text(err).color(theme::STATUS_ERROR)).padding([theme::PAD_8, 0.0]));
         }
 
         let scroll = widgets::vscroll(content);
@@ -1769,7 +1772,7 @@ impl SettingsState {
         container(body)
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(24)
+            .padding(theme::PAGE_PADDING)
             .style(theme::base_container_style)
             .into()
     }
@@ -1782,14 +1785,14 @@ impl SettingsState {
     fn workspaces_section(&self) -> Element<'_, SettingsMessage> {
         let ws = &self.workspaces_state;
 
-        let mut rows = Column::new().spacing(4);
+        let mut rows = Column::new().spacing(theme::SPACE_4);
 
         rows = widgets::push_error_banner(rows, ws.load_state.error());
 
         if ws.workspaces.is_empty() {
             rows = rows.push(
                 text("No workspaces configured. Add one below.")
-                    .size(12)
+                    .size(theme::TEXT_12)
                     .color(theme::TEXT_MUTED),
             );
         } else {
@@ -1799,14 +1802,14 @@ impl SettingsState {
                 let (pause_icon, pause_tooltip) = if paused {
                     (
                         lucide::play::<iced::Theme, iced::Renderer>()
-                            .size(11)
+                            .size(theme::TEXT_11)
                             .color(theme::ACCENT),
                         "Resume pipeline",
                     )
                 } else {
                     (
                         lucide::pause::<iced::Theme, iced::Renderer>()
-                            .size(11)
+                            .size(theme::TEXT_11)
                             .color(theme::TEXT_MUTED),
                         "Pause pipeline",
                     )
@@ -1816,10 +1819,14 @@ impl SettingsState {
                     column![
                         row![
                             // Name column (FillPortion: 15)
-                            container(text(&ws_item.name).size(14).color(theme::TEXT_PRIMARY))
-                                .width(Length::FillPortion(15))
-                                .align_x(Alignment::Start)
-                                .align_y(Alignment::Center),
+                            container(
+                                text(&ws_item.name)
+                                    .size(theme::TEXT_14)
+                                    .color(theme::TEXT_PRIMARY)
+                            )
+                            .width(Length::FillPortion(15))
+                            .align_x(Alignment::Start)
+                            .align_y(Alignment::Center),
                             // Status column (FillPortion: 18) — status pill,
                             // maintainer toggle, pause/unpause toggle.
                             container(
@@ -1828,10 +1835,9 @@ impl SettingsState {
                                         widgets::badge_pill(
                                             ws_item.status.to_string(),
                                             theme::workspace_status_color(ws_item.status),
-                                            11,
-                                            [2, 8],
+                                            widgets::PILL_MODAL,
                                         ),
-                                        text("Status").size(11),
+                                        text("Status").size(theme::TEXT_11),
                                         tooltip::Position::Top,
                                     )
                                     .style(theme::tooltip_style),
@@ -1866,7 +1872,7 @@ impl SettingsState {
                                         tooltip::Position::Top,
                                     ),
                                 ]
-                                .spacing(4)
+                                .spacing(theme::SPACE_4)
                                 .align_y(Alignment::Center),
                             )
                             .width(Length::FillPortion(18))
@@ -1875,15 +1881,17 @@ impl SettingsState {
                             // Contexts column (FillPortion: 28) — per-role
                             // context icons, general context, Diag, Notes.
                             {
-                                let mut left = Row::new().spacing(4).align_y(Alignment::Center);
-                                let mut role_btns = Row::new().spacing(2);
+                                let mut left = Row::new()
+                                    .spacing(theme::SPACE_4)
+                                    .align_y(Alignment::Center);
+                                let mut role_btns = Row::new().spacing(theme::SPACE_2);
                                 for role in Role::iter()
                                     .filter(|r| crate::agent::role::role_info(r).has_discovery)
                                 {
                                     let name = role.as_str();
                                     let (color, _bg) = theme::role_badge_color_for(&role);
                                     role_btns = role_btns.push(widgets::icon_tooltip_button(
-                                        theme::role_icon(&role).size(11).color(color),
+                                        theme::role_icon(&role).size(theme::TEXT_14).color(color),
                                         role.display_label(),
                                         Some(SettingsMessage::WorkspaceMsg(
                                             workspaces::WorkspacesMessage::ViewContext(
@@ -1894,14 +1902,16 @@ impl SettingsState {
                                         // Halve the default 10px horizontal
                                         // padding so adjacent role icons sit
                                         // closer; vertical stays at 5px.
-                                        [5.0, 5.0],
+                                        [theme::PAD_5, theme::PAD_5],
                                         theme::button_text,
                                         tooltip::Position::Top,
                                     ));
                                 }
                                 left = left.push(role_btns);
                                 left = left.push(widgets::icon_tooltip_button(
-                                    theme::general_context_icon().size(11).color(theme::ACCENT),
+                                    theme::general_context_icon()
+                                        .size(theme::TEXT_14)
+                                        .color(theme::ACCENT),
                                     "General context",
                                     Some(SettingsMessage::WorkspaceMsg(
                                         workspaces::WorkspacesMessage::ViewGeneralContext(
@@ -1914,7 +1924,7 @@ impl SettingsState {
                                 ));
                                 left = left.push(widgets::icon_tooltip_button(
                                     theme::diagnostics_icon()
-                                        .size(11)
+                                        .size(theme::TEXT_14)
                                         .color(theme::TEXT_PRIMARY),
                                     "Diagnostics commands",
                                     Some(SettingsMessage::WorkspaceMsg(
@@ -1927,7 +1937,7 @@ impl SettingsState {
                                     tooltip::Position::Top,
                                 ));
                                 left = left.push(widgets::icon_tooltip_button(
-                                    text("Notes").size(11).color(theme::TEXT_MUTED),
+                                    text("Notes").size(theme::TEXT_14).color(theme::TEXT_MUTED),
                                     "Custom context",
                                     Some(SettingsMessage::WorkspaceMsg(
                                         workspaces::WorkspacesMessage::ToggleNotes(
@@ -1944,25 +1954,33 @@ impl SettingsState {
                                     .align_y(Alignment::Center)
                             },
                             // Path column (FillPortion: 39)
-                            container(text(&ws_item.path).size(12).color(theme::TEXT_SECONDARY))
-                                .width(Length::FillPortion(39))
-                                .align_x(Alignment::Start)
-                                .align_y(Alignment::Center),
+                            container(
+                                text(&ws_item.path)
+                                    .size(theme::TEXT_12)
+                                    .color(theme::TEXT_SECONDARY)
+                            )
+                            .width(Length::FillPortion(39))
+                            .align_x(Alignment::Start)
+                            .align_y(Alignment::Center),
                         ]
                         .align_y(Alignment::Center),
                         {
                             // Second line: next maintenance time
                             if let Some(label) = super::workspaces::next_maintenance_label(ws_item)
                             {
-                                column![text(label).size(11).color(theme::TEXT_SECONDARY),]
+                                column![
+                                    text(label)
+                                        .size(theme::TEXT_11)
+                                        .color(theme::TEXT_SECONDARY),
+                                ]
                             } else {
                                 column![]
                             }
                         },
                     ]
-                    .spacing(4),
+                    .spacing(theme::SPACE_4),
                 )
-                .padding(8)
+                .padding(theme::PAD_8)
                 .style(theme::surface_card_style);
 
                 // Right-click context menu (Re-analyze / Delete). The card's
@@ -2004,7 +2022,7 @@ impl SettingsState {
                     );
                     rows = rows.push(
                         container(confirm)
-                            .padding([4, 8])
+                            .padding([theme::PAD_4, theme::PAD_8])
                             .style(theme::pill_style(theme::BG_ELEVATED)),
                     );
                 }
@@ -2030,7 +2048,7 @@ impl SettingsState {
                         )
                         .min_height(100.0)
                         .max_height(300.0)
-                        .padding(5.0);
+                        .padding(theme::PAD_5);
                     let editor: Element<'_, SettingsMessage> =
                         container(iced::Element::new(editor_widget).map(move |action| {
                             SettingsMessage::WorkspaceMsg(
@@ -2050,15 +2068,15 @@ impl SettingsState {
                     } else {
                         format!("{char_count}/{MAX_WORKSPACE_NOTES_CHARS}")
                     })
-                    .size(11)
+                    .size(theme::TEXT_11)
                     .color(if over_limit {
                         theme::STATUS_ERROR
                     } else {
                         theme::TEXT_SECONDARY
                     });
 
-                    let save_btn =
-                        button(text("Save Notes").size(12)).style(theme::button_secondary);
+                    let save_btn = button(text("Save Notes").size(theme::TEXT_12))
+                        .style(theme::button_secondary);
                     // Only enable Save when under the character limit
                     let save_btn = if over_limit {
                         save_btn
@@ -2068,7 +2086,7 @@ impl SettingsState {
                         ))
                     };
 
-                    let cancel_btn = button(text("Cancel").size(12))
+                    let cancel_btn = button(text("Cancel").size(theme::TEXT_12))
                         .style(theme::button_secondary)
                         .on_press(SettingsMessage::WorkspaceMsg(
                             workspaces::WorkspacesMessage::NotesCancel(ws_item.name.clone()),
@@ -2082,14 +2100,14 @@ impl SettingsState {
                                 char_counter,
                                 Space::new().width(Length::Fill),
                                 save_btn,
-                                Space::new().width(4),
+                                Space::new().width(theme::SPACE_4),
                                 cancel_btn,
                             ]
                             .align_y(Alignment::Center),
                         ]
-                        .spacing(4),
+                        .spacing(theme::SPACE_4),
                     )
-                    .padding([4, 8])
+                    .padding([theme::PAD_4, theme::PAD_8])
                     .style(theme::pill_style(theme::BG_ELEVATED));
 
                     rows = rows.push(notes_section);
@@ -2100,7 +2118,7 @@ impl SettingsState {
         // Inline "+" button in the section header
         let plus_btn = widgets::icon_tooltip_button(
             lucide::plus::<iced::Theme, iced::Renderer>()
-                .size(16)
+                .size(theme::TEXT_16)
                 .color(theme::ACCENT),
             "Add workspace",
             Some(SettingsMessage::ToggleAddWorkspaceModal),
@@ -2133,8 +2151,11 @@ impl SettingsState {
                     }
 
                     if items.is_empty() {
-                        view_col = view_col
-                            .push(text("Not yet discovered").size(13).color(theme::TEXT_MUTED));
+                        view_col = view_col.push(
+                            text("Not yet discovered")
+                                .size(theme::TEXT_13)
+                                .color(theme::TEXT_MUTED),
+                        );
                     } else {
                         let md: Element<'_, SettingsMessage> =
                             iced_selection::markdown::view(items, theme::markdown_settings()).map(
@@ -2146,7 +2167,7 @@ impl SettingsState {
                             );
                         view_col = view_col.push(
                             container(widgets::vscroll_sized(md, Length::Fill, Length::Shrink))
-                                .padding([4, 0])
+                                .padding([theme::PAD_4, 0.0])
                                 .height(Length::Fixed(300.0))
                                 .style(|_| {
                                     theme::container_style(theme::BG_BASE, 4.0, 1.0, theme::BORDER)
@@ -2158,7 +2179,7 @@ impl SettingsState {
                     view_col = view_col.push(
                         row![
                             Space::new().width(Length::Fill),
-                            button(text("Close").size(13))
+                            button(text("Close").size(theme::TEXT_13))
                                 .style(theme::button_secondary)
                                 .on_press(SettingsMessage::WorkspaceMsg(
                                     workspaces::WorkspacesMessage::Escape,
@@ -2166,17 +2187,17 @@ impl SettingsState {
                         ]
                         .align_y(Alignment::Center),
                     );
-                    view_col.spacing(4).into()
+                    view_col.spacing(theme::SPACE_4).into()
                 }
             };
 
             let view_container = container(
                 column![
-                    text(title).size(16).color(theme::TEXT_PRIMARY),
+                    text(title).size(theme::TEXT_16).color(theme::TEXT_PRIMARY),
                     Space::new().height(8),
                     body,
                 ]
-                .padding(16),
+                .padding(theme::PAD_16),
             )
             .width(Length::Fill)
             .style(theme::elevated_card_style);
@@ -2192,14 +2213,14 @@ impl SettingsState {
     fn users_section(&self, active_user: Option<&str>) -> Element<'_, SettingsMessage> {
         let us = &self.users_state;
 
-        let mut rows = Column::new().spacing(4);
+        let mut rows = Column::new().spacing(theme::SPACE_4);
 
         rows = widgets::push_error_banner(rows, us.load_state.error());
 
         if us.users.is_empty() {
             rows = rows.push(
                 text("No users configured. Add one below.")
-                    .size(12)
+                    .size(theme::TEXT_12)
                     .color(theme::TEXT_MUTED),
             );
         } else {
@@ -2211,7 +2232,7 @@ impl SettingsState {
                 let switch_icon: Element<'_, SettingsMessage> = if is_active {
                     container(
                         lucide::user_check::<iced::Theme, iced::Renderer>()
-                            .size(18)
+                            .size(theme::TEXT_18)
                             .color(theme::ACCENT),
                     )
                     .width(Length::Fixed(28.0))
@@ -2220,7 +2241,7 @@ impl SettingsState {
                 } else {
                     container(widgets::icon_tooltip_button(
                         lucide::log_in::<iced::Theme, iced::Renderer>()
-                            .size(18)
+                            .size(theme::TEXT_18)
                             .color(theme::TEXT_MUTED),
                         "Switch active user",
                         Some(SettingsMessage::UserMsg(users::UsersMessage::SwitchUser(
@@ -2241,10 +2262,10 @@ impl SettingsState {
                         // Inline binding input open
                         let mut row_elements: Vec<Element<'_, SettingsMessage>> = vec![
                             text("Telegram:")
-                                .size(12)
+                                .size(theme::TEXT_12)
                                 .color(theme::TEXT_SECONDARY)
                                 .into(),
-                            Space::new().width(8).into(),
+                            Space::new().width(theme::SPACE_8).into(),
                             widgets::single_line_editor(
                                 &us.bind_input.buffer,
                                 "@username",
@@ -2257,22 +2278,25 @@ impl SettingsState {
                                     ))
                                 },
                             ),
-                            Space::new().width(8).into(),
+                            Space::new().width(theme::SPACE_8).into(),
                         ];
                         row_elements.push(
-                            button(text(if us.binding { "Binding..." } else { "Bind" }).size(11))
-                                .style(theme::button_secondary)
-                                .on_press_maybe(if us.bind_input.text().trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(SettingsMessage::UserMsg(users::UsersMessage::SubmitBind(
-                                        user.name.clone(),
-                                    )))
-                                })
-                                .into(),
+                            button(
+                                text(if us.binding { "Binding..." } else { "Bind" })
+                                    .size(theme::TEXT_11),
+                            )
+                            .style(theme::button_secondary)
+                            .on_press_maybe(if us.bind_input.text().trim().is_empty() {
+                                None
+                            } else {
+                                Some(SettingsMessage::UserMsg(users::UsersMessage::SubmitBind(
+                                    user.name.clone(),
+                                )))
+                            })
+                            .into(),
                         );
                         row_elements.push(
-                            button(text("Cancel").size(11))
+                            button(text("Cancel").size(theme::TEXT_11))
                                 .style(theme::button_secondary)
                                 .on_press(SettingsMessage::UserMsg(
                                     users::UsersMessage::CloseBindInput,
@@ -2280,7 +2304,7 @@ impl SettingsState {
                                 .into(),
                         );
                         Row::with_children(row_elements)
-                            .spacing(4)
+                            .spacing(theme::SPACE_4)
                             .align_y(Alignment::Center)
                             .into()
                     } else if let Some(binding) = telegram_binding {
@@ -2288,23 +2312,27 @@ impl SettingsState {
                         let display = binding.identifier.as_str();
                         row![
                             lucide::link::<iced::Theme, iced::Renderer>()
-                                .size(11)
+                                .size(theme::TEXT_11)
                                 .color(theme::ACCENT),
-                            Space::new().width(6),
-                            text("Telegram:").size(12).color(theme::TEXT_SECONDARY),
-                            Space::new().width(6),
-                            text(display).size(12).color(theme::TEXT_SECONDARY),
-                            Space::new().width(4),
+                            Space::new().width(theme::SPACE_6),
+                            text("Telegram:")
+                                .size(theme::TEXT_12)
+                                .color(theme::TEXT_SECONDARY),
+                            Space::new().width(theme::SPACE_6),
+                            text(display)
+                                .size(theme::TEXT_12)
+                                .color(theme::TEXT_SECONDARY),
+                            Space::new().width(theme::SPACE_4),
                             if us.binding {
                                 let e: Element<'_, SettingsMessage> = text("Unbinding...")
-                                    .size(11)
+                                    .size(theme::TEXT_11)
                                     .color(theme::TEXT_MUTED)
                                     .into();
                                 e
                             } else {
                                 widgets::icon_tooltip_button(
                                     lucide::x::<iced::Theme, iced::Renderer>()
-                                        .size(11)
+                                        .size(theme::TEXT_11)
                                         .color(theme::TEXT_MUTED),
                                     "Unlink Telegram",
                                     Some(SettingsMessage::UserMsg(
@@ -2326,10 +2354,10 @@ impl SettingsState {
                         button(
                             row![
                                 lucide::link::<iced::Theme, iced::Renderer>()
-                                    .size(11)
+                                    .size(theme::TEXT_11)
                                     .color(theme::BG_BASE),
-                                Space::new().width(3),
-                                text("Bind Telegram").size(11),
+                                Space::new().width(theme::SPACE_3),
+                                text("Bind Telegram").size(theme::TEXT_11),
                             ]
                             .align_y(Alignment::Center),
                         )
@@ -2344,13 +2372,17 @@ impl SettingsState {
                     row![
                         // Name + permissions + Telegram (FillPortion: 40)
                         {
-                            let mut segment =
-                                row![text(&user.name).size(14).color(theme::TEXT_PRIMARY)]
-                                    .spacing(8)
-                                    .align_y(Alignment::Center);
+                            let mut segment = row![
+                                text(&user.name)
+                                    .size(theme::TEXT_14)
+                                    .color(theme::TEXT_PRIMARY)
+                            ]
+                            .spacing(theme::SPACE_8)
+                            .align_y(Alignment::Center);
                             if let Some(p) = user.permissions.as_deref().filter(|p| !p.is_empty()) {
-                                segment =
-                                    segment.push(text(p).size(12).color(theme::TEXT_SECONDARY));
+                                segment = segment.push(
+                                    text(p).size(theme::TEXT_12).color(theme::TEXT_SECONDARY),
+                                );
                             }
                             container(segment.push(telegram_elem))
                                 .width(Length::FillPortion(40))
@@ -2398,9 +2430,9 @@ impl SettingsState {
                                     )
                                     .style(theme::pick_list_style)
                                     .menu_style(theme::pick_list_menu_style)
-                                    .padding([4, 8])
+                                    .padding([theme::PAD_4, theme::PAD_8])
                                     .width(Length::Fixed(100.0)),
-                                    text("Active workspace").size(11),
+                                    text("Active workspace").size(theme::TEXT_11),
                                     tooltip::Position::Top,
                                 )
                                 .style(theme::tooltip_style),
@@ -2439,15 +2471,18 @@ impl SettingsState {
                                         })
                                         .style(theme::pick_list_style)
                                         .menu_style(theme::pick_list_menu_style)
-                                        .padding([4, 8])
+                                        .padding([theme::PAD_4, theme::PAD_8])
                                         .width(Length::Fixed(120.0)),
-                                        text("Active role").size(11),
+                                        text("Active role").size(theme::TEXT_11),
                                         tooltip::Position::Top,
                                     )
                                     .style(theme::tooltip_style)
                                     .into()
                                 }
-                                _ => text("none").size(12).color(theme::TEXT_SECONDARY).into(),
+                                _ => text("none")
+                                    .size(theme::TEXT_12)
+                                    .color(theme::TEXT_SECONDARY)
+                                    .into(),
                             };
                             container(role_picker)
                                 .width(Length::FillPortion(15))
@@ -2466,7 +2501,7 @@ impl SettingsState {
                     ]
                     .align_y(Alignment::Center),
                 )
-                .padding(8)
+                .padding(theme::PAD_8)
                 .style(theme::surface_card_style);
 
                 // Right-click context menu (Delete). The card's own controls
@@ -2496,7 +2531,7 @@ impl SettingsState {
         // Inline "+" button in the section header
         let plus_btn = widgets::icon_tooltip_button(
             lucide::plus::<iced::Theme, iced::Renderer>()
-                .size(16)
+                .size(theme::TEXT_16)
                 .color(theme::ACCENT),
             "Add user",
             Some(SettingsMessage::ToggleAddUserModal),
@@ -2609,7 +2644,9 @@ impl SettingsState {
             }],
             Some(
                 column![
-                    text("Default agent").size(12).color(theme::TEXT_SECONDARY),
+                    text("Default agent")
+                        .size(theme::TEXT_12)
+                        .color(theme::TEXT_SECONDARY),
                     pick_list(
                         vec![Role::Assistant, Role::Artist],
                         Some([Role::Assistant, Role::Artist][self.add_user_default]),
@@ -2620,7 +2657,7 @@ impl SettingsState {
                     )
                     .style(theme::pick_list_style)
                     .menu_style(theme::pick_list_menu_style)
-                    .padding([4, 8]),
+                    .padding([theme::PAD_4, theme::PAD_8]),
                     Space::new().height(8),
                 ]
                 .into(),
@@ -2652,7 +2689,7 @@ impl SettingsState {
         // the label-to-field mapping in two places.
         let labels = &crate::DiagnosticsCommands::COMMAND_LABELS;
 
-        let mut rows_col = Column::new().spacing(8);
+        let mut rows_col = Column::new().spacing(theme::SPACE_8);
 
         // Error banner
         if let Some(err) = error {
@@ -2663,7 +2700,7 @@ impl SettingsState {
             rows_col = rows_col.push(
                 row![
                     text(*label)
-                        .size(12)
+                        .size(theme::TEXT_12)
                         .color(theme::TEXT_SECONDARY)
                         .width(Length::Fixed(120.0))
                         .align_y(Alignment::Center),
@@ -2687,7 +2724,7 @@ impl SettingsState {
                         },
                     ),
                 ]
-                .spacing(8)
+                .spacing(theme::SPACE_8)
                 .align_y(Alignment::Center),
             );
         }
@@ -2699,10 +2736,10 @@ impl SettingsState {
             row![
                 button(row![
                     lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                        .size(12)
+                        .size(theme::TEXT_12)
                         .color(theme::TEXT_MUTED),
-                    Space::new().width(4),
-                    text("Re-discover").size(12),
+                    Space::new().width(theme::SPACE_4),
+                    text("Re-discover").size(theme::TEXT_12),
                 ])
                 .style(theme::button_text)
                 .on_press(SettingsMessage::WorkspaceMsg(
@@ -2711,7 +2748,7 @@ impl SettingsState {
                 Space::new().width(Length::Fill),
                 button(
                     text(if is_busy { "Working…" } else { "Save" })
-                        .size(12)
+                        .size(theme::TEXT_12)
                         .color(if is_busy {
                             theme::TEXT_MUTED
                         } else {
@@ -2726,8 +2763,8 @@ impl SettingsState {
                         workspaces::WorkspacesMessage::SaveDiagnostics(ws_name.clone()),
                     ))
                 }),
-                Space::new().width(8),
-                button(text("Cancel").size(12).color(theme::TEXT_MUTED))
+                Space::new().width(theme::SPACE_8),
+                button(text("Cancel").size(theme::TEXT_12).color(theme::TEXT_MUTED))
                     .style(theme::button_text)
                     .on_press(SettingsMessage::WorkspaceMsg(
                         workspaces::WorkspacesMessage::Escape,
@@ -2743,7 +2780,7 @@ impl SettingsState {
                 Space::new().height(16),
                 rows_col,
             ]
-            .spacing(8)
+            .spacing(theme::SPACE_8)
             .width(Length::Fill),
             620.0,
             24.0,
@@ -2868,7 +2905,7 @@ impl SettingsState {
             );
             if let Some(w) = self.endpoint_warning.as_ref() {
                 endpoint_row = column![endpoint_row, inline_warning(w, 188.0)]
-                    .spacing(2)
+                    .spacing(theme::SPACE_2)
                     .into();
             }
             rows.push(endpoint_row);
@@ -2884,7 +2921,10 @@ impl SettingsState {
             ));
         }
 
-        section("Provider", Column::with_children(rows).spacing(4))
+        section(
+            "Provider",
+            Column::with_children(rows).spacing(theme::SPACE_4),
+        )
     }
 
     fn models_section(&self) -> Element<'_, SettingsMessage> {
@@ -2934,7 +2974,7 @@ impl SettingsState {
                         .map(String::as_str),
                 ),
             ]
-            .spacing(4),
+            .spacing(theme::SPACE_4),
         )
     }
 
@@ -2966,25 +3006,25 @@ impl SettingsState {
         // ── Row 1: Transcription (toggle + inline status + Retry) ──
         let transcription_status: Element<'_, SettingsMessage> = if !transcription_enabled {
             Text::new("Disabled")
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::TEXT_SECONDARY)
                 .into()
         } else if crate::audio::local_transcriber::is_loaded() {
-            Text::new("Ready").size(13).into()
+            Text::new("Ready").size(theme::TEXT_13).into()
         } else if crate::audio::local_transcriber::is_failed() {
-            let retry_btn = button(Text::new("   Retry   ").size(13))
+            let retry_btn = button(Text::new("   Retry   ").size(theme::TEXT_13))
                 .on_press(SettingsMessage::RetryTranscription)
                 .style(theme::button_danger)
-                .padding(4);
+                .padding(theme::PAD_4);
             row![
-                Text::new("Download failed").size(14),
-                Space::new().width(8),
+                Text::new("Download failed").size(theme::TEXT_14),
+                Space::new().width(theme::SPACE_8),
                 retry_btn,
             ]
             .align_y(Alignment::Center)
             .into()
         } else {
-            Text::new("Downloading…").size(13).into()
+            Text::new("Downloading…").size(theme::TEXT_13).into()
         };
         let transcription_row = field_row(
             "Transcription",
@@ -2992,7 +3032,7 @@ impl SettingsState {
                 toggler(transcription_enabled)
                     .on_toggle(SettingsMessage::TranscriptionToggle)
                     .style(theme::toggler_style),
-                Space::new().width(12),
+                Space::new().width(theme::SPACE_12),
                 transcription_status,
             ]
             .align_y(Alignment::Center)
@@ -3006,51 +3046,61 @@ impl SettingsState {
         // model error …) is current after each coalesced event.
         let wake_status: Element<'_, SettingsMessage> = match status.clone() {
             crate::audio::voice::VoiceStatus::Disabled => Text::new("Disabled")
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::TEXT_SECONDARY)
                 .into(),
             crate::audio::voice::VoiceStatus::LoadingModels => {
-                Text::new("Loading models…").size(13).into()
+                Text::new("Loading models…").size(theme::TEXT_13).into()
             }
             crate::audio::voice::VoiceStatus::ModelError => {
-                let retry_btn = button(Text::new("   Retry   ").size(13))
+                let retry_btn = button(Text::new("   Retry   ").size(theme::TEXT_13))
                     .on_press(SettingsMessage::RetryVoiceModels)
                     .style(theme::button_danger)
-                    .padding(4);
+                    .padding(theme::PAD_4);
                 row![
-                    Text::new("Model error").size(14),
-                    Space::new().width(8),
+                    Text::new("Model error").size(theme::TEXT_14),
+                    Space::new().width(theme::SPACE_8),
                     retry_btn,
                 ]
                 .align_y(Alignment::Center)
                 .into()
             }
-            crate::audio::voice::VoiceStatus::Listening => {
-                Text::new("Listening for wake word").size(13).into()
-            }
+            crate::audio::voice::VoiceStatus::Listening => Text::new("Listening for wake word")
+                .size(theme::TEXT_13)
+                .into(),
             crate::audio::voice::VoiceStatus::Recording => {
-                Text::new("Recording command").size(13).into()
+                Text::new("Recording command").size(theme::TEXT_13).into()
             }
             crate::audio::voice::VoiceStatus::RecordingManual => {
-                Text::new("Recording voice message").size(13).into()
+                Text::new("Recording voice message")
+                    .size(theme::TEXT_13)
+                    .into()
             }
             crate::audio::voice::VoiceStatus::Transcribing => {
-                Text::new("Transcribing…").size(13).into()
+                Text::new("Transcribing…").size(theme::TEXT_13).into()
             }
             crate::audio::voice::VoiceStatus::MicPermissionDenied => {
-                Text::new("Microphone permission denied").size(13).into()
+                Text::new("Microphone permission denied")
+                    .size(theme::TEXT_13)
+                    .into()
             }
             crate::audio::voice::VoiceStatus::MicDisconnected => {
-                Text::new("Microphone disconnected").size(13).into()
+                Text::new("Microphone disconnected")
+                    .size(theme::TEXT_13)
+                    .into()
             }
             crate::audio::voice::VoiceStatus::Enrolling { .. }
             | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
             | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
             | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. } => {
-                Text::new("Enrolling…").size(13).into()
+                Text::new("Enrolling…").size(theme::TEXT_13).into()
             }
-            crate::audio::voice::VoiceStatus::Enrolled => Text::new("Enrolled").size(13).into(),
-            crate::audio::voice::VoiceStatus::Error(msg) => Text::new(msg).size(13).into(),
+            crate::audio::voice::VoiceStatus::Enrolled => {
+                Text::new("Enrolled").size(theme::TEXT_13).into()
+            }
+            crate::audio::voice::VoiceStatus::Error(msg) => {
+                Text::new(msg).size(theme::TEXT_13).into()
+            }
         };
         // Gated: wake word can only be enabled while Transcription is ON (they
         // share the loaded ASR model). Turning Transcription OFF cascades it off.
@@ -3064,7 +3114,7 @@ impl SettingsState {
                         None
                     })
                     .style(theme::toggler_style),
-                Space::new().width(12),
+                Space::new().width(theme::SPACE_12),
                 wake_status,
             ]
             .align_y(Alignment::Center)
@@ -3083,32 +3133,32 @@ impl SettingsState {
         let audio_ok = crate::audio::tts::audio_output_ready();
         let tts_status: Element<'_, SettingsMessage> = if !tts_enabled {
             Text::new("Disabled")
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::TEXT_SECONDARY)
                 .into()
         } else if tts_ready {
             if audio_ok {
-                Text::new("Ready").size(13).into()
+                Text::new("Ready").size(theme::TEXT_13).into()
             } else {
                 Text::new("No audio output device")
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .color(theme::STATUS_ERROR)
                     .into()
             }
         } else if tts_failed {
-            let retry_btn = button(Text::new("   Retry   ").size(13))
+            let retry_btn = button(Text::new("   Retry   ").size(theme::TEXT_13))
                 .on_press(SettingsMessage::TtsRetryModels)
                 .style(theme::button_danger)
-                .padding(4);
+                .padding(theme::PAD_4);
             row![
-                Text::new("Model download failed").size(14),
-                Space::new().width(8),
+                Text::new("Model download failed").size(theme::TEXT_14),
+                Space::new().width(theme::SPACE_8),
                 retry_btn,
             ]
             .align_y(Alignment::Center)
             .into()
         } else {
-            Text::new("Downloading models…").size(13).into()
+            Text::new("Downloading models…").size(theme::TEXT_13).into()
         };
         let tts_row = field_row(
             "Text to Speech",
@@ -3116,7 +3166,7 @@ impl SettingsState {
                 toggler(tts_enabled)
                     .on_toggle(SettingsMessage::TtsToggle)
                     .style(theme::toggler_style),
-                Space::new().width(12),
+                Space::new().width(theme::SPACE_12),
                 tts_status,
             ]
             .align_y(Alignment::Center)
@@ -3129,14 +3179,18 @@ impl SettingsState {
         // is on and transcription allows it — the push site below applies the
         // same guard, so the row collapses to nothing when either is off).
         let wake_word_row = if let Some(phrase) = crate::audio::voice::get_enrolled_phrase() {
-            field_row("Wake Word", Text::new(phrase).size(13).into(), None)
+            field_row(
+                "Wake Word",
+                Text::new(phrase).size(theme::TEXT_13).into(),
+                None,
+            )
         } else if has_enrollment {
             // V2 enrollment present but phrase unavailable (shouldn't
             // happen) — surface it so the user can re-enroll.
             field_row(
                 "Wake Word",
                 Text::new("Enrollment found — re-enroll to replace it")
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .into(),
                 None,
             )
@@ -3144,7 +3198,7 @@ impl SettingsState {
             field_row(
                 "Wake Word",
                 Text::new("Enroll a wake word to get started")
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .into(),
                 None,
             )
@@ -3167,10 +3221,10 @@ impl SettingsState {
 
         let enroll_btn: Element<'_, SettingsMessage> = if voice_enabled && transcription_enabled {
             container(
-                button(Text::new("Enroll Wake Word").size(13))
+                button(Text::new("Enroll Wake Word").size(theme::TEXT_13))
                     .on_press(SettingsMessage::StartVoiceEnrollment)
                     .style(theme::button_secondary)
-                    .padding(6),
+                    .padding(theme::PAD_6),
             )
             .into()
         } else {
@@ -3252,16 +3306,16 @@ impl SettingsState {
                 }
 
                 let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(13))
+                    button(Text::new("Cancel").size(theme::TEXT_13))
                         .on_press(SettingsMessage::CancelVoiceEnrollment)
                         .style(theme::button_danger)
-                        .padding(6),
+                        .padding(theme::PAD_6),
                 )
                 .into();
                 Some(
                     Column::new()
                         .push(Space::new().height(8))
-                        .push(Text::new(lines.join("\n")).size(13))
+                        .push(Text::new(lines.join("\n")).size(theme::TEXT_13))
                         .push(Space::new().height(8))
                         .push(cancel_btn)
                         .into(),
@@ -3269,16 +3323,16 @@ impl SettingsState {
             }
             crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
                 let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(13))
+                    button(Text::new("Cancel").size(theme::TEXT_13))
                         .on_press(SettingsMessage::CancelVoiceEnrollment)
                         .style(theme::button_danger)
-                        .padding(6),
+                        .padding(theme::PAD_6),
                 )
                 .into();
                 Some(
                     Column::new()
                         .push(Space::new().height(8))
-                        .push(Text::new("Listening…").size(13))
+                        .push(Text::new("Listening…").size(theme::TEXT_13))
                         .push(Space::new().height(8))
                         .push(cancel_btn)
                         .into(),
@@ -3286,16 +3340,16 @@ impl SettingsState {
             }
             crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
                 let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(13))
+                    button(Text::new("Cancel").size(theme::TEXT_13))
                         .on_press(SettingsMessage::CancelVoiceEnrollment)
                         .style(theme::button_danger)
-                        .padding(6),
+                        .padding(theme::PAD_6),
                 )
                 .into();
                 Some(
                     Column::new()
                         .push(Space::new().height(8))
-                        .push(Text::new("Keep silent to confirm…").size(13))
+                        .push(Text::new("Keep silent to confirm…").size(theme::TEXT_13))
                         .push(Space::new().height(8))
                         .push(cancel_btn)
                         .into(),
@@ -3310,10 +3364,10 @@ impl SettingsState {
                     .checked_div(target_secs)
                     .unwrap_or(0);
                 let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(13))
+                    button(Text::new("Cancel").size(theme::TEXT_13))
                         .on_press(SettingsMessage::CancelVoiceEnrollment)
                         .style(theme::button_danger)
-                        .padding(6),
+                        .padding(theme::PAD_6),
                 )
                 .into();
                 Some(
@@ -3324,7 +3378,7 @@ impl SettingsState {
                                 "Collecting negative samples… {accumulated_secs}s/{target_secs}s \
                                  ({pct}%) elapsed {wall_clock_elapsed}s"
                             ))
-                            .size(13),
+                            .size(theme::TEXT_13),
                         )
                         .push(Space::new().height(8))
                         .push(cancel_btn)
@@ -3371,7 +3425,7 @@ impl SettingsState {
                 value,
             }
         })
-        .text_size(13)
+        .text_size(theme::TEXT_13)
         .style(theme::pick_list_style)
         .menu_style(theme::pick_list_menu_style)
         .width(Length::Fixed(180.0));
@@ -3428,13 +3482,13 @@ impl SettingsState {
         };
         row![
             text(format!("MahBot v{}", crate::self_update::VERSION))
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::TEXT_FAINT),
             text(format!("Install mode: {mode_label}"))
-                .size(11)
+                .size(theme::TEXT_11)
                 .color(theme::TEXT_FAINT)
         ]
-        .spacing(8.0)
+        .spacing(theme::SPACE_8)
         .align_y(Alignment::Center)
         .into()
     }
@@ -3453,7 +3507,7 @@ impl SettingsState {
                 text(
                     "Provider routing only applies to OpenRouter — the custom endpoint ignores it.",
                 )
-                .size(10)
+                .size(theme::TEXT_10)
                 .color(theme::STATUS_WARNING)
                 .into(),
             );
@@ -3507,14 +3561,16 @@ impl SettingsState {
                 // Model name label (read-only)
                 text(display_name)
                     .font(theme::JETBRAINS_MONO)
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .color(theme::TEXT_SECONDARY),
                 order_input,
             ]
-            .spacing(2);
+            .spacing(theme::SPACE_2);
 
             rows.push(if let Some(err) = order_error {
-                column![row, inline_error(err, 0.0)].spacing(2).into()
+                column![row, inline_error(err, 0.0)]
+                    .spacing(theme::SPACE_2)
+                    .into()
             } else {
                 row.into()
             });
@@ -3559,9 +3615,13 @@ fn section_impl<'a>(
         None => styled_title.into(),
     };
 
-    column![header, Space::new().height(4), content.spacing(4)]
-        .spacing(2)
-        .into()
+    column![
+        header,
+        Space::new().height(4),
+        content.spacing(theme::SPACE_4)
+    ]
+    .spacing(theme::SPACE_2)
+    .into()
 }
 
 /// Label on the left, input on the right, optional hint below.
@@ -3576,7 +3636,7 @@ fn field_row<'a>(
 /// The inline error label rendered under a control: small, error-colored,
 /// indented `left_pad` px to align with the input column.
 fn inline_error(err: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
-    container(text(err).size(10).color(theme::STATUS_ERROR))
+    container(text(err).size(theme::TEXT_10).color(theme::STATUS_ERROR))
         .padding(iced::Padding::default().left(left_pad))
         .into()
 }
@@ -3585,7 +3645,7 @@ fn inline_error(err: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
 /// indented `left_pad` px to align with the input column. Non-fatal — the
 /// value was still saved (e.g. an unreachable custom endpoint).
 fn inline_warning(msg: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
-    container(text(msg).size(10).color(theme::STATUS_WARNING))
+    container(text(msg).size(theme::TEXT_10).color(theme::STATUS_WARNING))
         .padding(iced::Padding::default().left(left_pad))
         .into()
 }
@@ -3599,21 +3659,21 @@ fn field_row_with_error<'a>(
     error: Option<&'a str>,
 ) -> Element<'a, SettingsMessage> {
     let mut row_widget = row![
-        text(label).size(13).width(Length::Fixed(180.0)),
-        Space::new().width(8),
+        text(label).size(theme::TEXT_13).width(Length::Fixed(180.0)),
+        Space::new().width(theme::SPACE_8),
         input,
     ]
     .align_y(Alignment::Center);
 
     if let Some(h) = hint {
-        row_widget = row_widget.push(Space::new().width(8));
-        row_widget = row_widget.push(text(h).size(10).color(theme::TEXT_SECONDARY));
+        row_widget = row_widget.push(Space::new().width(theme::SPACE_8));
+        row_widget = row_widget.push(text(h).size(theme::TEXT_10).color(theme::TEXT_SECONDARY));
     }
 
     let row_elem: Element<'a, SettingsMessage> = row_widget.into();
     if let Some(err) = error {
         column![row_elem, inline_error(err, 188.0),]
-            .spacing(2)
+            .spacing(theme::SPACE_2)
             .into()
     } else {
         row_elem
@@ -3627,13 +3687,15 @@ fn delete_confirm_button<'a>(
     on_cancel: SettingsMessage,
 ) -> Element<'a, SettingsMessage> {
     row![
-        text("Delete?").size(12).color(theme::STATUS_ERROR),
-        Space::new().width(4),
-        button(text("Yes").size(11).color(theme::STATUS_ERROR))
+        text("Delete?")
+            .size(theme::TEXT_12)
+            .color(theme::STATUS_ERROR),
+        Space::new().width(theme::SPACE_4),
+        button(text("Yes").size(theme::TEXT_11).color(theme::STATUS_ERROR))
             .style(theme::button_danger)
             .on_press(on_confirm),
-        Space::new().width(4),
-        button(text("No").size(11))
+        Space::new().width(theme::SPACE_4),
+        button(text("No").size(theme::TEXT_11))
             .style(theme::button_secondary)
             .on_press(on_cancel),
     ]
@@ -3740,11 +3802,11 @@ fn modal_dialog<'a>(
     col = col.push(
         row![
             Space::new().width(Length::Fill),
-            button(text("Cancel").size(13))
+            button(text("Cancel").size(theme::TEXT_13))
                 .style(theme::button_secondary)
                 .on_press(on_cancel),
-            Space::new().width(8),
-            button(text(if adding { "Adding..." } else { submit_label }).size(13))
+            Space::new().width(theme::SPACE_8),
+            button(text(if adding { "Adding..." } else { submit_label }).size(theme::TEXT_13))
                 .style(theme::button_secondary)
                 .on_press_maybe(if adding || !submit_enabled {
                     None

@@ -424,9 +424,12 @@ impl LogsState {
         } else {
             theme::TEXT_FAINT
         };
-        let b = button(container(text(label.to_string()).size(13).color(color)).padding([6, 14]))
-            .style(theme::button_text)
-            .on_press(LogMessage::TabSelected(tab));
+        let b = button(
+            container(text(label.to_string()).size(theme::TEXT_13).color(color))
+                .padding([theme::PAD_6, theme::PAD_14]),
+        )
+        .style(theme::button_text)
+        .on_press(LogMessage::TabSelected(tab));
         if is_active {
             container(b).style(theme::container_bar).into()
         } else {
@@ -442,7 +445,7 @@ impl LogsState {
 
         let tab_bar = container(
             row![all_logs_btn, issues_btn, tf_btn]
-                .spacing(2)
+                .spacing(theme::SPACE_2)
                 .align_y(Alignment::Center),
         )
         .width(Length::Fill)
@@ -504,21 +507,21 @@ impl LogsState {
         container(
             row![
                 lucide::triangle_alert::<iced::Theme, iced::Renderer>()
-                    .size(14)
+                    .size(theme::TEXT_14)
                     .color(theme::STATUS_WARNING),
-                Space::new().width(6),
+                Space::new().width(theme::SPACE_6),
                 text(format!(
                     "Log store write failures: {} — durable log persistence is degraded{last}. \
                      Latest error: {detail}{stopped}",
                     info.count
                 ))
-                .size(12)
+                .size(theme::TEXT_12)
                 .color(theme::TEXT_SECONDARY),
             ]
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding([4, 8])
+        .padding([theme::PAD_4, theme::PAD_8])
         .style(|_| {
             theme::container_style(iced::Color::TRANSPARENT, 4.0, 1.0, theme::STATUS_WARNING)
         })
@@ -543,14 +546,14 @@ impl LogsState {
         let pagination_cluster: Element<'_, LogMessage> = if total_pages == 0 {
             Space::new().width(0).into()
         } else {
-            let prev_button = button(text("← Prev").size(12))
+            let prev_button = button(text("← Prev").size(theme::TEXT_12))
                 .style(theme::button_text)
                 .on_press_maybe(if page > 0 {
                     Some(LogMessage::PrevPage)
                 } else {
                     None
                 });
-            let next_button = button(text("Next →").size(12))
+            let next_button = button(text("Next →").size(theme::TEXT_12))
                 .style(theme::button_text)
                 .on_press_maybe(if page + 1 < total_pages {
                     Some(LogMessage::NextPage)
@@ -559,11 +562,11 @@ impl LogsState {
                 });
             row![
                 prev_button,
-                Space::new().width(8),
+                Space::new().width(theme::SPACE_8),
                 text(format!("Page {} of {}", page + 1, total_pages))
-                    .size(12)
+                    .size(theme::TEXT_12)
                     .color(theme::TEXT_SECONDARY),
-                Space::new().width(8),
+                Space::new().width(theme::SPACE_8),
                 next_button,
             ]
             .align_y(Alignment::Center)
@@ -579,7 +582,7 @@ impl LogsState {
                 Some(iced::widget::Id::new("logs_search")),
                 LogMessage::SearchInput,
             ))
-            .padding(2)
+            .padding(theme::PAD_2)
             .style(|_| theme::container_style(iced::Color::TRANSPARENT, 4.0, 1.0, theme::ACCENT))
             .into()
         } else {
@@ -595,9 +598,9 @@ impl LogsState {
 
         let search_group = row![
             lucide::search::<iced::Theme, iced::Renderer>()
-                .size(12)
+                .size(theme::TEXT_12)
                 .color(theme::TEXT_MUTED),
-            Space::new().width(4),
+            Space::new().width(theme::SPACE_4),
             search_input,
         ]
         .align_y(Alignment::Center);
@@ -605,12 +608,12 @@ impl LogsState {
         let pause_button = {
             let pause_btn: iced::Element<'_, LogMessage> = if self.paused {
                 lucide::play::<iced::Theme, iced::Renderer>()
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .color(theme::TEXT_MUTED)
                     .into()
             } else {
                 lucide::pause::<iced::Theme, iced::Renderer>()
-                    .size(13)
+                    .size(theme::TEXT_13)
                     .color(theme::TEXT_MUTED)
                     .into()
             };
@@ -627,7 +630,7 @@ impl LogsState {
 
         let bottom_row = row![
             pause_button,
-            Space::new().width(12),
+            Space::new().width(theme::SPACE_12),
             pagination_cluster,
             Space::new().width(Length::Fill),
             search_group,
@@ -637,7 +640,7 @@ impl LogsState {
 
         container(bottom_row)
             .width(Length::Fill)
-            .padding([8, 24])
+            .padding([theme::PAD_8, theme::PAD_24])
             .style(theme::surface_container_style)
             .into()
     }
@@ -704,7 +707,7 @@ impl LogsState {
                             })
                             .collect::<Vec<_>>(),
                     )
-                    .spacing(2),
+                    .spacing(theme::SPACE_2),
                 );
 
                 // Stick to bottom when not paused (latest entries at top, but we
@@ -720,7 +723,7 @@ impl LogsState {
         let base = container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(24)
+            .padding(theme::PAGE_PADDING)
             .style(theme::base_container_style);
 
         base.into()
@@ -733,47 +736,47 @@ impl LogsState {
         // copied in a single drag. Pills are emulated with span highlights.
         let mut spans: Vec<Span<'_, (), iced::Font>> = vec![
             Span::new(theme::format_hhmmss(&entry.timestamp))
-                .size(10)
+                .size(theme::TEXT_10)
                 .color(theme::TEXT_MUTED),
-            Span::new("  ").size(10),
+            Span::new("  ").size(theme::TEXT_10),
             Span::new(&entry.level)
-                .size(10)
+                .size(theme::TEXT_10)
                 .color(level_color)
                 .background(level_bg)
                 .border(iced::border::rounded(4))
-                .padding([1, 6]),
-            Span::new("  ").size(10),
+                .padding([theme::PAD_1, theme::PAD_6]),
+            Span::new("  ").size(theme::TEXT_10),
         ];
         if !entry.agent_role.is_empty() {
             let (role_color, role_bg) = theme::role_badge_color(&entry.agent_role);
             spans.push(
                 Span::new(&entry.agent_role)
-                    .size(10)
+                    .size(theme::TEXT_10)
                     .color(role_color)
                     .background(role_bg)
                     .border(iced::border::rounded(4))
-                    .padding([1, 6]),
+                    .padding([theme::PAD_1, theme::PAD_6]),
             );
-            spans.push(Span::new("  ").size(10));
+            spans.push(Span::new("  ").size(theme::TEXT_10));
         }
         spans.push(
             Span::new(&entry.target)
-                .size(11)
+                .size(theme::TEXT_11)
                 .color(theme::TEXT_SECONDARY),
         );
         if !entry.workspace.is_empty() {
-            spans.push(Span::new("  ").size(10));
+            spans.push(Span::new("  ").size(theme::TEXT_10));
             spans.push(
                 Span::new(&entry.workspace)
-                    .size(10)
+                    .size(theme::TEXT_10)
                     .color(theme::TEXT_MUTED),
             );
         }
 
-        spans.push(Span::new("\n").size(10));
+        spans.push(Span::new("\n").size(theme::TEXT_10));
         spans.push(
             Span::new(&entry.message)
-                .size(13)
+                .size(theme::TEXT_13)
                 .color(theme::TEXT_PRIMARY)
                 .font(super::JETBRAINS_MONO),
         );
@@ -789,10 +792,10 @@ impl LogsState {
                 // value stays queryable in the log store and is copied in
                 // full via the row's "Copy" context menu.
                 let val_str = crate::util::truncate(&field_value_str(value), 200);
-                spans.push(Span::new("\n").size(10));
+                spans.push(Span::new("\n").size(theme::TEXT_10));
                 spans.push(
                     Span::new(format!("{key}: {val_str}"))
-                        .size(10)
+                        .size(theme::TEXT_10)
                         .color(theme::TEXT_SECONDARY),
                 );
             }
@@ -809,7 +812,7 @@ impl LogsState {
         if fade_progress < 1.0 {
             // Fade-in: interpolate background/border alpha from 0.6 → 1.0
             container(rich)
-                .padding(6)
+                .padding(theme::PAD_6)
                 .style(move |_theme: &iced::Theme| container::Style {
                     background: Some(iced::Background::Color(iced::Color::from_rgba(
                         theme::BG_SURFACE.r,
@@ -832,7 +835,7 @@ impl LogsState {
                 .into()
         } else {
             container(rich)
-                .padding(6)
+                .padding(theme::PAD_6)
                 .style(theme::surface_card_style)
                 .into()
         }

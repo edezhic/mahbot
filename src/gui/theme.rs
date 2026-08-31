@@ -265,17 +265,60 @@ pub const FONT_ITALIC: iced::Font = iced::Font {
     ..iced::Font::DEFAULT
 };
 
+// ── Typography scale (px) ────────────────────────────────────────
+// f32 is the only type iced 0.14 accepts for both `Into<Pixels>`
+// (.size/.spacing) and `Into<Padding>` (.padding), so the whole scale is f32.
+// Deliberately shared beyond body text: lucide/role icons and the
+// editor/diff buffer font (font_metrics) sit on the same rungs, so a
+// change here moves those too.
+pub const TEXT_10: f32 = 10.0;
+pub const TEXT_11: f32 = 11.0;
+pub const TEXT_12: f32 = 12.0;
+pub const TEXT_13: f32 = 13.0;
+pub const TEXT_14: f32 = 14.0;
+pub const TEXT_16: f32 = 16.0;
+pub const TEXT_18: f32 = 18.0;
+pub const TEXT_24: f32 = 24.0;
+
+// ── De-facto 2px spacing grid (px) ───────────────────────────────
+pub const SPACE_1: f32 = 1.0;
+pub const SPACE_2: f32 = 2.0;
+pub const SPACE_3: f32 = 3.0;
+pub const SPACE_4: f32 = 4.0;
+pub const SPACE_6: f32 = 6.0;
+pub const SPACE_8: f32 = 8.0;
+pub const SPACE_10: f32 = 10.0;
+pub const SPACE_12: f32 = 12.0;
+pub const SPACE_16: f32 = 16.0;
+pub const SPACE_20: f32 = 20.0;
+
+pub const PAD_1: f32 = 1.0;
+pub const PAD_2: f32 = 2.0;
+pub const PAD_3: f32 = 3.0;
+pub const PAD_4: f32 = 4.0;
+pub const PAD_5: f32 = 5.0;
+pub const PAD_6: f32 = 6.0;
+pub const PAD_8: f32 = 8.0;
+pub const PAD_10: f32 = 10.0;
+pub const PAD_12: f32 = 12.0;
+pub const PAD_14: f32 = 14.0;
+pub const PAD_16: f32 = 16.0;
+pub const PAD_18: f32 = 18.0;
+pub const PAD_24: f32 = 24.0;
+/// Page-level base-container padding (the de-facto 24px inset shared by every page).
+pub const PAGE_PADDING: f32 = PAD_24;
+
 /// Body text size (px) of the transcript markdown renderer
 /// (`markdown_settings`). The sessions-page collapse measurement measures
 /// body elements at this size (narration at [`NARRATION_TEXT_SIZE`]), so a
 /// theme font-size change cannot silently drift the measured wrap count away
 /// from the actual render.
-pub const MARKDOWN_TEXT_SIZE: f32 = 13.0;
+pub const MARKDOWN_TEXT_SIZE: f32 = TEXT_13;
 
 /// Narration text size (px) — the italic narration line on Running Agents
 /// cards and the narration body on the Sessions transcript. The
 /// sessions-page collapse measurement measures narration at this size.
-pub const NARRATION_TEXT_SIZE: f32 = 14.0;
+pub const NARRATION_TEXT_SIZE: f32 = TEXT_14;
 
 /// Markdown rendering settings consistent with the Flexoki dark theme.
 #[must_use]

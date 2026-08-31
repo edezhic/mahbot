@@ -753,28 +753,34 @@ impl GitState {
             .iter()
             .map(|branch| {
                 let b = (*branch).clone();
-                button(text(b.clone()).size(14).color(theme::TEXT_PRIMARY))
-                    .padding([6, 4])
-                    .width(Length::Fill)
-                    .style(theme::button_text)
-                    .on_press_maybe(if self.syncing {
-                        None
-                    } else {
-                        Some(GitMessage::Switch(b))
-                    })
-                    .into()
+                button(
+                    text(b.clone())
+                        .size(theme::TEXT_14)
+                        .color(theme::TEXT_PRIMARY),
+                )
+                .padding([theme::PAD_6, theme::PAD_4])
+                .width(Length::Fill)
+                .style(theme::button_text)
+                .on_press_maybe(if self.syncing {
+                    None
+                } else {
+                    Some(GitMessage::Switch(b))
+                })
+                .into()
             })
             .collect();
 
         let list = super::widgets::vscroll_sized(
-            Column::with_children(branch_items).spacing(2),
+            Column::with_children(branch_items).spacing(theme::SPACE_2),
             Length::Fill,
             Length::Fixed(300.0),
         );
 
         // Error display — inset to align with the vscroll-wrapped branch list.
         let error_elem: Element<'_, GitMessage> = if let Some(ref err) = self.branch_error {
-            super::widgets::scroll_h_inset(text(err).size(12).color(theme::STATUS_ERROR))
+            super::widgets::scroll_h_inset(
+                text(err).size(theme::TEXT_12).color(theme::STATUS_ERROR),
+            )
         } else {
             container(text("")).into()
         };
@@ -792,14 +798,18 @@ impl GitState {
             },
         );
 
-        let create_btn = button(text("Create & Switch").size(14).color(theme::TEXT_PRIMARY))
-            .padding([6, 12])
-            .style(theme::button_secondary)
-            .on_press_maybe(if self.syncing {
-                None
-            } else {
-                Some(GitMessage::Create)
-            });
+        let create_btn = button(
+            text("Create & Switch")
+                .size(theme::TEXT_14)
+                .color(theme::TEXT_PRIMARY),
+        )
+        .padding([theme::PAD_6, theme::PAD_12])
+        .style(theme::button_secondary)
+        .on_press_maybe(if self.syncing {
+            None
+        } else {
+            Some(GitMessage::Create)
+        });
 
         column![
             widgets::section_heading("Branches"),
@@ -810,7 +820,7 @@ impl GitState {
             error_elem,
             Space::new().height(8),
             row![create_input, create_btn]
-                .spacing(8)
+                .spacing(theme::SPACE_8)
                 .align_y(Alignment::Center),
         ]
         .spacing(0)

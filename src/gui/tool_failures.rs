@@ -161,7 +161,7 @@ impl ToolFailuresState {
                             .map(Self::render_error_row)
                             .collect::<Vec<_>>(),
                     )
-                    .spacing(2),
+                    .spacing(theme::SPACE_2),
                 )
             };
 
@@ -171,7 +171,7 @@ impl ToolFailuresState {
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(24)
+            .padding(theme::PAGE_PADDING)
             .style(theme::base_container_style)
             .into()
     }
@@ -188,32 +188,34 @@ impl ToolFailuresState {
         let duration_label = format!("{}ms", entry.duration_ms);
 
         row![
-            text(timestamp).size(10).color(theme::TEXT_SECONDARY),
-            Space::new().width(8),
+            text(timestamp)
+                .size(theme::TEXT_10)
+                .color(theme::TEXT_SECONDARY),
+            Space::new().width(theme::SPACE_8),
             widgets::badge_pill(
                 entry.tool_name.clone(),
                 (theme::TEXT_SECONDARY, theme::HOVER),
-                10,
-                [1, 6],
+                widgets::PILL_COMPACT,
             ),
-            Space::new().width(4),
+            Space::new().width(theme::SPACE_4),
             widgets::badge_pill(
                 duration_label,
                 (theme::TEXT_SECONDARY, theme::HOVER),
-                10,
-                [1, 6]
+                widgets::PILL_COMPACT,
             ),
-            Space::new().width(4),
-            widgets::badge_pill(entry.role.clone(), role_colors, 10, [1, 6]),
+            Space::new().width(theme::SPACE_4),
+            widgets::badge_pill(entry.role.clone(), role_colors, widgets::PILL_COMPACT),
             Space::new().width(Length::Fill),
             if !entry.workspace.is_empty() {
-                text(&entry.workspace).size(10).color(theme::TEXT_SECONDARY)
+                text(&entry.workspace)
+                    .size(theme::TEXT_10)
+                    .color(theme::TEXT_SECONDARY)
             } else {
                 text("")
             },
         ]
         .align_y(Alignment::Center)
-        .spacing(2)
+        .spacing(theme::SPACE_2)
     }
 
     /// Compute an optional arguments preview string, truncated to 200 chars.
@@ -241,7 +243,7 @@ impl ToolFailuresState {
             if let Some(ref preview) = args_preview {
                 iced::Element::new(
                     selectable_text(preview.clone(), theme::TEXT_MUTED)
-                        .size(11)
+                        .size(theme::TEXT_11)
                         .font(super::JETBRAINS_MONO)
                         .width(Length::Fill),
                 )
@@ -255,7 +257,7 @@ impl ToolFailuresState {
                 }
                 parts = parts.push(
                     selectable_text(&entry.error_message, theme::TEXT_PRIMARY)
-                        .size(13)
+                        .size(theme::TEXT_13)
                         .font(super::JETBRAINS_MONO)
                         .width(Length::Fill),
                 );
@@ -267,7 +269,7 @@ impl ToolFailuresState {
         .spacing(0);
 
         container(row_content)
-            .padding(6)
+            .padding(theme::PAD_6)
             .style(theme::surface_card_style)
             .into()
     }

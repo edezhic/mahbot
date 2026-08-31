@@ -421,24 +421,27 @@ impl SessionsState {
             // The cache is rebuilt only when `self.sessions` changes (in
             // `Refreshed`). The `selected_progress` animation is applied at
             // widget-construction time every frame.
-            let mut session_list = Column::new().spacing(4);
+            let mut session_list = Column::new().spacing(theme::SPACE_4);
             let selected_progress = *self.selected_anim.value();
             if let Some(ref cached) = self.cached_session_items {
                 for item in cached {
                     let is_selected = self.selected_session.as_deref() == Some(&item.agent_id);
 
                     let mut title_row = iced::widget::Row::new()
-                        .spacing(6)
+                        .spacing(theme::SPACE_6)
                         .align_y(Alignment::Center);
                     if let Some(role) = item.role {
                         title_row = title_row.push(
                             theme::role_icon(&role)
-                                .size(13)
+                                .size(theme::TEXT_14)
                                 .color(theme::role_badge_color_for(&role).0),
                         );
                     }
-                    title_row = title_row
-                        .push(text(item.title.clone()).size(13).color(theme::TEXT_PRIMARY));
+                    title_row = title_row.push(
+                        text(item.title.clone())
+                            .size(theme::TEXT_13)
+                            .color(theme::TEXT_PRIMARY),
+                    );
 
                     let sess_row: Element<'_, SessionsMessage> = ContextMenu::new(
                         container(
@@ -459,32 +462,36 @@ impl SessionsState {
                                                     // exactly.
                                                     let mut meta_row = row![
                                                         text(&item.msg_count_label)
-                                                            .size(11)
+                                                            .size(theme::TEXT_11)
                                                             .color(theme::TEXT_SECONDARY)
                                                     ]
-                                                    .spacing(4);
+                                                    .spacing(theme::SPACE_4);
                                                     if let Some(token) = &item.token_label {
                                                         meta_row = meta_row
-                                                            .push(Space::new().width(8))
+                                                            .push(
+                                                                Space::new().width(theme::SPACE_8),
+                                                            )
                                                             .push(
                                                                 text(token)
-                                                                    .size(11)
+                                                                    .size(theme::TEXT_11)
                                                                     .color(theme::TEXT_SECONDARY),
                                                             );
                                                     }
-                                                    meta_row.push(Space::new().width(8)).push(
-                                                        text(&item.timestamp_label)
-                                                            .size(11)
-                                                            .color(theme::TEXT_SECONDARY),
-                                                    )
+                                                    meta_row
+                                                        .push(Space::new().width(theme::SPACE_8))
+                                                        .push(
+                                                            text(&item.timestamp_label)
+                                                                .size(theme::TEXT_11)
+                                                                .color(theme::TEXT_SECONDARY),
+                                                        )
                                                 },
                                                 text(&item.agent_id)
-                                                    .size(11)
+                                                    .size(theme::TEXT_11)
                                                     .color(theme::TEXT_SECONDARY),
                                             ]
-                                            .spacing(2),
+                                            .spacing(theme::SPACE_2),
                                         )
-                                        .padding(6)
+                                        .padding(theme::PAD_6)
                                         .width(Length::Fill)
                                         .style(
                                             move |_theme: &iced::Theme| container::Style {
@@ -518,7 +525,7 @@ impl SessionsState {
                                 ]
                                 .align_y(Alignment::Center),
                             ]
-                            .spacing(2),
+                            .spacing(theme::SPACE_2),
                         )
                         .style(theme::surface_card_style),
                         vec![MenuItem::with_icon(
@@ -543,7 +550,7 @@ impl SessionsState {
                 iced::widget::container(widgets::loading_text())
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .padding(16)
+                    .padding(theme::PAD_16)
                     .into()
             } else if let Some(ref _key) = self.selected_session {
                 let entries = &self.entries;
@@ -569,33 +576,38 @@ impl SessionsState {
                     container(render_transcript(&ctx, &scrollable_id))
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .padding([8, 0])
+                        .padding([theme::PAD_8, 0.0])
                         .into()
                 })
                 .into()
             } else {
                 container(
                     text("Select a session to view transcript.")
-                        .size(13)
+                        .size(theme::TEXT_13)
                         .color(theme::TEXT_MUTED),
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .padding(16)
+                .padding(theme::PAD_16)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into()
             };
 
             content = content.push(
-                row![session_scroll, Space::new().width(12), transcript].height(Length::Fill),
+                row![
+                    session_scroll,
+                    Space::new().width(theme::SPACE_12),
+                    transcript
+                ]
+                .height(Length::Fill),
             );
         }
 
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(24)
+            .padding(theme::PAGE_PADDING)
             .style(theme::base_container_style)
             .into()
     }
@@ -628,7 +640,7 @@ fn author_label<'a>(role: crate::ChatRole, assistant: bool) -> Element<'a, Sessi
         crate::ChatRole::Assistant => "Assistant",
         crate::ChatRole::Tool => "Tool",
     };
-    let label = text(name).size(11).color(theme::TEXT_SECONDARY);
+    let label = text(name).size(theme::TEXT_11).color(theme::TEXT_SECONDARY);
     if assistant {
         row![Space::new().width(Length::FillPortion(1)), label].into()
     } else {
@@ -645,7 +657,7 @@ fn bubble_row(
     body: Column<'_, SessionsMessage>,
 ) -> Element<'_, SessionsMessage> {
     let bubble = container(body)
-        .padding(10)
+        .padding(theme::PAD_10)
         .style(theme::bubble_style(
             if assistant {
                 theme::BG_ELEVATED
@@ -659,7 +671,7 @@ fn bubble_row(
         author_label(role, assistant),
         align_bubble(bubble, assistant)
     ]
-    .spacing(2)
+    .spacing(theme::SPACE_2)
     .into()
 }
 
@@ -742,10 +754,10 @@ fn collapsible_text_block(
         row![
             selectable_text(preview, color).size(size).font(font),
             lucide::ellipsis::<iced::Theme, iced::Renderer>()
-                .size(11)
+                .size(theme::TEXT_11)
                 .color(theme::TEXT_MUTED),
         ]
-        .spacing(4)
+        .spacing(theme::SPACE_4)
         .align_y(Alignment::Start)
         .into()
     } else {
@@ -801,7 +813,7 @@ fn plain_collapsible<'a>(
         color,
         11.0,
         theme::FONT_REGULAR,
-        selectable_text(content, color).size(11).into(),
+        selectable_text(content, color).size(theme::TEXT_11).into(),
     );
     click_toggle(key, collapses, el)
 }
@@ -827,11 +839,13 @@ fn thinking_block<'a>(
     let collapses = wrapped_lines > MAX_PREVIEW_LINES;
     let header = row![
         lucide::brain::<iced::Theme, iced::Renderer>()
-            .size(11)
+            .size(theme::TEXT_11)
             .color(theme::TEXT_MUTED),
-        text("Thinking").size(11).color(theme::TEXT_MUTED),
+        text("Thinking")
+            .size(theme::TEXT_11)
+            .color(theme::TEXT_MUTED),
     ]
-    .spacing(4)
+    .spacing(theme::SPACE_4)
     .align_y(Alignment::Center);
     let body = collapsible_text_block(
         collapses,
@@ -840,9 +854,11 @@ fn thinking_block<'a>(
         theme::TEXT_MUTED,
         11.0,
         theme::FONT_REGULAR,
-        selectable_text(content, theme::TEXT_MUTED).size(11).into(),
+        selectable_text(content, theme::TEXT_MUTED)
+            .size(theme::TEXT_11)
+            .into(),
     );
-    let whole: Element<'a, SessionsMessage> = column![header, body].spacing(4).into();
+    let whole: Element<'a, SessionsMessage> = column![header, body].spacing(theme::SPACE_4).into();
     click_toggle(key, collapses, whole)
 }
 
@@ -928,7 +944,7 @@ fn render_tool_round<'a>(
     calls: &'a [ToolCallEntry],
 ) -> Element<'a, SessionsMessage> {
     let md = ctx.entry_md.get(i).and_then(|m| m.as_deref());
-    let mut bubble_col = Column::new().spacing(4);
+    let mut bubble_col = Column::new().spacing(theme::SPACE_4);
 
     if let Some(reasoning) = reasoning {
         bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), reasoning));
@@ -962,7 +978,7 @@ fn render_tool_round<'a>(
             session_view::ToolBlockView::Full,
         ))
         .width(Length::Fill)
-        .padding([2, 4]);
+        .padding([theme::PAD_2, theme::PAD_4]);
         if collapses {
             bubble_col = bubble_col.push(click_toggle(key, true, tool_block.into()));
         } else {
@@ -979,11 +995,13 @@ fn render_tool_round<'a>(
                 bubble_col = bubble_col.push(
                     row![
                         lucide::arrow_down_to_line::<iced::Theme, iced::Renderer>()
-                            .size(11)
+                            .size(theme::TEXT_11)
                             .color(theme::TEXT_MUTED),
-                        text("(no result)").size(10).color(theme::TEXT_SECONDARY),
+                        text("(no result)")
+                            .size(theme::TEXT_10)
+                            .color(theme::TEXT_SECONDARY),
                     ]
-                    .spacing(4)
+                    .spacing(theme::SPACE_4)
                     .align_y(Alignment::Center),
                 );
             }
@@ -1008,7 +1026,7 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Element<'a, SessionsMe
             thinking,
         } => {
             let assistant = matches!(role, crate::ChatRole::Assistant);
-            let mut bubble_col = Column::new().spacing(4);
+            let mut bubble_col = Column::new().spacing(theme::SPACE_4);
             if let Some(thinking) = thinking {
                 bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), thinking));
             }
@@ -1039,7 +1057,7 @@ fn render_transcript<'a>(
 ) -> Element<'a, SessionsMessage> {
     if ctx.entries.is_empty() {
         return text("No messages in this session.")
-            .size(13)
+            .size(theme::TEXT_13)
             .color(theme::TEXT_MUTED)
             .into();
     }

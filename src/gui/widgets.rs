@@ -88,7 +88,7 @@ pub fn single_line_editor<'a, M: 'a>(
             super::editor_widget::EnterBehavior::Newline
         })
         .placeholder(placeholder)
-        .padding(5.0)
+        .padding(theme::PAD_5)
         .background(Some(theme::BG_ELEVATED));
     if let Some(id) = id {
         editor = editor.id(id);
@@ -131,7 +131,7 @@ pub fn password_field_editor<'a, M: Clone + 'a>(
         .code_mode(false)
         .enter(super::editor_widget::EnterBehavior::Submit)
         .placeholder(placeholder)
-        .padding(5.0)
+        .padding(theme::PAD_5)
         .background(Some(theme::BG_ELEVATED));
     if let Some(id) = id {
         editor = editor.id(id);
@@ -143,21 +143,21 @@ pub fn password_field_editor<'a, M: Clone + 'a>(
 
     let eye_icon: Element<'_, M> = if show {
         lucide::eye_off::<iced::Theme, iced::Renderer>()
-            .size(14)
+            .size(theme::TEXT_14)
             .color(theme::TEXT_MUTED)
             .into()
     } else {
         lucide::eye::<iced::Theme, iced::Renderer>()
-            .size(14)
+            .size(theme::TEXT_14)
             .color(theme::TEXT_MUTED)
             .into()
     };
     let toggle = button(eye_icon)
-        .padding(2)
+        .padding(theme::PAD_2)
         .style(theme::button_secondary)
         .on_press(on_toggle);
 
-    row![field, Space::new().width(4), toggle]
+    row![field, Space::new().width(theme::SPACE_4), toggle]
         .align_y(Alignment::Center)
         .into()
 }
@@ -165,8 +165,8 @@ pub fn password_field_editor<'a, M: Clone + 'a>(
 /// Render a styled error banner for dashboard panels.
 #[must_use]
 pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
-    container(text(err).size(13).color(theme::STATUS_ERROR))
-        .padding(8)
+    container(text(err).size(theme::TEXT_13).color(theme::STATUS_ERROR))
+        .padding(theme::PAD_8)
         .style(theme::pill_style(theme::STATUS_ERROR.scale_alpha(0.08)))
         .into()
 }
@@ -175,7 +175,7 @@ pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
 #[must_use]
 pub fn loading_text<'a, Message: 'a>() -> Element<'a, Message> {
     text("Loading\u{2026}")
-        .size(14)
+        .size(theme::TEXT_14)
         .color(theme::TEXT_MUTED)
         .into()
 }
@@ -242,9 +242,9 @@ pub fn empty_state_placeholder<'a, Message: 'a>(
     container(
         column![
             icon.size(48).color(accent),
-            text(label).size(14).color(accent),
+            text(label).size(theme::TEXT_14).color(accent),
         ]
-        .spacing(12)
+        .spacing(theme::SPACE_12)
         .align_x(Alignment::Center),
     )
     .width(Length::Fill)
@@ -254,17 +254,35 @@ pub fn empty_state_placeholder<'a, Message: 'a>(
     .into()
 }
 
+/// Canonical pill metrics: two sizes only — compact inline badges and modal header badges.
+#[derive(Debug, Clone, Copy)]
+pub struct PillMetrics {
+    pub text_size: f32,
+    pub padding: [f32; 2], // [vertical, horizontal]
+}
+
+/// Compact inline pill badge metrics.
+pub const PILL_COMPACT: PillMetrics = PillMetrics {
+    text_size: theme::TEXT_10,
+    padding: [theme::PAD_1, theme::PAD_6],
+};
+
+/// Modal header pill badge metrics.
+pub const PILL_MODAL: PillMetrics = PillMetrics {
+    text_size: theme::TEXT_12,
+    padding: [theme::PAD_2, theme::PAD_8],
+};
+
 /// Badge pill with an opaque background; `colors` is a `(foreground, background)`
 /// tuple — the convention shared by all badge-color helpers in [`crate::gui::theme`].
 #[must_use]
 pub fn badge_pill<'a, Message: 'a>(
     label: String,
     colors: (Color, Color),
-    text_size: u32,
-    padding: [u16; 2],
+    metrics: PillMetrics,
 ) -> Element<'a, Message> {
-    container(text(label).size(text_size).color(colors.0))
-        .padding(padding)
+    container(text(label).size(metrics.text_size).color(colors.0))
+        .padding(metrics.padding)
         .style(theme::pill_style(colors.1))
         .into()
 }
@@ -276,14 +294,14 @@ pub fn badge_pill<'a, Message: 'a>(
 pub fn maint_badge<'a, Message: 'a>(enabled: bool) -> Column<'a, Message> {
     column![
         theme::role_icon(&crate::Role::Maintainer)
-            .size(11)
+            .size(theme::TEXT_14)
             .color(if enabled {
                 theme::ACCENT
             } else {
                 theme::TEXT_MUTED
             }),
         text(if enabled { "ON" } else { "OFF" })
-            .size(9)
+            .size(theme::TEXT_10)
             .color(if enabled {
                 theme::ACCENT
             } else {
@@ -301,7 +319,7 @@ pub fn section_heading<'a>(
 ) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
     text(title.into())
         .font(theme::JETBRAINS_MONO)
-        .size(16)
+        .size(theme::TEXT_16)
         .color(theme::ACCENT)
 }
 
@@ -312,12 +330,12 @@ pub fn section_subheading<'a>(
 ) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
     text(title.into())
         .font(theme::JETBRAINS_MONO)
-        .size(13)
+        .size(theme::TEXT_13)
         .color(theme::ACCENT)
 }
 
 /// Icon size of the board's ticket-card action/archive buttons.
-pub const ACTION_ICON_SIZE: f32 = 16.0;
+pub const ACTION_ICON_SIZE: f32 = theme::TEXT_16;
 
 /// Shared icon/action button wrapped in a tooltip.
 ///
@@ -343,7 +361,7 @@ where
             .style(style)
             .padding(padding)
             .on_press_maybe(on_press),
-        text(tooltip_text.into()).size(11),
+        text(tooltip_text.into()).size(theme::TEXT_11),
         position,
     )
     .style(theme::tooltip_style)
@@ -391,7 +409,7 @@ pub fn tab_close_button<'a, Message: Clone + 'a>(
 ) -> widget::Button<'a, Message> {
     widget::button(
         lucide::x::<iced::Theme, iced::Renderer>()
-            .size(12)
+            .size(theme::TEXT_12)
             .color(if is_active {
                 theme::TEXT_SECONDARY
             } else {
@@ -577,7 +595,7 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         .placeholder(placeholder)
         .min_height(options.min_height)
         .max_height(options.max_height)
-        .padding(5.0)
+        .padding(theme::PAD_5)
         .background(Some(theme::BG_ELEVATED));
     if let Some(id) = options.id {
         editor = editor.id(id);
@@ -598,7 +616,7 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         options.sending || (options.grey_on_empty && content.text().trim().is_empty());
     let send_btn = icon_tooltip_button(
         lucide::send::<iced::Theme, iced::Renderer>()
-            .size(14)
+            .size(theme::TEXT_14)
             .color(if send_disabled {
                 theme::TEXT_MUTED
             } else {
@@ -617,7 +635,9 @@ pub fn chat_composer<'a, M: Clone + 'a>(
 
     // Right-aligned action toolbar inside the input surface: controls (Home
     // role/mic; empty for the plain Board composer) then the send button.
-    let mut toolbar = Row::new().spacing(6).align_y(Alignment::Center);
+    let mut toolbar = Row::new()
+        .spacing(theme::SPACE_6)
+        .align_y(Alignment::Center);
     toolbar = toolbar.push(Space::new().width(Length::Fill));
     for c in options.controls {
         toolbar = toolbar.push(c);
@@ -628,8 +648,8 @@ pub fn chat_composer<'a, M: Clone + 'a>(
     // inside one container matching the user message bubble form, stretched to
     // the full width of the chat pane. Callers inset the bubble (Home's black
     // composer strip) to keep small side margins; Board's modal already pads it.
-    container(column![input_editor, toolbar].spacing(6))
-        .padding(10)
+    container(column![input_editor, toolbar].spacing(theme::SPACE_6))
+        .padding(theme::PAD_10)
         .style(theme::bubble_style(
             theme::BG_ELEVATED,
             Some(theme::TEXT_PRIMARY),
@@ -708,7 +728,7 @@ pub fn git_footer_stats<'a, Message: 'a>(
     }
     Some(
         Row::with_children(parts)
-            .spacing(3)
+            .spacing(theme::SPACE_3)
             .align_y(Alignment::Center),
     )
 }
@@ -1509,11 +1529,11 @@ pub fn tree_row<'a, Message: 'a>(
     let mut row = Row::new()
         .push(text(guide).size(TREE_FONT_SIZE).color(theme::TEXT_MUTED))
         .push(icon)
-        .push(Space::new().width(4))
+        .push(Space::new().width(theme::SPACE_4))
         .push(name)
         .push(Space::new().width(Length::Fill));
     if let Some(counts) = counts {
-        row = row.push(counts).push(Space::new().width(6));
+        row = row.push(counts).push(Space::new().width(theme::SPACE_6));
     }
     row.align_y(Alignment::Center)
 }
