@@ -12,6 +12,7 @@ use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 
 use super::common::MAX_INPUT_CHARS;
+use super::dialog;
 use super::theme;
 use super::widgets::{self, badge_pill, diff_stats_row, selectable_text};
 
@@ -1611,7 +1612,7 @@ impl BoardState {
     pub fn render_modal_overlay(&self) -> Element<'_, BoardMessage> {
         let detail_layer = if self.is_modal_open() {
             if self.selected_loading {
-                let dialog = container(
+                let dialog = dialog::dialog_shell(
                     column![
                         text("Loading details\u{2026}")
                             .size(16)
@@ -1622,16 +1623,15 @@ impl BoardState {
                             .color(theme::TEXT_SECONDARY),
                     ]
                     .align_x(Alignment::Center),
-                )
-                .width(Length::Fixed(400.0))
-                .padding(24)
-                .style(theme::dialog_container_style);
+                    400.0,
+                    24.0,
+                );
 
                 widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             } else if self.selected_ticket.is_none()
                 && let Some(ref err) = self.detail_error
             {
-                let dialog = container(
+                let dialog = dialog::dialog_shell(
                     column![
                         text("Failed to load ticket")
                             .size(16)
@@ -1649,18 +1649,14 @@ impl BoardState {
                         .on_press(BoardMessage::CloseModal),
                     ]
                     .align_x(Alignment::Center),
-                )
-                .width(Length::Fixed(400.0))
-                .padding(24)
-                .style(theme::dialog_container_style);
+                    400.0,
+                    24.0,
+                );
 
                 widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             } else {
                 let detail = self.modal_detail();
-                let dialog = container(detail)
-                    .width(Length::Fixed(720.0))
-                    .padding(24)
-                    .style(theme::dialog_container_style);
+                let dialog = dialog::dialog_shell(detail, 720.0, 24.0);
 
                 widgets::modal_backdrop(dialog, BoardMessage::CloseModal, 0.5)
             }
@@ -1700,18 +1696,11 @@ impl BoardState {
     /// decision is always made there; the cancel transition itself is
     /// unconditional (no expected-phase guard).
     fn cancel_confirm_dialog(ticket_id: &str) -> Element<'_, BoardMessage> {
-        let dialog = container(
-            column![
-                text(format!("Cancel ticket {ticket_id}?"))
-                    .size(16)
-                    .color(theme::TEXT_PRIMARY)
-                    .font(theme::FONT_BOLD),
-                Space::new().height(12),
-                text("This ticket is in the middle of the development pipeline. Confirming will:")
-                    .size(13)
-                    .color(theme::TEXT_SECONDARY),
-                Space::new().height(8),
-                text(
+        widgets::modal_backdrop(
+            dialog::confirm_dialog(
+                dialog::dialog_title(format!("Cancel ticket {ticket_id}?")),
+                dialog::dialog_body([
+                    "This ticket is in the middle of the development pipeline. Confirming will:",
                     "• cancel the ticket immediately — it is archived \
                      automatically afterwards;\n\
                      • stop any running agent — the current tool may finish, \
@@ -1720,29 +1709,18 @@ impl BoardState {
                      committed, not reverted;\n\
                      • pause the workspace pipeline — all in-flight work stops \
                      and no pipeline stage advances until you manually resume it.",
-                )
-                .size(13)
-                .color(theme::TEXT_SECONDARY),
-                Space::new().height(16),
-                row![
-                    Space::new().width(Length::Fill),
-                    button(text("Keep ticket").size(13))
-                        .style(theme::button_secondary)
-                        .on_press(BoardMessage::DismissCancel),
-                    Space::new().width(8),
-                    button(text("Cancel ticket").size(13))
-                        .style(theme::button_danger)
-                        .on_press(BoardMessage::ConfirmCancel(ticket_id.to_string())),
-                ]
-                .align_y(Alignment::Center),
-            ]
-            .width(Length::Fill),
+                ]),
+                [
+                    dialog::DialogAction::secondary("Keep ticket", BoardMessage::DismissCancel),
+                    dialog::DialogAction::danger(
+                        "Cancel ticket",
+                        BoardMessage::ConfirmCancel(ticket_id.to_string()),
+                    ),
+                ],
+            ),
+            BoardMessage::DismissCancel,
+            0.5,
         )
-        .width(Length::Fixed(480.0))
-        .padding(24)
-        .style(theme::dialog_container_style);
-
-        widgets::modal_backdrop(dialog, BoardMessage::DismissCancel, 0.5)
     }
 
     /// Render the ticket detail modal content.

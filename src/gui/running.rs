@@ -53,6 +53,7 @@ use std::collections::HashSet;
 
 use crate::ChatRole;
 use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey, RunningTool};
+use crate::gui::dialog;
 use crate::gui::session_view::{
     MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, ToolBlockView, build_ledger, tool_block,
     truncate_at_boundary,
@@ -535,18 +536,11 @@ fn cancel_confirm_dialog(run_key: &str) -> Element<'static, RunningMessage> {
     // Deliberately unused: the run key must never appear in the dialog's
     // rendered text — the button action alone carries it (see the enum docs).
     let _ = run_key;
-    let dialog = container(
-        column![
-            text("Cancel this research run?")
-                .size(16)
-                .color(theme::TEXT_PRIMARY)
-                .font(theme::FONT_BOLD),
-            Space::new().height(12),
-            text("Confirming will:")
-                .size(13)
-                .color(theme::TEXT_SECONDARY),
-            Space::new().height(8),
-            text(
+    widgets::modal_backdrop(
+        dialog::confirm_dialog(
+            dialog::dialog_title("Cancel this research run?"),
+            dialog::dialog_body([
+                "Confirming will:",
                 "• stop all agents of this run — an in-flight tool or LLM call \
                  may finish, but no further work happens;\n\
                  • stop the orchestrator — no more rounds, no report, no \
@@ -554,29 +548,15 @@ fn cancel_confirm_dialog(run_key: &str) -> Element<'static, RunningMessage> {
                  • delete the run's temporary folder and archived result;\n\
                  • remove the run permanently — nothing is delivered to the \
                  Manager, and it can never resume.",
-            )
-            .size(13)
-            .color(theme::TEXT_SECONDARY),
-            Space::new().height(16),
-            row![
-                Space::new().width(Length::Fill),
-                button(text("Keep run").size(13))
-                    .style(theme::button_secondary)
-                    .on_press(RunningMessage::CancelDismissed),
-                Space::new().width(8),
-                button(text("Cancel run").size(13))
-                    .style(theme::button_danger)
-                    .on_press(RunningMessage::CancelConfirmed),
-            ]
-            .align_y(Alignment::Center),
-        ]
-        .width(Length::Fill),
+            ]),
+            [
+                dialog::DialogAction::secondary("Keep run", RunningMessage::CancelDismissed),
+                dialog::DialogAction::danger("Cancel run", RunningMessage::CancelConfirmed),
+            ],
+        ),
+        RunningMessage::CancelDismissed,
+        0.5,
     )
-    .width(Length::Fixed(480.0))
-    .padding(24)
-    .style(theme::dialog_container_style);
-
-    widgets::modal_backdrop(dialog, RunningMessage::CancelDismissed, 0.5)
 }
 
 /// Fallback label for workspaces outside the dashboard's registered set

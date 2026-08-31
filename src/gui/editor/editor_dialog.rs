@@ -4,11 +4,12 @@
 //! These are free functions extracted from `EditorState` in `editor.rs`.
 //! They take all state explicitly via parameters; none access `&self`.
 
-use iced::widget::{Row, Space, button, column, container, row, text};
+use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Color, Element, Length, widget::Id};
 
 use iced_fonts::lucide;
 
+use crate::gui::dialog;
 use crate::gui::theme;
 use crate::gui::widgets;
 
@@ -27,25 +28,6 @@ fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
         background: Some(iced::Background::Color(bg)),
         ..Default::default()
     }
-}
-
-/// Wrap dialog content in the shared dialog container and overlay it.
-/// All standard dialogs use this to ensure consistent container dimensions,
-/// padding, style, and backdrop behavior.
-pub(super) fn wrap_dialog<'a>(
-    content: impl Into<Element<'a, EditorMessage>>,
-    width: u32,
-    cancel_msg: EditorMessage,
-    opacity: f32,
-) -> Element<'a, EditorMessage> {
-    widgets::modal_backdrop(
-        container(content)
-            .width(width)
-            .padding(24)
-            .style(theme::dialog_container_style),
-        cancel_msg,
-        opacity,
-    )
 }
 
 /// Build the quick-open overlay: a centered dialog with search input
@@ -135,60 +117,12 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
         .into()
     };
 
-    let dialog = container(content)
-        .width(Length::Fixed(400.0))
-        .padding(12)
-        .style(theme::dialog_container_style);
+    let dialog = dialog::dialog_shell(content, 400.0, 12.0);
 
     widgets::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
 }
 
 // ── Close dialog ──────────────────────────────────────────────────
-
-/// Shared confirmation dialog builder.
-///
-/// Constructs a standardised confirmation overlay with an icon row (warning icon +
-/// title), a description, and a caller-provided button row. All confirmation
-/// dialogs (e.g. unsaved-changes, delete-confirm) use this to avoid duplicating
-/// the identical icon row, description styling, column wrapper, and wrap_dialog
-/// call.
-///
-/// Callers supply the button row as a pre-assembled [`Row`] (with its own
-/// `.align_y` / `.width` styling) so each site can freely choose button
-/// composition while reusing the structural boilerplate.
-fn confirmation_dialog<'a>(
-    title: impl Into<String>,
-    description: impl Into<String>,
-    button_row: impl Into<Element<'a, EditorMessage>>,
-    width: u32,
-    cancel_msg: EditorMessage,
-    opacity: f32,
-) -> Element<'a, EditorMessage> {
-    let title: String = title.into();
-    let description: String = description.into();
-    wrap_dialog(
-        column![
-            row![
-                lucide::triangle_alert::<iced::Theme, iced::Renderer>()
-                    .size(16)
-                    .color(theme::STATUS_WARNING),
-                Space::new().width(8),
-                text(title).size(16).color(theme::TEXT_PRIMARY),
-            ]
-            .align_y(Alignment::Center),
-            text(description)
-                .size(14)
-                .color(theme::TEXT_SECONDARY)
-                .width(Length::Fill),
-            button_row.into(),
-        ]
-        .spacing(16)
-        .width(Length::Fill),
-        width,
-        cancel_msg,
-        opacity,
-    )
-}
 
 /// Create a styled dialog button with consistent size (13) and center-aligned text.
 fn dialog_button(
@@ -203,21 +137,6 @@ fn dialog_button(
         .into()
 }
 
-/// Create a row of dialog buttons with 8px spacing between them,
-/// right-aligned within the row and filling the available width.
-fn dialog_button_row<'a>(
-    buttons: impl IntoIterator<Item = Element<'a, EditorMessage>>,
-) -> Element<'a, EditorMessage> {
-    let mut row = Row::new().align_y(Alignment::End).width(Length::Fill);
-    for (i, btn) in buttons.into_iter().enumerate() {
-        if i > 0 {
-            row = row.push(Space::new().width(8));
-        }
-        row = row.push(btn);
-    }
-    row.into()
-}
-
 /// Build the close-save-discard dialog overlay.
 pub(super) fn build_close_dialog(
     on_save: EditorMessage,
@@ -225,32 +144,23 @@ pub(super) fn build_close_dialog(
     on_cancel: EditorMessage,
     description: String,
 ) -> Element<'static, EditorMessage> {
-    let button_row = dialog_button_row([
-        dialog_button(
-            "Cancel",
-            theme::TEXT_SECONDARY,
-            theme::button_secondary,
-            on_cancel.clone(),
+    widgets::modal_backdrop(
+        dialog::confirm_dialog(
+            row![
+                lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+                    .size(16)
+                    .color(theme::STATUS_WARNING),
+                Space::new().width(8),
+                dialog::dialog_title("Unsaved changes"),
+            ]
+            .align_y(Alignment::Center),
+            dialog::dialog_body([description]),
+            [
+                dialog::DialogAction::secondary("Cancel", on_cancel.clone()),
+                dialog::DialogAction::danger("Discard", on_discard),
+                dialog::DialogAction::secondary("Save", on_save),
+            ],
         ),
-        dialog_button(
-            "Discard",
-            theme::STATUS_ERROR,
-            theme::button_danger,
-            on_discard,
-        ),
-        dialog_button(
-            "Save",
-            theme::TEXT_PRIMARY,
-            theme::button_secondary,
-            on_save,
-        ),
-    ]);
-
-    confirmation_dialog(
-        "Unsaved changes",
-        description,
-        button_row,
-        380,
         on_cancel,
         0.5,
     )
@@ -284,26 +194,22 @@ pub(super) fn build_delete_confirm_dialog(
         "Delete file"
     };
 
-    let button_row = dialog_button_row([
-        dialog_button(
-            "Cancel",
-            theme::TEXT_SECONDARY,
-            theme::button_secondary,
-            EditorMessage::CancelDelete,
+    widgets::modal_backdrop(
+        dialog::confirm_dialog(
+            row![
+                lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+                    .size(16)
+                    .color(theme::STATUS_WARNING),
+                Space::new().width(8),
+                dialog::dialog_title(title),
+            ]
+            .align_y(Alignment::Center),
+            dialog::dialog_body([description]),
+            [
+                dialog::DialogAction::secondary("Cancel", EditorMessage::CancelDelete),
+                dialog::DialogAction::danger("Delete", EditorMessage::ConfirmDelete),
+            ],
         ),
-        dialog_button(
-            "Delete",
-            theme::STATUS_ERROR,
-            theme::button_danger,
-            EditorMessage::ConfirmDelete,
-        ),
-    ]);
-
-    confirmation_dialog(
-        title,
-        description,
-        button_row,
-        400,
         EditorMessage::CancelDelete,
         0.5,
     )
@@ -332,30 +238,33 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
     );
 
     // Dialog content.
-    wrap_dialog(
-        column![
-            text(label).size(14).color(theme::TEXT_PRIMARY),
-            input,
-            dialog_button_row([
-                dialog_button(
-                    "Cancel",
-                    theme::TEXT_SECONDARY,
-                    theme::button_secondary,
-                    EditorMessage::Escape,
-                ),
-                dialog_button(
-                    "Create",
-                    theme::TEXT_PRIMARY,
-                    theme::button_secondary,
-                    EditorMessage::NewItemSubmit(target.input_text.text()),
-                ),
-            ]),
-        ]
-        .spacing(12)
-        .width(Length::Fill),
-        380,
+    widgets::modal_backdrop(
+        dialog::dialog_shell(
+            column![
+                text(label).size(14).color(theme::TEXT_PRIMARY),
+                input,
+                dialog::dialog_footer_row([
+                    dialog_button(
+                        "Cancel",
+                        theme::TEXT_SECONDARY,
+                        theme::button_secondary,
+                        EditorMessage::Escape,
+                    ),
+                    dialog_button(
+                        "Create",
+                        theme::TEXT_PRIMARY,
+                        theme::button_secondary,
+                        EditorMessage::NewItemSubmit(target.input_text.text()),
+                    ),
+                ]),
+            ]
+            .spacing(12)
+            .width(Length::Fill),
+            400.0,
+            24.0,
+        ),
         EditorMessage::Escape,
-        0.4,
+        0.5,
     )
 }
 
@@ -530,10 +439,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
         .into()
     };
 
-    let dialog = container(content)
-        .width(Length::Fixed(600.0))
-        .padding(12)
-        .style(theme::dialog_container_style);
+    let dialog = dialog::dialog_shell(content, 600.0, 12.0);
 
     widgets::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
 }

@@ -291,6 +291,28 @@ pub fn maint_badge<'a, Message: 'a>(enabled: bool) -> Column<'a, Message> {
     .align_x(Alignment::Center)
 }
 
+/// Page/panel section heading: JetBrains Mono, 16px, accent color.
+#[must_use]
+pub fn section_heading<'a>(
+    title: impl Into<String>,
+) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
+    text(title.into())
+        .font(theme::JETBRAINS_MONO)
+        .size(16)
+        .color(theme::ACCENT)
+}
+
+/// Sub-heading inside a section (smaller sibling of [`section_heading`]).
+#[must_use]
+pub fn section_subheading<'a>(
+    title: impl Into<String>,
+) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
+    text(title.into())
+        .font(theme::JETBRAINS_MONO)
+        .size(13)
+        .color(theme::ACCENT)
+}
+
 /// Icon size of the board's ticket-card action/archive buttons.
 pub const ACTION_ICON_SIZE: f32 = 16.0;
 

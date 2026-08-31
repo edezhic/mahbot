@@ -11,6 +11,7 @@
 
 pub(crate) mod board;
 pub(crate) mod common;
+pub(crate) mod dialog;
 pub(crate) mod diff;
 pub(crate) mod diff_widget;
 pub(crate) mod editor;
@@ -1934,10 +1935,7 @@ impl Dashboard {
 
         // ── Branch management modal (small centered dialog) ──────────
         let branch_overlay: Element<'_, Message> = if self.git_state.is_modal_open() {
-            let dialog = container(self.git_state.view().map(Message::Git))
-                .width(Length::Fixed(480.0))
-                .padding(24)
-                .style(theme::dialog_container_style);
+            let dialog = dialog::dialog_shell(self.git_state.view().map(Message::Git), 400.0, 24.0);
             widgets::modal_backdrop(dialog, Message::Git(git::GitMessage::CloseModal), 0.5)
         } else {
             widgets::empty_stack_placeholder()
@@ -1995,7 +1993,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
             .to_string();
         let hash = diff_state.commit_short_hash().unwrap_or("????????");
         column![
-            text(msg).size(18).color(theme::TEXT_PRIMARY),
+            widgets::section_heading(msg),
             text(hash).size(12).color(theme::TEXT_MUTED),
         ]
         .spacing(2)
@@ -2008,9 +2006,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
         .into()
     } else {
         column![
-            text("Uncommitted changes")
-                .size(18)
-                .color(theme::TEXT_PRIMARY),
+            widgets::section_heading("Uncommitted changes"),
             text("Working tree diff \u{2014} press Escape to close")
                 .size(11)
                 .color(theme::TEXT_MUTED),
@@ -2647,34 +2643,18 @@ impl Dashboard {
                  closing signals the restart."
             }
         };
-        let dialog = container(
-            column![
-                text("Update MahBot?")
-                    .size(16)
-                    .color(theme::TEXT_PRIMARY)
-                    .font(theme::FONT_BOLD),
-                Space::new().height(12),
-                text(build_desc).size(13).color(theme::TEXT_SECONDARY),
-                Space::new().height(16),
-                row![
-                    Space::new().width(Length::Fill),
-                    button(text("Cancel").size(13))
-                        .style(theme::button_secondary)
-                        .on_press(Message::CancelUpdate),
-                    Space::new().width(8),
-                    button(text("Update").size(13))
-                        .style(theme::button_secondary)
-                        .on_press(Message::ConfirmUpdate),
-                ]
-                .align_y(Alignment::Center),
-            ]
-            .width(Length::Fill),
+        widgets::modal_backdrop(
+            dialog::confirm_dialog(
+                dialog::dialog_title("Update MahBot?"),
+                dialog::dialog_body([build_desc]),
+                [
+                    dialog::DialogAction::secondary("Cancel", Message::CancelUpdate),
+                    dialog::DialogAction::secondary("Update", Message::ConfirmUpdate),
+                ],
+            ),
+            Message::CancelUpdate,
+            0.5,
         )
-        .width(Length::Fixed(480.0))
-        .padding(24)
-        .style(theme::dialog_container_style);
-
-        widgets::modal_backdrop(dialog, Message::CancelUpdate, 0.5)
     }
 
     /// Render the self-update button in the footer bar.

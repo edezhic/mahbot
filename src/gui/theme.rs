@@ -929,9 +929,7 @@ pub fn elevated_card_style(_theme: &iced::Theme) -> container::Style {
 }
 
 /// Style for modal dialog containers: elevated background, 8px rounded
-/// corners, and a strong border. Shared by all modal overlays across the
-/// dashboard (board detail, settings dialogs, editor overlays, diff/branch
-/// modals, etc.).
+/// corners, and a strong border.
 #[must_use]
 pub fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_ELEVATED, 8.0, 1.0, BORDER_STRONG)

@@ -32,6 +32,7 @@ use iced_fonts::lucide;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::common::SingleLineEditorState;
+use super::dialog;
 use super::editor_widget::EditorAction;
 use super::menus::{ContextMenu, MenuItem};
 use super::theme;
@@ -2041,9 +2042,7 @@ impl SettingsState {
                         }))
                         .width(Length::Fill)
                         .height(Length::Shrink)
-                        .style(|_theme| {
-                            theme::container_style(theme::BG_ELEVATED, 8.0, 1.0, theme::ACCENT)
-                        })
+                        .style(theme::elevated_card_style)
                         .into();
 
                     let char_counter = text(if over_limit {
@@ -2180,7 +2179,7 @@ impl SettingsState {
                 .padding(16),
             )
             .width(Length::Fill)
-            .style(theme::dialog_container_style);
+            .style(theme::elevated_card_style);
 
             section_content = section_content.push(view_container);
         }
@@ -2544,41 +2543,25 @@ impl SettingsState {
     /// immediately) — and what it preserves (sessions, chat history,
     /// userspace files).
     fn user_delete_dialog(user_name: &str) -> Element<'_, SettingsMessage> {
-        container(
-            column![
-                text(format!("Delete user {user_name}?"))
-                    .size(16)
-                    .color(theme::TEXT_PRIMARY)
-                    .font(theme::FONT_BOLD),
-                Space::new().height(12),
-                text(
-                    "This permanently removes the user and all their \
-                     channel bindings (including Telegram) — their access is \
-                     cut immediately. Their sessions, chat history, and \
-                     userspace files are preserved.",
-                )
-                .size(13)
-                .color(theme::TEXT_SECONDARY),
-                Space::new().height(16),
-                row![
-                    Space::new().width(Length::Fill),
-                    button(text("Keep user").size(13))
-                        .style(theme::button_secondary)
-                        .on_press(SettingsMessage::UserMsg(users::UsersMessage::CancelDelete)),
-                    Space::new().width(8),
-                    button(text("Delete").size(13))
-                        .style(theme::button_danger)
-                        .on_press(SettingsMessage::UserMsg(
-                            users::UsersMessage::ConfirmDelete(user_name.to_string()),
-                        )),
-                ]
-                .align_y(Alignment::Center),
-            ]
-            .width(Length::Fill),
+        dialog::confirm_dialog(
+            dialog::dialog_title(format!("Delete user {user_name}?")),
+            dialog::dialog_body(["This permanently removes the user and all their \
+                 channel bindings (including Telegram) — their access is cut \
+                 immediately. Their sessions, chat history, and userspace \
+                 files are preserved."]),
+            [
+                dialog::DialogAction::secondary(
+                    "Keep user",
+                    SettingsMessage::UserMsg(users::UsersMessage::CancelDelete),
+                ),
+                dialog::DialogAction::danger(
+                    "Delete",
+                    SettingsMessage::UserMsg(users::UsersMessage::ConfirmDelete(
+                        user_name.to_string(),
+                    )),
+                ),
+            ],
         )
-        .width(Length::Fixed(460.0))
-        .padding(24)
-        .style(theme::dialog_container_style)
         .into()
     }
 
@@ -2753,18 +2736,17 @@ impl SettingsState {
         );
 
         let modal_title = format!("Diagnostics: {ws_name}");
-        container(
+        dialog::dialog_shell(
             column![
-                text(modal_title).size(16).color(theme::TEXT_PRIMARY),
+                dialog::dialog_title(modal_title),
                 Space::new().height(16),
                 rows_col,
             ]
             .spacing(8)
-            .width(Length::Fill)
-            .padding(24),
+            .width(Length::Fill),
+            620.0,
+            24.0,
         )
-        .width(620)
-        .style(theme::dialog_container_style)
         .into()
     }
     // ── Config-field builders ────────────────────────────────────
@@ -2923,10 +2905,7 @@ impl SettingsState {
                 manager_row,
                 worker_row,
                 Space::new().height(12),
-                text("Image Generation")
-                    .size(13)
-                    .font(iced::Font::MONOSPACE)
-                    .color(theme::ACCENT),
+                widgets::section_subheading("Image Generation"),
                 Space::new().height(2),
                 model_picker_list(
                     ModelPickerTarget::ImageGen,
@@ -2940,10 +2919,7 @@ impl SettingsState {
                         .map(String::as_str),
                 ),
                 Space::new().height(12),
-                text("Video Generation")
-                    .size(13)
-                    .font(iced::Font::MONOSPACE)
-                    .color(theme::ACCENT),
+                widgets::section_subheading("Video Generation"),
                 Space::new().height(2),
                 model_picker_list(
                     ModelPickerTarget::Video,
@@ -3529,7 +3505,7 @@ impl SettingsState {
             let row = column![
                 // Model name label (read-only)
                 text(display_name)
-                    .font(iced::Font::MONOSPACE)
+                    .font(theme::JETBRAINS_MONO)
                     .size(13)
                     .color(theme::TEXT_SECONDARY),
                 order_input,
@@ -3573,10 +3549,7 @@ fn section_impl<'a>(
     action: Option<Element<'a, SettingsMessage>>,
     content: Column<'a, SettingsMessage>,
 ) -> Element<'a, SettingsMessage> {
-    let styled_title = text(title)
-        .font(iced::Font::MONOSPACE)
-        .size(16)
-        .color(theme::ACCENT);
+    let styled_title = widgets::section_heading(title);
 
     let header: Element<'a, SettingsMessage> = match action {
         Some(btn) => row![styled_title, Space::new().width(Length::Fill), btn,]
@@ -3728,14 +3701,9 @@ fn modal_dialog<'a>(
     on_cancel: SettingsMessage,
     on_submit: SettingsMessage,
 ) -> Element<'a, SettingsMessage> {
-    let mut col = Column::new().padding(24);
+    let mut col = Column::new();
 
-    col = col.push(
-        text(title)
-            .size(16)
-            .color(theme::TEXT_PRIMARY)
-            .font(theme::FONT_BOLD),
-    );
+    col = col.push(dialog::dialog_title(title));
 
     if !fields.is_empty() || middle.is_some() {
         col = col.push(Space::new().height(16));
@@ -3786,10 +3754,7 @@ fn modal_dialog<'a>(
         .align_y(Alignment::Center),
     );
 
-    container(col)
-        .width(Length::Fixed(620.0))
-        .style(theme::dialog_container_style)
-        .into()
+    dialog::dialog_shell(col, 620.0, 24.0).into()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

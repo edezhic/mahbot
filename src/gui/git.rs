@@ -9,6 +9,7 @@
 //! at the Dashboard level.
 
 use super::theme;
+use super::widgets;
 
 use crate::git::commands::{DiffStats, GitFileStatus, GitWorktreeSnapshot};
 
@@ -801,7 +802,7 @@ impl GitState {
             });
 
         column![
-            text("Branches").size(18).color(theme::TEXT_PRIMARY),
+            widgets::section_heading("Branches"),
             Space::new().height(8),
             search_input,
             Space::new().height(8),
