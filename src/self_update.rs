@@ -35,8 +35,8 @@
 //! `posix_spawn` triggers async Gatekeeper code-signing validation; deleting the
 //! spawn target during validation produces empty stderr (SIGKILL by
 //! `syspolicyd`). In the temp-root flow the spawn target is always the captured
-//! `current_exe()` (never a temp root), and the temp roots are only removed
-//! after a successful spawn, so the spawn target is never deleted in its
+//! `current_exe()` (never a temp root), and the temp roots are removed before
+//! the lock release and spawn, so the spawn target is never deleted in its
 //! startup window.
 
 use crate::ChannelMessage;
@@ -633,15 +633,16 @@ static UPDATE_MUTEX: Mutex<()> = Mutex::const_new(());
 
 // ── Execute update ────────────────────────────────────────────────────────
 
-/// Set while [`execute_update`] runs its finalizing window (step 10 shutdown
-/// through `exit(0)`). During this window the update path owns the process:
+/// Set while [`execute_update`] runs its finalizing window (drain through
+/// `exit(0)`). During this window the update path owns the process:
 /// the GUI exit path waits ([`update_is_finalizing`]) instead of exiting, so a
 /// window close or SIGINT cannot abort the update's checkpoint on the iced
 /// runtime and leave the daemon down without a replacement.
 static UPDATE_FINALIZING: AtomicBool = AtomicBool::new(false);
 
 /// True while [`execute_update`] is in its finalizing window (daemon shut
-/// down; checkpoint, lock release, spawn, and `exit(0)` pending).
+/// down; checkpoint, temp-root cleanup, lock release, spawn, and `exit(0)`
+/// pending).
 #[must_use]
 pub fn update_is_finalizing() -> bool {
     UPDATE_FINALIZING.load(Ordering::SeqCst)
@@ -749,8 +750,8 @@ async fn execute_local_update() -> Result<()> {
 
     // 4. Create temp roots for the install and the cargo build. Held in scope
     //    for the whole update so an install/spawn failure RAII-cleans them; on
-    //    success `std::process::exit(0)` bypasses RAII, so the `after_spawn`
-    //    closure in `finalize_install` removes them explicitly. The cold
+    //    success `std::process::exit(0)` bypasses RAII, so `finalize_install`
+    //    removes them explicitly before the lock release and spawn. The cold
     //    release rebuild of the heavy dep tree can be several-GB; the temp
     //    roots land under the (pinned) system temp dir, which on macOS is the
     //    boot volume with the repo, so no cross-volume fallback is warranted.
@@ -813,7 +814,7 @@ async fn execute_registry_update() -> Result<()> {
     .await;
 
     // 3. Create the temp install root, held for the whole update (RAII on error;
-    //    explicit cleanup on success — see `finalize_install`).
+    //    explicit cleanup in the finalize tail — see `finalize_install`).
     let temp_install_root =
         tempfile::tempdir().context("Failed to create temp install root for self-update")?;
     let install_root = temp_install_root.path().to_path_buf();
@@ -881,12 +882,13 @@ fn temp_bin_path(install_root: &Path) -> PathBuf {
 ///    locked in place).
 /// 6. Notify "starting new instance" (Telegram channel must still be live).
 /// 7. Hand off to [`finalize_update_and_restart`] for the drain → checkpoint →
-///    unlock → spawn-from-`current_exe` → temp-root cleanup → exit.
+///    temp-root cleanup → unlock → spawn-from-`current_exe` → exit.
 ///
-/// `cleanup_paths` are the temp roots to remove after a successful spawn. On
-/// any error return the caller keeps the `TempDir` values in scope, so their
-/// RAII drops clean them up; `std::process::exit(0)` bypasses RAII, so the
-/// success path removes them in the `after_spawn` closure instead.
+/// `cleanup_paths` are the temp roots to remove before the instance-lock release
+/// and spawn. On any error return the caller keeps the `TempDir` values in
+/// scope, so their RAII drops clean them up; `std::process::exit(0)` bypasses
+/// RAII, so the success path removes them in [`finalize_update_and_restart`]
+/// instead.
 async fn finalize_install(
     fresh_binary: &Path,
     admin_target: Option<&str>,
@@ -923,27 +925,17 @@ async fn finalize_install(
     //    finalize_update_and_restart — the Telegram channel must still be live).
     notify_admin("🔄 Starting new instance…", admin_target).await;
 
-    // 7. Shared finalize tail. The temp roots are removed here (after a
-    //    successful spawn) rather than by RAII: `exit(0)` bypasses destructors,
-    //    and they are never the spawn target (which is always `current_exe`),
-    //    so removal cannot race macOS Gatekeeper validation of the child.
-    finalize_update_and_restart(&current_exe, move || {
-        for path in &cleanup_paths {
-            if let Err(e) = fs::remove_dir_all(path) {
-                warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "Could not remove temp update root after successful spawn"
-                );
-            }
-        }
-    })
-    .await
+    // 7. Shared finalize tail. The temp roots are removed in the tail (before
+    //    the instance-lock release and spawn) rather than by RAII: `exit(0)`
+    //    bypasses destructors, and they are never the spawn target (which is
+    //    always `current_exe`), so removal cannot race macOS Gatekeeper
+    //    validation of the child.
+    finalize_update_and_restart(&current_exe, cleanup_paths).await
 }
 
 /// Shared finalize tail for both update modes: graceful drain, final
-/// single-writer checkpoint, instance-lock release, detached spawn of the
-/// replacement, optional post-spawn cleanup, and `exit(0)`.
+/// single-writer checkpoint, temp-root cleanup, instance-lock release, detached
+/// spawn of the replacement, and `exit(0)`.
 ///
 /// The ordering is load-bearing and MUST NOT be rearranged:
 ///
@@ -955,23 +947,39 @@ async fn finalize_install(
 ///    ([`update_is_finalizing`]) instead of exiting, so this sequence cannot
 ///    be aborted by a window close or SIGINT racing the checkpoint. No failure
 ///    transitions with 'service shutting down' comments fire — agents that
-///    cannot finish stay status='launched' and boot-resume.
+///    cannot finish stay status='launched' and boot-resume. The drain semantics
+///    are unchanged; then `close_all_browser_sessions()` releases the browser
+///    tabs the update path still owns.
 /// 2. Checkpoint all databases BEFORE releasing the instance lock and spawning
 ///    the replacement. `exit(0)` below bypasses Rust destructors, so Turso
 ///    connections are never properly closed. With the lock still held this is
 ///    the last single-writer checkpoint: no checkpoint runs after the
 ///    replacement is live (the GUI exit path waits while the update is
 ///    finalizing — see `save_and_exit` / `update_is_finalizing`).
-/// 3. Release the instance lock so the child process can acquire it on startup.
-/// 4. Spawn the new instance. On macOS, posix_spawn triggers asynchronous
-///    Gatekeeper code signature validation. Spawning before `after_spawn`
-///    guarantees the spawn target is never deleted during or before the
-///    child's startup window.
-/// 5. Run `after_spawn` (cleanup of the temp update root(s)), then `exit(0)`.
+/// 3. Remove the temp update roots BEFORE releasing the instance lock or
+///    spawning: `exit(0)` below bypasses Rust destructors, so the multi-GB
+///    deletion must complete here while the old process still holds Turso's
+///    exclusive open-time fcntl locks on the `-wal` files (connections are
+///    never formally closed). If the child booted while they were held, its
+///    store open would fail on the lock — boot has only a bounded retry, not
+///    immunity. Keeping the instance flock held during cleanup also prevents a
+///    manually started second instance from sneaking in. Safe to delete before
+///    spawn because the spawn target is ALWAYS the `current_exe()` path
+///    captured before the in-place `self_replace` swap in `finalize_install` —
+///    never a temp root — so cleanup can never delete the binary the child is
+///    validating; macOS syspolicyd SIGKILLs children whose binary is deleted
+///    during async code-signature validation, and that invariant must hold.
+/// 4. Release the instance lock so the child process can acquire it on startup.
+/// 5. Spawn the new instance. On macOS, posix_spawn triggers asynchronous
+///    Gatekeeper code signature validation. The spawn target is never a temp
+///    root (see step 3), so the cleanup cannot race the validation.
+/// 6. `exit(0)`.
 ///
-/// `after_spawn` must not fail the update (best-effort cleanup) — a panic here
-/// would still exit the process, so it must be infallible in practice.
-async fn finalize_update_and_restart(spawn_path: &Path, after_spawn: impl FnOnce()) -> Result<()> {
+/// On spawn failure (step 5) the process stays alive and the update returns
+/// `Err`, having already removed its temp roots — acceptable, since they are
+/// transient build artifacts (the caller keeps the `TempDir` values in scope
+/// and RAII cleans any leftover).
+async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathBuf>) -> Result<()> {
     // 1. Begin the graceful drain.
     UPDATE_FINALIZING.store(true, Ordering::SeqCst);
     crate::shutdown::drain_begin();
@@ -984,10 +992,25 @@ async fn finalize_update_and_restart(spawn_path: &Path, after_spawn: impl FnOnce
     //    spawning the replacement (see doc comment above).
     crate::db::checkpoint::checkpoint_all_databases().await;
 
-    // 3. Release instance lock so the child process can acquire it on startup.
+    // 3. Remove the temp update roots BEFORE releasing the instance lock and
+    //    spawning (see doc comment above): `exit(0)` bypasses destructors, so
+    //    the multi-GB deletion must complete here while the old process still
+    //    holds Turso's exclusive open-time locks. Best-effort — a failure to
+    //    remove a stale root must not abort the update.
+    for path in &cleanup_paths {
+        if let Err(e) = fs::remove_dir_all(path) {
+            warn!(
+                error = %e,
+                path = %path.display(),
+                "Could not remove temp update root"
+            );
+        }
+    }
+
+    // 4. Release instance lock so the child process can acquire it on startup.
     release_instance_lock().await;
 
-    // 4. Spawn the new instance from the determined spawn path.
+    // 5. Spawn the new instance from the determined spawn path.
     if let Err(e) = spawn_new_instance_from(spawn_path) {
         // Spawn failed — the process stays alive (unless a genuine window
         // close was requested during the finalizing window, in which case the
@@ -1001,10 +1024,7 @@ async fn finalize_update_and_restart(spawn_path: &Path, after_spawn: impl FnOnce
         return Err(e);
     }
 
-    // 5. Post-spawn cleanup (remove the temp update roots).
-    after_spawn();
-
-    // Exit — spawn succeeded.
+    // 6. Exit — spawn succeeded.
     std::process::exit(0);
 }
 
@@ -1376,8 +1396,8 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 ///
 /// The caller guarantees that `binary_path` is never deleted before or during
 /// the child's startup window (see the temp-root cleanup rationale in
-/// [`finalize_install`]). Deleting the spawn target while Gatekeeper is
-/// validating its code signature causes `syspolicyd` to SIGKILL the child.
+/// [`finalize_update_and_restart`]). Deleting the spawn target while Gatekeeper
+/// is validating its code signature causes `syspolicyd` to SIGKILL the child.
 fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
 

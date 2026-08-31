@@ -712,7 +712,7 @@ impl Dashboard {
         self.persist_window_state();
         if crate::self_update::update_in_progress() && crate::self_update::update_is_finalizing() {
             // The update path has shut down the daemon and owns the exit:
-            // checkpoint (execute_update step 11), lock release, spawn, exit(0).
+            // checkpoint, temp-root cleanup, lock release, spawn, exit(0).
             // Exiting here would drop the iced runtime and abort that sequence
             // mid-checkpoint, leaving the daemon down without a replacement —
             // so wait instead. A close requested meanwhile is recorded in

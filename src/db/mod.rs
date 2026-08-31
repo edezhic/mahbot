@@ -1,6 +1,7 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
@@ -502,6 +503,80 @@ async fn run_readonly_query(
     })
 }
 
+/// Number of retry attempts for the open-time WAL lock held by another process.
+const OPEN_LOCK_RETRY_ATTEMPTS: usize = 10;
+
+/// Delay between open-time WAL lock retries.
+const OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Whether an error is the transient open-time WAL lock from [turso_core].
+///
+/// Turso's [`turso::Builder::build`] takes the fcntl `F_SETLK` lock on the
+/// `-wal` file while the database is opened. When another process already
+/// holds that lock (e.g. the previous daemon process during a self-update
+/// restart), the open fails with a `WouldBlock` that [turso_core] folds into
+/// [`turso::Error::Error`] via the catch-all `From` impl, surfacing as a
+/// `"Locking error: Failed locking file '...'. File is locked by another
+/// process"` message. [`Connection::open`]'s `busy_timeout` does **not** cover
+/// this open-time lock — it only governs per-statement waits after the handle
+/// is connected.
+///
+/// The predicate is deliberately narrow: it requires both the `"Locking
+/// error:"` and `"File is locked by another process"` substrings, so it never
+/// treats generic `"database is locked"` / "table is locked" busy errors
+/// (which have their own retry/backoff semantics) or unrelated corruption or
+/// I/O messages as this transient condition.
+///
+/// [turso_core]: https://github.com/tursodatabase/turso
+fn is_open_time_lock_error(err: &turso::Error) -> bool {
+    matches!(
+        err,
+        turso::Error::Error(msg)
+            if msg.contains("Locking error:") && msg.contains("File is locked by another process")
+    )
+}
+
+/// Retries `attempt` only for the transient open-time WAL lock.
+///
+/// The previous process still holds the `-wal` lock briefly during a
+/// self-update restart; this bounded retry (a few seconds total) absorbs that
+/// race without masking any other open failure. `attempts` is the number of
+/// retries *after* the first try, so the maximum number of total tries is
+/// `attempts + 1`. A non-[open-time lock] error is returned on the first
+/// encounter and never retried.
+///
+/// [open-time lock]: is_open_time_lock_error
+async fn with_open_lock_retry<T, F, Fut>(
+    attempts: usize,
+    delay: Duration,
+    mut attempt: F,
+) -> Result<T, turso::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, turso::Error>>,
+{
+    let mut remaining = attempts;
+    loop {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(err) if is_open_time_lock_error(&err) => {
+                warn!(
+                    attempt = attempts - remaining + 1,
+                    total_attempts = attempts + 1,
+                    error = ?err,
+                    "database open blocked by another process (open-time WAL lock)"
+                );
+                if remaining == 0 {
+                    return Err(err);
+                }
+                tokio::time::sleep(delay).await;
+                remaining -= 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 impl Connection {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         let path_str = path
@@ -511,11 +586,14 @@ impl Connection {
         // If you need to add/remove an experimental feature, change
         // experimental_database_opts() and EXPERIMENTAL_FEATURES — not here.
         let opts = experimental_database_opts();
-        let db = Builder::new_local(path_str)
-            .experimental_index_method(opts.enable_index_method)
-            .build()
-            .await
-            .context("failed to open local database")?;
+        let db = with_open_lock_retry(OPEN_LOCK_RETRY_ATTEMPTS, OPEN_LOCK_RETRY_DELAY, || async {
+            Builder::new_local(path_str)
+                .experimental_index_method(opts.enable_index_method)
+                .build()
+                .await
+        })
+        .await
+        .context("failed to open local database")?;
         let conn = db.connect()?;
         conn.busy_timeout(Duration::from_mins(1))?;
         // In-memory temp storage for this connection (turso's
@@ -3003,6 +3081,7 @@ fn family_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn experimental_features_are_consistent() {
@@ -4046,6 +4125,103 @@ mod tests {
         assert!(
             quarantined,
             "original family must be quarantined (forensic record)"
+        );
+    }
+
+    #[test]
+    fn open_time_lock_error_predicate() {
+        let lock = |msg: &str| turso::Error::Error(msg.to_string());
+        // The real open-time fcntl `F_SETLK` WouldBlock folded into the
+        // generic Error variant by turso_core's catch-all From impl.
+        assert!(is_open_time_lock_error(&lock(
+            "Locking error: Failed locking file '/x/logs.db-wal'. File is locked by another process"
+        )));
+        // The shared-WAL coordination file variant of the same open-time lock.
+        assert!(is_open_time_lock_error(&lock(
+            "Locking error: Failed locking shared WAL coordination file. File is locked by another process"
+        )));
+        // A statement-level busy error is NOT the open-time lock.
+        assert!(!is_open_time_lock_error(&turso::Error::Busy(
+            "database is locked".into()
+        )));
+        // A table-level lock surfaced as a generic Error is NOT the open-time lock.
+        assert!(!is_open_time_lock_error(&lock(
+            "Runtime error: database table is locked"
+        )));
+        // Corruption and I/O-class messages must not be treated as this race.
+        assert!(!is_open_time_lock_error(&lock(
+            "Database file is corrupted"
+        )));
+    }
+
+    #[tokio::test]
+    async fn open_lock_retry_succeeds_after_transient_lock() {
+        let calls = AtomicUsize::new(0);
+        let result = with_open_lock_retry(3, Duration::from_millis(1), || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(turso::Error::Error(
+                        "Locking error: Failed locking file '/x/logs.db-wal'. File is locked by another process".to_string(),
+                    ))
+                } else {
+                    Ok("opened")
+                }
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "open must succeed after the transient lock clears"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "closure must be called twice before success"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_lock_retry_exhausts_and_preserves_error() {
+        let calls = AtomicUsize::new(0);
+        let err = with_open_lock_retry(2, Duration::from_millis(1), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), turso::Error>(turso::Error::Error(
+                    "Locking error: Failed locking file '/x/logs.db-wal'. File is locked by another process".to_string(),
+                ))
+            }
+        })
+        .await
+        .expect_err("a persistent open-time lock must eventually surface");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "max total tries must be attempts + 1"
+        );
+        assert!(
+            is_open_time_lock_error(&err),
+            "the original lock error must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_lock_no_retry_on_non_lock_error() {
+        let calls = AtomicUsize::new(0);
+        let err = with_open_lock_retry(2, Duration::from_millis(1), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), turso::Error>(turso::Error::Error("Disk I/O error".to_string())) }
+        })
+        .await
+        .expect_err("a non-lock open failure must not be retried");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "non-lock errors must not trigger retries"
+        );
+        assert!(
+            matches!(&err, turso::Error::Error(msg) if msg == "Disk I/O error"),
+            "the original non-lock error must be returned"
         );
     }
 }
