@@ -471,9 +471,9 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
     }
 }
 
-/// Render one group: header (flat label + run-lifetime marker) then the group
-/// panel holding its cards/rows. Cards are visually separated from the panel
-/// via the established card style.
+/// Render one group: header (flat label + run-lifetime marker) then its
+/// cards/rows directly on the page background — each agent card carries its
+/// own card style; call rows are unadorned by design.
 fn render_group(
     group: &DisplayGroup,
     expanded: &HashSet<(String, u64)>,
@@ -526,10 +526,7 @@ fn render_group(
         Row::with_children(header_parts)
             .spacing(8)
             .align_y(Alignment::Center),
-        container(items)
-            .width(Length::Fill)
-            .padding(10)
-            .style(theme::elevated_card_style),
+        items,
     ]
     .spacing(6)
     .into()
