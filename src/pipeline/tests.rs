@@ -1681,14 +1681,15 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         "dev",
     )
     .await;
-    let pin_id = crate::jobs::engineer_session_pin_id(&eid);
+    let pin_id = crate::jobs::session_pin_id(&eid, crate::Role::Engineer);
     // Seed the engineer's stable session anchor; a hard-failure reset must
     // preserve it across the round job's deletion.
-    crate::jobs::upsert_engineer_session_pin(
+    crate::jobs::upsert_session_pin(
         &crate::session::store().conn,
         &eid,
         "implement",
         crate::jobs::RowStatus::Launched,
+        crate::Role::Engineer,
     )
     .await
     .unwrap();

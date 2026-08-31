@@ -30,9 +30,9 @@ pub async fn run_archive_cancelled_loop() {
             break;
         }
 
-        // Engineer-anchor terminal deletion (S5): remove permanently-NULL
-        // seats for tickets in a terminal phase — the TTL guard stops
-        // protecting the accumulated engineer session once the anchor is gone
+        // Session-pin terminal deletion (S5): remove permanently-NULL seats
+        // for tickets in a terminal phase — the TTL guard stops protecting
+        // the accumulated stage session once the pin is gone
         // (idempotent, ≤5-min delay against the 8h TTL).
         crate::jobs::purge_terminal_session_pins().await;
 

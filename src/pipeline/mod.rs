@@ -525,11 +525,12 @@ async fn run_claim_pipeline(ws: &Workspace) {
         && let Ok(Some(ticket)) = board().claim_queued_for_development(&ws.name, now).await
     {
         info!(ticket = %ticket.id, workspace = %ws.name, "Claimed Queued → InDevelopment");
-        let _ = crate::jobs::upsert_engineer_session_pin(
+        let _ = crate::jobs::upsert_session_pin(
             &crate::session::store().conn,
             &ticket.id,
             &ticket.title,
             crate::jobs::RowStatus::Launched,
+            Role::Engineer,
         )
         .await;
     }
@@ -1323,12 +1324,30 @@ fn load_verifier_angles(role: Role) -> Vec<String> {
 
 // ── Single-agent stage rounds (engineer / sanitation) ───────────────────
 
-/// The single-agent stage rounds sharing one run tail: engineer (NULL-seat
-/// anchor) and sanitation (job-derived agent ID).
+/// The single-agent stage rounds sharing one run tail (each driven by a
+/// permanently-NULL-seat session pin): engineer and sanitation.
 #[derive(Clone, Copy)]
 enum StageRunKind {
     Engineer,
     Sanitation,
+}
+
+impl StageRunKind {
+    /// The role dispatched for this stage round.
+    fn role(self) -> Role {
+        match self {
+            Self::Engineer => Role::Engineer,
+            Self::Sanitation => Role::Sanitation,
+        }
+    }
+
+    /// The `agents.kind` roster label for this stage round.
+    fn agent_kind(self) -> crate::jobs::AgentKind {
+        match self {
+            Self::Engineer => crate::jobs::AgentKind::Engineer,
+            Self::Sanitation => crate::jobs::AgentKind::Sanitation,
+        }
+    }
 }
 
 async fn run_single_agent(
@@ -1388,7 +1407,7 @@ async fn guard_stage(
 }
 
 /// Run the stage-agent round tail shared by fresh dispatch. The NULL-seat
-/// anchor preserves the accumulated engineer session across round-job deletion.
+/// pin preserves the accumulated stage session across round-job deletion.
 async fn run_stage_agent(
     ticket: &Ticket,
     ws: &Workspace,
@@ -1396,55 +1415,30 @@ async fn run_stage_agent(
     task: &str,
     kind: StageRunKind,
 ) {
-    match kind {
-        StageRunKind::Engineer => {
-            if let Err(e) = crate::jobs::upsert_engineer_session_pin(
-                &crate::session::store().conn,
-                &ticket.id,
-                task,
-                crate::jobs::RowStatus::Launched,
-            )
-            .await
-            {
-                warn!(
-                    ticket = %ticket.id,
-                    job = %job_id,
-                    error = %e,
-                    "Failed to upsert engineer anchor — session continuity across bounces degraded",
-                );
-            }
-        }
-        StageRunKind::Sanitation => {
-            if let Err(e) = crate::jobs::upsert_sanitation_session_pin(
-                &crate::session::store().conn,
-                &ticket.id,
-                task,
-                crate::jobs::RowStatus::Launched,
-            )
-            .await
-            {
-                warn!(
-                    ticket = %ticket.id,
-                    job = %job_id,
-                    error = %e,
-                    "Failed to upsert sanitation anchor — session continuity across resets degraded",
-                );
-            }
-        }
+    let role = kind.role();
+    if let Err(e) = crate::jobs::upsert_session_pin(
+        &crate::session::store().conn,
+        &ticket.id,
+        task,
+        crate::jobs::RowStatus::Launched,
+        role,
+    )
+    .await
+    {
+        warn!(
+            ticket = %ticket.id,
+            job = %job_id,
+            error = %e,
+            "Failed to upsert {} session pin — session continuity across bounces/resets degraded",
+            role,
+        );
     }
 
-    let agent_id = match kind {
-        StageRunKind::Engineer => crate::jobs::engineer_session_pin_id(&ticket.id),
-        StageRunKind::Sanitation => crate::jobs::sanitation_session_pin_id(&ticket.id),
-    };
-    let agent_kind = match kind {
-        StageRunKind::Engineer => crate::jobs::AgentKind::Engineer,
-        StageRunKind::Sanitation => crate::jobs::AgentKind::Sanitation,
-    };
+    let agent_id = crate::jobs::session_pin_id(&ticket.id, role);
     let incoming_rx = register_running_agent(
         job_id,
         &agent_id,
-        agent_kind,
+        kind.agent_kind(),
         match kind {
             StageRunKind::Engineer => {
                 "Failed to register running engineer — stale agent already cancelled at dispatch, proceeding without roster registration"
@@ -1459,10 +1453,7 @@ async fn run_stage_agent(
     let message = task.to_string();
     let (agent, response) = run_single_agent(
         agent_id,
-        match kind {
-            StageRunKind::Engineer => Role::Engineer,
-            StageRunKind::Sanitation => Role::Sanitation,
-        },
+        kind.role(),
         ws,
         ticket,
         &message,

@@ -1327,7 +1327,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
         "Boot recovery scan complete",
     );
 
-    // Boot sweep for engineer anchors (S5 terminal deletion): anchors for
+    // Boot sweep for session pins (S5 terminal deletion): pins for
     // tickets already in a terminal phase are removed so the TTL guard stops
     // protecting their accumulated sessions (the 5-min archive loop re-runs
     // this — boot just catches up after downtime).
@@ -1336,86 +1336,50 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
     Ok(resumable)
 }
 
-// ── Engineer anchor (S5 — permanently-NULL seat) ────────────────────────
+// ── Session pins (S5 — permanently-NULL seats) ──────────────────────────
 
-/// Deterministic engineer anchor agent ID: the per-ticket accumulated
-/// session `ticket_{ticket_id}_engineer`, permanently job_id = NULL.
+/// Deterministic session-pin agent ID: the per-ticket accumulated session
+/// `ticket_{ticket_id}_{role}`, permanently job_id = NULL.
 #[must_use]
-pub fn engineer_session_pin_id(ticket_id: &str) -> String {
-    crate::session::ticket_agent_id(ticket_id, crate::Role::Engineer.as_str())
+pub(crate) fn session_pin_id(ticket_id: &str, role: Role) -> String {
+    crate::session::ticket_agent_id(ticket_id, role.as_str())
 }
 
-/// Deterministic sanitation anchor agent ID: the per-ticket accumulated
-/// session `ticket_{ticket_id}_sanitation`, permanently job_id = NULL.
-#[must_use]
-pub fn sanitation_session_pin_id(ticket_id: &str) -> String {
-    crate::session::ticket_agent_id(ticket_id, crate::Role::Sanitation.as_str())
-}
-
-/// Upsert the engineer anchor. NEVER sets job_id (setting it removes the row
-/// from the partial-index scope → later NULL insert no longer conflicts →
-/// duplicate anchor). The DDL and this UPSERT use the IDENTICAL syntactic
-/// WHERE form (`job_id IS NULL` on both sides).
-pub(crate) async fn upsert_engineer_session_pin(
+/// Upsert the session pin for `role` (engineer/sanitation). NEVER sets job_id
+/// (setting it removes the row from the partial-index scope → later NULL
+/// insert no longer conflicts → duplicate anchor). The DDL and this UPSERT use
+/// the IDENTICAL syntactic WHERE form (`job_id IS NULL` on both sides).
+pub(crate) async fn upsert_session_pin(
     conn: &Connection,
     ticket_id: &str,
     task: &str,
     status: RowStatus,
+    role: Role,
 ) -> Result<()> {
-    let anchor_id = engineer_session_pin_id(ticket_id);
+    let pin_id = session_pin_id(ticket_id, role);
     conn.execute(
         "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
-         VALUES (NULL, ?1, 'engineer', NULL, ?2, NULL, ?3) \
+         VALUES (NULL, ?1, ?4, NULL, ?2, NULL, ?3) \
          ON CONFLICT(agent_id) WHERE job_id IS NULL \
          DO UPDATE SET status = ?2, task = ?3, outcome = NULL",
-        params![anchor_id, status.as_str(), task],
+        params![pin_id, status.as_str(), task, role.as_str()],
     )
     .await
-    .with_context(|| format!("failed to upsert engineer anchor for ticket {ticket_id}"))?;
+    .with_context(|| format!("failed to upsert {role} session pin for ticket {ticket_id}"))?;
     Ok(())
 }
 
-/// Upsert the sanitation anchor (permanently-NULL seat) — mirrors the engineer
-/// pin so the sanitation session survives re-attempts (resets/new phase jobs).
-pub(crate) async fn upsert_sanitation_session_pin(
-    conn: &Connection,
-    ticket_id: &str,
-    task: &str,
-    status: RowStatus,
-) -> Result<()> {
-    let anchor_id = sanitation_session_pin_id(ticket_id);
-    conn.execute(
-        "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
-         VALUES (NULL, ?1, 'sanitation', NULL, ?2, NULL, ?3) \
-         ON CONFLICT(agent_id) WHERE job_id IS NULL \
-         DO UPDATE SET status = ?2, task = ?3, outcome = NULL",
-        params![anchor_id, status.as_str(), task],
-    )
-    .await
-    .with_context(|| format!("failed to upsert sanitation anchor for ticket {ticket_id}"))?;
-    Ok(())
-}
-
-/// Parse `ticket_{ticket_id}_engineer` — the ticket id is everything before
-/// the final `_engineer` (workspace names allow underscores, so ticket ids
-/// like `my_ws-42` are valid — only the final suffix is stripped).
+/// Parse `ticket_{ticket_id}_{role}` — the ticket id is everything before the
+/// final `_{role}` (workspace names allow underscores, so ticket ids like
+/// `my_ws-42` are valid — only the final suffix is stripped).
 #[must_use]
-pub fn engineer_session_pin_ticket_id(agent_id: &str) -> Option<String> {
+pub(crate) fn session_pin_ticket_id(agent_id: &str, role: Role) -> Option<String> {
     agent_id
         .strip_prefix("ticket_")
-        .and_then(|rest| rest.strip_suffix("_engineer"))
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-}
-
-/// Parse `ticket_{ticket_id}_sanitation` — the ticket id is everything before
-/// the final `_sanitation` (workspace names allow underscores, so ticket ids
-/// like `my_ws-42` are valid — only the final suffix is stripped).
-#[must_use]
-pub fn sanitation_session_pin_ticket_id(agent_id: &str) -> Option<String> {
-    agent_id
-        .strip_prefix("ticket_")
-        .and_then(|rest| rest.strip_suffix("_sanitation"))
+        .and_then(|rest| {
+            rest.strip_suffix(role.as_str())
+                .and_then(|r| r.strip_suffix('_'))
+        })
         .filter(|id| !id.is_empty())
         .map(str::to_string)
 }
@@ -1450,11 +1414,11 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
         let Ok(kind) = row.get::<String>(1) else {
             continue;
         };
-        let ticket_id = if kind == "engineer" {
-            engineer_session_pin_ticket_id(&agent_id)
-        } else {
-            sanitation_session_pin_ticket_id(&agent_id)
+        let role = match kind.as_str() {
+            "engineer" => Role::Engineer,
+            _ => Role::Sanitation,
         };
+        let ticket_id = session_pin_ticket_id(&agent_id, role);
         let Some(ticket_id) = ticket_id else {
             continue;
         };
@@ -1475,12 +1439,12 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
         {
             Ok(_) => deleted += 1,
             Err(e) => {
-                warn!(agent = %agent_id, error = %e, "Failed to delete terminal engineer anchor");
+                warn!(agent = %agent_id, error = %e, "Failed to delete terminal session pin");
             }
         }
     }
     if deleted > 0 {
-        info!(deleted, "Removed engineer anchors for terminal tickets");
+        info!(deleted, "Removed session pins for terminal tickets");
     }
     deleted
 }
