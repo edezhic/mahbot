@@ -2431,7 +2431,7 @@ impl SettingsState {
                                     .style(theme::pick_list_style)
                                     .menu_style(theme::pick_list_menu_style)
                                     .padding([theme::PAD_4, theme::PAD_8])
-                                    .width(Length::Fixed(100.0)),
+                                    .width(Length::Fixed(120.0)),
                                     text("Active workspace").size(theme::TEXT_11),
                                     tooltip::Position::Top,
                                 )
