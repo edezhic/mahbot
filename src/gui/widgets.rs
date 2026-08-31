@@ -310,6 +310,9 @@ pub fn maint_badge<'a, Message: 'a>(enabled: bool) -> Column<'a, Message> {
     .align_x(Alignment::Center)
 }
 
+/// Icon size of the board's ticket-card action/archive buttons.
+pub const ACTION_ICON_SIZE: f32 = 16.0;
+
 /// Shared icon/action button wrapped in a tooltip.
 ///
 /// Replicates the `tooltip(button(icon).style(..).padding(..).on_press_maybe(..),
@@ -338,6 +341,25 @@ where
         position,
     )
     .style(theme::tooltip_style)
+    .into()
+}
+
+/// Invisible, non-interactive, zero-width replica of an icon button:
+/// an [`iced_fonts::lucide`] icon at [`ACTION_ICON_SIZE`] inside a
+/// default-padded [`button`], clipped to zero width by its container.
+///
+/// Push it into an action-icon row whose real buttons are all
+/// conditionally absent (e.g. archived ticket cards): it contributes no
+/// width and paints nothing, but pins the row's height to whatever the
+/// real buttons produce, so the surrounding row never collapses.
+#[must_use]
+pub fn ghost_icon_button<Message: 'static + Clone>() -> Element<'static, Message> {
+    container(
+        button(lucide::circle_check::<iced::Theme, iced::Renderer>().size(ACTION_ICON_SIZE))
+            .padding(button::DEFAULT_PADDING),
+    )
+    .width(0)
+    .clip(true)
     .into()
 }
 

@@ -743,7 +743,7 @@ impl BoardState {
                 theme::button_text
             };
             icon_row = icon_row.push(widgets::icon_tooltip_button(
-                icon.size(16).color(icon_color),
+                icon.size(widgets::ACTION_ICON_SIZE).color(icon_color),
                 tooltip_text,
                 if is_disabled {
                     None
@@ -1468,7 +1468,12 @@ impl BoardState {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
         let actions = Self::available_actions(ticket.phase);
-        let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
+        let mut icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
+        if actions.is_empty() {
+            // Done/Cancelled cards render no action buttons; the ghost pins
+            // the badge row's height to the button-bearing metrics.
+            icon_row = icon_row.push(widgets::ghost_icon_button());
+        }
 
         let (unfulfilled_count, unfulfilled_ids) = self.unfulfilled_prereq_count(ticket);
 
@@ -1537,7 +1542,7 @@ impl BoardState {
         {
             let archive_btn = widgets::icon_tooltip_button(
                 lucide::archive::<iced::Theme, iced::Renderer>()
-                    .size(16)
+                    .size(widgets::ACTION_ICON_SIZE)
                     .color(theme::TEXT_MUTED),
                 "archive ticket",
                 if is_action_disabled {
