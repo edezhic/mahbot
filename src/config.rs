@@ -658,6 +658,13 @@ pub(crate) fn resolve_list_or(
 /// strip a trailing `/chat/completions` suffix. The default OpenRouter URL and
 /// trivial variants (trailing slash, whitespace, scheme/host case,
 /// chat-completions suffix) must never count as a custom endpoint.
+///
+/// Suffix matching is case-sensitive (`/Chat/Completions` is not stripped).
+/// Scheme-less input is returned largely unchanged (no `://` → no lowercasing,
+/// just trimmed/stripped); empty/whitespace-only input normalizes to `""`.
+///
+/// SSoT coupling: future changes here intentionally affect fetch URL
+/// construction at all call sites (catalog, transcribe, compatible provider).
 #[must_use]
 pub(crate) fn normalize_endpoint_url(url: &str) -> String {
     let t = url.trim().trim_end_matches('/');

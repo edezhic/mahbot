@@ -98,19 +98,8 @@ pub(crate) fn failure_class(class: reliable::ErrorClass, truncated: bool) -> Fai
 }
 
 /// Ensure a base URL includes the `/chat/completions` path segment.
-/// Delegates to [`crate::config::normalize_endpoint_url`] for suffix handling,
-/// so this also trims surrounding whitespace (both ends, not just trailing `/`)
-/// and lowercases scheme/host. Intentional narrow behavior change vs the
-/// previous `trim_end_matches('/')`-only impl — stored values are already
-/// rejected for uppercase scheme via `is_http_url` and pre-trimmed via
-/// `trimmed_or_none`, so divergence was latent/hygiene.
-/// SSoT coupling: future changes to `normalize_endpoint_url` intentionally
-/// affect fetch URL construction at all call sites (catalog, transcribe,
-/// compatible provider).
-/// Suffix matching remains case-sensitive (`/Chat/Completions` is not stripped).
-/// Edge cases: scheme-less input is returned largely unchanged (no `://` → no
-/// lowercasing, just trimmed/stripped); empty/whitespace-only input normalizes
-/// to `""` and this wrapper then yields `"/chat/completions"`.
+/// Normalization and edge-case behavior: see
+/// [`crate::config::normalize_endpoint_url`].
 pub(crate) fn ensure_chat_completions_url(url: &str) -> String {
     format!("{}/chat/completions", normalize_endpoint_url(url))
 }
@@ -122,19 +111,8 @@ pub(crate) fn ensure_chat_completions_url(url: &str) -> String {
 /// can be appended. Image generation uses the chat-completions endpoint directly
 /// (it mimics a chat-format tool-use API), while video generation uses a dedicated
 /// `/videos` endpoint under the same API base.
-/// Delegates to [`crate::config::normalize_endpoint_url`] for suffix handling,
-/// so this also trims surrounding whitespace (both ends, not just trailing `/`)
-/// and lowercases scheme/host. Intentional narrow behavior change vs the
-/// previous `trim_end_matches('/')`-only impl — stored values are already
-/// rejected for uppercase scheme via `is_http_url` and pre-trimmed via
-/// `trimmed_or_none`, so divergence was latent/hygiene.
-/// SSoT coupling: future changes to `normalize_endpoint_url` intentionally
-/// affect fetch URL construction at all call sites (catalog, transcribe,
-/// compatible provider).
-/// Suffix matching remains case-sensitive (`/Chat/Completions` is not stripped).
-/// Edge cases: scheme-less input is returned largely unchanged (no `://` → no
-/// lowercasing, just trimmed/stripped); empty/whitespace-only input normalizes
-/// to `""`.
+///
+/// Normalization and edge-case behavior: see [`crate::config::normalize_endpoint_url`].
 pub(crate) fn ensure_base_url(url: &str) -> String {
     normalize_endpoint_url(url)
 }

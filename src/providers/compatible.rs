@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 pub(crate) struct OpenAiCompatibleProvider {
-    pub name: String,
-    pub base_url: String,
-    pub credential: Option<String>,
+    name: String,
+    base_url: String,
+    credential: Option<String>,
 
     /// HTTP request timeout in seconds for LLM API calls. Default: 120.
     timeout_secs: u64,
@@ -203,11 +203,6 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-/// Remove `<think>...</think>` blocks from model output.
-/// Some reasoning models (e.g. `MiniMax`) embed their chain-of-thought inline
-/// in the `content` field rather than a separate `reasoning_content` field.
-/// The resulting `<think>` tags must be stripped before returning to the user.
-
 #[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
     #[serde(default)]
@@ -245,7 +240,7 @@ impl ResponseMessage {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ApiToolCall {
+struct ApiToolCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(rename = "type")]
@@ -272,7 +267,7 @@ pub(crate) struct ApiToolCall {
 /// Resolve tool-call name from `function.name` or top-level `name`.
 /// Returns the first non-empty name, or `None` if both are absent/empty.
 #[must_use]
-pub(crate) fn resolve_tool_call_name(
+fn resolve_tool_call_name(
     function_name: Option<&str>,
     direct_name: Option<&str>,
 ) -> Option<String> {
@@ -286,7 +281,7 @@ pub(crate) fn resolve_tool_call_name(
 /// or the `parameters` field (DeepSeek compatibility where arguments arrive as an object).
 /// Returns the first non-empty arguments string, or `None` if all are absent/empty.
 #[must_use]
-pub(crate) fn resolve_tool_call_arguments(
+fn resolve_tool_call_arguments(
     function_arguments: Option<&str>,
     direct_arguments: Option<&str>,
     parameters: Option<&serde_json::Value>,
@@ -321,11 +316,11 @@ impl ApiToolCall {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct ApiToolCallFunction {
+struct ApiToolCallFunction {
     #[serde(default)]
-    pub(crate) name: Option<String>,
+    name: Option<String>,
     #[serde(default)]
-    pub(crate) arguments: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -384,7 +379,7 @@ impl NativeMessage {
 /// `[IMAGE:]`, and non‑IMAGE markers (e.g. `[AUDIO:…]`) are likewise left
 /// untouched in the cleaned text.
 #[must_use]
-pub(crate) fn parse_image_markers(content: &str) -> (String, Vec<String>) {
+fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs: Vec<String> = Vec::new();
 
     let cleaned = crate::util::MEDIA_MARKER_RE
@@ -408,7 +403,7 @@ pub(crate) fn parse_image_markers(content: &str) -> (String, Vec<String>) {
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-pub(crate) enum MessageContent {
+enum MessageContent {
     Text(String),
     Parts(Vec<MessagePart>),
     Null,
@@ -416,14 +411,14 @@ pub(crate) enum MessageContent {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum MessagePart {
+enum MessagePart {
     Text { text: String },
     ImageUrl { image_url: ImageUrlPart },
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ImageUrlPart {
-    pub url: String,
+struct ImageUrlPart {
+    url: String,
 }
 
 /// Convert a role+content pair into the appropriate [`MessageContent`] variant.
@@ -439,7 +434,7 @@ pub(crate) struct ImageUrlPart {
 /// (`crate::session::estimate_tokens`) was removed with the
 /// token-estimation heuristic — this conversion is now the only place
 /// marker parsing lives.
-pub(crate) fn to_message_content(role: ChatRole, content: &str) -> MessageContent {
+fn to_message_content(role: ChatRole, content: &str) -> MessageContent {
     if role != ChatRole::User {
         return MessageContent::Text(content.to_string());
     }
@@ -683,16 +678,14 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Shared success tail of [`Provider::chat`] and [`Provider::chat_scoped`]:
-    /// usage mapping (incl. provider-reported cache tokens), first-choice
-    /// extraction, native-response parsing, and the tool-turn debug log.
-    /// `no_response` builds the error when no choice exists.
-    fn finalize_response<E>(
+    /// Shared success tail of [`Provider::chat_scoped`]: usage mapping (incl.
+    /// provider-reported cache tokens), first-choice extraction,
+    /// native-response parsing, and the tool-turn debug log.
+    fn finalize_response(
         &self,
         model: &str,
         native_response: ApiChatResponse,
-        no_response: impl FnOnce() -> E,
-    ) -> Result<ProviderChatResponse, E> {
+    ) -> Result<ProviderChatResponse, ScopedCallError> {
         let usage = native_response.usage.map(|u| {
             let (cached, miss) = normalize_cache_tokens(
                 u.prompt_tokens_details
@@ -712,11 +705,12 @@ impl OpenAiCompatibleProvider {
             }
         });
         let upstream_provider = native_response.provider.clone();
-        let choice = native_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(no_response)?;
+        let choice = native_response.choices.into_iter().next().ok_or_else(|| {
+            scoped_simple_error(
+                anyhow::anyhow!("No response from {}", self.name),
+                FailureClass::NoResponse,
+            )
+        })?;
         let finish_reason = choice.finish_reason;
         let message = choice.message;
 
@@ -739,7 +733,7 @@ impl OpenAiCompatibleProvider {
         Ok(result)
     }
 
-    /// Build the HTTP request for [`Provider::chat`] / [`Provider::chat_scoped`].
+    /// Build the HTTP request for [`Provider::chat_scoped`].
     /// This function itself is synchronous; the caller sends the request asynchronously.
     ///
     /// The request BYTES are identical regardless of which client is used —
@@ -1182,12 +1176,7 @@ impl Provider for OpenAiCompatibleProvider {
             }
         };
 
-        self.finalize_response(&model, native_response, || {
-            scoped_simple_error(
-                anyhow::anyhow!("No response from {}", self.name),
-                FailureClass::NoResponse,
-            )
-        })
+        self.finalize_response(&model, native_response)
     }
 }
 
@@ -1272,8 +1261,13 @@ mod tests {
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
         let p = OpenAiCompatibleProvider::new("Local", "http://127.0.0.1:1", None);
+        let policy = crate::retry::RetryPolicy::default();
         let result = p
-            .chat(test_request(vec![ChatMessage::user("hello")], None))
+            .chat_scoped(
+                test_request(vec![ChatMessage::user("hello")], None),
+                policy.idle_timeout,
+                std::time::Instant::now() + policy.operation_timeout,
+            )
             .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();

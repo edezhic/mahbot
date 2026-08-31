@@ -1442,25 +1442,6 @@ pub(crate) type ExtractionValidator<T> = dyn Fn(&T) -> Result<(), String> + Send
 
 #[async_trait]
 pub(crate) trait Provider: Send + Sync {
-    /// Send a chat request using the model specified in the request.
-    ///
-    /// The default implementation delegates to [`Self::chat_scoped`] with the
-    /// standard scoped timeouts (used by test doubles and any provider that
-    /// only implements the scoped path).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Default kept for test doubles; production dispatches chat_scoped"
-        )
-    )]
-    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
-        let deadline = std::time::Instant::now() + crate::retry::DEFAULT_OPERATION_TIMEOUT;
-        self.chat_scoped(request, crate::retry::DEFAULT_IDLE_TIMEOUT, deadline)
-            .await
-            .map_err(|e| e.inner)
-    }
-
     /// Single-attempt chat for the outer retry paths.
     ///
     /// Used by the outer retry loops in [`crate::retry`]. Contract:
@@ -1476,7 +1457,7 @@ pub(crate) trait Provider: Send + Sync {
     ///   diagnostics (classification, error chain, finish_reason) for the
     ///   retry trail.
     ///
-    /// Real providers must implement this method (or override [`Self::chat`]).
+    /// All providers must implement this method.
     async fn chat_scoped(
         &self,
         request: ChatRequest,

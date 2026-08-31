@@ -286,12 +286,6 @@ impl FakeProvider {
 
 #[async_trait::async_trait]
 impl crate::Provider for FakeProvider {
-    async fn chat(&self, _request: crate::ChatRequest) -> anyhow::Result<crate::ChatResponse> {
-        // The scoped tests always go through `chat_scoped`; this is a
-        // safety-net implementation for the trait's default path.
-        Ok(crate::ChatResponse::default())
-    }
-
     // `ScopedCallError` is deliberately large (full diagnostics payload); the
     // scripted-Result shape is the point of this test double.
     async fn chat_scoped(
