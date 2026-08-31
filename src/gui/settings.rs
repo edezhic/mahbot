@@ -787,9 +787,9 @@ impl SettingsState {
     /// Whether a genuinely non-default custom chat endpoint is staged or
     /// persisted in the editable snapshot (normalized — trivial variants of
     /// the default OpenRouter URL never count). Single predicate for the
-    /// OpenRouter-key highlight, the toggle state, and the OpenRouter
-    /// Provider Routing annotation, so UI state can never diverge from the
-    /// normalized runtime endpoint.
+    /// OpenRouter-key highlight, the toggle state, and the visibility of
+    /// the OpenRouter Provider Routing section, so UI state can never
+    /// diverge from the normalized runtime endpoint.
     fn custom_endpoint_active_ui(&self) -> bool {
         crate::config::is_custom_endpoint(&crate::config::effective_chat_endpoint(&self.config))
     }
@@ -1727,19 +1727,26 @@ impl SettingsState {
         let us_section = self.users_section(active_user);
 
         // Existing config sections
-        let config_sections = column![
-            self.provider_section(),
-            Space::new().height(16),
-            self.integrations_section(),
-            Space::new().height(16),
-            self.models_section(),
-            Space::new().height(16),
-            self.routing_section(),
-            Space::new().height(16),
-            self.audio_section(),
-            Space::new().height(16),
-            Self::about_section(),
-        ];
+        let config_sections = Column::new()
+            .push(self.provider_section())
+            .push(Space::new().height(16))
+            .push(self.integrations_section())
+            .push(Space::new().height(16))
+            .push(self.models_section())
+            .push(Space::new().height(16));
+        // With a custom chat endpoint active, provider routing is a no-op —
+        // hide the section entirely.
+        let config_sections = if !self.custom_endpoint_active_ui() {
+            config_sections
+                .push(self.routing_section())
+                .push(Space::new().height(16))
+        } else {
+            config_sections
+        };
+        let config_sections = config_sections
+            .push(self.audio_section())
+            .push(Space::new().height(16))
+            .push(Self::about_section());
 
         let mut content = column![
             ws_section,
@@ -3490,18 +3497,6 @@ impl SettingsState {
         let model_names = routing_slots(&self.config);
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
-        // With a custom chat endpoint staged, provider routing is a no-op —
-        // surface that so the section isn't misleading (req 8).
-        if self.custom_endpoint_active_ui() {
-            rows.push(
-                text(
-                    "Provider routing only applies to OpenRouter — the custom endpoint ignores it.",
-                )
-                .size(theme::TEXT_10)
-                .color(theme::STATUS_WARNING)
-                .into(),
-            );
-        }
         for (i, model_name) in model_names.iter().enumerate() {
             // `section_impl` clamps the content spacing to 4px, so a 4px
             // spacer row between pairs yields the 12px group gap while each
@@ -4752,6 +4747,42 @@ mod tests {
         assert!(
             state.error.is_some(),
             "failed endpoint save surfaces in the bottom banner"
+        );
+    }
+
+    /// Provider round-trip: the Provider Routing section is visible on
+    /// OpenRouter, hidden while a custom endpoint is staged (routing is a
+    /// no-op there), and visible again after toggling back. `view()` gates
+    /// the section on `custom_endpoint_active_ui()`, which is asserted
+    /// directly — rendering the full view needs the audio globals that
+    /// tests don't initialize.
+    #[test]
+    fn routing_section_visibility_round_trip() {
+        let mut state = SettingsState::new();
+        assert!(
+            !state.custom_endpoint_active_ui(),
+            "OpenRouter default: routing section visible"
+        );
+
+        // Reveal the custom-endpoint fields and stage a non-default URL
+        // (keystroke staging is enough to flip the predicate, matching the
+        // live debounced view).
+        let _ = state.update(SettingsMessage::CustomEndpointToggle(true));
+        let _ = state.update(SettingsMessage::ConfigField {
+            key: CONFIG_KEY_PROVIDER_ENDPOINT,
+            value: "http://localhost:11434/v1".into(),
+        });
+        assert!(
+            state.custom_endpoint_active_ui(),
+            "staged custom endpoint: routing section hidden"
+        );
+
+        // Toggle back to OpenRouter: the staged endpoint is cleared and the
+        // section reappears.
+        let _ = state.update(SettingsMessage::CustomEndpointToggle(false));
+        assert!(
+            !state.custom_endpoint_active_ui(),
+            "back on OpenRouter: routing section visible"
         );
     }
 }
