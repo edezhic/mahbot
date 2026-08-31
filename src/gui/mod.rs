@@ -1963,7 +1963,12 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         theme::button_text,
         tooltip::Position::Top,
     );
-    let search_row = row![search_input, clear_btn]
+    let mut search_row_children: Vec<Element<'_, Message>> = Vec::with_capacity(2);
+    search_row_children.push(search_input);
+    if search_active {
+        search_row_children.push(clear_btn);
+    }
+    let search_row = Row::with_children(search_row_children)
         .spacing(4)
         .align_y(Alignment::Center);
 
