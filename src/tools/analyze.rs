@@ -2066,10 +2066,7 @@ mod tests {
             text.contains("**Beta** [1/2]"),
             "solo group renders [1/2] without DISPUTED: {text}"
         );
-        assert!(
-            text.contains("**Ungrouped**"),
-            "ungrouped list renders: {text}"
-        );
+        assert!(text.contains("**Other**"), "ungrouped list renders: {text}");
         assert!(
             text.contains("- Agent 1: gamma is true"),
             "ungrouped member attributes its source: {text}"
@@ -2586,7 +2583,7 @@ mod tests {
             "frozen group with code-computed bracket renders: {text}"
         );
         assert!(
-            text.contains("**Ungrouped**") && text.contains("- Agent 0: beta is true"),
+            text.contains("**Other**") && text.contains("- Agent 0: beta is true"),
             "deterministic remainder renders in the ungrouped section: {text}"
         );
         assert!(

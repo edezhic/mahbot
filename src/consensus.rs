@@ -262,7 +262,7 @@ pub(crate) fn render_ungrouped_section(
     if output.ungrouped.is_empty() {
         return String::new();
     }
-    let mut out = String::from("\n\n**Ungrouped**");
+    let mut out = String::from("\n\n**Other**");
     for member in &output.ungrouped {
         let mut disputed = String::new();
         for reference in references.iter().filter(|r| r.member.id == member.id) {
