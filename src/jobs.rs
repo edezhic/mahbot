@@ -476,21 +476,13 @@ pub(crate) async fn complete_durable_job(
     envelope
 }
 
-/// Terminate a ticket's phase job (DELETE the row; the cascade clears the
-/// agent roster). A phase job is short-lived per phase — on success the phase
-/// body transitions the ticket and deletes its own job; on hard-failure
-/// cleanup it is also destroyed (the puller re-creates a fresh attempt).
-pub(crate) async fn complete_ticket_job(conn: &Connection, job_id: &str) -> Result<()> {
-    terminalize_job(conn, job_id).await
-}
-
-/// Kind-neutral terminalization for jobs whose result cannot be delivered
-/// (missing child row / unresolvable caller identity): DELETE the row
-/// entirely — CASCADE removes roster + child rows. Envelope kinds
-/// (analyze/research) are terminal only when the row is gone (the pending row IS
-/// the durable record); no-ops when the row is already absent. Safe for any
-/// jobs.kind — [`complete_ticket_job`] is the same per-phase DELETE (the phase
-/// job is transient by design; the puller recreates it on the next tick).
+/// Terminalize a job: DELETE the row entirely — CASCADE removes the agent
+/// roster and child rows; a no-op when the row is already absent. Safe for any
+/// jobs.kind. Ticket-phase call sites use it both on success (the phase body
+/// transitions the ticket and deletes its own short-lived job; the puller
+/// re-creates a fresh attempt on the next tick) and on hard-failure cleanup.
+/// Envelope kinds (analyze/research) are terminal only when the row is gone —
+/// the pending row IS the durable record.
 pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<()> {
     conn.execute("DELETE FROM jobs WHERE id = ?1", params![job_id])
         .await

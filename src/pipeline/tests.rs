@@ -371,9 +371,7 @@ async fn phase_job_is_unique_and_terminalizes() {
         .expect("phase job must be found");
     assert_eq!(row.id, job_id);
 
-    crate::jobs::complete_ticket_job(conn, &job_id)
-        .await
-        .unwrap();
+    crate::jobs::terminalize_job(conn, &job_id).await.unwrap();
     assert!(
         crate::jobs::find_phase_job(conn, &ticket_id, phase)
             .await

@@ -775,7 +775,7 @@ async fn finalize_analysis_round(
     if crate::shutdown::aborting() {
         return;
     }
-    if let Err(e) = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await {
+    if let Err(e) = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await {
         warn!(job = %job_id, error = %e, "Failed to terminalize analysis job");
     }
 }

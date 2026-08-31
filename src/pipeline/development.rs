@@ -201,7 +201,7 @@ pub(crate) async fn finalize_engineer_stage(
             "Engineer finished — transitioned ticket",
         )
         .await;
-        let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
+        let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
         return;
     }
 
@@ -267,5 +267,5 @@ async fn handle_engineer_failure(
         ticket = %ticket.id,
         "Engineer hard failure — workspace paused, ticket reset for a fresh development attempt"
     );
-    let _ = crate::jobs::complete_ticket_job(conn, job_id).await;
+    let _ = crate::jobs::terminalize_job(conn, job_id).await;
 }

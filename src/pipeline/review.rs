@@ -16,13 +16,10 @@ use crate::{Role, Workspace};
 
 use super::{
     ParallelVerdict, REVIEWER_VI, SYSTEM_ROLE, TicketPhase, TransitionCtx, VerifierInfo,
-    comment_and_transition, debug, dispatch_verifiers, guard_job_phase, info, warn,
+    comment_and_transition, debug, dispatch_verifiers, info, warn,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
-    if guard_job_phase(&ticket.id, TicketPhase::InReview, &job_id).await {
-        return;
-    }
     dispatch_verifiers(ticket, ws, REVIEWER_VI, job_id).await;
 }
 
@@ -61,7 +58,7 @@ pub(crate) async fn maybe_skip_review(
                  Skipping reviewer dispatch.",
             )
             .await;
-            let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
+            let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
             true
         }
         Ok(false) => false,

@@ -588,9 +588,7 @@ async fn is_ticket_in_phase(ticket_id: &str, expected_phase: TicketPhase) -> boo
 #[must_use]
 async fn guard_job_phase(ticket_id: &str, expected: TicketPhase, job_id: &str) -> bool {
     if !is_ticket_in_phase(ticket_id, expected).await {
-        if let Err(e) =
-            crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await
-        {
+        if let Err(e) = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await {
             warn!(job = %job_id, error = %e, "Failed to complete job after phase-moved");
         }
         return true;
@@ -862,7 +860,7 @@ pub(crate) async fn reset_phase_attempt(
     if let Err(e) = board().add_comment(&ticket.id, SYSTEM_ROLE, comment).await {
         warn!(ticket = %ticket.id, error = %e, "Failed to comment phase reset");
     }
-    let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
+    let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
 }
 
 /// Fetch the last ticket comment (any role) as failure details for a Manager
@@ -1595,7 +1593,7 @@ pub(crate) async fn bounce_to_development(
             if drains_siblings {
                 drain_queued_siblings(ticket).await;
             }
-            let _ = crate::jobs::complete_ticket_job(conn, job_id).await;
+            let _ = crate::jobs::terminalize_job(conn, job_id).await;
             info!(
                 ticket = %ticket.id,
                 "Bounce circuit breaker tripped ({} bounces) — ticket failed",
@@ -1604,7 +1602,7 @@ pub(crate) async fn bounce_to_development(
         } else {
             // Non-exhausting bounce: delete the phase job; the puller creates a
             // fresh InDevelopment attempt on the next tick.
-            let _ = crate::jobs::complete_ticket_job(conn, job_id).await;
+            let _ = crate::jobs::terminalize_job(conn, job_id).await;
             info!(
                 ticket = %ticket.id,
                 target = %target,
@@ -1661,8 +1659,12 @@ async fn finalize_verifier_round(
     }
 }
 
-/// Shared dispatch logic for parallel verifiers (reviewers and QA).
+/// Shared dispatch logic for parallel verifiers (reviewers and QA): guards the
+/// job phase (derived from the VerifierInfo), then dispatches the round.
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo, job_id: String) {
+    if guard_job_phase(&ticket.id, vi.active_phase, &job_id).await {
+        return;
+    }
     let is_reviewer = vi.role == Role::Reviewer;
     if review::maybe_skip_review(&ticket, &ws, vi, &job_id).await {
         return;

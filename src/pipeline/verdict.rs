@@ -823,6 +823,6 @@ async fn apply_clean_verifier_round(
         threshold = REVIEW_QA_THRESHOLD,
     );
     // Delete the phase job; the puller creates the next phase job.
-    let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
+    let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
     true
 }

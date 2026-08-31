@@ -101,7 +101,7 @@ async fn conclude_diagnostics_success(
         log_label,
     )
     .await;
-    let _ = crate::jobs::complete_ticket_job(&crate::session::store().conn, job_id).await;
+    let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
 }
 
 /// Conclude a failed diagnostics run — unified bounce back to development.
