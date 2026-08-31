@@ -62,8 +62,7 @@ use crate::gui::widgets;
 use chrono::{DateTime, Utc};
 
 use iced::widget::{
-    Column, Row, Space, button, column, container, mouse_area, row, scrollable, stack, text,
-    tooltip,
+    Column, Row, Space, button, column, container, mouse_area, row, stack, text, tooltip,
 };
 use iced::{Alignment, Element, Length};
 
@@ -146,11 +145,7 @@ pub(crate) fn view(
         for section in &sections {
             content = content.push(render_section(section, expanded));
         }
-        scrollable(container(content).width(Length::Fill).padding([0, 4]))
-            .height(Length::Fill)
-            .direction(theme::vertical_scrollbar())
-            .style(theme::scrollbar_style)
-            .into()
+        widgets::vscroll(content)
     };
 
     // Uniform page chrome with the rest of the dashboard: base Flexoki

@@ -4842,8 +4842,7 @@ impl EditorState {
             name,
             Space::new().width(Length::Fill),
         ]
-        .align_y(Alignment::Center)
-        .padding([0, 8]);
+        .align_y(Alignment::Center);
 
         let btn = widgets::tree_node_button(row, highlight, Some(message));
 

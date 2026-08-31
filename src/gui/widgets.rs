@@ -193,17 +193,54 @@ pub fn loading_text<'a, Message: 'a>() -> Element<'a, Message> {
     text("Loading...").size(14).color(theme::TEXT_MUTED).into()
 }
 
-/// Push an [`error_banner`] plus trailing 8px spacer onto `col` when `err` is present.
+/// Push an [`error_banner`] plus trailing 8px spacer onto `col` when `err` is
+/// present. For columns rendered outside a [`vscroll`] body, use
+/// [`push_error_banner_inset`] so the banner aligns with the scrolled content.
 #[must_use]
 pub fn push_error_banner<'a, Message: 'a>(
-    mut col: Column<'a, Message>,
+    col: Column<'a, Message>,
     err: Option<&'a str>,
 ) -> Column<'a, Message> {
+    push_banner(col, err, false)
+}
+
+/// [`push_error_banner`] with the banner inset to align with a sibling
+/// [`vscroll`] body — for banners rendered outside the scrollable itself.
+#[must_use]
+pub fn push_error_banner_inset<'a, Message: 'a>(
+    col: Column<'a, Message>,
+    err: Option<&'a str>,
+) -> Column<'a, Message> {
+    push_banner(col, err, true)
+}
+
+fn push_banner<'a, Message: 'a>(
+    mut col: Column<'a, Message>,
+    err: Option<&'a str>,
+    inset: bool,
+) -> Column<'a, Message> {
     if let Some(err) = err {
-        col = col.push(error_banner(err));
+        let banner = error_banner(err);
+        col = col.push(if inset {
+            scroll_h_inset(banner)
+        } else {
+            banner
+        });
         col = col.push(Space::new().height(8));
     }
     col
+}
+
+/// Horizontal inset matching the vertical scrollable wrappers: wrap a
+/// non-scrollable sibling of a [`vscroll`] body (banner, loading label) so its
+/// left edge aligns with the scrolled content.
+#[must_use]
+pub fn scroll_h_inset<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content.into())
+        .padding([0.0, SCROLL_H_PAD])
+        .into()
 }
 
 /// Render a centered empty-state placeholder with a lucide icon and label.
@@ -397,6 +434,15 @@ pub fn tab_close_button<'a, Message: Clone + 'a>(
     .padding(0)
 }
 
+/// Horizontal inset (per side) the shared vertical scrollable wrappers add
+/// around their content. Sites must trim their own horizontal padding by this
+/// amount so the effective content inset does not double.
+pub const SCROLL_H_PAD: f32 = 8.0;
+
+/// Bottom inset the shared horizontal scrollable wrapper adds under its
+/// content — the scrollbar rail sits on the bottom edge.
+pub const SCROLL_BOTTOM_PAD: f32 = 6.0;
+
 /// Wrap a tab strip in the shared scrollable + surface-container chrome.
 /// `scroll_id` is optional — the editor passes one for scroll-to-active-tab.
 /// `on_scroll` is optional — the editor passes a closure tracking the
@@ -409,21 +455,101 @@ pub fn tab_scrollable<'a, Message: 'a>(
     scroll_id: Option<widget::Id>,
     on_scroll: Option<impl Fn(scrollable::Viewport) -> Message + 'a>,
 ) -> Element<'a, Message> {
-    let mut sc = scrollable(row(tab_buttons).spacing(0).width(Length::Fill))
-        .direction(theme::horizontal_scrollbar())
-        .style(theme::scrollbar_style)
-        .width(Length::Fill)
-        .height(Length::Shrink);
-    if let Some(id) = scroll_id {
+    container(hscroll(
+        row(tab_buttons).spacing(0).width(Length::Fill),
+        scroll_id,
+        on_scroll,
+    ))
+    .style(theme::surface_container_style)
+    .width(Length::Fill)
+    .into()
+}
+
+/// Shared vertical [`scrollable`]: thin 6px scrollbar (see
+/// [`theme::vertical_scrollbar`]) plus an unconditional [`SCROLL_H_PAD`]
+/// horizontal content inset. Fill/Fill sized: the content container spans the
+/// viewport width, normalizing former shrink-width scrollables — rows keep
+/// their natural width unless they stretch themselves (`Fill`/`FillPortion`).
+#[must_use]
+pub fn vscroll<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    vscroll_sized(content, Length::Fill, Length::Fill)
+}
+
+/// [`vscroll`] with explicit width/height — fixed-height dropdown/result
+/// lists, shrink-height nested scrollables, fixed-width side lists.
+#[must_use]
+pub fn vscroll_sized<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: Length,
+    height: Length,
+) -> Element<'a, Message> {
+    vscroll_base(content, width, height).into()
+}
+
+/// [`vscroll`] with explicit width/height plus scroll tracking: `id` +
+/// `on_scroll` fire on every viewport change so callers can keep scroll state
+/// (chat feeds, tree panels).
+#[must_use]
+pub fn vscroll_tracked<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: Length,
+    height: Length,
+    id: widget::Id,
+    on_scroll: impl Fn(scrollable::Viewport) -> Message + 'a,
+) -> Element<'a, Message> {
+    vscroll_base(content, width, height)
+        .id(id)
+        .on_scroll(on_scroll)
+        .into()
+}
+
+/// The common vertical wrapper body: padded content inside a thin-rail
+/// [`scrollable`].
+fn vscroll_base<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: Length,
+    height: Length,
+) -> widget::Scrollable<'a, Message, iced::Theme, iced::Renderer> {
+    scrollable(
+        container(content.into())
+            .width(Length::Fill)
+            .padding([0.0, SCROLL_H_PAD]),
+    )
+    .width(width)
+    .height(height)
+    .direction(theme::vertical_scrollbar())
+    .style(theme::scrollbar_style)
+}
+
+/// Shared horizontal [`scrollable`]: thin 6px scrollbar (see
+/// [`theme::horizontal_scrollbar`]) plus an unconditional
+/// [`SCROLL_BOTTOM_PAD`] bottom content inset. Fill/Shrink sized. Consumed
+/// internally by [`tab_scrollable`]; make public when a standalone
+/// horizontal-scroll site appears.
+fn hscroll<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    id: Option<widget::Id>,
+    on_scroll: Option<impl Fn(scrollable::Viewport) -> Message + 'a>,
+) -> Element<'a, Message> {
+    let mut sc = scrollable(
+        container(content.into())
+            .width(Length::Fill)
+            .padding(Padding {
+                bottom: SCROLL_BOTTOM_PAD,
+                ..Padding::ZERO
+            }),
+    )
+    .width(Length::Fill)
+    .height(Length::Shrink)
+    .direction(theme::horizontal_scrollbar())
+    .style(theme::scrollbar_style);
+    if let Some(id) = id {
         sc = sc.id(id);
     }
     if let Some(on_scroll) = on_scroll {
         sc = sc.on_scroll(on_scroll);
     }
-    container(sc)
-        .style(theme::surface_container_style)
-        .width(Length::Fill)
-        .into()
+    sc.into()
 }
 
 /// Unified chat vertical rhythm: the composer's horizontal inset, reused
@@ -948,15 +1074,6 @@ pub const TREE_MIN_WIDTH: f32 = 260.0;
 /// at the smallest supported window size.
 pub const TREE_MAX_WIDTH: f32 = 400.0;
 
-/// Right-side room reserved in the auto-sized panel width so the 6px overlay
-/// scrollbar (see [`super::theme::thin_scrollbar`]) never covers the widest
-/// visible row's content: 6px scrollbar + 4px breathing room.
-pub const TREE_SCROLLBAR_ALLOWANCE: f32 = 10.0;
-
-/// Horizontal padding of every tree row (`.padding([0, 8])` in the editor
-/// and diff row renderers). The panel width computation adds both sides.
-pub const TREE_ROW_H_PADDING: f32 = 8.0;
-
 /// Glyph advance of JetBrains Mono as a fraction of em. Every glyph the tree
 /// rows render — ASCII, box-drawing (`│ ├ └`), `⚠`, `…`, digits — measures
 /// exactly 0.6em in both the Regular and Bold faces (verified from the TTFs
@@ -980,8 +1097,8 @@ pub fn mono_text_width(chars: usize, size: f32) -> f32 {
     chars as f32 * size * JETBRAINS_MONO_ADVANCE
 }
 
-/// Natural content width of a rendered tree row, excluding the row's
-/// horizontal padding (added by [`tree_panel_width`]).
+/// Natural content width of a rendered tree row, excluding the scrollable
+/// wrapper's horizontal inset (added by [`tree_panel_width`]).
 ///
 /// Replicates the exact row composition in the editor and diff renderers:
 /// `guide_chars` box-drawing guide glyphs (14px) + a lucide icon at
@@ -1074,10 +1191,10 @@ pub fn collect_tree_row_widths(
 /// measured: the documented fallback.
 ///
 /// The result is the widest measured row's natural content width plus the
-/// row's horizontal padding on both sides and
-/// [`TREE_SCROLLBAR_ALLOWANCE`], clamped to
-/// [`TREE_MIN_WIDTH`]..=[`TREE_MAX_WIDTH`]. A tree whose rows all fit at the
-/// minimum width stays at [`TREE_MIN_WIDTH`].
+/// vertical scrollable wrapper's horizontal inset on both sides
+/// ([`SCROLL_H_PAD`], which also clears the 6px overlay scrollbar with 2px to
+/// spare), clamped to [`TREE_MIN_WIDTH`]..=[`TREE_MAX_WIDTH`]. A tree whose
+/// rows all fit at the minimum width stays at [`TREE_MIN_WIDTH`].
 #[must_use]
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // viewport px → row index
 pub fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
@@ -1098,8 +1215,7 @@ pub fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
         // tree, where every row is visible anyway).
         _ => row_widths.iter().copied().fold(0.0f32, f32::max),
     };
-    (widest + 2.0 * TREE_ROW_H_PADDING + TREE_SCROLLBAR_ALLOWANCE)
-        .clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH)
+    (widest + 2.0 * SCROLL_H_PAD).clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH)
 }
 
 /// Controls whether [`scroll_to_tree_focus`] snaps to the focused row or
@@ -1219,11 +1335,15 @@ fn absolute_scroll_to<Message: 'static>(file_tree: &mut FileTree, y: f32) -> Tas
 /// node renderers (which may nest multiple rows per root element). See
 /// [`collect_tree_row_widths`].
 ///
-/// `on_scroll` is attached to the inner [`widget::scrollable()`] via
-/// `on_scroll` and fires whenever the viewport changes
+/// `on_scroll` is attached to the inner [`vscroll_tracked`] wrapper and fires
+/// whenever the viewport changes
 /// (scrollbar drag, mouse wheel, programmatic scroll). The caller should
 /// produce a message that updates [`FileTree::scroll_y`] and
 /// [`FileTree::viewport_h`] from the [`iced::widget::scrollable::Viewport`] data.
+///
+/// Rows render inside the wrapper's uniform [`SCROLL_H_PAD`] inset, so row
+/// hover/highlight backgrounds sit 8px inside the panel edges rather than
+/// touching them.
 pub fn build_tree_panel<'a, Message: 'a>(
     file_tree: &'a FileTree,
     tree_rows: Vec<Element<'a, Message>>,
@@ -1232,13 +1352,13 @@ pub fn build_tree_panel<'a, Message: 'a>(
 ) -> Element<'a, Message> {
     let panel_width = tree_panel_width(file_tree, row_widths);
 
-    let tree_body = widget::scrollable(column(tree_rows).spacing(0))
-        .id(file_tree.tree_scroll_id.clone())
-        .on_scroll(on_scroll)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .direction(theme::vertical_scrollbar())
-        .style(theme::scrollbar_style);
+    let tree_body = vscroll_tracked(
+        column(tree_rows).spacing(0),
+        Length::Fill,
+        Length::Fill,
+        file_tree.tree_scroll_id.clone(),
+        on_scroll,
+    );
 
     let tree_inner: Element<'_, Message> = container(tree_body)
         .width(Length::Fixed(panel_width))
@@ -2279,7 +2399,7 @@ mod tests {
 
     #[test]
     fn tree_panel_width_clamps_to_minimum() {
-        // Short rows → widest 68.4 + 26 = 94.4 < 260 → stays at minimum.
+        // Short rows → widest 100.0 + 16 = 116 < 260 → stays at minimum.
         let tree = tree_with_panel_viewport(0.0, Some(400.0));
         let widths = vec![68.4, 100.0, 50.0];
         assert!(close(tree_panel_width(&tree, &widths), TREE_MIN_WIDTH));
@@ -2287,7 +2407,7 @@ mod tests {
 
     #[test]
     fn tree_panel_width_clamps_to_maximum() {
-        // 50-char name → natural 438 → 464 → clamped to the 400px cap.
+        // 50-char name → natural 438 → 454 → clamped to the 400px cap.
         let tree = tree_with_panel_viewport(0.0, Some(400.0));
         let long_name = "x".repeat(50);
         let widths = vec![tree_row_natural_width(
@@ -2303,7 +2423,7 @@ mod tests {
 
     #[test]
     fn tree_panel_width_scales_with_widest_row() {
-        // 27-char name → 261.6 natural → 287.6 panel (within the bounds).
+        // 29-char name → 278.4 natural → 294.4 panel (within the bounds).
         let tree = tree_with_panel_viewport(0.0, Some(400.0));
         let wide = tree_row_natural_width(
             2,
@@ -2316,7 +2436,7 @@ mod tests {
         let widths = vec![68.4, wide, 50.0];
         assert!(close(
             tree_panel_width(&tree, &widths),
-            wide + 2.0 * TREE_ROW_H_PADDING + TREE_SCROLLBAR_ALLOWANCE
+            wide + 2.0 * SCROLL_H_PAD
         ));
     }
 
@@ -2330,8 +2450,7 @@ mod tests {
         let widths = vec![50.0, wide, 60.0];
         assert!(close(
             tree_panel_width(&tree, &widths),
-            (wide + 2.0 * TREE_ROW_H_PADDING + TREE_SCROLLBAR_ALLOWANCE)
-                .clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH)
+            (wide + 2.0 * SCROLL_H_PAD).clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH)
         ));
     }
 

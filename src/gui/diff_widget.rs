@@ -164,14 +164,21 @@ struct DiffBufferState {
 /// its full content height.
 pub struct DiffBufferWidget<'a> {
     data: &'a DiffFileBuffer,
-    padding: f32,
+    /// Horizontal inset. The shared scrollable wrapper (`widgets::SCROLL_H_PAD`)
+    /// provides the 8px/side inset, so the widget's own horizontal padding is 0.
+    h_padding: f32,
+    v_padding: f32,
 }
 
 impl<'a> DiffBufferWidget<'a> {
     /// Create a new [`DiffBufferWidget`] from pre-computed buffer data.
     #[must_use]
     pub const fn new(data: &'a DiffFileBuffer) -> Self {
-        Self { data, padding: 8.0 }
+        Self {
+            data,
+            h_padding: 0.0,
+            v_padding: 8.0,
+        }
     }
 }
 
@@ -199,11 +206,11 @@ const fn gutter_width_from_digits(digits: usize) -> f32 {
 /// `fill_text` uses the point as the right edge when `align_x` is `Right`.
 /// This mirrors the main editor gutter; passing each column's left edge clips
 /// or shifts line numbers into the gutter padding.
-fn gutter_column_right_edges(bounds_x: f32, padding: f32, gutter_width: f32) -> (f32, f32) {
+fn gutter_column_right_edges(bounds_x: f32, h_padding: f32, gutter_width: f32) -> (f32, f32) {
     let half_gutter = gutter_width / 2.0;
     (
-        bounds_x + padding + half_gutter,
-        bounds_x + padding + gutter_width,
+        bounds_x + h_padding + half_gutter,
+        bounds_x + h_padding + gutter_width,
     )
 }
 
@@ -313,9 +320,11 @@ fn hit_test(
     layout: Layout<'_>,
     cursor: mouse::Cursor,
     gutter_width: f32,
-    padding: f32,
+    h_padding: f32,
+    v_padding: f32,
 ) -> Option<usize> {
-    let (buf_x, buf_y) = cursor_to_buffer_coords(layout, cursor, gutter_width, padding)?;
+    let (buf_x, buf_y) =
+        cursor_to_buffer_coords(layout, cursor, gutter_width, h_padding, v_padding)?;
     let hit = buffer.hit(buf_x, buf_y)?;
     Some(hit_to_global_byte(buffer, hit.line, hit.index))
 }
@@ -379,7 +388,8 @@ where
 
         let text_area_width = text_area_rect(
             Rectangle::new(Point::ORIGIN, bounds),
-            self.padding,
+            self.h_padding,
+            self.v_padding,
             gutter_width,
         )
         .width;
@@ -404,7 +414,7 @@ where
         {
             return layout::Node::new(Size::new(
                 bounds.width,
-                entry.total_height + self.padding * 2.0,
+                entry.total_height + self.v_padding * 2.0,
             ));
         }
 
@@ -459,7 +469,7 @@ where
             total_height,
         });
 
-        layout::Node::new(Size::new(bounds.width, total_height + self.padding * 2.0))
+        layout::Node::new(Size::new(bounds.width, total_height + self.v_padding * 2.0))
     }
 
     #[expect(clippy::too_many_lines)]
@@ -492,7 +502,7 @@ where
         // ── 0. Fill background ──
         draw_background(renderer, bounds, theme::BG_BASE);
 
-        let text_rect = text_area_rect(bounds, self.padding, gutter_width);
+        let text_rect = text_area_rect(bounds, self.h_padding, self.v_padding, gutter_width);
         let text_x = text_rect.x;
         let text_y = text_rect.y;
         let text_area_width = text_rect.width;
@@ -546,7 +556,13 @@ where
 
         // ── 2. Draw line numbers (gutter) ───────────────────────────
         let number_color = theme::TEXT_MUTED;
-        let gutter_clip = gutter_clip_rect(bounds, self.padding, gutter_width, text_area_height);
+        let gutter_clip = gutter_clip_rect(
+            bounds,
+            self.h_padding,
+            self.v_padding,
+            gutter_width,
+            text_area_height,
+        );
 
         // Only draw gutter for the first visual line of each logical line.
         // `last_drawn_line` is updated for every run — including off-screen
@@ -578,7 +594,7 @@ where
 
             let half_gutter = gutter_width / 2.0;
             let (old_right_x, new_right_x) =
-                gutter_column_right_edges(bounds.x, self.padding, gutter_width);
+                gutter_column_right_edges(bounds.x, self.h_padding, gutter_width);
 
             // Draw old line number (right-aligned in left half)
             let old_str = old_num.map_or_else(String::new, |n| n.to_string());
@@ -682,9 +698,14 @@ where
 
         match event {
             Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
-                if let Some(byte) =
-                    hit_test(&buffer, layout, cursor, state.gutter_width, self.padding)
-                {
+                if let Some(byte) = hit_test(
+                    &buffer,
+                    layout,
+                    cursor,
+                    state.gutter_width,
+                    self.h_padding,
+                    self.v_padding,
+                ) {
                     state.mouse_held = true;
                     state.sel_anchor = Some(byte);
                     state.sel_cursor = Some(byte);
@@ -708,9 +729,14 @@ where
             }
 
             Event::Mouse(iced::mouse::Event::CursorMoved { .. }) if state.mouse_held => {
-                if let Some(byte) =
-                    hit_test(&buffer, layout, cursor, state.gutter_width, self.padding)
-                {
+                if let Some(byte) = hit_test(
+                    &buffer,
+                    layout,
+                    cursor,
+                    state.gutter_width,
+                    self.h_padding,
+                    self.v_padding,
+                ) {
                     state.sel_cursor = Some(byte);
                     shell.request_redraw();
                 }
@@ -1176,11 +1202,11 @@ mod tests {
     #[test]
     fn test_gutter_column_positions_are_right_edges() {
         let width = gutter_width_from_digits(3);
-        let (old_right, new_right) = gutter_column_right_edges(10.0, 8.0, width);
+        let (old_right, new_right) = gutter_column_right_edges(10.0, 0.0, width);
         #[expect(clippy::float_cmp)]
         {
-            assert_eq!(old_right, 10.0 + 8.0 + width / 2.0);
-            assert_eq!(new_right, 10.0 + 8.0 + width);
+            assert_eq!(old_right, 10.0 + width / 2.0);
+            assert_eq!(new_right, 10.0 + width);
         }
         assert!(new_right > old_right);
     }

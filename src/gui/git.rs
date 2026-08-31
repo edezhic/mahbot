@@ -12,7 +12,7 @@ use super::theme;
 
 use crate::git::commands::{DiffStats, GitFileStatus, GitWorktreeSnapshot};
 
-use iced::widget::{Column, Space, button, column, container, row, scrollable, text};
+use iced::widget::{Column, Space, button, column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
 
 use fff_search::{WatchId, WatchOptions};
@@ -753,7 +753,7 @@ impl GitState {
             .map(|branch| {
                 let b = (*branch).clone();
                 button(text(b.clone()).size(14).color(theme::TEXT_PRIMARY))
-                    .padding([6, 12])
+                    .padding([6, 4])
                     .width(Length::Fill)
                     .style(theme::button_text)
                     .on_press_maybe(if self.syncing {
@@ -765,13 +765,15 @@ impl GitState {
             })
             .collect();
 
-        let list = scrollable(Column::with_children(branch_items).spacing(2))
-            .height(Length::Fixed(300.0))
-            .style(theme::scrollbar_style);
+        let list = super::widgets::vscroll_sized(
+            Column::with_children(branch_items).spacing(2),
+            Length::Fill,
+            Length::Fixed(300.0),
+        );
 
-        // Error display
+        // Error display — inset to align with the vscroll-wrapped branch list.
         let error_elem: Element<'_, GitMessage> = if let Some(ref err) = self.branch_error {
-            text(err).size(12).color(theme::STATUS_ERROR).into()
+            super::widgets::scroll_h_inset(text(err).size(12).color(theme::STATUS_ERROR))
         } else {
             container(text("")).into()
         };

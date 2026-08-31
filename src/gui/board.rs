@@ -6,9 +6,7 @@ use std::path::Path;
 use crate::git::commands::{parse_numstat_lines, run_git_output};
 use crate::pipeline::board::{Ticket, TicketPhase};
 
-use iced::widget::{
-    Column, Row, Space, button, column, container, markdown, row, scrollable, text, tooltip,
-};
+use iced::widget::{Column, Row, Space, button, column, container, markdown, row, text, tooltip};
 use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
@@ -1788,16 +1786,12 @@ impl BoardState {
 
         // ── Scrollable content area ──────────────────────────────
         let scrollable_content =
-            scrollable(Column::from_vec(sections).spacing(4).width(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .direction(theme::vertical_scrollbar())
-                .style(theme::scrollbar_style);
+            widgets::vscroll(Column::from_vec(sections).spacing(4).width(Length::Fill));
 
         // ── Comment input area (pinned at the bottom) ────────────
         let input_area = self.render_comment_input();
 
-        column![scrollable_content.width(Length::Fill), input_area,]
+        column![scrollable_content, input_area,]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1995,17 +1989,14 @@ impl BoardState {
         }
 
         Some(if let Some(items) = description_md {
-            container(
-                scrollable(
-                    iced_selection::markdown::view(items, theme::markdown_settings())
-                        .map(BoardMessage::LinkClicked),
-                )
-                .width(Length::Fill)
-                .direction(theme::vertical_scrollbar())
-                .style(theme::scrollbar_style),
-            )
+            container(widgets::vscroll_sized(
+                iced_selection::markdown::view(items, theme::markdown_settings())
+                    .map(BoardMessage::LinkClicked),
+                Length::Fill,
+                Length::Shrink,
+            ))
             .width(Length::Fill)
-            .padding(10)
+            .padding([10, 2])
             .style(theme::bubble_style(
                 theme::BG_SURFACE,
                 Some(theme::TEXT_PRIMARY),

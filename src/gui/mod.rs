@@ -38,9 +38,7 @@ use crate::logs::LogStore;
 use crate::pipeline::board::Ticket;
 
 use iced::keyboard;
-use iced::widget::{
-    Column, Row, Space, button, column, container, row, rule, scrollable, text, tooltip,
-};
+use iced::widget::{Column, Row, Space, button, column, container, row, rule, text, tooltip};
 use iced::window;
 use iced::{Alignment, Color, Element, Length, Task};
 
@@ -2074,6 +2072,7 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     }
     let search_row = Row::with_children(search_row_children)
         .spacing(4)
+        .padding([0, 8])
         .align_y(Alignment::Center);
 
     // ── Body: search results or normal ticket groups ────────────────
@@ -2092,7 +2091,7 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     .spacing(0);
 
     container(content)
-        .padding([8, 12])
+        .padding([8, 4])
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::surface_container_style)
@@ -2106,7 +2105,7 @@ fn section_hint(label: &str) -> Element<'_, Message> {
         text(label).size(12).color(theme::TEXT_MUTED),
     ]
     .spacing(4)
-    .padding([8, 0])
+    .padding(8)
     .into()
 }
 
@@ -2137,11 +2136,7 @@ fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Mes
         if !completed.is_empty() {
             groups = groups.push(group_section("Completed", &completed, board_state));
         }
-        scrollable(groups)
-            .height(Length::Fill)
-            .direction(theme::vertical_scrollbar())
-            .style(theme::scrollbar_style)
-            .into()
+        widgets::vscroll(groups)
     }
 }
 
@@ -2154,11 +2149,7 @@ fn render_search_results(board_state: &board::BoardState) -> Element<'_, Message
         for ticket in &board_state.search_results {
             cards = cards.push(board_state.render_ticket_card(ticket).map(Message::Board));
         }
-        scrollable(cards)
-            .height(Length::Fill)
-            .direction(theme::vertical_scrollbar())
-            .style(theme::scrollbar_style)
-            .into()
+        widgets::vscroll(cards)
     }
 }
 

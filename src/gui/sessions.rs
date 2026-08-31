@@ -405,10 +405,11 @@ impl SessionsState {
     pub(crate) fn view(&self) -> Element<'_, SessionsMessage> {
         let mut content = column![];
 
-        content = widgets::push_error_banner(content, self.load_state.error());
+        // Error display — inset to align with the vscroll-wrapped list below.
+        content = widgets::push_error_banner_inset(content, self.load_state.error());
 
         if self.load_state.loading() && !self.load_state.has_loaded() {
-            content = content.push(widgets::loading_text());
+            content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
         } else if self.sessions.is_empty() {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
@@ -531,10 +532,8 @@ impl SessionsState {
                 }
             }
 
-            let session_scroll = scrollable(session_list)
-                .width(Length::Fixed(350.0))
-                .direction(theme::vertical_scrollbar())
-                .style(theme::scrollbar_style);
+            let session_scroll =
+                widgets::vscroll_sized(session_list, Length::Fixed(350.0), Length::Shrink);
 
             // Transcript on the right side. Wrapped in `responsive` so the
             // collapse measurement uses the real bubble body width, correct on
@@ -556,12 +555,12 @@ impl SessionsState {
                 let measure_cache = &self.measure_cache;
                 let scrollable_id = self.scrollable_id.clone();
                 responsive(move |size| {
-                    // The transcript container adds 8px padding per side. Every
-                    // transcript round (message or tool round) renders as a chat
-                    // bubble; all content measures at the bubble body width = 3/4
-                    // of the transcript row minus the bubble's 10px padding per
-                    // side, folded in with a +4px safety margin that errs toward
-                    // collapse.
+                    // The transcript scrollable wrapper adds 8px padding per
+                    // side. Every transcript round (message or tool round)
+                    // renders as a chat bubble; all content measures at the
+                    // bubble body width = 3/4 of the transcript row minus the
+                    // bubble's 10px padding per side, folded in with a +4px
+                    // safety margin that errs toward collapse.
                     let text_width = ((size.width - 16.0) * BUBBLE_BODY_RATIO - 24.0).max(0.0);
                     let ctx = TranscriptCtx {
                         entries,
@@ -573,7 +572,7 @@ impl SessionsState {
                     container(render_transcript(&ctx, &scrollable_id))
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .padding(8)
+                        .padding([8, 0])
                         .into()
                 })
                 .into()
@@ -1051,11 +1050,11 @@ fn render_transcript<'a>(
     for i in 0..ctx.entries.len() {
         items = items.push(render_entry(ctx, i));
     }
-    scrollable(items)
-        .id(scrollable_id.clone())
-        .on_scroll(SessionsMessage::ScrollChanged)
-        .height(Length::Fill)
-        .direction(theme::vertical_scrollbar())
-        .style(theme::scrollbar_style)
-        .into()
+    widgets::vscroll_tracked(
+        items,
+        Length::Fill,
+        Length::Fill,
+        scrollable_id.clone(),
+        SessionsMessage::ScrollChanged,
+    )
 }

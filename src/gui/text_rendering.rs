@@ -121,18 +121,23 @@ pub(crate) fn compute_total_height(
 }
 
 /// Compute the text area rectangle (position and size) inside the given
-/// `bounds`, accounting for `padding` and `gutter_width`.
+/// `bounds`, accounting for horizontal/vertical padding and `gutter_width`.
 ///
 /// The returned rectangle has:
-/// - `x`: `bounds.x + padding + gutter_width + 4px` gap
-/// - `y`: `bounds.y + padding`
-/// - `width`: remainder of `bounds.width` after gutter, gap, and padding
-/// - `height`: `bounds.height` minus `padding` on both sides
-pub(crate) fn text_area_rect(bounds: Rectangle, padding: f32, gutter_width: f32) -> Rectangle {
-    let x = bounds.x + padding + gutter_width + 4.0; // 4px gap
-    let y = bounds.y + padding;
-    let width = (bounds.width - (x - bounds.x) - padding).max(0.0);
-    let height = (bounds.height - padding * 2.0).max(0.0);
+/// - `x`: `bounds.x + h_padding + gutter_width + 4px` gap
+/// - `y`: `bounds.y + v_padding`
+/// - `width`: remainder of `bounds.width` after gutter, gap, and horizontal padding
+/// - `height`: `bounds.height` minus vertical padding on both sides
+pub(crate) fn text_area_rect(
+    bounds: Rectangle,
+    h_padding: f32,
+    v_padding: f32,
+    gutter_width: f32,
+) -> Rectangle {
+    let x = bounds.x + h_padding + gutter_width + 4.0; // 4px gap
+    let y = bounds.y + v_padding;
+    let width = (bounds.width - (x - bounds.x) - h_padding).max(0.0);
+    let height = (bounds.height - v_padding * 2.0).max(0.0);
     Rectangle {
         x,
         y,
@@ -154,16 +159,16 @@ pub(crate) fn byte_line_and_start(text: &str, offset: usize) -> (usize, usize) {
 /// Transform a cursor position into buffer-relative coordinates.
 ///
 /// Returns `Some((buf_x, buf_y))` with coordinates relative to the text
-/// buffer's origin (i.e., after subtracting padding, gutter, and the 4 px
-/// gap between gutter and text).  Returns `None` if the cursor is outside
-/// the text area (e.g. in the gutter or padding).
+/// buffer's origin (i.e., after subtracting horizontal/vertical padding,
+/// gutter, and the 4 px gap between gutter and text).  Returns `None` if the
+/// cursor is outside the text area (e.g. in the gutter or padding).
 ///
 /// # Coordinate system
 ///
 /// [`mouse::Cursor::position_in`] (Iced) subtracts `bounds.x` / `bounds.y`
 /// from the absolute cursor position, returning coordinates **relative to
 /// the widget's top-left corner**.  This function then subtracts the
-/// text-area origin (`padding + gutter_width + 4 px`) to obtain
+/// text-area origin (`h_padding + gutter_width + 4 px`) to obtain
 /// buffer-relative coordinates.  **Do not subtract `bounds.x` / `bounds.y`
 /// again** — that would double-subtract the layout position, breaking hit
 /// detection wherever the widget is not at x = 0 (e.g. beside a sidebar).
@@ -171,12 +176,13 @@ pub(crate) fn cursor_to_buffer_coords(
     layout: Layout<'_>,
     cursor: mouse::Cursor,
     gutter_width: f32,
-    padding: f32,
+    h_padding: f32,
+    v_padding: f32,
 ) -> Option<(f32, f32)> {
     let bounds = layout.bounds();
     let pos = cursor.position_in(bounds)?;
-    let buf_x = pos.x - padding - gutter_width - 4.0;
-    let buf_y = pos.y - padding;
+    let buf_x = pos.x - h_padding - gutter_width - 4.0;
+    let buf_y = pos.y - v_padding;
     if buf_x < 0.0 || buf_y < 0.0 {
         None
     } else {
@@ -187,13 +193,14 @@ pub(crate) fn cursor_to_buffer_coords(
 /// Compute the gutter clip rectangle for line numbers.
 pub(crate) fn gutter_clip_rect(
     bounds: Rectangle,
-    padding: f32,
+    h_padding: f32,
+    v_padding: f32,
     gutter_width: f32,
     text_area_height: f32,
 ) -> Rectangle {
     Rectangle {
-        x: bounds.x + padding,
-        y: bounds.y + padding,
+        x: bounds.x + h_padding,
+        y: bounds.y + v_padding,
         width: gutter_width,
         height: text_area_height,
     }

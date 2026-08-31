@@ -874,22 +874,21 @@ impl HomeState {
                     } else {
                         Some(HomeMessage::LoadOlderMessages)
                     });
+                // The 4px is the pill's design accent on top of the bubbles'
+                // inset (8 pre-rework column padding, now the wrapper's) —
+                // kept untrimmed so the pill stays 4px deeper than bubbles.
                 children.insert(0, container(load_btn).padding(4).into());
             }
 
-            container(
-                scrollable(
-                    Column::with_children(children)
-                        .spacing(super::widgets::CHAT_VERTICAL_RHYTHM)
-                        .padding(8),
-                )
-                .id(CHAT_SCROLL_ID)
-                .on_scroll(HomeMessage::ScrollChanged)
-                .direction(theme::vertical_scrollbar())
-                .style(theme::scrollbar_style)
-                .width(Length::Fill)
-                .height(Length::Fill),
-            )
+            container(super::widgets::vscroll_tracked(
+                Column::with_children(children)
+                    .spacing(super::widgets::CHAT_VERTICAL_RHYTHM)
+                    .padding([8, 0]),
+                Length::Fill,
+                Length::Fill,
+                CHAT_SCROLL_ID,
+                HomeMessage::ScrollChanged,
+            ))
             .width(Length::Fill)
             .height(Length::Fill)
             .style(theme::base_container_style)
@@ -1016,7 +1015,7 @@ impl HomeState {
 
         // Composer strip matches the BG_BASE chat pane so the empty space around
         // the rounded bubble blends with the page instead of showing a gray panel;
-        // the 8px horizontal padding matches the message-bubble column padding,
+        // the 8px horizontal padding matches the chat scrollable wrapper's inset,
         // and the bottom padding matches the shared chat vertical rhythm.
         // The bubble itself keeps its own elevated styling.
         let input_area: Element<'_, HomeMessage> = container(super::widgets::chat_composer(

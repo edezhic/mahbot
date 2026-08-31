@@ -2075,7 +2075,7 @@ fn hit_test(
     padding: f32,
     scroll_x: f32,
 ) -> Option<(usize, usize)> {
-    let (buf_x, buf_y) = cursor_to_buffer_coords(layout, cursor, gutter_width, padding)?;
+    let (buf_x, buf_y) = cursor_to_buffer_coords(layout, cursor, gutter_width, padding, padding)?;
     let buf = buffer.borrow_buffer();
     // `buf_x` is viewport-relative, but cosmic_text glyph positions are
     // stored in unscrolled buffer coordinates (horizontal scroll is applied
@@ -2479,7 +2479,7 @@ impl<'a> EditorWidget<'a> {
             return input_method::InputMethod::Disabled;
         }
 
-        let text_rect = text_area_rect(bounds, self.padding, state.gutter_width);
+        let text_rect = text_area_rect(bounds, self.padding, self.padding, state.gutter_width);
         let cursor = state.buffer_for_render.as_deref().map_or_else(
             || {
                 let metrics = font_metrics();
@@ -2613,6 +2613,7 @@ where
         let text_rect = text_area_rect(
             Rectangle::new(Point::ORIGIN, bounds),
             self.padding,
+            self.padding,
             gutter_width,
         );
         let text_area_width = text_rect.width;
@@ -2678,6 +2679,7 @@ where
             // scroll range/auto-scroll use the visible area.
             let text_rect = text_area_rect(
                 Rectangle::new(Point::ORIGIN, bounds),
+                self.padding,
                 self.padding,
                 gutter_width,
             );
@@ -2828,7 +2830,7 @@ where
         let bounds = layout.bounds();
         let gutter_width = state.gutter_width;
 
-        let text_rect = text_area_rect(bounds, self.padding, gutter_width);
+        let text_rect = text_area_rect(bounds, self.padding, self.padding, gutter_width);
         let text_x = text_rect.x;
         let text_y = text_rect.y;
         let text_area_width = text_rect.width;
@@ -2947,7 +2949,8 @@ where
                 // layout() jumps the viewport to that wrong line.
                 {
                     let bounds = layout.bounds();
-                    let text_rect = text_area_rect(bounds, self.padding, state.gutter_width);
+                    let text_rect =
+                        text_area_rect(bounds, self.padding, self.padding, state.gutter_width);
                     let text_area_width = text_rect.width;
                     let text_area_height = text_rect.height;
 
@@ -3223,7 +3226,8 @@ where
                         // Shape the buffer with current scroll so layout runs
                         // reflect the viewport (same as mouse click handler).
                         let bounds = layout.bounds();
-                        let text_rect = text_area_rect(bounds, self.padding, state.gutter_width);
+                        let text_rect =
+                            text_area_rect(bounds, self.padding, self.padding, state.gutter_width);
                         let text_area_width = text_rect.width;
                         let text_area_height = text_rect.height;
 
@@ -3325,7 +3329,8 @@ where
                     if is_cmd_left || is_cmd_right {
                         // Shape the buffer so layout runs reflect the viewport.
                         let bounds = layout.bounds();
-                        let text_rect = text_area_rect(bounds, self.padding, state.gutter_width);
+                        let text_rect =
+                            text_area_rect(bounds, self.padding, self.padding, state.gutter_width);
                         let text_area_width = text_rect.width;
                         let text_area_height = text_rect.height;
 
@@ -3682,7 +3687,7 @@ fn draw_line_numbers<Renderer>(
     Renderer: iced::advanced::text::Renderer,
 {
     let number_color = theme::TEXT_MUTED;
-    let number_clip = gutter_clip_rect(bounds, padding, gutter_width, text_area_height);
+    let number_clip = gutter_clip_rect(bounds, padding, padding, gutter_width, text_area_height);
 
     let mut last_line_i = usize::MAX;
     for run in buffer.layout_runs() {

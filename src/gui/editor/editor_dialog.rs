@@ -4,7 +4,7 @@
 //! These are free functions extracted from `EditorState` in `editor.rs`.
 //! They take all state explicitly via parameters; none access `&self`.
 
-use iced::widget::{Row, Space, button, column, container, row, scrollable, text};
+use iced::widget::{Row, Space, button, column, container, row, text};
 use iced::{Alignment, Color, Element, Length, widget::Id};
 
 use iced_fonts::lucide;
@@ -91,7 +91,7 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
                 theme::TEXT_SECONDARY
             });
             let entry = container(label)
-                .padding([4, 12])
+                .padding([4, 4])
                 .width(Length::Fill)
                 .style(result_entry_style(bg));
             button(entry)
@@ -129,9 +129,7 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
     } else {
         column![
             search_elem,
-            scrollable(results_column)
-                .height(Length::Fixed(300.0))
-                .style(theme::scrollbar_style),
+            widgets::vscroll_sized(results_column, Length::Fill, Length::Fixed(300.0)),
         ]
         .spacing(4)
         .into()
@@ -506,7 +504,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
             let entry_content = column![path_label, snippet_label].spacing(1);
 
             let entry = container(entry_content)
-                .padding([4, 12])
+                .padding([4, 4])
                 .width(Length::Fill)
                 .style(result_entry_style(bg));
 
@@ -529,9 +527,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
         column![
             search_elem,
             status_elem,
-            scrollable(results_column)
-                .height(Length::Fixed(400.0))
-                .style(theme::scrollbar_style),
+            widgets::vscroll_sized(results_column, Length::Fill, Length::Fixed(400.0)),
         ]
         .spacing(4)
         .into()

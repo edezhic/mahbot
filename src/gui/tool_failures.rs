@@ -7,7 +7,7 @@
 
 use crate::stats::{ToolErrorEntry, ToolErrorQuery};
 
-use iced::widget::{Column, Space, column, container, row, scrollable, text};
+use iced::widget::{Column, Space, column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
@@ -139,12 +139,12 @@ impl ToolFailuresState {
         let state = &self.state;
         let mut content = Column::new();
 
-        // Error display
-        content = widgets::push_error_banner(content, state.load_state.error());
+        // Error display — inset to align with the vscroll-wrapped entries below.
+        content = widgets::push_error_banner_inset(content, state.load_state.error());
 
         // Entries or empty state
         if state.load_state.loading() && !state.load_state.has_loaded() {
-            content = content.push(widgets::loading_text());
+            content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
         } else if state.entries.is_empty() && state.load_state.has_loaded() {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::bug::<iced::Theme, iced::Renderer>(),
@@ -152,7 +152,7 @@ impl ToolFailuresState {
             ));
         } else if !state.entries.is_empty() {
             let entries_view = {
-                scrollable(
+                widgets::vscroll(
                     Column::with_children(
                         state
                             .entries
@@ -162,9 +162,6 @@ impl ToolFailuresState {
                     )
                     .spacing(2),
                 )
-                .height(Length::Fill)
-                .direction(theme::vertical_scrollbar())
-                .style(theme::scrollbar_style)
             };
 
             content = content.push(entries_view);

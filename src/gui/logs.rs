@@ -9,7 +9,7 @@
 use crate::logs::{LogEntry, LogQuery, LogStore};
 
 use iced::advanced::text::Span;
-use iced::widget::{Column, Space, button, column, container, row, scrollable, text, tooltip};
+use iced::widget::{Column, Space, button, column, container, row, text, tooltip};
 use iced::{Alignment, Element, Length, Subscription, Task, window};
 use iced_anim::Animated;
 use iced_anim::transition::Easing;
@@ -656,12 +656,12 @@ impl LogsState {
         };
         let mut content = Column::new();
 
-        // Error display
-        content = widgets::push_error_banner(content, data.load_state.error());
+        // Error display — inset to align with the vscroll-wrapped entries below.
+        content = widgets::push_error_banner_inset(content, data.load_state.error());
 
         // Log entries
         if data.load_state.loading() && !data.load_state.has_loaded() {
-            content = content.push(widgets::loading_text());
+            content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
         } else if data.entries.is_empty() {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::activity::<iced::Theme, iced::Renderer>(),
@@ -671,7 +671,7 @@ impl LogsState {
             let entries_view = {
                 let fade_progress = *self.fade_anim.value();
                 let newest_ts = self.newest_entry_timestamp.clone();
-                let scroll = scrollable(
+                let scroll = widgets::vscroll(
                     Column::with_children(
                         data.entries
                             .iter()
@@ -704,10 +704,7 @@ impl LogsState {
                             .collect::<Vec<_>>(),
                     )
                     .spacing(2),
-                )
-                .height(Length::Fill)
-                .direction(theme::vertical_scrollbar())
-                .style(theme::scrollbar_style);
+                );
 
                 // Stick to bottom when not paused (latest entries at top, but we
                 // want to scroll to latest entries which are at position 0).

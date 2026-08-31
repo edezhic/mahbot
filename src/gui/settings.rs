@@ -22,8 +22,8 @@ use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Column, Id, Row, Space, button, column, container, pick_list, row, scrollable, stack, text,
-    toggler, tooltip,
+    Column, Id, Row, Space, button, column, container, pick_list, row, stack, text, toggler,
+    tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -1753,21 +1753,17 @@ impl SettingsState {
 
         if let Some(ref err) = self.error {
             content = content.push(Space::new().height(8));
-            content = content.push(container(text(err).color(theme::STATUS_ERROR)).padding(8));
+            content = content.push(container(text(err).color(theme::STATUS_ERROR)).padding([8, 0]));
         }
 
-        let scroll = scrollable(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .direction(theme::vertical_scrollbar())
-            .style(theme::scrollbar_style);
+        let scroll = widgets::vscroll(content);
 
         // Modal overlay (rendered above everything else)
         let modal = self.render_modal_overlay();
 
         // Stack order: [scroll content, modal overlay] — every change on the
         // page persists automatically, so there is no floating Save button.
-        let body = stack([scroll.into(), modal]);
+        let body = stack([scroll, modal]);
 
         container(body)
             .width(Length::Fill)
@@ -2151,8 +2147,8 @@ impl SettingsState {
                                 },
                             );
                         view_col = view_col.push(
-                            container(scrollable(md).direction(theme::vertical_scrollbar()))
-                                .padding(4)
+                            container(widgets::vscroll_sized(md, Length::Fill, Length::Shrink))
+                                .padding([4, 0])
                                 .height(Length::Fixed(300.0))
                                 .style(|_| {
                                     theme::container_style(theme::BG_BASE, 4.0, 1.0, theme::BORDER)

@@ -24,7 +24,7 @@ use crate::git::diff_parse::{
 };
 
 use iced::widget::Id;
-use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Color, Element, Length, Task, keyboard};
 
 use iced_fonts::lucide;
@@ -992,8 +992,7 @@ impl DiffState {
                 .color(theme::TEXT_SECONDARY),
             Space::new().width(Length::Fill),
         ]
-        .align_y(Alignment::Center)
-        .padding([0, 8]);
+        .align_y(Alignment::Center);
 
         let full_path = node.full_path.clone();
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
@@ -1125,8 +1124,7 @@ impl DiffState {
             counts,
             Space::new().width(6),
         ]
-        .align_y(Alignment::Center)
-        .padding([0, 8]);
+        .align_y(Alignment::Center);
 
         let full_path = node.full_path.clone();
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
@@ -1156,17 +1154,11 @@ impl DiffState {
     #[expect(clippy::too_many_lines)]
     fn build_diff_content(&self) -> Element<'_, DiffMessage> {
         if self.diff_files.is_empty() {
-            return container(
-                scrollable(column![])
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .direction(theme::vertical_scrollbar())
-                    .style(theme::scrollbar_style),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::base_container_style)
-            .into();
+            return container(widgets::vscroll(column![]))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(theme::base_container_style)
+                .into();
         }
 
         let truncate_at = compute_truncation_index(
@@ -1212,6 +1204,8 @@ impl DiffState {
                 (file.path.clone(), CachedIcon::FileText)
             };
 
+            // The tinted band spans the wrapper's content width, so it sits at
+            // the uniform 8px inset from the panel edge instead of touching it.
             rows.push(
                 container(
                     row![
@@ -1222,7 +1216,7 @@ impl DiffState {
                     .align_y(Alignment::Center),
                 )
                 .width(Length::Fill)
-                .padding([6, 12])
+                .padding([6, 4])
                 .style(move |_t: &iced::Theme| iced::widget::container::Style {
                     background: Some(iced::Background::Color(theme::DIFF_FILE_HEADER_BG)),
                     ..Default::default()
@@ -1239,7 +1233,7 @@ impl DiffState {
                                 .size(13)
                                 .color(theme::TEXT_MUTED),
                         )
-                        .padding([2, 12])
+                        .padding([2, 4])
                         .into(),
                     );
                     continue;
@@ -1251,7 +1245,7 @@ impl DiffState {
                                 .size(13)
                                 .color(theme::TEXT_MUTED),
                         )
-                        .padding([2, 12])
+                        .padding([2, 4])
                         .into(),
                     );
                     continue;
@@ -1276,18 +1270,14 @@ impl DiffState {
                     .size(12)
                     .color(theme::STATUS_WARNING),
                 )
-                .padding([8, 12])
+                .padding([8, 4])
                 .into(),
             );
         }
 
-        container(
-            scrollable(column(rows).spacing(0).width(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .direction(theme::vertical_scrollbar())
-                .style(theme::scrollbar_style),
-        )
+        container(widgets::vscroll(
+            column(rows).spacing(0).width(Length::Fill),
+        ))
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::base_container_style)
