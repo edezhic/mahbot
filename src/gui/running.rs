@@ -12,8 +12,11 @@
 //! status) — the GUI refreshes as activity happens, not on a fixed cadence.
 //!
 //! Truthfulness rules:
-//! - The card's top-right carries the token/elapsed metrics alone, in both the
-//!   collapsed and expanded card. Narration (the assistant's short reasoning
+//! - The card's first row is the role icon followed inline by the token/elapsed
+//!   metrics (collapsed and expanded alike), with no fill spacers; the rest of
+//!   the card content (thinking fallback, trace groups, tool blocks, activity
+//!   line) starts on the second row at the card's left edge. Narration (the
+//!   assistant's short reasoning
 //!   text) is shown exactly once — as the current (latest) trace-group label,
 //!   which shows a neutral "thinking…" placeholder while its narration hasn't
 //!   committed; a brand-new agent with no trace group shows a card-level
@@ -598,9 +601,9 @@ fn workspace_label_for(
     }
 }
 
-/// Render one running-agent card: role icon (left rail), the token/elapsed
-/// metrics alone in the top-right corner, trace groups, and the current
-/// toolcalls. The whole card is clickable to expand/collapse the trace groups.
+/// Render one running-agent card: the role icon and the token/elapsed metrics
+/// inline in the first row, trace groups, and the current toolcalls. The whole
+/// card is clickable to expand/collapse the trace groups.
 ///
 /// Narration (the assistant's short reasoning text) lives solely in the
 /// current trace-group label, which shows a "thinking…" placeholder while its
@@ -638,13 +641,14 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         .spacing(theme::SPACE_6)
         .align_x(Alignment::Start)
         .width(Length::Fill);
-    // The token / elapsed metrics render alone in the top-right corner of the
-    // card, in both the collapsed and expanded view.
-    content = content.push(
-        container(render_metrics(token_count, &elapsed))
-            .width(Length::Fill)
-            .align_x(Alignment::End),
-    );
+    // The card's first row is the role icon followed inline by the token /
+    // elapsed metrics, sitting at the left edge of the card (no fill spacers).
+    let first_row = Row::new()
+        .spacing(theme::SPACE_12)
+        .align_y(Alignment::Center)
+        .push(icon)
+        .push(render_metrics(token_count, &elapsed));
+    content = content.push(first_row);
     // A brand-new agent with no trace group yet (no history to project from)
     // shows a card-level "thinking…" placeholder. Once any group exists the
     // current group's own label handles narration / thinking, so this fallback
@@ -690,18 +694,8 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     // The whole card is a click target (expand/collapse), but it stays a
     // `container` under a transparent `mouse_area` so the inner tool blocks
     // keep their hover tooltips (a `button` wrapper would swallow them).
-    //
-    // Layout: the role icon sits in a left rail at the top of the card, with
-    // the card content rendered as a single column beside it. The rail is not
-    // Height::Fill — in the vertical scrolling context iced collapses a
-    // cross-axis Fill to 0 height, hiding the icon — so the rail is natural
-    // height and the "empty space below the glyph" comes from the taller
-    // content column.
-    let card_body = row![column![icon], content]
-        .spacing(theme::SPACE_8)
-        .align_y(Alignment::Start);
     mouse_area(
-        container(card_body)
+        container(content)
             .width(Length::Fill)
             .padding(theme::PAD_8)
             .style(theme::surface_card_style),
@@ -731,11 +725,12 @@ fn thinking_placeholder() -> iced::widget::Text<'static, iced::Theme, iced::Rend
 }
 
 /// Render the card's metrics: the live session-token count (when known) and
-/// the elapsed run time, each as a compact labeled tooltip. Rendered alone in
-/// the top-right corner of the card (see [`render_agent_card`]).
+/// the elapsed run time, each as a compact labeled tooltip. Renders inline in
+/// the card's first row, right after the role icon (see
+/// [`render_agent_card`]).
 fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, RunningMessage> {
     let mut metrics = Row::new()
-        .spacing(theme::SPACE_8)
+        .spacing(theme::SPACE_12)
         .align_y(Alignment::Center);
     // The live token count comes from the published transcript snapshot (the
     // registry no longer carries a session_tokens mirror). It renders as a
