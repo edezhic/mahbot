@@ -13,7 +13,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -32,8 +32,7 @@ use fff_search::parse_grep_query;
 
 use super::menus::{ContextMenu, MenuItem};
 
-use crate::git::commands::{is_git_repo, run_git_check_ignore, run_git_output, run_git_status};
-use crate::util::unquote_c_style;
+use crate::git::commands::GitFileStatus;
 
 use super::common::{SingleLineEditorState, UndoSnapshot, UndoStack};
 use super::editor_widget::{LineEnding, detect_line_ending};
@@ -88,12 +87,6 @@ fn estimated_tab_left(tabs: &[Tab], idx: usize) -> f32 {
 fn estimated_content_width(tabs: &[Tab]) -> f32 {
     tabs.iter().map(estimate_tab_width).sum()
 }
-
-/// Tick interval (keeps consistency with other dashboard pages).
-const TICK_INTERVAL_SECS: u64 = 5;
-
-/// Interval for re-reading expanded directory entries from disk.
-const DIR_REFRESH_INTERVAL_SECS: u64 = 30;
 
 /// Base font size for the editor.
 const EDITOR_FONT_SIZE: f32 = 13.0;
@@ -169,15 +162,6 @@ pub struct FsEntry {
     /// Error message if this entry couldn't be properly inspected
     /// (broken symlink, permission denied, etc.).
     pub error: Option<String>,
-}
-
-/// Git file status for coloring the file tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitFileStatus {
-    /// File has uncommitted modifications (M in porcelain output).
-    Modified,
-    /// File is untracked (?? in porcelain output) or newly added (A).
-    Added,
 }
 
 /// A single editor tab (metadata, no content).
@@ -406,13 +390,17 @@ pub enum EditorMessage {
     /// Workspace selected via the Dashboard workspace picker (name,
     /// optional filesystem path).
     WorkspaceSelected(String, Option<String>),
+    /// The editor page became visible or hidden (single source of truth for
+    /// whether the editor is the active page). `true` triggers a refresh-on-entry
+    /// batch; `false` closes any open modal (modals do not survive a page switch).
+    PageVisibilityChanged(bool),
     /// A directory's listing was loaded from the filesystem.
     DirExpanded {
         dir_path: String,
         r#gen: u64,
         entries: Result<Vec<FsEntry>, ReadDirError>,
         /// When `true`, read errors are logged instead of shown as a toast.
-        /// Used by background (periodic/manual) refresh to avoid noise.
+        /// Used by background (refresh) reads to avoid noise.
         /// Missing directories are forgotten silently either way.
         quiet: bool,
     },
@@ -490,19 +478,23 @@ pub enum EditorMessage {
         keep_idx: usize,
         action: CloseAction,
     },
-    /// Periodic tick — refreshes git status and gitignore for file tree coloring.
-    Tick,
-    /// Git status has been loaded for the current workspace's file tree.
-    /// `r#gen` is captured at spawn time for stale-result prevention.
-    GitStatusLoaded {
-        r#gen: u64,
-        result: Result<HashMap<String, GitFileStatus>, String>,
+    /// The workspace gitignore matcher was rebuilt in the background.
+    /// `workspace` is the workspace path the matcher was built for — the
+    /// handler drops a matcher whose path differs from the currently-selected
+    /// workspace (a matcher built for a previously-selected workspace is
+    /// discarded). `matcher` is `None` for no dimming (no path or build
+    /// fallback).
+    IgnoreMatcherReady {
+        workspace: String,
+        matcher: Option<ignore::IncrementalIgnore>,
     },
-    /// Git ignore status has been loaded for the current workspace's file tree.
-    /// `r#gen` is captured at spawn time for stale-result prevention.
-    GitIgnoredLoaded {
-        r#gen: u64,
-        result: Result<HashSet<String>, String>,
+    /// Per-file git statuses forwarded from the Git state (single owner of
+    /// `git status --porcelain`). `workspace` is the Git state's workspace
+    /// name — `Some("personal:{user}")` for Personal; the handler drops a
+    /// forward whose workspace differs from the currently-selected one.
+    GitStatusUpdated {
+        workspace: Option<String>,
+        statuses: HashMap<String, GitFileStatus>,
     },
     /// Toast message to show.
     Toast(super::ToastMessage),
@@ -526,9 +518,18 @@ pub enum EditorMessage {
     FindReplaceAll,
     /// Toggle case-sensitive matching.
     FindToggleCaseSensitivity,
-    /// Manual or periodic refresh of all expanded directory listings from disk.
-    /// Also triggers a git status refresh so newly discovered files get colors.
+    /// Manual refresh (Cmd+R / Ctrl+R) of all expanded directory listings from disk.
     RefreshFileTree,
+    /// File-tree change event from the global FILE_CHANGE_TX broadcast (coalesced
+    /// to at most one per window). Gated on page visibility + a selected workspace.
+    FileTreePinged,
+    /// Periodic git-dirty probe (every 1s) — stats `.git/index` and
+    /// `.git/logs/HEAD` and requests a git-status refresh when they change.
+    CheckGitDirty,
+    /// Editor-side request for the Git state to run its standard throttled
+    /// file-change refresh. Intercepted by the Dashboard and routed to
+    /// `GitState::update(GitMessage::FileChanged)`.
+    RequestGitStatusRefresh,
     /// Close all tabs except the given index.
     CloseOtherTabs(usize),
     /// Periodic check (every 300 ms) for external file changes on the active tab.
@@ -916,6 +917,43 @@ fn dir_expanded_task(
     Task::perform(dir_expanded_msg(ws_path, dir_path, r#gen, quiet), |msg| msg)
 }
 
+/// Resolve the `.git` entry covering `start` via the shared repo-root walk
+/// (`commands::resolve_git_top_level`), so a nested workspace still detects the
+/// enclosing repo's staging dir. For a `.git` file (worktree) the detector's
+/// stat targets do not exist, so detection no-ops (accepted edge; recovery is
+/// the watcher or Cmd+R).
+fn find_git_dir(start: &Path) -> Option<PathBuf> {
+    crate::git::commands::resolve_git_top_level(start).map(|root| root.join(".git"))
+}
+
+/// Stat the git-dirty detector's two targets and return `(index mtime,
+/// logs/HEAD mtime)`. Each is `None` when the file is absent (fresh/unborn repo
+/// has no logs/HEAD; a fresh init has no index yet).
+fn stat_git_dirty_mtimes(git_dir: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
+    let index = git_dir.join("index");
+    let logs_head = git_dir.join("logs").join("HEAD");
+    (
+        std::fs::metadata(&index)
+            .ok()
+            .and_then(|m| m.modified().ok()),
+        std::fs::metadata(&logs_head)
+            .ok()
+            .and_then(|m| m.modified().ok()),
+    )
+}
+
+/// Stream of coalesced file-tree change pings from the global [`super::git::FILE_CHANGE_TX`]
+/// broadcast. A free fn (not a closure) because [`Subscription::run`] takes a
+/// `fn() -> Stream` builder. Bursts collapse into one trailing ping per 300 ms.
+fn file_tree_change_stream() -> impl futures_util::Stream<Item = EditorMessage> {
+    super::common::coalesced_broadcast_producer(
+        64,
+        &super::git::FILE_CHANGE_TX,
+        Duration::from_millis(300),
+        || EditorMessage::FileTreePinged,
+    )
+}
+
 /// Validate file content for size and binary content.
 ///
 /// Returns `Ok(())` if the bytes pass size and null-byte checks,
@@ -1142,6 +1180,7 @@ fn build_hierarchical_tree(
                 is_dir: entry.is_dir,
                 children: Vec::new(),
                 error: entry.error.clone(),
+                ignored: false,
             };
             if node.is_dir && expanded_dirs.contains(&node.full_path) {
                 node.children =
@@ -1155,222 +1194,40 @@ fn build_hierarchical_tree(
     nodes
 }
 
-// ── Git status utilities ──────────────────────────────────────────
-
-/// Parse `git status --porcelain` output into a map of file path → `GitFileStatus`.
+/// Build the in-process gitignore matcher for `workspace_path`.
 ///
-/// The porcelain format uses a two-column status (index + worktree).
-/// Precedence: modified > added > untracked. Rename entries (`R`) extract
-/// the new path after ` -> `. Deleted files (`D`) are ignored. Handles
-/// git's C-style quoting for paths with special characters.
-fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
-    let mut map: HashMap<String, GitFileStatus> = HashMap::new();
-
-    for line in output.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.len() < 2 {
-            continue;
-        }
-
-        let chars: Vec<char> = trimmed.chars().take(2).collect();
-        if chars.len() < 2 {
-            continue;
-        }
-
-        let ix = chars[0];
-        let wt = chars[1];
-
-        // Skip deleted files — they don't appear in the working tree.
-        if ix == 'D' || wt == 'D' {
-            continue;
-        }
-
-        // Rename entries: "R  old_path -> new_path"
-        // Both paths may be individually C-quoted by git. The separator
-        // ` -> ` appears at the boundary between the two paths.
-        if ix == 'R' {
-            let rest = &trimmed[2..];
-            let rest = rest.trim_start();
-            let new_path: String = if rest.starts_with('"') {
-                // Both paths are quoted. The boundary is `" -> "`.
-                // rsplit_once on `" -> "` strips the opening quote of the
-                // new path — add it back so `unquote_c_style` can strip both.
-                if let Some((_, tail)) = rest.rsplit_once("\" -> \"") {
-                    format!("\"{tail}")
-                } else {
-                    // Malformed — skip.
-                    continue;
-                }
-            } else {
-                // Unquoted paths: split on ` -> `.
-                if let Some((_, tail)) = rest.rsplit_once(" -> ") {
-                    tail.to_string()
-                } else {
-                    continue;
-                }
-            };
-            if let Some(unquoted) = unquote_c_style(&new_path) {
-                map.insert(unquoted, GitFileStatus::Modified);
-            }
-            continue;
-        }
-
-        // Extract path: strip first 2 chars (status columns) and leading space.
-        let path = trimmed[2..].trim_start();
-        if path.is_empty() {
-            continue;
-        }
-
-        let status = if ix == 'M' || wt == 'M' {
-            GitFileStatus::Modified
-        } else if ix == 'A' || wt == 'A' || (ix == '?' && wt == '?') {
-            GitFileStatus::Added
-        } else {
-            // Clean or ignored — don't store.
-            continue;
-        };
-
-        let Some(path) = unquote_c_style(path) else {
-            continue;
-        };
-        // Strip trailing slash — git appends '/' for untracked directories
-        // (e.g., `?? new_dir/`), but tree node full_path has no trailing slash.
-        let path = path.strip_suffix('/').unwrap_or(&path).to_string();
-
-        // For entries with multiple lines referencing the same file (e.g., staged +
-        // unstaged), keep the most "interesting" status: Modified > Added.
-        let entry = map.entry(path).or_insert(status);
-        if status == GitFileStatus::Modified && *entry == GitFileStatus::Added {
-            *entry = GitFileStatus::Modified;
-        }
-    }
-
-    map
+/// Crate defaults are kept for `require_git`/`parents` — they give the
+/// subdir-of-repo behavior (parent repo .gitignore applies) and the
+/// no-`.git`-no-dimming behavior for non-git workspaces. The ripgrep
+/// defaults are explicitly disabled: dotfiles are NOT treated as ignored
+/// (`hidden(false)`) and `.ignore` files are NOT read (`ignore(false)`).
+/// `current_dir` lets global git excludes resolve against the workspace.
+/// Returns `None` when there is no workspace path — the safe fallback is
+/// "no dimming", never an error.
+#[must_use]
+fn build_ignore_matcher(workspace_path: &Path) -> Option<ignore::IncrementalIgnore> {
+    let mut builder = ignore::WalkBuilder::new(workspace_path);
+    builder.hidden(false);
+    builder.ignore(false);
+    builder.current_dir(workspace_path);
+    builder.build_matchers().into_iter().next()
 }
 
-/// Load git status for a workspace. Returns an empty map if the workspace
-/// is not a git repo or if git is not installed.
-async fn load_git_status(workspace_path: String) -> Result<HashMap<String, GitFileStatus>, String> {
-    let ws_path = Path::new(&workspace_path);
-    if !is_git_repo(ws_path) {
-        tracing::debug!("Workspace '{workspace_path}' is not a git repo — skipping git status");
-        return Ok(HashMap::new());
-    }
-
-    let output = run_git_status(ws_path).await.map_err(|e| e.to_string())?;
-    Ok(parse_git_status_porcelain(&output))
-}
-
-/// Collect all file and directory paths from the tree recursively.
-fn collect_tree_paths(nodes: &[widgets::TreeNode]) -> Vec<String> {
-    let mut paths = Vec::new();
+/// Stamp `ignored` on every node by querying the matcher with the node's
+/// workspace-relative path and `is_dir` flag. Only an IGNORE verdict dims —
+/// negated/whitelisted patterns stay undimmed. Runs as a post-build pass so
+/// BOTH the rebuild_tree path and the collapse_dir raw-rebuild path stamp,
+/// and so `build_hierarchical_tree`'s signature stays unchanged.
+fn stamp_ignored_nodes(
+    nodes: &mut [widgets::TreeNode],
+    matcher: &mut Option<ignore::IncrementalIgnore>,
+) {
     for node in nodes {
-        paths.push(node.full_path.clone());
-        if node.is_dir {
-            paths.extend(collect_tree_paths(&node.children));
+        if let Some(m) = matcher.as_mut() {
+            node.ignored = m.matched(node.full_path.as_str(), node.is_dir).is_ignore();
         }
+        stamp_ignored_nodes(&mut node.children, matcher);
     }
-    paths
-}
-
-/// Load git ignore status for the given tree paths.
-/// Handles workspaces that are subdirectories of a git repo by detecting
-/// the repo root and adjusting paths accordingly.
-/// Returns an empty set if the workspace is not in a git repo.
-async fn load_git_ignore(
-    workspace_path: String,
-    tree_paths: Vec<String>,
-) -> Result<HashSet<String>, String> {
-    if tree_paths.is_empty() {
-        return Ok(HashSet::new());
-    }
-
-    let ws_path = Path::new(&workspace_path);
-
-    // Find the git repo root (handles subdirectory-of-repo workspaces).
-    let output = run_git_output(ws_path, &["rev-parse", "--show-toplevel"])
-        .await
-        .map_err(|e| format!("Failed to run git rev-parse: {e}"))?;
-
-    if !output.status.success() {
-        tracing::debug!(
-            "Workspace '{workspace_path}' is not in a git repo — skipping git ignore check"
-        );
-        return Ok(HashSet::new());
-    }
-
-    let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let repo_path = Path::new(&repo_root);
-
-    // Compute the relative prefix from repo root to workspace.
-    // When workspace is the repo root itself, prefix is empty.
-    let ws_canonical = ws_path
-        .canonicalize()
-        .map_err(|e| format!("Failed to canonicalize workspace path: {e}"))?;
-
-    let prefix = ws_canonical
-        .strip_prefix(repo_path)
-        .map_err(|e| format!("Workspace is not inside git repo: {e}"))?;
-
-    let prefix_empty = prefix.as_os_str().is_empty();
-
-    // Adjust tree paths to be repo-root-relative for git check-ignore.
-    let adjusted_paths: Vec<String> = if prefix_empty {
-        tree_paths
-    } else {
-        let prefix_str = prefix.to_string_lossy();
-        tree_paths
-            .iter()
-            .map(|p| format!("{prefix_str}/{p}"))
-            .collect()
-    };
-
-    let raw_ignored = run_git_check_ignore(repo_path, &adjusted_paths)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Strip the prefix back to get workspace-relative paths for the cache.
-    let ignored: HashSet<String> = if prefix_empty {
-        raw_ignored
-    } else {
-        let prefix_str = prefix.to_string_lossy();
-        let prefix_slash = format!("{prefix_str}/");
-        raw_ignored
-            .into_iter()
-            .filter_map(|p| {
-                p.strip_prefix(&prefix_slash)
-                    .or_else(|| (p == prefix_str).then_some(""))
-                    .map(ToString::to_string)
-            })
-            .collect()
-    };
-
-    Ok(ignored)
-}
-
-/// Handle git-status/git-ignore-loaded — updates the corresponding cache.
-/// Discards stale results via the shared `git_status_gen` counter.
-fn finish_git_load<T: Default>(
-    loading: &mut bool,
-    current_gen: u64,
-    r#gen: u64,
-    result: Result<T, String>,
-    cache: &mut T,
-    label: &str,
-) -> Task<EditorMessage> {
-    *loading = false;
-    // Stale result from a previous workspace or refresh? Discard.
-    if r#gen != current_gen {
-        return Task::none();
-    }
-    match result {
-        Ok(value) => *cache = value,
-        Err(e) => {
-            tracing::warn!("Failed to load {label}: {e}");
-            *cache = T::default();
-        }
-    }
-    Task::none()
 }
 
 // ── Global search helpers ──────────────────────────────────────────
@@ -1487,6 +1344,10 @@ pub struct EditorState {
     selected_workspace_name: Option<String>,
     /// Filesystem path for the currently selected workspace.
     selected_workspace_path: Option<String>,
+    /// Whether the editor page is the currently visible page (single source of
+    /// truth for page-visible gating; set via `PageVisibilityChanged` before any
+    /// refresh-on-entry task is dispatched).
+    page_visible: bool,
     /// Monotonically increasing generation counter for stale-result prevention.
     generation: u64,
     /// Monotonically increasing generation counter for saved-tabs restoration,
@@ -1533,12 +1394,28 @@ pub struct EditorState {
     pending_enter_dir: Option<String>,
     /// Cached git status per file path (relative to workspace root).
     git_status_cache: HashMap<String, GitFileStatus>,
-    /// Guard against concurrent git status refresh operations.
+    /// In-flight guard for a git-status refresh that will resolve via a
+    /// forwarded `GitStatusUpdated`. Set when a refresh is awaited
+    /// (workspace_selected — a GitState eager refresh is in flight); cleared
+    /// only by the `GitStatusUpdated` handler and workspace clear.
     git_status_loading: bool,
-    /// Cached gitignored file/directory paths (relative to workspace root).
-    git_ignore_cache: HashSet<String>,
-    /// Guard against concurrent git ignore refresh operations.
-    git_ignore_loading: bool,
+    /// The `.git` directory (or `.git` file for worktrees/submodules) covering
+    /// the selected workspace, resolved at `workspace_selected` by walking up
+    /// from the workspace path. `None` when the workspace is not in a git repo.
+    /// Used by the commit/staging mtime detector to stat `.git/index` and
+    /// `.git/logs/HEAD`.
+    git_dir: Option<PathBuf>,
+    /// Latch of `(index mtime, logs/HEAD mtime)` observed at the last git-status
+    /// resolution. `None` before the first probe; each inner value is `None`
+    /// when the corresponding file does not exist (fresh/unborn repo). A change
+    /// between probes means staging changed on disk and a git-status refresh is
+    /// owed. Re-latched on every `GitStatusUpdated` so a git-status write that
+    /// touches `.git/index` does not re-trigger the detector.
+    git_dirty_mtimes: Option<(Option<SystemTime>, Option<SystemTime>)>,
+    /// The in-process gitignore matcher for the current workspace, if one was
+    /// built. `None` means no dimming (no workspace path, or the workspace is
+    /// not in a git repo). Rebuilt on workspace selection and file-tree refresh.
+    ignore_matcher: Option<ignore::IncrementalIgnore>,
     /// Shared atomic counter used by async save tasks for pre-write staleness
     /// checking.  Written to on every save initiation; read by in-flight tasks
     /// to determine if a newer save has superseded them.
@@ -1556,12 +1433,6 @@ pub struct EditorState {
     /// Cached list of all workspace files for quick-open filtering.
     /// Populated on each quick-open toggle from currently expanded dirs.
     all_workspace_files: Vec<String>,
-    /// Generation counter for git status and gitignore stale-result prevention.
-    /// Bumped on workspace switch to invalidate in-flight GitStatusLoaded
-    /// and GitIgnoredLoaded results. Separate from `generation` to avoid
-    /// false-positive discards when `refresh_file_tree` bumps `generation`
-    /// for directory refresh tasks.
-    git_status_gen: u64,
     /// Generation counter for global search stale-result prevention.
     global_search_gen: u64,
     /// When set, the next file load for this path+generation should jump to this line.
@@ -1604,6 +1475,7 @@ impl EditorState {
         Self {
             selected_workspace_name: None,
             selected_workspace_path: None,
+            page_visible: false,
             generation: 0,
             saved_tabs_gen: 0,
             dir_generations: HashMap::new(),
@@ -1623,15 +1495,15 @@ impl EditorState {
             pending_enter_dir: None,
             git_status_cache: HashMap::new(),
             git_status_loading: false,
-            git_ignore_cache: HashSet::new(),
-            git_ignore_loading: false,
+            git_dir: None,
+            git_dirty_mtimes: None,
+            ignore_matcher: None,
             tab_save_counter: Arc::new(AtomicU64::new(0)),
             file_mtimes: HashMap::new(),
             deleted_file_toasted: HashSet::new(),
             active_modal: None,
             all_workspace_files: Vec::new(),
             global_search_gen: 0,
-            git_status_gen: 0,
             pending_goto: None,
             goto_line_input: SingleLineEditorState::new(""),
         }
@@ -1655,8 +1527,10 @@ impl EditorState {
     /// and `expanded_dirs`.  Callers that also need `tree_focused = true` must set
     /// it separately after this call.
     fn rebuild_tree(&mut self) {
-        self.file_tree.nodes =
+        let mut nodes =
             build_hierarchical_tree(&self.dir_entries, &self.file_tree.expanded_dirs, "");
+        stamp_ignored_nodes(&mut nodes, &mut self.ignore_matcher);
+        self.file_tree.nodes = nodes;
         self.file_tree.rebuild_visible();
     }
 
@@ -1803,11 +1677,14 @@ impl EditorState {
     ///
     /// Note: [`FileTree::collapse_dir_and_keep_focus`] calls [`rebuild_visible`]
     /// internally, so this helper uses raw [`build_hierarchical_tree`] (not
-    /// [`rebuild_tree`]) to avoid rebuilding the visible list twice.
+    /// [`rebuild_tree`]) to avoid rebuilding the visible list twice. It still
+    /// stamps the freshly built nodes so dimming survives the collapse.
     fn collapse_dir(&mut self, path: &str) -> Task<EditorMessage> {
         self.file_tree.expanded_dirs.remove(path);
-        self.file_tree.nodes =
+        let mut nodes =
             build_hierarchical_tree(&self.dir_entries, &self.file_tree.expanded_dirs, "");
+        stamp_ignored_nodes(&mut nodes, &mut self.ignore_matcher);
+        self.file_tree.nodes = nodes;
         self.file_tree
             .collapse_dir_and_keep_focus::<EditorMessage>(path)
     }
@@ -1853,32 +1730,31 @@ impl EditorState {
         }
     }
 
-    /// Periodic timers (Tick, RefreshFileTree, CheckFileChanges) only run
-    /// while the Editor page is visible.
-    pub fn subscription(
-        &self,
-        page_visible: bool,
-        dashboard_modal_open: bool,
-    ) -> Subscription<EditorMessage> {
+    /// The CheckFileChanges / CheckGitDirty timers only run while the Editor page
+    /// is visible (see `self.page_visible`). The FILE_CHANGE_TX tree-refresh
+    /// subscription is always on — it is cheap and drops messages while hidden.
+    pub fn subscription(&self, dashboard_modal_open: bool) -> Subscription<EditorMessage> {
         let mut subs: Vec<Subscription<EditorMessage>> = Vec::new();
-        if page_visible && self.selected_workspace_name.is_some() {
-            subs.push(
-                iced::time::every(Duration::from_secs(TICK_INTERVAL_SECS))
-                    .map(|_| EditorMessage::Tick),
-            );
-            // Periodic directory refresh — re-reads all expanded directories
-            // to pick up external filesystem changes (git checkout, build
-            // scripts, other editors).
-            subs.push(
-                iced::time::every(Duration::from_secs(DIR_REFRESH_INTERVAL_SECS))
-                    .map(|_| EditorMessage::RefreshFileTree),
-            );
+        // Always-on file-tree change subscription over the global FILE_CHANGE_TX
+        // broadcast (fed by the fff-search watcher). Coalesced to at most one
+        // FileTreePinged per 300 ms window; the handler gates on visibility and
+        // drops pings while hidden (refresh-on-entry catches up).
+        subs.push(Subscription::run(file_tree_change_stream));
+        if self.page_visible && self.selected_workspace_name.is_some() {
             // Auto-refresh tick for detecting external file changes on the
             // active tab.  Only the active (visible) tab is polled; dirty
             // tabs (unsaved edits) are never auto-reloaded.
             subs.push(
                 iced::time::every(Duration::from_millis(300))
                     .map(|_| EditorMessage::CheckFileChanges),
+            );
+        }
+        if self.page_visible && self.git_dir.is_some() {
+            // Commit/staging mtime detector: polls `.git/index` and
+            // `.git/logs/HEAD` and requests a git-status refresh when they
+            // change (staging grew/moved without a watcher event).
+            subs.push(
+                iced::time::every(Duration::from_secs(1)).map(|_| EditorMessage::CheckGitDirty),
             );
         }
         // Always listen for keyboard events — tree navigation may be active.
@@ -2262,8 +2138,7 @@ impl EditorState {
 
     /// Clear all workspace-scoped editor state when switching workspaces.
     /// Does not touch `selected_workspace_name`, `selected_workspace_path`,
-    /// `generation`, `saved_tabs_gen`, or `git_status_gen` — those are
-    /// managed at the call site.
+    /// `generation`, or `saved_tabs_gen` — those are managed at the call site.
     fn clear_workspace_editor_state(&mut self) {
         self.file_tree.nodes.clear();
         self.file_tree.expanded_dirs.clear();
@@ -2277,8 +2152,9 @@ impl EditorState {
         self.file_generations.clear();
         self.git_status_cache.clear();
         self.git_status_loading = false;
-        self.git_ignore_cache.clear();
-        self.git_ignore_loading = false;
+        self.git_dir = None;
+        self.git_dirty_mtimes = None;
+        self.ignore_matcher = None;
         self.session_initialized = false;
         self.active_modal = None;
         self.pending_close = None;
@@ -2332,6 +2208,8 @@ impl EditorState {
             EditorMessage::WorkspaceSelected(ref name, ref path) => {
                 self.workspace_selected(name, path.as_deref())
             }
+
+            EditorMessage::PageVisibilityChanged(visible) => self.page_visibility_changed(visible),
 
             EditorMessage::SavedTabsLoaded { tabs_data, r#gen } => {
                 self.saved_tabs_loaded(tabs_data, r#gen)
@@ -2551,27 +2429,27 @@ impl EditorState {
 
             EditorMessage::RefreshFileTree => self.refresh_file_tree(),
 
-            EditorMessage::Tick => self.tick(),
+            EditorMessage::FileTreePinged => self.file_tree_pinged(),
+
+            EditorMessage::CheckGitDirty => self.check_git_dirty(),
+
+            EditorMessage::RequestGitStatusRefresh => {
+                // Intercepted by the Dashboard and routed to GitState::update
+                // (FileChanged). This arm is the fallback for direct/test
+                // routing; production never reaches it.
+                Task::none()
+            }
 
             EditorMessage::Toast(_) => Task::none(),
 
-            EditorMessage::GitStatusLoaded { r#gen, result } => finish_git_load(
-                &mut self.git_status_loading,
-                self.git_status_gen,
-                r#gen,
-                result,
-                &mut self.git_status_cache,
-                "git status",
-            ),
+            EditorMessage::GitStatusUpdated {
+                workspace,
+                statuses,
+            } => self.git_status_updated(workspace.as_deref(), statuses),
 
-            EditorMessage::GitIgnoredLoaded { r#gen, result } => finish_git_load(
-                &mut self.git_ignore_loading,
-                self.git_status_gen,
-                r#gen,
-                result,
-                &mut self.git_ignore_cache,
-                "git ignore status",
-            ),
+            EditorMessage::IgnoreMatcherReady { workspace, matcher } => {
+                self.ignore_matcher_ready(&workspace, matcher)
+            }
 
             EditorMessage::CheckFileChanges => self.check_file_changes(),
 
@@ -2588,7 +2466,9 @@ impl EditorState {
 
     /// Handle workspace selection — initializes file tree, loads tabs, sets up workspace.
     fn workspace_selected(&mut self, name: &str, path: Option<&str>) -> Task<EditorMessage> {
-        // Accept personal workspaces when a path is provided.
+        // An empty name with no path is the "no workspace selected" clear.
+        // Personal workspaces arrive as a named `personal:{user}` selection
+        // with a real path and are handled as a normal named selection below.
         if name.is_empty() && path.is_none() {
             self.selected_workspace_name = None;
             self.selected_workspace_path = None;
@@ -2605,9 +2485,21 @@ impl EditorState {
         let r#gen = self.bump_generation();
         let saved_gen = self.saved_tabs_gen.wrapping_add(1);
         self.saved_tabs_gen = saved_gen;
-        let git_gen = self.git_status_gen.wrapping_add(1);
-        self.git_status_gen = git_gen;
         self.clear_workspace_editor_state();
+        // Resolve the covering `.git` (dir or worktree file) and reset the
+        // mtime latch so the first CheckGitDirty probe re-latches fresh values
+        // instead of diffing against the previous workspace's mtimes.
+        self.git_dir = path
+            .filter(|p| !p.is_empty())
+            .map(Path::new)
+            .and_then(find_git_dir);
+        self.git_dirty_mtimes = None;
+        // GitState eagerly refreshes on workspace switch and will forward the
+        // per-file statuses via GitStatusUpdated. Mark the in-flight guard so
+        // colors stay absent (not stale) until that forward arrives — only
+        // when a forward can actually happen: a non-git workspace never
+        // produces a snapshot, and the guard must not claim one is in flight.
+        self.git_status_loading = self.git_dir.is_some();
 
         // Register the root generation so DirExpanded can validate it.
         self.dir_generations.insert(String::new(), r#gen);
@@ -2686,19 +2578,53 @@ impl EditorState {
         );
         tasks.push(load_tabs_task);
 
-        // ── Task 3: refresh git status for file tree coloring ──
-        self.git_status_loading = true;
-        let git_path = path.unwrap_or_default().to_string();
-        let git_task = Task::perform(
-            async move { load_git_status(git_path).await },
-            move |result| EditorMessage::GitStatusLoaded {
-                r#gen: git_gen,
-                result,
-            },
-        );
-        tasks.push(git_task);
+        // ── Task 3: build the gitignore matcher for file tree dimming ──
+        if let Some(ws_path) = path.filter(|p| !p.is_empty()) {
+            tasks.push(Self::spawn_ignore_matcher(ws_path));
+        }
 
         Task::batch(tasks)
+    }
+
+    /// Handle editor-page visibility change (single source of truth for whether
+    /// the editor is the active page).
+    ///
+    /// `false` (navigating away): close any open modal — modals do not survive
+    /// a page switch; unsaved tab changes stay in editor state without warning
+    /// (no confirmation machinery).
+    ///
+    /// `true` (navigating to the editor): refresh-on-entry, which replays any
+    /// tree changes that arrived while the page was hidden. `refresh_file_tree`
+    /// also rebuilds the ignore matcher, so dimming catches up too.
+    fn page_visibility_changed(&mut self, visible: bool) -> Task<EditorMessage> {
+        self.page_visible = visible;
+        if !visible {
+            self.active_modal = None;
+            return Task::none();
+        }
+        if self.selected_workspace_path.is_some() {
+            self.refresh_file_tree()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Handle a coalesced file-tree change ping from the global FILE_CHANGE_TX
+    /// broadcast. Dropped while the page is hidden or no workspace is selected —
+    /// refresh-on-entry (PageVisibilityChanged) catches up. When visible, the
+    /// tree (and ignore matcher, rebuilt by `refresh_file_tree`) re-reads the
+    /// expanded directories.
+    ///
+    /// Accepted consequences: a `.gitignore` edit usually pings the watcher (the
+    /// file is not itself ignored) so dimming refreshes; a rare ignored-
+    /// `.gitignore` setup goes stale until the next event or Cmd+R. Unwatched or
+    /// watch-failed sessions have no automatic tree refresh — recovery is a
+    /// manual Cmd+R or a workspace switch.
+    fn file_tree_pinged(&mut self) -> Task<EditorMessage> {
+        if !self.page_visible || self.selected_workspace_path.is_none() {
+            return Task::none();
+        }
+        self.refresh_file_tree()
     }
 
     /// Insert a newly created tab into the editor state: push the tab,
@@ -4338,8 +4264,7 @@ impl EditorState {
     fn refresh_file_tree(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the file tree should
         // not refresh behind an active overlay.  This covers both the
-        // Cmd+R / Ctrl+R keyboard shortcut AND the periodic 30-second
-        // timer subscription.
+        // Cmd+R / Ctrl+R keyboard shortcut.
         if self.active_modal.is_some() {
             return Task::none();
         }
@@ -4387,51 +4312,110 @@ impl EditorState {
             ));
         }
 
-        // Kick off a git status refresh so newly discovered files
-        // get their git status colors without waiting for the next Tick.
-        if !self.git_status_loading {
-            self.git_status_loading = true;
-            let path = root_path;
-            let r#gen = self.git_status_gen;
-            tasks.push(Task::perform(
-                async move { load_git_status(path).await },
-                move |result| EditorMessage::GitStatusLoaded { r#gen, result },
-            ));
-        }
+        // Rebuild the gitignore matcher so dimming reflects any .gitignore
+        // changes picked up on disk.
+        tasks.push(Self::spawn_ignore_matcher(&root_path));
 
         Task::batch(tasks)
     }
 
-    /// Handle tick — refreshes git status and gitignore for file tree coloring.
-    fn tick(&mut self) -> Task<EditorMessage> {
-        if let Some(ref ws_path) = self.selected_workspace_path {
-            let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
-
-            if !self.git_status_loading {
-                self.git_status_loading = true;
-                let path = ws_path.clone();
-                let r#gen = self.git_status_gen;
-                tasks.push(Task::perform(
-                    async move { load_git_status(path).await },
-                    move |result| EditorMessage::GitStatusLoaded { r#gen, result },
-                ));
-            }
-
-            if !self.git_ignore_loading {
-                self.git_ignore_loading = true;
-                let path = ws_path.clone();
-                let tree_paths = collect_tree_paths(&self.file_tree.nodes);
-                let r#gen = self.git_status_gen;
-                tasks.push(Task::perform(
-                    async move { load_git_ignore(path, tree_paths).await },
-                    move |result| EditorMessage::GitIgnoredLoaded { r#gen, result },
-                ));
-            }
-
-            Task::batch(tasks)
-        } else {
-            Task::none()
+    /// Handle ignore-matcher-ready — store the rebuilt matcher (or `None` for
+    /// no dimming) and re-stamp the current tree so dimming follows a late
+    /// matcher arrival. Discards a matcher built for a workspace that is no
+    /// longer selected (tagged by path).
+    fn ignore_matcher_ready(
+        &mut self,
+        workspace: &str,
+        matcher: Option<ignore::IncrementalIgnore>,
+    ) -> Task<EditorMessage> {
+        if self.selected_workspace_path.as_deref() != Some(workspace) {
+            return Task::none();
         }
+        self.ignore_matcher = matcher;
+        stamp_ignored_nodes(&mut self.file_tree.nodes, &mut self.ignore_matcher);
+        Task::none()
+    }
+
+    /// Build a gitignore matcher for `workspace_path` and return a task that
+    /// delivers it as `IgnoreMatcherReady` tagged with the workspace path (so
+    /// a matcher built for a previously-selected workspace is discarded on
+    /// arrival).
+    fn spawn_ignore_matcher(workspace_path: &str) -> Task<EditorMessage> {
+        let path = workspace_path.to_string();
+        let tag = path.clone();
+        Task::perform(
+            async move { build_ignore_matcher(Path::new(&path)) },
+            move |matcher| EditorMessage::IgnoreMatcherReady {
+                workspace: tag,
+                matcher,
+            },
+        )
+    }
+
+    /// Handle git-status-updated — per-file statuses forwarded from the Git
+    /// state. Stores them and clears the in-flight guard. A forward whose
+    /// workspace no longer matches the selected one is dropped (on a workspace
+    /// switch the editor clears its cache via its own WorkspaceSelected path).
+    fn git_status_updated(
+        &mut self,
+        workspace: Option<&str>,
+        statuses: HashMap<String, GitFileStatus>,
+    ) -> Task<EditorMessage> {
+        // The forwarded workspace name matches the selected one exactly for
+        // every resolved selection (including `personal:{user}`) — compare
+        // directly and drop forwards from a superseded workspace.
+        if workspace != self.selected_workspace_name.as_deref() {
+            return Task::none();
+        }
+        self.git_status_cache = statuses;
+        self.git_status_loading = false;
+        // Re-latch the detector now that a refresh resolved. A git-status run
+        // rewrites `.git/index`, so without this the detector would see an
+        // index mtime change and re-trigger forever.
+        self.relatch_git_dirty_mtimes();
+        Task::none()
+    }
+
+    /// Probe `.git/index` and `.git/logs/HEAD` for mtime changes. If the latch
+    /// is empty, record the fresh values (no trigger — the repo may be freshly
+    /// cloned/initialized and we have no baseline). If a file's mtime changed
+    /// since the last latch, staging grew or moved on disk without a watcher
+    /// event — request a git-status refresh (routed to GitState by the
+    /// Dashboard). Does NOT re-latch; the `GitStatusUpdated` handler re-latches
+    /// after the refresh resolves so the git-status own index write is absorbed.
+    ///
+    /// Skips entirely while a git-status refresh is already in flight (the
+    /// in-flight guard is shared with the workspace-selected eager refresh).
+    ///
+    /// For a `.git` that is a file (worktree/submodule), `index`/`logs/HEAD`
+    /// under it don't exist, so the probe reads `(None, None)` and never
+    /// triggers — an accepted edge (those repos need the watcher or Cmd+R).
+    fn check_git_dirty(&mut self) -> Task<EditorMessage> {
+        if self.git_status_loading {
+            return Task::none();
+        }
+        let Some(git_dir) = self.git_dir.as_ref() else {
+            self.git_dirty_mtimes = None;
+            return Task::none();
+        };
+        let now = stat_git_dirty_mtimes(git_dir);
+        match self.git_dirty_mtimes {
+            None => {
+                self.git_dirty_mtimes = Some(now);
+                Task::none()
+            }
+            Some(prev) if prev != now => {
+                self.git_status_loading = true;
+                Task::done(EditorMessage::RequestGitStatusRefresh)
+            }
+            Some(_) => Task::none(),
+        }
+    }
+
+    /// Re-stat the git dir and re-latch the mtimes. Called after every resolved
+    /// git-status update so the baseline tracks the post-refresh disk state.
+    fn relatch_git_dirty_mtimes(&mut self) {
+        self.git_dirty_mtimes = self.git_dir.as_ref().map(|g| stat_git_dirty_mtimes(g));
     }
 
     /// Handle check-file-changes — detects external file modifications and reloads.
@@ -4818,28 +4802,6 @@ impl EditorState {
         best
     }
 
-    /// Check whether a path is gitignored, either directly or because an
-    /// ancestor directory is in the gitignore cache (directory inheritance).
-    #[must_use]
-    fn is_path_ignored(&self, full_path: &str) -> bool {
-        if self.git_ignore_cache.is_empty() {
-            return false;
-        }
-        if self.git_ignore_cache.contains(full_path) {
-            return true;
-        }
-        // Walk up the path tree: if any parent directory is ignored,
-        // the child inherits that status.
-        let mut path = full_path;
-        while let Some(pos) = path.rfind('/') {
-            path = &path[..pos];
-            if self.git_ignore_cache.contains(path) {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Shared tree-node row helper.  Builds the guide-lines + icon + name row,
     /// wraps it in a `tree_node_button`, then wraps that in a `ContextMenu`
     /// with caller-specific items prepended before the common items
@@ -4930,7 +4892,7 @@ impl EditorState {
     ) -> Element<'a, EditorMessage> {
         let is_expanded = self.file_tree.expanded_dirs.contains(&node.full_path);
         let is_loading = self.loading_dirs.contains(&node.full_path);
-        let is_ignored = self.is_path_ignored(&node.full_path);
+        let is_ignored = node.ignored;
         let icon = if is_expanded {
             lucide::folder_open()
         } else {
@@ -5039,7 +5001,7 @@ impl EditorState {
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
 
         let icon = lucide::file::<iced::Theme, iced::Renderer>();
-        let is_ignored = self.is_path_ignored(&node.full_path);
+        let is_ignored = node.ignored;
         let icon_color = if is_selected {
             theme::ACCENT
         } else if is_ignored {

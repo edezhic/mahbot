@@ -684,162 +684,6 @@ fn test_toggle_dir_no_workspace_returns_none() {
     assert!(state.dir_generations.is_empty());
 }
 
-// ── Git status porcelain parsing tests ─────────────────────────
-
-#[expect(clippy::too_many_lines)]
-#[test]
-fn test_parse_git_status_porcelain() {
-    struct Case {
-        /// Short label for failure messages.
-        name: &'static str,
-        /// Raw git status --porcelain output.
-        input: &'static str,
-        /// Expected entries: (path, Some(status)) asserts the file has that
-        /// status; (path, None) asserts the file is absent from the map.
-        /// An empty slice asserts the entire map is empty.
-        expected: &'static [(&'static str, Option<GitFileStatus>)],
-    }
-    let cases: &[Case] = &[
-        Case {
-            name: "unstaged modified file",
-            input: " M src/main.rs\n",
-            expected: &[("src/main.rs", Some(GitFileStatus::Modified))],
-        },
-        Case {
-            name: "staged added file",
-            input: "A  new_file.rs\n",
-            expected: &[("new_file.rs", Some(GitFileStatus::Added))],
-        },
-        Case {
-            name: "untracked file",
-            input: "?? new_file.rs\n",
-            expected: &[("new_file.rs", Some(GitFileStatus::Added))],
-        },
-        Case {
-            name: "staged and unstaged modified (MM)",
-            input: "MM both.rs\n",
-            expected: &[("both.rs", Some(GitFileStatus::Modified))],
-        },
-        Case {
-            name: "staged added + unstaged modified (AM)",
-            input: "AM partial.rs\n",
-            expected: &[("partial.rs", Some(GitFileStatus::Modified))],
-        },
-        Case {
-            name: "rename (old -> new)",
-            input: "R  old.rs -> new.rs\n",
-            expected: &[("new.rs", Some(GitFileStatus::Modified))],
-        },
-        Case {
-            name: "rename with arrow in old path",
-            input: "R  \"old -> name.rs\" -> \"new -> name.rs\"\n",
-            expected: &[("new -> name.rs", Some(GitFileStatus::Modified))],
-        },
-        Case {
-            name: "untracked directory (trailing slash stripped)",
-            input: "?? new_dir/\n",
-            expected: &[("new_dir", Some(GitFileStatus::Added))],
-        },
-        Case {
-            name: "quoted path with spaces",
-            input: " M \"path with spaces.rs\"\n",
-            expected: &[("path with spaces.rs", Some(GitFileStatus::Modified))],
-        },
-        Case {
-            name: "deleted file (unstaged) skipped",
-            input: " D gone.rs\n",
-            expected: &[],
-        },
-        Case {
-            name: "deleted file (staged) skipped",
-            input: "D  gone.rs\n",
-            expected: &[],
-        },
-        Case {
-            name: "clean (unrecognized status) not present",
-            input: "   clean.rs\n",
-            expected: &[("clean.rs", None)],
-        },
-        Case {
-            name: "multiple entries same file — modified wins over added",
-            input: "A  dup.rs\n M dup.rs\n",
-            expected: &[("dup.rs", Some(GitFileStatus::Modified))],
-        },
-        Case {
-            name: "multiple entries same file — added sticks",
-            input: "?? dup.rs\nA  dup.rs\n",
-            expected: &[("dup.rs", Some(GitFileStatus::Added))],
-        },
-        Case {
-            name: "empty output",
-            input: "",
-            expected: &[],
-        },
-        Case {
-            name: "mixed statuses",
-            input: concat!(
-                " M src/main.rs\n",
-                "?? new_file.rs\n",
-                "A  staged.rs\n",
-                " D deleted.rs\n",
-            ),
-            expected: &[
-                ("src/main.rs", Some(GitFileStatus::Modified)),
-                ("new_file.rs", Some(GitFileStatus::Added)),
-                ("staged.rs", Some(GitFileStatus::Added)),
-                ("deleted.rs", None),
-            ],
-        },
-    ];
-
-    for case in cases {
-        let map = parse_git_status_porcelain(case.input);
-
-        if case.expected.is_empty() {
-            assert!(
-                map.is_empty(),
-                "case '{}' (input={:?}): expected empty map, got {:#?}",
-                case.name,
-                case.input,
-                map
-            );
-        } else {
-            let expected_count = case.expected.iter().filter(|(_, s)| s.is_some()).count();
-            assert_eq!(
-                map.len(),
-                expected_count,
-                "case '{}' (input={:?}): map has unexpected entries",
-                case.name,
-                case.input,
-            );
-            for &(path, expected_status) in case.expected {
-                match expected_status {
-                    Some(status) => {
-                        assert_eq!(
-                            map.get(path),
-                            Some(&status),
-                            "case '{}' (input={:?}): path={:?}",
-                            case.name,
-                            case.input,
-                            path
-                        );
-                    }
-                    None => {
-                        assert!(
-                            !map.contains_key(path),
-                            "case '{}' (input={:?}): path={:?} should be absent, got {:?}",
-                            case.name,
-                            case.input,
-                            path,
-                            map.get(path)
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
 // ── Find/Replace tests ───────────────────────────────────────────
 
 #[test]
@@ -2320,4 +2164,294 @@ fn test_confirm_delete_dir_defers_prune_until_success() {
     // parent slot only when the delete succeeds (via DirDeleted).
     assert!(!state.dir_generations.contains_key(""));
     assert_eq!(state.dir_generations.len(), 2); // fixture: "src" and "src/sub"
+}
+
+// ── Gitignore dimming (in-process matcher) ──────────────────────
+
+/// Find a tree node by workspace-relative path (depth-first through children).
+fn find_node<'a>(nodes: &'a [widgets::TreeNode], path: &str) -> &'a widgets::TreeNode {
+    find_in_tree(nodes, path).unwrap_or_else(|| panic!("node not found in tree: {path}"))
+}
+
+/// Depth-first search for a tree node; returns `None` when absent.
+fn find_in_tree<'a>(nodes: &'a [widgets::TreeNode], path: &str) -> Option<&'a widgets::TreeNode> {
+    for node in nodes {
+        if node.full_path == path {
+            return Some(node);
+        }
+        if let Some(found) = find_in_tree(&node.children, path) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[test]
+fn test_ignore_dimming_survives_collapse_and_expand() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let ws = dir.path();
+    // Dummy `.git` dir so `require_git` is satisfied — no `git init` needed.
+    std::fs::create_dir(ws.join(".git")).unwrap();
+    std::fs::write(ws.join(".gitignore"), "secret/\n").unwrap();
+    std::fs::create_dir(ws.join("secret")).unwrap();
+    std::fs::write(ws.join("secret/hidden.txt"), "x").unwrap();
+    std::fs::write(ws.join("visible.txt"), "x").unwrap();
+
+    let mut matcher = build_ignore_matcher(ws);
+    assert!(matcher.is_some());
+
+    let mut dir_entries = HashMap::new();
+    dir_entries.insert(
+        String::new(),
+        vec![
+            FsEntry {
+                name: "secret".into(),
+                full_path: "secret".into(),
+                is_dir: true,
+                error: None,
+            },
+            FsEntry {
+                name: "visible.txt".into(),
+                full_path: "visible.txt".into(),
+                is_dir: false,
+                error: None,
+            },
+        ],
+    );
+    dir_entries.insert(
+        "secret".into(),
+        vec![FsEntry {
+            name: "hidden.txt".into(),
+            full_path: "secret/hidden.txt".into(),
+            is_dir: false,
+            error: None,
+        }],
+    );
+
+    // Expanded tree: secret dir fully populated and stamped.
+    let expanded = HashSet::from(["secret".to_string()]);
+    let mut nodes = build_hierarchical_tree(&dir_entries, &expanded, "");
+    stamp_ignored_nodes(&mut nodes, &mut matcher);
+    assert!(find_node(&nodes, "secret").ignored);
+    assert!(find_node(&nodes, "secret/hidden.txt").ignored);
+    assert!(!find_node(&nodes, "visible.txt").ignored);
+
+    // Collapse path (raw rebuild, no visible-list rebuild): dimming survives.
+    let collapsed = HashSet::new();
+    let mut nodes = build_hierarchical_tree(&dir_entries, &collapsed, "");
+    stamp_ignored_nodes(&mut nodes, &mut matcher);
+    assert!(find_node(&nodes, "secret").ignored);
+
+    // Re-expand: children come back and are still dimmed.
+    let mut nodes = build_hierarchical_tree(&dir_entries, &expanded, "");
+    stamp_ignored_nodes(&mut nodes, &mut matcher);
+    assert!(find_node(&nodes, "secret").ignored);
+    assert!(find_node(&nodes, "secret/hidden.txt").ignored);
+}
+
+#[test]
+fn test_negated_patterns_do_not_dim() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let ws = dir.path();
+    std::fs::create_dir(ws.join(".git")).unwrap();
+    // `build/*` ignores the *contents* of build but not build itself, so a
+    // negated child can be re-included. (A plain `build/` + `!build/keep.txt`
+    // would NOT un-ignore keep.txt — git can't re-include a file inside an
+    // excluded directory, and the ignore crate follows that.)
+    std::fs::write(ws.join(".gitignore"), "build/*\n!build/keep.txt\n").unwrap();
+    std::fs::create_dir(ws.join("build")).unwrap();
+    std::fs::write(ws.join("build/keep.txt"), "x").unwrap();
+    std::fs::write(ws.join("build/other.txt"), "x").unwrap();
+
+    let mut matcher = build_ignore_matcher(ws);
+    assert!(matcher.is_some());
+
+    let mut dir_entries = HashMap::new();
+    dir_entries.insert(
+        String::new(),
+        vec![FsEntry {
+            name: "build".into(),
+            full_path: "build".into(),
+            is_dir: true,
+            error: None,
+        }],
+    );
+    dir_entries.insert(
+        "build".into(),
+        vec![
+            FsEntry {
+                name: "keep.txt".into(),
+                full_path: "build/keep.txt".into(),
+                is_dir: false,
+                error: None,
+            },
+            FsEntry {
+                name: "other.txt".into(),
+                full_path: "build/other.txt".into(),
+                is_dir: false,
+                error: None,
+            },
+        ],
+    );
+
+    let expanded = HashSet::from(["build".to_string()]);
+    let mut nodes = build_hierarchical_tree(&dir_entries, &expanded, "");
+    stamp_ignored_nodes(&mut nodes, &mut matcher);
+
+    let build = find_node(&nodes, "build");
+    assert!(
+        !build.ignored,
+        "build/* does not match the build dir itself"
+    );
+    for child in &build.children {
+        if child.full_path == "build/keep.txt" {
+            assert!(!child.ignored, "negated keep.txt must not be dimmed");
+        } else {
+            assert!(child.ignored, "non-negated other.txt must be dimmed");
+        }
+    }
+}
+
+#[test]
+fn test_matcher_covers_subdirectory_of_repo() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/hidden.txt"), "x").unwrap();
+    std::fs::write(root.join("sub/kept.txt"), "x").unwrap();
+    // A root-level gitignore rule that targets the sub workspace applies to a
+    // subdirectory-of-repo workspace even though the workspace's matcher root
+    // is `sub` (parents default).
+    std::fs::write(root.join(".gitignore"), "sub/hidden.txt\n").unwrap();
+
+    let ws = root.join("sub");
+    let mut matcher = build_ignore_matcher(&ws).unwrap();
+    assert!(
+        matcher.matched("hidden.txt", false).is_ignore(),
+        "parent repo .gitignore should apply to a subdirectory workspace"
+    );
+    assert!(
+        !matcher.matched("kept.txt", false).is_ignore(),
+        "a non-matching file should not be ignored"
+    );
+
+    // Without a `.git` dir in the ancestry, nothing is dimmed (require_git).
+    std::fs::remove_dir_all(root.join(".git")).unwrap();
+    let mut matcher = build_ignore_matcher(&ws).unwrap();
+    assert!(
+        !matcher.matched("hidden.txt", false).is_ignore(),
+        "no .git in the repo ancestry means nothing is dimmed"
+    );
+}
+
+// ── Commit/staging mtime detector ───────────────────────────────
+
+/// Bump a file's mtime deterministically: sleep past any coarse timestamp
+/// granularity, then rewrite the file so the OS assigns a strictly newer mtime
+/// (`std::fs::File::set_times` is a no-op on this macOS/APFS setup, so a real
+/// write is the reliable way to force a detectable mtime change).
+fn bump_file_mtime(path: &Path) {
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(path, "changed\n").unwrap();
+}
+
+/// Build an editor state pointed at a temp `ws/` containing a `.git/` dir with
+/// `index` and `logs/HEAD` files, with `git_dir` resolved via `find_git_dir`.
+fn make_editor_with_git_ws() -> (tempfile::TempDir, EditorState) {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let ws = dir.path();
+    let git_dir = ws.join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::create_dir(git_dir.join("logs")).unwrap();
+    std::fs::write(git_dir.join("index"), "").unwrap();
+    std::fs::write(git_dir.join("logs/HEAD"), "").unwrap();
+
+    let mut state = EditorState::new();
+    state.selected_workspace_name = Some("ws".to_string());
+    state.selected_workspace_path = Some(ws.to_string_lossy().to_string());
+    state.git_dir = find_git_dir(ws);
+    (dir, state)
+}
+
+#[test]
+fn test_git_status_update_re_latches_mtimes() {
+    let (dir, mut state) = make_editor_with_git_ws();
+    let ws = dir.path();
+    let index = ws.join(".git").join("index");
+
+    // First probe latches the baseline without triggering a refresh.
+    let _ = state.update(EditorMessage::CheckGitDirty);
+    assert!(!state.git_status_loading);
+    assert!(state.git_dirty_mtimes.is_some());
+
+    // Staging grew: bump `.git/index` mtime to a distinct value.
+    bump_file_mtime(&index);
+    let _ = state.update(EditorMessage::CheckGitDirty);
+    assert!(
+        state.git_status_loading,
+        "an index mtime change must request a git-status refresh"
+    );
+
+    // The refresh resolves via the existing GitState → GitStatusUpdated forward.
+    let mut statuses = HashMap::new();
+    statuses.insert("src/main.rs".to_string(), GitFileStatus::Modified);
+    let _ = state.update(EditorMessage::GitStatusUpdated {
+        workspace: Some("ws".to_string()),
+        statuses,
+    });
+    assert!(state.git_status_cache.contains_key("src/main.rs"));
+    assert!(
+        !state.git_status_loading,
+        "GitStatusUpdated clears the guard"
+    );
+
+    // The GitStatusUpdated handler re-latched the (now-changed) mtimes, so a
+    // subsequent probe sees no delta and must NOT re-trigger (loop prevented).
+    let _ = state.update(EditorMessage::CheckGitDirty);
+    assert!(
+        !state.git_status_loading,
+        "re-latched baseline must not re-trigger the detector"
+    );
+}
+
+#[test]
+fn test_page_visibility_gates_tree_ping() {
+    let mut state = make_editor_with_tree();
+    assert!(state.selected_workspace_path.is_some());
+    let gen_count_before = state.dir_generations.len();
+
+    // Hidden page: pings are dropped, so no directory refresh is dispatched.
+    state.page_visible = false;
+    let _ = state.update(EditorMessage::FileTreePinged);
+    assert_eq!(
+        state.dir_generations.len(),
+        gen_count_before,
+        "hidden editor must drop file-tree pings"
+    );
+
+    // Visible page: the ping triggers a refresh (a new root dir generation).
+    state.page_visible = true;
+    let _ = state.update(EditorMessage::FileTreePinged);
+    assert!(
+        state.dir_generations.len() > gen_count_before,
+        "visible editor must dispatch a tree refresh on ping"
+    );
+}
+
+#[test]
+fn test_modal_cleared_on_page_switch() {
+    let mut state = make_editor_with_tree();
+    state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
+        filter: crate::gui::common::SingleLineEditorState::new(""),
+        selected_index: 0,
+        results: Vec::new(),
+    }));
+
+    let _ = state.update(EditorMessage::PageVisibilityChanged(false));
+    assert!(
+        state.active_modal.is_none(),
+        "modals must close on a page switch"
+    );
+    assert!(!state.page_visible);
 }

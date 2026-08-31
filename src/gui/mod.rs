@@ -550,7 +550,9 @@ pub struct Dashboard {
     /// [`Message::WorkspacesReloaded`], which rebuilds the whole map from the
     /// store (no incremental boolean patching).
     workspaces: HashMap<String, Workspace>,
-    /// Currently selected workspace name ("" / None = "Personal").
+    /// Currently selected workspace name. `Some("personal:{user}")` = the
+    /// impersonated user's "Personal" workspace; `Some("ws")` = a shared
+    /// workspace; `None` = nothing selected.
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
     selected_user_name: Option<String>,
@@ -764,7 +766,10 @@ impl Dashboard {
 
         let load_users = self.home_state.load_users().map(Message::Home);
 
-        // Empty string => "Personal" workspace (no shared workspace).
+        // A resolved selection always has a name (`personal:{user}` for the
+        // Personal workspace). An empty string means no user/workspace is
+        // selected yet (boot without a persisted user) — treated as "no
+        // selection".
         let ws_name = if restored_name.is_empty() {
             self.selected_workspace_name = None;
             String::new()
@@ -782,7 +787,15 @@ impl Dashboard {
     /// Navigate to a page, refreshing page-specific state as needed.
     fn navigate_to(&mut self, page: Page) -> Task<Message> {
         self.page = page;
-        match page {
+        // Every navigation notifies the editor of its visibility AFTER
+        // `self.page` is set, so the handler sees the new state. This is the
+        // single source of truth for the editor's page-visible gating: on the
+        // Editor page it triggers refresh-on-entry, on any other page it closes
+        // the editor's modals (modals do not survive a page switch).
+        let visibility = Task::done(Message::Editor(
+            editor::EditorMessage::PageVisibilityChanged(self.page == Page::Editor),
+        ));
+        let refresh = match page {
             // Logs and Shell maintain their own internal state; Editor
             // receives workspace state via WorkspaceSelected from the
             // Dashboard — none need a refresh on navigation. Running Agents
@@ -802,7 +815,8 @@ impl Dashboard {
                 self.sync_settings_lists_from_map();
                 self.refresh_settings_users()
             }
-        }
+        };
+        Task::batch([visibility, refresh])
     }
 
     /// Refresh the Settings users list. The workspace list is not read here —
@@ -823,8 +837,16 @@ impl Dashboard {
         let mut list: Vec<Workspace> = self.workspaces.values().cloned().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         self.settings_state.workspaces_state.workspaces = list;
+        // The Personal option value is the impersonated user's personal name
+        // (`personal:{user}`). The settings page replaces it with each row's
+        // own personal name when rendering per-user pickers.
+        let personal_name = self
+            .selected_user_name
+            .as_deref()
+            .map(crate::users::personal_workspace_name)
+            .unwrap_or_default();
         self.settings_state.users_state.workspace_options =
-            workspace_pick_options(&self.workspaces);
+            workspace_pick_options(&self.workspaces, &personal_name);
     }
 
     /// Toggle the selected workspace's pause or maintainer state.
@@ -1332,7 +1354,21 @@ impl Dashboard {
                     diff_task
                 }
             }
-            Message::Editor(msg) => self.editor_state.update(msg).map(Message::Editor),
+            Message::Editor(msg) => {
+                // The editor's commit/staging mtime detector requests a
+                // git-status refresh. Route it through GitState's standard
+                // throttle/coalescing file-change path instead of the editor's
+                // own handler, so it reuses the 300ms refresh coalescing (and
+                // the resulting WorktreeSnapshot flows back to the editor via
+                // the usual GitStatusUpdated forward).
+                if matches!(msg, editor::EditorMessage::RequestGitStatusRefresh) {
+                    self.git_state
+                        .update(git::GitMessage::FileChanged)
+                        .map(Message::Git)
+                } else {
+                    self.editor_state.update(msg).map(Message::Editor)
+                }
+            }
             Message::Settings(msg) => self.process_settings_message(msg),
             // ── Diff modal ────────────────────────────────────────
             Message::OpenDiffModal(commit_hash) => self.open_diff_modal(commit_hash),
@@ -1343,7 +1379,24 @@ impl Dashboard {
                 if matches!(msg, git::GitMessage::OpenModal) {
                     self.show_diff_modal = false;
                 }
-                self.git_state.update(msg).map(Message::Git)
+                let snapshot = matches!(msg, git::GitMessage::WorktreeSnapshot(..));
+                let task = self.git_state.update(msg).map(Message::Git);
+                // A current-generation worktree snapshot (Ok or Err) hands the
+                // editor the latest (possibly last-known-good) per-file statuses
+                // so its file-tree colors track GitState — the editor no longer
+                // runs its own `git status` subprocess.
+                if snapshot {
+                    if let Some((workspace, statuses)) = self.git_state.take_status_forward() {
+                        return Task::batch([
+                            task,
+                            Task::done(Message::Editor(editor::EditorMessage::GitStatusUpdated {
+                                workspace,
+                                statuses,
+                            })),
+                        ]);
+                    }
+                }
+                task
             }
             Message::FocusSearch => match self.page {
                 Page::Logs => self
@@ -1450,9 +1503,15 @@ impl Dashboard {
                 // Propagate only on an actual fallback — propagate is heavy
                 // (board refresh + home reload) and must not run on every CDC
                 // event.
+                let personal_name = self
+                    .selected_user_name
+                    .as_deref()
+                    .map(crate::users::personal_workspace_name)
+                    .unwrap_or_default();
                 let resolved = resolve_workspace_selection(
                     &self.workspaces,
                     self.selected_workspace_name.as_deref(),
+                    &personal_name,
                 );
                 let current = self.selected_workspace_name.as_deref().unwrap_or_default();
                 if current != resolved.as_str() {
@@ -1535,11 +1594,13 @@ impl Dashboard {
         // Close branch modal synchronously if open.
         // CloseModal always returns Task::none() so discarding is safe.
         let _ = self.git_state.update(git::GitMessage::CloseModal);
-        // `selected_workspace_name` is `None` in Personal workspace mode (no shared
-        // workspace selected). An empty string is the established convention and is
-        // safe here: `ws` is only consumed in the `Some(hash)` branch below — the
-        // `None` branch (working-tree diff, triggered by the git stats button) does
-        // not use it.
+        // `selected_workspace_name` is `Some("personal:{user}")` for the
+        // Personal workspace and `Some("ws")` for a shared one; `None` only
+        // when nothing is selected. `unwrap_or_default()` yields an empty
+        // string for the no-selection case, which is safe here: `ws` is only
+        // consumed in the `Some(hash)` branch below — the `None` branch
+        // (working-tree diff, triggered by the git stats button) does not use
+        // it.
         let ws = self.selected_workspace_name.clone().unwrap_or_default();
         let diff_task = match commit_hash {
             Some(hash) => Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
@@ -1567,17 +1628,20 @@ impl Dashboard {
     /// Canonical entry point for workspace switching throughout the dashboard:
     /// applies the selection in memory and persists it as the impersonated
     /// user's `users.selected_workspace` (the DB is the single source of truth;
-    /// an empty name selects "Personal" and stores NULL). The DB write is
-    /// best-effort — failures are logged, the GUI selection still applies.
+    /// a personal selection stores NULL). The DB write is best-effort —
+    /// failures are logged, the GUI selection still applies.
     ///
     /// A name missing from the workspace map is never persisted: the
     /// reverse-sync path can surface a legacy dangling
     /// `users.selected_workspace` value, and re-asserting it would keep the
-    /// DB dangling. The in-memory selection still applies; a subsequent
+    /// DB dangling. Personal names are always persisted (as NULL). The
+    /// in-memory selection still applies; a subsequent
     /// [`Message::WorkspacesReloaded`] re-resolves it to "Personal".
     fn select_workspace(&mut self, name: &str) -> Task<Message> {
         let propagate = self.apply_workspace_selection(name);
-        let known = name.is_empty() || self.workspaces.contains_key(name);
+        let known = name.is_empty()
+            || crate::users::is_personal_workspace(name)
+            || self.workspaces.contains_key(name);
         let db_write = known
             .then(|| self.selected_user_name.clone())
             .flatten()
@@ -1618,54 +1682,62 @@ impl Dashboard {
         self.board_state.delta_removed_ids.clear();
         let board_refresh = self.board_state.refresh().map(Message::Board);
 
-        // Resolve the personal workspace path when name is empty (Personal)
-        // and a user is selected.  Editor, Shell, and Diff need a real
-        // filesystem path to work with.
-        let personal_path = if name.is_empty() {
-            self.selected_user_name.as_ref().map(|u| {
-                crate::users::personal_workspace_path(u)
-                    .to_string_lossy()
-                    .to_string()
-            })
-        } else {
-            None
-        };
+        // Personal workspace name + path for the selected user. The personal
+        // name is the resolved fallback (and the resolution target when `name`
+        // is a `personal:{user}` name); the path is needed by Editor, Shell,
+        // and Diff.
+        let personal_name = self
+            .selected_user_name
+            .as_deref()
+            .map(crate::users::personal_workspace_name);
+        let personal_path = self.selected_user_name.as_ref().map(|u| {
+            crate::users::personal_workspace_path(u)
+                .to_string_lossy()
+                .to_string()
+        });
 
-        // If the path is missing from the map, send an empty selection so
-        // downstream pages clear their state (the workspace picker
-        // guards against this in normal operation, but guard for db
-        // inconsistency).  Personal workspaces get their resolved path.
-        let (page_name, page_path) =
-            resolve_dashboard_workspace_path(name, ws_path.as_deref(), personal_path.as_deref());
+        // If the path is missing from the map, fall back to the personal
+        // workspace (name + path) so downstream pages stay in a valid
+        // selection. Personal workspaces always get their resolved path.
+        let (page_name, page_path) = resolve_dashboard_workspace_path(
+            name,
+            ws_path.as_deref(),
+            personal_name.as_deref(),
+            personal_path.as_deref(),
+        );
         let editor_task: Task<Message> = Task::done(editor::EditorMessage::WorkspaceSelected(
             page_name.clone(),
             page_path.clone(),
         ))
         .map(Message::Editor);
 
-        let diff_name = name.to_string();
-        let diff_path = personal_path.clone();
-
         // Propagate workspace path to git state, triggering eager refresh.
         // GitState owns the single source of truth for this path and the
-        // workspace name (empty = Personal/unnamed → timer fallback).
-        let resolved_path = ws_path.or_else(|| personal_path.clone());
-        let ws_name = (!name.is_empty()).then(|| name.to_string());
+        // workspace name (`personal:{user}` for Personal).
+        let git_name = if page_name.is_empty() {
+            None
+        } else {
+            Some(page_name.clone())
+        };
         let git_task: Task<Message> = self
             .git_state
-            .set_workspace_path(ws_name, resolved_path)
+            .set_workspace_path(git_name, page_path.clone())
             .map(Message::Git);
 
-        let diff_task: Task<Message> =
-            Task::done(diff::DiffMessage::WorkspaceSelected(diff_name, diff_path))
-                .map(Message::DiffModal);
+        let diff_task: Task<Message> = Task::done(diff::DiffMessage::WorkspaceSelected(
+            page_name.clone(),
+            page_path.clone(),
+        ))
+        .map(Message::DiffModal);
 
-        let shell_task: Task<Message> =
-            Task::done(shell::ShellMessage::WorkspaceSelected(page_name, page_path))
-                .map(Message::Shell);
+        let shell_task: Task<Message> = Task::done(shell::ShellMessage::WorkspaceSelected(
+            page_name.clone(),
+            page_path,
+        ))
+        .map(Message::Shell);
 
         // Notify the Home page so it can reload chat history.
-        let home_name = name.to_string();
+        let home_name = page_name;
         let home_task: Task<Message> =
             Task::done(home::HomeMessage::WorkspaceChanged(Some(home_name))).map(Message::Home);
 
@@ -1689,11 +1761,11 @@ impl Dashboard {
         Task::perform(load_workspace_map(), std::convert::identity)
     }
 
-    /// Return the selected workspace name, or `None` if no shared workspace
-    /// is currently selected (empty-string "Personal" is treated as None).
+    /// Return the selected shared-workspace name, or `None` if the "Personal"
+    /// workspace is selected (no shared workspace).
     fn active_workspace_name(&self) -> Option<String> {
         match self.selected_workspace_name.as_deref() {
-            Some(n) if !n.is_empty() => Some(n.to_string()),
+            Some(n) if !crate::users::is_personal_workspace(n) => Some(n.to_string()),
             _ => None,
         }
     }
@@ -1703,7 +1775,7 @@ impl Dashboard {
     fn has_active_workspace(&self) -> bool {
         self.selected_workspace_name
             .as_deref()
-            .is_some_and(|n| !n.is_empty())
+            .is_some_and(|n| !crate::users::is_personal_workspace(n))
     }
 
     /// Whether a dashboard-level overlay modal is open over the current page.
@@ -2163,7 +2235,7 @@ impl Dashboard {
             self.board_state.subscription().map(Message::Board),
             self.sessions_state.subscription().map(Message::Sessions),
             self.editor_state
-                .subscription(self.page == Page::Editor, self.overlay_modal_open())
+                .subscription(self.overlay_modal_open())
                 .map(Message::Editor),
             self.home_state.subscription().map(Message::Home),
             iced::Subscription::run(shutdown_subscription),
@@ -3149,25 +3221,28 @@ async fn read_workspace_map() -> anyhow::Result<HashMap<String, Workspace>> {
 }
 
 /// Resolve the restored workspace selection against a freshly loaded map:
-/// the previous selection is kept when it still exists ("" = "Personal", always
-/// valid); anything else falls back to the "Personal" default.
+/// the previous selection is kept when it still exists (a `personal:{user}`
+/// name is never in the map, so it always falls through to the personal
+/// default); anything else falls back to the "Personal" default (the
+/// impersonated user's `personal:{user}` name).
 #[must_use]
 fn resolve_workspace_selection(
     map: &HashMap<String, Workspace>,
     prev_selection: Option<&str>,
+    personal_name: &str,
 ) -> String {
     match prev_selection {
-        Some(name) if name.is_empty() || map.contains_key(name) => name.to_string(),
-        _ => String::new(),
+        Some(name) if !name.is_empty() && map.contains_key(name) => name.to_string(),
+        _ => personal_name.to_string(),
     }
 }
 
 /// Load the full workspace map during boot and resolve the selected
 /// workspace from the DB (`users.selected_workspace` for the impersonated
 /// user — the single source of truth). Degrades to the "Personal" default
-/// when no user is selected, the stored value is NULL/personal, the read
-/// fails, or the stored workspace is missing from the map (the boot path
-/// must complete).
+/// (`personal:{user}`) when no user is selected, the stored value is
+/// NULL/personal, the read fails, or the stored workspace is missing from the
+/// map (the boot path must complete).
 async fn load_workspace_options(user: Option<String>) -> Message {
     let prev = match user.as_deref() {
         Some(user) => match crate::users::get_raw_selected_workspace(user).await {
@@ -3181,18 +3256,29 @@ async fn load_workspace_options(user: Option<String>) -> Message {
         None => None,
     };
     let workspaces = read_workspace_map().await.unwrap_or_default();
-    let restored = resolve_workspace_selection(&workspaces, prev.as_deref());
+    // The personal default is the impersonated user's `personal:{user}` name
+    // (empty when no user is selected — no personal workspace exists yet).
+    let personal_name = user
+        .as_deref()
+        .map(crate::users::personal_workspace_name)
+        .unwrap_or_default();
+    let restored = resolve_workspace_selection(&workspaces, prev.as_deref(), &personal_name);
     Message::BootWorkspaces(workspaces, restored)
 }
 
 /// Build the Settings users-page workspace picker options from the shared
-/// workspace map: "Personal" prepended, then map values sorted by name. The
-/// labels match those previously produced by the same `store.list()` rows.
+/// workspace map: "Personal" prepended (value = the impersonated user's
+/// `personal:{user}` name), then map values sorted by name. The Settings page
+/// swaps the Personal value for each row's own personal name at render time.
+/// The labels match those previously produced by the same `store.list()` rows.
 #[must_use]
-fn workspace_pick_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
+fn workspace_pick_options(
+    map: &HashMap<String, Workspace>,
+    personal_name: &str,
+) -> Vec<widgets::PickOption> {
     let mut options = Vec::with_capacity(map.len() + 1);
     options.push(widgets::PickOption {
-        value: String::new(),
+        value: personal_name.to_string(),
         label: "Personal".to_string(),
     });
     let mut values: Vec<&Workspace> = map.values().collect();
@@ -3222,31 +3308,43 @@ fn open_url(url: &str) {
 }
 
 /// Resolve a workspace name+path pair from the dashboard's in-memory workspace
-/// map and optional personal workspace path.  This is a synchronous lookup —
+/// map and optional personal workspace name/path.  This is a synchronous lookup —
 /// it does **not** query the database.  For a DB-backed resolution (async),
 /// see `gui::diff::resolve_workspace_path`.
 ///
-/// If `ws_path` is `Some`, that takes priority; otherwise `personal_path` is
-/// used as a fallback ("Personal workspace — use resolved user path").  When
-/// `name` is empty and no path is available, returns `None` for the path
-/// ("Personal workspace without a selected user — no path to send").  Logs a
-/// warning for non-empty names where neither path source is available (possible
-/// DB inconsistency).
+/// A `personal:{user}` name resolves to its own path directly (derived from the
+/// name's embedded user). A named shared workspace in the map uses its stored
+/// path. A name missing from the map (possible DB inconsistency) warns and
+/// falls back to the personal workspace name/path. An empty `name` with no path
+/// (no selection) returns `("", None)`.
 fn resolve_dashboard_workspace_path(
     name: &str,
     ws_path: Option<&str>,
+    personal_name: Option<&str>,
     personal_path: Option<&str>,
 ) -> (String, Option<String>) {
     if let Some(p) = ws_path {
         (name.to_string(), Some(p.to_string()))
-    } else if let Some(p) = personal_path {
-        (name.to_string(), Some(p.to_string()))
+    } else if let Some(user) = crate::users::personal_user_name(name) {
+        // Personal workspace — derive its path directly from the name's user.
+        (
+            name.to_string(),
+            Some(
+                crate::users::personal_workspace_path(user)
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        )
+    } else if let (Some(pn), Some(pp)) = (personal_name, personal_path) {
+        // Unknown name (missing from the map) — fall back to the personal
+        // workspace name/path.
+        (pn.to_string(), Some(pp.to_string()))
     } else if name.is_empty() {
         (String::new(), None)
     } else {
         tracing::warn!(
             workspace = name,
-            "Workspace path not found in map — sending empty selection"
+            "Workspace path not found in map and no personal workspace — sending empty selection"
         );
         (String::new(), None)
     }
@@ -3319,10 +3417,20 @@ mod tests {
     #[test]
     fn resolve_workspace_selection_keeps_valid_falls_back_personal() {
         let map = HashMap::from([("ws1".to_string(), ws("ws1"))]);
-        assert_eq!(resolve_workspace_selection(&map, Some("ws1")), "ws1");
-        assert_eq!(resolve_workspace_selection(&map, Some("gone")), "");
-        assert_eq!(resolve_workspace_selection(&map, Some("")), "");
-        assert_eq!(resolve_workspace_selection(&map, None), "");
+        let personal = "personal:alice";
+        assert_eq!(
+            resolve_workspace_selection(&map, Some("ws1"), personal),
+            "ws1"
+        );
+        assert_eq!(
+            resolve_workspace_selection(&map, Some("gone"), personal),
+            personal
+        );
+        assert_eq!(
+            resolve_workspace_selection(&map, Some(""), personal),
+            personal
+        );
+        assert_eq!(resolve_workspace_selection(&map, None, personal), personal);
     }
 
     #[test]
@@ -3402,19 +3510,31 @@ mod tests {
         assert!(map.contains_key("boot_ws_gui"));
         assert_eq!(restored, "boot_ws_gui");
 
-        for (user, why) in [
-            (Some("boot_bob_gui".to_string()), "personal stored value"),
+        for (user, why, expected) in [
+            (
+                Some("boot_bob_gui".to_string()),
+                "personal stored value",
+                "personal:boot_bob_gui",
+            ),
             (
                 Some("boot_carol_gui".to_string()),
                 "stored value missing from the map",
+                "personal:boot_carol_gui",
             ),
-            (Some("boot_dave_gui".to_string()), "NULL stored value"),
-            (None, "no user selected"),
+            (
+                Some("boot_dave_gui".to_string()),
+                "NULL stored value",
+                "personal:boot_dave_gui",
+            ),
+            (None, "no user selected", ""),
         ] {
             let Message::BootWorkspaces(_, restored) = load_workspace_options(user).await else {
                 panic!("expected BootWorkspaces");
             };
-            assert_eq!(restored, "", "{why} must resolve to the Personal default");
+            assert_eq!(
+                restored, expected,
+                "{why} must resolve to the Personal default"
+            );
         }
     }
 }

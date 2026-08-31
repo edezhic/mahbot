@@ -214,9 +214,9 @@ pub struct HomeState {
     /// Currently selected user (sender identifier).
     pub(crate) selected_user: Option<String>,
     /// Currently selected workspace name (synced from Dashboard workspace
-    /// picker, whose selected value is the user's DB record). Empty string
-    /// `""` means the "Personal" workspace — must be resolved
-    /// to `personal:<user_name>` before querying chat_history or sessions.
+    /// picker). `Some("personal:{user}")` = the user's "Personal" workspace;
+    /// `Some("ws")` = a shared workspace. Resolved to `personal:<user_name>`
+    /// before querying chat_history or sessions.
     selected_workspace: Option<String>,
     /// The selected user's DB-stored project workspace (None when unset or
     /// personal). The merge partner for the Personal-picker chat view: at
@@ -337,14 +337,15 @@ impl HomeState {
     }
 
     /// Resolve the workspace name for chat history and session queries.
-    /// `None` or empty string (Personal) → `personal:<user_name>`.
-    /// Non-empty workspace → the workspace name as-is.
+    /// A `personal:{user}` name is used as-is; `None` or an empty string (a
+    /// legacy/edge sentinel) → `personal:<user_name>`. Non-personal names are
+    /// the workspace name as-is.
     fn resolve_workspace_name(&self) -> Option<String> {
         match &self.selected_workspace {
             Some(w) if !w.is_empty() => Some(w.clone()),
             _ => {
                 let user = self.selected_user.as_ref()?;
-                Some(format!("personal:{user}"))
+                Some(crate::users::personal_workspace_name(user))
             }
         }
     }
@@ -361,7 +362,7 @@ impl HomeState {
     /// `None` when no user is selected.
     fn visible_workspaces(&self) -> Option<VisibleChat> {
         let user = self.selected_user.as_ref()?;
-        let personal = format!("personal:{user}");
+        let personal = crate::users::personal_workspace_name(user);
         let chat = match self.resolve_workspace_name() {
             Some(sel) if !self.is_selected_user_personal_workspace(&sel) => VisibleChat {
                 primary: sel,
@@ -406,10 +407,11 @@ impl HomeState {
         match crate::users::get_raw_selected_workspace(&user).await {
             Ok(Some(ws_name)) => {
                 // User has an explicit stored workspace preference. Normalize
-                // personal workspaces to the GUI sentinel ""; the project
-                // workspace is the merge partner at the Personal picker.
+                // a personal stored value to the GUI-wide `personal:{user}` name;
+                // the project workspace is the merge partner at the Personal
+                // picker.
                 let (sidebar_ws, project_ws) = if crate::users::is_personal_workspace(&ws_name) {
-                    (String::new(), None)
+                    (crate::users::personal_workspace_name(&user), None)
                 } else {
                     (ws_name.clone(), Some(ws_name))
                 };
@@ -2150,8 +2152,10 @@ mod tests {
             .messages
             .push(make_msg("m1", "hi", ChatDirection::User, None, false));
 
-        let _task = state.update(HomeMessage::WorkspaceChanged(Some(String::new())));
-        assert_eq!(state.selected_workspace.as_deref(), Some(""));
+        let _task = state.update(HomeMessage::WorkspaceChanged(Some(
+            "personal:alice".to_string(),
+        )));
+        assert_eq!(state.selected_workspace.as_deref(), Some("personal:alice"));
         assert!(
             state.messages.is_empty(),
             "chat state resets on workspace change"
@@ -2159,7 +2163,7 @@ mod tests {
         assert_eq!(
             state.resolve_workspace_name().as_deref(),
             Some("personal:alice"),
-            "empty picker selection resolves to the personal workspace"
+            "personal picker selection resolves to the personal workspace"
         );
 
         // A project-picker change refreshes history directly and keeps the

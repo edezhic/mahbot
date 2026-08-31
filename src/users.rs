@@ -518,6 +518,14 @@ pub fn personal_workspace_path(user_name: &str) -> PathBuf {
     userspaces_root().join(user_name)
 }
 
+/// The canonical GUI-wide workspace name for a user's personal workspace:
+/// `personal:{user_name}`. This is the single search-engine key shared by the
+/// agent side and the dashboard.
+#[must_use]
+pub fn personal_workspace_name(user_name: &str) -> String {
+    format!("personal:{user_name}")
+}
+
 /// Ensure the personal workspace directory for a user exists and is
 /// git-initialized. Creates the directory if it's missing and runs `git init`
 /// only when no repo is present yet (idempotent otherwise). Both failures are
@@ -583,15 +591,25 @@ pub async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
 /// Shared by the message router and the boot resume path so both treat
 /// synthetic personal workspaces identically.
 pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>> {
-    match crate::workspace::get_by_name(workspace_name).await? {
-        Some(ws) => Ok(Some(ws)),
-        None if is_personal_workspace(workspace_name) => {
-            let user_name = personal_user_name(workspace_name)
-                .expect("invariant: is_personal_workspace checked the prefix");
-            let path = personal_workspace_path(user_name);
-            Ok(Some(personal_workspace_struct(user_name, &path)))
+    if let Some(ws) = crate::workspace::get_by_name(workspace_name).await? {
+        // A shared workspace row whose name looks like a personal workspace can
+        // only be a legacy row (validate_name rejects ':'), so `personal:{user}`
+        // shadows the personal-workspace key. Log it so the operator can clean
+        // it up — the personal key wins the registry elsewhere.
+        if is_personal_workspace(&ws.name) {
+            warn!(
+                workspace_name = %ws.name,
+                "Shared workspace name shadows the personal workspace key 'personal:{{user}}'"
+            );
         }
-        None => Ok(None),
+        Ok(Some(ws))
+    } else if is_personal_workspace(workspace_name) {
+        let user_name = personal_user_name(workspace_name)
+            .expect("invariant: is_personal_workspace checked the prefix");
+        let path = personal_workspace_path(user_name);
+        Ok(Some(personal_workspace_struct(user_name, &path)))
+    } else {
+        Ok(None)
     }
 }
 
@@ -600,7 +618,7 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
 #[must_use]
 pub fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
     let mut ws = Workspace::from_path(path);
-    ws.name = format!("personal:{user_name}");
+    ws.name = personal_workspace_name(user_name);
     ws.status = WorkspaceStatus::Ready;
     ws.maintainer_debounce_mins = Workspace::MAX_MAINTAINER_DEBOUNCE_MINS;
     ws

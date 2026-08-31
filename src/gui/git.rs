@@ -10,13 +10,14 @@
 
 use super::theme;
 
-use crate::git::commands::DiffStats;
+use crate::git::commands::{DiffStats, GitFileStatus, GitWorktreeSnapshot};
 
 use iced::widget::{Column, Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Task};
 
-use fff_search::{Error as FffError, WatchId, WatchOptions};
+use fff_search::{WatchId, WatchOptions};
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -50,14 +51,10 @@ const LOCAL_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(300);
 /// at this cadence.
 pub(crate) const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Non-blocking retry window for registering the file-change watch while the
-/// watcher is not ready (initial scan) or the engine is not yet created.
-const WATCH_RETRY_WINDOW: Duration = Duration::from_secs(30);
-
-/// Non-blocking retry cadence, within the bounded [`WATCH_RETRY_WINDOW`], for
-/// the scoped self-rescheduling watch-retry timer (matches the previous
-/// per-tick retry cadence).
-const WATCH_RETRY_POLL: Duration = Duration::from_secs(1);
+/// Bounded wait for a lazily-created workspace engine's file watcher to become
+/// ready before registering the file-change watch. Registration happens once per
+/// workspace selection — there is no retry loop.
+const WATCH_READY_WAIT: Duration = Duration::from_secs(30);
 
 /// Git state owned by the Dashboard.
 ///
@@ -70,6 +67,9 @@ pub struct GitState {
     workspace_path: Option<PathBuf>,
     /// Cached diff stats (+N / -M) from periodic refresh.
     diff_stats: Option<DiffStats>,
+    /// Cached per-file porcelain statuses for the current workspace. Keyed by
+    /// workspace-relative path; forwarded to the editor's file tree.
+    file_statuses: HashMap<String, GitFileStatus>,
     /// Cached current branch name from periodic refresh.
     current_branch: Option<String>,
     /// Cached behind/ahead counts from periodic refresh.
@@ -92,9 +92,16 @@ pub struct GitState {
     // ── Refresh state ───────────────────────────────────────────
     /// Workspace name for the currently selected workspace, used to resolve the
     /// per-workspace [`SharedFilePicker`](fff_search::SharedFilePicker) watch
-    /// by name (the registry is keyed by workspace name, not path). `None` for
-    /// Personal/unnamed workspaces, which fall back to the timer.
+    /// by name (the registry is keyed by workspace name, not path). `Some`
+    /// for every resolved selection, including `personal:{user}` — `None` only
+    /// when no workspace is selected.
     workspace_name: Option<String>,
+    /// One-shot flag: a [`GitMessage::WorktreeSnapshot`] result was applied for
+    /// the current generation (Ok or Err), so [`Self::take_status_forward`]
+    /// should hand the editor the (possibly last-known-good) statuses. Set on
+    /// every current-generation snapshot result; reset by [`Self::clear`],
+    /// [`Self::set_workspace_path`], and [`Self::take_status_forward`].
+    statuses_dirty: bool,
     /// Generation for local refreshes (diff stats + current branch). Each
     /// local refresh captures the current value and only applies while it is
     /// current, so stale/out-of-order results never overwrite newer state.
@@ -117,13 +124,6 @@ pub struct GitState {
     /// The active file-change watch subscription id. `Some` only when a watch
     /// was successfully registered on the current workspace's picker.
     watch_id: Option<WatchId>,
-    /// Registration of the file-change watch failed (watcher not ready, or the
-    /// engine not created yet) — retried non-blocking by a scoped
-    /// self-rescheduling timer within [`WATCH_RETRY_WINDOW`].
-    watch_pending: bool,
-    /// Bounded window for [`Self::watch_pending`] retries; after it elapses the
-    /// watch is abandoned in favour of the timer fallback.
-    watch_retry_deadline: Option<Instant>,
 }
 
 /// Messages for the git sub-state.
@@ -134,18 +134,19 @@ pub struct GitState {
 #[derive(Debug, Clone)]
 pub enum GitMessage {
     // ── Refresh results ─────────────────────────────────────────
-    /// Result of `run_git_diff_stats`. Carries the refresh generation;
+    /// Result of `run_git_worktree_snapshot`. Carries the refresh generation;
     /// results from a superseded generation are discarded. `Ok` on genuine
     /// success (including a clean tree); `Err` on transient failure keeps
-    /// the cached last-known-good value.
-    DiffStats(u64, Result<DiffStats, String>),
+    /// the cached last-known-good value. Either outcome marks the statuses
+    /// for forwarding to the editor so its in-flight flag cannot stick.
+    WorktreeSnapshot(u64, Result<GitWorktreeSnapshot, String>),
     /// Result of `run_git_current_branch`. Same generation/staleness
-    /// semantics as [`GitMessage::DiffStats`].
+    /// semantics as [`GitMessage::WorktreeSnapshot`].
     CurrentBranch(u64, Result<String, String>),
     /// Result of `run_git_behind_ahead`. `Ok((0, 0))` is a genuine
     /// clean/no-upstream state (hides the sync button); `Err` keeps the
     /// last-known-good counts. Same generation semantics as
-    /// [`GitMessage::DiffStats`] but against [`GitState::remote_generation`].
+    /// [`GitMessage::WorktreeSnapshot`] but against [`GitState::remote_generation`].
     BehindAhead(u64, Result<(usize, usize), String>),
 
     // ── Event-driven refresh ────────────────────────────────────
@@ -173,12 +174,10 @@ pub enum GitMessage {
     /// refresh, or reschedules itself when a newer event restarted the throttle
     /// window. A stale timer firing with no owed refresh is a no-op.
     DeferredLocalRefresh,
-    /// Fired by the scoped self-rescheduling 1s retry timer while a file-change
-    /// watch registration is pending (watcher not ready / engine not created).
-    /// Retries within the bounded [`WATCH_RETRY_WINDOW`]; abandons the watch in
-    /// favour of the periodic timer when the window elapses. No-op when nothing
-    /// is pending.
-    WatchRetryTick,
+    /// Result of a deferred file-change watch registration. Carries the
+    /// registration generation; results from a superseded generation (a
+    /// workspace switch raced the deferred registration) are discarded.
+    WatchRegistered(u64, Result<WatchId, String>),
 
     // ── Branch listing ──────────────────────────────────────────
     /// Result of listing local branches.
@@ -226,6 +225,7 @@ impl GitState {
         Self {
             workspace_path: None,
             diff_stats: None,
+            file_statuses: HashMap::new(),
             current_branch: None,
             behind_ahead: None,
             show_branch_modal: false,
@@ -235,14 +235,13 @@ impl GitState {
             branch_error: None,
             new_branch_name: super::common::SingleLineEditorState::new(""),
             workspace_name: None,
+            statuses_dirty: false,
             local_generation: 0,
             remote_generation: 0,
             last_local_refresh: None,
             local_refresh_pending: false,
             last_remote_refresh: None,
             watch_id: None,
-            watch_pending: false,
-            watch_retry_deadline: None,
         }
     }
 
@@ -287,7 +286,8 @@ impl GitState {
 
     // ── State mutators (called from Dashboard during workspace switch) ──
 
-    /// Clear all cached git info (diff stats, branch, behind/ahead, modal).
+    /// Clear all cached git info (diff stats, per-file statuses, branch,
+    /// behind/ahead, modal).
     /// Does **not** clear `workspace_path`, `workspace_name`, the watch state,
     /// or the refresh throttle/timer state — those are managed explicitly by
     /// [`Self::set_workspace_path`] and the periodic/deferred timers. Bumps both
@@ -295,6 +295,8 @@ impl GitState {
     /// are discarded as stale.
     pub fn clear(&mut self) {
         self.diff_stats = None;
+        self.file_statuses.clear();
+        self.statuses_dirty = false;
         self.current_branch = None;
         self.behind_ahead = None;
         self.local_branches.clear();
@@ -308,13 +310,16 @@ impl GitState {
     }
 
     /// Set the workspace name and filesystem path, and trigger an eager refresh
-    /// of git info (diff stats, branch, behind/ahead for the new workspace).
+    /// of git info (diff stats, per-file statuses, branch, behind/ahead for the
+    /// new workspace).
     /// Clears all cached state first and re-registers the file-change watch for
-    /// the new workspace (best-effort; retried by a self-rescheduling timer if
-    /// the watcher is not ready yet).
+    /// the new workspace (one deferred attempt when the engine's watcher is
+    /// ready — no retry loop; registration failure is a WARN and the workspace
+    /// stays unwatched until the next switch).
     ///
-    /// `name` is `None` for Personal/unnamed workspaces, which have no search
-    /// engine subscribe to and therefore fall back to the periodic timer.
+    /// `name` is `Some` for every resolved selection — including the personal
+    /// `personal:{user}` workspace, which IS watched via its lazily-created
+    /// engine. `None` means no workspace is selected (nothing to watch).
     ///
     /// Returns a batch of [`Task`]s that produce [`GitMessage`] results
     /// when the async operations complete.
@@ -328,15 +333,12 @@ impl GitState {
         // clear() bumps both generations — results still in flight from the
         // previous workspace are discarded as stale.
         self.clear();
-        self.workspace_name = name.filter(|n| !n.is_empty());
+        self.workspace_name = name;
         self.workspace_path = path.map(PathBuf::from);
         // Reset the local throttle for the new workspace (nothing refreshed yet).
         self.last_local_refresh = None;
         self.local_refresh_pending = false;
-        self.watch_pending = false;
-        self.watch_retry_deadline = None;
-        // Register the file-change watch (best-effort; retried by a
-        // self-rescheduling timer while the watcher is not ready yet).
+        // Register the file-change watch (one deferred attempt — no retry).
         let watch_task = self.try_register_watch();
         match &self.workspace_path {
             Some(p) => {
@@ -354,6 +356,24 @@ impl GitState {
         }
     }
 
+    /// Resolve the statuses to forward to the editor, if the last
+    /// current-generation snapshot applied (Ok or Err) has not yet been
+    /// claimed. Returns `Some((workspace_name, statuses))` once, resetting the
+    /// one-shot flag; `None` when nothing new is pending.
+    ///
+    /// `workspace_name` is `Some` for every resolved selection (including the
+    /// `personal:{user}` workspace) — passed through so the editor can drop a
+    /// forward that no longer matches its selected workspace.
+    pub(crate) fn take_status_forward(
+        &mut self,
+    ) -> Option<(Option<String>, HashMap<String, GitFileStatus>)> {
+        if !self.statuses_dirty {
+            return None;
+        }
+        self.statuses_dirty = false;
+        Some((self.workspace_name.clone(), self.file_statuses.clone()))
+    }
+
     // ── Update / message handling ─────────────────────────────────
 
     /// Process a [`GitMessage`] and return any resulting tasks.
@@ -361,14 +381,26 @@ impl GitState {
     pub fn update(&mut self, msg: GitMessage) -> Task<GitMessage> {
         match msg {
             // ── Refresh results ─────────────────────────────────
-            GitMessage::DiffStats(generation, result) => {
-                // Only apply current-generation successes — a transient git
-                // failure (`Err`) keeps the last-known-good value so the
-                // footer controls don't flicker.
-                if generation == self.local_generation
-                    && let Ok(stats) = result
-                {
-                    self.diff_stats = Some(stats);
+            GitMessage::WorktreeSnapshot(generation, result) => {
+                // Only apply current-generation snapshots. On `Ok` store both
+                // the stats and the per-file statuses; on `Err` keep the
+                // last-known-good values so the footer controls don't flicker.
+                // Either outcome flags the statuses for forwarding so the
+                // editor re-renders with last-known-good (its in-flight flag
+                // must never stick on a transient error).
+                //
+                // A stale-generation snapshot is dropped without forwarding —
+                // safe because the generation only moves when a newer refresh
+                // (workspace switch, throttle fire, periodic sync) starts, and
+                // that newer refresh produces its own current-generation
+                // forward. The editor's in-flight guard therefore resolves
+                // with the superseding snapshot, never the dropped one.
+                if generation == self.local_generation {
+                    if let Ok(snapshot) = result {
+                        self.diff_stats = Some(snapshot.stats);
+                        self.file_statuses = snapshot.file_statuses;
+                    }
+                    self.statuses_dirty = true;
                 }
                 Task::none()
             }
@@ -473,25 +505,36 @@ impl GitState {
                     }
                 }
             }
-            GitMessage::WatchRetryTick => {
-                // A stale retry firing with nothing pending is a no-op.
-                if !self.watch_pending {
+            GitMessage::WatchRegistered(generation, result) => {
+                // Only apply current-generation registrations — a workspace
+                // switch raced the deferred registration and superseded it.
+                if generation != self.local_generation {
                     return Task::none();
                 }
-                let now = Instant::now();
-                // Once the bounded retry window elapses (or is unanchored),
-                // abandon the watch in favour of the periodic timer fallback.
-                if self.watch_retry_deadline.is_none_or(|d| now >= d) {
-                    self.watch_pending = false;
-                    self.watch_retry_deadline = None;
-                    return Task::none();
+                match result {
+                    Ok(id) => {
+                        self.watch_id = Some(id);
+                        tracing::info!(
+                            ?id,
+                            workspace = %self.workspace_name.as_deref().unwrap_or("<none>"),
+                            "file-change watch registered",
+                        );
+                    }
+                    Err(e) => {
+                        // Registration failed (watcher not ready within the
+                        // bounded wait, or the engine could not be created).
+                        // No retry: the workspace stays unwatched (periodic
+                        // sync still refreshes the footer) until the next
+                        // workspace switch re-attempts.
+                        tracing::warn!(
+                            error = %e,
+                            workspace = %self.workspace_name.as_deref().unwrap_or("<none>"),
+                            "file-change watch registration failed — workspace stays unwatched \
+                             until the next workspace switch",
+                        );
+                    }
                 }
-                let task = self.try_register_watch();
-                if self.watch_pending {
-                    task
-                } else {
-                    Task::none()
-                }
+                Task::none()
             }
 
             // ── Branch listing result ───────────────────────────
@@ -787,38 +830,69 @@ async fn with_ws_path<T>(
     }
 }
 
-/// Self-rescheduling task that fires [`GitMessage::WatchRetryTick`] after
-/// [`WATCH_RETRY_POLL`] — the non-blocking retry cadence for a pending watch
-/// registration.
-fn watch_retry_task() -> Task<GitMessage> {
-    // Sleep built lazily at first poll — eager construction would panic off
-    // the tokio runtime context (see the deferred-refresh timer).
-    Task::perform(
-        async move { tokio::time::sleep(WATCH_RETRY_POLL).await },
-        |()| GitMessage::WatchRetryTick,
-    )
+/// One deferred attempt to register the file-change watch on a workspace's
+/// picker, blocking off the UI thread until the engine's watcher is ready.
+///
+/// Lazily initialises the engine (creating it + spawning the background scan)
+/// if it does not already exist, then registers an empty-pattern watch over the
+/// whole tree. The engine may already exist from an agent search; reusing it is
+/// the common path. On `WatcherNotReady` (initial scan still running) or engine
+/// creation failure, returns `Err` — there is no retry loop; the caller warns
+/// and the workspace stays unwatched until the next switch (the periodic sync
+/// still refreshes the footer).
+///
+/// The watcher callback runs on the watcher's dedicated thread and must only do
+/// a non-blocking send — never lock the picker (deadlock).
+async fn register_watch_task(name: String, path: String) -> Result<WatchId, String> {
+    tokio::task::spawn_blocking(move || {
+        let entry = match crate::search_engine::get_engine_by_name(&name) {
+            Some(entry) => entry,
+            None => {
+                crate::search_engine::get_or_init_engine(&name, std::path::Path::new(&path), false)?
+            }
+        };
+        if !entry.picker.wait_for_watcher(WATCH_READY_WAIT) {
+            return Err(format!(
+                "watcher not ready within {}s for workspace {name}",
+                WATCH_READY_WAIT.as_secs()
+            ));
+        }
+        let picker = entry.picker.clone();
+        let tx = file_change_tx().clone();
+        picker
+            .watch("", WatchOptions::default(), move |_id, _events| {
+                let _ = tx.send(());
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("watch registration task join error: {e}"))?
 }
 
 impl GitState {
     /// Spawn two parallel async tasks to refresh the local working-tree state
-    /// (diff stats + current branch). Results carry `generation` and are applied
-    /// by [`Self::update`] only while the local generation is current — stale or
-    /// out-of-order results are dropped. Transient git failures surface as
-    /// `Err` and leave the cached last-known-good values untouched.
+    /// (diff stats + per-file statuses + current branch). Results carry
+    /// `generation` and are applied by [`Self::update`] only while the local
+    /// generation is current — stale or out-of-order results are dropped.
+    /// Transient git failures surface as `Err` and leave the cached
+    /// last-known-good values untouched.
     fn refresh_local(path: PathBuf, generation: u64) -> Task<GitMessage> {
-        if !crate::git::commands::is_git_repo(&path) {
+        // Repo check walks UP so a workspace that is a subdirectory of a repo
+        // still refreshes (git commands run at the workspace path; porcelain
+        // paths stay workspace-relative). Without a repo, skip the subprocesses.
+        if crate::git::commands::resolve_git_top_level(&path).is_none() {
             return Task::none();
         }
 
-        // Diff stats
+        // Diff stats + per-file statuses
         let stats_path = path.clone();
         let stats_task = Task::perform(
             async move {
-                crate::git::commands::run_git_diff_stats(&stats_path)
+                crate::git::commands::run_git_worktree_snapshot(&stats_path)
                     .await
                     .map_err(|e| e.to_string())
             },
-            move |res| GitMessage::DiffStats(generation, res),
+            move |res| GitMessage::WorktreeSnapshot(generation, res),
         );
 
         // Current branch
@@ -842,7 +916,9 @@ impl GitState {
     /// logged at debug level and behind/ahead is still computed against local
     /// refs.
     fn refresh_remote(path: PathBuf, generation: u64, fetch: bool) -> Task<GitMessage> {
-        if !crate::git::commands::is_git_repo(&path) {
+        // Same repo check as the local refresh — a subdirectory of a repo
+        // still refreshes.
+        if crate::git::commands::resolve_git_top_level(&path).is_none() {
             return Task::none();
         }
         Task::perform(
@@ -882,7 +958,8 @@ impl GitState {
                     )
                     .max(Duration::from_millis(1));
                 Task::perform(
-                    // Sleep built lazily at first poll (see watch_retry_task).
+                    // Sleep built lazily at first poll (eager construction
+                    // would panic off the tokio runtime context).
                     async move { tokio::time::sleep(remaining).await },
                     |()| GitMessage::DeferredLocalRefresh,
                 )
@@ -948,58 +1025,29 @@ impl GitState {
         }
     }
 
-    /// Register the file-change watch on the current workspace's picker. Reuses
-    /// an existing engine — never creates one as a side effect. A `WatcherNotReady`
-    /// (initial scan) or missing engine sets [`Self::watch_pending`] and returns a
-    /// self-rescheduling retry timer that fires [`GitMessage::WatchRetryTick`] after
-    /// [`WATCH_RETRY_POLL`], within a bounded window; any other failure falls back
-    /// to the periodic timer.
+    /// Register the file-change watch on the current workspace's picker.
+    ///
+    /// Requires a resolved (name, path) pair — `None` means no workspace is
+    /// selected. Returns a single deferred [`Task`] that, once the engine's
+    /// watcher is ready, registers an empty-pattern whole-tree watch. This is
+    /// ONE attempt, not a retry loop: if the engine must be created lazily or
+    /// the watcher is not ready within [`WATCH_READY_WAIT`], the resulting
+    /// [`GitMessage::WatchRegistered`] carries the error and the workspace stays
+    /// unwatched until the next switch.
     fn try_register_watch(&mut self) -> Task<GitMessage> {
-        self.watch_pending = false;
-
-        let (Some(name), Some(_path)) = (&self.workspace_name, &self.workspace_path) else {
-            // Personal/unnamed or no filesystem path — timer fallback.
+        let (Some(name), Some(path)) = (
+            self.workspace_name.clone(),
+            self.workspace_path
+                .clone()
+                .map(|p| p.to_string_lossy().to_string()),
+        ) else {
+            // No workspace selected — nothing to watch.
             return Task::none();
         };
-        let Some(entry) = crate::search_engine::get_engine_by_name(name) else {
-            // Engine not created yet; retry once it appears (eager scan/search).
-            // Anchor the retry deadline only on the first failure so the window
-            // is actually bounded.
-            self.watch_pending = true;
-            if self.watch_retry_deadline.is_none() {
-                self.watch_retry_deadline = Some(Instant::now() + WATCH_RETRY_WINDOW);
-            }
-            return watch_retry_task();
-        };
-
-        let picker = entry.picker.clone();
-        // The callback runs on the watcher's dedicated thread and must only do
-        // a non-blocking send — never lock the picker (deadlock). An empty
-        // pattern watches the whole tree (the watcher already excludes `.git`,
-        // gitignored paths, and Access events, so git status/index self-trigger
-        // loops cannot occur).
-        let tx = file_change_tx().clone();
-        match picker.watch("", WatchOptions::default(), move |_id, _events| {
-            let _ = tx.send(());
-        }) {
-            Ok(id) => {
-                self.watch_id = Some(id);
-                self.watch_retry_deadline = None;
-                Task::none()
-            }
-            Err(FffError::WatcherNotReady) => {
-                self.watch_pending = true;
-                if self.watch_retry_deadline.is_none() {
-                    self.watch_retry_deadline = Some(Instant::now() + WATCH_RETRY_WINDOW);
-                }
-                watch_retry_task()
-            }
-            Err(_) => {
-                // WatcherDisabled or another error — rely on the timer fallback.
-                self.watch_retry_deadline = None;
-                Task::none()
-            }
-        }
+        let generation = self.local_generation;
+        Task::perform(register_watch_task(name, path), move |res| {
+            GitMessage::WatchRegistered(generation, res)
+        })
     }
 }
 
@@ -1014,19 +1062,25 @@ mod tests {
         s
     }
 
+    /// A snapshot with the given line stats and no per-file statuses.
+    fn snapshot(added: i64, removed: i64) -> GitWorktreeSnapshot {
+        GitWorktreeSnapshot {
+            stats: DiffStats {
+                added,
+                removed,
+                huge_binary_file_count: 0,
+            },
+            file_statuses: HashMap::new(),
+            unborn_head: false,
+        }
+    }
+
     // ── Refresh results: last-known-good + generation guard ───────
 
     #[test]
     fn test_refresh_success_applies_current_generation() {
         let mut s = state_with_gen(7);
-        let _ = s.update(GitMessage::DiffStats(
-            7,
-            Ok(DiffStats {
-                added: 3,
-                removed: 1,
-                huge_binary_file_count: 0,
-            }),
-        ));
+        let _ = s.update(GitMessage::WorktreeSnapshot(7, Ok(snapshot(3, 1))));
         let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
         let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
         assert_eq!(
@@ -1034,7 +1088,7 @@ mod tests {
             Some(DiffStats {
                 added: 3,
                 removed: 1,
-                huge_binary_file_count: 0
+                huge_binary_file_count: 0,
             })
         );
         assert_eq!(s.current_branch(), Some("main"));
@@ -1044,18 +1098,11 @@ mod tests {
     #[test]
     fn test_refresh_error_keeps_last_known_good() {
         let mut s = state_with_gen(7);
-        let _ = s.update(GitMessage::DiffStats(
-            7,
-            Ok(DiffStats {
-                added: 3,
-                removed: 1,
-                huge_binary_file_count: 0,
-            }),
-        ));
+        let _ = s.update(GitMessage::WorktreeSnapshot(7, Ok(snapshot(3, 1))));
         let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
         let _ = s.update(GitMessage::BehindAhead(7, Ok((2, 5))));
         // Transient failures — cached values must survive (no flicker).
-        let _ = s.update(GitMessage::DiffStats(7, Err("spawn failed".into())));
+        let _ = s.update(GitMessage::WorktreeSnapshot(7, Err("spawn failed".into())));
         let _ = s.update(GitMessage::CurrentBranch(7, Err("spawn failed".into())));
         let _ = s.update(GitMessage::BehindAhead(7, Err("spawn failed".into())));
         assert_eq!(
@@ -1063,7 +1110,7 @@ mod tests {
             Some(DiffStats {
                 added: 3,
                 removed: 1,
-                huge_binary_file_count: 0
+                huge_binary_file_count: 0,
             })
         );
         assert_eq!(s.current_branch(), Some("main"));
@@ -1083,14 +1130,7 @@ mod tests {
     fn test_stale_generation_results_are_dropped() {
         let mut s = state_with_gen(9);
         // Results from a superseded generation must not overwrite newer state.
-        let _ = s.update(GitMessage::DiffStats(
-            8,
-            Ok(DiffStats {
-                added: 99,
-                removed: 99,
-                huge_binary_file_count: 0,
-            }),
-        ));
+        let _ = s.update(GitMessage::WorktreeSnapshot(8, Ok(snapshot(99, 99))));
         let _ = s.update(GitMessage::CurrentBranch(8, Ok("old-branch".into())));
         let _ = s.update(GitMessage::BehindAhead(8, Ok((99, 99))));
         assert_eq!(s.diff_stats(), None);
@@ -1101,24 +1141,65 @@ mod tests {
     #[test]
     fn test_clear_invalidates_inflight_results() {
         let mut s = state_with_gen(3);
-        let _ = s.update(GitMessage::DiffStats(
-            3,
-            Ok(DiffStats {
-                added: 3,
-                removed: 1,
-                huge_binary_file_count: 0,
-            }),
-        ));
+        let _ = s.update(GitMessage::WorktreeSnapshot(3, Ok(snapshot(3, 1))));
         let _ = s.update(GitMessage::CurrentBranch(3, Ok("main".into())));
         s.clear(); // bumps both generations — in-flight results become stale
-        let _ = s.update(GitMessage::DiffStats(
-            3,
-            Ok(DiffStats {
-                added: 7,
-                removed: 7,
-                huge_binary_file_count: 0,
+        let _ = s.update(GitMessage::WorktreeSnapshot(3, Ok(snapshot(7, 7))));
+        assert_eq!(s.diff_stats(), None);
+    }
+
+    // ── Status forwarding to the editor ──────────────────────────
+
+    #[test]
+    fn test_worktree_snapshot_ok_stores_statuses_and_forwards() {
+        let mut s = state_with_gen(7);
+        s.workspace_name = Some("ws".into());
+        let _ = s.update(GitMessage::WorktreeSnapshot(
+            7,
+            Ok(GitWorktreeSnapshot {
+                stats: DiffStats {
+                    added: 3,
+                    removed: 1,
+                    huge_binary_file_count: 0,
+                },
+                file_statuses: HashMap::from([(
+                    "src/main.rs".to_string(),
+                    GitFileStatus::Modified,
+                )]),
+                unborn_head: false,
             }),
         ));
+        // Statuses are stored and the forward is dirty.
+        let forward = s.take_status_forward();
+        assert_eq!(
+            forward,
+            Some((
+                Some("ws".into()),
+                HashMap::from([("src/main.rs".to_string(), GitFileStatus::Modified)]),
+            ))
+        );
+        // Once claimed, a second take is None.
+        assert_eq!(s.take_status_forward(), None);
+    }
+
+    #[test]
+    fn test_worktree_snapshot_err_marks_forward_dirty() {
+        let mut s = state_with_gen(7);
+        s.workspace_name = None;
+        let _ = s.update(GitMessage::WorktreeSnapshot(7, Err("spawn failed".into())));
+        // Err keeps last-known-good (empty) but still forwards so the editor's
+        // in-flight flag clears.
+        assert_eq!(s.diff_stats(), None);
+        assert_eq!(s.take_status_forward(), Some((None, HashMap::new())));
+        assert_eq!(s.take_status_forward(), None);
+    }
+
+    #[test]
+    fn test_worktree_snapshot_stale_generation_forwards_nothing() {
+        let mut s = state_with_gen(9);
+        // A superseded-generation result is dropped entirely — no forward.
+        let _ = s.update(GitMessage::WorktreeSnapshot(8, Ok(snapshot(99, 99))));
+        assert_eq!(s.take_status_forward(), None);
         assert_eq!(s.diff_stats(), None);
     }
 
@@ -1245,29 +1326,43 @@ mod tests {
         assert_eq!(s.local_generation, before);
     }
 
-    // ── Watch registration retry loop ─────────────────────────────
+    // ── Watch registration (single deferred attempt, no retry) ─────
 
     #[test]
-    fn test_watch_retry_loop_rearms_while_pending() {
+    fn test_try_register_watch_without_selection_is_noop() {
         let mut s = GitState::new();
-        s.workspace_name = Some("no-such-engine".into());
-        s.workspace_path = Some(PathBuf::from("/nonexistent"));
-        // First registration attempt: no engine under that name → pending,
-        // the 30s window is anchored, and a re-arm task is scheduled.
+        // No workspace name / path → no watch task, nothing stored.
         let _ = s.try_register_watch();
-        assert!(s.watch_pending);
-        assert!(s.watch_retry_deadline.is_some());
-        // A retry tick before the deadline re-attempts; the engine is still
-        // missing, so the loop re-arms (the returned task is the next timer).
-        let _ = s.update(GitMessage::WatchRetryTick);
-        assert!(s.watch_pending);
-        assert!(s.watch_retry_deadline.is_some());
-        // Deadline elapsed → the loop abandons the watch in favour of the
-        // periodic timer fallback and stops re-arming.
-        s.watch_retry_deadline = Some(Instant::now() - Duration::from_secs(1));
-        let _ = s.update(GitMessage::WatchRetryTick);
-        assert!(!s.watch_pending);
-        assert!(s.watch_retry_deadline.is_none());
+        assert_eq!(s.watch_id, None);
+    }
+
+    #[test]
+    fn test_watch_registered_current_gen_stores_id() {
+        let mut s = state_with_gen(7);
+        let _ = s.update(GitMessage::WatchRegistered(7, Ok(WatchId(42))));
+        assert_eq!(s.watch_id, Some(WatchId(42)));
+    }
+
+    #[test]
+    fn test_watch_registered_error_does_not_store() {
+        let mut s = state_with_gen(7);
+        let before = s.watch_id;
+        let _ = s.update(GitMessage::WatchRegistered(
+            7,
+            Err("watcher not ready within 30s".to_string()),
+        ));
+        // A failed registration never stores a watch id, and there is no
+        // pending state to retry — the workspace stays unwatched.
+        assert_eq!(s.watch_id, before);
+    }
+
+    #[test]
+    fn test_watch_registered_stale_generation_dropped() {
+        let mut s = state_with_gen(9);
+        // A registration from a superseded generation (a workspace switch raced
+        // the deferred registration) is discarded entirely.
+        let _ = s.update(GitMessage::WatchRegistered(8, Ok(WatchId(99))));
+        assert_eq!(s.watch_id, None);
     }
 
     #[test]

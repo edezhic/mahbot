@@ -354,14 +354,17 @@ impl BoardState {
         self.displayed_queued_tickets().next().is_some()
     }
 
-    /// Workspaces to drain for the bulk pause. A concrete (non-empty)
-    /// `workspace_name` selects that workspace; otherwise (`None` or the
-    /// empty-string Personal filter, which must be treated as "no concrete
-    /// workspace") the set is the distinct workspaces of the displayed
-    /// non-archived Queued tickets. Each workspace is drained once.
+    /// Workspaces to drain for the bulk pause. A concrete (non-empty,
+    /// non-personal) `workspace_name` selects that workspace; otherwise (`None`,
+    /// the empty string, or a `personal:{user}` name — personal workspaces have
+    /// no board pipeline and must be treated as "no concrete workspace") the set
+    /// is the distinct workspaces of the displayed non-archived Queued tickets.
+    /// Each workspace is drained once.
     fn pause_all_queued_workspaces(&self) -> Vec<String> {
         match self.workspace_name.as_deref() {
-            Some(ws) if !ws.is_empty() => vec![ws.to_string()],
+            Some(ws) if !ws.is_empty() && !crate::users::is_personal_workspace(ws) => {
+                vec![ws.to_string()]
+            }
             _ => {
                 let mut workspaces: Vec<String> = Vec::new();
                 for ticket in self.displayed_queued_tickets() {
@@ -3202,13 +3205,20 @@ mod tests {
     #[test]
     fn pause_all_queued_workspaces_empty_string_is_no_concrete() {
         let mut state = make_board_state();
-        // Personal mode stores `Some("")`; it must be treated as "no concrete
-        // workspace" so the drain set is derived from the displayed tickets.
+        // An empty-string name (no concrete selection; legacy sentinel) must
+        // be treated as "no concrete workspace" so the drain set is derived
+        // from the displayed tickets. `personal:{user}` names take the same
+        // branch via `is_personal_workspace`.
         state.workspace_name = Some(String::new());
         state.tickets = vec![
             ticket_in("ws1", "t1", TicketPhase::Queued, false),
             ticket_in("ws2", "t2", TicketPhase::Queued, false),
         ];
+        assert_eq!(
+            state.pause_all_queued_workspaces(),
+            vec!["ws1".to_string(), "ws2".to_string()]
+        );
+        state.workspace_name = Some("personal:alice".to_string());
         assert_eq!(
             state.pause_all_queued_workspaces(),
             vec!["ws1".to_string(), "ws2".to_string()]

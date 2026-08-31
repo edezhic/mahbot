@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::git::commands::{
-    has_unstaged_changes, run_git_add_all, run_git_diff_stats, run_git_head, run_git_status,
+    has_unstaged_changes, run_git_add_all, run_git_head, run_git_status, run_git_worktree_snapshot,
     run_git_write_tree,
 };
 use crate::pipeline::board::Ticket;
@@ -117,10 +117,16 @@ pub(crate) async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> an
 
 /// Gather the working-tree churn at review dispatch.
 async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
-    let stats = run_git_diff_stats(repo_path).await?;
+    let snapshot = run_git_worktree_snapshot(repo_path).await?;
+    // An unborn HEAD is not a valid churn baseline (same semantics as the
+    // pre-snapshot numstat failure): surface as Err so the caller defaults
+    // the reviewer base instead of calibrating on a zero diff.
+    if snapshot.unborn_head {
+        anyhow::bail!("Repository has no commits — no churn baseline");
+    }
     // Churn calibration uses only the exact line counts — the
     // huge/binary untracked file-count must NOT influence reviewer counts.
-    Ok(stats.added + stats.removed)
+    Ok(snapshot.stats.added + snapshot.stats.removed)
 }
 
 /// Compute the reviewer count for a review round.

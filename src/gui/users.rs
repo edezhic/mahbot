@@ -19,15 +19,18 @@ pub(crate) fn user_store() -> Result<&'static UserStore, String> {
         .ok_or_else(|| "User store not initialized".to_string())
 }
 
-/// Run a single-field `update_user`, mapping an empty value to
-/// [`FieldUpdate::Clear`]. `is_role` selects which column is updated.
+/// Run a single-field `update_user`, mapping an empty value (or a `personal:{user}`
+/// workspace name) to [`FieldUpdate::Clear`] — the personal workspace is stored
+/// as NULL and computed on the fly. `is_role` selects which column is updated.
 pub(crate) async fn update_user_field(
     sender: String,
     value: String,
     is_role: bool,
 ) -> Result<(), String> {
     let store = user_store()?;
-    let val = if value.is_empty() {
+    // Empty and personal-workspace values both mean "no shared workspace
+    // selected" → NULL. Role columns never accept a personal mapping.
+    let val = if value.is_empty() || (!is_role && crate::users::is_personal_workspace(&value)) {
         FieldUpdate::Clear
     } else {
         FieldUpdate::Set(&value)

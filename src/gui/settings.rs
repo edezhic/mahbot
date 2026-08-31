@@ -2364,7 +2364,24 @@ impl SettingsState {
                         },
                         // Workspace column (FillPortion: 20)
                         {
-                            let ws_value = user.selected_workspace.as_deref().unwrap_or("");
+                            // The shared option list carries one Personal
+                            // entry (options[0], value = the impersonated
+                            // user's `personal:{user}` name) reused by every
+                            // row: a personal/NULL stored selection for ANY
+                            // user displays as that entry, and selecting it
+                            // persists NULL — which means the ROW user's own
+                            // personal workspace — so no per-row value is
+                            // needed.
+                            let personal_value = us
+                                .workspace_options
+                                .first()
+                                .map(|o| o.value.clone())
+                                .unwrap_or_default();
+                            let ws_value = user
+                                .selected_workspace
+                                .as_deref()
+                                .filter(|ws| !crate::users::is_personal_workspace(ws))
+                                .map_or(personal_value, str::to_string);
                             let ws_selected = us
                                 .workspace_options
                                 .iter()

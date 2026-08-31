@@ -646,6 +646,9 @@ pub struct TreeNode {
     pub children: Vec<TreeNode>,
     /// Error message if this entry couldn't be inspected (broken symlink, etc.).
     pub error: Option<String>,
+    /// Whether gitignore machinery marked this node ignored — rendered dimmed
+    /// (never hidden). Only the editor sets it true.
+    pub ignored: bool,
 }
 
 /// Direction for navigating the file tree (arrow-key vertical movement).
@@ -1954,6 +1957,7 @@ mod tests {
                 is_dir: false,
                 children: vec![],
                 error: None,
+                ignored: false,
             },
             TreeNode {
                 name: "b".into(),
@@ -1961,6 +1965,7 @@ mod tests {
                 is_dir: false,
                 children: vec![],
                 error: None,
+                ignored: false,
             },
             TreeNode {
                 name: "c".into(),
@@ -1968,6 +1973,7 @@ mod tests {
                 is_dir: false,
                 children: vec![],
                 error: None,
+                ignored: false,
             },
         ];
         tree.rebuild_visible();
@@ -2374,6 +2380,7 @@ mod tests {
                         is_dir: false,
                         children: vec![],
                         error: None,
+                        ignored: false,
                     },
                     TreeNode {
                         name: "lib.rs".into(),
@@ -2381,9 +2388,11 @@ mod tests {
                         is_dir: false,
                         children: vec![],
                         error: None,
+                        ignored: false,
                     },
                 ],
                 error: None,
+                ignored: false,
             },
             TreeNode {
                 name: "Cargo.toml".into(),
@@ -2391,6 +2400,7 @@ mod tests {
                 is_dir: false,
                 children: vec![],
                 error: None,
+                ignored: false,
             },
         ];
         tree.expanded_dirs.insert("src".to_string());
@@ -2427,6 +2437,7 @@ mod tests {
                     is_dir: false,
                     children: vec![],
                     error: None,
+                    ignored: false,
                 },
                 TreeNode {
                     name: "main.rs".into(),
@@ -2434,9 +2445,11 @@ mod tests {
                     is_dir: false,
                     children: vec![],
                     error: None,
+                    ignored: false,
                 },
             ],
             error: None,
+            ignored: false,
         }];
         tree
     }

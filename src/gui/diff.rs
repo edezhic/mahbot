@@ -375,7 +375,10 @@ impl DiffState {
     pub fn update(&mut self, msg: DiffMessage) -> Task<DiffMessage> {
         match msg {
             DiffMessage::WorkspaceSelected(name, path_override) => {
-                // Accept personal workspaces when a path is provided.
+                // An empty name with no path is the "no workspace selected"
+                // clear. Personal workspaces arrive as a named `personal:{user}`
+                // selection with a path override and are handled as a normal
+                // named selection below.
                 if name.is_empty() && path_override.is_none() {
                     self.clear_diff_state();
                     self.selected_workspace_name = None;
@@ -1517,6 +1520,7 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
                 is_dir: components.len() > 1,
                 children: Vec::new(),
                 error: None,
+                ignored: false,
             });
 
         if components.len() == 1 {
@@ -1530,6 +1534,7 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
                     is_dir: false,
                     children: Vec::new(),
                     error: None,
+                    ignored: false,
                 });
             } else {
                 // Already a file node — just ensure path is correct.
@@ -1558,6 +1563,7 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
                             is_dir: !is_last,
                             children: Vec::new(),
                             error: None,
+                            ignored: false,
                         });
                     }
                 }
