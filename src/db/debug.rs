@@ -1069,10 +1069,7 @@ fn execute_query_readonly(
     sql: &str,
     db_path: &Path,
 ) -> Result<String> {
-    let mut stmt = conn
-        .query(sql)
-        .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?
-        .ok_or_else(|| anyhow!("query produced no statement on '{}'", db_path.display()))?;
+    let mut stmt = prepare_readonly(conn, sql, db_path)?;
 
     let col_count = stmt.num_columns();
     if col_count == 0 {
@@ -1088,38 +1085,12 @@ fn execute_query_readonly(
     out.push_str(&column_names.join("|"));
     out.push('\n');
 
-    let mut row_count = 0usize;
-    let mut has_more = false;
-
-    loop {
-        match stmt
-            .step()
-            .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?
-        {
-            turso::core::StepResult::Done => break,
-            turso::core::StepResult::IO | turso::core::StepResult::Yield => {
-                io.step()
-                    .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?;
-            }
-            turso::core::StepResult::Row => {
-                if row_count >= ROW_LIMIT {
-                    has_more = true;
-                    break;
-                }
-                let row = stmt
-                    .row()
-                    .ok_or_else(|| anyhow!("row missing after StepResult::Row"))?;
-                out.push_str(&format_core_row(row, col_count));
-                out.push('\n');
-                row_count += 1;
-            }
-            turso::core::StepResult::Interrupt => {
-                bail!("query interrupted on '{}'", db_path.display())
-            }
-            turso::core::StepResult::Busy => {
-                bail!("database busy on '{}'; try again later", db_path.display())
-            }
-        }
+    let (rows, has_more) = step_rows(io, db_path, &mut stmt, Some(ROW_LIMIT), |row| {
+        format_core_row(row, col_count)
+    })?;
+    for row in rows {
+        out.push_str(&row);
+        out.push('\n');
     }
 
     if has_more {
@@ -1177,14 +1148,14 @@ fn dump_schema(
     let tables = collect_rows(io, &conn, &tables_sql, db_path, |row| {
         let name = format_core_value(row.get_value(0));
         let sql = format_core_value(row.get_value(1));
-        Ok((name, sql))
+        (name, sql)
     })?;
 
     let mut out = format!("== schema dump: {label} ==\n");
     for (name, sql) in tables {
         let count_sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&name));
         let counts = collect_rows(io, &conn, &count_sql, db_path, |row| {
-            Ok(format_core_value(row.get_value(0)))
+            format_core_value(row.get_value(0))
         })?;
         let count = counts.first().ok_or_else(|| {
             anyhow!(
@@ -1198,23 +1169,33 @@ fn dump_schema(
     Ok(out)
 }
 
-/// Step a single statement to completion, collecting one owned value per row.
-/// Mirrors [`execute_query_readonly`]'s IO/Yield/Busy/Interrupt handling so the
-/// dump queries share the same robustness (a failure propagates and the caller
-/// reports it as a clean error).
-fn collect_rows<T>(
-    io: &std::sync::Arc<dyn turso::core::IO>,
+/// Prepare a read-only statement on a `turso::core` connection, mapping prepare
+/// failures to the same error strings used across the debug tooling.
+fn prepare_readonly(
     conn: &std::sync::Arc<turso::core::Connection>,
     sql: &str,
     db_path: &Path,
-    mut collect: impl FnMut(&turso::core::Row) -> Result<T>,
-) -> Result<Vec<T>> {
-    let mut stmt = conn
-        .query(sql)
+) -> Result<turso::core::Statement> {
+    conn.query(sql)
         .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?
-        .ok_or_else(|| anyhow!("query produced no statement on '{}'", db_path.display()))?;
+        .ok_or_else(|| anyhow!("query produced no statement on '{}'", db_path.display()))
+}
 
+/// Shared IO/Yield/Busy/Interrupt stepping loop for all read-only
+/// `turso::core` queries.
+///
+/// `limit` stops stepping with `has_more = true` when a row would exceed the
+/// cap; that row is NOT collected. Callers buffer output so a mid-query
+/// failure never leaks partial results.
+fn step_rows<T>(
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    db_path: &Path,
+    stmt: &mut turso::core::Statement,
+    limit: Option<usize>,
+    mut collect: impl FnMut(&turso::core::Row) -> T,
+) -> Result<(Vec<T>, bool)> {
     let mut rows = Vec::new();
+    let mut has_more = false;
     loop {
         match stmt
             .step()
@@ -1226,10 +1207,14 @@ fn collect_rows<T>(
                     .map_err(|e| anyhow!("SQL query failed on '{}': {e}", db_path.display()))?;
             }
             turso::core::StepResult::Row => {
+                if limit.is_some_and(|l| rows.len() >= l) {
+                    has_more = true;
+                    break;
+                }
                 let row = stmt
                     .row()
                     .ok_or_else(|| anyhow!("row missing after StepResult::Row"))?;
-                rows.push(collect(row)?);
+                rows.push(collect(row));
             }
             turso::core::StepResult::Interrupt => {
                 bail!("query interrupted on '{}'", db_path.display())
@@ -1239,6 +1224,21 @@ fn collect_rows<T>(
             }
         }
     }
+    Ok((rows, has_more))
+}
+
+/// Step a single statement to completion, collecting one owned value per row
+/// (uncapped [`step_rows`]). A failure propagates and the caller reports it as
+/// a clean error.
+fn collect_rows<T>(
+    io: &std::sync::Arc<dyn turso::core::IO>,
+    conn: &std::sync::Arc<turso::core::Connection>,
+    sql: &str,
+    db_path: &Path,
+    collect: impl FnMut(&turso::core::Row) -> T,
+) -> Result<Vec<T>> {
+    let mut stmt = prepare_readonly(conn, sql, db_path)?;
+    let (rows, _has_more) = step_rows(io, db_path, &mut stmt, None, collect)?;
     Ok(rows)
 }
 
