@@ -662,10 +662,10 @@ async fn absorb_flush(store: &LogStore, batch: &mut Vec<LogEntry>) {
             );
             let consecutive = record_log_writer_panic(&message);
             if log_writer_stopped() {
-                eprintln!(
-                    "[mahbot] log store writer stopped after {consecutive} consecutive storage \
+                crate::boot::timestamped_stderr(&format!(
+                    "log store writer stopped after {consecutive} consecutive storage \
                      panics: {message}"
-                );
+                ));
             } else {
                 tokio::time::sleep(log_writer_panic_backoff(consecutive)).await;
             }
@@ -897,7 +897,7 @@ fn emit_stderr_warning(count: u64, message: &str, kind: &str) {
     let last_warn_ms = LOG_WRITE_LAST_STDERR_WARN_MS.load(Ordering::SeqCst);
     if now_ms.saturating_sub(last_warn_ms) >= LOG_WRITE_STDERR_WARN_INTERVAL_MS {
         LOG_WRITE_LAST_STDERR_WARN_MS.store(now_ms, Ordering::SeqCst);
-        eprintln!("[mahbot] log store {kind} #{count}: {message}");
+        crate::boot::timestamped_stderr(&format!("log store {kind} #{count}: {message}"));
     }
 }
 

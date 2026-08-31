@@ -514,6 +514,7 @@ async fn shutdown_after_dashboard() {
 
 fn main() -> Result<()> {
     mahbot::shutdown::install_fatal_signal_handlers();
+    mahbot::shutdown::install_panic_hook();
 
     // Debug subcommand: run SQL query directly, skip all GUI/daemon setup.
     // Must be checked before lock acquisition so the debug tool can query

@@ -259,3 +259,17 @@ extern "C" fn fatal_signal_handler(sig: i32) {
 pub fn install_fatal_signal_handlers() {
     // No-op on non-Unix platforms.
 }
+
+// ── Panic hook ────────────────────────────────────────────────────────────
+
+/// Install a global panic hook that prints a timestamped marker line before
+/// the default panic report, so panics captured in update.log (the replacement
+/// daemon's stderr) are time-attributable. The default hook (message +
+/// backtrace) still runs.
+pub fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::boot::timestamped_stderr(&info.to_string());
+        default_hook(info);
+    }));
+}

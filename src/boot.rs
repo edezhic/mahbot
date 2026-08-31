@@ -1,7 +1,8 @@
 //! Boot-time diagnostics emitted before the tracing layer exists (the
 //! pre-flight scan and the logs store's own heal run before `init_tracing`).
-//! Written to stderr immediately and buffered for replay into the logs store
-//! once tracing is live, so they appear in the GUI boot log.
+//! Written to stderr immediately (carrying a local-time timestamp for
+//! update.log forensics) and buffered for replay into the logs store once
+//! tracing is live, so they appear in the GUI boot log.
 
 use crate::util::UnwrapPoison;
 
@@ -9,9 +10,17 @@ static PRE_TRACING_DIAGNOSTICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex
 static TRACING_INITIALIZED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Write a diagnostic line to stderr with a local-time timestamp prefix, so
+/// lines captured in update.log (the replacement daemon's stderr) are
+/// time-attributable during incident review.
+pub(crate) fn timestamped_stderr(message: &str) {
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    eprintln!("[mahbot] [{ts}] {message}");
+}
+
 /// Record a boot-time diagnostic: stderr now, logs store after tracing init.
 pub(crate) fn boot_diagnostic(message: String) {
-    eprintln!("[mahbot] {message}");
+    timestamped_stderr(&message);
     if TRACING_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) {
         tracing::warn!("{message}");
     } else {
