@@ -78,6 +78,64 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut O
     }
 }
 
+/// Build one model-picker entry row: a secondary-styled button with an
+/// active/inactive circle indicator plus a gray X removal button (omitted for
+/// merged display-only entries).
+///
+/// Active rows keep the same appearance as inactive ones; the accent-colored
+/// check is the only selected-state affordance. The X is a 24px gray glyph in
+/// a row-height, 24px-wide hit area.
+fn model_entry_row(
+    target: ModelPickerTarget,
+    model: String,
+    is_active: bool,
+    is_merged: bool,
+) -> Element<'static, SettingsMessage> {
+    let indicator = if is_active {
+        lucide::circle_check::<iced::Theme, iced::Renderer>()
+            .size(12)
+            .color(theme::ACCENT)
+    } else {
+        lucide::circle::<iced::Theme, iced::Renderer>()
+            .size(12)
+            .color(theme::TEXT_SECONDARY)
+    };
+    let model_btn = button(
+        row![
+            indicator,
+            Space::new().width(4),
+            text(model.clone()).size(12)
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(4)
+    .style(theme::button_secondary)
+    .on_press(SettingsMessage::ModelPicker {
+        target,
+        action: ModelPickerAction::SetActive(model.clone()),
+    });
+
+    let mut entry = row![model_btn];
+    if !is_merged {
+        // Fill height: exactly the model-row height (the row's tallest child).
+        let remove_btn = button(
+            lucide::x::<iced::Theme, iced::Renderer>()
+                .size(24)
+                .color(theme::TEXT_SECONDARY),
+        )
+        .width(24)
+        .height(Length::Fill)
+        .padding(0)
+        .style(theme::button_text)
+        .on_press(SettingsMessage::ModelPicker {
+            target,
+            action: ModelPickerAction::RemoveModel(model),
+        });
+        entry = entry.push(Space::new().width(4)).push(remove_btn);
+    }
+    entry.align_y(Alignment::Center).into()
+}
+
 /// Render a model picker with a list of model entries, active indicator,
 /// remove buttons per entry, and an add-model row (text input + "Add" button).
 ///
@@ -101,14 +159,6 @@ fn model_picker_list<'a>(
     let on_add = SettingsMessage::ModelPicker {
         target,
         action: ModelPickerAction::AddModel,
-    };
-    let on_remove = move |m| SettingsMessage::ModelPicker {
-        target,
-        action: ModelPickerAction::RemoveModel(m),
-    };
-    let on_set_active = move |m| SettingsMessage::ModelPicker {
-        target,
-        action: ModelPickerAction::SetActive(m),
     };
     let mut models = parse_models(models_field);
     let original_models = models.clone();
@@ -139,40 +189,7 @@ fn model_picker_list<'a>(
                 // list) must not offer removal — it is not in the list to
                 // remove, and removing it would silently repoint the active.
                 let is_merged = is_active && !original_models.iter().any(|m| m == model);
-                let indicator = if is_active {
-                    lucide::circle_check::<iced::Theme, iced::Renderer>()
-                        .size(12)
-                        .color(theme::BG_BASE)
-                } else {
-                    lucide::circle::<iced::Theme, iced::Renderer>()
-                        .size(12)
-                        .color(theme::TEXT_SECONDARY)
-                };
-                let mut model_btn = button(
-                    row![
-                        indicator,
-                        Space::new().width(4),
-                        text(model.clone()).size(12),
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .padding(4);
-                if is_active {
-                    model_btn = model_btn.style(theme::button_primary);
-                } else {
-                    model_btn = model_btn.style(theme::button_secondary);
-                }
-                model_btn = model_btn.on_press(on_set_active(model.clone()));
-
-                let mut entry = row![model_btn];
-                if !is_merged {
-                    let remove_btn = button(text("×").size(12))
-                        .padding(2)
-                        .style(theme::button_text_danger)
-                        .on_press(on_remove(model.clone()));
-                    entry = entry.push(Space::new().width(4)).push(remove_btn);
-                }
-                entry.align_y(Alignment::Center).into()
+                model_entry_row(target, model.clone(), is_active, is_merged)
             })
             .collect()
     };
