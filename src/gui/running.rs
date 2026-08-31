@@ -140,6 +140,7 @@ pub(crate) fn view(
         widgets::empty_state_placeholder(
             lucide::radar::<iced::Theme, iced::Renderer>(),
             "Nothing is currently running.",
+            theme::TEXT_MUTED,
         )
     } else {
         let mut content = Column::new().spacing(20);

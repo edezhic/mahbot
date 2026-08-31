@@ -1905,7 +1905,7 @@ impl BoardState {
         summary_parts.push(
             text(format!("{hash:.8}"))
                 .size(11)
-                .color(theme::TEXT_MUTED)
+                .color(theme::TEXT_SECONDARY)
                 .into(),
         );
         summary_parts.push(Space::new().width(6).into());
@@ -2091,12 +2091,12 @@ impl BoardState {
                     // User comments show the bare user name; "system" and
                     // legacy labels render as plain muted text.
                     let label = comment.role.strip_prefix("user:").unwrap_or(&comment.role);
-                    text(label).size(11).color(theme::TEXT_MUTED).into()
+                    text(label).size(11).color(theme::TEXT_SECONDARY).into()
                 };
             let mut header = row![author_el].align_y(Alignment::Center).spacing(6);
             let ts = theme::format_relative_time(&comment.created_at, chrono::Local::now());
             if !ts.is_empty() {
-                header = header.push(text(ts).size(11).color(theme::TEXT_MUTED));
+                header = header.push(text(ts).size(11).color(theme::TEXT_SECONDARY));
             }
 
             let mut comment_col = Column::new().spacing(4);

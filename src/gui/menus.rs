@@ -587,7 +587,7 @@ where
 
             // Draw label text using fill_text.
             let text_color = if is_disabled {
-                theme::TEXT_MUTED
+                theme::TEXT_FAINT
             } else if *self.hovered == Some(i) {
                 theme::TEXT_PRIMARY
             } else {

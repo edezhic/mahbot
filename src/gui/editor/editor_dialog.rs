@@ -99,7 +99,7 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
             Some(
                 text("No matches found")
                     .size(12)
-                    .color(theme::TEXT_MUTED)
+                    .color(theme::TEXT_SECONDARY)
                     .into(),
             )
         } else {
@@ -307,7 +307,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
         .into(),
         GlobalSearchStatus::NoResults => text("No matches found")
             .size(12)
-            .color(theme::TEXT_MUTED)
+            .color(theme::TEXT_SECONDARY)
             .into(),
         GlobalSearchStatus::Error(e) => text(format!("Search error: {e}"))
             .size(12)
@@ -320,7 +320,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
                 if count == 1 { "" } else { "s" }
             ))
             .size(12)
-            .color(theme::TEXT_FAINT)
+            .color(theme::TEXT_SECONDARY)
             .into()
         }
     };
@@ -383,7 +383,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
                     let text_color = if is_selected {
                         theme::TEXT_PRIMARY
                     } else {
-                        theme::TEXT_MUTED
+                        theme::TEXT_SECONDARY
                     };
 
                     row![

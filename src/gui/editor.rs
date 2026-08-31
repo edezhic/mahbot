@@ -88,9 +88,6 @@ fn estimated_content_width(tabs: &[Tab]) -> f32 {
     tabs.iter().map(estimate_tab_width).sum()
 }
 
-/// Base font size for the editor.
-const EDITOR_FONT_SIZE: f32 = 13.0;
-
 /// Widget IDs for find/replace text inputs (used for auto-focus).
 const FIND_SEARCH_ID: &str = "find_search_input";
 const FIND_REPLACE_ID: &str = "find_replace_input";
@@ -123,22 +120,6 @@ fn is_os_file(name: &str) -> bool {
     name.eq_ignore_ascii_case(".ds_store")
         || name.eq_ignore_ascii_case("thumbs.db")
         || name.eq_ignore_ascii_case("desktop.ini")
-}
-
-/// Render a centered empty-state placeholder with text content.
-///
-/// The caller passes a fully-configured `text()` widget (with size, color,
-/// optional font, etc.) and this helper wraps it in the standard centered
-/// container pattern used throughout the editor panel.
-fn empty_placeholder(
-    text: iced::widget::Text<'_, iced::Theme, iced::Renderer>,
-) -> Element<'_, EditorMessage> {
-    container(text)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
 }
 
 /// Wrap a bar row in the full-width bar container. The `.width(Length::Fill)`
@@ -4613,11 +4594,10 @@ impl EditorState {
     pub fn view(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         // ── No workspace selected — placeholder ──────────────────────
         if self.selected_workspace_name.is_none() {
-            return empty_placeholder(
-                text("No workspace selected")
-                    .size(24)
-                    .color(theme::TEXT_MUTED)
-                    .font(theme::FONT_BOLD),
+            return widgets::empty_state_placeholder(
+                lucide::folder_open(),
+                "No workspace selected",
+                theme::TEXT_MUTED,
             );
         }
 
@@ -4712,10 +4692,10 @@ impl EditorState {
         // Natural width of every rendered row, in render order, for the
         // auto-sizing tree panel. Replicates the exact row composition:
         // guide (depth*2 box-drawing chars at 14px) + lucide icon
-        // (15px dirs / 14px files) + 4px gap + name label at 14px, with the
-        // loading/error suffixes and `[⚠]` error marker. The rename
-        // text-input mode measures the would-be label so the tree does not
-        // snap to its cap while renaming.
+        // (TREE_ICON_SIZE for dirs and files) + 4px gap + name label at 14px,
+        // with the loading/error suffixes and `[⚠]` error marker. The closure
+        // always measures node.name so the panel width stays stable while the
+        // rename text-input replaces the rendered label.
         let row_widths = widgets::collect_tree_row_widths(
             &self.file_tree.nodes,
             &self.file_tree.expanded_dirs,
@@ -4742,7 +4722,7 @@ impl EditorState {
                     let suffix = node.error.as_ref().map(|_| ("[⚠]", 11.0));
                     widgets::tree_row_natural_width(
                         guide_chars,
-                        widgets::TREE_FONT_SIZE,
+                        widgets::TREE_ICON_SIZE,
                         &node.name,
                         widgets::TREE_FONT_SIZE,
                         suffix,
@@ -4830,19 +4810,7 @@ impl EditorState {
         extra_context_items: Vec<MenuItem<EditorMessage>>,
         full_path: &str,
     ) -> Element<'a, EditorMessage> {
-        let guide_text: Element<'a, EditorMessage> = text(guide)
-            .size(widgets::TREE_FONT_SIZE)
-            .color(theme::TEXT_MUTED)
-            .into();
-
-        let row = row![
-            guide_text,
-            icon,
-            Space::new().width(4),
-            name,
-            Space::new().width(Length::Fill),
-        ]
-        .align_y(Alignment::Center);
+        let row = widgets::tree_row(guide, icon, name, None);
 
         let btn = widgets::tree_node_button(row, highlight, Some(message));
 
@@ -4903,7 +4871,7 @@ impl EditorState {
             None
         };
         let icon_color = if is_ignored {
-            theme::TEXT_MUTED
+            theme::TEXT_FAINT
         } else if is_expanded && dir_status.is_some() {
             match dir_status {
                 Some(GitFileStatus::Modified) => theme::STATUS_WARNING,
@@ -4921,7 +4889,7 @@ impl EditorState {
         } else if let Some(ref err) = node.error {
             (format!("{} [⚠ {err}]", node.name), theme::STATUS_ERROR)
         } else if is_ignored {
-            (node.name.clone(), theme::TEXT_MUTED)
+            (node.name.clone(), theme::TEXT_FAINT)
         } else if dir_status.is_some() {
             let color = match dir_status {
                 Some(GitFileStatus::Modified) => theme::STATUS_WARNING,
@@ -5015,7 +4983,7 @@ impl EditorState {
         } else if node.error.is_some() {
             theme::STATUS_ERROR
         } else if is_ignored {
-            theme::TEXT_MUTED
+            theme::TEXT_FAINT
         } else if git_status == Some(&GitFileStatus::Modified) {
             theme::STATUS_WARNING
         } else if git_status == Some(&GitFileStatus::Added) {
@@ -5060,7 +5028,7 @@ impl EditorState {
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
 
         let icon_element: Element<'_, EditorMessage> =
-            icon.size(widgets::TREE_FONT_SIZE).color(icon_color).into();
+            icon.size(widgets::TREE_ICON_SIZE).color(icon_color).into();
 
         self.render_tree_node_row(
             guide,
@@ -5086,10 +5054,10 @@ impl EditorState {
 
     fn build_editor_panel(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         if self.tabs.is_empty() {
-            return empty_placeholder(
-                text("Select a file to edit")
-                    .size(18)
-                    .color(theme::TEXT_MUTED),
+            return widgets::empty_state_placeholder(
+                lucide::file_text(),
+                "Select a file to edit",
+                theme::TEXT_MUTED,
             );
         }
 
@@ -5131,7 +5099,7 @@ impl EditorState {
             let name_color = if is_active {
                 theme::ACCENT
             } else {
-                theme::TEXT_MUTED
+                theme::TEXT_FAINT
             };
             let name_text = text(&tab.file_name).size(12).color(name_color);
 
@@ -5265,7 +5233,7 @@ impl EditorState {
             search_input,
             replace_input,
             prev_btn,
-            text(match_label).size(12).color(theme::TEXT_MUTED),
+            text(match_label).size(12).color(theme::TEXT_SECONDARY),
             next_btn,
             Space::new().width(Length::Fixed(4.0)),
             case_btn,
@@ -5304,7 +5272,7 @@ impl EditorState {
             .padding([2, 8]);
 
         let bar = row![
-            text("Go to line:").size(12).color(theme::TEXT_MUTED),
+            text("Go to line:").size(12).color(theme::TEXT_SECONDARY),
             Space::new().width(4),
             line_input,
             go_btn,
@@ -5318,19 +5286,19 @@ impl EditorState {
 
     fn build_editor_widget(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         let Some(idx) = self.active_tab_idx() else {
-            return empty_placeholder(
-                text("No file selected")
-                    .size(EDITOR_FONT_SIZE)
-                    .color(theme::TEXT_MUTED),
+            return widgets::empty_state_placeholder(
+                lucide::file(),
+                "No file selected",
+                theme::TEXT_MUTED,
             );
         };
 
         let path = &self.tabs[idx].path;
         let Some(tab_data) = self.tab_contents.get(path) else {
-            return empty_placeholder(
-                text("Error: tab content missing")
-                    .size(EDITOR_FONT_SIZE)
-                    .color(theme::STATUS_ERROR),
+            return widgets::empty_state_placeholder(
+                lucide::triangle_alert(),
+                "Error: tab content missing",
+                theme::STATUS_ERROR,
             );
         };
 

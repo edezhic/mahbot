@@ -792,7 +792,7 @@ impl HomeState {
                                 let label = theme::format_relative_time(ts, chrono::Local::now());
                                 if !label.is_empty() {
                                     icon_row = icon_row
-                                        .push(text(label).size(11).color(theme::TEXT_MUTED));
+                                        .push(text(label).size(11).color(theme::TEXT_SECONDARY));
                                 }
                             }
                             column![icon_row, content].spacing(4).into()

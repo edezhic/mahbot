@@ -422,7 +422,7 @@ impl LogsState {
         let color = if is_active {
             theme::ACCENT
         } else {
-            theme::TEXT_MUTED
+            theme::TEXT_FAINT
         };
         let b = button(container(text(label.to_string()).size(13).color(color)).padding([6, 14]))
             .style(theme::button_text)
@@ -513,7 +513,7 @@ impl LogsState {
                     info.count
                 ))
                 .size(12)
-                .color(theme::TEXT_MUTED),
+                .color(theme::TEXT_SECONDARY),
             ]
             .align_y(Alignment::Center),
         )
@@ -562,7 +562,7 @@ impl LogsState {
                 Space::new().width(8),
                 text(format!("Page {} of {}", page + 1, total_pages))
                     .size(12)
-                    .color(theme::TEXT_MUTED),
+                    .color(theme::TEXT_SECONDARY),
                 Space::new().width(8),
                 next_button,
             ]
@@ -666,6 +666,7 @@ impl LogsState {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::activity::<iced::Theme, iced::Renderer>(),
                 "No log entries",
+                theme::TEXT_MUTED,
             ));
         } else {
             let entries_view = {

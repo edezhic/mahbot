@@ -414,6 +414,7 @@ impl SessionsState {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
                 "No sessions",
+                theme::TEXT_MUTED,
             ));
         } else {
             // Session list on the left side — built from cached display data.
@@ -459,7 +460,7 @@ impl SessionsState {
                                                     let mut meta_row = row![
                                                         text(&item.msg_count_label)
                                                             .size(11)
-                                                            .color(theme::TEXT_MUTED)
+                                                            .color(theme::TEXT_SECONDARY)
                                                     ]
                                                     .spacing(4);
                                                     if let Some(token) = &item.token_label {
@@ -468,18 +469,18 @@ impl SessionsState {
                                                             .push(
                                                                 text(token)
                                                                     .size(11)
-                                                                    .color(theme::TEXT_MUTED),
+                                                                    .color(theme::TEXT_SECONDARY),
                                                             );
                                                     }
                                                     meta_row.push(Space::new().width(8)).push(
                                                         text(&item.timestamp_label)
                                                             .size(11)
-                                                            .color(theme::TEXT_MUTED),
+                                                            .color(theme::TEXT_SECONDARY),
                                                     )
                                                 },
                                                 text(&item.agent_id)
                                                     .size(11)
-                                                    .color(theme::TEXT_MUTED),
+                                                    .color(theme::TEXT_SECONDARY),
                                             ]
                                             .spacing(2),
                                         )
@@ -980,7 +981,7 @@ fn render_tool_round<'a>(
                         lucide::arrow_down_to_line::<iced::Theme, iced::Renderer>()
                             .size(11)
                             .color(theme::TEXT_MUTED),
-                        text("(no result)").size(10).color(theme::TEXT_MUTED),
+                        text("(no result)").size(10).color(theme::TEXT_SECONDARY),
                     ]
                     .spacing(4)
                     .align_y(Alignment::Center),

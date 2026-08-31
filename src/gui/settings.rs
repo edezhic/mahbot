@@ -1944,7 +1944,7 @@ impl SettingsState {
                                     .align_y(Alignment::Center)
                             },
                             // Path column (FillPortion: 39)
-                            container(text(&ws_item.path).size(12).color(theme::TEXT_MUTED))
+                            container(text(&ws_item.path).size(12).color(theme::TEXT_SECONDARY))
                                 .width(Length::FillPortion(39))
                                 .align_x(Alignment::Start)
                                 .align_y(Alignment::Center),
@@ -1954,7 +1954,7 @@ impl SettingsState {
                             // Second line: next maintenance time
                             if let Some(label) = super::workspaces::next_maintenance_label(ws_item)
                             {
-                                column![text(label).size(11).color(theme::TEXT_MUTED),]
+                                column![text(label).size(11).color(theme::TEXT_SECONDARY),]
                             } else {
                                 column![]
                             }
@@ -2054,7 +2054,7 @@ impl SettingsState {
                     .color(if over_limit {
                         theme::STATUS_ERROR
                     } else {
-                        theme::TEXT_MUTED
+                        theme::TEXT_SECONDARY
                     });
 
                     let save_btn =
@@ -2291,7 +2291,7 @@ impl SettingsState {
                                 .size(11)
                                 .color(theme::ACCENT),
                             Space::new().width(6),
-                            text("Telegram:").size(12).color(theme::TEXT_MUTED),
+                            text("Telegram:").size(12).color(theme::TEXT_SECONDARY),
                             Space::new().width(6),
                             text(display).size(12).color(theme::TEXT_SECONDARY),
                             Space::new().width(4),
@@ -2349,7 +2349,8 @@ impl SettingsState {
                                     .spacing(8)
                                     .align_y(Alignment::Center);
                             if let Some(p) = user.permissions.as_deref().filter(|p| !p.is_empty()) {
-                                segment = segment.push(text(p).size(12).color(theme::TEXT_MUTED));
+                                segment =
+                                    segment.push(text(p).size(12).color(theme::TEXT_SECONDARY));
                             }
                             container(segment.push(telegram_elem))
                                 .width(Length::FillPortion(40))
@@ -2446,7 +2447,7 @@ impl SettingsState {
                                     .style(theme::tooltip_style)
                                     .into()
                                 }
-                                _ => text("none").size(12).color(theme::TEXT_MUTED).into(),
+                                _ => text("none").size(12).color(theme::TEXT_SECONDARY).into(),
                             };
                             container(role_picker)
                                 .width(Length::FillPortion(15))
@@ -2608,7 +2609,7 @@ impl SettingsState {
             }],
             Some(
                 column![
-                    text("Default agent").size(12).color(theme::TEXT_MUTED),
+                    text("Default agent").size(12).color(theme::TEXT_SECONDARY),
                     pick_list(
                         vec![Role::Assistant, Role::Artist],
                         Some([Role::Assistant, Role::Artist][self.add_user_default]),
@@ -2663,7 +2664,7 @@ impl SettingsState {
                 row![
                     text(*label)
                         .size(12)
-                        .color(theme::TEXT_MUTED)
+                        .color(theme::TEXT_SECONDARY)
                         .width(Length::Fixed(120.0))
                         .align_y(Alignment::Center),
                     widgets::single_line_editor(
@@ -3428,7 +3429,7 @@ impl SettingsState {
         row![
             text(format!("MahBot v{}", crate::self_update::VERSION))
                 .size(13)
-                .color(theme::TEXT_MUTED),
+                .color(theme::TEXT_FAINT),
             text(format!("Install mode: {mode_label}"))
                 .size(11)
                 .color(theme::TEXT_FAINT)

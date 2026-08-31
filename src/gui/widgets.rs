@@ -231,15 +231,18 @@ pub fn scroll_h_inset<'a, Message: 'a>(
 }
 
 /// Render a centered empty-state placeholder with a lucide icon and label.
+/// `accent` colors both the icon and the label — [`theme::TEXT_MUTED`] for
+/// ordinary placeholders, [`theme::STATUS_ERROR`] for error states.
 #[must_use]
 pub fn empty_state_placeholder<'a, Message: 'a>(
     icon: iced::widget::Text<'a, iced::Theme, iced::Renderer>,
     label: &'a str,
+    accent: iced::Color,
 ) -> Element<'a, Message> {
     container(
         column![
-            icon.size(48).color(theme::TEXT_MUTED),
-            text(label).size(14).color(theme::TEXT_MUTED),
+            icon.size(48).color(accent),
+            text(label).size(14).color(accent),
         ]
         .spacing(12)
         .align_x(Alignment::Center),
@@ -669,7 +672,7 @@ pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> R
         .align_y(Alignment::Center)
 }
 
-/// Build the git footer diff-stats content: `+X / -Y` (non-zero sides) plus
+/// Build the git footer diff-stats content: `+X/−Y` (non-zero sides) plus
 /// an optional "N files" indicator for oversized/binary untracked files.
 ///
 /// Returns `None` when there is nothing to show (all stats zero). The
@@ -699,7 +702,7 @@ pub fn git_footer_stats<'a, Message: 'a>(
         parts.push(
             text(format!("{huge_binary_file_count} files"))
                 .size(size)
-                .color(theme::TEXT_MUTED)
+                .color(theme::TEXT_SECONDARY)
                 .into(),
         );
     }
@@ -1026,9 +1029,9 @@ impl FileTree {
 /// Font size for file tree item labels and connector guides.
 pub const TREE_FONT_SIZE: f32 = 14.0;
 
-/// Icon size for directory nodes in the file tree (slightly larger than
-/// [`TREE_FONT_SIZE`] to compensate for lucide icons appearing smaller
-/// at the same nominal point size).
+/// Icon size for all file-tree node icons (directories and files). Slightly
+/// larger than [`TREE_FONT_SIZE`] to compensate for lucide icons appearing
+/// smaller at the same nominal point size.
 pub const TREE_ICON_SIZE: f32 = 15.0;
 
 /// Minimum width of the auto-sizing file-tree panel — the tree never gets
@@ -1041,10 +1044,10 @@ pub const TREE_MIN_WIDTH: f32 = 260.0;
 pub const TREE_MAX_WIDTH: f32 = 400.0;
 
 /// Glyph advance of JetBrains Mono as a fraction of em. Every glyph the tree
-/// rows render — ASCII, box-drawing (`│ ├ └`), `⚠`, `…`, digits — measures
-/// exactly 0.6em in both the Regular and Bold faces (verified from the TTFs
-/// in `src/gui/`), so `chars × size × 0.6` is an exact width, not an
-/// estimate. The dashboard default font is JetBrains Mono
+/// rows render — ASCII, box-drawing (`│ ├ └`), `⚠`, `…`, `−` (U+2212), `/`,
+/// digits — measures exactly 0.6em in both the Regular and Bold faces
+/// (verified from the TTFs in `src/gui/`), so `chars × size × 0.6` is an exact
+/// width, not an estimate. The dashboard default font is JetBrains Mono
 /// (see [`super::JETBRAINS_MONO`]), so `text()` widgets without an explicit
 /// font (diff ± counts, `[⚠]` suffixes) use it too.
 pub const JETBRAINS_MONO_ADVANCE: f32 = 0.6;
@@ -1076,7 +1079,9 @@ pub fn mono_text_width(chars: usize, size: f32) -> f32 {
 /// `counts` is `Some((add, remove))` for diff file rows (either string may be
 /// empty; the 6px trailing gap is part of the row either way) and `None` for
 /// every other row type. When both strings are non-empty they render as
-/// `"{add} {remove}"` — one separating space at 10px.
+/// `"{add}/{remove}"` — a single `/` separator at 10px. The removed side uses
+/// the unicode minus U+2212, which occupies one monospace cell like ASCII, so
+/// the `add + 1 + rem` char arithmetic is unchanged.
 ///
 /// JetBrains Mono is monospace with a single advance for all weights, so the
 /// bold name of selected rows and the regular name of unselected rows measure
@@ -1197,14 +1202,14 @@ pub enum ScrollMode {
 }
 
 /// Estimated height per tree row for scroll-into-view on keyboard navigation.
-/// Derived from [`TREE_FONT_SIZE`] × Iced's default relative line height (1.3)
-/// for a close approximation of actual rendered row height. File entries are
-/// ~18.2 px; directory entries (with [`TREE_ICON_SIZE`] 15 pt icons) are
-/// ~19.5 px.
+/// Derived from [`TREE_ICON_SIZE`] × Iced's default relative line height (1.3)
+/// for a close approximation of actual rendered row height. All tree rows
+/// (file and directory) are ~19.5 px because both render [`TREE_ICON_SIZE`]
+/// icons.
 ///
 /// This constant is used directly by [`scroll_to_tree_focus`] to compute
 /// row positions for keyboard-navigation scroll-into-view logic.
-pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_FONT_SIZE * 1.3;
+pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_ICON_SIZE * 1.3;
 
 /// Scroll the tree panel to bring the focused row into view.
 ///
@@ -1219,7 +1224,7 @@ pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_FONT_SIZE * 1.3;
 ///   viewport height is unknown ([`FileTree::viewport_h`] is `None`).
 ///
 /// Row height is approximated by [`ESTIMATED_TREE_ROW_HEIGHT`], derived
-/// from [`TREE_FONT_SIZE`] × Iced's default relative line height (1.3).
+/// from [`TREE_ICON_SIZE`] × Iced's default relative line height (1.3).
 ///
 /// This method updates [`FileTree::scroll_y`] directly so that consecutive
 /// calls during the same frame see an accurate scroll offset even before the
@@ -1488,6 +1493,29 @@ pub fn tree_node_button<'a, Message: Clone + 'a>(
         btn = btn.on_press(msg);
     }
     btn.into()
+}
+
+/// Shared tree-row scaffold for the editor and diff file trees: guide
+/// glyphs (TEXT_MUTED at [`TREE_FONT_SIZE`]) + icon + 4px gap + name +
+/// Fill spacer, plus the optional diff counts slot followed by a 6px
+/// trailing gap. This is the render-side counterpart of
+/// [`tree_row_natural_width`] — keep the two in lockstep.
+pub fn tree_row<'a, Message: 'a>(
+    guide: String,
+    icon: Element<'a, Message>,
+    name: Element<'a, Message>,
+    counts: Option<Element<'a, Message>>,
+) -> Row<'a, Message> {
+    let mut row = Row::new()
+        .push(text(guide).size(TREE_FONT_SIZE).color(theme::TEXT_MUTED))
+        .push(icon)
+        .push(Space::new().width(4))
+        .push(name)
+        .push(Space::new().width(Length::Fill));
+    if let Some(counts) = counts {
+        row = row.push(counts).push(Space::new().width(6));
+    }
+    row.align_y(Alignment::Center)
 }
 
 /// Build the semi-transparent click-to-dismiss backdrop layer shared by all
@@ -2319,16 +2347,16 @@ mod tests {
         }
         #[rustfmt::skip] // compact one-line cases, matching the file's other case tables
         let cases = [
-            // Depth 1 (guide 2 chars) + 14px icon + 4px gap + 11-char name.
-            Case { label: "plain_file_row", guide_chars: 2, icon_size: TREE_FONT_SIZE, name: "src/main.rs", name_suffix: None, counts: None, expected: 127.2 },
+            // Depth 1 (guide 2 chars) + 15px icon + 4px gap + 11-char name.
+            Case { label: "plain_file_row", guide_chars: 2, icon_size: TREE_ICON_SIZE, name: "src/main.rs", name_suffix: None, counts: None, expected: 128.2 },
             // Root dir row: 15px icon + 4px gap + "src  Loading…" (13 glyphs).
             Case { label: "dir_loading_suffix", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "src  Loading…", name_suffix: None, counts: None, expected: 128.2 },
             // Error file row: name + 4px gap + "[⚠]" at 11px.
-            Case { label: "error_file_suffix", guide_chars: 0, icon_size: TREE_FONT_SIZE, name: "broken.txt", name_suffix: Some(("[⚠]", 11.0)), counts: None, expected: 125.8 },
-            // Diff file row: name + "+123 -45" at 10px + 6px trailing gap.
-            Case { label: "diff_counts", guide_chars: 0, icon_size: TREE_FONT_SIZE, name: "lib.rs", name_suffix: None, counts: Some(("+123", "-45")), expected: 122.4 },
+            Case { label: "error_file_suffix", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "broken.txt", name_suffix: Some(("[⚠]", 11.0)), counts: None, expected: 126.8 },
+            // Diff file row: name + "+123/−45" (U+2212 minus) at 10px + 6px trailing gap.
+            Case { label: "diff_counts", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "lib.rs", name_suffix: None, counts: Some(("+123", "\u{2212}45")), expected: 123.4 },
             // 8-char name + "binary" at 10px + 6px trailing gap.
-            Case { label: "diff_binary_count", guide_chars: 0, icon_size: TREE_FONT_SIZE, name: "data.bin", name_suffix: None, counts: Some(("binary", "")), expected: 127.2 },
+            Case { label: "diff_binary_count", guide_chars: 0, icon_size: TREE_ICON_SIZE, name: "data.bin", name_suffix: None, counts: Some(("binary", "")), expected: 128.2 },
         ];
         for case in cases {
             let w = tree_row_natural_width(
@@ -2666,18 +2694,18 @@ mod tests {
         }
         #[rustfmt::skip] // compact one-line cases, matching the file's other case tables
         let cases = [
-            // Viewport y=40..440, focus idx 3 (row y≈54..72) fully within → unchanged.
+            // Viewport y=40..440, focus idx 3 (row y≈58.5..78) fully within → unchanged.
             Case { label: "fully_visible", n: 30, scroll_y: 40.0, viewport_h: Some(400.0), focus: 3, mode: ScrollMode::ScrollIntoView, expected: 40.0 },
-            // Viewport 0..200, focus idx 15 (y≈273) below bottom → advance one row (~18.2).
-            Case { label: "below_viewport", n: 30, scroll_y: 0.0, viewport_h: Some(200.0), focus: 15, mode: ScrollMode::ScrollIntoView, expected: 18.2 },
-            // Viewport 100..500, focus idx 3 (y≈54.6) above top → scroll_y = focus_y.
-            Case { label: "above_viewport", n: 30, scroll_y: 100.0, viewport_h: Some(400.0), focus: 3, mode: ScrollMode::ScrollIntoView, expected: 54.6 },
-            // Viewport 50..450, focus idx 2 row bottom ≈54.6 straddles top → unchanged.
+            // Viewport 0..200, focus idx 15 (y≈292.5) below bottom → advance one row (~19.5).
+            Case { label: "below_viewport", n: 30, scroll_y: 0.0, viewport_h: Some(200.0), focus: 15, mode: ScrollMode::ScrollIntoView, expected: 19.5 },
+            // Viewport 100..500, focus idx 3 (y≈58.5) above top → scroll_y = focus_y.
+            Case { label: "above_viewport", n: 30, scroll_y: 100.0, viewport_h: Some(400.0), focus: 3, mode: ScrollMode::ScrollIntoView, expected: 58.5 },
+            // Viewport 50..450, focus idx 2 row bottom ≈58.5 straddles top → unchanged.
             Case { label: "top_edge_partial", n: 30, scroll_y: 50.0, viewport_h: Some(400.0), focus: 2, mode: ScrollMode::ScrollIntoView, expected: 50.0 },
-            // viewport_h None → SnapToTop fallback: scroll_y = focus_y ≈ 182.
-            Case { label: "no_viewport_snap", n: 30, scroll_y: 10.0, viewport_h: None, focus: 10, mode: ScrollMode::ScrollIntoView, expected: 182.0 },
-            // SnapToTop: scroll_y = focus_y (8 * 18.2 ≈ 145.6).
-            Case { label: "snap_to_top", n: 30, scroll_y: 0.0, viewport_h: Some(400.0), focus: 8, mode: ScrollMode::SnapToTop, expected: 145.6 },
+            // viewport_h None → SnapToTop fallback: scroll_y = focus_y ≈ 195.
+            Case { label: "no_viewport_snap", n: 30, scroll_y: 10.0, viewport_h: None, focus: 10, mode: ScrollMode::ScrollIntoView, expected: 195.0 },
+            // SnapToTop: scroll_y = focus_y (8 * 19.5 ≈ 156.0).
+            Case { label: "snap_to_top", n: 30, scroll_y: 0.0, viewport_h: Some(400.0), focus: 8, mode: ScrollMode::SnapToTop, expected: 156.0 },
             // Empty tree: early-returns Task::none(); scroll_y unchanged.
             Case { label: "empty_tree", n: 0, scroll_y: 0.0, viewport_h: Some(400.0), focus: 0, mode: ScrollMode::ScrollIntoView, expected: 0.0 },
         ];

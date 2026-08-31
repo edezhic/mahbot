@@ -333,7 +333,7 @@ impl ShellState {
             let name_color = if is_active {
                 theme::ACCENT
             } else {
-                theme::TEXT_MUTED
+                theme::TEXT_FAINT
             };
             let name_text = text(&tab.label).size(12).color(name_color);
 

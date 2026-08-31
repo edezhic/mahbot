@@ -195,6 +195,25 @@ impl DiffFile {
     }
 }
 
+/// What the diff tree counter slot shows for a file row.
+enum CountsSlot {
+    Binary,
+    Stats { added: i64, removed: i64 },
+    Unchanged,
+}
+
+#[expect(clippy::cast_possible_wrap)] // usize line counts → i64 for diff_stats_row
+fn counts_slot(file: Option<&DiffFile>) -> CountsSlot {
+    match file {
+        Some(f) if f.content == DiffContent::Binary => CountsSlot::Binary,
+        Some(f) if f.add_count > 0 || f.remove_count > 0 => CountsSlot::Stats {
+            added: f.add_count as i64,
+            removed: f.remove_count as i64,
+        },
+        _ => CountsSlot::Unchanged,
+    }
+}
+
 /// Icon identifier for file headers (avoids widget construction at cache time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CachedIcon {
@@ -577,8 +596,8 @@ impl DiffState {
                                 format!("Committed {}", info.short_hash())
                             }
                             (a, 0) => format!("Committed {} (+{a})", info.short_hash()),
-                            (0, r) => format!("Committed {} (-{r})", info.short_hash()),
-                            (a, r) => format!("Committed {} (+{a}/-{r})", info.short_hash()),
+                            (0, r) => format!("Committed {} (\u{2212}{r})", info.short_hash()),
+                            (a, r) => format!("Committed {} (+{a}/\u{2212}{r})", info.short_hash()),
                         };
                         // Immediately refresh the diff.
                         if self.selected_workspace_name.is_some() {
@@ -885,8 +904,8 @@ impl DiffState {
         // Natural width of every rendered row, in render order, for the
         // auto-sizing tree panel. Replicates the exact row composition:
         // guide (depth*2 box-drawing chars at 14px) + lucide icon
-        // (15px dirs / 14px files) + 4px gap + name at 14px, plus the ±
-        // change counts at 10px with a 6px trailing gap on file rows.
+        // (TREE_ICON_SIZE for dirs and files) + 4px gap + name at 14px, plus
+        // the ± change counts at 10px with a 6px trailing gap on file rows.
         let row_widths = widgets::collect_tree_row_widths(
             &self.file_tree.nodes,
             &self.file_tree.expanded_dirs,
@@ -904,36 +923,32 @@ impl DiffState {
                 } else {
                     // File rows always render a counts slot (empty when the
                     // file has no changes or is not in the diff list) plus a
-                    // 6px trailing gap — replicate that exactly.
-                    let counts: Option<(String, String)> = Some(
-                        match self.diff_files.iter().find(|f| f.path == node.full_path) {
-                            Some(f) if f.content == DiffContent::Binary => {
-                                ("binary".to_string(), String::new())
-                            }
-                            Some(f) if f.add_count > 0 || f.remove_count > 0 => (
-                                if f.add_count > 0 {
-                                    format!("+{}", f.add_count)
-                                } else {
-                                    String::new()
-                                },
-                                if f.remove_count > 0 {
-                                    format!("-{}", f.remove_count)
-                                } else {
-                                    String::new()
-                                },
-                            ),
-                            _ => (String::new(), String::new()),
-                        },
-                    );
+                    // 6px trailing gap.
+                    let (add_label, rem_label) = match counts_slot(
+                        self.diff_files.iter().find(|f| f.path == node.full_path),
+                    ) {
+                        CountsSlot::Binary => ("binary".to_string(), String::new()),
+                        CountsSlot::Stats { added, removed } => (
+                            if added > 0 {
+                                format!("+{added}")
+                            } else {
+                                String::new()
+                            },
+                            if removed > 0 {
+                                format!("\u{2212}{removed}")
+                            } else {
+                                String::new()
+                            },
+                        ),
+                        CountsSlot::Unchanged => (String::new(), String::new()),
+                    };
                     widgets::tree_row_natural_width(
                         guide_chars,
-                        widgets::TREE_FONT_SIZE,
+                        widgets::TREE_ICON_SIZE,
                         &node.name,
                         widgets::TREE_FONT_SIZE,
                         None,
-                        counts
-                            .as_ref()
-                            .map(|(add, rem)| (add.as_str(), rem.as_str())),
+                        Some((add_label.as_str(), rem_label.as_str())),
                     )
                 }
             },
@@ -978,21 +993,14 @@ impl DiffState {
         };
 
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
-        let guide_text: Element<'_, DiffMessage> = text(guide)
+        let icon_element: Element<'_, DiffMessage> =
+            icon.size(widgets::TREE_ICON_SIZE).color(icon_color).into();
+        let name_element: Element<'_, DiffMessage> = text(&node.name)
             .size(widgets::TREE_FONT_SIZE)
-            .color(theme::TEXT_MUTED)
+            .color(theme::TEXT_SECONDARY)
             .into();
 
-        let header_row = row![
-            guide_text,
-            icon.size(widgets::TREE_ICON_SIZE).color(icon_color),
-            Space::new().width(4),
-            text(&node.name)
-                .size(widgets::TREE_FONT_SIZE)
-                .color(theme::TEXT_SECONDARY),
-            Space::new().width(Length::Fill),
-        ]
-        .align_y(Alignment::Center);
+        let header_row = widgets::tree_row(guide, icon_element, name_element, None);
 
         let full_path = node.full_path.clone();
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);
@@ -1043,10 +1051,6 @@ impl DiffState {
         let is_selected = self.selected_file.as_deref() == Some(&node.full_path);
 
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
-        let guide_text: Element<'_, DiffMessage> = text(guide)
-            .size(widgets::TREE_FONT_SIZE)
-            .color(theme::TEXT_MUTED)
-            .into();
 
         // File status icon
         let (icon, icon_color) = if let Some(f) = file {
@@ -1066,36 +1070,12 @@ impl DiffState {
         };
 
         // Line count labels
-        let counts: Element<'_, DiffMessage> = if let Some(f) = file {
-            if f.content == DiffContent::Binary {
-                text("binary").size(10).color(theme::TEXT_MUTED).into()
-            } else if f.add_count > 0 || f.remove_count > 0 {
-                let mut parts: Vec<Element<'_, DiffMessage>> = Vec::new();
-                if f.add_count > 0 {
-                    parts.push(
-                        text(format!("+{}", f.add_count))
-                            .size(10)
-                            .color(theme::STATUS_SUCCESS)
-                            .into(),
-                    );
-                }
-                if f.add_count > 0 && f.remove_count > 0 {
-                    parts.push(text(" ").size(10).into());
-                }
-                if f.remove_count > 0 {
-                    parts.push(
-                        text(format!("-{}", f.remove_count))
-                            .size(10)
-                            .color(theme::STATUS_ERROR)
-                            .into(),
-                    );
-                }
-                row(parts).spacing(0).into()
-            } else {
-                text("").size(10).into()
+        let counts: Element<'_, DiffMessage> = match counts_slot(file) {
+            CountsSlot::Binary => text("binary").size(10).color(theme::TEXT_SECONDARY).into(),
+            CountsSlot::Stats { added, removed } => {
+                widgets::diff_stats_row(added, removed, 10.0).into()
             }
-        } else {
-            text("").size(10).into()
+            CountsSlot::Unchanged => text("").size(10).into(),
         };
 
         let name_color = if is_selected {
@@ -1109,22 +1089,18 @@ impl DiffState {
             iced::font::Weight::Normal
         };
 
-        let btn_row = row![
-            guide_text,
-            icon.size(widgets::TREE_FONT_SIZE).color(icon_color),
-            Space::new().width(4),
-            text(&node.name)
-                .size(widgets::TREE_FONT_SIZE)
-                .color(name_color)
-                .font(iced::Font {
-                    weight: name_weight,
-                    ..theme::FONT_REGULAR
-                }),
-            Space::new().width(Length::Fill),
-            counts,
-            Space::new().width(6),
-        ]
-        .align_y(Alignment::Center);
+        let icon_element: Element<'_, DiffMessage> =
+            icon.size(widgets::TREE_ICON_SIZE).color(icon_color).into();
+        let name_element: Element<'_, DiffMessage> = text(&node.name)
+            .size(widgets::TREE_FONT_SIZE)
+            .color(name_color)
+            .font(iced::Font {
+                weight: name_weight,
+                ..theme::FONT_REGULAR
+            })
+            .into();
+
+        let btn_row = widgets::tree_row(guide, icon_element, name_element, Some(counts));
 
         let full_path = node.full_path.clone();
         let is_focused = widgets::tree_node_focused(&self.file_tree, &node.full_path);

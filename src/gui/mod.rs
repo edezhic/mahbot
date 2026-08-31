@@ -1994,7 +1994,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
         let hash = diff_state.commit_short_hash().unwrap_or("????????");
         column![
             widgets::section_heading(msg),
-            text(hash).size(12).color(theme::TEXT_MUTED),
+            text(hash).size(12).color(theme::TEXT_SECONDARY),
         ]
         .spacing(2)
         .padding(iced::Padding {
@@ -2009,7 +2009,7 @@ fn render_diff_modal(diff_state: &diff::DiffState) -> Element<'_, Message> {
             widgets::section_heading("Uncommitted changes"),
             text("Working tree diff \u{2014} press Escape to close")
                 .size(11)
-                .color(theme::TEXT_MUTED),
+                .color(theme::TEXT_SECONDARY),
         ]
         .spacing(4)
         .padding(iced::Padding {
@@ -2089,7 +2089,7 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
 fn section_hint(label: &str) -> Element<'_, Message> {
     column![
         Space::new().height(8),
-        text(label).size(12).color(theme::TEXT_MUTED),
+        text(label).size(12).color(theme::TEXT_SECONDARY),
     ]
     .spacing(4)
     .padding(8)
@@ -2779,13 +2779,13 @@ impl Dashboard {
                 parts.push(
                     lucide::arrow_up::<iced::Theme, iced::Renderer>()
                         .size(16)
-                        .color(theme::TEXT_MUTED)
+                        .color(theme::TEXT_SECONDARY)
                         .into(),
                 );
                 parts.push(
                     text(format!("{ahead}"))
                         .size(16)
-                        .color(theme::TEXT_MUTED)
+                        .color(theme::TEXT_SECONDARY)
                         .into(),
                 );
             }
@@ -2796,13 +2796,13 @@ impl Dashboard {
                 parts.push(
                     lucide::arrow_down::<iced::Theme, iced::Renderer>()
                         .size(16)
-                        .color(theme::TEXT_MUTED)
+                        .color(theme::TEXT_SECONDARY)
                         .into(),
                 );
                 parts.push(
                     text(format!("{behind}"))
                         .size(16)
-                        .color(theme::TEXT_MUTED)
+                        .color(theme::TEXT_SECONDARY)
                         .into(),
                 );
             }
@@ -2983,7 +2983,7 @@ impl Dashboard {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (progress * 100.0).round() as u32;
         let label = format!("TTS: {file_name} {pct}%");
-        container(text(label).size(12).color(theme::TEXT_MUTED))
+        container(text(label).size(12).color(theme::TEXT_SECONDARY))
             .padding([0, 12])
             .into()
     }
@@ -3024,7 +3024,7 @@ impl Dashboard {
             VoiceStatus::Enrolled => "🔊 ✅ Enrolled".into(),
             VoiceStatus::Error(msg) => format!("🔊 Error: {msg}"),
         };
-        container(text(label).size(12).color(theme::TEXT_MUTED))
+        container(text(label).size(12).color(theme::TEXT_SECONDARY))
             .padding([0, 12])
             .into()
     }

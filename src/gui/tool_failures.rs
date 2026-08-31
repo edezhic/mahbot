@@ -149,6 +149,7 @@ impl ToolFailuresState {
             content = content.push(widgets::empty_state_placeholder(
                 lucide::bug::<iced::Theme, iced::Renderer>(),
                 "No tool failures",
+                theme::TEXT_MUTED,
             ));
         } else if !state.entries.is_empty() {
             let entries_view = {
@@ -187,7 +188,7 @@ impl ToolFailuresState {
         let duration_label = format!("{}ms", entry.duration_ms);
 
         row![
-            text(timestamp).size(10).color(theme::TEXT_MUTED),
+            text(timestamp).size(10).color(theme::TEXT_SECONDARY),
             Space::new().width(8),
             widgets::badge_pill(
                 entry.tool_name.clone(),
@@ -198,7 +199,7 @@ impl ToolFailuresState {
             Space::new().width(4),
             widgets::badge_pill(
                 duration_label,
-                (theme::TEXT_MUTED, theme::HOVER),
+                (theme::TEXT_SECONDARY, theme::HOVER),
                 10,
                 [1, 6]
             ),
@@ -206,7 +207,7 @@ impl ToolFailuresState {
             widgets::badge_pill(entry.role.clone(), role_colors, 10, [1, 6]),
             Space::new().width(Length::Fill),
             if !entry.workspace.is_empty() {
-                text(&entry.workspace).size(10).color(theme::TEXT_MUTED)
+                text(&entry.workspace).size(10).color(theme::TEXT_SECONDARY)
             } else {
                 text("")
             },
