@@ -3015,36 +3015,37 @@ mod tests {
     // ── has_new_commits — commit comparison tests ────────────────
 
     #[test]
-    fn new_commits_null_stored_triggers_rediscovery() {
-        assert!(
-            has_new_commits(None, "abc123"),
-            "NULL last_analyzed_commit should trigger rediscovery",
-        );
-    }
-
-    #[test]
-    fn new_commits_matching_hash_skips() {
-        assert!(
-            !has_new_commits(Some("abc123"), "abc123"),
-            "Same hash should not trigger rediscovery",
-        );
-    }
-
-    #[test]
-    fn new_commits_different_hash_triggers() {
-        assert!(
-            has_new_commits(Some("abc123"), "def456"),
-            "Different hash should trigger rediscovery",
-        );
-    }
-
-    #[test]
-    fn new_commits_empty_current_hash_triggers() {
-        // Edge case: current_hash is empty (shouldn't happen from git
-        // rev-parse HEAD, but the function handles it gracefully).
-        assert!(
-            has_new_commits(Some("abc123"), ""),
-            "Empty current hash should trigger rediscovery",
-        );
+    fn new_commits_table() {
+        let cases: &[(Option<&str>, &str, bool, &str)] = &[
+            (
+                None,
+                "abc123",
+                true,
+                "NULL last_analyzed_commit should trigger rediscovery",
+            ),
+            (
+                Some("abc123"),
+                "abc123",
+                false,
+                "Same hash should not trigger rediscovery",
+            ),
+            (
+                Some("abc123"),
+                "def456",
+                true,
+                "Different hash should trigger rediscovery",
+            ),
+            // Edge case: current_hash is empty (shouldn't happen from git
+            // rev-parse HEAD, but the function handles it gracefully).
+            (
+                Some("abc123"),
+                "",
+                true,
+                "Empty current hash should trigger rediscovery",
+            ),
+        ];
+        for (stored, current, expected, msg) in cases {
+            assert_eq!(has_new_commits(*stored, current), *expected, "{msg}");
+        }
     }
 }

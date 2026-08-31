@@ -978,10 +978,7 @@ mod tests {
             level: "INFO".to_string(),
             target: String::new(),
             message: "plain message".to_string(),
-            fields: serde_json::Value::Null,
-            agent_id: String::new(),
-            agent_role: String::new(),
-            workspace: String::new(),
+            ..Default::default()
         };
         let out = format_log_entry(&entry);
         assert_eq!(

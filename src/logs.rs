@@ -22,7 +22,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Schema for a single log entry stored in Turso.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogEntry {
     pub timestamp: String,
     pub level: String,
@@ -1172,10 +1172,7 @@ mod tests {
             level: "INFO".to_string(),
             target: "test".to_string(),
             message: "should not persist".to_string(),
-            fields: serde_json::Value::Null,
-            agent_id: String::new(),
-            agent_role: String::new(),
-            workspace: String::new(),
+            ..Default::default()
         };
 
         // Deterministic insert failure: drop the logs table through the store's
@@ -1216,10 +1213,7 @@ mod tests {
             level: "INFO".to_string(),
             target: "test".to_string(),
             message: "persisted".to_string(),
-            fields: serde_json::Value::Null,
-            agent_id: String::new(),
-            agent_role: String::new(),
-            workspace: String::new(),
+            ..Default::default()
         }];
         flush_log_batch(&store, &mut batch).await;
 
@@ -1303,30 +1297,21 @@ mod tests {
                 level: "INFO".into(),
                 target: "module_a".into(),
                 message: "processing request".into(),
-                fields: serde_json::Value::Null,
-                agent_id: String::new(),
-                agent_role: String::new(),
-                workspace: String::new(),
+                ..Default::default()
             },
             LogEntry {
                 timestamp: "2025-01-01T00:00:01Z".into(),
                 level: "ERROR".into(),
                 target: "module_b".into(),
                 message: "failed to process".into(),
-                fields: serde_json::Value::Null,
-                agent_id: String::new(),
-                agent_role: String::new(),
-                workspace: String::new(),
+                ..Default::default()
             },
             LogEntry {
                 timestamp: "2025-01-01T00:00:02Z".into(),
                 level: "INFO".into(),
                 target: "module_c".into(),
                 message: "started".into(),
-                fields: serde_json::Value::Null,
-                agent_id: String::new(),
-                agent_role: String::new(),
-                workspace: String::new(),
+                ..Default::default()
             },
         ];
 
@@ -1373,10 +1358,7 @@ mod tests {
                 level: "INFO".into(),
                 target: "mahbot::orchestrator".into(),
                 message: "processing request".into(),
-                fields: serde_json::Value::Null,
-                agent_id: String::new(),
-                agent_role: String::new(),
-                workspace: String::new(),
+                ..Default::default()
             },
             LogEntry {
                 timestamp: "2025-01-01T00:00:01Z".into(),
@@ -1384,19 +1366,14 @@ mod tests {
                 target: "mahbot::tools".into(),
                 message: "failed to process".into(),
                 fields: serde_json::json!({"code": 1}),
-                agent_id: String::new(),
-                agent_role: String::new(),
-                workspace: String::new(),
+                ..Default::default()
             },
             LogEntry {
                 timestamp: "2025-01-01T00:00:02Z".into(),
                 level: "INFO".into(),
                 target: "mahbot::api".into(),
                 message: "started".into(),
-                fields: serde_json::Value::Null,
-                agent_id: String::new(),
-                agent_role: String::new(),
-                workspace: String::new(),
+                ..Default::default()
             },
         ];
 
@@ -1445,20 +1422,14 @@ mod tests {
                 level: "INFO".into(),
                 target: "module_a".into(),
                 message: "processing `Hello ${name}` template".into(),
-                fields: serde_json::Value::Null,
-                agent_id: String::new(),
-                agent_role: String::new(),
-                workspace: String::new(),
+                ..Default::default()
             },
             LogEntry {
                 timestamp: "2025-01-01T00:00:01Z".into(),
                 level: "ERROR".into(),
                 target: "module_b".into(),
                 message: "normal log entry".into(),
-                fields: serde_json::Value::Null,
-                agent_id: String::new(),
-                agent_role: String::new(),
-                workspace: String::new(),
+                ..Default::default()
             },
         ];
 
@@ -1530,10 +1501,7 @@ mod tests {
                     level: "INFO".into(),
                     target: "test".into(),
                     message: "pre-corruption".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
+                    ..Default::default()
                 }])
                 .await
                 .expect("seed entry");
@@ -1605,10 +1573,7 @@ mod tests {
                     level: "INFO".into(),
                     target: "test".into(),
                     message: "pre-corruption".into(),
-                    fields: serde_json::Value::Null,
-                    agent_id: String::new(),
-                    agent_role: String::new(),
-                    workspace: String::new(),
+                    ..Default::default()
                 }])
                 .await
                 .expect("seed entry");
