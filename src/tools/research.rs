@@ -1,20 +1,33 @@
 //! ResearchTool — Manager-only deep multi-round research orchestrator.
 //!
 //! Unlike [`AnalyzeTool`](super::analyze::AnalyzeTool) (one round of parallel analysts
-//! for quick clarification), `research` decomposes the question into
-//! sub-questions via three independent plans (merged by id-based coverage),
-//! runs one analyst per sub-question, then runs conditional gap rounds with
-//! fresh analysts targeting only the named gaps. Stopping is artifact-based —
-//! coverage completion, answerability abstention (checked on every structural
-//! quiet round), a verification gate, and a hard agent-spawn cap (never agent
-//! self-assessment). Exactly one envelope is delivered asynchronously to the
-//! Manager; intermediate rounds never reach the user.
+//! for quick clarification), the pipeline is: round 0 decomposes the question
+//! via three independent plans merged by id-based coverage; round 1 runs one
+//! analyst per sub-question (two decorrelated angles for high-risk items);
+//! conditional gap rounds with shrinking width follow, each targeting the
+//! named gaps. A coder-in-loop prototype pass (`run_coder_round`) runs before
+//! the first gap round and after every progress round that refreshes a
+//! non-empty gap list, gated by the analyst budget, round deadline,
+//! shutdown/cancel, and a 30-minute minimum-remaining guard (`CODER_MIN_REMAINING`)
+//! — skips are fail-open markers in the report.
 //!
-//! Budgeting is by analysts spawned (decomposers, round-1 researchers,
-//! gap-round researchers, and verification analysts all count); orchestrator
-//! coordination LLM calls do not. The cap is enforced at reservation time and
-//! never refunded. No per-agent tool-call caps and no wall-clock limit — the
-//! existing global iteration backstop and retry machinery remain untouched.
+//! Deadline-aborted analysts are recovered by the wrap-up stage (a dispatch-time
+//! snapshot of frozen chat params replays the KV-cache prefix for accumulated
+//! findings); sub-agent shell commands are captured per round into the run
+//! folder. Stopping is artifact-based — coverage completion, answerability
+//! abstention (every structural quiet round), a verification gate, and a hard
+//! analyst-spawn cap (never self-assessment) — plus budget exhaustion,
+//! deadline expiry, shutdown, and manual cancel. Exactly one envelope reaches
+//! the Manager asynchronously; intermediate rounds never reach the user, and
+//! exhaustion delivers a partial report rather than nothing.
+//!
+//! A per-round wall-clock deadline (`round_timeout`, default 3h) bounds each
+//! round's member waits; the run has no additional wall-clock cap. Budgeting
+//! is by analysts spawned (decomposers, round-1 researchers, gap-round
+//! researchers, verification analysts all count); orchestrator coordination
+//! calls do not. The cap is enforced at reservation time and never refunded;
+//! no per-agent tool-call caps — the global iteration backstop and retry
+//! machinery remain untouched.
 
 use crate::agent::message_router::{self, AgentJob, MessageKind};
 use crate::agent::{chat_request, role_tools_and_specs, run_default_agent};
@@ -1357,6 +1370,25 @@ fn resolve_round_members_with_timeouts<T>(
     (runs, timed_out)
 }
 
+/// Dispatch a round of analyst members and resolve it: staggered spawn,
+/// deadline-bounded await, timeout resolution against the dispatch-time
+/// wrap-up snapshots (empty for rounds that never wrap up).
+async fn dispatch_analyst_round<T, Fut, F>(
+    members: Vec<F>,
+    resume: bool,
+    deadline: std::time::Instant,
+    snapshots: &[WrapUpEntry],
+) -> (Vec<AnalystRun<T>>, Vec<WrapUpEntry>)
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+    Fut: std::future::Future<Output = AnalystRun<T>> + Send + 'static,
+    F: FnOnce(crate::agent::RoundOpts) -> Fut + Send + 'static,
+{
+    let handles = crate::agent::spawn_staggered_round(members, resume).await;
+    let members_out = await_round_members(handles, deadline).await;
+    resolve_round_members_with_timeouts(members_out, snapshots)
+}
+
 // ── Agent runners ────────────────────────────────────────────────────────
 
 /// One analyst run. Mirrors analyze's three-state fail-open typing: a
@@ -1383,14 +1415,6 @@ struct AnalystRunOutcome<T> {
     tool_calls: usize,
     searches: usize,
     queries: Vec<String>,
-}
-
-/// Collapse awaited round members into analyst runs — the decomposition-path
-/// convenience (no wrap-up snapshots): timed-out, panicked, and cancelled
-/// members all map to [`AnalystRun::NoResponse`]. Research rounds use
-/// [`resolve_round_members_with_timeouts`] to keep the TimedOut set alive.
-fn resolve_round_members<T>(members: Vec<RoundMember<AnalystRun<T>>>) -> Vec<AnalystRun<T>> {
-    resolve_round_members_with_timeouts(members, &[]).0
 }
 
 /// Run a single analyst agent on `task` and extract structured output `T`
@@ -1636,9 +1660,9 @@ async fn round0_decompose(
             )
         })
         .collect();
-    let handles = crate::agent::spawn_staggered_round(members, resume).await;
-    let plans: Vec<AnalystRun<DecompositionPlan>> =
-        resolve_round_members(await_round_members(handles, deadline).await);
+    let plans: Vec<_> = dispatch_analyst_round(members, resume, deadline, &[])
+        .await
+        .0;
     let mut valid = Vec::new();
     for run in plans {
         match run {
@@ -1874,9 +1898,7 @@ async fn round1_research(
             ));
         }
     }
-    let handles = crate::agent::spawn_staggered_round(members, resume).await;
-    let members_out = await_round_members(handles, deadline).await;
-    let (runs, timed_out) = resolve_round_members_with_timeouts(members_out, &snapshots);
+    let (runs, timed_out) = dispatch_analyst_round(members, resume, deadline, &snapshots).await;
     // collect_evidence runs first so the wrap-up's ledger registrations can
     // never skew this round's saturation counters (round.queries /
     // repeat_queries stay from successful analysts only).
@@ -2002,9 +2024,7 @@ async fn run_gap_round(
             question.clone(),
         ));
     }
-    let handles = crate::agent::spawn_staggered_round(members, resume).await;
-    let members_out = await_round_members(handles, deadline).await;
-    resolve_round_members_with_timeouts(members_out, &snapshots)
+    dispatch_analyst_round(members, resume, deadline, &snapshots).await
 }
 
 /// Record a coder-round marker — a GATE-SKIP (`"skipped — {reason}"`; the
@@ -2057,17 +2077,37 @@ fn unclaim_coder_round(state: &mut ResearchState, round_key: usize) {
 /// checks then skip the following gap rounds, fail-open). The coder's response
 /// text is NOT inserted into the report; failures and skips are marked in the
 /// report, never silent.
+///
+/// Gated at the top by the same checks as the loop top: analyst-budget
+/// exhaustion, round-deadline expiry, shutdown/drain, cancel, and a 30-minute
+/// minimum-remaining guard ([`CODER_MIN_REMAINING`]). Every gate-skip is
+/// marked in the report, never silent (fail-open). Only the PRE-LOOP key-0
+/// round is re-attempted on boot-resume (`!coder_rounds_done.contains(&0)`);
+/// a post-progress skip (key ≥ 1) is final — the advanced `round_index` never
+/// revisits the key. No speculative inline retry: `run_agent` already
+/// exhausts its internal retry bounds before returning Failed, so a second
+/// full coder session would only double the LLM spend of a confirmed failure
+/// (design: "Сбой кодера = fail-open").
 #[expect(clippy::too_many_arguments)]
 async fn run_coder_round(
     job_id: &str,
     run_root: &str,
     ws: &Workspace,
     question: &str,
+    budget: &ResearchBudget,
     gap_list: &GapList,
     deadline: std::time::Instant,
     state: &mut ResearchState,
     round_key: usize,
 ) {
+    if budget.is_exhausted() {
+        set_coder_marker(state, round_key, "skipped — analyst budget exhausted");
+        return;
+    }
+    if std::time::Instant::now() >= deadline {
+        set_coder_marker(state, round_key, "skipped — round deadline expired");
+        return;
+    }
     if crate::shutdown::aborting() {
         set_coder_marker(state, round_key, "skipped — shutdown/drain");
         return;
@@ -2133,43 +2173,6 @@ async fn run_coder_round(
         unclaim_coder_round(state, round_key);
         set_coder_marker(state, round_key, outcome);
     }
-}
-
-/// Gate a coder round with the gap-loop top checks (budget/deadline — the
-/// same checks that would skip the following gap round). A gate-skip is
-/// marked in the report, never silent. Only the PRE-LOOP key-0 round is
-/// re-attempted on boot-resume (`!coder_rounds_done.contains(&0)` in
-/// `gap_rounds`); post-progress rounds (key ≥ 1) are dispatched only as a
-/// side-effect of a progress event inside the loop, so a skip after a long
-/// gap round is final (fail-open — the run continues without the prototype).
-/// No speculative inline retry: `run_agent` already exhausts its internal
-/// retry bounds before returning Failed, so a second full coder session would
-/// only double the LLM spend of a confirmed failure (design: "Сбой кодера =
-/// fail-open").
-#[expect(clippy::too_many_arguments)]
-async fn run_coder_gated(
-    job_id: &str,
-    run_root: &str,
-    ws: &Workspace,
-    question: &str,
-    budget: &ResearchBudget,
-    gap_list: &GapList,
-    deadline: std::time::Instant,
-    state: &mut ResearchState,
-    round_key: usize,
-) {
-    if budget.is_exhausted() {
-        set_coder_marker(state, round_key, "skipped — analyst budget exhausted");
-        return;
-    }
-    if std::time::Instant::now() >= deadline {
-        set_coder_marker(state, round_key, "skipped — round deadline expired");
-        return;
-    }
-    run_coder_round(
-        job_id, run_root, ws, question, gap_list, deadline, state, round_key,
-    )
-    .await;
 }
 
 /// Conditional gap rounds. Stopping is artifact-based, never agent
@@ -2245,7 +2248,7 @@ async fn gap_rounds(
     // Pre-loop coder round (key 0): one prototype pass over the initial gap
     // list before the first gap round dispatches.
     if !gap_list.gaps.is_empty() && !state.coder_rounds_done.contains(&0) {
-        run_coder_gated(
+        run_coder_round(
             job_id, run_root, ws, question, budget, &gap_list, deadline, state, 0,
         )
         .await;
@@ -2352,7 +2355,7 @@ async fn gap_rounds(
             // Post-progress coder round (key = this gap round's index): fresh
             // prototypes targeting the refreshed gap list.
             if !gap_list.gaps.is_empty() && !state.coder_rounds_done.contains(&round_index) {
-                run_coder_gated(
+                run_coder_round(
                     job_id,
                     run_root,
                     ws,
