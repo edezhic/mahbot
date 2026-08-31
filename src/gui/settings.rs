@@ -84,8 +84,8 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut O
 /// merged display-only entries).
 ///
 /// Active rows keep the same appearance as inactive ones; the accent-colored
-/// check is the only selected-state affordance. The X is a 24px gray glyph in
-/// a row-height, 24px-wide hit area.
+/// check is the only selected-state affordance. The X is the shared compact
+/// gray [`widgets::compact_x_button`] with a 24px-wide hit area.
 fn model_entry_row(
     target: ModelPickerTarget,
     model: String,
@@ -118,23 +118,18 @@ fn model_entry_row(
 
     let mut entry = row![model_btn];
     if !is_merged {
-        // Fill height: exactly the model-row height (the row's tallest child).
-        let remove_btn = button(
-            lucide::x::<iced::Theme, iced::Renderer>()
-                .size(theme::TEXT_24)
-                .color(theme::TEXT_SECONDARY),
-        )
-        .width(24)
-        .height(Length::Fill)
-        .padding(0)
-        .style(theme::button_text)
-        .on_press(SettingsMessage::ModelPicker {
-            target,
-            action: ModelPickerAction::RemoveModel(model),
-        });
+        // 12px glyph + 6px padding on every side = the same 24px-wide
+        // hit area the old 24px glyph button provided.
         entry = entry
             .push(Space::new().width(theme::SPACE_4))
-            .push(remove_btn);
+            .push(widgets::compact_x_button(
+                theme::SPACE_6,
+                Some(SettingsMessage::ModelPicker {
+                    target,
+                    action: ModelPickerAction::RemoveModel(model),
+                }),
+                None,
+            ));
     }
     entry.align_y(Alignment::Center).into()
 }
@@ -2330,20 +2325,15 @@ impl SettingsState {
                                     .into();
                                 e
                             } else {
-                                widgets::icon_tooltip_button(
-                                    lucide::x::<iced::Theme, iced::Renderer>()
-                                        .size(theme::TEXT_11)
-                                        .color(theme::TEXT_MUTED),
-                                    "Unlink Telegram",
+                                widgets::compact_x_button(
+                                    button::DEFAULT_PADDING,
                                     Some(SettingsMessage::UserMsg(
                                         users::UsersMessage::UnbindChannel(
                                             user.name.clone(),
                                             binding.identifier.clone(),
                                         ),
                                     )),
-                                    button::DEFAULT_PADDING,
-                                    theme::button_text,
-                                    tooltip::Position::Top,
+                                    Some("Unlink Telegram"),
                                 )
                             },
                         ]

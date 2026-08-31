@@ -719,17 +719,44 @@ impl BoardState {
     }
 
     /// Build a row of icon-only action buttons for the given ticket and actions.
-    /// Icons are 16px with 4px spacing. Cancel gets red [`theme::button_text_danger`]
-    /// treatment; all others use [`theme::button_text`]. When `is_disabled` is true
-    /// all buttons dim to [`theme::TEXT_MUTED`] and become non-interactive.
+    /// Icons are 16px with 4px spacing. Cancel buttons render by phase: while the
+    /// ticket is not pipeline-occupied ([`TicketPhase::is_pipeline_occupied`] —
+    /// backlog/analysis/planning/queued/failed) the cancel is the shared compact
+    /// gray [`widgets::compact_x_button`]; once the ticket occupies the pipeline
+    /// it keeps the red 16px `circle_x` with [`theme::button_text_danger`].
+    /// All others use [`theme::button_text`]. When `is_disabled` is true all
+    /// buttons dim to [`theme::TEXT_MUTED`] and become non-interactive.
     fn action_icon_row<'a>(
         ticket_id: &str,
+        current_phase: TicketPhase,
         actions: &[(&'static str, TicketPhase)],
         is_disabled: bool,
     ) -> Row<'a, BoardMessage> {
-        let mut icon_row = Row::new().spacing(theme::SPACE_4);
+        let mut icon_row = Row::new()
+            .spacing(theme::SPACE_4)
+            .align_y(Alignment::Center);
         for (label, phase) in actions {
             let is_cancel = label.contains("Cancel");
+            if is_cancel && !current_phase.is_pipeline_occupied() {
+                // Pre-pipeline cancel: compact gray X. Padding compensates the
+                // smaller 12px glyph so the hit zone stays the same 36x26 box the
+                // red 16px-glyph cancel renders (12 + 2*12 = 36 wide, ~12 + 2*7 = 26 tall).
+                icon_row = icon_row.push(widgets::compact_x_button(
+                    iced::Padding {
+                        top: 7.0,
+                        bottom: 7.0,
+                        left: 12.0,
+                        right: 12.0,
+                    },
+                    if is_disabled {
+                        None
+                    } else {
+                        Some(BoardMessage::RequestCancel(ticket_id.to_string()))
+                    },
+                    Some("cancel ticket"),
+                ));
+                continue;
+            }
             let (icon, tooltip_text) = Self::action_icon_and_tooltip(label);
             let icon_color = if is_disabled {
                 theme::TEXT_MUTED
@@ -1472,7 +1499,8 @@ impl BoardState {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
 
         let actions = Self::available_actions(ticket.phase);
-        let mut icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
+        let mut icon_row =
+            Self::action_icon_row(&ticket.id, ticket.phase, &actions, is_action_disabled);
         if actions.is_empty() {
             // Done/Cancelled cards render no action buttons; the ghost pins
             // the badge row's height to the button-bearing metrics.
@@ -1813,7 +1841,8 @@ impl BoardState {
         is_action_disabled: bool,
     ) -> Element<'_, BoardMessage> {
         let actions = Self::available_actions(ticket.phase);
-        let icon_row = Self::action_icon_row(&ticket.id, &actions, is_action_disabled);
+        let icon_row =
+            Self::action_icon_row(&ticket.id, ticket.phase, &actions, is_action_disabled);
 
         let now = chrono::Local::now();
         let created = Self::relative_timestamp(&ticket.created_at, now);
