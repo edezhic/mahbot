@@ -788,11 +788,7 @@ impl DiffState {
             } else {
                 Some(DiffMessage::CommitClicked)
             })
-            .style(if commit_disabled {
-                theme::button_secondary
-            } else {
-                theme::button_primary
-            });
+            .style(theme::button_secondary);
 
             container(
                 row![commit_input, Space::new().width(8), commit_btn].align_y(Alignment::Center),

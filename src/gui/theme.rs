@@ -669,34 +669,6 @@ pub fn tab_button_style(
     }
 }
 
-/// Primary action button (Save, Submit, Confirm). Uses Flexoki accent green.
-#[must_use]
-pub fn button_primary(
-    _: &iced::Theme,
-    status: iced::widget::button::Status,
-) -> iced::widget::button::Style {
-    let base = match status {
-        iced::widget::button::Status::Active => ACCENT,
-        iced::widget::button::Status::Hovered => ACCENT_LIGHT,
-        iced::widget::button::Status::Pressed => Color::from_rgb(0.165, 0.482, 0.455),
-        iced::widget::button::Status::Disabled => TEXT_FAINT,
-    };
-    let text = match status {
-        iced::widget::button::Status::Disabled => TEXT_MUTED,
-        _ => BG_BASE,
-    };
-    iced::widget::button::Style {
-        background: Some(iced::Background::Color(base)),
-        text_color: text,
-        border: iced::Border {
-            radius: 4.0.into(),
-            width: 0.0,
-            color: Color::TRANSPARENT,
-        },
-        ..iced::widget::button::Style::default()
-    }
-}
-
 /// Danger button (Delete, Purge, Clear). Uses Flexoki error red.
 #[must_use]
 pub fn button_danger(

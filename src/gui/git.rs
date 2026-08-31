@@ -748,7 +748,7 @@ impl GitState {
 
         let create_btn = button(text("Create & Switch").size(14).color(theme::TEXT_PRIMARY))
             .padding([6, 12])
-            .style(theme::button_primary)
+            .style(theme::button_secondary)
             .on_press_maybe(if self.syncing {
                 None
             } else {

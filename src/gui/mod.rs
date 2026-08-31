@@ -2577,7 +2577,7 @@ impl Dashboard {
                         .on_press(Message::CancelUpdate),
                     Space::new().width(8),
                     button(text("Update").size(13))
-                        .style(theme::button_primary)
+                        .style(theme::button_secondary)
                         .on_press(Message::ConfirmUpdate),
                 ]
                 .align_y(Alignment::Center),

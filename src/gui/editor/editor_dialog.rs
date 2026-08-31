@@ -240,7 +240,12 @@ pub(super) fn build_close_dialog(
             theme::button_danger,
             on_discard,
         ),
-        dialog_button("Save", theme::ACCENT_LIGHT, theme::button_primary, on_save),
+        dialog_button(
+            "Save",
+            theme::TEXT_PRIMARY,
+            theme::button_secondary,
+            on_save,
+        ),
     ]);
 
     confirmation_dialog(
@@ -342,8 +347,8 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
                 ),
                 dialog_button(
                     "Create",
-                    theme::ACCENT_LIGHT,
-                    theme::button_primary,
+                    theme::TEXT_PRIMARY,
+                    theme::button_secondary,
                     EditorMessage::NewItemSubmit(target.input_text.text()),
                 ),
             ]),

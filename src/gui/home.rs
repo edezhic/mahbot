@@ -1050,7 +1050,7 @@ impl HomeState {
                 .color(theme::STATUS_ERROR);
             let send_btn = button(text("Stop + Send").size(12))
                 .on_press(HomeMessage::StopVoiceRecordingSend)
-                .style(theme::button_primary)
+                .style(theme::button_secondary)
                 .padding(5);
             let discard_btn = button(text("Stop + Discard").size(12))
                 .on_press(HomeMessage::StopVoiceRecordingDiscard)

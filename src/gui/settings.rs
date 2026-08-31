@@ -206,7 +206,7 @@ fn model_picker_list<'a>(
         Space::new().width(4),
         button(text("Add").size(11))
             .padding(4)
-            .style(theme::button_primary)
+            .style(theme::button_secondary)
             .on_press(on_add),
     ]
     .align_y(Alignment::Center);
@@ -2063,7 +2063,8 @@ impl SettingsState {
                         theme::TEXT_MUTED
                     });
 
-                    let save_btn = button(text("Save Notes").size(12)).style(theme::button_primary);
+                    let save_btn =
+                        button(text("Save Notes").size(12)).style(theme::button_secondary);
                     // Only enable Save when under the character limit
                     let save_btn = if over_limit {
                         save_btn
@@ -2266,7 +2267,7 @@ impl SettingsState {
                         ];
                         row_elements.push(
                             button(text(if us.binding { "Binding..." } else { "Bind" }).size(11))
-                                .style(theme::button_primary)
+                                .style(theme::button_secondary)
                                 .on_press_maybe(if us.bind_input.text().trim().is_empty() {
                                     None
                                 } else {
@@ -2338,7 +2339,7 @@ impl SettingsState {
                             ]
                             .align_y(Alignment::Center),
                         )
-                        .style(theme::button_primary)
+                        .style(theme::button_secondary)
                         .on_press(SettingsMessage::UserMsg(
                             users::UsersMessage::OpenBindInput(user.name.clone()),
                         ))
@@ -3169,7 +3170,7 @@ impl SettingsState {
             container(
                 button(Text::new("Enroll Wake Word").size(13))
                     .on_press(SettingsMessage::StartVoiceEnrollment)
-                    .style(theme::button_primary)
+                    .style(theme::button_secondary)
                     .padding(6),
             )
             .into()
@@ -3752,7 +3753,7 @@ fn modal_dialog<'a>(
                 .on_press(on_cancel),
             Space::new().width(8),
             button(text(if adding { "Adding..." } else { submit_label }).size(13))
-                .style(theme::button_primary)
+                .style(theme::button_secondary)
                 .on_press_maybe(if adding || !submit_enabled {
                     None
                 } else {
