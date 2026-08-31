@@ -4,7 +4,7 @@
 use iced::Background;
 use iced::Color;
 use iced::border;
-use iced::widget::{container, scrollable};
+use iced::widget::{container, pick_list, scrollable, toggler};
 
 use crate::WorkspaceStatus;
 use crate::pipeline::board::TicketPhase;
@@ -784,6 +784,72 @@ pub fn button_text(
     button_text_style(status, TEXT_PRIMARY)
 }
 
+/// Flexoki-dark themed style for [`fn@pick_list`] widgets.
+#[must_use]
+pub fn pick_list_style(_theme: &iced::Theme, _status: pick_list::Status) -> pick_list::Style {
+    pick_list::Style {
+        text_color: TEXT_PRIMARY,
+        placeholder_color: TEXT_MUTED,
+        handle_color: TEXT_MUTED,
+        background: Background::Color(BG_ELEVATED),
+        border: iced::Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: BORDER_STRONG,
+        },
+    }
+}
+
+/// Flexoki-dark themed style for the expanded menu of [`fn@pick_list`] widgets,
+/// matching the ContextMenu/RoleMenu overlay look (BG_ELEVATED fill, radius-4
+/// hairline border, TEXT_SECONDARY items highlighted to TEXT_PRIMARY on hover,
+/// no shadow). The menu's internal overflow scrollbar is styled by iced's
+/// default scrollable catalog and is not reachable through this API.
+#[must_use]
+pub fn pick_list_menu_style(_theme: &iced::Theme) -> iced::overlay::menu::Style {
+    iced::overlay::menu::Style {
+        background: Background::Color(BG_ELEVATED),
+        border: iced::Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: BORDER_STRONG,
+        },
+        text_color: TEXT_SECONDARY,
+        selected_text_color: TEXT_PRIMARY,
+        selected_background: Background::Color(HOVER),
+        shadow: iced::Shadow::default(),
+    }
+}
+
+/// Flexoki-dark themed style for [`fn@toggler`] widgets.
+#[must_use]
+pub fn toggler_style(_theme: &iced::Theme, status: toggler::Status) -> toggler::Style {
+    let (track, knob, toggled) = match status {
+        toggler::Status::Active { is_toggled: true } => (ACCENT, BG_BASE, true),
+        toggler::Status::Active { is_toggled: false } => (BG_ELEVATED, TEXT_MUTED, false),
+        toggler::Status::Hovered { is_toggled: true } => (ACCENT_LIGHT, BG_BASE, true),
+        toggler::Status::Hovered { is_toggled: false } => (BG_ELEVATED, TEXT_SECONDARY, false),
+        toggler::Status::Disabled { is_toggled: true } => (ACCENT_DIM, BG_BASE, true),
+        toggler::Status::Disabled { is_toggled: false } => (BG_SURFACE, TEXT_FAINT, false),
+    };
+    let (border_width, border_color) = if toggled {
+        (0.0, Color::TRANSPARENT)
+    } else {
+        (1.0, BORDER_STRONG)
+    };
+    toggler::Style {
+        background: Background::Color(track),
+        background_border_width: border_width,
+        background_border_color: border_color,
+        foreground: Background::Color(knob),
+        foreground_border_width: 0.0,
+        foreground_border_color: Color::TRANSPARENT,
+        text_color: None,
+        border_radius: None,
+        padding_ratio: 0.1,
+    }
+}
+
 // ── Container styles ─────────────────────────────────────────────
 
 /// Shared container style factory: background fill plus border parameters.
@@ -1045,9 +1111,10 @@ mod tests {
         }
     }
 
-    /// Locks the pre-consolidation values of the container factories and
-    /// the button_text/button_text_danger pair so parameterization cannot
-    /// silently change any rendered style.
+    /// Locks the pre-consolidation values of the container factories, the
+    /// button_text/button_text_danger pair, the pick_list field/menu styles,
+    /// and the toggler style so parameterization cannot silently change any
+    /// rendered style.
     #[test]
     fn style_factory_values_unchanged() {
         let theme = iced::Theme::Dark;
@@ -1143,6 +1210,87 @@ mod tests {
             };
             assert_eq!(button_text(&theme, status), expected(TEXT_PRIMARY));
             assert_eq!(button_text_danger(&theme, status), expected(STATUS_ERROR));
+        }
+
+        // pick_list field style is status-independent.
+        assert_eq!(
+            pick_list_style(&theme, pick_list::Status::Active),
+            pick_list::Style {
+                text_color: TEXT_PRIMARY,
+                placeholder_color: TEXT_MUTED,
+                handle_color: TEXT_MUTED,
+                background: Background::Color(BG_ELEVATED),
+                border: border(4.0, 1.0, BORDER_STRONG),
+            }
+        );
+        assert_eq!(
+            pick_list_menu_style(&theme),
+            iced::overlay::menu::Style {
+                background: Background::Color(BG_ELEVATED),
+                border: border(4.0, 1.0, BORDER_STRONG),
+                text_color: TEXT_SECONDARY,
+                selected_text_color: TEXT_PRIMARY,
+                selected_background: Background::Color(HOVER),
+                shadow: iced::Shadow::default(),
+            }
+        );
+
+        for (status, toggled, track, knob, bg_border) in [
+            (
+                toggler::Status::Active { is_toggled: true },
+                true,
+                ACCENT,
+                BG_BASE,
+                Color::TRANSPARENT,
+            ),
+            (
+                toggler::Status::Active { is_toggled: false },
+                false,
+                BG_ELEVATED,
+                TEXT_MUTED,
+                BORDER_STRONG,
+            ),
+            (
+                toggler::Status::Hovered { is_toggled: true },
+                true,
+                ACCENT_LIGHT,
+                BG_BASE,
+                Color::TRANSPARENT,
+            ),
+            (
+                toggler::Status::Hovered { is_toggled: false },
+                false,
+                BG_ELEVATED,
+                TEXT_SECONDARY,
+                BORDER_STRONG,
+            ),
+            (
+                toggler::Status::Disabled { is_toggled: true },
+                true,
+                ACCENT_DIM,
+                BG_BASE,
+                Color::TRANSPARENT,
+            ),
+            (
+                toggler::Status::Disabled { is_toggled: false },
+                false,
+                BG_SURFACE,
+                TEXT_FAINT,
+                BORDER_STRONG,
+            ),
+        ] {
+            let expected = toggler::Style {
+                background: Background::Color(track),
+                background_border_width: if toggled { 0.0 } else { 1.0 },
+                background_border_color: bg_border,
+                foreground: Background::Color(knob),
+                foreground_border_width: 0.0,
+                foreground_border_color: Color::TRANSPARENT,
+                text_color: None,
+                border_radius: None,
+                padding_ratio: 0.1,
+            };
+            assert_eq!(toggler_style(&theme, status), expected);
         }
     }
 

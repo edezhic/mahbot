@@ -2396,7 +2396,8 @@ impl SettingsState {
                                             )
                                         },
                                     )
-                                    .style(widgets::pick_list_style)
+                                    .style(theme::pick_list_style)
+                                    .menu_style(theme::pick_list_menu_style)
                                     .padding([4, 8])
                                     .width(Length::Fixed(100.0)),
                                     text("Active workspace").size(11),
@@ -2436,7 +2437,8 @@ impl SettingsState {
                                                 ),
                                             )
                                         })
-                                        .style(widgets::pick_list_style)
+                                        .style(theme::pick_list_style)
+                                        .menu_style(theme::pick_list_menu_style)
                                         .padding([4, 8])
                                         .width(Length::Fixed(120.0)),
                                         text("Active role").size(11),
@@ -2632,7 +2634,8 @@ impl SettingsState {
                             _ => SettingsMessage::AddUserDefaultRole(0),
                         },
                     )
-                    .style(super::widgets::pick_list_style)
+                    .style(theme::pick_list_style)
+                    .menu_style(theme::pick_list_menu_style)
                     .padding([4, 8]),
                     Space::new().height(8),
                 ]
@@ -2865,6 +2868,7 @@ impl SettingsState {
                 "Custom endpoint",
                 toggler(custom_section_open)
                     .on_toggle(SettingsMessage::CustomEndpointToggle)
+                    .style(theme::toggler_style)
                     .into(),
                 Some("custom chat-completions server (e.g. llama.cpp or vLLM)"),
             ),
@@ -3008,7 +3012,9 @@ impl SettingsState {
         let transcription_row = field_row(
             "Transcription",
             row![
-                toggler(transcription_enabled).on_toggle(SettingsMessage::TranscriptionToggle),
+                toggler(transcription_enabled)
+                    .on_toggle(SettingsMessage::TranscriptionToggle)
+                    .style(theme::toggler_style),
                 Space::new().width(12),
                 transcription_status,
             ]
@@ -3074,11 +3080,13 @@ impl SettingsState {
         let wake_row = field_row(
             "Wake Word Detection",
             row![
-                toggler(voice_enabled).on_toggle_maybe(if transcription_enabled {
-                    Some(SettingsMessage::VoiceToggle)
-                } else {
-                    None
-                }),
+                toggler(voice_enabled)
+                    .on_toggle_maybe(if transcription_enabled {
+                        Some(SettingsMessage::VoiceToggle)
+                    } else {
+                        None
+                    })
+                    .style(theme::toggler_style),
                 Space::new().width(12),
                 wake_status,
             ]
@@ -3128,7 +3136,9 @@ impl SettingsState {
         let tts_row = field_row(
             "Text to Speech",
             row![
-                toggler(tts_enabled).on_toggle(SettingsMessage::TtsToggle),
+                toggler(tts_enabled)
+                    .on_toggle(SettingsMessage::TtsToggle)
+                    .style(theme::toggler_style),
                 Space::new().width(12),
                 tts_status,
             ]
@@ -3385,7 +3395,8 @@ impl SettingsState {
             }
         })
         .text_size(13)
-        .style(super::widgets::pick_list_style)
+        .style(theme::pick_list_style)
+        .menu_style(theme::pick_list_menu_style)
         .width(Length::Fixed(180.0));
 
         let provider_row = field_row_with_error(

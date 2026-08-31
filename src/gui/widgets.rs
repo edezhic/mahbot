@@ -1,4 +1,4 @@
-//! Shared dashboard widgets: styled pick_list, PickOption type, FileTree state struct
+//! Shared dashboard widgets: PickOption type, FileTree state struct
 //! and build_tree_panel for shared file-tree panel rendering.
 
 use super::theme;
@@ -10,8 +10,8 @@ use iced::advanced::widget::tree::{self, Tree};
 use iced::advanced::{Clipboard, Shell, Widget};
 use iced::mouse;
 use iced::widget::{
-    self, Column, Row, Space, button, column, container, mouse_area, pick_list, row, scrollable,
-    stack, text, tooltip,
+    self, Column, Row, Space, button, column, container, mouse_area, row, scrollable, stack, text,
+    tooltip,
 };
 use iced::{
     Alignment, Color, Element, Event, Length, Padding, Point, Rectangle, Size, Task, Vector,
@@ -23,12 +23,12 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// An option for [`fn@pick_list`] with separate value and display label.
+/// An option for [`fn@iced::widget::pick_list`] with separate value and display label.
 ///
 /// Equality is determined by `value` only — two `PickOption`s with the same
-/// `value` are considered equal regardless of label. This lets [`fn@pick_list`]
-/// highlight the correct option even when the selected value is constructed
-/// independently of the options list.
+/// `value` are considered equal regardless of label. This lets
+/// [`fn@iced::widget::pick_list`] highlight the correct option even when the
+/// selected value is constructed independently of the options list.
 #[derive(Debug, Clone)]
 pub struct PickOption {
     pub value: String,
@@ -46,22 +46,6 @@ impl Eq for PickOption {}
 impl std::fmt::Display for PickOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.label)
-    }
-}
-
-/// Flexoki-dark themed style for [`fn@pick_list`] widgets.
-#[must_use]
-pub fn pick_list_style(_theme: &iced::Theme, _status: pick_list::Status) -> pick_list::Style {
-    pick_list::Style {
-        text_color: theme::TEXT_PRIMARY,
-        placeholder_color: theme::TEXT_MUTED,
-        handle_color: theme::TEXT_MUTED,
-        background: iced::Background::Color(theme::BG_ELEVATED),
-        border: iced::Border {
-            radius: 4.0.into(),
-            width: 1.0,
-            color: theme::BORDER_STRONG,
-        },
     }
 }
 
