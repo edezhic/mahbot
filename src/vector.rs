@@ -1,7 +1,7 @@
 //! Vector operations — cosine similarity, hybrid merge, serialization.
 //!
-//! Extracted from the former memory module and now used by
-//! [`crate::tools::SearchArchivedTicketsTool`] for hybrid FTS+semantic search.
+//! Used by [`crate::tools::SearchArchivedTicketsTool`] for hybrid FTS+semantic
+//! search.
 //! [`crate::embedder::Embedder`] produces embeddings that are stored as
 //! blobs in the tickets table and deserialized via [`bytes_to_vec`] during search.
 

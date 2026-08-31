@@ -177,8 +177,9 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
                 // Artist generated/uploads keep-detection — after the purge so
                 // the jobs-state is final; artist sessions are never transient,
                 // so keep-evidence is live regardless of ordering. (Research
-                // run folders are NOT swept here — they are released by the
-                // run's own cleanup flow; crash leftovers are the OS's job.)
+                // run folders are NOT swept here — `release_run_folder` is the
+                // single release point, invoked per-job by completion, the cancel
+                // sweep, and boot resume; crash leftovers are the OS's job.)
                 let media = mahbot::research_cleanup::sweep_media().await?;
                 Ok(purged + cleaned + media)
             },

@@ -11,14 +11,16 @@
 //! ephemeral search tracker also lives inside the folder (see
 //! `crate::search_engine`), so everything temporary dies with it.
 //!
-//! The folder is removed ONLY by the run's own completion flow: the cleanup
-//! tail ([`run_cleanup_agent_and_finish`]) releases the search-engine state,
-//! deletes the whole folder, then terminalizes the cleanup row. Folders of
-//! crashed runs are left for the OS — the daemon builds no mechanisms for
-//! crash leftovers, so there are no boot or periodic run-folder sweeps. The
-//! only periodic temp sweep (the temp-dir cleaner, see `crate::temp`)
-//! protects research run folders by prompt instruction — the daemon builds
-//! no programmatic run-folder sweeps.
+//! The folder is removed via [`release_run_folder`], the single run-folder
+//! release point, invoked per-job (never as a sweep) from the completion tail
+//! ([`run_cleanup_agent_and_finish`]), the cancel sweep
+//! ([`crate::research_cancel::sweep_cancelled_run`]), and the boot-resume paths
+//! (an unloadable cleanup row in [`resume_research_cleanup`], an unresolvable
+//! workspace in the pipeline resume). There is no periodic or scan-based
+//! run-folder sweep anywhere in the daemon, so folders of crashed runs are
+//! left for the OS temp sweep (see `crate::temp` — the temp-dir cleaner
+//! protects research run folders only by prompt instruction, never
+//! programmatically).
 //!
 //! ## Command dump + Sanitation cleanup
 //!
@@ -112,9 +114,12 @@ async fn run_folder_exists(job_id: &str) -> bool {
 /// entry first (drops the picker + LMDB tracker handles), then the whole
 /// folder (the ephemeral search tracker lives inside it and dies with it).
 ///
-/// Called by the cleanup tail ([`run_cleanup_agent_and_finish`], folder
-/// before row terminalize). The cleanup jobs row is NOT touched here:
-/// callers own row removal/aging.
+/// Called by the completion tail ([`run_cleanup_agent_and_finish`], folder
+/// before row terminalize), the cancel sweep
+/// ([`crate::research_cancel::sweep_cancelled_run`]), and the boot-resume
+/// paths (unloadable cleanup row in [`resume_research_cleanup`], unresolvable
+/// workspace in the pipeline resume). The cleanup jobs row is NOT touched
+/// here: callers own row removal/aging.
 ///
 /// Removal failure is swallowed (the folder is "left for the OS") and the row
 /// is still terminalized by the caller — the crash-window classifier then

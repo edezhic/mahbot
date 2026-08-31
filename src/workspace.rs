@@ -1159,7 +1159,7 @@ impl WorkspaceStore {
             // `rediscover`, NOT via `set_paused`, so it does NOT trigger this
             // cancel and must not cancel the in-flight discovery agents.
             //
-            // The store→registry call mirrors `set_maintainer` below (which
+            // The store→registry call mirrors `set_maintenance_enabled` above (which
             // cancels Maintainer agents): the store is the single choke point
             // for every pause entry point (GUI, Telegram, failure), so the
             // cancel is guaranteed rather than left to each caller.

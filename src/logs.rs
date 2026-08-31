@@ -766,7 +766,7 @@ impl LogWriterPanicState {
 /// Snapshot of the log-writer failure surface, for display and tests.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogWriteErrorInfo {
-    /// Total number of batch insert failures recorded since startup.
+    /// Total failures recorded since startup — batch insert failures and writer panics.
     pub count: u64,
     /// RFC 3339 timestamp of the most recent failure.
     pub last_timestamp: Option<String>,

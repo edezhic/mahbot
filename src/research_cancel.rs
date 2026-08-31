@@ -133,7 +133,7 @@ pub(crate) async fn cancel_research_run(job_id: &str) -> Result<(), String> {
 ///   deleted by the completion boundary before the cleanup row is created).
 /// - the run folder (search/tracker state first, then the folder) — safe when
 ///   the folder is already missing or being released concurrently;
-/// - the results.md archive (Behavior 5: no archive file).
+/// - the results.md archive (no archive file).
 ///
 /// Idempotent and safe to run concurrently from both the cancel action and
 /// the orchestrator's cancelled-exit path — every statement is a no-op on
