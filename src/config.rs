@@ -622,7 +622,7 @@ pub(crate) fn parse_newline_list(s: &str) -> Vec<String> {
 /// The value is trimmed before being returned.
 /// Delegates to [`trimmed_or_none`].
 #[must_use]
-pub(crate) fn non_empty(val: Option<String>) -> Option<String> {
+fn non_empty(val: Option<String>) -> Option<String> {
     val.and_then(|s| trimmed_or_none(&s))
 }
 
@@ -639,7 +639,7 @@ pub(crate) fn resolve_or(val: Option<String>, fallback: &str) -> String {
 /// lines are returned as a `Vec<String>`. Otherwise a single-element vec containing the resolved
 /// value of `fallback_field` (or `default_value`) is returned.
 #[must_use]
-pub(crate) fn resolve_list_or(
+fn resolve_list_or(
     list_field: Option<&str>,
     fallback_field: Option<String>,
     default_value: &str,
@@ -710,7 +710,7 @@ pub(crate) fn is_custom_endpoint(endpoint: &str) -> bool {
 /// Whether a custom chat-completions endpoint is currently active in the
 /// global CONFIG (default URL and trivial variants never count as custom).
 #[must_use]
-pub(crate) fn custom_endpoint_active() -> bool {
+fn custom_endpoint_active() -> bool {
     is_custom_endpoint(&CONFIG.provider_endpoint())
 }
 

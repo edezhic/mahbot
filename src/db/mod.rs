@@ -950,7 +950,7 @@ impl Connection {
     /// Execute a query that returns exactly one row, using the cached
     /// prepared-statement path (see [`Self::query_cached`] for the cache
     /// contract).
-    pub async fn query_row_cached<T, E>(
+    async fn query_row_cached<T, E>(
         &self,
         sql: &str,
         params: impl IntoParams + Send + 'static,
@@ -1011,7 +1011,7 @@ impl Connection {
     /// distinguish a complete checkpoint from a busy or partial one — Limbo
     /// never reports a busy result in the row's first column on its success
     /// path, so incompleteness must be derived from `log > checkpointed`.
-    pub async fn checkpoint(&self) -> anyhow::Result<CheckpointOutcome> {
+    pub(crate) async fn checkpoint(&self) -> anyhow::Result<CheckpointOutcome> {
         self.run_checkpoint(CheckpointMode::Truncate).await
     }
 
@@ -1022,7 +1022,7 @@ impl Connection {
     /// it never resets the shared WAL frame index, so it is safe to run while
     /// other connections are live. The WAL file keeps growing until a
     /// TRUNCATE checkpoint runs; callers bound that growth with a size cap.
-    pub async fn checkpoint_passive(&self) -> anyhow::Result<CheckpointOutcome> {
+    pub(crate) async fn checkpoint_passive(&self) -> anyhow::Result<CheckpointOutcome> {
         self.run_checkpoint(CheckpointMode::Passive).await
     }
 
@@ -1096,7 +1096,7 @@ fn scan_integrity_rows(rows: &[Row]) -> anyhow::Result<Vec<String>> {
 /// is set only on the pager checkpoint error path. A partial checkpoint is
 /// therefore detected via `log > checkpointed` (frames remaining in the WAL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointOutcome {
+pub(crate) struct CheckpointOutcome {
     /// True when the checkpoint returned SQLITE_BUSY (locks held by another
     /// writer/checkpointer).
     pub busy: bool,

@@ -15,7 +15,7 @@
 //! # Agent ID formats
 //!
 //! Agent IDs are stable deterministic strings built by
-//! [`crate::session::resolve_agent_id`] and friends. The [`Role`] is embedded
+//! `crate::session::resolve_agent_id` and friends. The [`Role`] is embedded
 //! directly in [`AgentJob`] so the router never needs to parse the agent ID.
 //!
 //! # Response delivery
@@ -255,7 +255,7 @@ pub fn route(agent_id: &str, job: AgentJob) {
 
 /// Route a user message to the agent for the given role in a workspace.
 ///
-/// Computes the agent ID via [`crate::session::resolve_agent_id`] (Manager
+/// Computes the agent ID via `crate::session::resolve_agent_id` (Manager
 /// role → `manager_{ws_name}`, others → channel-agnostic direct ID per
 /// user+workspace+role) and enqueues
 /// a [`MessageKind::UserMessage`] job. Surrounding per-site pipelines (broadcast,

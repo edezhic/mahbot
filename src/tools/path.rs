@@ -55,7 +55,7 @@ async fn canonicalize_parent_and_join(path: &Path) -> std::io::Result<PathBuf> {
 /// Uses parent canonicalization + final component (same strategy as write-mode
 /// path resolution) so existing directories are listable even when agents omit
 /// a trailing `/` or when full-path canonicalization fails on edge-case paths.
-pub(crate) async fn resolve_directory_read_fallback(full_path: &Path) -> Option<PathBuf> {
+async fn resolve_directory_read_fallback(full_path: &Path) -> Option<PathBuf> {
     let meta = tokio::fs::symlink_metadata(full_path).await.ok()?;
     if !meta.is_dir() {
         return None;

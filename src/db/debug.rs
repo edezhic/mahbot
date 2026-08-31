@@ -35,7 +35,7 @@
 //! ## Other verbs
 //!
 //! - `mahbot debug detect [--db <name>]` — classify store file sets without
-//!   opening any database via [`wal_guard::inspect_store_at`], reporting
+//!   opening any database via `wal_guard::inspect_store_at`, reporting
 //!   `healthy`/`durable-b`/`structural` plus the on-disk `-wal` size and a
 //!   stale `.tshm` flag. Exits 1 when any store is structurally corrupt.
 //! - `mahbot debug families [--db <name>]` — list every quarantine and

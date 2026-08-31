@@ -6,11 +6,11 @@
 
 pub mod dead_session;
 pub(crate) mod image_strip;
-pub mod manager;
+mod manager;
 pub(crate) mod transcript;
 pub(crate) use manager::FinalizeOutcome;
 pub(crate) use manager::RewriteOutcome;
-pub use manager::Session;
+pub(crate) use manager::Session;
 pub(crate) use transcript::{TRANSCRIPT_REGISTRY, TranscriptSnapshot};
 
 use crate::db::{self, IntoParams, Row, TxGuard, Value, params};
@@ -60,7 +60,7 @@ fn is_tool_call_frame(msg: &ChatMessage) -> bool {
 /// message is the newest entry, so it always lands last — callers must not
 /// re-append it separately.
 #[must_use]
-pub(crate) fn select_retention_window(history: &[ChatMessage]) -> Vec<ChatMessage> {
+fn select_retention_window(history: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut users: Vec<(usize, &ChatMessage)> = Vec::new();
     let mut assistants: Vec<(usize, &ChatMessage)> = Vec::new();
     for (idx, msg) in history.iter().enumerate().rev() {
@@ -467,11 +467,7 @@ impl SessionStore {
         Ok(())
     }
 
-    pub(crate) async fn batch_append(
-        &self,
-        agent_id: &str,
-        messages: &[ChatMessage],
-    ) -> Result<()> {
+    async fn batch_append(&self, agent_id: &str, messages: &[ChatMessage]) -> Result<()> {
         self.append_messages(agent_id, messages, false, None).await
     }
 
@@ -479,7 +475,7 @@ impl SessionStore {
     /// `user_name`, `workspace_name`, `role`) in the same transaction as
     /// the message insert, eliminating the atomicity gap between message
     /// persistence and context persistence.
-    pub(crate) async fn batch_append_with_context(
+    async fn batch_append_with_context(
         &self,
         agent_id: &str,
         messages: &[ChatMessage],
@@ -498,7 +494,7 @@ impl SessionStore {
     }
 
     /// Like [`batch_append`], but also sets session context in the same transaction.
-    pub(crate) async fn append_with_context(
+    async fn append_with_context(
         &self,
         agent_id: &str,
         message: &ChatMessage,
@@ -518,11 +514,7 @@ impl SessionStore {
         .await
     }
 
-    pub(crate) async fn replace_messages(
-        &self,
-        agent_id: &str,
-        messages: &[ChatMessage],
-    ) -> Result<()> {
+    async fn replace_messages(&self, agent_id: &str, messages: &[ChatMessage]) -> Result<()> {
         self.append_messages(agent_id, messages, true, None).await
     }
 
@@ -700,11 +692,7 @@ impl SessionStore {
     /// mid-session change detection; `None` clears the baseline (no block
     /// rendered — fail-open). Upserts so a missing metadata row (e.g. a
     /// session without a preceding message append) still records the baseline.
-    pub(crate) async fn set_active_models(
-        &self,
-        agent_id: &str,
-        snapshot: Option<&str>,
-    ) -> Result<()> {
+    async fn set_active_models(&self, agent_id: &str, snapshot: Option<&str>) -> Result<()> {
         self.set_metadata_value(agent_id, MetadataColumn::ActiveModels, snapshot.into())
             .await
     }
@@ -712,7 +700,7 @@ impl SessionStore {
     /// Read the last persisted `<active-models-opts>` snapshot, if any.
     /// Returns `None` when no baseline exists (no block rendered, or a
     /// session started before this feature).
-    pub(crate) async fn get_active_models(&self, agent_id: &str) -> Option<String> {
+    async fn get_active_models(&self, agent_id: &str) -> Option<String> {
         self.get_metadata_value(
             agent_id,
             MetadataColumn::ActiveModels,
@@ -742,7 +730,7 @@ impl SessionStore {
     /// `None` when the session never recorded a successful usage-bearing
     /// agent call (new sessions, pre-migration sessions — approved
     /// no-backfill semantics) or the value was explicitly cleared.
-    pub(crate) async fn get_token_length(&self, agent_id: &str) -> Option<u64> {
+    async fn get_token_length(&self, agent_id: &str) -> Option<u64> {
         self.get_metadata_value(
             agent_id,
             MetadataColumn::TokenLength,
@@ -823,13 +811,13 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
 /// [`cleanup_old_transient_sessions`] purges only the transient entries
 /// (`manager_` is intentionally excluded there). Both match via SQL
 /// `LIKE 'prefix_%'`, which SQLite applies case-insensitively for ASCII.
-pub(crate) fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
+fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
     std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
 }
 
 /// Case-insensitive (ASCII) [`str::starts_with`], matching Turso's `LIKE`
 /// semantics for the reserved-prefix exclusion.
-pub(crate) fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     s.get(..prefix.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
@@ -904,7 +892,7 @@ fn safe_user_segment(user_name: &str) -> Cow<'_, str> {
 /// escaped with a `user_` prefix (see [`safe_user_segment`]) so their
 /// conversation is never mistaken for a transient/background agent.
 #[must_use]
-pub fn direct_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
+fn direct_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
     // Invariant: the routed user identity is never an empty string
     // ([`normalize_user_name`]). Guard the ID itself so no bare "_ws_role" key
     // can ever be produced — the single chokepoint for every direct ID builder
@@ -947,7 +935,7 @@ pub(crate) fn ticket_agent_id(ticket_id: &str, role: &str) -> String {
 ///
 /// Format: `manager_{ws_name}`
 #[must_use]
-pub fn manager_agent_id(ws_name: &str) -> String {
+pub(crate) fn manager_agent_id(ws_name: &str) -> String {
     format!("manager_{ws_name}")
 }
 
@@ -968,7 +956,7 @@ pub fn manager_agent_id(ws_name: &str) -> String {
 /// Matches [`direct_agent_id`]: `user_name` first, then `role`,
 /// and `ws_name` last.
 #[must_use]
-pub fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
+pub(crate) fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
     if role == "manager" {
         manager_agent_id(ws_name)
     } else {

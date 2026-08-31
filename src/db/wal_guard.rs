@@ -12,7 +12,7 @@
 //! is detected and reported (`has_stale_tshm` / a boot `warn!`) but never
 //! created in normal operation (single-process mode uses the standard `-shm`).
 //!
-//! [`inspect_store`] / [`inspect_store_at`] classify one store's file set
+//! `inspect_store` / `inspect_store_at` classify one store's file set
 //! without opening the database. [`diagnose_all_stores`] is the boot
 //! pre-flight that feeds each store's heal strategy in `crate::db::open_store`.
 
@@ -91,7 +91,7 @@ impl BootDiagnosis {
 
     /// Map to the single-process [`StoreClass`].
     #[must_use]
-    pub(crate) fn into_store_class(self) -> StoreClass {
+    fn into_store_class(self) -> StoreClass {
         match self {
             Self::Healthy => StoreClass::Healthy,
             Self::DurableB => StoreClass::DurableB,
@@ -105,7 +105,7 @@ impl BootDiagnosis {
 /// durable-B (0-byte main DB with a non-empty WAL). `has_stale_tshm` reports a
 /// leftover `.tshm` from a pre-removal multiprocess run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreClass {
+pub(super) enum StoreClass {
     Healthy,
     DurableB,
     Structural,
@@ -125,7 +125,7 @@ impl StoreClass {
 
 /// Classification of one store's file set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoreArtifactStatus {
+pub(super) struct StoreArtifactStatus {
     /// Store name (matches the `--db` argument of `mahbot debug`).
     pub store: String,
     /// Single-process corruption class (main-DB header + WAL size).
@@ -143,7 +143,7 @@ pub struct StoreArtifactStatus {
 /// is safe to run against live stores and is unit-testable with synthetic
 /// file states.
 #[must_use]
-pub fn inspect_store_at(db_path: &Path) -> StoreArtifactStatus {
+pub(super) fn inspect_store_at(db_path: &Path) -> StoreArtifactStatus {
     let sidecars = crate::db::store_sidecars(db_path);
     let wal_size = std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len());
     let has_stale_tshm = sidecars.tshm.exists();
@@ -162,7 +162,7 @@ pub fn inspect_store_at(db_path: &Path) -> StoreArtifactStatus {
 
 /// Classify the file set of one store under `root/db/`.
 #[must_use]
-pub fn inspect_store(root: &Path, name: &str) -> StoreArtifactStatus {
+pub(super) fn inspect_store(root: &Path, name: &str) -> StoreArtifactStatus {
     inspect_store_at(&crate::db::store_db_path(root, name))
 }
 

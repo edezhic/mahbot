@@ -1535,7 +1535,7 @@ pub(super) enum SegmentMode {
 /// Grep's blank-line and case-`;;` allowances are structural, not policy
 /// variants: the `\n` flush skips; the `;` arm consumes the second `;`.
 #[derive(Clone, Copy)]
-pub(super) enum EmptySegPolicy {
+enum EmptySegPolicy {
     Skip,
     Error,
 }

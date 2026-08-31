@@ -811,7 +811,7 @@ impl SettingsState {
     }
 
     /// Mirror a toggle in both config snapshots: `"true"`/`""` (the empty
-    /// string keeps the [non_empty] accessor collapsing to None = disabled),
+    /// string keeps the `non_empty` accessor collapsing to None = disabled),
     /// plus the global CONFIG so refresh() can't revert the change.
     fn set_toggle(&mut self, key: &str, enabled: bool) {
         let val = if enabled { "true" } else { "" };

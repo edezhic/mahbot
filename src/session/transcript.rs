@@ -52,7 +52,7 @@ struct TranscriptEntry {
 /// agent with the same `agent_id` gets a FRESH holder and a stale
 /// deregistration can never remove the replacement's entry.
 #[derive(Default)]
-pub struct TranscriptRegistry {
+pub(crate) struct TranscriptRegistry {
     inner: Mutex<HashMap<String, TranscriptEntry>>,
 }
 

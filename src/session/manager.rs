@@ -34,7 +34,7 @@ use super::TranscriptSnapshot;
 /// Coordinates session persistence and prompt building across a single
 /// agent turn.
 #[derive(Default)]
-pub struct Session {
+pub(crate) struct Session {
     /// In-memory history for the current turn (includes system prompt,
     /// conversation, and the latest user message).
     history: Vec<ChatMessage>,
@@ -357,7 +357,7 @@ impl Session {
     /// containing a fresh system prompt (via `build_context_messages`), the
     /// given `summary_text`, and the latest [`crate::session::RETENTION_PER_SIDE`]
     /// user messages + assistant answers from the pre-compaction history
-    /// (tool traffic excluded — see [`crate::session::select_retention_window`]).
+    /// (tool traffic excluded — see `select_retention_window`).
     ///
     /// The LLM call to produce the summary text is the responsibility of
     /// [`crate::Agent::summarize`] — this method
