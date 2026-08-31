@@ -21,7 +21,11 @@ pub(crate) fn user_store() -> Result<&'static UserStore, String> {
 
 /// Run a single-field `update_user`, mapping an empty value to
 /// [`FieldUpdate::Clear`]. `is_role` selects which column is updated.
-async fn update_user_field(sender: String, value: String, is_role: bool) -> Result<(), String> {
+pub(crate) async fn update_user_field(
+    sender: String,
+    value: String,
+    is_role: bool,
+) -> Result<(), String> {
     let store = user_store()?;
     let val = if value.is_empty() {
         FieldUpdate::Clear

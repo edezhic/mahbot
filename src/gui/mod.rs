@@ -550,7 +550,7 @@ pub struct Dashboard {
     /// [`Message::WorkspacesReloaded`], which rebuilds the whole map from the
     /// store (no incremental boolean patching).
     workspaces: HashMap<String, Workspace>,
-    /// Currently selected workspace name from the global picker.
+    /// Currently selected workspace name ("" / None = "Personal").
     selected_workspace_name: Option<String>,
     /// Currently selected user name (for impersonation). Persisted in window state.
     selected_user_name: Option<String>,
@@ -656,7 +656,7 @@ impl Dashboard {
                 self.selected_user_name = prev.selected_user;
                 self.board_state.current_user_name = self.selected_user_name.clone();
                 let boot_workspaces = Task::perform(
-                    load_workspace_options(prev.selected_workspace),
+                    load_workspace_options(self.selected_user_name.clone()),
                     std::convert::identity,
                 );
 
@@ -706,13 +706,12 @@ impl Dashboard {
         iced::Theme::Dark
     }
 
-    /// Persist the current window position, size, selected workspace, and
-    /// selected user to `~/.mahbot/window-state.json`.
+    /// Persist the current window position, size, and selected user to
+    /// `~/.mahbot/window-state.json`.
     fn persist_window_state(&self) {
         save_window_state(
             self.last_position,
             self.last_size,
-            self.selected_workspace_name.as_deref(),
             self.selected_user_name.as_deref(),
         );
     }
@@ -1002,7 +1001,10 @@ impl Dashboard {
                 users::UsersMessage::UpdateWorkspace(sender, ws)
                     if self.selected_user_name.as_deref() == Some(sender.as_str()) =>
                 {
-                    intercept_task = Some(self.select_workspace(ws));
+                    // The picker's own DB write (below, via settings_state.update)
+                    // already persisted the active user's selection — only move
+                    // the sidebar.
+                    intercept_task = Some(self.apply_workspace_selection(ws));
                 }
                 // An active-role change in Settings leaves the
                 // Dashboard's cached role/pool stale (composer role dropdown
@@ -1216,8 +1218,10 @@ impl Dashboard {
                 // Intercept RequestWorkspaceChange: the Home page detected
                 // that the selected user's DB workspace differs from the
                 // sidebar selection.  Perform a Dashboard-level workspace
-                // switch so the sidebar, saved state, and all pages stay
-                // consistent.
+                // switch so the sidebar and all pages stay consistent; the
+                // switch also writes the same value back to the user's
+                // `users.selected_workspace` (idempotent — it is the value
+                // just read from the DB).
                 if let home::HomeMessage::RequestWorkspaceChange(ref name) = msg {
                     return self.select_workspace(name);
                 }
@@ -1546,12 +1550,10 @@ impl Dashboard {
         Task::batch([close_board, diff_task])
     }
 
-    /// Persist the workspace selection (sidebar state, window-state.json,
-    /// and all page broadcasts). This is the canonical entry point for
-    /// workspace switching throughout the dashboard.
-    ///
-    /// An empty name selects the "Personal" workspace (no shared workspace).
-    fn select_workspace(&mut self, name: &str) -> Task<Message> {
+    /// Apply a workspace selection in memory and broadcast it to all pages,
+    /// without writing the DB. Used where the DB write happened (or happens)
+    /// elsewhere — e.g. the Settings→Users picker for the active user.
+    fn apply_workspace_selection(&mut self, name: &str) -> Task<Message> {
         // Git state is cleared and eagerly refreshed below via
         // propagate_workspace_selection → set_workspace_path.
         self.selected_workspace_name = if name.is_empty() {
@@ -1559,8 +1561,38 @@ impl Dashboard {
         } else {
             Some(name.to_string())
         };
-        self.persist_window_state();
         self.propagate_workspace_selection(name)
+    }
+
+    /// Canonical entry point for workspace switching throughout the dashboard:
+    /// applies the selection in memory and persists it as the impersonated
+    /// user's `users.selected_workspace` (the DB is the single source of truth;
+    /// an empty name selects "Personal" and stores NULL). The DB write is
+    /// best-effort — failures are logged, the GUI selection still applies.
+    ///
+    /// A name missing from the workspace map is never persisted: the
+    /// reverse-sync path can surface a legacy dangling
+    /// `users.selected_workspace` value, and re-asserting it would keep the
+    /// DB dangling. The in-memory selection still applies; a subsequent
+    /// [`Message::WorkspacesReloaded`] re-resolves it to "Personal".
+    fn select_workspace(&mut self, name: &str) -> Task<Message> {
+        let propagate = self.apply_workspace_selection(name);
+        let known = name.is_empty() || self.workspaces.contains_key(name);
+        let db_write = known
+            .then(|| self.selected_user_name.clone())
+            .flatten()
+            .map(|user| {
+                let ws = name.to_string();
+                Task::perform(
+                    async move {
+                        if let Err(e) = users::update_user_field(user.clone(), ws, false).await {
+                            tracing::warn!(error = %e, user = %user, "Failed to persist workspace selection");
+                        }
+                    },
+                    |()| Message::Nop,
+                )
+            });
+        Task::batch(std::iter::once(propagate).chain(db_write))
     }
 
     /// Propagate the global workspace selection to all affected pages.
@@ -3011,15 +3043,13 @@ impl Dashboard {
     }
 }
 
-/// Persisted window geometry.
+/// Persisted window geometry and selected user.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WindowState {
     pub width: f32,
     pub height: f32,
     pub x: i32,
     pub y: i32,
-    #[serde(default)]
-    pub selected_workspace: Option<String>,
     #[serde(default)]
     pub selected_user: Option<String>,
 }
@@ -3040,7 +3070,6 @@ impl Default for WindowState {
             height: 800.0,
             x: -1,
             y: -1,
-            selected_workspace: None,
             selected_user: None,
         }
     }
@@ -3060,23 +3089,15 @@ pub fn read_window_state() -> WindowState {
         .unwrap_or_default()
 }
 
-/// Save current window geometry and last-used workspace to `~/.mahbot/window-state.json`.
+/// Save current window geometry and selected user to `~/.mahbot/window-state.json`.
 #[expect(clippy::cast_possible_truncation)]
-fn save_window_state(
-    pos: iced::Point,
-    size: iced::Size,
-    selected_workspace: Option<&str>,
-    selected_user: Option<&str>,
-) {
+fn save_window_state(pos: iced::Point, size: iced::Size, selected_user: Option<&str>) {
     let mut state = serde_json::json!({
         "width": size.width,
         "height": size.height,
         "x": pos.x as i32,
         "y": pos.y as i32,
     });
-    if let Some(ws) = selected_workspace {
-        state["selected_workspace"] = serde_json::Value::String(ws.to_string());
-    }
     if let Some(user) = selected_user {
         state["selected_user"] = serde_json::Value::String(user.to_string());
     }
@@ -3141,13 +3162,26 @@ fn resolve_workspace_selection(
     }
 }
 
-/// Load the full workspace map during boot. Degrades to an empty map on a
-/// read failure (the boot path must complete) — the resolved selection is
-/// preserved rather than wiped. Returns a [`Message::BootWorkspaces`]
-/// ready for use with `Task::perform`.
-async fn load_workspace_options(prev_selection: Option<String>) -> Message {
+/// Load the full workspace map during boot and resolve the selected
+/// workspace from the DB (`users.selected_workspace` for the impersonated
+/// user — the single source of truth). Degrades to the "Personal" default
+/// when no user is selected, the stored value is NULL/personal, the read
+/// fails, or the stored workspace is missing from the map (the boot path
+/// must complete).
+async fn load_workspace_options(user: Option<String>) -> Message {
+    let prev = match user.as_deref() {
+        Some(user) => match crate::users::get_raw_selected_workspace(user).await {
+            Ok(Some(ws)) if !crate::users::is_personal_workspace(&ws) => Some(ws),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, user = %user, "Failed to read selected workspace at boot");
+                None
+            }
+        },
+        None => None,
+    };
     let workspaces = read_workspace_map().await.unwrap_or_default();
-    let restored = resolve_workspace_selection(&workspaces, prev_selection.as_deref());
+    let restored = resolve_workspace_selection(&workspaces, prev.as_deref());
     Message::BootWorkspaces(workspaces, restored)
 }
 
@@ -3273,7 +3307,7 @@ mod tests {
     fn workspaces_reloaded_preserves_boot_restored_selection() {
         // Models the exact boot race: a CDC baseline reload was triggered while
         // the selection was still None, but lands after `finish_boot` applied
-        // the persisted selection ("mahbot"). Re-resolving from the live
+        // the DB-restored selection ("mahbot"). Re-resolving from the live
         // selection keeps it instead of wiping it to Personal.
         let mut dash = ready_dashboard();
         dash.selected_workspace_name = Some("mahbot".to_string());
@@ -3326,5 +3360,61 @@ mod tests {
             (options[2].value.as_str(), options[2].label.as_str()),
             ("beta", "beta")
         );
+    }
+
+    /// The DB-sourced boot resolution: a shared stored workspace present in
+    /// the map is restored; personal, stale, and NULL stored values (and no
+    /// user at all) all resolve to the "Personal" default.
+    #[tokio::test]
+    async fn boot_workspace_options_resolve_from_db() {
+        crate::util::test::init_test_stores().await;
+        crate::workspace::store()
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO workspaces (name, path, created_at, updated_at) \
+                 VALUES ('boot_ws_gui', '/p/boot_ws_gui', '2026-01-01T00:00:00+00:00', \
+                         '2026-01-01T00:00:00+00:00')",
+                crate::db::params![],
+            )
+            .await
+            .expect("seed workspace");
+        for (name, selected) in [
+            ("boot_alice_gui", Some("boot_ws_gui")),
+            ("boot_bob_gui", Some("personal:bob_gui")),
+            ("boot_carol_gui", Some("gone_ws_gui")),
+            ("boot_dave_gui", None),
+        ] {
+            crate::users::store()
+                .conn
+                .execute(
+                    "INSERT OR IGNORE INTO users (name, selected_workspace) VALUES (?1, ?2)",
+                    crate::db::params![name, selected],
+                )
+                .await
+                .expect("seed user");
+        }
+
+        let Message::BootWorkspaces(map, restored) =
+            load_workspace_options(Some("boot_alice_gui".to_string())).await
+        else {
+            panic!("expected BootWorkspaces");
+        };
+        assert!(map.contains_key("boot_ws_gui"));
+        assert_eq!(restored, "boot_ws_gui");
+
+        for (user, why) in [
+            (Some("boot_bob_gui".to_string()), "personal stored value"),
+            (
+                Some("boot_carol_gui".to_string()),
+                "stored value missing from the map",
+            ),
+            (Some("boot_dave_gui".to_string()), "NULL stored value"),
+            (None, "no user selected"),
+        ] {
+            let Message::BootWorkspaces(_, restored) = load_workspace_options(user).await else {
+                panic!("expected BootWorkspaces");
+            };
+            assert_eq!(restored, "", "{why} must resolve to the Personal default");
+        }
     }
 }

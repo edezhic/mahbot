@@ -1,7 +1,7 @@
 //! Home page — native GUI chat interface with user impersonation.
 //!
 //! Users pick an identity from the user picker, select a workspace via the
-//! Dashboard sidebar/global picker, and chat with MahBot agents in real time
+//! Dashboard workspace picker, and chat with MahBot agents in real time
 //! with full markdown rendering and typing indicators.
 
 use crate::ChatDirection;
@@ -124,7 +124,7 @@ fn align_bubble<'a>(
 pub enum HomeMessage {
     /// User selected (from picker, Users page icon, or auto-selected at boot).
     UserSelected(String),
-    /// Workspace changed (from global picker — propagated via Dashboard).
+    /// Workspace changed (from Dashboard workspace picker — propagated via Dashboard).
     WorkspaceChanged(Option<String>),
     /// Text editor content changed.
     InputChanged(super::editor_widget::EditorAction),
@@ -213,8 +213,9 @@ pub enum HomeMessage {
 pub struct HomeState {
     /// Currently selected user (sender identifier).
     pub(crate) selected_user: Option<String>,
-    /// Currently selected workspace name (synced from dashboard sidebar).
-    /// Empty string `""` means the "Personal" workspace — must be resolved
+    /// Currently selected workspace name (synced from Dashboard workspace
+    /// picker, whose selected value is the user's DB record). Empty string
+    /// `""` means the "Personal" workspace — must be resolved
     /// to `personal:<user_name>` before querying chat_history or sessions.
     selected_workspace: Option<String>,
     /// The selected user's DB-stored project workspace (None when unset or
@@ -398,10 +399,9 @@ impl HomeState {
     /// change cascading to [`WorkspaceChanged`] → `refresh_history`);
     /// otherwise it refreshes history directly.
     ///
-    /// NOTE: We deliberately do NOT write the sidebar workspace to the
-    /// impersonated user's DB record.  The GUI sidebar is a per-session
-    /// context — persisting it would silently overwrite the user's real
-    /// workspace choice.
+    /// NOTE: The Dashboard-level switch emitted here writes the same value back
+    /// to the user's DB record via `select_workspace` — idempotent by design,
+    /// since the DB is the single source of truth for the selection.
     async fn resolve_user_workspace_sync(user: String, current_ws: Option<String>) -> HomeMessage {
         match crate::users::get_raw_selected_workspace(&user).await {
             Ok(Some(ws_name)) => {
@@ -1477,13 +1477,9 @@ impl HomeState {
                 self.loading_older = false;
                 Task::done(HomeMessage::Toast(ToastMessage::Error(msg)))
             }
-            HomeMessage::RequestWorkspaceChange(_) => {
-                // This variant is intercepted by the Dashboard and should
-                // never reach Home's update handler.  No-op fallback.
-                Task::none()
-            }
-            HomeMessage::Toast(_) => {
-                // Intercepted by Dashboard.  No-op fallback.
+            HomeMessage::Toast(_) | HomeMessage::RequestWorkspaceChange(_) => {
+                // Intercepted by the Dashboard (Toast → toast stack,
+                // RequestWorkspaceChange → sidebar switch). No-op fallback.
                 Task::none()
             }
             HomeMessage::LinkClicked(url) => {

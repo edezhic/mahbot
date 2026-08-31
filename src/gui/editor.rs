@@ -3,7 +3,7 @@
 //!
 //! Layout: split view of a fixed-width file tree (left) and a tabbed editor
 //! (right, filling the remaining width). Workspace selection is handled by
-//! the Dashboard sidebar/global picker. Tabs persist to the workspace
+//! the Dashboard workspace picker. Tabs persist to the workspace
 //! database and are restored on workspace selection.
 //! Key bindings: Ctrl+S/Cmd+S to save, Tab/Shift+Tab for indent/outdent,
 //! Ctrl+B for tree focus toggle.
@@ -403,7 +403,7 @@ pub struct SavedTabData {
 
 #[derive(Debug, Clone)]
 pub enum EditorMessage {
-    /// Workspace selected via the Dashboard sidebar/global picker (name,
+    /// Workspace selected via the Dashboard workspace picker (name,
     /// optional filesystem path).
     WorkspaceSelected(String, Option<String>),
     /// A directory's listing was loaded from the filesystem.
@@ -1482,7 +1482,7 @@ async fn run_global_search(
 // ── Editor State ──────────────────────────────────────────────────
 
 pub struct EditorState {
-    /// Currently selected workspace name (set by the Dashboard sidebar/global
+    /// Currently selected workspace name (set by the Dashboard workspace
     /// picker).
     selected_workspace_name: Option<String>,
     /// Filesystem path for the currently selected workspace.

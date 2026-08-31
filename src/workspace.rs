@@ -1039,12 +1039,21 @@ impl WorkspaceStore {
             .await
     }
 
-    /// Delete a workspace by name. Context rows are cascaded automatically.
-    /// The associated search engine is also removed from the in-memory registry.
+    /// Delete a workspace by name. Context rows are cascaded automatically, and
+    /// any `users.selected_workspace` referencing the deleted workspace is
+    /// cleared (NULL = personal workspace) in the same transaction so the DB
+    /// never holds a dangling selection. The associated search engine is also
+    /// removed from the in-memory registry.
     pub async fn delete(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM workspaces WHERE name = ?1", db::params![name])
+        let tx = self.conn.begin_tx().await?;
+        tx.execute("DELETE FROM workspaces WHERE name = ?1", db::params![name])
             .await?;
+        tx.execute(
+            "UPDATE users SET selected_workspace = NULL WHERE selected_workspace = ?1",
+            db::params![name],
+        )
+        .await?;
+        tx.commit().await?;
         crate::search_engine::remove_engine(name);
         clear_pending_pickup_cooldown(name);
         Ok(())
@@ -2936,6 +2945,71 @@ mod tests {
             crate::db::parse_utc_timestamp(&healed).is_ok(),
             "pass-start write must self-heal the stored value",
         );
+    }
+
+    // ── delete — dangling user-selection cleanup ──────────────
+
+    #[tokio::test]
+    async fn delete_clears_dangling_user_workspace_references() {
+        let (store, _tmp) = test_store().await;
+        // delete() removes the workspace's search engine from the global
+        // registry (init_global is idempotent).
+        crate::search_engine::init_global();
+        insert_direct(&store, "doomed_ws", "/tmp/doomed_ws", false, false, 0, 0).await;
+
+        // Seed users via raw SQL: two reference the workspace being deleted,
+        // one references an unrelated workspace, and one has no selection.
+        for (name, ws) in [
+            ("alice", Some("doomed_ws")),
+            ("bob", Some("doomed_ws")),
+            ("carol", Some("other_ws")),
+            ("dave", None),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO users (name, selected_workspace) VALUES (?1, ?2)",
+                    crate::db::params![name, ws],
+                )
+                .await
+                .expect("seed user");
+        }
+
+        store.delete("doomed_ws").await.expect("delete workspace");
+
+        // The workspace row is gone.
+        assert!(
+            store.get_by_name("doomed_ws").await.unwrap().is_none(),
+            "the workspace row must be deleted"
+        );
+
+        // Referencing users are cleared (NULL = personal workspace).
+        for name in ["alice", "bob"] {
+            let selected = selected_workspace(&store, name).await;
+            assert_eq!(selected, None, "{name}'s selection must be cleared");
+        }
+
+        // Other users are untouched: an unrelated selection is kept and a
+        // user with no selection stays NULL.
+        assert_eq!(
+            selected_workspace(&store, "carol").await.as_deref(),
+            Some("other_ws")
+        );
+        assert_eq!(selected_workspace(&store, "dave").await, None);
+    }
+
+    /// Read a user's `selected_workspace` column (NULL ↔ `None`).
+    async fn selected_workspace(store: &WorkspaceStore, name: &str) -> Option<String> {
+        store
+            .conn
+            .query_optional(
+                "SELECT selected_workspace FROM users WHERE name = ?1",
+                crate::db::params![name],
+                |row| row.get::<Option<String>>(0),
+            )
+            .await
+            .expect("query user workspace")
+            .flatten()
     }
 
     // ── has_new_commits — commit comparison tests ────────────────

@@ -153,7 +153,7 @@ pub struct BoardState {
     description_md: Option<Vec<markdown::Item>>,
     /// Cached parsed markdown for comments (re-parsed when ticket changes).
     comments_md: Vec<(usize, Vec<markdown::Item>)>,
-    /// Current workspace name filter (set by global picker).
+    /// Current workspace name filter (set by the Dashboard workspace picker).
     pub(crate) workspace_name: Option<String>,
     /// Bumped on every workspace selection / baseline refresh. The
     /// [`BoardMessage::Refreshed`] handler drops a stale snapshot whose
