@@ -455,8 +455,8 @@ impl Tool for ResearchTool {
                     // boot's resume (the result and artifacts arrive at the
                     // real terminalization); a manual cancel removes the run
                     // permanently (rows + folder + archive swept). The
-                    // distinction is logged by dispatch_durable_research
-                    // itself — never a "resumes at boot" message here.
+                    // distinction is logged by the dispatch path/terminalization
+                    // tail itself — never a "resumes at boot" message here.
                     tracing::info!(
                         "Research run ended without delivery (aborted or manually cancelled)"
                     );
@@ -565,70 +565,23 @@ async fn dispatch_durable_research(
         }
         ResearchExit::Terminal(result) => result,
     };
-    // Manual-cancel gate: a cancel that landed after the orchestrator's last
-    // boundary check (mid-terminalization) must not write artifacts, complete
-    // the job, dispatch cleanup, or route anything.
-    if crate::research_cancel::is_cancelled(&job_id) {
-        tracing::info!(
-            job = %job_id,
-            "Research run cancelled during terminalization — permanent stop"
-        );
-        let _ = crate::research_cancel::sweep_cancelled_run(&job_id).await;
-        return None;
-    }
-    // Terminalization artifacts BEFORE the exactly-once boundary, only for
-    // runs that actually started (a spawn failure has no state to archive).
-    // The aborted flag (not the global shutdown state) already gated aborts
-    // above: shutdown firing in the window after a fully successful run
-    // returned must not skip the artifacts.
-    if spawned {
-        let state = ResearchState::load(&job_id).await;
-        let delivered = build_async_research_message(&result);
-        write_terminalization_artifacts(&job_id, question, &delivered, &state).await;
-    }
-    let envelope = crate::jobs::complete_durable_job(
+    terminalize_research(
         &job_id,
-        build_async_research_message(&result),
-        MessageKind::ResearchResult,
+        ws,
+        &result,
         caller_role,
+        question,
         &user_name,
         &channel,
-        &ws.name,
+        spawned,
     )
-    .await;
-    // Defensive post-completion gate: the in-tx cancel gate in
-    // complete_job_with_envelope rolled the completion back when the cancel
-    // fired mid-tx — never route the report or dispatch the cleanup. The
-    // sweep (this path or the cancel action's) removes any surviving rows.
-    if crate::research_cancel::is_cancelled(&job_id) {
-        tracing::info!(
-            job = %job_id,
-            "Research completion suppressed by manual cancel — not routed"
-        );
-        let _ = crate::research_cancel::sweep_cancelled_run(&job_id).await;
-        return None;
-    }
-    // Cleanup dispatch AFTER the exactly-once boundary: the cleanup jobs row
-    // reuses id == run_id (the folder name) as the durability marker that
-    // holds the folder until the cleanup completes, so it must be spawned
-    // only after complete_durable_job freed that id (a wrongly-ordered row
-    // would be deleted by the completion DELETE).
-    if spawned
-        && let Err(e) =
-            crate::research_cleanup::dispatch_research_cleanup(&job_id, question, ws).await
-    {
-        tracing::warn!(
-            job = %job_id,
-            error = %e,
-            "Research cleanup dispatch failed — run folder left for the OS temp sweep"
-        );
-    }
-    Some(envelope)
+    .await
 }
 
 /// Real-terminalization artifacts (results.md + the command dump), written
-/// BEFORE the exactly-once terminalizing boundary at exactly two points:
-/// fresh dispatch and boot resume. Shutdown/drain
+/// BEFORE the exactly-once terminalizing boundary. Called from exactly one
+/// point — the shared [`terminalize_research`] tail, which serves both fresh
+/// dispatch and boot resume. Shutdown/drain
 /// aborts and panics write nothing (the run stays alive for the next boot —
 /// both the fresh-dispatch and resume paths now leave the job row 'launched'
 /// on abort, so boot-recovery re-enters and terminalizes for real). A dump
@@ -636,7 +589,8 @@ async fn dispatch_durable_research(
 ///
 /// The Sanitation cleanup is NOT dispatched here — it runs after
 /// `complete_durable_job` (the cleanup jobs row reuses id == run_id, so the
-/// completion DELETE must have run first). Callers dispatch it in the tail.
+/// completion DELETE must have run first); the [`terminalize_research`] tail
+/// dispatches it.
 async fn write_terminalization_artifacts(
     job_id: &str,
     question: &str,
@@ -648,55 +602,83 @@ async fn write_terminalization_artifacts(
     crate::research_cleanup::write_command_dump(&run_root, &state.commands).await;
 }
 
-/// Real-terminalization tail: artifacts (results.md + command dump) written
-/// BEFORE the exactly-once boundary, then durable completion, cleanup
-/// dispatch, and routing to the stored caller (in that order — matching the
-/// fresh-dispatch path: the envelope is never routed before the cleanup row
-/// exists). Callers pass their already-loaded state.
+/// Real-terminalization tail shared by fresh dispatch and boot resume:
+/// artifacts (results.md + command dump) written BEFORE the exactly-once
+/// boundary, then durable completion and cleanup dispatch (in that order —
+/// the cleanup jobs row reuses id == run_id, so the completion DELETE must
+/// free it before the cleanup row is spawned). Returns `Some(envelope)` on a
+/// real terminalization — the envelope is the completion helper's own copy
+/// (`pending_job_id` set by the tx, so persisted and routed copies cannot
+/// drift). Returns `None` on a manual cancel (the run is swept permanently).
+/// The caller routes the returned envelope (fresh: via
+/// [`ResearchTool::execute`]; resume: directly), so routing always happens
+/// after the cleanup row exists.
+#[expect(clippy::too_many_arguments)]
 async fn terminalize_research(
     job_id: &str,
     ws: &Workspace,
     result: &anyhow::Result<String>,
-    state: &ResearchState,
     caller_role: Role,
-    caller: &crate::jobs::JobCaller,
-) {
-    // Manual-cancel gate BEFORE any artifact is written: a cancelled run must
-    // not produce a results.md archive or a command dump (a racing write is
-    // deleted by the cancel sweep — the bounded race documented there).
+    question: &str,
+    user_name: &str,
+    channel: &str,
+    spawned: bool,
+) -> Option<AgentJob> {
+    // Manual-cancel gate BEFORE any artifact is written: a cancel that landed
+    // after the orchestrator's last boundary check (mid-terminalization) must
+    // not write artifacts, complete the job, dispatch cleanup, or route
+    // anything (a racing write is deleted by the cancel sweep — the bounded
+    // race documented there).
     if crate::research_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research terminalization suppressed by manual cancel");
         let _ = crate::research_cancel::sweep_cancelled_run(job_id).await;
-        return;
+        return None;
     }
     let delivered = build_async_research_message(result);
-    write_terminalization_artifacts(job_id, &caller.task, &delivered, state).await;
+    // Terminalization artifacts BEFORE the exactly-once boundary, only for
+    // runs that actually started (a spawn failure has no state to archive).
+    // The aborted flag (not the global shutdown state) already gated aborts
+    // above: shutdown firing in the window after a fully successful run
+    // returned must not skip the artifacts.
+    if spawned {
+        let state = ResearchState::load(job_id).await;
+        write_terminalization_artifacts(job_id, question, &delivered, &state).await;
+    }
     // Complete BEFORE the cleanup dispatch (the cleanup jobs row reuses
     // id == run_id; the completion DELETE must free it first) and BEFORE the
     // route: a crash between complete and cleanup dispatch leaves the
     // envelope pending, and boot replay recreates the cleanup row while the
     // run folder still exists — closing the durability hole where the
-    // envelope was routed before the cleanup row was created.
+    // envelope was routed before the cleanup row was created. UNCONDITIONAL
+    // (never gated on `spawned`): a failed spawn relies on this completion
+    // to deliver its error envelope.
     let envelope = crate::jobs::complete_durable_job(
         job_id,
         delivered,
         MessageKind::ResearchResult,
         caller_role,
-        &caller.user_name,
-        &caller.channel,
+        user_name,
+        channel,
         &ws.name,
     )
     .await;
-    // Post-completion gate: the in-tx cancel gate rolled the completion back
-    // when the cancel fired mid-tx — never route the report and never
-    // dispatch the cleanup for a cancelled run.
+    // Defensive post-completion gate: the in-tx cancel gate in
+    // complete_job_with_envelope rolled the completion back when the cancel
+    // fired mid-tx — never route the report or dispatch the cleanup. The
+    // sweep (this path or the cancel action's) removes any surviving rows.
     if crate::research_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research completion suppressed by manual cancel — not routed");
         let _ = crate::research_cancel::sweep_cancelled_run(job_id).await;
-        return;
+        return None;
     }
-    if let Err(e) =
-        crate::research_cleanup::dispatch_research_cleanup(job_id, &caller.task, ws).await
+    // Cleanup dispatch AFTER the exactly-once boundary: the cleanup jobs row
+    // reuses id == run_id (the folder name) as the durability marker that
+    // holds the folder until the cleanup completes, so it must be spawned
+    // only after complete_durable_job freed that id (a wrongly-ordered row
+    // would be deleted by the completion DELETE).
+    if spawned
+        && let Err(e) =
+            crate::research_cleanup::dispatch_research_cleanup(job_id, question, ws).await
     {
         tracing::warn!(
             job = %job_id,
@@ -704,7 +686,7 @@ async fn terminalize_research(
             "Research cleanup dispatch failed — run folder left for the OS temp sweep"
         );
     }
-    crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+    Some(envelope)
 }
 
 /// Boot resume of a research run: re-enter the orchestrator at the
@@ -745,15 +727,23 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
         }
         ResearchExit::Terminal(result) => result,
     };
-    // Manual-cancel gate: a cancel that landed after the orchestrator's last
-    // boundary check must not terminalize.
-    if crate::research_cancel::is_cancelled(job_id) {
-        tracing::info!(job = %job_id, "Research resume cancelled during terminalization — permanent stop");
-        let _ = crate::research_cancel::sweep_cancelled_run(job_id).await;
+    // Terminalize exactly like a fresh dispatch, then route here — the
+    // resume path has no execute() wrapper to route for it.
+    let Some(envelope) = terminalize_research(
+        job_id,
+        ws,
+        &result,
+        caller_role,
+        &caller.task,
+        &caller.user_name,
+        &caller.channel,
+        true,
+    )
+    .await
+    else {
         return;
-    }
-    let state = ResearchState::load(job_id).await;
-    terminalize_research(job_id, ws, &result, &state, caller_role, &caller).await;
+    };
+    crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
 /// Build the `<research-result>` envelope message for the async research
@@ -3723,6 +3713,53 @@ mod tests {
             envelope.content.contains("final synthesized report"),
             "the resume envelope must carry the synthesized report: {envelope_json}"
         );
+    }
+
+    /// Spawn-failure terminalization: when the spawn tx failed (no jobs row
+    /// exists), the shared tail must STILL complete the durable job so the
+    /// error envelope is delivered (never a silent drop), and must write no
+    /// artifacts (there is no run state to archive, and no cleanup
+    /// durability row is created). The pending row is NOT asserted on: the
+    /// completion INSERT succeeds even with no jobs row (a 0-row DELETE is
+    /// not an error, so the tx commits and the pending row persists).
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn terminalization_spawn_failure_delivers_error_envelope_without_artifacts() {
+        let _lock = crate::util::test::retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/test_ws_research_spawn_fail");
+        let envelope = terminalize_research(
+            "research_job_spawn_fail_1",
+            &ws,
+            &Err(anyhow::anyhow!("spawn failed")),
+            crate::Role::Assistant,
+            "question?",
+            "caller-user",
+            "telegram",
+            false,
+        )
+        .await
+        .expect("spawn failure still delivers an error envelope");
+        assert!(
+            envelope.content.contains("An error occurred: spawn failed"),
+            "{}",
+            envelope.content
+        );
+        let conn = &crate::session::store().conn;
+        let jobs = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::db::params!["research_job_spawn_fail_1"],
+            )
+            .await
+            .unwrap();
+        assert!(
+            jobs.is_empty(),
+            "no cleanup durability row without a spawned run"
+        );
+        let archive =
+            crate::research_cleanup::results_archive_path("research_job_spawn_fail_1").unwrap();
+        assert!(!archive.exists(), "spawn failure must not write results.md");
     }
 
     /// A fired manual-cancel signal must stop the orchestrator at its next

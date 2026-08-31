@@ -168,16 +168,9 @@ pub(crate) async fn sweep_cancelled_run(job_id: &str) -> Result<(), String> {
 /// envelope-race class — the file is never routed to any session); the
 /// terminalize gates keep that window to a single racing write.
 async fn delete_results_archive(job_id: &str) {
-    let root = crate::config::CONFIG
-        .try_storage_root()
-        .or_else(|| crate::config::default_config_dir().ok());
-    let Some(root) = root else {
+    let Some(path) = crate::research_cleanup::results_archive_path(job_id) else {
         return;
     };
-    let path = root
-        .join("research")
-        .join("results")
-        .join(format!("{job_id}.md"));
     match tokio::fs::remove_file(&path).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -252,14 +245,7 @@ mod tests {
         tokio::fs::write(run_root.join("commands.dump"), "shell cmd")
             .await
             .unwrap();
-        let root = crate::config::CONFIG
-            .try_storage_root()
-            .or_else(|| crate::config::default_config_dir().ok())
-            .unwrap();
-        let archive = root
-            .join("research")
-            .join("results")
-            .join(format!("{job_id}.md"));
+        let archive = crate::research_cleanup::results_archive_path(job_id).unwrap();
         tokio::fs::create_dir_all(archive.parent().unwrap())
             .await
             .unwrap();
@@ -318,14 +304,7 @@ mod tests {
         .await
         .unwrap();
         let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        let root = crate::config::CONFIG
-            .try_storage_root()
-            .or_else(|| crate::config::default_config_dir().ok())
-            .unwrap();
-        let archive = root
-            .join("research")
-            .join("results")
-            .join(format!("{job_id}.md"));
+        let archive = crate::research_cleanup::results_archive_path(job_id).unwrap();
         tokio::fs::create_dir_all(archive.parent().unwrap())
             .await
             .unwrap();

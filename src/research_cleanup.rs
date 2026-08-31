@@ -139,22 +139,35 @@ pub(crate) async fn release_run_folder(job_id: &str) {
 
 // ── Results archive (results.md) ──────────────────────────────────────────
 
-/// Write the run's archived result to `<storage_root>/research/results/{run_id}.md`
+/// Shared results-archive location `<storage_root>/research/results/{job_id}.md`.
+/// The writer and the cancel sweep must agree on it, or a cancel would delete
+/// the wrong file (or nothing).
+pub(crate) fn results_archive_path(job_id: &str) -> Option<PathBuf> {
+    let root = config::CONFIG
+        .try_storage_root()
+        .or_else(|| config::default_config_dir().ok());
+    Some(
+        root?
+            .join("research")
+            .join("results")
+            .join(format!("{job_id}.md")),
+    )
+}
+
+/// Write the run's archived result to the shared results-archive location
 /// (question + delivered result, including partial terminalizations).
 /// Overwrites idempotently on resume; a failed write is fail-open (the
 /// terminalization is never blocked on the archive). The storage root comes
 /// from CONFIG when set (test stores point it at a temp dir — no test writes
 /// into the real `~/.mahbot`), falling back to the default config dir.
 pub(crate) async fn write_results_md(job_id: &str, question: &str, result: &str) {
-    let root = config::CONFIG
-        .try_storage_root()
-        .or_else(|| config::default_config_dir().ok());
-    let Some(root) = root else {
+    let Some(path) = results_archive_path(job_id) else {
         tracing::warn!(job = %job_id, "results.md skipped — no config dir");
         return;
     };
-    let dir = root.join("research").join("results");
-    let path = dir.join(format!("{job_id}.md"));
+    let dir = path
+        .parent()
+        .expect("archive path always ends in a file name");
     let content =
         format!("# Research {job_id}\n\n## Question\n\n{question}\n\n## Result\n\n{result}\n");
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
@@ -464,8 +477,8 @@ pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Resu
 
 /// Dispatch the Sanitation-role cleanup agent for a terminalized research run.
 ///
-/// Called at terminalization (all three terminalization points funnel through
-/// the terminalize_research / write_terminalization_artifacts tail). The
+/// Called at terminalization (all terminalization funnels through the
+/// terminalize_research tail). The
 /// cleanup runs FIRE-AND-FORGET (result delivery is never delayed); the run
 /// folder is held by the durable `research_cleanup` jobs row (id == run_id —
 /// the folder name) until the cleanup completes. Dispatch is UNCONDITIONAL:
