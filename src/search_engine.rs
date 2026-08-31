@@ -33,7 +33,6 @@
 //! yields zero files is not an error — the live watcher populates the index
 //! incrementally as files appear.
 
-use crate::Workspace;
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 use fff_search::file_picker::{FFFMode, FilePickerOptions};
@@ -302,19 +301,6 @@ pub(crate) async fn resolve_engine(
 pub(crate) fn get_engine_by_name(name: &str) -> Option<Arc<SearchEngineEntry>> {
     let reg = REGISTRY.get()?.read().ok()?;
     reg.get(name).cloned()
-}
-
-/// Get a workspace's search engine entry without creating one.
-///
-/// Unlike [`get_or_init_engine`], this returns `None` if the engine hasn't
-/// been created yet (no searches have occurred in this workspace), or if the
-/// global registry hasn't been initialized yet (during early bootstrap or in
-/// tests that don't set up the search engine). Used by tools that want to
-/// update the search index after file writes without triggering engine
-/// creation as a side effect.
-#[must_use]
-pub(crate) fn get_engine_if_exists(ws: &Workspace) -> Option<Arc<SearchEngineEntry>> {
-    get_engine_by_name(&ws.name)
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────

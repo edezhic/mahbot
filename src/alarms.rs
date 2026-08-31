@@ -28,17 +28,14 @@ crate::columns! {
         USER_NAME        => "user_name",
         KIND             => "kind",
         TEXT             => "text",
-        FIRE_AT          => "fire_at",
         INTERVAL_SECONDS => "interval_seconds",
         NEXT_FIRE_AT     => "next_fire_at",
-        STATUS           => "status",
-        CREATED_AT       => "created_at",
     }
 }
 
 /// A single alarm/reminder row.
 #[derive(Debug, Clone)]
-pub struct Alarm {
+pub(crate) struct Alarm {
     pub id: String,
     pub session_id: String,
     /// The raw (un-escaped) user the alarm belongs to.
@@ -46,15 +43,10 @@ pub struct Alarm {
     /// `"one-shot"` or `"periodic"`.
     pub kind: String,
     pub text: String,
-    /// RFC3339 UTC absolute fire time — one-shot only.
-    pub fire_at: Option<String>,
     /// Periodic interval in seconds.
     pub interval_seconds: Option<i64>,
     /// RFC3339 UTC next fire time.
     pub next_fire_at: String,
-    /// `"active"`, `"fired"`, or `"removed"`.
-    pub status: String,
-    pub created_at: String,
 }
 
 fn alarm_from_row(row: &db::Row) -> Result<Alarm, ::turso::Error> {
@@ -64,11 +56,8 @@ fn alarm_from_row(row: &db::Row) -> Result<Alarm, ::turso::Error> {
         user_name: row.get(COL_ALARM_USER_NAME)?,
         kind: row.get(COL_ALARM_KIND)?,
         text: row.get(COL_ALARM_TEXT)?,
-        fire_at: row.get(COL_ALARM_FIRE_AT)?,
         interval_seconds: row.get(COL_ALARM_INTERVAL_SECONDS)?,
         next_fire_at: row.get(COL_ALARM_NEXT_FIRE_AT)?,
-        status: row.get(COL_ALARM_STATUS)?,
-        created_at: row.get(COL_ALARM_CREATED_AT)?,
     })
 }
 
@@ -186,11 +175,8 @@ pub(crate) async fn add_alarm(
         user_name: user_name.to_string(),
         kind: kind.to_string(),
         text: text.to_string(),
-        fire_at: normalized_fire_at,
         interval_seconds: interval_secs,
         next_fire_at,
-        status: "active".to_string(),
-        created_at,
     })
 }
 

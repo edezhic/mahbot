@@ -62,13 +62,6 @@ pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
 /// fusion less sensitive to score-scale differences across ranking sources.
 pub(crate) const RRF_K: f32 = 60.0;
 
-/// A scored result for hybrid merging
-#[derive(Debug, Clone)]
-pub struct ScoredResult {
-    pub id: String,
-    pub final_score: f32,
-}
-
 /// Apply RRF scoring to a ranked list and accumulate into `scores`.
 ///
 /// Encapsulates the rank-to-reciprocal-score mapping so it can be applied
@@ -90,34 +83,27 @@ fn accumulate_rrf(scores: &mut HashMap<String, f32>, mut results: Vec<(String, f
 /// score `1 / (K + rank)` that is summed across sources. Items appearing in both
 /// sources receive additive contributions, naturally boosting their final rank.
 ///
-/// Results are sorted by final score descending, with deterministic tiebreaking
-/// by ID (lexicographic order).
+/// Results are sorted by RRF score descending, with deterministic tiebreaking
+/// by id (lexicographic order).
 #[must_use]
 pub(crate) fn hybrid_merge(
     vector_results: Vec<(String, f32)>,  // (id, cosine_similarity)
     keyword_results: Vec<(String, f32)>, // (id, bm25_score)
-) -> Vec<ScoredResult> {
+) -> Vec<String> {
     let mut rrf_scores: HashMap<String, f32> = HashMap::new();
 
     accumulate_rrf(&mut rrf_scores, vector_results);
     accumulate_rrf(&mut rrf_scores, keyword_results);
 
-    // Build results sorted by final score descending
-    let mut results: Vec<ScoredResult> = rrf_scores
-        .into_iter()
-        .map(|(id, score)| ScoredResult {
-            id,
-            final_score: score,
-        })
-        .collect();
-
+    // Collect into (id, score) pairs, sorted by score descending,
+    // with deterministic tiebreaking by id (lexicographic order).
+    let mut results: Vec<(String, f32)> = rrf_scores.into_iter().collect();
     results.sort_by(|a, b| {
-        b.final_score
-            .partial_cmp(&a.final_score)
+        b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.0.cmp(&b.0))
     });
-    results
+    results.into_iter().map(|(id, _)| id).collect()
 }
 
 #[cfg(test)]
@@ -223,7 +209,7 @@ mod tests {
             );
             if let Some(first) = case.expected_first {
                 assert!(!merged.is_empty(), "case: {}", case.name);
-                assert_eq!(merged[0].id, first, "case: {}", case.name);
+                assert_eq!(merged[0], first, "case: {}", case.name);
             }
         }
     }

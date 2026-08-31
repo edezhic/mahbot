@@ -221,7 +221,7 @@ impl EditTool {
 /// exhausted), we log a warning but don't fail — the background watcher
 /// will eventually trigger a full rescan.
 fn update_search_index_after_write(ws: &Workspace, file_path: &std::path::Path) {
-    let Some(entry) = crate::search_engine::get_engine_if_exists(ws) else {
+    let Some(entry) = crate::search_engine::get_engine_by_name(&ws.name) else {
         return;
     };
 

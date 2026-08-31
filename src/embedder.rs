@@ -313,13 +313,8 @@ async fn download_retry_loop() {
 
         // ── Phase 2: Download missing files ──
         let (model_result, tokenizer_result) = tokio::join!(
-            maybe_download(&client, MODEL_URL, &model_dest, Some(MODEL_SHA256)),
-            maybe_download(
-                &client,
-                TOKENIZER_URL,
-                &tokenizer_dest,
-                Some(TOKENIZER_SHA256)
-            ),
+            maybe_download(&client, MODEL_URL, &model_dest, MODEL_SHA256),
+            maybe_download(&client, TOKENIZER_URL, &tokenizer_dest, TOKENIZER_SHA256),
         );
 
         let model_ok = model_result.is_ok();
@@ -386,28 +381,18 @@ async fn maybe_download(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
-    expected_sha256: Option<&str>,
+    expected_sha256: &str,
 ) -> Result<()> {
     // Skip download if the file already exists (from a previous partial success).
     if dest.exists() {
         return Ok(());
     }
-    download_file(client, url, dest, expected_sha256).await
-}
-
-/// Download a single file with atomic write and size verification.
-async fn download_file(
-    client: &reqwest::Client,
-    url: &str,
-    dest: &Path,
-    expected_sha256: Option<&str>,
-) -> Result<()> {
     let mut size = 0u64;
     crate::util::http::download_verified(
         client,
         url,
         dest,
-        expected_sha256.unwrap_or(""),
+        expected_sha256,
         None,
         crate::util::http::DownloadSizeCheck::Exact,
         |downloaded, _| size = downloaded,

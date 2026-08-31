@@ -166,35 +166,6 @@ impl UserStore {
         Ok(!rows.is_empty())
     }
 
-    /// Find the first user whose channel binding for `channel` has a
-    /// `reply_target` matching `target` (exact, or `target:thread`). Used for
-    /// reverse lookup of the recipient of an outbound message — first match
-    /// wins when multiple users share a chat (group chats).
-    pub async fn resolve_user_by_reply_target(
-        &self,
-        channel: &str,
-        target: &str,
-    ) -> Result<Option<String>> {
-        let rows = self
-            .conn
-            .query(
-                "SELECT user_name, reply_target FROM user_channels WHERE channel = ?1",
-                db::params![channel],
-            )
-            .await?;
-        let thread_prefix = format!("{target}:");
-        for row in rows {
-            let user_name: String = row.get(0)?;
-            let reply_target: Option<String> = row.get(1)?;
-            if let Some(t) = reply_target
-                && (t == target || t.starts_with(&thread_prefix))
-            {
-                return Ok(Some(user_name));
-            }
-        }
-        Ok(None)
-    }
-
     // ── Channel bindings ──────────────────────────────────────
 
     /// Bind a channel to a user. `channel` is e.g. `"telegram"`, `identifier`
@@ -441,7 +412,7 @@ impl UserRecord {
 
 /// Whether a permissions value grants admin rights (`"full"`).
 #[must_use]
-pub fn is_admin_permissions(permissions: Option<&str>) -> bool {
+fn is_admin_permissions(permissions: Option<&str>) -> bool {
     permissions == Some("full")
 }
 
@@ -449,7 +420,7 @@ pub fn is_admin_permissions(permissions: Option<&str>) -> bool {
 /// table). Full-permissions (admin) users get the onboarding pool; all other
 /// users are limited to the personal assistant roles.
 #[must_use]
-pub fn role_pool_for_permissions(permissions: Option<&str>) -> Vec<Role> {
+fn role_pool_for_permissions(permissions: Option<&str>) -> Vec<Role> {
     if is_admin_permissions(permissions) {
         vec![Role::Support, Role::Assistant, Role::Manager, Role::Artist]
     } else {
@@ -572,7 +543,7 @@ pub async fn get_raw_selected_workspace(user_name: &str) -> Result<Option<String
 /// If `selected_workspace` is set, looks up from the `workspaces` table.
 /// If NULL, constructs a personal workspace from the user's name
 /// (path: `~/.mahbot/userspaces/<user_name>/`).
-pub async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
+async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
     let s = store();
     let selected = s.get_selected_workspace_name(user_name).await?;
     if let Some(ws_name) = selected {
@@ -616,7 +587,7 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
 /// Build a `Workspace` struct for a personal workspace.
 /// Has no diagnostics, no maintenance, no discovery — minimal defaults.
 #[must_use]
-pub fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
+fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
     let mut ws = Workspace::from_path(path);
     ws.name = personal_workspace_name(user_name);
     ws.status = WorkspaceStatus::Ready;
@@ -833,8 +804,25 @@ pub async fn resolve_user_by_channel(channel: &str, identifier: &str) -> Option<
 pub async fn resolve_user_by_reply_target(channel: &str, target: &str) -> Option<String> {
     let store = USER_STORE.get()?;
     store
-        .resolve_user_by_reply_target(channel, target)
+        .conn
+        .query(
+            "SELECT user_name, reply_target FROM user_channels WHERE channel = ?1",
+            db::params![channel],
+        )
         .await
+        .and_then(|rows| {
+            let thread_prefix = format!("{target}:");
+            for row in rows {
+                let user_name: String = row.get(0)?;
+                let reply_target: Option<String> = row.get(1)?;
+                if let Some(t) = reply_target
+                    && (t == target || t.starts_with(&thread_prefix))
+                {
+                    return Ok(Some(user_name));
+                }
+            }
+            Ok(None)
+        })
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, ?channel, ?target, "Failed to resolve user by reply target");
             None

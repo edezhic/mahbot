@@ -66,7 +66,7 @@ impl Tool for SearchArchivedTicketsTool {
 
         let merged = crate::vector::hybrid_merge(vector_results, fts_results);
 
-        let top_ids: Vec<String> = merged.into_iter().take(10).map(|r| r.id).collect();
+        let top_ids: Vec<String> = merged.into_iter().take(10).collect();
 
         if top_ids.is_empty() {
             return Ok("No archived tickets found matching the query.".to_string());
