@@ -34,7 +34,7 @@ use super::menus::{ContextMenu, MenuItem};
 
 use crate::git::commands::GitFileStatus;
 
-use super::common::{SingleLineEditorState, UndoSnapshot, UndoStack};
+use super::common::{SingleLineEditorState, UndoSnapshot, UndoStack, focus_navigation_task};
 use super::editor_widget::{LineEnding, detect_line_ending};
 use crate::tools::MAX_FILE_SIZE_BYTES as MAX_FILE_SIZE;
 
@@ -2251,10 +2251,7 @@ impl EditorState {
             EditorMessage::GoToLineToggle => self.go_to_line_toggle(),
 
             EditorMessage::GoToLineInput(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.go_to_line_input(action)
+                focus_navigation_task(&action).unwrap_or_else(|| self.go_to_line_input(action))
             }
 
             EditorMessage::GoToLineGo => self.go_to_line_go(),
@@ -2263,10 +2260,7 @@ impl EditorState {
             EditorMessage::GlobalSearchToggle => self.global_search_toggle(),
 
             EditorMessage::GlobalSearchInput(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.global_search_input(action)
+                focus_navigation_task(&action).unwrap_or_else(|| self.global_search_input(action))
             }
 
             EditorMessage::GlobalSearchResults {
@@ -2306,20 +2300,14 @@ impl EditorState {
             EditorMessage::NewItemSubmit(name) => self.new_item_submit(&name),
 
             EditorMessage::NewItemInput(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.new_item_input(action)
+                focus_navigation_task(&action).unwrap_or_else(|| self.new_item_input(action))
             }
 
             // ── Inline rename ────────────────────────────────────────────
             EditorMessage::RenameRequested(path) => self.rename_requested(&path),
 
             EditorMessage::RenameInput(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.rename_input(action)
+                focus_navigation_task(&action).unwrap_or_else(|| self.rename_input(action))
             }
 
             EditorMessage::RenameSubmit => self.rename_submit(),
@@ -2346,10 +2334,7 @@ impl EditorState {
             EditorMessage::QuickOpenToggle => self.quick_open_toggle(),
 
             EditorMessage::QuickOpenInput(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.quick_open_input(action)
+                focus_navigation_task(&action).unwrap_or_else(|| self.quick_open_input(action))
             }
 
             EditorMessage::QuickOpenSelect(idx) => self.quick_open_select(idx),
@@ -2388,17 +2373,11 @@ impl EditorState {
             EditorMessage::FindToggle => self.find_toggle(),
 
             EditorMessage::FindQueryInput(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.find_query_input(action)
+                focus_navigation_task(&action).unwrap_or_else(|| self.find_query_input(action))
             }
 
             EditorMessage::FindReplaceInput(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.find_replace_input(action)
+                focus_navigation_task(&action).unwrap_or_else(|| self.find_replace_input(action))
             }
 
             EditorMessage::FindNext => self.navigate_find_match(FindDirection::Next),
