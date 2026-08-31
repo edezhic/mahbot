@@ -492,11 +492,38 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
 
 /// The single prompt-driven claim pipeline: Backlog→Analysis (5s grace) and
 /// Queued→InDevelopment (pipeline-occupied enforced).
+///
+/// Each claim is gated on a read-only existence probe over the SAME predicate
+/// as the claim (shared `claim_candidate_where` builder, shared
+/// now/cutoff — no one-tick false negative). The probe is a best-effort cost
+/// gate: the claim UPDATE stays the atomic arbiter, so a false-positive probe
+/// just costs a failed UPDATE and a candidate that appears between probe and
+/// claim waits at most one 100ms tick. Probe errors MUST fail open
+/// (`unwrap_or(true)`), because a false negative would skip a real claim and
+/// stall the pipeline.
 async fn run_claim_pipeline(ws: &Workspace) {
-    if let Ok(Some(ticket)) = board().claim_backlog_for_analysis(&ws.name).await {
+    // Compute the claim-time clock once per round and share it with the probes
+    // AND the claims, so a probe and its claim can never evaluate eligibility
+    // against a different instant.
+    let now = crate::db::now();
+    let grace_cutoff = (chrono::Utc::now() - BoardStore::BACKLOG_CLAIM_GRACE).to_rfc3339();
+
+    if board()
+        .backlog_claim_candidate_exists(&ws.name, &grace_cutoff)
+        .await
+        .unwrap_or(true)
+        && let Ok(Some(ticket)) = board()
+            .claim_backlog_for_analysis(&ws.name, now.clone(), grace_cutoff)
+            .await
+    {
         info!(ticket = %ticket.id, workspace = %ws.name, "Claimed Backlog → Analysis");
     }
-    if let Ok(Some(ticket)) = board().claim_queued_for_development(&ws.name).await {
+    if board()
+        .queued_claim_candidate_exists(&ws.name)
+        .await
+        .unwrap_or(true)
+        && let Ok(Some(ticket)) = board().claim_queued_for_development(&ws.name, now).await
+    {
         info!(ticket = %ticket.id, workspace = %ws.name, "Claimed Queued → InDevelopment");
         let _ = crate::jobs::upsert_engineer_session_pin(
             &crate::session::store().conn,

@@ -177,6 +177,43 @@ fn phase_list_sql_fragment(phases: &[TicketPhase]) -> String {
         .join(", ")
 }
 
+/// The claim-candidate eligibility predicate, shared verbatim by the claim
+/// UPDATE and its read-only probe (single source — the two cannot drift).
+/// `source` selects the claim shape: only Backlog→Analysis applies the
+/// [`BACKLOG_CLAIM_GRACE`] cutoff, only Queued→InDevelopment enforces
+/// pipeline occupancy. Placeholders are numbered from `base`: `?{base}` =
+/// source phase, `?{base+1}` = workspace name and, for Backlog,
+/// `?{base+2}` = grace cutoff.
+fn claim_candidate_where(base: usize, source: TicketPhase) -> String {
+    let mut parts = vec![
+        format!("t1.phase = ?{base}"),
+        format!("t1.workspace_name = ?{}", base + 1),
+        "t1.is_archived = 0".to_string(),
+    ];
+    if source == TicketPhase::Backlog {
+        parts.push(format!("t1.created_at <= ?{}", base + 2));
+    }
+    if source == TicketPhase::Queued {
+        parts.push(format!(
+            "NOT EXISTS (SELECT 1 FROM tickets t2 \
+                WHERE t2.workspace_name = t1.workspace_name \
+                AND t2.phase IN ({}) \
+                AND t2.is_archived = 0 \
+                AND t2.id != t1.id)",
+            phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES),
+        ));
+    }
+    parts.push(format!(
+        "NOT EXISTS ( \
+            SELECT 1 FROM json_each(t1.prerequisites) AS je \
+            JOIN tickets t_pre ON t_pre.id = je.value \
+            WHERE t_pre.phase NOT IN ({}) \
+         )",
+        phase_list_sql_fragment(UNBLOCKING_PHASES),
+    ));
+    parts.join(" AND ")
+}
+
 fn parse_prereqs(raw: &str) -> Result<Vec<String>> {
     serde_json::from_str(raw).with_context(|| {
         let preview = if raw.len() > 200 {
@@ -958,29 +995,28 @@ impl BoardStore {
     /// tickets with lower priority (higher urgency) are claimed first, then the
     /// oldest ticket (earliest created_at) is claimed first.
     ///
+    /// The WHERE predicate comes from [`claim_candidate_where`], the same
+    /// builder the read-only probe uses — so the claim and its probe cannot
+    /// drift. `now` and `grace_cutoff` are supplied by the caller (computed
+    /// once per poll round and shared with the probe, so the probe and the
+    /// claim can never disagree about the grace cutoff).
+    ///
     /// Note: the claim SELECT is kept to the tickets table, and the agents
     /// roster is a separate logical table checked by the caller (via the
     /// phase-job + launched-roster guard). Backlog tickets have no running agent.
     pub(crate) async fn claim_backlog_for_analysis(
         &self,
         workspace_name: &str,
+        now: String,
+        grace_cutoff: String,
     ) -> Result<Option<Ticket>> {
-        let now = db::now();
-        let grace_cutoff = (Utc::now() - Self::BACKLOG_CLAIM_GRACE).to_rfc3339();
         let sql = format!(
             "UPDATE tickets SET phase = ?1, updated_at = ?2 \
              WHERE id = (SELECT t1.id FROM tickets t1 \
-             WHERE t1.phase = ?3 AND t1.workspace_name = ?4 \
-             AND t1.is_archived = 0 \
-             AND t1.created_at <= ?5 \
-             AND NOT EXISTS ( \
-                SELECT 1 FROM json_each(t1.prerequisites) AS je \
-                JOIN tickets t_pre ON t_pre.id = je.value \
-                WHERE t_pre.phase NOT IN ({}) \
-             ) \
+             WHERE {} \
              ORDER BY t1.priority ASC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}",
-            phase_list_sql_fragment(UNBLOCKING_PHASES),
+            claim_candidate_where(3, TicketPhase::Backlog),
         );
         let params = db::params![
             TicketPhase::Analysis.as_ref(),
@@ -1028,33 +1064,27 @@ impl BoardStore {
     /// tickets with lower priority (higher urgency) are claimed first, then the
     /// oldest ticket (earliest created_at) is claimed first.
     ///
+    /// The WHERE predicate comes from [`claim_candidate_where`], the same
+    /// builder the read-only probe uses — so the claim and its probe cannot
+    /// drift. `now` is supplied by the caller (computed once per poll round
+    /// and shared with the probe, so the probe and the claim agree on the
+    /// clock).
+    ///
     /// Note: the claim SELECT is kept to the tickets table, and the agents
     /// roster is a separate logical table checked by the caller (via the
     /// phase-job + launched-roster guard). Queued tickets have no running agent.
     pub(crate) async fn claim_queued_for_development(
         &self,
         workspace_name: &str,
+        now: String,
     ) -> Result<Option<Ticket>> {
-        let now = db::now();
         let sql = format!(
             "UPDATE tickets SET phase = ?1, updated_at = ?2 \
              WHERE id = (SELECT t1.id FROM tickets t1 \
-             WHERE t1.phase = ?3 AND t1.workspace_name = ?4 \
-             AND t1.is_archived = 0 \
-             AND NOT EXISTS (SELECT 1 FROM tickets t2 \
-                WHERE t2.workspace_name = t1.workspace_name \
-                AND t2.phase IN ({occupied}) \
-                AND t2.is_archived = 0 \
-                AND t2.id != t1.id) \
-             AND NOT EXISTS ( \
-                SELECT 1 FROM json_each(t1.prerequisites) AS je \
-                JOIN tickets t_pre ON t_pre.id = je.value \
-                WHERE t_pre.phase NOT IN ({unblocking}) \
-             ) \
+             WHERE {} \
              ORDER BY t1.priority ASC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}",
-            occupied = phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES),
-            unblocking = phase_list_sql_fragment(UNBLOCKING_PHASES),
+            claim_candidate_where(3, TicketPhase::Queued),
         );
         let params = db::params![
             TicketPhase::InDevelopment.as_ref(),
@@ -1067,6 +1097,57 @@ impl BoardStore {
             Some(row) => Ok(Some(self.ticket_from_row(&row, LoadComments::Yes).await?)),
             None => Ok(None),
         }
+    }
+
+    /// Read-only existence probe for the Backlog→Analysis claim: `true` when at
+    /// least one ticket satisfies the exact claim predicate (same shared
+    /// builder, same bound grace cutoff — no drift). Existence only: no ORDER
+    /// BY, no column fetch.
+    pub(crate) async fn backlog_claim_candidate_exists(
+        &self,
+        workspace_name: &str,
+        grace_cutoff: &str,
+    ) -> Result<bool> {
+        self.claim_candidate_exists(TicketPhase::Backlog, workspace_name, Some(grace_cutoff))
+            .await
+    }
+
+    /// Read-only existence probe for the Queued→InDevelopment claim.
+    pub(crate) async fn queued_claim_candidate_exists(&self, workspace_name: &str) -> Result<bool> {
+        self.claim_candidate_exists(TicketPhase::Queued, workspace_name, None)
+            .await
+    }
+
+    /// Core probe: `SELECT 1 FROM tickets t1 WHERE {claim_candidate_where} LIMIT 1`
+    /// through the prepared-cached path. The SQL text is invariant (phase lists
+    /// are compile-time constants; workspace/cutoff are bound parameters), which
+    /// the [`Connection::query_cached`] cache contract requires. The text is a
+    /// plain SELECT — read-only by construction, since `query_cached` does not
+    /// enforce read-only the way `query_readonly` does. Existence only, so
+    /// unlike the claim there is no ORDER BY sorter to pay for.
+    async fn claim_candidate_exists(
+        &self,
+        source: TicketPhase,
+        workspace_name: &str,
+        grace_cutoff: Option<&str>,
+    ) -> Result<bool> {
+        let sql = format!(
+            "SELECT 1 FROM tickets t1 WHERE {} LIMIT 1",
+            claim_candidate_where(1, source),
+        );
+        let rows = match grace_cutoff {
+            Some(cutoff) => {
+                self.conn
+                    .query_cached(&sql, db::params![source.as_ref(), workspace_name, cutoff])
+                    .await?
+            }
+            None => {
+                self.conn
+                    .query_cached(&sql, db::params![source.as_ref(), workspace_name])
+                    .await?
+            }
+        };
+        Ok(!rows.is_empty())
     }
 
     /// Select tickets matching a SQL suffix (everything after `FROM tickets`),

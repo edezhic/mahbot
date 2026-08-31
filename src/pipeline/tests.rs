@@ -9,7 +9,7 @@
 //! the live model. Global-DB tests are serialized behind [`TEST_LOCK`] because
 //! every global store shares one test root; isolated-store tests run freely.
 
-use crate::pipeline::board::{BoardStore, TicketPhase};
+use crate::pipeline::board::{BoardStore, Ticket, TicketPhase};
 use crate::util::test::{
     create_test_workspace, expect_ticket, expect_ticket_phase, init_management_test_stores,
     make_ticket,
@@ -33,9 +33,10 @@ async fn claim_backlog_obeys_grace() {
     let id = make_ticket(&store, &ws, "Grace ticket", TicketPhase::Backlog).await;
 
     // Fresh ticket sits inside the grace window → no claim.
+    let (now, cutoff) = claim_clock();
     assert!(
         store
-            .claim_backlog_for_analysis(&ws.name)
+            .claim_backlog_for_analysis(&ws.name, now, cutoff)
             .await
             .unwrap()
             .is_none(),
@@ -52,8 +53,9 @@ async fn claim_backlog_obeys_grace() {
         )
         .await
         .unwrap();
+    let (now, cutoff) = claim_clock();
     let claimed = store
-        .claim_backlog_for_analysis(&ws.name)
+        .claim_backlog_for_analysis(&ws.name, now, cutoff)
         .await
         .unwrap()
         .expect("aged ticket must be claimed");
@@ -71,7 +73,7 @@ async fn claim_queued_blocks_on_pipeline_occupancy() {
     // No occupied sibling yet → the Queued claim succeeds.
     let first = make_ticket(&store, &ws, "Queued one", TicketPhase::Queued).await;
     let claimed = store
-        .claim_queued_for_development(&ws.name)
+        .claim_queued_for_development(&ws.name, crate::db::now())
         .await
         .unwrap()
         .expect("Queued ticket must claim without a pipeline-occupied sibling");
@@ -82,7 +84,7 @@ async fn claim_queued_blocks_on_pipeline_occupancy() {
     make_ticket(&store, &ws, "Queued two", TicketPhase::Queued).await;
     assert!(
         store
-            .claim_queued_for_development(&ws.name)
+            .claim_queued_for_development(&ws.name, crate::db::now())
             .await
             .unwrap()
             .is_none(),
@@ -114,9 +116,10 @@ async fn claim_backlog_honors_prerequisites() {
     // dependent past the grace window FIRST so this assertion isolates the
     // prereq rule rather than passing vacuously on the grace cutoff.
     age_ticket_past_grace(&store, &dependent).await;
+    let (now, cutoff) = claim_clock();
     assert!(
         store
-            .claim_backlog_for_analysis(&ws.name)
+            .claim_backlog_for_analysis(&ws.name, now, cutoff)
             .await
             .unwrap()
             .is_none(),
@@ -132,8 +135,9 @@ async fn claim_backlog_honors_prerequisites() {
         )
         .await
         .unwrap();
+    let (now, cutoff) = claim_clock();
     let claimed = store
-        .claim_backlog_for_analysis(&ws.name)
+        .claim_backlog_for_analysis(&ws.name, now, cutoff)
         .await
         .unwrap()
         .expect("dependent must claim once its prereq unblocks");
@@ -163,7 +167,7 @@ async fn claim_queued_honors_prerequisites() {
     // Unmet prereq → blocked despite a free pipeline.
     assert!(
         store
-            .claim_queued_for_development(&ws.name)
+            .claim_queued_for_development(&ws.name, crate::db::now())
             .await
             .unwrap()
             .is_none(),
@@ -180,12 +184,136 @@ async fn claim_queued_honors_prerequisites() {
         .await
         .unwrap();
     let claimed = store
-        .claim_queued_for_development(&ws.name)
+        .claim_queued_for_development(&ws.name, crate::db::now())
         .await
         .unwrap()
         .expect("dependent must claim once its prereq unblocks");
     assert_eq!(claimed.id, dependent);
     assert_eq!(claimed.phase, TicketPhase::InDevelopment);
+}
+
+/// The claim probes are a fail-open cost gate, so a false negative (probe
+/// says "no candidate" while the claim would succeed) is the only forbidden
+/// outcome. Differential oracle: with a shared clock the probe decision must
+/// equal the claim outcome in every eligibility scenario — grace boundary,
+/// prerequisites, and pipeline occupancy.
+#[tokio::test]
+async fn claim_probes_agree_with_claim_outcomes() {
+    // ── Backlog grace boundary: fresh inside grace vs aged past it ───────
+    {
+        let (store, _dir) = crate::open_test_store!(BoardStore, "board");
+        let ws = ws_named("probe-blog-grace");
+        let id = make_ticket(&store, &ws, "Fresh backlog", TicketPhase::Backlog).await;
+
+        let (now, cutoff) = claim_clock();
+        let (probe, claimed) = probe_then_claim_backlog(&store, &ws, now, &cutoff).await;
+        assert!(!probe, "fresh Backlog inside grace must probe false");
+        assert!(
+            claimed.is_none(),
+            "fresh Backlog inside grace must not claim",
+        );
+
+        age_ticket_past_grace(&store, &id).await;
+        let (now, cutoff) = claim_clock();
+        let (probe, claimed) = probe_then_claim_backlog(&store, &ws, now, &cutoff).await;
+        assert!(probe, "aged Backlog past grace must probe true");
+        assert!(claimed.is_some(), "aged Backlog past grace must claim");
+    }
+
+    // ── Backlog prerequisites: unmet blocks, unblocking frees ───────────
+    {
+        let (store, _dir) = crate::open_test_store!(BoardStore, "board");
+        let ws = ws_named("probe-blog-prereq");
+        let prereq_analysis =
+            make_ticket(&store, &ws, "Prereq (analysis)", TicketPhase::Analysis).await;
+        let dependent = crate::util::test::TicketBuilder::new(&store, &ws)
+            .title("Dependent")
+            .phase(TicketPhase::Backlog)
+            .prereqs(std::slice::from_ref(&prereq_analysis))
+            .create()
+            .await
+            .unwrap();
+        age_ticket_past_grace(&store, &dependent).await;
+
+        let (now, cutoff) = claim_clock();
+        let (probe, claimed) = probe_then_claim_backlog(&store, &ws, now, &cutoff).await;
+        assert!(
+            !probe,
+            "dependent with a non-unblocking prereq must probe false",
+        );
+        assert!(
+            claimed.is_none(),
+            "dependent with an unmet prereq must not claim",
+        );
+
+        store
+            .transition_to(
+                &prereq_analysis,
+                Some(TicketPhase::Analysis),
+                TicketPhase::Done,
+            )
+            .await
+            .unwrap();
+        let (now, cutoff) = claim_clock();
+        let (probe, claimed) = probe_then_claim_backlog(&store, &ws, now, &cutoff).await;
+        assert!(probe, "dependent must probe true once its prereq unblocks");
+        assert!(
+            claimed.is_some(),
+            "dependent must claim once its prereq unblocks"
+        );
+    }
+
+    // ── Queued: unmet prereq (free pipeline) blocks; unblocking claims; a
+    //    sibling then occupies the pipeline and blocks a second candidate.
+    {
+        let (store, _dir) = crate::open_test_store!(BoardStore, "board");
+        let ws = ws_named("probe-queued");
+        let prereq_analysis =
+            make_ticket(&store, &ws, "Prereq (analysis)", TicketPhase::Analysis).await;
+        let dependent = crate::util::test::TicketBuilder::new(&store, &ws)
+            .title("Dependent")
+            .phase(TicketPhase::Queued)
+            .prereqs(std::slice::from_ref(&prereq_analysis))
+            .create()
+            .await
+            .unwrap();
+
+        // Unmet prereq with a free pipeline → blocked.
+        let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
+        assert!(
+            !probe,
+            "Queued with a non-unblocking prereq must probe false",
+        );
+        assert!(
+            claimed.is_none(),
+            "Queued with an unmet prereq must not claim",
+        );
+
+        // Prereq unblocks → free pipeline → claims (now InDevelopment → occupied).
+        store
+            .transition_to(
+                &prereq_analysis,
+                Some(TicketPhase::Analysis),
+                TicketPhase::Done,
+            )
+            .await
+            .unwrap();
+        let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
+        assert!(probe, "Queued with a free pipeline must probe true");
+        let claimed = claimed.expect("dependent must claim once its prereq unblocks");
+        assert_eq!(claimed.phase, TicketPhase::InDevelopment);
+        assert_eq!(claimed.id, dependent);
+
+        // The claimed ticket now occupies the pipeline → blocks the next Queued
+        // candidate.
+        make_ticket(&store, &ws, "Queued two", TicketPhase::Queued).await;
+        let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
+        assert!(!probe, "Queued with an occupied sibling must probe false");
+        assert!(
+            claimed.is_none(),
+            "Queued with an occupied sibling must not claim",
+        );
+    }
 }
 
 /// A phase job is unique per (kind, ticket_id); creating a duplicate is a
@@ -635,6 +763,54 @@ async fn age_ticket_past_grace(store: &BoardStore, id: &str) {
         )
         .await
         .unwrap();
+}
+
+/// Claim-time clock shared by claim calls in tests: now + the grace cutoff
+/// derived from it (same instant, as in production).
+fn claim_clock() -> (String, String) {
+    let now = crate::db::now();
+    let cutoff = (chrono::Utc::now() - BoardStore::BACKLOG_CLAIM_GRACE).to_rfc3339();
+    (now, cutoff)
+}
+
+/// Probe then claim Backlog→Analysis under a shared clock, asserting the
+/// probe decision equals the claim outcome (the differential invariant).
+async fn probe_then_claim_backlog(
+    store: &BoardStore,
+    ws: &Workspace,
+    now: String,
+    cutoff: &str,
+) -> (bool, Option<Ticket>) {
+    let probe = store
+        .backlog_claim_candidate_exists(&ws.name, cutoff)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_backlog_for_analysis(&ws.name, now, cutoff.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        probe,
+        claimed.is_some(),
+        "probe must agree with claim outcome",
+    );
+    (probe, claimed)
+}
+
+/// Probe then claim Queued→InDevelopment, asserting the probe decision equals
+/// the claim outcome (the differential invariant).
+async fn probe_then_claim_queued(store: &BoardStore, ws: &Workspace) -> (bool, Option<Ticket>) {
+    let probe = store.queued_claim_candidate_exists(&ws.name).await.unwrap();
+    let claimed = store
+        .claim_queued_for_development(&ws.name, crate::db::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        probe,
+        claimed.is_some(),
+        "probe must agree with claim outcome",
+    );
+    (probe, claimed)
 }
 
 // ── 1. Full pipeline lifecycle ──────────────────────────────────────────
