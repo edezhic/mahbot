@@ -191,19 +191,19 @@ impl ToolFailuresState {
             Space::new().width(8),
             widgets::badge_pill(
                 entry.tool_name.clone(),
-                (theme::HOVER, theme::TEXT_SECONDARY),
+                (theme::TEXT_SECONDARY, theme::HOVER),
                 10,
                 [1, 6],
             ),
             Space::new().width(4),
             widgets::badge_pill(
                 duration_label,
-                (theme::HOVER, theme::TEXT_MUTED),
+                (theme::TEXT_MUTED, theme::HOVER),
                 10,
                 [1, 6]
             ),
             Space::new().width(4),
-            widgets::role_badge(entry.role.clone(), role_colors, 10, [1, 6], false),
+            widgets::badge_pill(entry.role.clone(), role_colors, 10, [1, 6]),
             Space::new().width(Length::Fill),
             if !entry.workspace.is_empty() {
                 text(&entry.workspace).size(10).color(theme::TEXT_MUTED)

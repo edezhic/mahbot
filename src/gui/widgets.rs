@@ -187,10 +187,13 @@ pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
         .into()
 }
 
-/// Standardized "Loading..." placeholder label for load-state scaffolding.
+/// Standardized "Loading…" placeholder label for load-state scaffolding.
 #[must_use]
 pub fn loading_text<'a, Message: 'a>() -> Element<'a, Message> {
-    text("Loading...").size(14).color(theme::TEXT_MUTED).into()
+    text("Loading\u{2026}")
+        .size(14)
+        .color(theme::TEXT_MUTED)
+        .into()
 }
 
 /// Push an [`error_banner`] plus trailing 8px spacer onto `col` when `err` is
@@ -264,7 +267,8 @@ pub fn empty_state_placeholder<'a, Message: 'a>(
     .into()
 }
 
-/// Badge pill with an opaque background; `colors` is a `(background, text)` tuple.
+/// Badge pill with an opaque background; `colors` is a `(foreground, background)`
+/// tuple — the convention shared by all badge-color helpers in [`crate::gui::theme`].
 #[must_use]
 pub fn badge_pill<'a, Message: 'a>(
     label: String,
@@ -272,51 +276,7 @@ pub fn badge_pill<'a, Message: 'a>(
     text_size: u32,
     padding: [u16; 2],
 ) -> Element<'a, Message> {
-    container(text(label).size(text_size).color(colors.1))
-        .padding(padding)
-        .style(theme::pill_style(colors.0))
-        .into()
-}
-
-/// Role badge pill: a container with the role name, caller-specified padding,
-/// and the translucent role-colored pill background (canonical 4px radius).
-///
-/// Takes the role as an owned `String` (not `&str`) because the sessions
-/// transcript renders move a loop-local String into an Element that outlives
-/// the iteration — a borrowed parameter would not compile there; call sites
-/// that only have a borrow pay a trivial `.clone()`.
-///
-/// `colors` is the `(foreground, background)` tuple from
-/// [`theme::role_badge_color`] / [`theme::role_badge_color_for`]; the
-/// background member (always the foreground at 0.1 alpha — that math lives
-/// in exactly one place, `theme::badge_bg`) feeds [`theme::pill_style`].
-///
-/// `padding` is the container padding `[vertical, horizontal]`, passed
-/// through to the container's padding builder; the board comment rows use
-/// the enlarged `[2, 12]` so the role stands out while scrolling, while the
-/// sessions transcript and tool-failure metadata rows keep the compact
-/// `[1, 6]`.
-///
-/// `selectable` chooses between plain [`text`] and [`selectable_text`]: both
-/// arms coerce into `Element` via `.into()`, but plain `text` is cheaper (no
-/// selection machinery) while `selectable_text` lets the role name be
-/// selected/copied from the UI. The sessions transcript uses selectable text
-/// so a whole line can be copied in one drag; the board comment rows and
-/// tool-failure metadata rows use plain text.
-#[must_use]
-pub fn role_badge<'a, Message: 'a>(
-    role: String,
-    colors: (Color, Color),
-    text_size: u32,
-    padding: [u16; 2],
-    selectable: bool,
-) -> Element<'a, Message> {
-    let label: Element<'a, Message> = if selectable {
-        selectable_text(role, colors.0).size(text_size).into()
-    } else {
-        text(role).size(text_size).color(colors.0).into()
-    };
-    container(label)
+    container(text(label).size(text_size).color(colors.0))
         .padding(padding)
         .style(theme::pill_style(colors.1))
         .into()

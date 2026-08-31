@@ -539,15 +539,11 @@ impl SessionsState {
             // collapse measurement uses the real bubble body width, correct on
             // first render and after every window resize.
             let transcript: iced::Element<'_, SessionsMessage> = if self.selected_loading {
-                iced::widget::container(
-                    iced::widget::text("Loading messages...")
-                        .size(13)
-                        .color(theme::TEXT_MUTED),
-                )
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding(16)
-                .into()
+                iced::widget::container(widgets::loading_text())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(16)
+                    .into()
             } else if let Some(ref _key) = self.selected_session {
                 let entries = &self.entries;
                 let entry_md = &self.entry_md;

@@ -86,8 +86,9 @@ pub fn log_level_color(level: &str) -> (Color, Color) {
 /// Translucent pill background for a badge foreground color: the foreground
 /// at 0.1 alpha. Single source of the badge-background math — the second
 /// member of every [`role_badge_color_for`] / [`role_badge_color`] tuple is
-/// `badge_bg(fg)` (including the unknown-role fallback), and consumers
-/// (role pill, logs span) use that member directly, so rendering cannot
+/// `badge_bg(fg)` (including the unknown-role fallback), as is the background
+/// member of [`workspace_status_color`]. Consumers (role pill, logs span,
+/// workspace status pill) use that member directly, so rendering cannot
 /// drift from this alpha.
 const fn badge_bg(fg: Color) -> Color {
     Color::from_rgba(fg.r, fg.g, fg.b, 0.1)
@@ -238,6 +239,15 @@ pub fn comment_author_icon(
     }
 }
 
+/// Dashboard default font (JetBrains Mono). Registered via `.default_font()`
+/// in `main.rs`; fonts embedded via `.font()` calls there.
+pub const JETBRAINS_MONO: iced::Font = iced::Font {
+    family: iced::font::Family::Name("JetBrains Mono"),
+    weight: iced::font::Weight::Normal,
+    stretch: iced::font::Stretch::Normal,
+    style: iced::font::Style::Normal,
+};
+
 /// Bold weight variant of JetBrains Mono (the dashboard default font).
 pub const FONT_BOLD: iced::Font = iced::Font {
     family: iced::font::Family::Name("JetBrains Mono"),
@@ -246,10 +256,7 @@ pub const FONT_BOLD: iced::Font = iced::Font {
 };
 
 /// Regular weight variant of JetBrains Mono.
-pub const FONT_REGULAR: iced::Font = iced::Font {
-    family: iced::font::Family::Name("JetBrains Mono"),
-    ..iced::Font::DEFAULT
-};
+pub const FONT_REGULAR: iced::Font = JETBRAINS_MONO;
 
 /// Italic variant of JetBrains Mono (narration text).
 pub const FONT_ITALIC: iced::Font = iced::Font {
@@ -306,6 +313,9 @@ fn markdown_settings_with(font: iced::Font, text_size: f32) -> iced::widget::mar
 // ── Ticket phase colors ───────────────────────────────────────────
 // All TicketPhase variants exhaustively matched — no catch-all.
 
+/// Returns a `(foreground, background)` tuple — the badge-pill convention
+/// shared with `widgets::badge_pill`. The first member is the readable text
+/// color and the second the darker pill background.
 #[must_use]
 pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
@@ -315,58 +325,58 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     match phase {
         // Early phases — cool/muted, neutral
         Backlog => (
-            Color::from_rgb(0.176, 0.176, 0.176),
             Color::from_rgb(0.808, 0.804, 0.765),
+            Color::from_rgb(0.176, 0.176, 0.176),
         ),
         Planning => (
-            Color::from_rgb(0.263, 0.243, 0.114),
             Color::from_rgb(0.902, 0.863, 0.784),
+            Color::from_rgb(0.263, 0.243, 0.114),
         ),
         Analysis => (
-            Color::from_rgb(0.114, 0.216, 0.310),
             Color::from_rgb(0.784, 0.863, 0.949),
+            Color::from_rgb(0.114, 0.216, 0.310),
         ),
         // Queued — olive gateway (Manager→Engineer)
         Queued => (
-            Color::from_rgb(0.263, 0.224, 0.114),
             Color::from_rgb(0.902, 0.863, 0.784),
+            Color::from_rgb(0.263, 0.224, 0.114),
         ),
         // Active phases — warm
         InDevelopment => (
-            Color::from_rgb(0.380, 0.216, 0.078),
             Color::from_rgb(0.941, 0.878, 0.784),
+            Color::from_rgb(0.380, 0.216, 0.078),
         ),
         // Diagnostic phases — amber/teal
         InDiagnostics => (
-            Color::from_rgb(0.310, 0.224, 0.102),
             Color::from_rgb(0.902, 0.863, 0.784),
+            Color::from_rgb(0.310, 0.224, 0.102),
         ),
         // Sanitation phases — neutral gray
         InSanitation => (
-            Color::from_rgb(0.310, 0.310, 0.310),
             Color::from_rgb(0.788, 0.788, 0.788),
+            Color::from_rgb(0.310, 0.310, 0.310),
         ),
         // Review & QA
         InReview => (
-            Color::from_rgb(0.184, 0.216, 0.380),
             Color::from_rgb(0.816, 0.816, 0.933),
+            Color::from_rgb(0.184, 0.216, 0.380),
         ),
         InQa => (
-            Color::from_rgb(0.216, 0.184, 0.380),
             Color::from_rgb(0.816, 0.816, 0.933),
+            Color::from_rgb(0.216, 0.184, 0.380),
         ),
         // Unblocking phases — distinct
         Done => (
-            Color::from_rgb(0.114, 0.176, 0.114),
             Color::from_rgb(0.753, 0.816, 0.753),
+            Color::from_rgb(0.114, 0.176, 0.114),
         ),
         Cancelled => (
-            Color::from_rgb(0.145, 0.145, 0.145),
             Color::from_rgb(0.690, 0.690, 0.690),
+            Color::from_rgb(0.145, 0.145, 0.145),
         ),
         Failed => (
-            Color::from_rgb(0.310, 0.114, 0.114),
             Color::from_rgb(0.878, 0.753, 0.753),
+            Color::from_rgb(0.310, 0.114, 0.114),
         ),
     }
 }
@@ -374,7 +384,7 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
 // ── Ticket priority chip colors (Flexoki muted palette) ──────────
 //
 // Priority uses the same muted-tone approach as phase badges:
-// darker backgrounds with lighter, readable text on a dark theme.
+// lighter, readable text on darker backgrounds (a dark theme).
 //
 // P0 (urgent):     red     — failed-like
 // P1 (high):       orange  — in-development-like
@@ -382,28 +392,31 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
 // P3 (low):        green   — qa-passed-like
 // P4+ (lowest):    green   — done-like
 
+/// Returns a `(foreground, background)` tuple — the badge-pill convention
+/// shared with `widgets::badge_pill`. The first member is the readable text
+/// color and the second the darker pill background.
 #[must_use]
 pub fn ticket_priority_color(priority: i64) -> (Color, Color) {
     match priority {
         0 => (
-            Color::from_rgb(0.310, 0.114, 0.114),
             Color::from_rgb(0.878, 0.753, 0.753),
+            Color::from_rgb(0.310, 0.114, 0.114),
         ),
         1 => (
-            Color::from_rgb(0.380, 0.216, 0.078),
             Color::from_rgb(0.941, 0.878, 0.784),
+            Color::from_rgb(0.380, 0.216, 0.078),
         ),
         2 => (
-            Color::from_rgb(0.310, 0.224, 0.102),
             Color::from_rgb(0.902, 0.863, 0.784),
+            Color::from_rgb(0.310, 0.224, 0.102),
         ),
         3 => (
-            Color::from_rgb(0.176, 0.310, 0.208),
             Color::from_rgb(0.784, 0.902, 0.816),
+            Color::from_rgb(0.176, 0.310, 0.208),
         ),
         _ => (
-            Color::from_rgb(0.114, 0.176, 0.114),
             Color::from_rgb(0.753, 0.816, 0.753),
+            Color::from_rgb(0.114, 0.176, 0.114),
         ),
     }
 }
@@ -497,19 +510,19 @@ pub fn workspace_status_color(status: WorkspaceStatus) -> (Color, Color) {
     match status {
         WorkspaceStatus::Ready => (
             Color::from_rgb(0.133, 0.773, 0.369),
-            Color::from_rgba(0.133, 0.773, 0.369, 0.1),
+            badge_bg(Color::from_rgb(0.133, 0.773, 0.369)),
         ),
         WorkspaceStatus::Analyzing => (
             Color::from_rgb(0.851, 0.557, 0.0),
-            Color::from_rgba(0.851, 0.557, 0.0, 0.1),
+            badge_bg(Color::from_rgb(0.851, 0.557, 0.0)),
         ),
         WorkspaceStatus::Failed => (
             Color::from_rgb(0.957, 0.247, 0.369),
-            Color::from_rgba(0.957, 0.247, 0.369, 0.1),
+            badge_bg(Color::from_rgb(0.957, 0.247, 0.369)),
         ),
         WorkspaceStatus::Pending => (
             Color::from_rgb(0.631, 0.631, 0.631),
-            Color::from_rgba(0.631, 0.631, 0.631, 0.1),
+            badge_bg(Color::from_rgb(0.631, 0.631, 0.631)),
         ),
     }
 }

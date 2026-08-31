@@ -50,16 +50,7 @@ use self::menus::ContextMenu;
 
 use iced_fonts::lucide;
 
-/// JetBrains Mono as the dashboard default font.
-/// Registered at startup via `.default_font()` on the Iced application builder,
-/// so all text widgets use JetBrains Mono by default. The font bytes are loaded
-/// via `.font()` calls in the application builder.
-pub const JETBRAINS_MONO: iced::Font = iced::Font {
-    family: iced::font::Family::Name("JetBrains Mono"),
-    weight: iced::font::Weight::Normal,
-    stretch: iced::font::Stretch::Normal,
-    style: iced::font::Style::Normal,
-};
+pub use theme::JETBRAINS_MONO;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;

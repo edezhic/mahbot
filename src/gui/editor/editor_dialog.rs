@@ -441,10 +441,10 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
                 theme::TEXT_SECONDARY
             };
 
-            let path_label = text(path_text).size(12).color(accent).font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..theme::FONT_REGULAR
-            });
+            let path_label = text(path_text)
+                .size(12)
+                .color(accent)
+                .font(theme::FONT_BOLD);
 
             // Build the snippet with match portion highlighted in bold.
             let trimmed = line_content.trim().to_string();
@@ -482,10 +482,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
                         text(matched)
                             .size(12)
                             .color(theme::ACCENT_LIGHT)
-                            .font(iced::Font {
-                                weight: iced::font::Weight::Bold,
-                                ..theme::FONT_REGULAR
-                            }),
+                            .font(theme::FONT_BOLD),
                         text(post).size(12).color(text_color),
                     ]
                     .spacing(0)

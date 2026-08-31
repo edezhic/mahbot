@@ -813,7 +813,7 @@ impl DiffState {
                 .style(theme::base_container_style)
                 .into()
         } else if self.diff_loading && !self.diff_has_loaded {
-            container(text("Loading diff…").size(12).color(theme::TEXT_MUTED))
+            container(widgets::loading_text())
                 .padding([8, 12])
                 .width(Length::Fill)
                 .height(Length::Fill)

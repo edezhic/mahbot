@@ -850,7 +850,7 @@ impl HomeState {
             // Prepend "Load older messages" button when applicable.
             if self.has_more && self.history_loaded {
                 let load_text = if self.loading_older {
-                    "Loading older messages..."
+                    "Loading older messages\u{2026}"
                 } else {
                     "▲ Load older messages"
                 };

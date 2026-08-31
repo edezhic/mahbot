@@ -1793,7 +1793,6 @@ impl SettingsState {
             );
         } else {
             for ws_item in &ws.workspaces {
-                let (status_color, status_bg) = theme::workspace_status_color(ws_item.status);
                 let maintainer_on = ws_item.maintenance_enabled;
                 let paused = ws_item.paused;
                 let (pause_icon, pause_tooltip) = if paused {
@@ -1827,7 +1826,7 @@ impl SettingsState {
                                     tooltip(
                                         widgets::badge_pill(
                                             ws_item.status.to_string(),
-                                            (status_bg, status_color),
+                                            theme::workspace_status_color(ws_item.status),
                                             11,
                                             [2, 8],
                                         ),

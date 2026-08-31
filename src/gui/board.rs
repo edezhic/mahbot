@@ -774,8 +774,8 @@ impl BoardState {
         text_size: u32,
         padding: [u16; 2],
     ) -> Element<'a, BoardMessage> {
-        let (bg, fg) = theme::ticket_phase_color(phase);
-        let pill = badge_pill(phase.display_name(), (bg, fg), text_size, padding);
+        let (fg, bg) = theme::ticket_phase_color(phase);
+        let pill = badge_pill(phase.display_name(), (fg, bg), text_size, padding);
         tooltip(pill, text("Current phase").size(11), tooltip::Position::Top)
             .style(theme::tooltip_style)
             .into()
@@ -787,8 +787,8 @@ impl BoardState {
         text_size: u32,
         padding: [u16; 2],
     ) -> Element<'a, BoardMessage> {
-        let (bg, fg) = theme::ticket_priority_color(priority);
-        let pill = badge_pill(format!("P{priority}"), (bg, fg), text_size, padding);
+        let (fg, bg) = theme::ticket_priority_color(priority);
+        let pill = badge_pill(format!("P{priority}"), (fg, bg), text_size, padding);
         tooltip(pill, text("Priority").size(11), tooltip::Position::Top)
             .style(theme::tooltip_style)
             .into()
@@ -1613,7 +1613,7 @@ impl BoardState {
             if self.selected_loading {
                 let dialog = container(
                     column![
-                        text("Loading details...")
+                        text("Loading details\u{2026}")
                             .size(16)
                             .color(theme::TEXT_SECONDARY),
                         Space::new().height(12),
@@ -1912,14 +1912,9 @@ impl BoardState {
 
         if loading {
             return Some(
-                column![
-                    Space::new().height(8),
-                    text("Loading commit stats\u{2026}")
-                        .size(12)
-                        .color(theme::TEXT_MUTED),
-                ]
-                .spacing(4)
-                .into(),
+                column![Space::new().height(8), widgets::loading_text(),]
+                    .spacing(4)
+                    .into(),
             );
         }
 
