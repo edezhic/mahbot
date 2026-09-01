@@ -81,15 +81,53 @@ const MAX_TOKENS_PER_CHUNK: usize = 13;
 /// window (N=3) still spans ~0.5 s of speech.
 pub(crate) const SCORE_STRIDE_MEL_FRAMES: usize = 16;
 
-/// Maximum cosine floor — the upper clamp bound for the calibrated floor.
-/// The soft-score mapping anchors the floor at score 0, so a floor set
-/// at/above a match's cosine would squash that match to zero; this constant
-/// keeps the calibrated floor below the match range.
-const MAX_SOFT_FLOOR: f32 = 0.75;
+// ── Calibration-derived scoring geometry ─────────────────────────────────
+//
+// The soft-score mapping uses a parametric floor derived from the negative
+// sufficient statistics (mean/std) — [`Calibration::soft_floor`] — rather
+// than the raw p99 percentile.  The constants below define that geometry and
+// the anchor that keeps a raised floor from crushing recall.
 
-/// Fallback cosine floor when no negative calibration exists (e.g. the
-/// enrollment skipped negatives).
+/// Maximum cosine floor — the upper clamp bound for the derived floor.
+///
+/// Two reasons this is 0.80 (was 0.75): it keeps the anchored fire factor
+/// ≥ (POS_MATCH_COSINE_ANCHOR − 0.80)/(1 − 0.80) = 0.45, so the static rolling
+/// threshold ≥ 3 × 0.45 = 1.35 > 1.0 — a single frame can never fire (the
+/// multi-frame temporal guard is preserved); and it leaves a minimal soft
+/// band for reset/adaptive resolution.
+const MAX_SOFT_FLOOR: f32 = 0.80;
+
+/// Fallback cosine floor when the enrollment collected no usable negatives.
 const DEFAULT_SOFT_FLOOR: f32 = 0.55;
+
+/// Standard-normal 99th-percentile z-score.
+///
+/// The floor is the parametric p99 estimate `neg_mean + NEG_TAIL_Z × neg_std`.
+/// Parametric on purpose: the empirical nearest-rank p99 equals the single
+/// maximum for pools of n ≤ 51 (live enrollments have n ≈ 11), which is
+/// outlier-driven and would compress the positive soft range; mean/std are
+/// stable sufficient statistics at any pool size.
+const NEG_TAIL_Z: f32 = 2.33;
+
+/// Empirically validated static firing point in RAW cosine space.
+///
+/// The encoder scale is absolute and does not move with the negative pool, so
+/// this anchor pins the effective firing cosine.  Provenance: with the
+/// historical floor 0.75 and factor 0.55 the effective firing cosine was
+/// 0.75 + 0.55 × 0.25 = 0.8875 at 90% bench recall; raising the floor to 0.85
+/// at the same factor (firing 0.9325) collapsed recall to 37.5%.  0.89 anchors
+/// recall while the raised floor zeroes the negative bulk.
+const POS_MATCH_COSINE_ANCHOR: f32 = 0.89;
+
+/// Legacy per-frame soft-score factor; the effective static fire factor is its
+/// min with the anchor-derived cap ([`Calibration::fire_soft`]).
+const MATCH_THRESHOLD_FACTOR: f32 = 0.55;
+
+/// The no-match reset threshold is this ratio × the fire factor (≈ the
+/// historical 0.35/0.55), keeping the frame-accumulation band proportional to
+/// the firing bar so a raised floor never pushes genuine wake frames below the
+/// reset line.
+const RESET_FIRE_RATIO: f32 = 0.64;
 
 /// Enrollment consistency: minimum cosine between an utterance embedding and
 /// the centroid, and the fraction of utterances that must pass.
@@ -189,21 +227,59 @@ pub(crate) struct Calibration {
     pub(crate) neg_mean: f32,
     /// Standard deviation of the negative cosine distribution.
     pub(crate) neg_std: f32,
-    /// 99th percentile of the negative cosine distribution — the calibration
-    /// floor source ([`Calibration::soft_floor`]).
+    /// Raw (unclamped) 99th percentile of the negative cosine distribution —
+    /// diagnostic/observability only.  The scoring floor is derived
+    /// parametrically from [`neg_mean`](Self::neg_mean)/
+    /// [`neg_std`](Self::neg_std) (see [`Calibration::soft_floor`]).  Old
+    /// records store a clamped value here, which is harmless because scoring
+    /// never reads it.
     pub(crate) neg_p99: f32,
     /// Number of negative windows scored.
     pub(crate) n_negatives: usize,
 }
 
 impl Calibration {
-    /// Cosine floor for the soft-score mapping: `neg_p99` clamped to
+    /// Cosine floor for the soft-score mapping: the parametric p99 estimate
+    /// `neg_mean + NEG_TAIL_Z × neg_std`, clamped to
     /// [`DEFAULT_SOFT_FLOOR`]..=[`MAX_SOFT_FLOOR`].  Scores below the floor map
     /// to ~0, so the negative material sits at the bottom of the soft-score
     /// range.
+    ///
+    /// Derived at scoring time from the persisted sufficient statistics
+    /// (mean/std) so EXISTING enrollments (whose stored p99 was clamped) get
+    /// the corrected floor without re-enrollment.  When no usable negatives
+    /// exist (`n_negatives == 0` or non-finite mean/std, or non-finite
+    /// parametric estimate) the default floor is returned.
     #[must_use]
     pub(crate) fn soft_floor(&self) -> f32 {
-        self.neg_p99.clamp(DEFAULT_SOFT_FLOOR, MAX_SOFT_FLOOR)
+        if self.n_negatives == 0 || !self.neg_mean.is_finite() || !self.neg_std.is_finite() {
+            return DEFAULT_SOFT_FLOOR;
+        }
+        let parametric = self.neg_mean + NEG_TAIL_Z * self.neg_std;
+        if !parametric.is_finite() {
+            return DEFAULT_SOFT_FLOOR;
+        }
+        parametric.clamp(DEFAULT_SOFT_FLOOR, MAX_SOFT_FLOOR)
+    }
+
+    /// Per-frame soft-score factor for the static detection threshold — the
+    /// min of the legacy factor [`MATCH_THRESHOLD_FACTOR`] and the
+    /// [`POS_MATCH_COSINE_ANCHOR`]-derived cap.
+    ///
+    /// For floors ≤ ≈0.7556 this equals the legacy factor exactly (behavior
+    /// unchanged); hotter floors are anchored at [`POS_MATCH_COSINE_ANCHOR`]
+    /// so recall survives the raised floor.
+    #[must_use]
+    pub(crate) fn fire_soft(&self) -> f32 {
+        let floor = self.soft_floor();
+        MATCH_THRESHOLD_FACTOR.min((POS_MATCH_COSINE_ANCHOR - floor) / (1.0 - floor))
+    }
+
+    /// Per-frame reset threshold in soft space — [`RESET_FIRE_RATIO`] ×
+    /// [`Calibration::fire_soft`].
+    #[must_use]
+    pub(crate) fn reset_soft(&self) -> f32 {
+        RESET_FIRE_RATIO * self.fire_soft()
     }
 
     /// Map a raw cosine ([-1,1]) into the soft-score space [0,1] used by the
@@ -215,12 +291,15 @@ impl Calibration {
     }
 }
 
+/// Default calibration represents an enrollment with no usable negatives:
+/// `soft_floor()` = [`DEFAULT_SOFT_FLOOR`] and `fire_soft()` =
+/// [`MATCH_THRESHOLD_FACTOR`].
 impl Default for Calibration {
     fn default() -> Self {
         Self {
             neg_mean: 0.0,
             neg_std: 0.0,
-            neg_p99: DEFAULT_SOFT_FLOOR,
+            neg_p99: 0.0, // raw unknown — see [`Calibration::soft_floor`]
             n_negatives: 0,
         }
     }
@@ -345,7 +424,11 @@ impl WakeWordEnrollment {
     /// "mahbot" prototype AND the "madbot" anti-prototype, but it is closer
     /// to the latter, so the comparison collapses it.  Windows closer to the
     /// prototype are scored by the plain positive cosine through the
-    /// calibration floor.
+    /// calibration floor.  The calibration floor is derived parametrically
+    /// from the negative sufficient statistics, and the anti-prototype veto
+    /// remains the discriminative defense for windows resembling a negative
+    /// MORE than the wake word (the floor handles the absolute negative bulk;
+    /// the veto handles lookalikes above it).
     #[must_use]
     pub(crate) fn soft_score(&self, embedding: &[f32]) -> f32 {
         let pos = self.cosine(embedding);
@@ -414,11 +497,13 @@ pub(crate) fn distill_negative_prototypes(negatives: &[Vec<f32>]) -> Vec<Vec<f32
 /// Compute calibration stats from negative window embeddings (already
 /// L2-normalized) against the prototype.
 ///
-/// The floor is the **99th percentile** of the negative cosine distribution —
-/// the confusable near-miss tail ("madbot" vs "mahbot") is the discriminative
-/// signal (a p95 floor would leave ~5% of that tail above it).  With fewer
-/// than 4 negatives, falls back to `mean + 2σ` (or the default floor when σ
-/// is degenerate).
+/// The scoring floor is no longer taken from the 99th percentile — scoring
+/// derives it parametrically from the negative mean/std (see
+/// [`Calibration::soft_floor`]), robust for small pools where the empirical
+/// p99 is just the maximum.  The raw 99th percentile is persisted for
+/// diagnostics only.  With fewer than 4 negatives, the small-n branch computes
+/// the p99 as `mean + 2σ` (or the max when σ is degenerate) — still stored raw
+/// for the diagnostic.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
@@ -447,11 +532,9 @@ pub(crate) fn calibrate_negatives(prototype: &[f32], negatives: &[Vec<f32>]) -> 
     Calibration {
         neg_mean: mean,
         neg_std: std,
-        // The floor is clamped into the meaningful soft-score range
-        // [DEFAULT_SOFT_FLOOR, MAX_SOFT_FLOOR] — [`Calibration::soft_floor`]
-        // re-clamps to the same range (the clamp here keeps the persisted
-        // p99 field itself canonical).
-        neg_p99: p99.clamp(DEFAULT_SOFT_FLOOR, MAX_SOFT_FLOOR),
+        // Raw, unclamped — diagnostic/observability only; scoring derives the
+        // floor parametrically from the sufficient statistics (soft_floor).
+        neg_p99: p99,
         n_negatives: n,
     }
 }
@@ -500,9 +583,9 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        // 20 genuinely distinct negative directions at cosines 0.20..0.44 —
-        // all below the default floor.  p99 ≈ 0.44 clamps to the default
-        // floor (0.55), and every negative maps to soft score 0.
+        // 20 genuinely distinct negative directions at cosines 0.20..0.4375 —
+        // all below the derived parametric floor (≈0.487), which clamps to the
+        // default floor (0.55), and every negative maps to soft score 0.
         let negatives: Vec<Vec<f32>> = (0..20)
             .map(|i| {
                 #[expect(clippy::cast_precision_loss)] // i ∈ 0..20 — exact in f32
@@ -526,14 +609,13 @@ mod tests {
             );
         }
         let cal = calibrate_negatives(&proto, &negatives);
-        assert!(
-            (cal.neg_p99 - DEFAULT_SOFT_FLOOR).abs() < 1e-6,
-            "p99 below the floor must clamp to the default floor, got {}",
-            cal.neg_p99,
-        );
         #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
         {
-            assert_eq!(cal.soft_floor(), DEFAULT_SOFT_FLOOR);
+            assert_eq!(
+                cal.soft_floor(),
+                DEFAULT_SOFT_FLOOR,
+                "parametric floor below DEFAULT must clamp to DEFAULT",
+            );
         }
         for n in &negatives {
             #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
@@ -545,9 +627,9 @@ mod tests {
         let match_emb = unit_with_cosine(&proto, 0.9, 999);
         assert!(cal.soft_score(cosine_similarity(&match_emb, &proto)) > 0.5);
 
-        // Second band: negatives clustered HIGH (cosine ~0.70) — the p99
-        // floor must follow the data (floor > default), proving calibration
-        // is not just the default clamp.
+        // Second band: negatives clustered HIGH (cosine ~0.70) — the derived
+        // parametric floor (≈0.712) must follow the data (floor > default),
+        // proving calibration is not just the default clamp.
         let hot_negatives: Vec<Vec<f32>> = (0..10)
             .map(|i| {
                 #[expect(clippy::cast_precision_loss)] // i ∈ 0..10 — exact in f32
@@ -572,6 +654,100 @@ mod tests {
         }
         let strong = unit_with_cosine(&proto, 0.9, 998);
         assert!(hot.soft_score(cosine_similarity(&strong, &proto)) > 0.5);
+    }
+
+    #[test]
+    fn floor_is_parametric_from_sufficient_stats() {
+        // The shape of existing persisted enrollments: a clamped p99 (0.75)
+        // with raw mean/std.  Scoring must derive a working floor from the
+        // sufficient statistics so these records get corrected without
+        // re-enrollment.
+        let cal = Calibration {
+            neg_mean: 0.4756,
+            neg_std: 0.1133,
+            neg_p99: 0.75,
+            n_negatives: 11,
+        };
+        assert!(
+            (cal.soft_floor() - 0.7396).abs() < 1e-3,
+            "parametric floor from sufficient stats should be ≈0.7396, got {}",
+            cal.soft_floor(),
+        );
+        #[expect(clippy::float_cmp)] // anchor cap not engaged at ≈0.7396 — exact min
+        {
+            assert_eq!(
+                cal.fire_soft(),
+                MATCH_THRESHOLD_FACTOR,
+                "anchor cap must not engage at floor ≈0.7396 → legacy factor stays",
+            );
+        }
+
+        // n_negatives == 0 → default floor (no usable negatives).
+        let none = Calibration {
+            neg_mean: 0.0,
+            neg_std: 0.0,
+            neg_p99: 0.0,
+            n_negatives: 0,
+        };
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(none.soft_floor(), DEFAULT_SOFT_FLOOR);
+        }
+
+        // Non-finite std → default floor.
+        let nan_std = Calibration {
+            neg_mean: 0.5,
+            neg_std: f32::NAN,
+            neg_p99: 0.6,
+            n_negatives: 10,
+        };
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(nan_std.soft_floor(), DEFAULT_SOFT_FLOOR);
+        }
+    }
+
+    #[test]
+    fn hot_pool_floor_saturates_and_anchors() {
+        // A very hot negative pool (mean 0.80, std 0.06) saturates the derived
+        // floor at MAX_SOFT_FLOOR (0.80) and anchors the fire factor at
+        // (0.89−0.80)/0.20 = 0.45, so the reset tracks proportionally.
+        let cal = Calibration {
+            neg_mean: 0.80,
+            neg_std: 0.06,
+            neg_p99: 0.97,
+            n_negatives: 200,
+        };
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(
+                cal.soft_floor(),
+                MAX_SOFT_FLOOR,
+                "hot pool floor must saturate at MAX_SOFT_FLOOR",
+            );
+        }
+        let fire = cal.fire_soft();
+        assert!(
+            (fire - 0.45).abs() < 1e-3,
+            "anchored fire factor should be ≈0.45, got {fire}",
+        );
+        let reset = cal.reset_soft();
+        assert!(
+            (reset - 0.288).abs() < 1e-3,
+            "reset should be ≈0.288, got {reset}",
+        );
+        // A negative at the mean maps to soft 0.0.
+        #[expect(clippy::float_cmp)] // deterministic clamp/soft-score math
+        {
+            assert_eq!(cal.soft_score(0.80), 0.0);
+        }
+        // A negative at mean+1σ maps below the fire factor (accumulates but
+        // cannot fire alone).
+        let at_1sig = cal.soft_score(0.86);
+        assert!(
+            at_1sig < fire,
+            "negative at mean+1σ must be below fire factor, got {at_1sig} > {fire}",
+        );
     }
 
     #[test]

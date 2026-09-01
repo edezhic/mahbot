@@ -2580,13 +2580,20 @@ pub(crate) fn run_wake_word_benchmark() {
         );
         return;
     };
+    let calibration = enrollment.calibration.clone();
+    #[expect(clippy::cast_precision_loss)] // ROLLING_WINDOW_N small — exact in f32
+    let static_match_threshold = (super::ROLLING_WINDOW_N as f32) * calibration.fire_soft();
     info!(
-        "Enrollment built: phrase='{}', {} utterances, calibration neg_mean={:.4} (p99={:.4}, n={})",
+        "Enrollment built: phrase='{}', {} utterances, calibration neg_mean={:.4} (p99={:.4}, n={}), \
+         derived_floor={:.4}, fire_factor={:.4}, static_threshold={:.4}",
         enrollment.phrase,
         enrollment.utterance_count,
-        enrollment.calibration.neg_mean,
-        enrollment.calibration.neg_p99,
-        enrollment.calibration.n_negatives,
+        calibration.neg_mean,
+        calibration.neg_p99,
+        calibration.n_negatives,
+        calibration.soft_floor(),
+        calibration.fire_soft(),
+        static_match_threshold,
     );
     super::set_enrollment(enrollment);
 
@@ -2637,7 +2644,11 @@ pub(crate) fn run_wake_word_benchmark() {
         );
     }
     let mut fa_metrics = DetectionMetrics::default();
-    let mut shared_adaptive = super::AdaptiveThresholdState::warmed();
+    // The warm pass's adaptive harbor must be the bench enrollment's own
+    // co-derived static threshold — not the no-enrollment default (1.65),
+    // which would silently raise the false-reaction bar for a hot-floor
+    // enrollment (static 1.35).
+    let mut shared_adaptive = super::AdaptiveThresholdState::warmed(static_match_threshold);
     test_detection_samples(
         &negative_corpus.confusable,
         &mut fa_metrics,
@@ -2697,6 +2708,16 @@ pub(crate) fn run_wake_word_benchmark() {
             "rate": recognition_rate,
             "basis": "existing 40-clip held-out wake-only basis (enrolled voice, \
                       seeds 3000+, fixed bench phrase)",
+        },
+        "calibration": {
+            "neg_mean": calibration.neg_mean,
+            "neg_std": calibration.neg_std,
+            "neg_p99": calibration.neg_p99,
+            "n_negatives": calibration.n_negatives,
+            "derived_soft_floor": calibration.soft_floor(),
+            "static_match_threshold": static_match_threshold,
+            "note": "harness calibration is in-memory only (never persisted) and \
+                     differs from any live production enrollment",
         },
         "false_reactions": {
             "non_phrase_set": {
