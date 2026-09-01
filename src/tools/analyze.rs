@@ -1491,6 +1491,7 @@ async fn run_claim_verifier(
         Role::Analyst,
         ws,
         task,
+        false,
         Some(round),
         parent_key,
         Some(question.to_string()),

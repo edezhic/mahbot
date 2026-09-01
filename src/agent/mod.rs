@@ -602,7 +602,9 @@ impl Agent {
         // check fires. The round is cut before any LLM work; boot resume
         // continues the session.
         if crate::shutdown::aborting() {
-            anyhow::bail!("Agent round cut short by shutdown/drain — resumes at boot");
+            anyhow::bail!(
+                "Agent round cut short by shutdown/drain — session is durable; resumes when re-driven"
+            );
         }
 
         // A resumed stage-agent round starting with an empty message would
@@ -665,7 +667,7 @@ impl Agent {
                 // fires). The round is resumed at boot via the job row
                 // (status='launched').
                 if crate::shutdown::aborting() {
-                    anyhow::bail!("Agent round cut short by shutdown/drain — resumes at boot");
+                    anyhow::bail!("Agent round cut short by shutdown/drain — session is durable; resumes when re-driven");
                 }
                 if tool_rounds >= MAX_TOOL_ROUNDS {
                     anyhow::bail!(
@@ -2089,18 +2091,23 @@ pub(crate) async fn run_agent(
     outcome
 }
 
-/// Default dispatch: no ticket, empty user/channel, no inbox, no resume.
+/// Default dispatch: no ticket, empty user/channel, no inbox.
+///
+/// `resume` selects the slot-resume primitive (empty committed-tail
+/// continuation, summarization skipped); default `false` for fresh dispatches.
 ///
 /// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
 /// Running Agents view (ticket / analyze round / research run); `None` for
 /// workspace singletons (manager / maintainer / discovery / direct chat).
 /// `parent_label` is the human-readable label of that parent invocation
 /// (analyze question / research question) — purely presentational.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_default_agent(
     agent_id: &str,
     role: crate::Role,
     ws: &crate::Workspace,
     message: &str,
+    resume: bool,
     round: Option<RoundOpts>,
     parent_key: Option<crate::agent::registry::ParentKey>,
     parent_label: Option<String>,
@@ -2115,7 +2122,7 @@ pub(crate) async fn run_default_agent(
         String::new(),
         false,
         None,
-        false,
+        resume,
         round,
         parent_key,
         parent_label,

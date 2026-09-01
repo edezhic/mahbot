@@ -225,11 +225,6 @@ pub struct Workspace {
     /// when the pause lands can still clear it on completion — residual race,
     /// see `finalize_discovery`.
     pub paused: bool,
-    /// Minutes until the next maintainer run.
-    /// Reset to 1 when a run creates tickets; doubled on empty runs
-    /// (clamped to [5, 240] before doubling, hard‑capped at 240).
-    /// Sequence after ticket creation: 1 → (if next empty) 10 → 20 → … → 240.
-    pub maintainer_debounce_mins: i64,
     /// RFC 3339 timestamp of the last completed maintainer run.
     /// `None` means the workspace has never been maintained.
     pub maintainer_last_run_at: Option<String>,
@@ -261,7 +256,6 @@ impl Default for Workspace {
             status: WorkspaceStatus::Pending,
             maintenance_enabled: bool::default(),
             paused: bool::default(),
-            maintainer_debounce_mins: 5,
             maintainer_last_run_at: Option::default(),
             diagnostics: Option::default(),
             notes: String::default(),
@@ -272,14 +266,10 @@ impl Default for Workspace {
 }
 
 impl Workspace {
-    /// Maximum allowed maintainer debounce in minutes (4 hours).
-    ///
-    /// Used as both the input-clamp upper bound before doubling and the
-    /// absolute output cap after doubling in `advance_debounce`; also
-    /// used as the cap in `should_skip_maintainer_debounce` and the
-    /// GUI display. If these two semantics ever need to diverge, introduce
-    /// a separate constant for the input-clamp bound.
-    pub const MAX_MAINTAINER_DEBOUNCE_MINS: i64 = 240;
+    /// Fixed scheduling gate between maintainer runs, in minutes. The former
+    /// per-workspace adaptive debounce (create_ticket-count escalation) was
+    /// removed; this constant is the only gate for fresh runs.
+    pub const MAINTAINER_DEBOUNCE_MINS: i64 = 5;
 
     /// Return the workspace path as a `&Path`.
     #[must_use]

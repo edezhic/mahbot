@@ -52,21 +52,6 @@ pub struct ToolErrorQuery {
 }
 
 impl crate::logs::LogStore {
-    /// Query the count of tool calls for a given agent and tool.
-    ///
-    /// Uses `COUNT(*)` which always returns a row.
-    pub(crate) async fn query_tool_usage(&self, agent_id: &str, tool_name: &str) -> Result<i64> {
-        self.conn
-            .query_optional(
-                "SELECT COUNT(*) FROM tool_calls \
-                 WHERE agent_id = ?1 AND tool_name = ?2",
-                db::params![agent_id, tool_name],
-                |row| row.get::<i64>(0),
-            )
-            .await
-            .map(|opt| opt.expect("COUNT(*) aggregate always returns a row"))
-    }
-
     /// Query tool call error entries with optional filters and pagination.
     ///
     /// Returns `(entries, total_count)` where each entry corresponds to a
@@ -525,7 +510,7 @@ mod tests {
     }
 
     /// Integration test: write per-call records via flush_batch, then verify
-    /// they can be read back via query_tool_usage and query_tool_errors.
+    /// they can be read back via query_tool_errors.
     /// Uses the logs store (the consolidated home of the stats tables).
     #[tokio::test]
     async fn flush_and_query_round_trip() {
@@ -560,25 +545,6 @@ mod tests {
             .flush_batch("test-agent", "Engineer", "my-workspace", &records)
             .await
             .expect("flush_batch");
-
-        // Verify query_tool_usage (COUNT)
-        let count = store
-            .query_tool_usage("test-agent", "create_ticket")
-            .await
-            .expect("query_tool_usage");
-        assert_eq!(count, 1, "should have 1 create_ticket call");
-
-        let count = store
-            .query_tool_usage("test-agent", "read")
-            .await
-            .expect("query_tool_usage");
-        assert_eq!(count, 1, "should have 1 read call");
-
-        let count = store
-            .query_tool_usage("test-agent", "nonexistent")
-            .await
-            .expect("query_tool_usage");
-        assert_eq!(count, 0, "should have 0 nonexistent calls");
 
         // Verify query_tool_errors — only the 'write' call failed
         let (errors, total) = store

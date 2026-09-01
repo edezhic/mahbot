@@ -23,11 +23,16 @@ const MAX_PRE_DEV_TICKETS: i64 = 5;
 /// Run the maintainer background loop.
 ///
 /// Runs a Maintainer agent per workspace with the investigation prompt.
-/// On success (agent produced a response), updates `maintainer_last_run_at`
-/// and adjusts debounce: resets to 1 min if tickets were created, advances
-/// otherwise (`advance_debounce`: clamps current to [`MAX_MAINTAINER_DEBOUNCE_MINS`](crate::Workspace::MAX_MAINTAINER_DEBOUNCE_MINS),
-/// doubles, caps at that value — producing the sequence 1 → 10 → 20 → … → `MAX_MAINTAINER_DEBOUNCE_MINS`).
-/// On cancellation or error, debounce and last-run timestamp are left unchanged.
+/// The agent id is deterministic (`maintainer_{ws}`) so runs are resumable:
+/// a content-bearing session means an interrupted run, which is resumed with
+/// an empty message and `resume = true` (bypassing the debounce gate — it is
+/// not a new run). On success the created tickets are the durable outcome and
+/// the session is deleted so the next cycle starts fresh; `maintainer_last_run_at`
+/// is updated only on success. On failure or cancellation the session is kept
+/// so the next cycle naturally resumes — unlike the pre-resume behavior, a
+/// failed run is retried on the very next 1-minute cycle (resume bypasses the
+/// debounce gate), which is accepted: repeated insta-deaths are a bug to fix
+/// at root cause, not to paper over.
 ///
 /// ## Concurrency
 ///
@@ -39,10 +44,14 @@ const MAX_PRE_DEV_TICKETS: i64 = 5;
 /// ## Behavioural notes
 ///
 /// * **Pipeline throttle**: `is_maintainer_pipeline_full` checks run concurrently
-///   for all workspaces rather than sequentially. The
-///   [`MAX_PRE_DEV_TICKETS`] throttle therefore sees a slightly wider window
-///   of concurrent ticket counts — acceptable since the maintainer is
-///   best-effort and the per-workspace count check is still atomic.
+///   for all workspaces rather than sequentially, so the pre-dev ticket-count
+///   throttle sees a slightly wider window of concurrent ticket counts —
+///   acceptable since the maintainer is best-effort and the per-workspace
+///   count check is still atomic.
+/// * **Double-dispatch guard**: a defensive registry check per task — a live
+///   run for the same deterministic id is never re-dispatched. The loop
+///   itself is sequential (`join_all` blocks the next cycle), so the guard
+///   only fires if a future dispatch path ever overlaps.
 /// * **Shutdown**: all matching workspaces are spawned in a single batch even
 ///   if shutdown fires during dispatch; each task independently checks
 ///   cancellation before the LLM call. The original sequential loop's
@@ -91,15 +100,28 @@ pub async fn run_maintainer_loop() {
                     info!(workspace = %ws.name, status = %ws.status, "Maintainer: skipping — workspace not ready");
                     return false;
                 }
-                if should_skip_maintainer_debounce(ws) {
-                    return false;
-                }
                 true
             })
             .map(|ws| {
                 let prompt = prompt.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
+                    // Deterministic agent ID — the session doubles as the resume state.
+                    let agent_id = crate::session::maintainer_agent_id(&ws.name);
+
+                    // Defensive double-dispatch guard: never re-dispatch a live
+                    // run for the same deterministic ID.
+                    if crate::agent::registry::AGENT_REGISTRY.contains(&agent_id) {
+                        return;
+                    }
+
+                    // Resume decision: a session with content is an interrupted run to
+                    // continue — resume bypasses the debounce gate (it is not a new run).
+                    let resume = crate::session::store().has_content(&agent_id).await;
+                    if !resume && should_skip_maintainer_debounce(&ws) {
+                        return;
+                    }
+
                     // Async pre-check (DB query) — cannot live in a sync .filter closure.
                     if is_maintainer_pipeline_full(&ws).await {
                         return;
@@ -110,36 +132,41 @@ pub async fn run_maintainer_loop() {
                         return;
                     }
 
-                    // Unique agent ID per run — don't accumulate history
-                    let agent_id = crate::session::maintainer_agent_id(&ws.name);
+                    info!(workspace = %ws.name, agent_id = %agent_id, resumed = resume, "Maintainer: starting maintenance run");
 
-                    info!(workspace = %ws.name, agent_id = %agent_id, "Maintainer: starting maintenance run");
-
-                    let (agent, response) =
-                        run_default_agent(&agent_id, Role::Maintainer, &ws, &prompt, None, None, None)
-                            .await;
+                    let message = if resume { "" } else { prompt.as_str() };
+                    let (_, response) = run_default_agent(
+                        &agent_id,
+                        Role::Maintainer,
+                        &ws,
+                        message,
+                        resume,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
 
                     if let Some(_response) = response {
                         info!(workspace = %ws.name, "Maintainer: run complete");
 
-                        // ── Debounce update after successful run ──────────────────
-                        let now_str = db::now();
-                        let new_debounce = compute_debounce(
-                            &agent.agent_id,
-                            ws.maintainer_debounce_mins,
-                            ws.name.as_str(),
-                        )
-                        .await;
-
+                        // ── Completion: clean state for the next cycle ─────────────────────────
+                        // The created tickets are the durable outcome, not the transcript —
+                        // delete the session so the next run starts fresh (does not rely on
+                        // TTL cleanup), then record the last-run timestamp.
+                        if let Err(e) = crate::session::store().delete(&agent_id).await {
+                            warn!(workspace = %ws.name, error = %e, "Maintainer: failed to delete completed session");
+                        }
                         if let Err(e) = crate::workspace::store()
-                            .set_maintenance_debounce(&ws.name, new_debounce, &now_str)
+                            .set_maintainer_last_run_at(&ws.name, &db::now())
                             .await
                         {
-                            warn!(workspace = %ws.name, error = %e, "Maintainer: failed to update debounce state");
+                            warn!(workspace = %ws.name, error = %e, "Maintainer: failed to update last-run timestamp");
                         }
                     } else {
-                        // Error or cancellation — do NOT advance debounce, do NOT update last_run_at
-                        info!(workspace = %ws.name, "Maintainer: run failed or cancelled — debounce unchanged");
+                        // Error or cancellation — keep the session so the next cycle
+                        // naturally resumes; do NOT update last_run_at.
+                        info!(workspace = %ws.name, "Maintainer: run failed or cancelled — session kept for resume, last_run_at unchanged");
                     }
 
                     // Backlog tickets are discovered by the poll loop (BacklogAnalysis),
@@ -157,23 +184,22 @@ pub async fn run_maintainer_loop() {
     }
 }
 
-/// Returns `true` if the maintainer should skip this workspace due to debounce.
+/// Returns `true` if the maintainer should skip this workspace due to the
+/// fixed debounce gate.
 ///
 /// Checks whether enough time has passed since the last maintainer run by
 /// parsing `maintainer_last_run_at`, computing elapsed time relative to the
-/// debounce interval. On parse errors (stale data) or when `last_run_at` is
-/// `None` (first run), returns `false` to allow the run.
+/// [`Workspace::MAINTAINER_DEBOUNCE_MINS`] interval. On parse errors (stale data) or
+/// when `last_run_at` is `None` (first run), returns `false` to allow the run
+/// (fail-open).
 fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
     let now = Utc::now();
-    let debounce = ws
-        .maintainer_debounce_mins
-        .clamp(0, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS);
     if let Some(ref last_str) = ws.maintainer_last_run_at {
         match db::parse_utc_timestamp(last_str) {
             Ok(last_time) => {
                 let elapsed = now - last_time;
                 let mins_elapsed = elapsed.num_minutes();
-                if mins_elapsed < debounce {
+                if mins_elapsed < Workspace::MAINTAINER_DEBOUNCE_MINS {
                     return true;
                 }
             }
@@ -229,59 +255,18 @@ async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
     false
 }
 
-/// Compute the new debounce value based on whether the agent produced tickets.
-///
-/// - If `create_ticket` was called → reset to 1.
-/// - If no `create_ticket` calls → double (clamped to `[5, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS]`, capped at `Workspace::MAX_MAINTAINER_DEBOUNCE_MINS`).
-async fn compute_debounce(agent_id: &str, current: i64, ws_name: &str) -> i64 {
-    // Fail-open: no logs store (test contexts) advances the debounce.
-    let Some(store) = crate::logs::LOG_STORE.get() else {
-        return advance_debounce(current);
-    };
-
-    match store.query_tool_usage(agent_id, "create_ticket").await {
-        Ok(call_count) if call_count > 0 => {
-            info!(workspace = %ws_name, "Maintainer: produced tickets — reset debounce to 1");
-            1
-        }
-        Ok(_) => {
-            let new_val = advance_debounce(current);
-            if new_val >= Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
-                && current < Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
-            {
-                info!(workspace = %ws_name, "Maintainer: no tickets created — debounce capped at {}", Workspace::MAX_MAINTAINER_DEBOUNCE_MINS);
-            } else {
-                info!(workspace = %ws_name, "Maintainer: no tickets created — debounce advanced to {new_val}");
-            }
-            new_val
-        }
-        Err(e) => {
-            warn!(workspace = %ws_name, error = %e, "Maintainer: stats query failed, advancing debounce");
-            advance_debounce(current)
-        }
-    }
-}
-
-/// Double the debounce value, clamped to `[5, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS]`
-/// with a hard cap at `Workspace::MAX_MAINTAINER_DEBOUNCE_MINS`.
-fn advance_debounce(mins: i64) -> i64 {
-    (mins.clamp(5, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS) * 2)
-        .min(Workspace::MAX_MAINTAINER_DEBOUNCE_MINS)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Minimal workspace with only the fields relevant to debounce tests.
-    fn ws_with(last_run_at: Option<&str>, debounce_mins: i64) -> Workspace {
+    fn ws_with(last_run_at: Option<&str>) -> Workspace {
         Workspace {
             name: "test-ws".into(),
             path: "/tmp/test".into(),
             status: WorkspaceStatus::Ready,
             maintenance_enabled: true,
             paused: false,
-            maintainer_debounce_mins: debounce_mins,
             maintainer_last_run_at: last_run_at.map(String::from),
             diagnostics: None,
             notes: String::new(),
@@ -292,43 +277,32 @@ mod tests {
 
     /// Table-driven test for all `should_skip_maintainer_debounce` cases.
     ///
-    /// Reasoning for the "just ran" cases: both `now_str` cases evaluate
-    /// against the same instant, so any near-zero elapsed time produces
-    /// `elapsed < debounce` → `true`. The 500 value is clamped to 240
-    /// internally, so the behaviour is identical to the 240 case.
+    /// Reasoning for the "just ran" case: `now_str` evaluates against the
+    /// same instant, so any near-zero elapsed time produces
+    /// `elapsed < debounce` → `true`.
     #[test]
     fn should_skip_maintainer_debounce_cases() {
         let now_str = Utc::now().to_rfc3339();
         let cases = [
             (
-                ws_with(None, 5),
+                ws_with(None),
                 false,
                 "no prior run → last_run_at is None → no debounce",
             ),
             (
-                ws_with(Some("garbage-timestamp"), 5),
+                ws_with(Some("garbage-timestamp")),
                 false,
                 "unparseable timestamp → parse error → let through",
             ),
             (
-                ws_with(Some(&now_str), Workspace::MAX_MAINTAINER_DEBOUNCE_MINS),
+                ws_with(Some(&now_str)),
                 true,
-                "just ran — elapsed ~0s < 240 → skip",
+                "just ran — elapsed < 5 min → skip",
             ),
             (
-                ws_with(Some("2020-01-01T00:00:00Z"), 5),
+                ws_with(Some("2020-01-01T00:00:00Z")),
                 false,
                 "long ago — many years elapsed >= 5 → let through",
-            ),
-            (
-                ws_with(Some("2020-01-01T00:00:00Z"), -5),
-                false,
-                "debounce clamped from -5 to 0 → mins_elapsed < 0 never true",
-            ),
-            (
-                ws_with(Some(&now_str), 500),
-                true,
-                "debounce clamped from 500 to 240 → elapsed ~0s < 240 → skip",
             ),
         ];
         for (ws, expected, reason) in &cases {
@@ -338,38 +312,5 @@ mod tests {
                 "case: {reason}"
             );
         }
-    }
-
-    #[test]
-    fn advance_debounce_edges() {
-        // Floor: values below 5 clamp to 5, then double to 10.
-        assert_eq!(advance_debounce(0), 10);
-        assert_eq!(advance_debounce(4), 10);
-        assert_eq!(advance_debounce(5), 10);
-
-        // Normal doubling.
-        assert_eq!(advance_debounce(6), 12);
-        assert_eq!(advance_debounce(60), 120);
-
-        // Cap: 119 doubles to 238; 120 doubles to MAX; 121 clamps→MAX; MAX stays at MAX.
-        assert_eq!(advance_debounce(119), 238);
-        assert_eq!(
-            advance_debounce(120),
-            Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
-        );
-        assert_eq!(
-            advance_debounce(121),
-            Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
-        );
-        assert_eq!(
-            advance_debounce(240),
-            Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
-        );
-
-        // Above MAX — clamp brings it down, then double hits cap.
-        assert_eq!(
-            advance_debounce(300),
-            Workspace::MAX_MAINTAINER_DEBOUNCE_MINS
-        );
     }
 }

@@ -45,7 +45,6 @@ crate::columns! {
         STATUS                => "status",
         MAINTENANCE_ENABLED    => "maintenance",
         PAUSED                => "paused",
-        MAINTAINER_DEBOUNCE_MINS => "maintainer_debounce_mins",
         MAINTAINER_LAST_RUN_AT  => "maintainer_last_run_at",
         DIAGNOSTICS           => "diagnostics",
         NOTES                  => "notes",
@@ -170,8 +169,17 @@ async fn run_discovery_task(
 
     // Create a Discovery agent pointed at the workspace
     let agent_id = discovery_agent_id(&ws.name, label);
-    let (agent, response) =
-        run_default_agent(&agent_id, Role::Discovery, ws, &prompt, None, None, None).await;
+    let (agent, response) = run_default_agent(
+        &agent_id,
+        Role::Discovery,
+        ws,
+        &prompt,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await;
     let Some(response) = response else {
         return Err(discovery_no_response_error(&agent, "Discovery"));
     };
@@ -238,8 +246,17 @@ async fn run_workspace_diagnostics(
     // Load the diagnostics discovery prompt directly (not a role-specific discovery prompt).
     let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");
 
-    let (agent, response) =
-        run_default_agent(&agent_id, Role::Discovery, ws, &prompt, None, None, None).await;
+    let (agent, response) = run_default_agent(
+        &agent_id,
+        Role::Discovery,
+        ws,
+        &prompt,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await;
     let Some(_response) = response else {
         return Err(discovery_no_response_error(&agent, "Diagnostics discovery"));
     };
@@ -939,7 +956,6 @@ fn workspace_from_row(row: &db::Row) -> anyhow::Result<Workspace> {
             .parse::<WorkspaceStatus>()?,
         maintenance_enabled: row.get::<bool>(COL_WS_MAINTENANCE_ENABLED)?,
         paused: row.get::<bool>(COL_WS_PAUSED)?,
-        maintainer_debounce_mins: row.get::<i64>(COL_WS_MAINTAINER_DEBOUNCE_MINS)?,
         maintainer_last_run_at: row.get::<Option<String>>(COL_WS_MAINTAINER_LAST_RUN_AT)?,
         diagnostics: row.get::<Option<String>>(COL_WS_DIAGNOSTICS)?,
         notes: row.get::<String>(COL_WS_NOTES)?,
@@ -1122,11 +1138,11 @@ impl WorkspaceStore {
     pub async fn set_maintenance_enabled(&self, name: &str, enabled: bool) -> Result<()> {
         let val: i64 = i64::from(enabled);
         if enabled {
-            // Reset debounce state so the maintainer runs on the very next
-            // 1-minute poll cycle (last_run_at = NULL bypasses the debounce
-            // gate), regardless of how long the previous interval was.
+            // last_run_at = NULL lets the maintainer run on the very next
+            // 1-minute poll cycle; a kept interrupted session resumes
+            // regardless (resume bypasses the debounce gate).
             self.exec_update_with_updated_at(
-                "maintenance = ?, maintainer_debounce_mins = 5, maintainer_last_run_at = NULL",
+                "maintenance = ?, maintainer_last_run_at = NULL",
                 vec![Value::from(val)],
                 name,
             )
@@ -1177,19 +1193,14 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Update the maintenance debounce state atomically.
-    ///
-    /// Sets both `maintainer_debounce_mins` and `maintainer_last_run_at` in one
-    /// UPDATE along with `updated_at`.
-    pub async fn set_maintenance_debounce(
-        &self,
-        name: &str,
-        debounce_mins: i64,
-        last_run_at: &str,
-    ) -> Result<()> {
+    /// Record a completed maintainer run by writing `maintainer_last_run_at`
+    /// (plus `updated_at`). The debounce interval itself is the fixed
+    /// [`Workspace::MAINTAINER_DEBOUNCE_MINS`] — the per-workspace adaptive
+    /// value was retired.
+    pub async fn set_maintainer_last_run_at(&self, name: &str, last_run_at: &str) -> Result<()> {
         self.exec_update_with_updated_at(
-            "maintainer_debounce_mins = ?, maintainer_last_run_at = ?",
-            vec![Value::from(debounce_mins), Value::from(last_run_at)],
+            "maintainer_last_run_at = ?",
+            vec![Value::from(last_run_at)],
             name,
         )
         .await
@@ -1865,7 +1876,6 @@ mod tests {
             status: WorkspaceStatus::Pending,
             maintenance_enabled,
             paused,
-            maintainer_debounce_mins: 5,
             maintainer_last_run_at: None,
             diagnostics: None,
             notes: String::new(),
@@ -2307,10 +2317,6 @@ mod tests {
         assert!(
             !ws.maintenance_enabled,
             "add() must return a Workspace with maintenance_enabled = false"
-        );
-        assert_eq!(
-            ws.maintainer_debounce_mins, 5,
-            "add() must return a Workspace with maintainer_debounce_mins = 5"
         );
 
         // Also verify via get_by_name.

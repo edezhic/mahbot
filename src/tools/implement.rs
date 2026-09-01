@@ -154,6 +154,7 @@ impl Tool for ImplementTool {
             Role::Coder,
             ws,
             task,
+            false,
             None,
             parent_key,
             parent_label,

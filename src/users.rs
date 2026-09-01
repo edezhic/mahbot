@@ -632,7 +632,6 @@ fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
     let mut ws = Workspace::from_path(path);
     ws.name = personal_workspace_name(user_name);
     ws.status = WorkspaceStatus::Ready;
-    ws.maintainer_debounce_mins = Workspace::MAX_MAINTAINER_DEBOUNCE_MINS;
     ws
 }
 

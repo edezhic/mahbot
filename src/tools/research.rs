@@ -1438,6 +1438,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
         Role::Analyst,
         ws,
         task,
+        false,
         Some(round),
         Some(crate::agent::registry::ParentKey::Research(
             run_key.to_string(),
@@ -2154,6 +2155,7 @@ async fn run_coder_round(
         Role::Coder,
         &coder_ws,
         &task,
+        false,
         None,
         Some(crate::agent::registry::ParentKey::Research(
             job_id.to_string(),

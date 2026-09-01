@@ -556,6 +556,7 @@ async fn run_cleanup_agent_and_finish(
         crate::Role::Sanitation,
         ws,
         prompt,
+        false,
         None,
         Some(crate::agent::registry::ParentKey::Research(
             job_id.to_string(),

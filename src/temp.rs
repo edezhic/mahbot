@@ -285,6 +285,7 @@ async fn run_temp_cleanup_and_finish(job_id: &str, ws: &Workspace, prompt: &str)
         crate::Role::Sanitation,
         ws,
         prompt,
+        false,
         None,
         None,
         None,

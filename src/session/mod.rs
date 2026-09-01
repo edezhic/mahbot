@@ -970,7 +970,7 @@ pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> String
 }
 
 /// Build a transient agent ID shared by the suffixed builder family
-/// (`analyze_`, `research_`, `discovery_`, `maintainer_`).
+/// (`analyze_`, `research_`, `discovery_`).
 ///
 /// Format: `{prefix}{ws_name}_{suffix}` when `label` is `None`, or
 /// `{prefix}{ws_name}_{suffix}_{label}` when `label` is `Some(_)`. The
@@ -987,14 +987,16 @@ fn transient_agent_id(prefix: &str, ws_name: &str, label: Option<&str>) -> Strin
     }
 }
 
-/// Construct an agent ID for Maintainer agents (workspace-scoped, unique per run).
+/// Construct the Maintainer agent ID for a workspace (deterministic, workspace-scoped).
 ///
-/// Format: `maintainer_{ws_name}_{suffix}`
-/// Each run gets a fresh ID (via random suffix) — maintainer runs should not
-/// accumulate conversation history across maintenance cycles.
+/// Format: `maintainer_{ws_name}` — same stable-ID precedent as `manager_{ws_name}`.
+/// A stable ID makes runs resumable: the next maintainer cycle (including after a
+/// daemon restart) picks up the interrupted session instead of restarting from
+/// scratch. Keep `maintainer_` registered in [`TRANSIENT_AGENT_ID_PREFIXES`] so the
+/// 8h TTL purge still applies to stale maintainer sessions.
 #[must_use]
 pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
-    transient_agent_id("maintainer_", ws_name, None)
+    format!("maintainer_{ws_name}")
 }
 
 /// Construct an agent ID for sub-agent analyze rounds (Engineer/Maintainer → sub-agent).

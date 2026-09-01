@@ -30,11 +30,7 @@ pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
         }
     };
     let now = chrono::Utc::now();
-    let next_run = last_time
-        + chrono::Duration::minutes(
-            ws.maintainer_debounce_mins
-                .clamp(0, Workspace::MAX_MAINTAINER_DEBOUNCE_MINS),
-        );
+    let next_run = last_time + chrono::Duration::minutes(Workspace::MAINTAINER_DEBOUNCE_MINS);
     let remaining = next_run - now;
     let mins = remaining.num_minutes();
     if mins <= 0 {
