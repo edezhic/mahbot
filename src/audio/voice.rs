@@ -230,12 +230,6 @@ const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
     ("Say it with your normal morning voice", 2),
 ];
 
-/// Maximum size of the raw audio ring buffer (~200ms at 16kHz = 3200
-/// samples).  Used during enrollment to capture ~100ms of pre-VAD-trigger
-/// and post-speech context so the template includes the onset/offset
-/// phonemes that the enrollment VAD threshold excludes.
-pub(crate) const RAW_RING_MAX: usize = SAMPLE_RATE as usize / 5;
-
 // ── Wake-word scoring geometry (re-calibrated for the encoder pipeline) ──
 //
 // The scoring constants below were re-calibrated for the 1024-dim cosine
@@ -330,7 +324,7 @@ const ADAPTIVE_BOOTSTRAP_FRAMES: usize = 5;
 /// Returns `true` when the rolling sum of recent scores meets or exceeds
 /// `match_threshold()`.  When the incoming score is below
 /// [`NO_MATCH_RESET_THRESHOLD`], the window is cleared entirely to prevent
-/// slow accumulation from noise — unless `preserve_window_on_reset` is set.
+/// slow accumulation from noise.
 /// On detection the score window is NOT cleared here — the caller is
 /// responsible for full pipeline cleanup.
 ///
@@ -341,21 +335,18 @@ fn process_wake_word_score(
     total_score: f32,
     score_window: &mut Vec<f32>,
     adaptive_threshold_override: Option<f32>,
-    preserve_window_on_reset: bool,
 ) -> (bool, f32) {
     if total_score < NO_MATCH_RESET_THRESHOLD {
         // Far from matching — reset the entire rolling window to prevent
         // slow accumulation from noise.
-        if !preserve_window_on_reset {
-            if !score_window.is_empty() {
-                debug!(
-                    "Wake word match lost: total_score={total_score:.4} < NO_MATCH_RESET_THRESHOLD \
-                     (window reset, had {} scores)",
-                    score_window.len(),
-                );
-            }
-            score_window.clear();
+        if !score_window.is_empty() {
+            debug!(
+                "Wake word match lost: total_score={total_score:.4} < NO_MATCH_RESET_THRESHOLD \
+                 (window reset, had {} scores)",
+                score_window.len(),
+            );
         }
+        score_window.clear();
         (false, 0.0)
     } else {
         // Good-enough frame: append score to rolling window.
@@ -467,7 +458,7 @@ pub(crate) fn score_single_embedding(
 
     // ── Rolling window gate ─────────────────────────────
     let (detected, rolling_sum) =
-        process_wake_word_score(total_score, score_window, adaptive_override, false);
+        process_wake_word_score(total_score, score_window, adaptive_override);
 
     // ── Voice debug logging ─────────────────────────────
     // When the `voice-debug` feature is enabled, log every per-frame
@@ -1421,7 +1412,7 @@ pub fn enrollment_prompt_for_sample(sample: usize) -> &'static str {
 
 /// Segmentation parameters for [`segment_utterances_by_vad`].
 ///
-/// Bundles the six module-level constants that are identical across all call
+/// Bundles the four module-level constants that are identical across all call
 /// sites into a single struct.  This reduces the function signature from 8 to
 /// 3 parameters and makes the call sites more resilient to parameter-order
 /// changes.
@@ -1437,20 +1428,13 @@ pub(crate) struct VadSegmentationConfig {
     /// (typically [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] = 4 864 ≈ 304 ms
     /// aligned to streaming's segment timeout).
     silence_threshold_samples: usize,
-    /// Samples of pre/post speech context to include
-    /// (0 — enrollment now matches streaming detection
-    /// by not adding context padding).
-    context_padding_samples: usize,
-    /// Max samples in the internal raw-audio ring buffer
-    /// (typically [`RAW_RING_MAX`] = 3 200 ≈ 200 ms).
-    raw_ring_max: usize,
 }
 
 /// Module-level default config for [`segment_utterances_by_vad`] using the
 /// standard voice-pipeline constants.
 ///
-/// Context padding is intentionally 0 to match the streaming detection path,
-/// which does not add context padding.
+/// Utterances intentionally include no context padding, matching the
+/// streaming detection path.
 ///
 /// Silence threshold uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (~304ms)
 /// aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`].
@@ -1459,8 +1443,6 @@ pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSeg
     hop_length: HOP_LENGTH,
     consecutive_required: ENROLLMENT_VAD_CONSECUTIVE_REQUIRED,
     silence_threshold_samples: ENROLLMENT_SILENCE_THRESHOLD_SAMPLES,
-    context_padding_samples: 0,
-    raw_ring_max: RAW_RING_MAX,
 };
 
 /// Core VAD-gated utterance segmentation.
@@ -1476,15 +1458,14 @@ pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSeg
 /// 1. For each frame (stride = `config.hop_length`), check the VAD decision.
 /// 2. VAD-positive frames accumulate into the current utterance.
 /// 3. `config.consecutive_required` consecutive VAD-positive frames confirm
-///    **sustained speech**.  On this transition the function may prepend
-///    pre-speech context from the raw-audio ring buffer (if
-///    `config.context_padding_samples > 0`).
+///    **sustained speech**.
 /// 4. After speech, `config.silence_threshold_samples` of consecutive
-///    VAD-negative audio ends the utterance.  Post-speech context (if
-///    `config.context_padding_samples > 0`) is optionally appended from
-///    the raw-audio ring (captured at the first silence frame).
+///    VAD-negative audio ends the utterance.
 /// 5. The complete utterance is emitted and internal state resets for the
 ///    next utterance.
+///
+/// No context padding is added, so segmentation matches the streaming
+/// detection path.
 ///
 /// # Parameters
 ///
@@ -1510,8 +1491,6 @@ pub(crate) fn segment_utterances_by_vad(
         hop_length,
         consecutive_required,
         silence_threshold_samples,
-        context_padding_samples,
-        raw_ring_max,
     } = *config;
 
     assert!(
@@ -1531,23 +1510,11 @@ pub(crate) fn segment_utterances_by_vad(
     let mut utterance_silence_samples: usize = 0;
     let mut utterance_speech_end_len: usize = 0;
     let mut vad_positives_in_a_row: usize = 0;
-    let mut raw_audio_ring: Vec<f32> = Vec::with_capacity(raw_ring_max);
-    let mut post_speech_tail: Vec<f32> = Vec::new();
 
     // Iterate frames at hop_length stride.
     // Each frame corresponds to one VAD decision.
     for (frame_idx, &is_speech) in vad_decisions.iter().enumerate() {
         let frame_start = frame_idx * hop_length;
-
-        // Update raw-audio ring with the current frame's full-res samples.
-        let frame_end = (frame_start + frame_length).min(raw_audio.len());
-        if frame_end > frame_start {
-            raw_audio_ring.extend_from_slice(&raw_audio[frame_start..frame_end]);
-            if raw_audio_ring.len() > raw_ring_max {
-                let excess = raw_audio_ring.len() - raw_ring_max;
-                raw_audio_ring.drain(..excess);
-            }
-        }
 
         if is_speech {
             // VAD-positive: accumulate hop_length samples into utterance.
@@ -1560,19 +1527,6 @@ pub(crate) fn segment_utterances_by_vad(
 
             if vad_positives_in_a_row >= consecutive_required {
                 // Sustained speech confirmed.
-
-                if !utterance_had_speech {
-                    // Prepend pre-speech context from raw-audio ring
-                    // (first transition only).
-                    let start = raw_audio_ring.len().saturating_sub(context_padding_samples);
-                    let padding: Vec<f32> = raw_audio_ring[start..].to_vec();
-                    if !padding.is_empty() {
-                        let mut padded = padding;
-                        padded.extend_from_slice(&utterance_buf);
-                        utterance_buf = padded;
-                    }
-                }
-
                 utterance_had_speech = true;
                 utterance_speech_end_len = utterance_buf.len();
                 utterance_silence_samples = 0;
@@ -1587,27 +1541,17 @@ pub(crate) fn segment_utterances_by_vad(
             vad_positives_in_a_row = 0;
 
             if utterance_had_speech {
-                // Capture trailing speech at first silence.
-                if utterance_silence_samples == 0 {
-                    let start = raw_audio_ring.len().saturating_sub(context_padding_samples);
-                    post_speech_tail = raw_audio_ring[start..].to_vec();
-                }
-
                 utterance_silence_samples += hop_length;
 
                 if utterance_silence_samples >= silence_threshold_samples {
                     // Utterance is complete.
                     utterance_buf.truncate(utterance_speech_end_len);
-                    if !post_speech_tail.is_empty() {
-                        utterance_buf.extend_from_slice(&post_speech_tail);
-                    }
                     if !utterance_buf.is_empty() {
                         utterances.push(std::mem::take(&mut utterance_buf));
                     }
                     utterance_speech_end_len = 0;
                     utterance_had_speech = false;
                     utterance_silence_samples = 0;
-                    post_speech_tail.clear();
                     vad_positives_in_a_row = 0;
                 }
             }
@@ -4039,9 +3983,8 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 
     // ── Accumulate full-res audio for extracted VAD gating function ──
     // Store the ORIGINAL mic samples (not sub-sampled, not framed) so
-    // [`segment_utterances_by_vad`] has full 16 kHz resolution for its
-    // internal raw-audio ring (correct context padding) and can access
-    // frames at hop_length stride to align with `ctx.frame_vad`.
+    // [`segment_utterances_by_vad`] can access frames at hop_length stride,
+    // aligned with `ctx.frame_vad`, at full 16 kHz resolution.
     ctx.frame_raw_audio.extend_from_slice(samples);
 
     // Process frames with offset tracking instead of per-iteration O(n) drain.
@@ -4448,15 +4391,12 @@ mod tests {
 
     /// Test config with a shorter silence threshold (10 frames ≈ 2560 samples
     /// instead of the default 94 frames ≈ 24000 samples) so tests don't need
-    /// prohibitively long audio buffers.  Context padding is 0 — matches
-    /// streaming detection which does not prepend/append context padding.
+    /// prohibitively long audio buffers.
     const TEST_VAD_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
         frame_length: FRAME_LENGTH,
         hop_length: HOP_LENGTH,
         consecutive_required: ENROLLMENT_VAD_CONSECUTIVE_REQUIRED,
         silence_threshold_samples: HOP_LENGTH * 10, // 2560 samples ≈ 10 frames
-        context_padding_samples: 0,
-        raw_ring_max: RAW_RING_MAX,
     };
 
     /// Build a raw audio buffer long enough for `n_frames` frames at
@@ -4543,8 +4483,7 @@ mod tests {
     }
 
     /// The default segmentation config must use the standard pipeline
-    /// constants (context padding 0, silence threshold aligned to the
-    /// streaming segment timeout).
+    /// constants (silence threshold aligned to the streaming segment timeout).
     #[test]
     fn vad_segmentation_config_defaults() {
         assert_eq!(DEFAULT_VAD_SEGMENTATION_CONFIG.frame_length, FRAME_LENGTH);
@@ -4557,8 +4496,6 @@ mod tests {
             DEFAULT_VAD_SEGMENTATION_CONFIG.silence_threshold_samples,
             ENROLLMENT_SILENCE_THRESHOLD_SAMPLES
         );
-        assert_eq!(DEFAULT_VAD_SEGMENTATION_CONFIG.context_padding_samples, 0);
-        assert_eq!(DEFAULT_VAD_SEGMENTATION_CONFIG.raw_ring_max, RAW_RING_MAX);
     }
 
     // ── Refractory period tests ──────────────────────────────────────────
@@ -5138,7 +5075,7 @@ mod tests {
     fn score_window_resets_below_no_match_threshold() {
         let mut window = vec![0.9, 0.8, 0.7];
         let (detected, rolling) =
-            process_wake_word_score(NO_MATCH_RESET_THRESHOLD - 0.01, &mut window, None, false);
+            process_wake_word_score(NO_MATCH_RESET_THRESHOLD - 0.01, &mut window, None);
         assert!(!detected);
         #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
         {
@@ -5155,26 +5092,14 @@ mod tests {
         // match_threshold = 1.65 → need 3 frames summing to ≥1.65.
         let mut window = Vec::new();
         for score in [0.7, 0.7] {
-            let (detected, _) = process_wake_word_score(score, &mut window, None, false);
+            let (detected, _) = process_wake_word_score(score, &mut window, None);
             assert!(!detected, "2 frames of 0.7 must not fire (sum 1.4 < 1.65)");
         }
-        let (detected, rolling) = process_wake_word_score(0.7, &mut window, None, false);
+        let (detected, rolling) = process_wake_word_score(0.7, &mut window, None);
         assert!(detected, "3 frames of 0.7 must fire (sum 2.1 ≥ 1.65)");
         assert!(
             (rolling - 2.1).abs() < 1e-6,
             "rolling sum should be 2.1, got {rolling}"
-        );
-    }
-
-    #[test]
-    fn score_window_preserve_on_reset_keeps_window() {
-        let mut window = vec![0.9, 0.8];
-        let (detected, _) = process_wake_word_score(0.1, &mut window, None, true);
-        assert!(!detected);
-        assert_eq!(
-            window.len(),
-            2,
-            "preserve_window_on_reset must not clear the window"
         );
     }
 
@@ -5184,7 +5109,7 @@ mod tests {
         // A high adaptive override (3.0) must suppress detection even when
         // three 0.7 frames would otherwise fire (sum 2.1 < 3.0).
         for _ in 0..3 {
-            let (detected, _) = process_wake_word_score(0.7, &mut window, Some(3.0), false);
+            let (detected, _) = process_wake_word_score(0.7, &mut window, Some(3.0));
             assert!(!detected, "adaptive override must raise the detection bar");
         }
     }
@@ -5298,9 +5223,7 @@ mod tests {
 
     #[test]
     fn score_single_low_score_resets_window() {
-        // A below-reset frame mid-utterance clears the rolling window
-        // (unless preserve_window_on_reset, which the encoder pipeline never
-        // sets).
+        // A below-reset frame mid-utterance clears the rolling window.
         let enrollment = synthetic_enrollment(MIN_ENROLLMENT_UTTERANCES);
         let mut window = vec![0.9, 0.8];
         let bg = basis_embedding(1);
