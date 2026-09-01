@@ -1632,7 +1632,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ws_path = dir.path().to_path_buf();
 
-        // Write bytes that are not valid UTF-8 and not a PDF
+        // Write bytes that are not valid UTF-8
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
         tokio::fs::write(ws_path.join("data.bin"), &binary_data)
             .await
