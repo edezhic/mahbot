@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     paused      INTEGER NOT NULL DEFAULT 1,
     maintainer_debounce_mins INTEGER NOT NULL DEFAULT 5,
     maintainer_last_run_at TEXT,
+    maintainer_recommendations TEXT,
     diagnostics TEXT,
     diagnostics_generation INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
@@ -385,13 +386,15 @@ CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command)
 
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
-/// Entries `24`–`26` are the consolidated current-shape baseline:
+/// Entries `24`–`27` are the consolidated current-shape baseline:
 /// - `24` builds the full core schema; on existing installs every statement is
 ///   `IF NOT EXISTS`, so it is a strict no-op.
 /// - `25` upfills the retired delta `23`'s `chat_history` reply columns — the
 ///   one genuine migration a 0.5.0 (one-delta-behind) database needs; it is a
 ///   guarded, idempotent no-op on current-main and fresh installs.
 /// - `26` builds the logs baseline; a strict no-op on existing logs stores.
+/// - `27` adds `workspaces.maintainer_recommendations` via a guarded Rust body —
+///   a real upfill on existing installs, a no-op on fresh ones.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -407,6 +410,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "26",
         target: TargetDb::Logs,
         body: MigrationBody::Sql(BASELINE_LOGS_SCHEMA),
+    },
+    Migration {
+        id: "27",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_workspaces_maintainer_recommendations),
     },
 ];
 
@@ -536,6 +544,32 @@ async fn run_add_chat_history_reply_columns(conn: &Connection) -> anyhow::Result
                 .await
                 .with_context(|| format!("Failed to add chat_history.{column}"))?;
         }
+    }
+    Ok(())
+}
+
+fn add_workspaces_maintainer_recommendations<'a>(
+    conn: &'a Connection,
+    _root: &'a Path,
+) -> BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(run_add_workspaces_maintainer_recommendations(conn))
+}
+
+/// Upfill `workspaces.maintainer_recommendations` for databases created before
+/// delta `27` (0.5.x live installs). Fresh installs get the column from entry
+/// `24`'s `CREATE TABLE`, so the probe makes this a no-op there. Turso has no
+/// `ADD COLUMN IF NOT EXISTS`, so the existence probe lives in this guarded,
+/// idempotent body (non-transactional like every Rust body, re-runnable until
+/// recorded). Holds a replace-only JSON blob of maintainer recommendations:
+/// {"recommendations": [...], "generated_at": RFC3339}.
+async fn run_add_workspaces_maintainer_recommendations(conn: &Connection) -> anyhow::Result<()> {
+    if !column_exists(conn, "workspaces", "maintainer_recommendations").await? {
+        conn.execute(
+            "ALTER TABLE workspaces ADD COLUMN maintainer_recommendations TEXT",
+            (),
+        )
+        .await
+        .with_context(|| "Failed to add workspaces.maintainer_recommendations")?;
     }
     Ok(())
 }
@@ -845,6 +879,7 @@ mod tests {
                 "paused",
                 "maintainer_debounce_mins",
                 "maintainer_last_run_at",
+                "maintainer_recommendations",
                 "diagnostics",
                 "diagnostics_generation",
                 "notes",
@@ -992,14 +1027,6 @@ mod tests {
         expected_core_table_names()
             .into_iter()
             .filter(|n| *n != "schema_migrations")
-            .collect()
-    }
-
-    /// Expected core table names, excluding `schema_migrations` and `excluded`.
-    fn expected_core_tables_except(excluded: &str) -> Vec<&'static str> {
-        expected_core_table_names()
-            .into_iter()
-            .filter(|n| *n != "schema_migrations" && *n != excluded)
             .collect()
     }
 
@@ -1843,8 +1870,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     // ── Tests ──────────────────────────────────────────────────────────
 
-    /// A fresh install runs the baseline (`24`/`25`) and converges to the exact
-    /// current core shape: the table set (which also proves the required
+    /// A fresh install runs the baseline (`24`/`25`/`27`) and converges to the
+    /// exact current core shape: the table set (which also proves the required
     /// absences of `user_roles` / `config_role` / `ticket_jobs` /
     /// `ticket_stage_jobs`) and the per-table column sets (which prove the
     /// absences of `assigned_to` / `pipeline_reservation` / `paused_frozen`).
@@ -1867,8 +1894,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         applied.sort();
         assert_eq!(
             applied,
-            vec!["24".to_string(), "25".to_string()],
-            "fresh core applies baseline 24/25 exactly"
+            vec!["24".to_string(), "25".to_string(), "27".to_string()],
+            "fresh core applies baseline 24/25/27 exactly"
         );
     }
 
@@ -2004,11 +2031,33 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         }
     }
 
-    async fn assert_core_catalog_unchanged(conn: &Connection, before: &CoreSnapshot) {
+    /// Filter a `name → value` map down to the entries whose key is not in
+    /// `exclude` — used to compare a catalog snapshot "except" certain tables
+    /// whose DDL/columns legitimately change on reopen (delta `27`).
+    fn without<V: Clone>(
+        map: &std::collections::BTreeMap<String, V>,
+        exclude: &[&str],
+    ) -> std::collections::BTreeMap<String, V> {
+        map.iter()
+            .filter(|(name, _)| !exclude.contains(&name.as_str()))
+            .map(|(name, v)| (name.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Assert that reopening the core catalog leaves the database unchanged,
+    /// except for `except_tables`, whose table DDL and column set may differ on
+    /// reopen (the delta-27 `workspaces` column upfill). Index definitions, row
+    /// counts, `chat_history` content and `tickets` content are asserted to be
+    /// strictly unchanged.
+    async fn assert_core_catalog_unchanged(
+        conn: &Connection,
+        before: &CoreSnapshot,
+        except_tables: &[&str],
+    ) {
         assert_eq!(
-            table_defs(conn).await,
-            before.tables,
-            "core table DDL must be unchanged on reopen"
+            without(&table_defs(conn).await, except_tables),
+            without(&before.tables, except_tables),
+            "core table DDL (except {except_tables:?}) must be unchanged on reopen"
         );
         assert_eq!(
             index_defs(conn).await,
@@ -2016,9 +2065,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "core index definitions must be unchanged on reopen"
         );
         assert_eq!(
-            column_sets(conn, &expected_core_table_names()).await,
-            before.cols,
-            "core column sets must be unchanged on reopen"
+            without(
+                &column_sets(conn, &expected_core_table_names()).await,
+                except_tables
+            ),
+            without(&before.cols, except_tables),
+            "core column sets (except {except_tables:?}) must be unchanged on reopen"
         );
         assert_eq!(
             table_row_counts(conn, &expected_core_domain_tables()).await,
@@ -2051,8 +2103,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`) as a STRICT no-op — no schema, index, or
-    /// data change. This also proves Turso honors `IF NOT EXISTS` on the FTS
+    /// the new baseline (`24`/`25`/`27`) as a STRICT no-op except the delta-27
+    /// `workspaces.maintainer_recommendations` column upfill, which is asserted
+    /// explicitly. This also proves Turso honors `IF NOT EXISTS` on the FTS
     /// index when the baseline re-runs it.
     #[tokio::test]
     async fn old_catalog_current_db_reopens_as_noop() {
@@ -2079,15 +2132,25 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         expected_ids.push("24".to_string());
         expected_ids.push("25".to_string());
+        expected_ids.push("27".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25"
+            "reopen must record exactly old ids ∪ 24/25/27"
         );
 
-        assert_core_catalog_unchanged(&conn, &before).await;
+        // Everything else is a strict no-op; only workspaces gains its delta-27
+        // column, appended at the end by the ALTER.
+        assert_core_catalog_unchanged(&conn, &before, &["workspaces"]).await;
+        let after_ws_cols = column_sets(&conn, &["workspaces"]).await;
+        let mut expected_ws_cols = before.cols["workspaces"].clone();
+        expected_ws_cols.push("maintainer_recommendations".to_string());
+        assert_eq!(
+            after_ws_cols["workspaces"], expected_ws_cols,
+            "reopen must append exactly maintainer_recommendations to workspaces columns"
+        );
     }
 
     /// The logs fleet-wide boot-safety pin: an old-catalog logs store (ids
@@ -2151,8 +2214,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The 0.5.0 (one-delta-behind) upgrade: a database built by the retired
     /// chain WITHOUT entry `23` has no `chat_history` reply columns; the
-    /// baseline entry `25` upfills exactly those two columns, leaving every
-    /// row and every other table's schema untouched.
+    /// baseline entry `25` upfills exactly those two columns, and entry `27`
+    /// adds `workspaces.maintainer_recommendations`, leaving every row and every
+    /// other table's schema untouched.
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2197,7 +2261,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             !before_chat_cols.contains(&"reply_snippet".to_string()),
             "0.5.0 DB must not have reply_snippet"
         );
-        let before_other = column_sets(&conn, &expected_core_tables_except("chat_history")).await;
+        let untouched_tables: Vec<&str> = expected_core_table_names()
+            .into_iter()
+            .filter(|n| *n != "chat_history" && *n != "workspaces" && *n != "schema_migrations")
+            .collect();
+        let before_other = column_sets(&conn, &untouched_tables).await;
         let mut before_ids = applied_ids(&conn).await;
         before_ids.sort();
 
@@ -2213,6 +2281,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert!(
             after_chat_cols.contains(&"reply_snippet".to_string()),
             "reply_snippet must be added"
+        );
+        let after_ws_cols = column_names(&conn, "workspaces").await;
+        assert!(
+            after_ws_cols.contains(&"maintainer_recommendations".to_string()),
+            "maintainer_recommendations must be added to workspaces"
         );
 
         let reply_nulls: i64 = conn
@@ -2239,18 +2312,20 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut expected_ids = before_ids.clone();
         expected_ids.push("24".to_string());
         expected_ids.push("25".to_string());
+        expected_ids.push("27".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25"
+            "upgrade must record exactly old ids ∪ 24/25/27"
         );
 
         assert_eq!(
-            column_sets(&conn, &expected_core_tables_except("chat_history")).await,
+            column_sets(&conn, &untouched_tables).await,
             before_other,
-            "only chat_history columns may change on the 0.5.0 upgrade"
+            "only chat_history (delta 25) and workspaces (delta 27) columns may change \
+             on the 0.5.0 upgrade"
         );
     }
 }

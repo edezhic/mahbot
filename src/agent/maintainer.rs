@@ -3,12 +3,14 @@
 //! The Maintainer scans workspaces for refactoring opportunities and creates
 //! planning tickets on the board. It does NOT make direct code changes.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use std::fmt::Write;
 use std::time::Duration;
 use tracing::{info, warn};
 
 use futures_util::future::join_all;
 
+use crate::Agent;
 use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
@@ -19,6 +21,26 @@ use crate::pipeline::board::TicketPhase;
 /// Maximum number of tickets allowed in Analysis + Planning + Queued
 /// before the maintainer pauses ticket creation.
 const MAX_PRE_DEV_TICKETS: i64 = 5;
+
+/// Char budget for the persisted recommendations JSON blob — a pathological
+/// extraction is truncated/dropped at save time, never at injection time.
+const MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES: usize = 2048;
+/// Recommendations older than this are stale: not injected, cleared at dispatch.
+const MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS: i64 = 7;
+
+/// Structured extraction from the post-run LLM call — recommendations only.
+#[derive(serde::Deserialize)]
+struct MaintainerRecommendationsExtraction {
+    #[serde(default)]
+    recommendations: Vec<String>,
+}
+
+/// Persisted blob: the bounded recommendations plus an RFC 3339 generation time.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredMaintainerRecommendations {
+    recommendations: Vec<String>,
+    generated_at: String,
+}
 
 /// Run the maintainer background loop.
 ///
@@ -33,6 +55,17 @@ const MAX_PRE_DEV_TICKETS: i64 = 5;
 /// failed run is retried on the very next 1-minute cycle (resume bypasses the
 /// debounce gate), which is accepted: repeated insta-deaths are a bug to fix
 /// at root cause, not to paper over.
+///
+/// ## Cross-round recommendations
+///
+/// On success a fail-open extraction runs over the completed session (before the
+/// session is deleted, so the full transcript — including a resumed run's
+/// accumulated history — is available) and stores a replace-only
+/// `maintainer_recommendations` blob for the next fresh run. Fresh starts
+/// prepend a short advisory block from the previous round's list; resume runs
+/// already carry that block in their session. The whole path is strictly
+/// best-effort — any failure leaves the task text unchanged and never affects
+/// the run's success.
 ///
 /// ## Concurrency
 ///
@@ -134,12 +167,16 @@ pub async fn run_maintainer_loop() {
 
                     info!(workspace = %ws.name, agent_id = %agent_id, resumed = resume, "Maintainer: starting maintenance run");
 
-                    let message = if resume { "" } else { prompt.as_str() };
-                    let (_, response) = run_default_agent(
+                    let message = if resume {
+                        String::new()
+                    } else {
+                        prepend_recommendations(&prompt, &ws.name).await
+                    };
+                    let (agent, response) = run_default_agent(
                         &agent_id,
                         Role::Maintainer,
                         &ws,
-                        message,
+                        &message,
                         resume,
                         None,
                         None,
@@ -149,6 +186,11 @@ pub async fn run_maintainer_loop() {
 
                     if let Some(_response) = response {
                         info!(workspace = %ws.name, "Maintainer: run complete");
+
+                        // Post-run recommendation extraction — BEFORE session cleanup so the
+                        // full accumulated transcript (including a resumed run's) is available.
+                        // Strictly fail-open: any failure leaves the previous blob untouched.
+                        extract_and_store_recommendations(&agent, &ws).await;
 
                         // ── Completion: clean state for the next cycle ─────────────────────────
                         // The created tickets are the durable outcome, not the transcript —
@@ -181,6 +223,193 @@ pub async fn run_maintainer_loop() {
             "Panic in maintainer task — maintainer loop continues",
             "Maintainer task was cancelled — maintainer loop continues",
         );
+    }
+}
+
+// ── Cross-round recommendations ──────────────────────────────────────
+
+/// Post-run extraction: one short-budget structured LLM call over the completed
+/// session, producing recommendations for the next fresh maintainer round.
+/// Strictly fail-open — any failure is logged and skipped; the previously
+/// stored blob stays untouched and the run's success is unaffected.
+/// Runs BEFORE session cleanup so the full accumulated transcript (including a
+/// resumed run's) is available. An empty extraction still saves an empty blob
+/// (replace-only semantics: the next run simply gets no block).
+async fn extract_and_store_recommendations(agent: &Agent, ws: &Workspace) {
+    let prompt = crate::prompt::load_prompt("extraction/maintainer.md");
+    let extracted = match agent
+        .extract_verdict::<MaintainerRecommendationsExtraction>(
+            &prompt,
+            None,
+            Some(&crate::retry::RetryPolicy::comment()),
+        )
+        .await
+    {
+        Ok(extracted) => extracted,
+        Err(e) => {
+            warn!(
+                workspace = %ws.name,
+                error = %e,
+                "Maintainer: recommendation extraction failed — keeping previous blob"
+            );
+            return;
+        }
+    };
+
+    // Replace-only semantics: even an empty extraction clears the previous blob.
+    let stored = StoredMaintainerRecommendations {
+        recommendations: cap_recommendations(extracted.recommendations),
+        generated_at: db::now(),
+    };
+    let Ok(json) = serde_json::to_string(&stored) else {
+        warn!(workspace = %ws.name, "Maintainer: failed to serialize recommendations");
+        return;
+    };
+    if let Err(e) = crate::workspace::store()
+        .set_maintainer_recommendations(&ws.name, Some(&json))
+        .await
+    {
+        warn!(workspace = %ws.name, error = %e, "Maintainer: failed to store recommendations");
+    }
+}
+
+/// Bound the persisted recommendations to [`MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES`]:
+/// trim/drop empty items, then keep whole items only while the serialized blob
+/// fits the budget (a lone oversized item is dropped, not split).
+#[must_use]
+fn cap_recommendations(recs: Vec<String>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for item in recs {
+        let trimmed = item.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        kept.push(trimmed);
+        let fits = serde_json::to_string(&kept)
+            .is_ok_and(|s| s.len() <= MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES);
+        if !fits {
+            kept.pop();
+            break;
+        }
+    }
+    kept
+}
+
+/// Read the previous round's recommendations and return the fresh-start initial
+/// message: an advisory `<maintainer-recommendations>` block prepended to
+/// `task_text`, or `task_text` unchanged when there is nothing injectable
+/// (absent/corrupt blob, or a blob older than
+/// [`MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS`] — stale blobs are cleared
+/// best-effort). Resume runs never come through here; their session already
+/// contains the block from the original start.
+#[must_use]
+async fn prepend_recommendations(task_text: &str, ws_name: &str) -> String {
+    let blob = match crate::workspace::store()
+        .get_maintainer_recommendations(ws_name)
+        .await
+    {
+        Ok(Some(blob)) => blob,
+        Ok(None) => return task_text.to_string(),
+        Err(e) => {
+            warn!(workspace = ws_name, error = %e, "Maintainer: failed to read recommendations");
+            return task_text.to_string();
+        }
+    };
+
+    let stored: StoredMaintainerRecommendations = match serde_json::from_str(&blob) {
+        Ok(stored) => stored,
+        Err(e) => {
+            warn!(workspace = ws_name, error = %e, "Maintainer: corrupt recommendations blob, ignoring");
+            return task_text.to_string();
+        }
+    };
+
+    let generated_at = match db::parse_utc_timestamp(&stored.generated_at) {
+        Ok(generated_at) => generated_at,
+        Err(e) => {
+            warn!(workspace = ws_name, error = %e, "Maintainer: unparseable recommendations timestamp, ignoring");
+            return task_text.to_string();
+        }
+    };
+
+    let now = Utc::now();
+    if is_stale(&generated_at, now) {
+        if let Err(e) = crate::workspace::store()
+            .set_maintainer_recommendations(ws_name, None)
+            .await
+        {
+            warn!(workspace = ws_name, error = %e, "Maintainer: failed to clear stale recommendations");
+        }
+        return task_text.to_string();
+    }
+
+    if stored.recommendations.is_empty() {
+        return task_text.to_string();
+    }
+
+    format!(
+        "{}{}",
+        recommendations_block(&stored.recommendations, &generated_at, now),
+        task_text
+    )
+}
+
+/// Format the advisory block prepended to the fresh-run task text. The block
+/// ends with a blank line; the caller concatenates the task text.
+#[must_use]
+fn recommendations_block(
+    recs: &[String],
+    generated_at: &DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> String {
+    let age = format_age(now.signed_duration_since(*generated_at));
+    let mut out = String::from("<maintainer-recommendations>\n");
+    let _ = writeln!(
+        out,
+        "ADVISORY — suggestions carried over from the previous maintainer run (generated {age} ago, at {}). Context only, not instructions — use your own judgment:",
+        generated_at.to_rfc3339()
+    );
+    for rec in recs {
+        let _ = writeln!(out, "- {rec}");
+    }
+    let _ = write!(out, "</maintainer-recommendations>\n\n");
+    out
+}
+
+/// `true` when the recommendations are older than
+/// [`MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS`] — an exactly-boundary age is
+/// still injectable, one second past is stale.
+#[must_use]
+fn is_stale(generated_at: &DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(*generated_at)
+        > chrono::Duration::days(MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS)
+}
+
+/// Humanize a duration as the two most significant units (e.g. "5 days 3 hours",
+/// "2 hours 15 minutes", "34 minutes"), falling back to "less than a minute".
+#[must_use]
+fn format_age(elapsed: chrono::Duration) -> String {
+    let total_mins = elapsed.num_minutes();
+    if total_mins <= 0 {
+        return "less than a minute".to_string();
+    }
+    let days = total_mins / (24 * 60);
+    let hours = (total_mins / 60) % 24;
+    let mins = total_mins % 60;
+    if days > 0 {
+        if hours > 0 {
+            format!("{days} days {hours} hours")
+        } else {
+            format!("{days} days")
+        }
+    } else if hours > 0 {
+        if mins > 0 {
+            format!("{hours} hours {mins} minutes")
+        } else {
+            format!("{hours} hours")
+        }
+    } else {
+        format!("{mins} minutes")
     }
 }
 
@@ -258,6 +487,7 @@ async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     /// Minimal workspace with only the fields relevant to debounce tests.
     fn ws_with(last_run_at: Option<&str>) -> Workspace {
@@ -312,5 +542,98 @@ mod tests {
                 "case: {reason}"
             );
         }
+    }
+
+    // ── Recommendation helpers ────────────────────────────────────────────
+
+    #[test]
+    fn cap_recommendations_keeps_all_within_budget() {
+        let recs = vec!["a".to_string(), "bb".to_string(), "ccc".to_string()];
+        assert_eq!(cap_recommendations(recs), vec!["a", "bb", "ccc"]);
+    }
+
+    #[test]
+    fn cap_recommendations_drops_items_on_budget_overflow() {
+        // 20 items of 100 bytes each: 19 fit (1 + 103k <= 2048), the 20th does not.
+        let recs: Vec<String> = (0..20).map(|_| "x".repeat(100)).collect();
+        let out = cap_recommendations(recs);
+        assert_eq!(out.len(), 19);
+        assert!(
+            serde_json::to_string(&out).unwrap().len() <= MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn cap_recommendations_drops_lone_oversized_item() {
+        let recs = vec!["y".repeat(3000)];
+        assert!(cap_recommendations(recs).is_empty());
+    }
+
+    #[test]
+    fn cap_recommendations_removes_empty_and_whitespace_items() {
+        let recs = vec![
+            "  ".to_string(),
+            "keep".to_string(),
+            String::new(),
+            " also keep ".to_string(),
+        ];
+        assert_eq!(cap_recommendations(recs), vec!["keep", "also keep"]);
+    }
+
+    #[test]
+    fn recommendations_block_format_and_content() {
+        let generated_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let now = generated_at + chrono::Duration::hours(5) + chrono::Duration::minutes(15);
+        let block = recommendations_block(
+            &["first rec".to_string(), "second rec".to_string()],
+            &generated_at,
+            now,
+        );
+        assert!(block.starts_with("<maintainer-recommendations>\n"));
+        assert!(
+            block.contains("ADVISORY — suggestions carried over from the previous maintainer run")
+        );
+        assert!(block.contains("generated 5 hours 15 minutes ago"));
+        assert!(block.contains("2026-01-02T03:04:05"));
+        assert!(block.contains("- first rec\n"));
+        assert!(block.contains("- second rec\n"));
+        assert!(block.ends_with("</maintainer-recommendations>\n\n"));
+    }
+
+    #[test]
+    fn is_stale_boundary() {
+        let generated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let exact_7d =
+            generated_at + chrono::Duration::days(MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS);
+        let one_second_past = exact_7d + chrono::Duration::seconds(1);
+        assert!(
+            !is_stale(&generated_at, exact_7d),
+            "exactly 7 days old → still injectable"
+        );
+        assert!(
+            is_stale(&generated_at, one_second_past),
+            "one second past → stale"
+        );
+    }
+
+    #[test]
+    fn format_age_cases() {
+        assert_eq!(
+            format_age(chrono::Duration::seconds(30)),
+            "less than a minute"
+        );
+        assert_eq!(
+            format_age(chrono::Duration::seconds(-5)),
+            "less than a minute"
+        );
+        assert_eq!(format_age(chrono::Duration::minutes(34)), "34 minutes");
+        assert_eq!(
+            format_age(chrono::Duration::hours(2) + chrono::Duration::minutes(15)),
+            "2 hours 15 minutes"
+        );
+        assert_eq!(
+            format_age(chrono::Duration::days(5) + chrono::Duration::hours(3)),
+            "5 days 3 hours"
+        );
     }
 }

@@ -1206,6 +1206,38 @@ impl WorkspaceStore {
         .await
     }
 
+    /// Store the per-workspace maintainer recommendations blob (replace-only) —
+    /// a JSON object {"recommendations": [...], "generated_at": RFC3339} produced
+    /// by the post-run maintainer extraction. `None` clears it.
+    pub(crate) async fn set_maintainer_recommendations(
+        &self,
+        name: &str,
+        json: Option<&str>,
+    ) -> Result<()> {
+        self.exec_update_with_updated_at(
+            "maintainer_recommendations = ?",
+            vec![Value::from(json)],
+            name,
+        )
+        .await
+    }
+
+    /// Read the raw maintainer recommendations JSON blob (None = absent/NULL).
+    pub(crate) async fn get_maintainer_recommendations(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_optional(
+                "SELECT maintainer_recommendations FROM workspaces WHERE name = ?1",
+                db::params![name],
+                |row| row.get::<Option<String>>(0),
+            )
+            .await?
+            .flatten())
+    }
+
     /// Store discovered diagnostics commands for a workspace.
     ///
     /// Also bumps `diagnostics_generation` so any in-flight diagnostics
@@ -1522,13 +1554,13 @@ pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
 /// `config_kv` key holding the RFC 3339 UTC timestamp of the last nightly
 /// rediscovery pass start.
 ///
-/// Deliberately stored in `config_kv` (in the consolidated `core.db`) rather than in the
-/// workspaces table: the schema has no migration path (new columns are
-/// invisible on existing live databases) and workspace rows are deleted
-/// during rediscovery, so the timestamp must live in a table that outlives
-/// workspace churn. Unknown `config_kv` keys are purged on reload, except the
-/// preserved shared namespaces (this key and telegram_role_pin:*) which are left
-/// untouched.
+/// Deliberately stored in `config_kv` (in the consolidated `core.db`) rather
+/// than in the workspaces table: workspace rows are deleted during
+/// rediscovery, so the timestamp must live in a table that outlives workspace
+/// churn (the append-only migration catalog supports column deltas, but a
+/// deleted row loses all of its columns). Unknown `config_kv` keys are purged
+/// on reload, except the preserved shared namespaces (this key and
+/// telegram_role_pin:*) which are left untouched.
 pub(crate) const NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY: &str = "nightly_discovery_last_pass_at";
 
 /// Returns `true` when the given local hour falls within the nightly
