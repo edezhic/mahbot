@@ -547,6 +547,9 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
     (cleaned.trim().to_string(), attachments)
 }
 
+/// Base URL for the Telegram Bot API.
+const API_BASE: &str = "https://api.telegram.org";
+
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
@@ -567,10 +570,6 @@ pub struct TelegramChannel {
     bot_token: String,
     /// Shared HTTP client with connection reuse across all Telegram API calls.
     http_client: reqwest::Client,
-
-    /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
-    /// Override for local Bot API servers or testing.
-    api_base: String,
 
     /// Per-instance cancellation token — cancelling this stops only this
     /// channel's listener, not the entire application.
@@ -878,7 +877,6 @@ impl TelegramChannel {
         Self {
             bot_token,
             http_client: crate::util::http::build_http_client(Duration::from_mins(1)),
-            api_base: "https://api.telegram.org".to_string(),
             cancel: std::sync::Arc::new(tokio_util::sync::CancellationToken::new()),
             offset,
             menu_cache: std::sync::Arc::new(
@@ -1049,7 +1047,7 @@ impl TelegramChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+        format!("{API_BASE}/bot{}/{method}", self.bot_token)
     }
 
     /// Signal this specific channel's listener to stop, without affecting
@@ -1094,7 +1092,6 @@ impl TelegramChannel {
 
         let bot_token = self.bot_token.clone();
         let http_client = self.http_client.clone();
-        let api_base = self.api_base.clone();
         let cache = std::sync::Arc::clone(&self.menu_cache);
         let chat_id = chat_id.to_string();
         tokio::spawn(async move {
@@ -1131,7 +1128,7 @@ impl TelegramChannel {
                 return;
             }
 
-            let url = format!("{api_base}/bot{bot_token}/setMyCommands");
+            let url = format!("{API_BASE}/bot{bot_token}/setMyCommands");
             let body = serde_json::json!({
                 "scope": {
                     "type": "chat",
@@ -1163,7 +1160,7 @@ impl TelegramChannel {
         if token.trim().is_empty() {
             anyhow::bail!("Telegram bot token is empty");
         }
-        let url = format!("https://api.telegram.org/bot{token}/getMe");
+        let url = format!("{API_BASE}/bot{token}/getMe");
         let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
         let resp = client
             .get(&url)
@@ -1219,7 +1216,7 @@ impl TelegramChannel {
 
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
+        let url = format!("{API_BASE}/file/bot{}/{file_path}", self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
