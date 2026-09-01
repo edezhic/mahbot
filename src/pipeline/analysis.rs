@@ -240,7 +240,8 @@ fn append_escalation_report(
     }
 }
 
-/// Format a natural-language grade-count summary of analyst verdicts.
+/// Format the analyst grade-count summary that is logged (not posted to the
+/// ticket) when the analysis comment is composed.
 fn format_grade_summary(results: &[ParallelVerdict]) -> String {
     let mut clean = 0usize;
     let mut minor = 0usize;
@@ -562,13 +563,11 @@ async fn finalize_analysis_round_with_grouping(
     escalation_entries: &[EscalationEntry],
     job_id: &str,
 ) {
-    let summary = format_grade_summary(base_results);
     let (round, outcome) = build_round_grouping(
         "Analysis",
         base_results,
         /* threshold unused for analysis */ 0,
         Role::Analyst,
-        &summary,
         ws,
         &ticket.id,
         &ticket.title,
@@ -700,13 +699,11 @@ async fn run_analysis_round(
         return;
     }
     let base_count = base_results.len();
-    let summary = format_grade_summary(&base_results);
     let (round, outcome) = build_round_grouping(
         "Analysis",
         &base_results,
         /* threshold unused for analysis */ 0,
         Role::Analyst,
-        &summary,
         ws,
         &ticket.id,
         &ticket.title,
@@ -832,6 +829,7 @@ async fn process_analyst_verdicts(
         reset_analysis_round(ticket, job_id).await;
         return;
     }
+    info!("{}", format_grade_summary(base_results));
     let mut joint_comment = render_joint_comment(
         round,
         outcome,

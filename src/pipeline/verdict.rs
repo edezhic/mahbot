@@ -91,9 +91,6 @@ pub(crate) struct JointRound {
     pub verdicts: Vec<JointVerdict>,
     /// Failed agents (no response / parse failure).
     pub failures: Vec<JointFailure>,
-    /// Code-computed agreement summary line (counts/classification — never
-    /// the LLM's numbers).
-    pub header: String,
     /// Pass threshold: the clean-round summary only claims "passed clean" when
     /// every valid verdict clears it (a sub-threshold verdict bounces the round
     /// even with an empty issues list).
@@ -201,8 +198,7 @@ pub(crate) async fn run_synthesis(
 /// Render the joint comment for a round given the repair-mode synthesis
 /// outcome.
 ///
-/// Structure: optional stage header (analysis-only — verifier rounds pass an
-/// empty header), groups of issue statements (frozen by the repair protocol
+/// Structure: groups of issue statements (frozen by the repair protocol
 /// when synthesis succeeded, raw member dump otherwise; contradiction groups
 /// carry a `— DISPUTED` marker), the code-computed
 /// ungrouped remainder in a deterministic trailing section (DISPUTED
@@ -219,12 +215,6 @@ pub(crate) fn render_joint_comment(
     table: &crate::consensus::ItemTable<'_>,
 ) -> String {
     let mut out = String::new();
-
-    // Code-computed stage summary (analysis only — verifier rounds pass an
-    // empty header).
-    if !round.header.is_empty() {
-        out.push_str(&round.header);
-    }
 
     // Issues — grouped by the LLM when available.
     let has_issues = table.len() > 0;
@@ -303,8 +293,8 @@ pub(crate) fn render_joint_comment(
         }
     }
 
-    // A removed stage header (verifier rounds) would leave the first section's
-    // separator as leading blank lines — strip them.
+    // The first section's leading separator would leave leading blank lines —
+    // strip them.
     crate::util::truncate_sandwich(
         &crate::util::scrub_credentials(out.trim_start_matches('\n')),
         crate::util::FAILURE_DETAIL_CAP,
@@ -560,28 +550,17 @@ pub(crate) fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
 
 /// Build the joint comment for a round: deterministic merge + a single LLM
 /// synthesis pass.
-#[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_round_joint_comment(
     stage: &'static str,
     results: &[ParallelVerdict],
     threshold: u8,
     role: Role,
-    header: &str,
     ws: &Workspace,
     ticket_id: &str,
     ticket_title: &str,
 ) -> String {
-    let (round, outcome) = build_round_grouping(
-        stage,
-        results,
-        threshold,
-        role,
-        header,
-        ws,
-        ticket_id,
-        ticket_title,
-    )
-    .await;
+    let (round, outcome) =
+        build_round_grouping(stage, results, threshold, role, ws, ticket_id, ticket_title).await;
     render_joint_comment(
         &round,
         &outcome,
@@ -594,18 +573,16 @@ pub(crate) async fn build_round_joint_comment(
 /// final rendering). Skips the LLM grouping pass when every verdict is clean
 /// or when a single verifier's verdict is authoritative; otherwise runs
 /// [`run_synthesis`].
-#[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_round_grouping(
     stage: &'static str,
     results: &[ParallelVerdict],
     threshold: u8,
     role: Role,
-    header: &str,
     ws: &Workspace,
     ticket_id: &str,
     ticket_title: &str,
 ) -> (JointRound, crate::consensus::RepairOutcome) {
-    let round = build_joint_round(stage, results, threshold, header);
+    let round = build_joint_round(stage, results, threshold);
     let has_no_issues = round.has_no_issues();
     let single_verifier_verdict = matches!(role, Role::Reviewer | Role::Qa) && round.n_valid() == 1;
     if has_no_issues || single_verifier_verdict {
@@ -622,7 +599,6 @@ fn build_joint_round(
     stage: &'static str,
     results: &[ParallelVerdict],
     threshold: u8,
-    header: &str,
 ) -> JointRound {
     let mut verdicts: Vec<JointVerdict> = Vec::new();
     let mut failures: Vec<JointFailure> = Vec::new();
@@ -657,7 +633,6 @@ fn build_joint_round(
         stage,
         verdicts,
         failures,
-        header: header.to_string(),
         threshold,
         issues,
         grades,
@@ -767,7 +742,6 @@ pub(crate) async fn process_verifier_verdicts(
         results,
         REVIEW_QA_THRESHOLD,
         verifier.role,
-        "",
         ws,
         &ticket.id,
         &ticket.title,
