@@ -12,12 +12,7 @@ keywords = ["ai", "agent"]
 categories = ["development-tools"]
 rust-version = "1.96"
 resolver = "2"
-# `vendor/` holds canonical sources of pinned forks that cannot be published
-# with mahbot.  The last such fork (candle-onnx-mahbot) was removed
-# (replaced by the in-repo runtime in src/onnx), so the directory
-# is currently unused; the exclude keeps any future vendored tree out of the
-# published .crate.
-exclude = [".DS_Store", "vendor/"]
+exclude = [".DS_Store"]
 
 [features]
 # `full` is a default-on marker feature used by `required-features` on the app
