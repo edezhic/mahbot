@@ -2320,6 +2320,7 @@ mod tests {
             workspace: "test".to_string(),
             optimistic_id: None,
             transient: false,
+            reply_reference: None,
         });
     }
 

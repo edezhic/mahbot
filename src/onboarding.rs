@@ -202,6 +202,7 @@ pub async fn kickoff_support(user_name: &str) -> anyhow::Result<()> {
         workspace: format!("personal:{user_name}"),
         optimistic_id: None,
         callback_query_id: None,
+        reply_reference: None,
     };
     if let Some(tx) = crate::GUI_MESSAGE_TX.get()
         && let Err(e) = tx.send(msg)

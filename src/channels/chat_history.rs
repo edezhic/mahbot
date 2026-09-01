@@ -6,6 +6,7 @@
 //! Each message gets a NanoID for deduplication.
 
 use crate::ChatDirection;
+use crate::channels::ReplyReference;
 use crate::db::{self, Row};
 use anyhow::Result;
 
@@ -17,7 +18,7 @@ crate::define_store! {
 
 /// Parameters for inserting a chat history entry.
 ///
-/// This struct bundles the 7 fields needed by [`ChatHistoryStore::insert`].
+/// This struct bundles the 8 fields needed by [`ChatHistoryStore::insert`].
 /// Owned `String` fields match the pattern established by
 /// [`LogEntry`](crate::logs::LogEntry).
 #[derive(Debug, Clone)]
@@ -29,6 +30,9 @@ pub struct ChatHistoryInsert {
     pub agent_role: Option<String>,
     pub workspace: String,
     pub timestamp: Option<String>,
+    /// Optional reference to the replied-to message, rendered as a quote
+    /// header by the GUI.
+    pub reply_reference: Option<ReplyReference>,
 }
 
 /// A single chat message record for history display.
@@ -40,6 +44,8 @@ pub struct ChatHistoryEntry {
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
     pub timestamp: Option<String>,
+    /// Optional reference to the replied-to message for quote-header rendering.
+    pub reply_reference: Option<ReplyReference>,
 }
 
 /// Maximum number of history entries to load at once.
@@ -48,18 +54,26 @@ const HISTORY_LIMIT: usize = 100;
 // Column definitions for `chat_history` SELECT queries.
 crate::columns! {
     CHAT_HISTORY_COLUMNS [CH] {
-        ID          => "id",
-        MESSAGE_ID  => "message_id",
-        CONTENT     => "content",
-        DIRECTION   => "direction",
-        AGENT_ROLE  => "agent_role",
-        TIMESTAMP   => "timestamp",
+        ID           => "id",
+        MESSAGE_ID   => "message_id",
+        CONTENT      => "content",
+        DIRECTION    => "direction",
+        AGENT_ROLE   => "agent_role",
+        TIMESTAMP    => "timestamp",
+        REPLY_AUTHOR => "reply_author",
+        REPLY_SNIPPET => "reply_snippet",
     }
 }
 
 /// Convert a database row to a [`ChatHistoryEntry`] using the column-index
 /// constants from [`CHAT_HISTORY_COLUMNS`].
 fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
+    let reply_author = row.get::<Option<String>>(COL_CH_REPLY_AUTHOR)?;
+    let reply_snippet = row.get::<Option<String>>(COL_CH_REPLY_SNIPPET)?;
+    let reply_reference = match (reply_author, reply_snippet) {
+        (Some(author), Some(snippet)) => Some(ReplyReference { author, snippet }),
+        _ => None,
+    };
     Ok(ChatHistoryEntry {
         id: row.get::<i64>(COL_CH_ID)?,
         message_id: row.get::<String>(COL_CH_MESSAGE_ID)?,
@@ -71,6 +85,7 @@ fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
         },
         agent_role: row.get::<Option<String>>(COL_CH_AGENT_ROLE)?,
         timestamp: row.get::<Option<String>>(COL_CH_TIMESTAMP)?,
+        reply_reference,
     })
 }
 
@@ -102,8 +117,9 @@ impl ChatHistoryStore {
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO chat_history \
-                 (message_id, user_name, direction, content, agent_role, workspace, timestamp) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (message_id, user_name, direction, content, agent_role, workspace, timestamp, \
+                  reply_author, reply_snippet) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 db::params![
                     entry.message_id.clone(),
                     entry.user_name.clone(),
@@ -112,6 +128,8 @@ impl ChatHistoryStore {
                     entry.agent_role.clone(),
                     entry.workspace.clone(),
                     entry.timestamp.clone(),
+                    entry.reply_reference.as_ref().map(|r| r.author.clone()),
+                    entry.reply_reference.as_ref().map(|r| r.snippet.clone()),
                 ],
             )
             .await?;
@@ -212,6 +230,7 @@ impl ChatHistoryStore {
             agent_role: None,
             workspace: workspace.to_string(),
             timestamp: None,
+            reply_reference: None,
         })
         .await
     }
@@ -252,6 +271,7 @@ mod tests {
                 agent_role: None,
                 workspace: "ws".to_string(),
                 timestamp: None,
+                reply_reference: None,
             })
             .await
             .expect("insert should succeed");
@@ -377,6 +397,7 @@ mod tests {
                 agent_role: None,
                 workspace: "ws1".to_string(),
                 timestamp: None,
+                reply_reference: None,
             })
             .await
             .expect("insert should succeed");
@@ -397,6 +418,7 @@ mod tests {
                 agent_role: None,
                 workspace: "ws1".to_string(),
                 timestamp: None,
+                reply_reference: None,
             })
             .await
             .expect("insert should succeed");
@@ -443,6 +465,7 @@ mod tests {
                     agent_role: None,
                     workspace: ws.to_string(),
                     timestamp: None,
+                    reply_reference: None,
                 })
                 .await
                 .expect("insert should succeed");
@@ -488,6 +511,7 @@ mod tests {
                     agent_role: None,
                     workspace: ws.to_string(),
                     timestamp: None,
+                    reply_reference: None,
                 })
                 .await
                 .expect("insert should succeed");
@@ -521,5 +545,39 @@ mod tests {
             .expect("load older should succeed");
         let contents: Vec<&str> = older.iter().map(|e| e.content.as_str()).collect();
         assert_eq!(contents, ["c0", "c1", "c2"]);
+    }
+
+    #[tokio::test]
+    async fn test_reply_reference_roundtrip() {
+        let (store, _tmp) = test_setup().await;
+
+        store
+            .insert(&ChatHistoryInsert {
+                message_id: "msg-reply".to_string(),
+                user_name: "alice".to_string(),
+                direction: "user".to_string(),
+                content: "hello".to_string(),
+                agent_role: None,
+                workspace: "ws1".to_string(),
+                timestamp: Some(crate::db::now()),
+                reply_reference: Some(crate::channels::ReplyReference {
+                    author: "bob".to_string(),
+                    snippet: "earlier message".to_string(),
+                }),
+            })
+            .await
+            .expect("insert should succeed");
+
+        let (history, _) = store
+            .load_for_user_workspaces("alice", "ws1", None)
+            .await
+            .expect("load should succeed");
+        assert_eq!(history.len(), 1);
+        let reply = history[0]
+            .reply_reference
+            .as_ref()
+            .expect("reply reference should survive the round-trip");
+        assert_eq!(reply.author, "bob");
+        assert_eq!(reply.snippet, "earlier message");
     }
 }

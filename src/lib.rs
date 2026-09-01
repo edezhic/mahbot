@@ -460,6 +460,9 @@ pub struct ChannelMessage {
     /// Only set for callback queries (`__act__` prefix),
     /// used to acknowledge and dismiss the Telegram loading spinner.
     pub callback_query_id: Option<String>,
+    /// Reference to the message this message is replying to, used to render a
+    /// quote header. `None` for messages with no reply target.
+    pub reply_reference: Option<crate::channels::ReplyReference>,
 }
 
 /// An outbound message to deliver on a channel.
@@ -554,6 +557,9 @@ pub enum ChatEvent {
         /// deliberately NOT persisted to chat_history (e.g. the Phase-1
         /// scripted onboarding exchange). Default false for all persisted paths.
         transient: bool,
+        /// Reference to the replied-to message for quote-header rendering.
+        #[serde(default)]
+        reply_reference: Option<crate::channels::ReplyReference>,
     },
     /// Typing indicator event.
     Typing {

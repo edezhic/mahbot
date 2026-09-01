@@ -438,6 +438,11 @@ CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(status, next_fire_at);";
 /// stay NULL, which maps to no label.
 const DELTA_CHAT_HISTORY_TIMESTAMP: &str = "ALTER TABLE chat_history ADD COLUMN timestamp TEXT;";
 
+/// Chat-history reply reference: two nullable TEXT columns carrying the
+/// replied-to message's author and normalized snippet. Both are NULL for rows
+/// with no reply; a non-NULL reference requires both columns to be set.
+const DELTA_CHAT_HISTORY_REPLY_REFERENCE: &str = "ALTER TABLE chat_history ADD COLUMN reply_author TEXT; ALTER TABLE chat_history ADD COLUMN reply_snippet TEXT;";
+
 /// Rename the 'ready_for_development' phase value to 'queued'.
 ///
 /// The phase rename (ReadyForDevelopment → Queued) changes the stored
@@ -713,6 +718,13 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "22",
         target: TargetDb::Core,
         body: MigrationBody::Sql(DELTA_TICKETS_WORKSPACE_PHASE_INDEX),
+    },
+    // Chat-history reply reference columns (author + normalized snippet) for
+    // rendering the reply-to quote header on GUI messages.
+    Migration {
+        id: "23",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(DELTA_CHAT_HISTORY_REPLY_REFERENCE),
     },
 ];
 
@@ -2009,8 +2021,14 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
         // Migration "18" (chat_history.timestamp) is a genuine one-time schema
         // addition, not an idempotent cleanup like "15"/"16". The pre-change
         // DB had no such column, so drop it to restore that shape before the
-        // reopen re-applies it.
+        // reopen re-applies it. Same for the migration "23" reply columns.
         conn.execute("ALTER TABLE chat_history DROP COLUMN timestamp;", ())
+            .await
+            .unwrap();
+        conn.execute("ALTER TABLE chat_history DROP COLUMN reply_author;", ())
+            .await
+            .unwrap();
+        conn.execute("ALTER TABLE chat_history DROP COLUMN reply_snippet;", ())
             .await
             .unwrap();
         for id in OLD_DEPLOYED_IDS {
@@ -2039,6 +2057,11 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
         let tickets_cols = column_names(&conn, "tickets").await;
         assert!(!tickets_cols.contains(&"pipeline_reservation".to_string()));
         assert!(!tickets_cols.contains(&"assigned_to".to_string()));
+        // Migrations "18"/"23" re-applied on the reopened shape.
+        let chat_cols = column_names(&conn, "chat_history").await;
+        assert!(chat_cols.contains(&"timestamp".to_string()));
+        assert!(chat_cols.contains(&"reply_author".to_string()));
+        assert!(chat_cols.contains(&"reply_snippet".to_string()));
 
         let applied = applied_ids(&conn).await;
         for id in ["15", "16"] {

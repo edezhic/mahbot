@@ -1578,6 +1578,7 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
         workspace: workspace.to_string(),
         optimistic_id: None,
         callback_query_id: None,
+        reply_reference: None,
     };
     crate::channels::broadcast_and_persist_incoming_message(&msg, transcript, transcript).await;
 }

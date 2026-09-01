@@ -1236,6 +1236,14 @@ async fn process_channel_message(mut msg: ChannelMessage) {
         msg.content = s;
     }
 
+    // ── Reply marker ────────────────────────────────────────────────
+    // Prepend the reply marker AFTER link enrichment (so URL summaries never
+    // see it) and BEFORE routing. Broadcast + persist ran above on the
+    // marker-free content, so the marker never reaches chat_history.
+    if let Some(reply) = msg.reply_reference.clone() {
+        msg.content = mahbot::channels::apply_reply_marker(&msg.content, &reply);
+    }
+
     // ── Route through the agent-ID message router ─────────────────
     // An empty role pool means no role is allowed — the message was still
     // broadcast/persisted above, but no agent answers. The user notice

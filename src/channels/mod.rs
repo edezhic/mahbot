@@ -1,7 +1,9 @@
 pub(crate) mod chat_history;
 mod enrichment;
+pub(crate) mod reply;
 pub mod telegram;
 pub use enrichment::{EnrichmentStrategy, enrich_links, enrich_message, has_only_audio_markers};
+pub use reply::{ReplyReference, apply_reply_marker};
 pub use telegram::mirror_gui_message_to_telegram;
 
 use crate::channels::chat_history::ChatHistoryInsert;
@@ -27,6 +29,7 @@ struct BroadcastPersistEntry {
     agent_role: Option<String>,
     workspace: String,
     optimistic_id: Option<String>,
+    reply_reference: Option<crate::channels::ReplyReference>,
 }
 
 impl BroadcastPersistEntry {
@@ -58,6 +61,7 @@ impl BroadcastPersistEntry {
             self.agent_role.clone(),
             &self.workspace,
             self.optimistic_id.clone(),
+            self.reply_reference.clone(),
             &timestamp,
             false,
         );
@@ -72,6 +76,7 @@ impl BroadcastPersistEntry {
                 agent_role: self.agent_role,
                 workspace: self.workspace,
                 timestamp: Some(timestamp),
+                reply_reference: self.reply_reference,
             })
             .await;
     }
@@ -104,7 +109,8 @@ pub(crate) async fn broadcast_and_persist_agent_response(
         direction: ChatDirection::Agent,
         agent_role, // moved — no clone needed
         workspace: workspace.to_string(),
-        optimistic_id: None, // agent messages must not carry one
+        optimistic_id: None,   // agent messages must not carry one
+        reply_reference: None, // agent responses never carry a reply reference
     }
     .broadcast_and_persist()
     .await;
@@ -131,6 +137,7 @@ pub(crate) fn broadcast_chat_event(
     agent_role: Option<String>,
     workspace: &str,
     optimistic_id: Option<String>,
+    reply_reference: Option<crate::channels::ReplyReference>,
     timestamp: &str,
     transient: bool,
 ) {
@@ -148,6 +155,7 @@ pub(crate) fn broadcast_chat_event(
             workspace: workspace.to_string(),
             optimistic_id,
             transient,
+            reply_reference,
         });
     }
 }
@@ -165,6 +173,7 @@ pub(crate) fn broadcast_transient_event(
     agent_role: Option<String>,
     workspace: &str,
     optimistic_id: Option<String>,
+    reply_reference: Option<crate::channels::ReplyReference>,
     timestamp: &str,
 ) {
     broadcast_chat_event(
@@ -176,6 +185,7 @@ pub(crate) fn broadcast_transient_event(
         agent_role,
         workspace,
         optimistic_id,
+        reply_reference,
         timestamp,
         true,
     );
@@ -209,6 +219,7 @@ pub async fn broadcast_and_persist_incoming_message(
         None,
         &msg.workspace,
         msg.optimistic_id.clone(),
+        msg.reply_reference.clone(),
         &timestamp,
         false,
     );
@@ -225,6 +236,7 @@ pub async fn broadcast_and_persist_incoming_message(
                     agent_role: None,
                     workspace: msg.workspace.clone(),
                     timestamp: Some(timestamp),
+                    reply_reference: msg.reply_reference.clone(),
                 })
                 .await;
         },

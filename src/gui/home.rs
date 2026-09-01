@@ -6,7 +6,9 @@
 
 use crate::ChatDirection;
 use crate::Role;
+use crate::channels::ReplyReference;
 use crate::channels::chat_history::ChatHistoryEntry;
+use crate::channels::reply::{agent_author_label, normalize_reply_text};
 use futures_util::SinkExt;
 use iced::widget::rule;
 use iced::widget::{Column, Id, Space, button, column, container, row, scrollable, text, tooltip};
@@ -27,6 +29,10 @@ const DEDUP_PRUNE_THRESHOLD: usize = 500;
 /// history loads.
 pub(super) const CHAT_SCROLL_ID: Id = Id::new("home_chat_scroll");
 
+/// Focus id for the chat composer editor, used to refocus it after selecting
+/// a reply target.
+pub(super) const CHAT_COMPOSER_ID: Id = Id::new("home_chat_composer");
+
 /// A displayed chat message in the scroll view.
 #[derive(Debug, Clone)]
 pub struct DisplayMessage {
@@ -38,6 +44,9 @@ pub struct DisplayMessage {
     pub agent_role: Option<String>,
     /// Timestamp (from chat_history) used for the relative-time label.
     pub timestamp: Option<String>,
+    /// Reference to the message this message replies to, rendered as a quote
+    /// header. `None` for messages with no reply target.
+    pub reply_reference: Option<ReplyReference>,
     /// Pre-parsed markdown items for rendering.
     pub md_items: Vec<iced::widget::markdown::Item>,
     /// True when this is an optimistic placeholder pushed before the pipeline
@@ -49,6 +58,7 @@ pub struct DisplayMessage {
 /// parses markdown; divider directions skip markdown (rendered as rules).
 /// `id` is `Some` for history-loaded entries, `None` for live/optimistic
 /// messages.
+#[expect(clippy::too_many_arguments)]
 fn display_message(
     id: Option<i64>,
     message_id: String,
@@ -56,6 +66,7 @@ fn display_message(
     direction: ChatDirection,
     agent_role: Option<String>,
     timestamp: Option<String>,
+    reply_reference: Option<ReplyReference>,
     is_optimistic: bool,
 ) -> DisplayMessage {
     use iced::widget::markdown;
@@ -73,6 +84,7 @@ fn display_message(
         direction,
         agent_role,
         timestamp,
+        reply_reference,
         md_items,
         is_optimistic,
     }
@@ -87,6 +99,7 @@ impl From<ChatHistoryEntry> for DisplayMessage {
             direction,
             agent_role,
             timestamp,
+            reply_reference,
             ..
         } = entry;
         display_message(
@@ -96,6 +109,7 @@ impl From<ChatHistoryEntry> for DisplayMessage {
             direction,
             agent_role,
             timestamp,
+            reply_reference,
             false,
         )
     }
@@ -118,6 +132,86 @@ fn align_bubble<'a>(
         // Agent: spacer left, bubble right
         row![Space::new().width(Length::FillPortion(1)), bubble,].into()
     }
+}
+
+/// Derive the [`ReplyReference`] captured for a reply-to action. User messages
+/// resolve to the selected user's canonical name; agent messages use the shared
+/// author-label derivation. Author and snippet both get angle brackets
+/// stripped (the snippet via [`normalize_reply_text`], which also HTML-decodes,
+/// collapses newlines, maps media markers, and caps the text).
+#[must_use]
+fn reply_reference_for(
+    direction: ChatDirection,
+    agent_role: Option<&str>,
+    content: &str,
+    user_name: &str,
+) -> ReplyReference {
+    let author = if direction == ChatDirection::User {
+        user_name.to_string()
+    } else {
+        agent_author_label(agent_role)
+    };
+    ReplyReference {
+        author: author.replace(['<', '>'], ""),
+        snippet: normalize_reply_text(content),
+    }
+}
+
+/// Render the compact reply quote header shown above a bubble that carries a
+/// [`ReplyReference`]: a muted "_author_: snippet" line with a small reply
+/// glyph, aligned to the row the bubble occupies.
+fn reply_quote_header(reply: &ReplyReference) -> Element<'_, HomeMessage> {
+    let icon = lucide::reply::<iced::Theme, iced::Renderer>()
+        .size(theme::TEXT_12)
+        .color(theme::ACCENT);
+    let author = text(&reply.author)
+        .size(theme::TEXT_11)
+        .color(theme::TEXT_SECONDARY);
+    let snippet = text(&reply.snippet)
+        .size(theme::TEXT_11)
+        .color(theme::TEXT_MUTED);
+    row![icon, author, snippet]
+        .spacing(theme::SPACE_4)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// Render the reply preview bar shown between the message list and the
+/// composer when a reply reference is pending: author + snippet on one line
+/// (the snippet's own cap produces the ellipsis) with a dismiss control.
+fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
+    let icon = lucide::reply::<iced::Theme, iced::Renderer>()
+        .size(theme::TEXT_12)
+        .color(theme::ACCENT);
+    let author = text(&reply.author)
+        .size(theme::TEXT_11)
+        .color(theme::TEXT_PRIMARY);
+    let snippet = text(&reply.snippet)
+        .size(theme::TEXT_11)
+        .color(theme::TEXT_MUTED);
+    let dismiss = button(
+        lucide::x::<iced::Theme, iced::Renderer>()
+            .size(theme::TEXT_12)
+            .color(theme::TEXT_MUTED),
+    )
+    .on_press(HomeMessage::CancelReply)
+    .style(theme::icon_button_style(false))
+    .padding(theme::PAD_2);
+    container(
+        row![
+            icon,
+            author,
+            snippet,
+            Space::new().width(Length::Fill),
+            dismiss
+        ]
+        .spacing(theme::SPACE_4)
+        .align_y(Alignment::Center),
+    )
+    .padding([theme::PAD_4, theme::PAD_8])
+    .style(theme::surface_container_style)
+    .width(Length::Fill)
+    .into()
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +269,18 @@ pub enum HomeMessage {
     /// Carries the exact stored/transmitted text (original media markers
     /// included), not the rendered view.
     CopyMessage(String),
+    /// Reply to a displayed chat message: capture its author + snippet as the
+    /// pending reply reference and focus the composer. Carries the message
+    /// identity needed to derive author/snippet (direction/agent_role/content)
+    /// without any id-based resolution — deliberately not the whole
+    /// [`DisplayMessage`], whose parsed markdown would be dead weight.
+    ReplyTo {
+        direction: ChatDirection,
+        agent_role: Option<String>,
+        content: String,
+    },
+    /// Dismiss the pending reply preview (clears the captured reference).
+    CancelReply,
     /// Switch user's active role. Carries (user_name, new_role).
     SwitchRole(String, Role),
     /// Chat history cleared successfully — divider inserted.
@@ -259,6 +365,10 @@ pub struct HomeState {
     undo_stack: super::common::UndoStack,
     /// Whether the composer role dropdown is open.
     role_menu_open: bool,
+    /// Captured {author, snippet} of the message being replied to. `Some`
+    /// while a reply preview is shown above the composer; cleared on send,
+    /// cancel, chat clear, or user/workspace switch.
+    pending_reply: Option<ReplyReference>,
 }
 
 /// The chat view for the selected user: two workspaces — the picker-resolved
@@ -312,6 +422,7 @@ impl HomeState {
             pagination_gen: 0,
             undo_stack: super::common::UndoStack::new(),
             role_menu_open: false,
+            pending_reply: None,
         }
     }
 
@@ -501,6 +612,7 @@ impl HomeState {
         self.history_loaded = false;
         self.onboarding_script_active = false;
         self.role_menu_open = false;
+        self.pending_reply = None;
         self.reset_pagination_state();
     }
 
@@ -548,6 +660,7 @@ impl HomeState {
                     Some("support".to_string()),
                     &workspace,
                     None,
+                    None,
                     &crate::db::now(),
                 );
             }
@@ -573,6 +686,7 @@ impl HomeState {
     /// [`DisplayMessage`], marks the canonical ID as seen, clears `sending`,
     /// and returns `Some(snap_task)` so the caller can early-return.
     /// Returns `None` when no replacement was performed.
+    #[expect(clippy::too_many_arguments)]
     fn replace_optimistic(
         &mut self,
         optimistic_id: Option<&str>,
@@ -581,6 +695,7 @@ impl HomeState {
         direction: ChatDirection,
         agent_role: Option<&str>,
         timestamp: Option<&str>,
+        reply_reference: Option<ReplyReference>,
     ) -> Option<Task<HomeMessage>> {
         if let Some(opt_id) = optimistic_id {
             if let Some(pos) = self
@@ -588,6 +703,10 @@ impl HomeState {
                 .iter()
                 .position(|m| m.is_optimistic && m.message_id == *opt_id)
             {
+                // Fall back to the optimistic bubble's own reference when the
+                // confirmed event carries none (robustness for agent/derived
+                // confirmations that drop the reference).
+                let reply = reply_reference.or_else(|| self.messages[pos].reply_reference.clone());
                 self.messages[pos] = display_message(
                     None,
                     message_id.to_string(),
@@ -595,6 +714,7 @@ impl HomeState {
                     direction,
                     agent_role.map(std::string::ToString::to_string),
                     timestamp.map(std::string::ToString::to_string),
+                    reply,
                     false,
                 );
                 // Track the canonical ID for dedup — the optimistic ID was
@@ -680,6 +800,7 @@ impl HomeState {
         direction: ChatDirection,
         agent_role: Option<String>,
         timestamp: Option<String>,
+        reply_reference: Option<ReplyReference>,
     ) {
         if Some(user_name) != self.selected_user.as_deref() {
             return;
@@ -689,7 +810,14 @@ impl HomeState {
         }
 
         self.messages.push(display_message(
-            None, message_id, content, direction, agent_role, timestamp, false,
+            None,
+            message_id,
+            content,
+            direction,
+            agent_role,
+            timestamp,
+            reply_reference,
+            false,
         ));
     }
 
@@ -774,20 +902,13 @@ impl HomeState {
                     let bubble_body: Element<'_, HomeMessage> = if is_user {
                         content
                     } else {
-                        // Strip numeric suffix (e.g. "analyst_3" → "analyst") and parse.
-                        let maybe_role = msg.agent_role.as_ref().and_then(|r| {
-                            let stripped = r
-                                .rsplit_once('_')
-                                .and_then(|(base, suffix)| {
-                                    if suffix.chars().all(|c| c.is_ascii_digit()) {
-                                        Some(base)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(r.as_str());
-                            stripped.parse::<Role>().ok()
-                        });
+                        // Strip the numeric role suffix (e.g. "analyst_3" →
+                        // "analyst", shared with reply author labels) and parse.
+                        let maybe_role = msg
+                            .agent_role
+                            .as_deref()
+                            .map(crate::channels::reply::strip_agent_role_suffix)
+                            .and_then(|stripped| stripped.parse::<Role>().ok());
                         if let Some(role) = maybe_role {
                             let (icon_color, _) = theme::role_badge_color_for(&role);
                             let icon = theme::role_icon(&role)
@@ -824,20 +945,46 @@ impl HomeState {
                         ))
                         .width(Length::FillPortion(3));
 
+                    // Quote header for a replied-to message: rendered above the
+                    // bubble (inside the same context-menu region) so a reply
+                    // stays visually tied to its target. Direction-agnostic —
+                    // agent messages never carry references today, but the
+                    // header renders whenever one is present.
+                    let bubble_region: Element<'_, HomeMessage> =
+                        if let Some(reply) = &msg.reply_reference {
+                            column![reply_quote_header(reply), bubble.width(Length::Fill),]
+                                .spacing(theme::SPACE_4)
+                                .width(Length::FillPortion(3))
+                                .into()
+                        } else {
+                            bubble.into()
+                        };
+
                     // Per-bubble context menu: right-clicking the bubble offers
                     // copying the raw markdown content (the exact stored text
-                    // with original media markers). Wrapping only the bubble —
+                    // with original media markers) and replying to it (hidden on
+                    // optimistic placeholders; divider rows return earlier so
+                    // they never get a menu). Wrapping only the bubble region —
                     // not the align_bubble row — keeps the spacer beside it a
                     // fall-through: spacer/empty-space right-clicks reach the
                     // outer "Reset session" menu in gui/mod.rs instead.
-                    let bubble: Element<'_, HomeMessage> = ContextMenu::new(
-                        bubble,
-                        vec![MenuItem::new(
-                            "Copy message".into(),
-                            HomeMessage::CopyMessage(msg.content.clone()),
-                        )],
-                    )
-                    .into();
+                    let mut menu_items = vec![MenuItem::new(
+                        "Copy message".into(),
+                        HomeMessage::CopyMessage(msg.content.clone()),
+                    )];
+                    if !msg.is_optimistic {
+                        menu_items.push(MenuItem::with_icon(
+                            iced_fonts::lucide::advanced_text::reply,
+                            "Reply".into(),
+                            HomeMessage::ReplyTo {
+                                direction: msg.direction,
+                                agent_role: msg.agent_role.clone(),
+                                content: msg.content.clone(),
+                            },
+                        ));
+                    }
+                    let bubble: Element<'_, HomeMessage> =
+                        ContextMenu::new(bubble_region, menu_items).into();
 
                     align_bubble(bubble, is_user)
                 })
@@ -1051,7 +1198,7 @@ impl HomeState {
                 controls,
                 grey_on_empty: true,
                 send_tooltip: "send text message",
-                id: Some(Id::new("home_chat_composer")),
+                id: Some(CHAT_COMPOSER_ID),
             },
         ))
         .style(theme::base_container_style)
@@ -1109,8 +1256,16 @@ impl HomeState {
             Space::new().height(0).into()
         };
 
+        // ── Reply preview ────────────────────────────────────────
+        // Shown between the message list and the composer while a reply target
+        // is pending; the dismiss control cancels it.
+        let reply_preview: Element<'_, HomeMessage> = match &self.pending_reply {
+            Some(reply) => reply_preview(reply),
+            None => Space::new().height(0).into(),
+        };
+
         // ── Full layout ──────────────────────────────────────────
-        column![chat_area, recording_popup, input_area,]
+        column![chat_area, recording_popup, reply_preview, input_area,]
             .align_x(Alignment::End)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1275,6 +1430,7 @@ impl HomeState {
                 self.typing = false;
                 self.typing_tick_state = 0;
                 self.role_menu_open = false;
+                self.pending_reply = None;
                 self.reset_pagination_state();
 
                 // Build agent ID and schedule async cleanup.
@@ -1322,6 +1478,10 @@ impl HomeState {
                 )
             }
             HomeMessage::ChatCleared => {
+                // Belt and suspenders: ClearChat cleared the message list and
+                // this callback re-loads history (not via reset_chat_state), so
+                // drop any pending reply explicitly.
+                self.pending_reply = None;
                 let toast = Task::done(HomeMessage::Toast(ToastMessage::SuccessMsg(
                     "Session cleared".to_string(),
                 )));
@@ -1331,6 +1491,29 @@ impl HomeState {
                 // Raw markdown copy — no toast, matching the editor's
                 // copy-path context-menu actions.
                 iced::clipboard::write(content)
+            }
+            HomeMessage::ReplyTo {
+                direction,
+                agent_role,
+                content,
+            } => {
+                let Some(user_name) = self.selected_user.clone() else {
+                    return Task::none();
+                };
+                self.pending_reply = Some(reply_reference_for(
+                    direction,
+                    agent_role.as_deref(),
+                    &content,
+                    &user_name,
+                ));
+                // Refocus the composer so the user can type the reply
+                // immediately, matching the select-to-focus affordance
+                // established by the composer's `Id`.
+                iced::widget::operation::focus::<HomeMessage>(CHAT_COMPOSER_ID)
+            }
+            HomeMessage::CancelReply => {
+                self.pending_reply = None;
+                Task::none()
             }
             HomeMessage::SwitchRole(user, role) => {
                 // Intercepted by Dashboard — no-op in Home
@@ -1351,6 +1534,7 @@ impl HomeState {
                     agent_role,
                     workspace,
                     optimistic_id,
+                    reply_reference,
                     ..
                 } => {
                     // 1. Replace optimistic placeholder if present.
@@ -1361,6 +1545,7 @@ impl HomeState {
                         direction,
                         agent_role.as_deref(),
                         Some(timestamp.as_str()),
+                        reply_reference.clone(),
                     ) {
                         return task;
                     }
@@ -1382,6 +1567,7 @@ impl HomeState {
                         direction,
                         agent_role,
                         Some(timestamp),
+                        reply_reference,
                     );
 
                     self.maybe_snap()
@@ -1611,8 +1797,16 @@ impl HomeState {
         self.sending = true;
 
         // Push optimistic message immediately so the user sees their own
-        // message without waiting for the pipeline round-trip.
+        // message without waiting for the pipeline round-trip. The pending
+        // reply reference (if any) attaches to the bubble so the quote header
+        // renders live; the scripted onboarding path must never flash one, so
+        // the reference is skipped (and left untouched) there.
         if let Some(ref opt_id) = optimistic_id {
+            let reply = if self.onboarding_script_active {
+                None
+            } else {
+                self.pending_reply.clone()
+            };
             self.messages.push(display_message(
                 None,
                 opt_id.clone(),
@@ -1620,16 +1814,26 @@ impl HomeState {
                 ChatDirection::User,
                 None,
                 None,
+                reply,
                 true,
             ));
         }
 
         // Phase-1 scripted onboarding intercepts the send before the pipeline:
         // the provider entry is parsed and persisted directly, and the
-        // exchange is rendered as transient (never persisted) events.
+        // exchange is rendered as transient (never persisted) events. The
+        // pending reply is dropped with the send — scripted messages never
+        // carry one, and a stale reference must not attach to a later send.
         if self.onboarding_script_active {
+            self.pending_reply = None;
             return self.send_scripted_message(content, optimistic_id);
         }
+
+        // Capture the pending reply reference for the confirmed message — a
+        // command-based message (no optimistic bubble) still carries it so it
+        // surfaces on the confirmed bubble via the ChatEvent. Cleared only
+        // after the send is queued (see below).
+        let reply = self.pending_reply.clone();
 
         let msg = crate::ChannelMessage {
             user_name: sender.clone(),
@@ -1639,6 +1843,7 @@ impl HomeState {
             workspace: self.selected_workspace.clone().unwrap_or_default(),
             optimistic_id,
             callback_query_id: None,
+            reply_reference: reply,
         };
 
         // Push to GUI_MESSAGE_TX.
@@ -1653,6 +1858,9 @@ impl HomeState {
             self.sending = false;
             return Task::none();
         }
+
+        // The send was queued — drop the pending reply so the preview clears.
+        self.pending_reply = None;
 
         // Spawn a safety timeout: if sending stays true for 30 seconds
         // (silent agent failure, crash, cancellation), auto-clear it.
@@ -1702,6 +1910,7 @@ impl HomeState {
                     None,
                     &workspace,
                     opt,
+                    None,
                     &crate::db::now(),
                 );
                 let outcome: Result<(), String> = match parsed {
@@ -1714,6 +1923,7 @@ impl HomeState {
                             "gui",
                             Some("support".to_string()),
                             &workspace,
+                            None,
                             None,
                             &crate::db::now(),
                         );
@@ -1730,6 +1940,7 @@ impl HomeState {
                                 Some("support".to_string()),
                                 &workspace,
                                 None,
+                                None,
                                 &crate::db::now(),
                             );
                             Ok(())
@@ -1743,6 +1954,7 @@ impl HomeState {
                                 "gui",
                                 Some("support".to_string()),
                                 &workspace,
+                                None,
                                 None,
                                 &crate::db::now(),
                             );
@@ -1831,6 +2043,7 @@ mod tests {
             direction,
             agent_role: agent_role.map(String::from),
             timestamp: None,
+            reply_reference: None,
             md_items: Vec::new(),
             is_optimistic,
         }
@@ -1856,6 +2069,7 @@ mod tests {
             "real-42",
             "Hello!",
             ChatDirection::User,
+            None,
             None,
             None,
         );
@@ -1892,6 +2106,7 @@ mod tests {
             ChatDirection::User,
             None,
             None,
+            None,
         );
 
         assert!(task.is_none(), "expected None when no optimistic match");
@@ -1906,8 +2121,15 @@ mod tests {
     fn test_replace_optimistic_no_opt_id() {
         let mut state = make_home_state("alice", "ws1");
 
-        let task =
-            state.replace_optimistic(None, "real-42", "Hello!", ChatDirection::User, None, None);
+        let task = state.replace_optimistic(
+            None,
+            "real-42",
+            "Hello!",
+            ChatDirection::User,
+            None,
+            None,
+            None,
+        );
 
         assert!(task.is_none(), "expected None when optimistic_id is None");
     }
@@ -2024,6 +2246,7 @@ mod tests {
             ChatDirection::User,
             None,
             None,
+            None,
         );
 
         assert_eq!(state.messages.len(), 1);
@@ -2041,6 +2264,7 @@ mod tests {
             "msg-1".to_string(),
             "Hello!".to_string(),
             ChatDirection::User,
+            None,
             None,
             None,
         );
@@ -2064,6 +2288,7 @@ mod tests {
             ChatDirection::User,
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -2084,6 +2309,7 @@ mod tests {
             "Agent answer".to_string(),
             ChatDirection::Agent,
             Some("engineer".to_string()),
+            None,
             None,
         );
 
@@ -2343,6 +2569,7 @@ mod tests {
                 ChatDirection::Agent,
                 Some(role.to_string()),
                 None,
+                None,
             );
             assert_eq!(state.messages.len(), 1);
             assert_eq!(state.messages[0].content, content);
@@ -2363,6 +2590,7 @@ mod tests {
             "msg-other".to_string(),
             "other".to_string(),
             ChatDirection::Agent,
+            None,
             None,
             None,
         );
@@ -2386,6 +2614,7 @@ mod tests {
             direction: ChatDirection::User,
             agent_role: None,
             timestamp: None,
+            reply_reference: None,
         };
         let msg = DisplayMessage::from(entry);
 
@@ -2408,6 +2637,7 @@ mod tests {
             direction: ChatDirection::Divider,
             agent_role: None,
             timestamp: None,
+            reply_reference: None,
         };
         let msg = DisplayMessage::from(entry);
 
@@ -2421,6 +2651,149 @@ mod tests {
             msg.md_items.len()
         );
         assert!(!msg.is_optimistic);
+    }
+
+    #[test]
+    fn test_display_message_from_entry_with_reply_reference() {
+        let entry = ChatHistoryEntry {
+            id: 7,
+            message_id: "msg-7".to_string(),
+            content: "replied text".to_string(),
+            direction: ChatDirection::User,
+            agent_role: None,
+            timestamp: None,
+            reply_reference: Some(crate::channels::ReplyReference {
+                author: "alice".to_string(),
+                snippet: "quote".to_string(),
+            }),
+        };
+        let msg = DisplayMessage::from(entry);
+
+        assert_eq!(
+            msg.reply_reference.as_ref().map(|r| r.author.as_str()),
+            Some("alice"),
+            "From<ChatHistoryEntry> must carry the entry's reply_reference"
+        );
+        assert_eq!(
+            msg.reply_reference.as_ref().map(|r| r.snippet.as_str()),
+            Some("quote")
+        );
+    }
+
+    #[test]
+    fn test_reply_reference_for_user_message() {
+        // Angle brackets in the (nominally canonical) user name are stripped
+        // from the author, matching the snippet's own stripping.
+        let reply = reply_reference_for(
+            ChatDirection::User,
+            None,
+            "Hello <world>\n\nwith [IMAGE:/tmp/photo.png]",
+            "al<i>ce",
+        );
+
+        // User direction resolves to the selected user's canonical name; the
+        // snippet is normalized (angle brackets stripped, newlines collapsed —
+        // each `\n` becomes a single space, so `\n\n` yields two — media marker
+        // mapped).
+        assert_eq!(reply.author, "alice");
+        assert_eq!(reply.snippet, "Hello world  with [Photo]");
+    }
+
+    #[test]
+    fn test_reply_reference_for_agent_message() {
+        let reply = reply_reference_for(
+            ChatDirection::Agent,
+            Some("analyst_3"),
+            "line one\n<line two> [IMAGE:/tmp/x.png] and a long tail",
+            "alice",
+        );
+
+        // Agent direction uses the shared author-label derivation (suffix
+        // stripped + role label); snippet normalized the same way.
+        assert_eq!(reply.author, "Analyst");
+        assert_eq!(reply.snippet, "line one line two [Photo] and a long tail");
+    }
+
+    #[test]
+    fn test_reply_reference_snippet_caps_at_100() {
+        let long = "a".repeat(150);
+        let reply = reply_reference_for(ChatDirection::User, None, &long, "alice");
+
+        assert!(
+            reply.snippet.chars().count() <= crate::channels::reply::REPLY_SNIPPET_MAX_CHARS,
+            "snippet must be capped at 100 chars, got {}",
+            reply.snippet.chars().count()
+        );
+        assert!(
+            reply.snippet.ends_with('…'),
+            "truncated snippet ends with …"
+        );
+    }
+
+    #[test]
+    fn test_replace_optimistic_reply_reference_fallback() {
+        // A confirmed event carrying no reference falls back to the target
+        // optimistic bubble's own reference.
+        let mut state = make_home_state("alice", "ws1");
+        state.messages.push(DisplayMessage {
+            id: None,
+            message_id: "opt-9".to_string(),
+            content: "(placeholder)".to_string(),
+            direction: ChatDirection::User,
+            agent_role: None,
+            timestamp: None,
+            reply_reference: Some(crate::channels::ReplyReference {
+                author: "bob".to_string(),
+                snippet: "original quote".to_string(),
+            }),
+            md_items: Vec::new(),
+            is_optimistic: true,
+        });
+
+        let task = state.replace_optimistic(
+            Some("opt-9"),
+            "real-9",
+            "Hello!",
+            ChatDirection::User,
+            None,
+            None,
+            None,
+        );
+        assert!(task.is_some(), "expected replacement");
+        let replaced = &state.messages[0];
+        assert_eq!(
+            replaced.reply_reference.as_ref().map(|r| r.author.as_str()),
+            Some("bob"),
+            "event with no reference must keep the optimistic bubble's"
+        );
+
+        // A confirmed reference wins over the optimistic one.
+        let mut state = make_home_state("alice", "ws1");
+        state.messages.push(make_msg(
+            "opt-10",
+            "(placeholder)",
+            ChatDirection::User,
+            None,
+            true,
+        ));
+        let task = state.replace_optimistic(
+            Some("opt-10"),
+            "real-10",
+            "Hi",
+            ChatDirection::User,
+            None,
+            None,
+            Some(crate::channels::ReplyReference {
+                author: "carol".to_string(),
+                snippet: "confirmed".to_string(),
+            }),
+        );
+        assert!(task.is_some(), "expected replacement");
+        let replaced = &state.messages[0];
+        assert_eq!(
+            replaced.reply_reference.as_ref().map(|r| r.author.as_str()),
+            Some("carol")
+        );
     }
 
     // ------------------------------------------------------------------

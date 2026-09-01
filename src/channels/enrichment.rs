@@ -715,6 +715,7 @@ mod tests {
             workspace: "test".into(),
             optimistic_id: None,
             callback_query_id: None,
+            reply_reference: None,
         }
     }
 

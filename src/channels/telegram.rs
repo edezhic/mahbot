@@ -1,3 +1,5 @@
+use crate::channels::ReplyReference;
+use crate::channels::reply::normalize_reply_text;
 use crate::util::html::{decode_html_entities, escape_html, push_escaped};
 use crate::util::media_target::{self, MediaTarget};
 use crate::util::{TELEGRAM_MEDIA_MARKER_RE, UnwrapPoison, is_http_url, parse_media_marker};
@@ -220,6 +222,9 @@ struct MessageContext {
     chat_id: String,
     message_id: i64,
     reply_target: String,
+    /// Reply reference parsed from the update's `reply_to_message` — `None`
+    /// when this message does not reply to anything.
+    reply_reference: Option<ReplyReference>,
 }
 
 impl MessageContext {
@@ -232,6 +237,7 @@ impl MessageContext {
             workspace: String::new(),
             optimistic_id: None,
             callback_query_id: cq_id,
+            reply_reference: self.reply_reference,
         }
     }
 }
@@ -357,6 +363,116 @@ fn format_sender_label(from: &serde_json::Value) -> String {
             .unwrap_or(crate::users::TELEGRAM_UNKNOWN_SENTINEL)
             .to_string()
     }
+}
+
+/// Resolve the display label for a replied-to message's author.
+///
+/// The fallback chain is deliberately distinct from [`format_sender_label`],
+/// which keeps the `'unknown'` sentinel: a reply quote header must never
+/// surface `'unknown'`, so the ultimate fallback is `"user"`.
+///
+/// 1. `sender_chat` present → its `title`, else `"channel"`.
+/// 2. `from` present → if `is_bot`: `@username` else `"bot"`; otherwise
+///    `@username` → `first_name` → `"user"`.
+/// 3. Neither → `"user"`.
+///
+/// `<` / `>` are stripped from the resulting label since `first_name` /
+/// `title` may contain user-controlled angle brackets.
+#[must_use]
+pub(crate) fn replied_to_sender_label(message: &serde_json::Value) -> String {
+    let label = if let Some(sender_chat) = message.get("sender_chat") {
+        sender_chat
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("channel")
+            .to_string()
+    } else if let Some(from) = message.get("from") {
+        if from
+            .get("is_bot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            from.get("username")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| "bot".to_string(), |u| format!("@{u}"))
+        } else {
+            from.get("username")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(
+                    || {
+                        from.get("first_name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("user")
+                            .to_string()
+                    },
+                    |u| format!("@{u}"),
+                )
+        }
+    } else {
+        "user".to_string()
+    };
+    label.replace(['<', '>'], "")
+}
+
+/// Placeholder text for a media message reply whose text/caption is empty.
+///
+/// The mapping mirrors the original reply-quote logic: photo / voice/audio /
+/// video / document / sticker get a specific label, everything else
+/// (animation, video_note, etc.) falls back to `[Message]`.
+#[must_use]
+fn media_kind_placeholder(reply_to: &serde_json::Value) -> String {
+    if reply_to.get("voice").is_some() || reply_to.get("audio").is_some() {
+        "[Voice message]".to_string()
+    } else if reply_to.get("photo").is_some() {
+        "[Photo]".to_string()
+    } else if reply_to.get("document").is_some() {
+        "[Document]".to_string()
+    } else if reply_to.get("video").is_some() {
+        "[Video]".to_string()
+    } else if reply_to.get("sticker").is_some() {
+        "[Sticker]".to_string()
+    } else {
+        "[Message]".to_string()
+    }
+}
+
+/// Derive a reply snippet from a `reply_to_message` object.
+///
+/// Text/caption snippets are normalized via [`normalize_reply_text`]; media
+/// messages with no text/caption use [`media_kind_placeholder`].
+#[must_use]
+fn reply_to_snippet(reply_to: &serde_json::Value) -> String {
+    if let Some(text) = reply_to.get("text").and_then(serde_json::Value::as_str)
+        && !text.is_empty()
+    {
+        normalize_reply_text(text)
+    } else if let Some(caption) = reply_to.get("caption").and_then(serde_json::Value::as_str)
+        && !caption.is_empty()
+    {
+        normalize_reply_text(caption)
+    } else {
+        media_kind_placeholder(reply_to)
+    }
+}
+
+/// Build a [`ReplyReference`] from a Telegram message's `reply_to_message`,
+/// when present. Returns `None` when the message does not reply to another
+/// message.
+///
+/// The snippet is derived from the replied-to message's text/caption
+/// (normalized via [`normalize_reply_text`]) or, for media messages with no
+/// text, a media-kind placeholder. The author label comes from
+/// [`replied_to_sender_label`].
+#[must_use]
+pub(crate) fn build_reply_reference(message: &serde_json::Value) -> Option<ReplyReference> {
+    let reply_to = message.get("reply_to_message")?;
+    if !reply_to.is_object() {
+        return None;
+    }
+    Some(ReplyReference {
+        author: replied_to_sender_label(reply_to),
+        snippet: reply_to_snippet(reply_to),
+    })
 }
 
 /// Build the user-facing content string for an incoming attachment.
@@ -964,6 +1080,7 @@ impl TelegramChannel {
             chat_id: String::new(),
             message_id: 0,
             reply_target,
+            reply_reference: None,
         };
         Some(ctx.into_channel_message(data.to_string(), callback_query_id))
     }
@@ -999,16 +1116,13 @@ impl TelegramChannel {
             chat_id,
             message_id,
             reply_target,
+            reply_reference: build_reply_reference(message),
         })
     }
 
-    /// Prepend reply context and forwarding attribution to content.
-    fn prepend_reply_metadata(content: String, message: &serde_json::Value) -> String {
-        let content = if let Some(quote) = Self::extract_reply_context(message) {
-            format!("{quote}\n\n{content}")
-        } else {
-            content
-        };
+    /// Prepend forwarding attribution (from `forward_from` /
+    /// `forward_from_chat` / `forward_sender_name`) to content.
+    fn prepend_forward_attribution(content: String, message: &serde_json::Value) -> String {
         if let Some(attr) = Self::format_forward_attribution(message) {
             format!("{attr}{content}")
         } else {
@@ -1400,7 +1514,7 @@ impl TelegramChannel {
             let _ = write!(content, "\n\n{caption}");
         }
 
-        let content = Self::prepend_reply_metadata(content, message);
+        let content = Self::prepend_forward_attribution(content, message);
 
         Some(ctx.into_channel_message(content, None))
     }
@@ -1430,39 +1544,6 @@ impl TelegramChannel {
         }
     }
 
-    /// Extract reply context from a Telegram `reply_to_message`, if present.
-    fn extract_reply_context(message: &serde_json::Value) -> Option<String> {
-        let reply = message.get("reply_to_message")?;
-
-        let from = reply.get("from");
-        let reply_label = from.map_or_else(|| "unknown".to_string(), format_sender_label);
-
-        let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
-            text.to_string()
-        } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
-            "[Voice message]".to_string()
-        } else if reply.get("photo").is_some() {
-            "[Photo]".to_string()
-        } else if reply.get("document").is_some() {
-            "[Document]".to_string()
-        } else if reply.get("video").is_some() {
-            "[Video]".to_string()
-        } else if reply.get("sticker").is_some() {
-            "[Sticker]".to_string()
-        } else {
-            "[Message]".to_string()
-        };
-
-        // Format as blockquote with sender attribution
-        let quoted_lines: String = reply_text
-            .lines()
-            .map(|line| format!("> {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Some(format!("> {reply_label}:\n{quoted_lines}"))
-    }
-
     async fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let message = update.get("message")?;
         let text = message.get("text").and_then(serde_json::Value::as_str)?;
@@ -1478,7 +1559,7 @@ impl TelegramChannel {
 
         let content = text.to_string();
 
-        let content = Self::prepend_reply_metadata(content, message);
+        let content = Self::prepend_forward_attribution(content, message);
 
         Some(ctx.into_channel_message(content, None))
     }
@@ -2438,7 +2519,10 @@ pub async fn send_reply(recipient: &str, content: &str) {
 /// text retains markdown formatting through the standard inline parser.
 /// Media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`) are stripped
 /// so raw marker syntax does not appear in the quote; purely media-only
-/// messages are skipped entirely.
+/// messages are skipped entirely. When the message carries a
+/// [`ReplyReference`], a `↩ {author}: {snippet}` header line leads the
+/// blockquote (before the user's text), and a media-only message with a
+/// reference still mirrors — the blockquote then holds only the `↩` line.
 pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
     // Guard: only mirror local-originated user messages — GUI text and local
     // voice transcripts (prevents echo loops: voice is a strictly local source
@@ -2485,18 +2569,31 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
         return; // No Telegram binding — silently skip.
     }
 
-    // Strip media markers so users don't see raw `[IMAGE:...]` syntax in the quote.
+    // Strip media markers so users don't see raw `[IMAGE:...]` syntax in the
+    // quote. A reply reference is preserved as a `↩` header line inside the
+    // blockquote; when a reference is present the media-only guard below is
+    // relaxed so a reply to a media message still mirrors the `↩` line.
     let content = TELEGRAM_MEDIA_MARKER_RE
         .replace_all(trimmed, "")
         .to_string();
     let content = content.trim().to_string();
-    if content.is_empty() {
-        return; // Media-only message — nothing to quote.
-    }
 
-    // Wrap in <blockquote> — these tags pass through markdown_to_telegram_html
-    // unchanged, while the user's text retains markdown formatting.
-    let quoted = format!("<blockquote>\n{content}\n</blockquote>");
+    let quoted = if let Some(reply) = &msg.reply_reference {
+        let header = format!("↩ {}: {}", reply.author, reply.snippet);
+        if content.is_empty() {
+            // Media-only message with a reply — emit just the `↩` line.
+            format!("<blockquote>\n{header}\n</blockquote>")
+        } else {
+            format!("<blockquote>\n{header}\n{content}\n</blockquote>")
+        }
+    } else {
+        if content.is_empty() {
+            return; // Media-only message — nothing to quote.
+        }
+        // Wrap in <blockquote> — these tags pass through markdown_to_telegram_html
+        // unchanged, while the user's text retains markdown formatting.
+        format!("<blockquote>\n{content}\n</blockquote>")
+    };
 
     for binding in &telegram_bindings {
         let Some(reply_target) = &binding.reply_target else {

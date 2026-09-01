@@ -782,50 +782,158 @@ async fn usernameless_sender_stays_unauthorized_despite_legacy_binding() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// extract_reply_context tests
+// build_reply_reference / replied_to_sender_label tests
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_extract_reply_context() {
-    // text message reply
-    let msg = serde_json::json!({
+fn build_reply_reference_text_snippet_normalized() {
+    // Entities decoded, angle brackets stripped, newlines collapsed.
+    let message = serde_json::json!({
         "reply_to_message": {
             "from": { "username": "alice" },
-            "text": "Hello world"
+            "text": "say &quot;hi&quot; &amp; <bye>\nsecond line"
         }
     });
-    let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
-    assert_eq!(ctx, "> @alice:\n> Hello world");
+    let reply = build_reply_reference(&message).unwrap();
+    assert_eq!(reply.author, "@alice");
+    assert_eq!(reply.snippet, "say \"hi\" & bye second line");
+}
 
-    // voice message reply
-    let msg = serde_json::json!({
+#[test]
+fn build_reply_reference_snippet_caps_at_max() {
+    let long = "a".repeat(crate::channels::reply::REPLY_SNIPPET_MAX_CHARS + 50);
+    let message = serde_json::json!({
+        "reply_to_message": {
+            "from": { "username": "alice" },
+            "text": long
+        }
+    });
+    let reply = build_reply_reference(&message).unwrap();
+    assert_eq!(
+        reply.snippet.chars().count(),
+        crate::channels::reply::REPLY_SNIPPET_MAX_CHARS
+    );
+    assert!(reply.snippet.ends_with('…'));
+}
+
+#[test]
+fn build_reply_reference_caption_fallback() {
+    // A media message with an empty `text` falls back to the caption.
+    let message = serde_json::json!({
         "reply_to_message": {
             "from": { "username": "bob" },
-            "voice": { "file_id": "abc", "duration": 5 }
+            "photo": [{ "file_id": "x", "width": 1, "height": 1 }],
+            "caption": "at the <beach>"
         }
     });
-    let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
-    assert_eq!(ctx, "> @bob:\n> [Voice message]");
+    let reply = build_reply_reference(&message).unwrap();
+    assert_eq!(reply.snippet, "at the beach");
+}
 
-    // no reply
-    let msg = serde_json::json!({
-        "text": "just a regular message"
-    });
-    assert!(TelegramChannel::extract_reply_context(&msg).is_none());
-
-    // no username, uses first_name
-    let msg = serde_json::json!({
+#[test]
+fn build_reply_reference_media_kind_placeholders() {
+    for (field, expected) in [
+        ("photo", "[Photo]"),
+        ("document", "[Document]"),
+        ("video", "[Video]"),
+        ("voice", "[Voice message]"),
+        ("audio", "[Voice message]"),
+        ("sticker", "[Sticker]"),
+        ("animation", "[Message]"),
+    ] {
+        let mut reply_to = serde_json::Map::new();
+        reply_to.insert("from".to_string(), serde_json::json!({ "username": "bob" }));
+        reply_to.insert(field.to_string(), serde_json::json!({ "file_id": "x" }));
+        let message = serde_json::json!({ "reply_to_message": reply_to });
+        let reply = build_reply_reference(&message).unwrap();
+        assert_eq!(reply.snippet, expected, "field: {field}");
+    }
+    // Unknown kind (video_note) also falls back to [Message].
+    let message = serde_json::json!({
         "reply_to_message": {
-            "from": { "id": 999, "first_name": "Charlie" },
-            "text": "Hi there"
+            "from": { "username": "bob" },
+            "video_note": { "file_id": "x" }
         }
     });
-    let ctx = TelegramChannel::extract_reply_context(&msg).unwrap();
-    assert_eq!(ctx, "> Charlie:\n> Hi there");
+    assert_eq!(
+        build_reply_reference(&message).unwrap().snippet,
+        "[Message]"
+    );
+}
+
+#[test]
+fn build_reply_reference_no_reply_is_none() {
+    let message = serde_json::json!({ "text": "no reply here" });
+    assert!(build_reply_reference(&message).is_none());
+    // A null reply_to_message (not an object) is also "no reply".
+    let message = serde_json::json!({ "text": "hi", "reply_to_message": null });
+    assert!(build_reply_reference(&message).is_none());
+}
+
+#[test]
+fn build_reply_reference_mirrored_message() {
+    // A reply to a GUI-mirrored message: its raw text IS the mirror's own
+    // blockquote HTML, which normalizes away leaving just the `↩` line.
+    let message = serde_json::json!({
+        "reply_to_message": {
+            "from": { "username": "alice" },
+            "text": "<blockquote>\n↩ alice: hi there\n</blockquote>"
+        }
+    });
+    let reply = build_reply_reference(&message).unwrap();
+    assert_eq!(reply.snippet, "↩ alice: hi there");
+}
+
+#[test]
+fn replied_to_sender_label_chain() {
+    // @username.
+    assert_eq!(
+        replied_to_sender_label(&serde_json::json!({ "from": { "username": "alice" } })),
+        "@alice"
+    );
+    // No username + first_name → first_name.
+    assert_eq!(
+        replied_to_sender_label(&serde_json::json!({ "from": { "id": 1, "first_name": "Bob" } })),
+        "Bob"
+    );
+    // Neither → "user".
+    assert_eq!(
+        replied_to_sender_label(&serde_json::json!({ "from": { "id": 1 } })),
+        "user"
+    );
+    // sender_chat with title → title.
+    assert_eq!(
+        replied_to_sender_label(&serde_json::json!({ "sender_chat": { "title": "Daily News" } })),
+        "Daily News"
+    );
+    // sender_chat without title → "channel".
+    assert_eq!(
+        replied_to_sender_label(&serde_json::json!({ "sender_chat": { "id": 1 } })),
+        "channel"
+    );
+    // Bot with username → @username.
+    assert_eq!(
+        replied_to_sender_label(
+            &serde_json::json!({ "from": { "is_bot": true, "username": "poll_bot" } })
+        ),
+        "@poll_bot"
+    );
+    // Bot without username → "bot".
+    assert_eq!(
+        replied_to_sender_label(&serde_json::json!({ "from": { "is_bot": true } })),
+        "bot"
+    );
+    // Angle brackets in first_name are stripped.
+    assert_eq!(
+        replied_to_sender_label(&serde_json::json!({ "from": { "first_name": "<Bob>" } })),
+        "Bob"
+    );
+    // Neither sender_chat nor from → "user".
+    assert_eq!(replied_to_sender_label(&serde_json::json!({})), "user");
 }
 
 #[tokio::test]
-async fn parse_update_message_includes_reply_context() {
+async fn parse_update_message_populates_reply_reference() {
     let ch = test_channel().await;
     let update = test_update(&[(
         "message",
@@ -841,19 +949,88 @@ async fn parse_update_message_includes_reply_context() {
         }),
     )]);
     let parsed = ch.parse_update_message(&update).await.unwrap();
-    assert!(
-        parsed.content.starts_with("> @bot:"),
-        "content should start with quote: {}",
-        parsed.content
-    );
-    assert!(
-        parsed.content.contains("translate this"),
-        "content should contain user text"
-    );
-    assert!(
-        parsed.content.contains("Bonjour le monde"),
-        "content should contain quoted text"
-    );
+    // No leading `> ` quote — the content is the raw user text only.
+    assert_eq!(parsed.content, "translate this");
+    let reply = parsed
+        .reply_reference
+        .expect("parsed message should carry the reply reference");
+    assert_eq!(reply.author, "@bot");
+    assert_eq!(reply.snippet, "Bonjour le monde");
+}
+
+#[tokio::test]
+async fn attachment_message_reply_carries_reference() {
+    // `try_parse_attachment_message` builds its context through
+    // `extract_message_context`, so a reply to a media message must also
+    // carry the reference (the no-silent-drop path for replies to media).
+    let ch = test_channel().await;
+    let message = serde_json::json!({
+        "message_id": 7,
+        "from": { "id": 1, "username": "alice" },
+        "chat": { "id": 100, "type": "private" },
+        "photo": [{ "file_id": "x", "width": 1, "height": 1 }],
+        "reply_to_message": {
+            "from": { "username": "bob" },
+            "photo": [{ "file_id": "y", "width": 1, "height": 1 }]
+        }
+    });
+    let ctx = ch
+        .extract_message_context(&message)
+        .await
+        .expect("valid context");
+    let reply = ctx.reply_reference.expect("media reply carries reference");
+    assert_eq!(reply.author, "@bob");
+    assert_eq!(reply.snippet, "[Photo]");
+}
+
+#[tokio::test]
+async fn reply_that_is_a_command_parses_as_command() {
+    let ch = test_channel().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 11,
+            "text": "/clear",
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 100, "type": "private" },
+            "reply_to_message": {
+                "from": { "username": "bot" },
+                "text": "some earlier text"
+            }
+        }),
+    )]);
+    let parsed = ch.parse_update_message(&update).await.unwrap();
+    // The raw command text reaches the content, so parse_bot_command matches
+    // and the command handler takes over (the reply reference is dropped).
+    assert_eq!(parsed.content, "/clear");
+    assert!(crate::parse_bot_command(&parsed.content).is_some());
+}
+
+#[tokio::test]
+async fn reply_to_command_keeps_reference() {
+    let ch = test_channel().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 12,
+            "text": "why did you clear?",
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 100, "type": "private" },
+            "reply_to_message": {
+                "from": { "username": "bot" },
+                "text": "/clear"
+            }
+        }),
+    )]);
+    let parsed = ch.parse_update_message(&update).await.unwrap();
+    // A non-command reply to a command message keeps its reference and routes
+    // to the agent as usual.
+    assert_eq!(parsed.content, "why did you clear?");
+    assert!(crate::parse_bot_command(&parsed.content).is_none());
+    let reply = parsed
+        .reply_reference
+        .expect("non-command reply keeps its reference");
+    assert_eq!(reply.snippet, "/clear");
 }
 
 // ── IncomingAttachment / parse_attachment_metadata tests ─────────
@@ -1706,6 +1883,7 @@ fn gui_msg(user_name: &str, content: &str) -> ChannelMessage {
         workspace: "test".to_string(),
         optimistic_id: None,
         callback_query_id: None,
+        reply_reference: None,
     }
 }
 
@@ -1718,6 +1896,7 @@ fn telegram_msg(user_name: &str, content: &str) -> ChannelMessage {
         workspace: "test".to_string(),
         optimistic_id: None,
         callback_query_id: None,
+        reply_reference: None,
     }
 }
 
@@ -1730,6 +1909,7 @@ fn voice_msg(user_name: &str, content: &str) -> ChannelMessage {
         workspace: "test".to_string(),
         optimistic_id: None,
         callback_query_id: None,
+        reply_reference: None,
     }
 }
 
@@ -1831,6 +2011,19 @@ async fn mirror_skips_guard_cases() {
         MirrorSkipSetup::BoundTo("media_only", "target_media"),
         &gui_msg("media_only", "[IMAGE:/path/to/img.png]"),
         "media-only content should not send",
+    )
+    .await;
+    // A reply reference must NOT rescue an entirely-empty message: the
+    // pre-strip trimmed-empty guard still skips it regardless of a reference.
+    let mut empty_ref = gui_msg("skip_ew", "");
+    empty_ref.reply_reference = Some(crate::channels::ReplyReference {
+        author: "alice".to_string(),
+        snippet: "hi".to_string(),
+    });
+    assert_mirror_skips(
+        MirrorSkipSetup::BoundTo("skip_ew", "target_empty_ws"),
+        &empty_ref,
+        "empty content with a reply reference should not send",
     )
     .await;
 }
@@ -1996,6 +2189,55 @@ async fn preserves_markdown_formatting_in_blockquote() {
     assert_eq!(
         our_msgs[0].content,
         "<blockquote>\n**bold** and `code` and *italic*\n</blockquote>"
+    );
+}
+
+#[tokio::test]
+async fn mirrors_reply_reference_header() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding("ref_user", "unique_ref", "ref_user").await;
+
+    let mut msg = gui_msg("ref_user", "hello");
+    msg.reply_reference = Some(crate::channels::ReplyReference {
+        author: "alice".to_string(),
+        snippet: "hi there".to_string(),
+    });
+    super::mirror_gui_message_to_telegram(&msg).await;
+
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "unique_ref")
+        .collect();
+    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    assert_eq!(
+        our_msgs[0].content,
+        "<blockquote>\n↩ alice: hi there\nhello\n</blockquote>"
+    );
+}
+
+#[tokio::test]
+async fn mirrors_media_only_with_reply_reference() {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding("media_ref", "unique_media_ref", "media_ref").await;
+
+    let mut msg = gui_msg("media_ref", "[IMAGE:/tmp/screenshot.png]");
+    msg.reply_reference = Some(crate::channels::ReplyReference {
+        author: "bob".to_string(),
+        snippet: "[Photo]".to_string(),
+    });
+    super::mirror_gui_message_to_telegram(&msg).await;
+
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == "unique_media_ref")
+        .collect();
+    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    // Media-only content (markers stripped) still mirrors the `↩` line.
+    assert_eq!(
+        our_msgs[0].content,
+        "<blockquote>\n↩ bob: [Photo]\n</blockquote>"
     );
 }
 

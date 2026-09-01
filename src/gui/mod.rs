@@ -273,7 +273,6 @@ impl ToggleKind {
 
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)]
-#[expect(clippy::large_enum_variant)]
 pub enum Message {
     /// MahBot finished async startup (or failed). On success, [`BOOT_LOG_STORE`] is set.
     Boot(Result<(), String>),
