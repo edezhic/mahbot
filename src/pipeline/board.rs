@@ -963,120 +963,99 @@ impl BoardStore {
         })
     }
 
-    /// Grace window for Backlog→Analysis claims: tickets younger than this are
-    /// not claimed into Analysis. Gives the Manager ~5s after create_ticket to
-    /// move the ticket straight to Planning/Queued — claiming it
-    /// into Analysis within the window would spawn analysts that immediately
-    /// get cancelled (plus a spurious phase-change notification).
+    /// Grace window for Backlog→Analysis claims; the rationale lives on
+    /// [`claim_backlog_for_analysis`](Self::claim_backlog_for_analysis).
     pub(crate) const BACKLOG_CLAIM_GRACE: Duration = Duration::seconds(5);
 
-    /// Claim a workspace's oldest eligible Backlog ticket and transition it to
-    /// Analysis in a single atomic `UPDATE..RETURNING`. Always filters by
-    /// `workspace_name` so only tickets from that workspace are eligible.
-    ///
-    /// Only tickets currently in [`TicketPhase::Backlog`] are eligible. The
-    /// WHERE clause includes `t1.phase = ?3` bound to `Backlog`, providing
-    /// CAS-style atomicity for the phase transition — if no Backlog ticket
-    /// matches, the claim returns `None`.
-    ///
-    /// A `created_at <= ?5` cutoff excludes tickets created within the
-    /// [`BACKLOG_CLAIM_GRACE`] window, so a fresh ticket stays in Backlog a bit
-    /// longer (giving the Manager ~5s after `create_ticket` to move the ticket
-    /// straight to Planning/Queued). Claiming it into Analysis within the
-    /// window would spawn analysts that immediately get cancelled.
-    ///
-    /// The prereq filter is part of the same atomic UPDATE (no separate
-    /// SELECT + UPDATE window): a Backlog ticket with an unmet prerequisite is
-    /// excluded via `NOT EXISTS` over `json_each(t1.prerequisites)`, joining to
-    /// each prerequisite ticket and rejecting the candidate unless every
-    /// prerequisite is in an unblocking phase ([`UNBLOCKING_PHASES`]).
-    ///
-    /// The candidate subquery orders by `priority ASC, created_at ASC` so that
-    /// tickets with lower priority (higher urgency) are claimed first, then the
-    /// oldest ticket (earliest created_at) is claimed first.
-    ///
-    /// The WHERE predicate comes from [`claim_candidate_where`], the same
-    /// builder the read-only probe uses — so the claim and its probe cannot
-    /// drift. `now` and `grace_cutoff` are supplied by the caller (computed
-    /// once per poll round and shared with the probe, so the probe and the
-    /// claim can never disagree about the grace cutoff).
-    ///
-    /// Note: the claim SELECT is kept to the tickets table, and the agents
-    /// roster is a separate logical table checked by the caller (via the
-    /// phase-job + launched-roster guard). Backlog tickets have no running agent.
+    /// Claim a workspace's oldest eligible [`TicketPhase::Backlog`] ticket and
+    /// transition it to Analysis. See [`claim_for_phase`] for the shared
+    /// semantics. The Backlog shape additionally applies a `created_at <= ?5`
+    /// cutoff excluding tickets younger than [`BACKLOG_CLAIM_GRACE`], so a
+    /// fresh ticket stays in Backlog ~5s — claiming it into Analysis within
+    /// the window would spawn analysts that immediately get cancelled (plus a
+    /// spurious phase-change notification), while the Manager gets time to
+    /// move it straight to Planning/Queued.
     pub(crate) async fn claim_backlog_for_analysis(
         &self,
         workspace_name: &str,
         now: String,
         grace_cutoff: String,
     ) -> Result<Option<Ticket>> {
-        let sql = format!(
-            "UPDATE tickets SET phase = ?1, updated_at = ?2 \
-             WHERE id = (SELECT t1.id FROM tickets t1 \
-             WHERE {} \
-             ORDER BY t1.priority ASC, t1.created_at ASC LIMIT 1) \
-             RETURNING {TICKET_COLUMNS}",
-            claim_candidate_where(3, TicketPhase::Backlog),
-        );
-        let params = db::params![
-            TicketPhase::Analysis.as_ref(),
-            now,
-            TicketPhase::Backlog.as_ref(),
+        self.claim_for_phase(
             workspace_name,
-            grace_cutoff,
-        ];
-        let rows = self.conn.query_cached(&sql, params).await?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(Some(self.ticket_from_row(&row, LoadComments::Yes).await?)),
-            None => Ok(None),
-        }
+            now,
+            TicketPhase::Backlog,
+            TicketPhase::Analysis,
+            Some(&grace_cutoff),
+        )
+        .await
     }
 
-    /// Claim a workspace's oldest eligible Queued ticket and transition it to
-    /// InDevelopment in a single atomic `UPDATE..RETURNING`. Always filters by
-    /// `workspace_name` so only tickets from that workspace are eligible.
-    ///
-    /// Only tickets currently in [`TicketPhase::Queued`] are eligible. The
-    /// WHERE clause includes `t1.phase = ?3` bound to `Queued`, providing
-    /// CAS-style atomicity for the phase transition — if no Queued ticket
-    /// matches, the claim returns `None`.
-    ///
-    /// The prereq filter is part of the same atomic UPDATE (no separate
-    /// SELECT + UPDATE window): a Queued ticket with an unmet prerequisite is
-    /// excluded via `NOT EXISTS` over `json_each(t1.prerequisites)`, rejecting
-    /// the candidate unless every prerequisite is in an unblocking phase
-    /// ([`UNBLOCKING_PHASES`]) — the same filter the Backlog claim applies, so
-    /// a Manager moving a Backlog ticket straight to Queued (or a prereq being
-    /// re-opened after its dependent entered the pipeline) cannot start
-    /// development out of dependency order.
-    ///
-    /// The claim is rejected (returns `None`) when any pipeline-occupied ticket
-    /// exists in the same workspace, enforcing a single ticket at a time per
-    /// workspace in the dev/review/QA pipeline. The occupancy check is part of
-    /// the same atomic SQL UPDATE (no separate SELECT + UPDATE window).
-    /// Pipeline-occupied phases are defined in [`PIPELINE_OCCUPIED_PHASES`]. The
-    /// correlated `NOT EXISTS` subquery also requires `t2.is_archived = 0` so
-    /// archived tickets never occupy the pipeline — a deliberate no-op today,
-    /// since only Done/Cancelled tickets get archived and neither is a pipeline
-    /// phase, but kept for consistency.
-    ///
-    /// The candidate subquery orders by `priority ASC, created_at ASC` so that
-    /// tickets with lower priority (higher urgency) are claimed first, then the
-    /// oldest ticket (earliest created_at) is claimed first.
-    ///
-    /// The WHERE predicate comes from [`claim_candidate_where`], the same
-    /// builder the read-only probe uses — so the claim and its probe cannot
-    /// drift. `now` is supplied by the caller (computed once per poll round
-    /// and shared with the probe, so the probe and the claim agree on the
-    /// clock).
-    ///
-    /// Note: the claim SELECT is kept to the tickets table, and the agents
-    /// roster is a separate logical table checked by the caller (via the
-    /// phase-job + launched-roster guard). Queued tickets have no running agent.
+    /// Claim a workspace's oldest eligible [`TicketPhase::Queued`] ticket and
+    /// transition it to InDevelopment. See [`claim_for_phase`] for the shared
+    /// semantics. The Queued shape additionally rejects the claim (returns
+    /// `None`) while any pipeline-occupied ticket ([`PIPELINE_OCCUPIED_PHASES`])
+    /// exists in the same workspace, enforcing a single ticket at a time in the
+    /// dev/review/QA pipeline. The occupancy check's `t2.is_archived = 0` guard
+    /// is a deliberate no-op today — only Done/Cancelled tickets get archived
+    /// and neither is a pipeline phase — but kept for consistency.
     pub(crate) async fn claim_queued_for_development(
         &self,
         workspace_name: &str,
         now: String,
+    ) -> Result<Option<Ticket>> {
+        self.claim_for_phase(
+            workspace_name,
+            now,
+            TicketPhase::Queued,
+            TicketPhase::InDevelopment,
+            None,
+        )
+        .await
+    }
+
+    /// Core claim: atomically transition a workspace's oldest eligible ticket
+    /// from `source` to `target` in a single `UPDATE..RETURNING`. Always
+    /// filters by `workspace_name` so only tickets from that workspace are
+    /// eligible. The WHERE clause includes `t1.phase = ?3` bound to `source`,
+    /// providing CAS-style atomicity — if no matching ticket exists, the claim
+    /// returns `None`.
+    ///
+    /// The WHERE predicate comes from [`claim_candidate_where`] with base
+    /// placeholder offset 3 (`?1`/`?2` are the SET-clause phase/updated_at
+    /// binds), the same builder the read-only probe uses — so the claim and
+    /// its probe cannot drift. Only Backlog carries the `grace_cutoff` bind
+    /// (it must be `Some` only for [`TicketPhase::Backlog`]); only Queued
+    /// enforces pipeline occupancy. `now` and `grace_cutoff` are supplied by
+    /// the caller, computed once per poll round and shared with the probe, so
+    /// the probe and the claim can never disagree about the clock or the
+    /// cutoff.
+    ///
+    /// The prereq filter is part of the same atomic UPDATE (no separate
+    /// SELECT+UPDATE window): a candidate with an unmet prerequisite is excluded
+    /// via `NOT EXISTS` over `json_each(t1.prerequisites)`, joining to each
+    /// prerequisite ticket and rejecting the candidate unless every
+    /// prerequisite is in an unblocking phase ([`UNBLOCKING_PHASES`]) — so a
+    /// Manager moving a Backlog ticket straight to Queued (or a prereq being
+    /// re-opened after its dependent entered the pipeline) cannot advance it
+    /// out of dependency order.
+    ///
+    /// The candidate subquery orders by `priority ASC, created_at ASC` so
+    /// tickets with lower priority (higher urgency) are claimed first, then
+    /// the oldest ticket (earliest created_at) first.
+    ///
+    /// The SQL text per (source, grace_cutoff) combination is invariant, which
+    /// the [`Connection::query_cached`] cache contract requires. Note: the
+    /// claim SELECT is kept to the tickets table, and the agents roster is a
+    /// separate logical table checked by the caller (via the phase-job +
+    /// launched-roster guard) — Backlog/Queued tickets have no running agent.
+    async fn claim_for_phase(
+        &self,
+        workspace_name: &str,
+        now: String,
+        source: TicketPhase,
+        target: TicketPhase,
+        grace_cutoff: Option<&str>,
     ) -> Result<Option<Ticket>> {
         let sql = format!(
             "UPDATE tickets SET phase = ?1, updated_at = ?2 \
@@ -1084,15 +1063,32 @@ impl BoardStore {
              WHERE {} \
              ORDER BY t1.priority ASC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}",
-            claim_candidate_where(3, TicketPhase::Queued),
+            claim_candidate_where(3, source),
         );
-        let params = db::params![
-            TicketPhase::InDevelopment.as_ref(),
-            now,
-            TicketPhase::Queued.as_ref(),
-            workspace_name,
-        ];
-        let rows = self.conn.query_cached(&sql, params).await?;
+        let rows = match grace_cutoff {
+            Some(cutoff) => {
+                self.conn
+                    .query_cached(
+                        &sql,
+                        db::params![
+                            target.as_ref(),
+                            now,
+                            source.as_ref(),
+                            workspace_name,
+                            cutoff
+                        ],
+                    )
+                    .await?
+            }
+            None => {
+                self.conn
+                    .query_cached(
+                        &sql,
+                        db::params![target.as_ref(), now, source.as_ref(), workspace_name],
+                    )
+                    .await?
+            }
+        };
         match rows.into_iter().next() {
             Some(row) => Ok(Some(self.ticket_from_row(&row, LoadComments::Yes).await?)),
             None => Ok(None),
