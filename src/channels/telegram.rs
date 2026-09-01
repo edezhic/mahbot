@@ -685,9 +685,8 @@ fn try_format_inline(text: &str, i: &mut usize, out: &mut String, delim: &str, t
     false
 }
 
-/// Convert Markdown to Telegram HTML format.
-/// Telegram HTML supports: &lt;b&gt;, &lt;i&gt;, &lt;u&gt;, &lt;s&gt;, &lt;code&gt;, &lt;pre&gt;, &lt;a href="..."&gt;
 /// Convert a subset of Markdown to Telegram's HTML parse_mode format.
+/// Telegram HTML supports: &lt;b&gt;, &lt;i&gt;, &lt;u&gt;, &lt;s&gt;, &lt;code&gt;, &lt;pre&gt;, &lt;a href="..."&gt;
 ///
 /// Supported: headers (`# …`, `## …`), bold (`**…**`, `__…__`), italic (`*…*`),
 /// inline code (`` `…` ``), links (`[…](url)`), strikethrough (`~~…~~`),

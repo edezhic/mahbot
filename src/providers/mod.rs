@@ -252,7 +252,7 @@ pub(crate) async fn warmup_provider_from_config(
 /// `()`.
 ///
 /// `background_warmup`: the provider-endpoint persist arm performs its own
-/// foreground warmup to surface the req-9 warning (or deliberately skips
+/// foreground warmup to surface the custom-endpoint warning (or deliberately skips
 /// it when reverting to the default), so it passes `false` to avoid a
 /// duplicate network call; the provider-key persist arm passes `true` so
 /// the new credential's pool is pre-warmed in the background.

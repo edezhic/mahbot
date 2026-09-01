@@ -430,7 +430,7 @@ impl SessionStore {
         .await
     }
 
-    /// O(1) session-non-emptiness check (resume dispatch rule): true when the
+    /// Session-non-emptiness check (resume dispatch rule): true when the
     /// agent has at least one non-empty message row. Avoids materializing the
     /// full history just to test `.is_empty()` — the engineer's accumulated
     /// session can exceed 200k tokens.

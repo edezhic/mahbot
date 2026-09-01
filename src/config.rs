@@ -1328,7 +1328,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         // never validates keys (a GET that ignores auth status), so key saves
         // are structurally validated + written, and `recreate_all` rebuilds the
         // provider with the new credential (warmup runs as a non-fatal
-        // background task inside it). This keeps the req-9 custom-endpoint
+        // background task inside it). This keeps the custom-endpoint
         // warning channel off the key fields — a warmup failure while a custom
         // endpoint is active must not surface an 'unreachable' warning under
         // the OpenRouter key field.

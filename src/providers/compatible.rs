@@ -430,10 +430,7 @@ struct ImageUrlPart {
 /// (they stay as literal text); prose/path markers and fake/truncated data URIs
 /// also stay in the text. Everything else is returned as [`MessageContent::Text`].
 ///
-/// The old estimator-side mirror of this marker handling
-/// (`crate::session::estimate_tokens`) was removed with the
-/// token-estimation heuristic — this conversion is now the only place
-/// marker parsing lives.
+/// This conversion is the only place marker parsing lives.
 fn to_message_content(role: ChatRole, content: &str) -> MessageContent {
     if role != ChatRole::User {
         return MessageContent::Text(content.to_string());

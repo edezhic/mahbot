@@ -1734,16 +1734,13 @@ impl BoardStore {
 
     /// List the live tickets of a workspace across all working phases
     /// ([`WORKING_PHASES`]) in one snapshot, grouped phase-major in dispatch
-    /// order with `priority ASC, created_at DESC` within each phase — the
-    /// exact ordering the previous six per-phase
-    /// [`list_all_tickets`](Self::list_all_tickets) queries produced (the
+    /// order with `priority ASC, created_at DESC` within each phase (the
     /// global `ORDER BY` plus stable per-phase bucketing preserves each
     /// phase's internal order).
     ///
     /// Unlike [`list_all_tickets`](Self::list_all_tickets) (which the GUI
     /// still uses), this is a single snapshot so the polling dispatch sees
-    /// one consistent view per tick instead of six separate per-phase
-    /// queries.
+    /// one consistent view per tick.
     pub(crate) async fn list_working_tickets(
         &self,
         workspace_name: &str,

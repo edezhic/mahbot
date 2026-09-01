@@ -38,7 +38,7 @@
 //! ## Artist media sweep
 //!
 //! `sweep_media` deletes generated/uploads files in userspaces that no Artist
-//! session mentions (keep-detection is strictly session-based — solution 1).
+//! session mentions (keep-detection is strictly session-based).
 //! It is orthogonal to research-run cleanup and stays in the periodic
 //! cleanup loop.
 
@@ -53,8 +53,8 @@ use std::path::{Path, PathBuf};
 
 /// Command-dump cap (bytes, soft — newest-wins): the raw unfiltered shell
 /// command history of a run, written at terminalization inside the run folder.
-/// The dump is intent for the Sanitation cleanup agent, not a report body, so
-/// it can be much larger than the old 32 KiB cleaner-ticket cap.
+/// The dump is intent for the Sanitation cleanup agent, not a report body,
+/// so the cap is deliberately generous.
 pub(crate) const COMMAND_DUMP_CAP_BYTES: usize = 10 * 1024 * 1024;
 /// Per-tick artist-session scan budget (bytes of session content). Typical
 /// bases (~3 MB) fit in one tick; pathological growth is cut across ticks.

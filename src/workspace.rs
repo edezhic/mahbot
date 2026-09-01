@@ -34,8 +34,10 @@ pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
 
 // Column definitions for workspace SELECT queries.
 // Note: `discovery_generation` and `diagnostics_generation` are intentionally
-// excluded from this column list: both are read only via their own single-column
-// SELECT in [`WorkspaceStore::get_generation`] and are never part of a workspace struct query.
+// excluded from this column list and are never part of a workspace struct query.
+// Reads go through [`WorkspaceStore::get_generation`]'s single-column SELECT
+// (plus `WorkspaceStore::claim_pending_for_discovery`'s `UPDATE .. RETURNING`
+// for `discovery_generation`).
 crate::columns! {
     WORKSPACE_COLUMNS [WS] {
         NAME                  => "name",
