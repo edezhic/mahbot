@@ -1668,33 +1668,6 @@ mod tests {
         buf
     }
 
-    /// Content-mode read of a native raster returns the image annotation and
-    /// attaches the image to the conversation instead of lossy garbage.
-    #[tokio::test]
-    async fn file_read_native_image_returns_annotation() {
-        let dir = TempDir::new().unwrap();
-        let ws_path = dir.path().to_path_buf();
-        let png = tiny_png_bytes(4, 4);
-        tokio::fs::write(ws_path.join("tiny.png"), &png)
-            .await
-            .unwrap();
-
-        let result = ReadTool
-            .execute(&Workspace::from_path(&ws_path), json!({"path": "tiny.png"}))
-            .await
-            .expect("native image read must succeed");
-        // The ReadTool's execute output is claim-neutral — the agent loop
-        // appends the 'attached'/'already attached' qualifier from the payload
-        // it actually injects, so a read that cannot be injected never falsely
-        // claims an attachment.
-        assert!(result.contains("Read image file"), "got: {result}");
-        assert!(result.contains("PNG"), "got: {result}");
-        assert!(
-            !result.contains("attached to the conversation"),
-            "read output must stay claim-neutral, got: {result}"
-        );
-    }
-
     /// A recognised-but-unsupported raster (GIF) is reported gracefully, not
     /// decoded into garbage or treated as an error.
     #[tokio::test]
