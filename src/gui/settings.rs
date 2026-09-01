@@ -3002,24 +3002,11 @@ impl SettingsState {
 
         // ── Row 1: Transcription (toggle + inline status + Retry) ──
         let transcription_status: Element<'_, SettingsMessage> = if !transcription_enabled {
-            Text::new("Disabled")
-                .size(theme::TEXT_13)
-                .color(theme::TEXT_SECONDARY)
-                .into()
+            disabled_status()
         } else if crate::audio::local_transcriber::is_loaded() {
             Text::new("Ready").size(theme::TEXT_13).into()
         } else if crate::audio::local_transcriber::is_failed() {
-            let retry_btn = button(Text::new("   Retry   ").size(theme::TEXT_13))
-                .on_press(SettingsMessage::RetryTranscription)
-                .style(theme::button_danger)
-                .padding(theme::PAD_4);
-            row![
-                Text::new("Download failed").size(theme::TEXT_14),
-                Space::new().width(theme::SPACE_8),
-                retry_btn,
-            ]
-            .align_y(Alignment::Center)
-            .into()
+            retry_status_row("Download failed", SettingsMessage::RetryTranscription)
         } else {
             Text::new("Downloading…").size(theme::TEXT_13).into()
         };
@@ -3042,25 +3029,12 @@ impl SettingsState {
         // events, so the rendered pipeline state (listening / enrolling /
         // model error …) is current after each coalesced event.
         let wake_status: Element<'_, SettingsMessage> = match status.clone() {
-            crate::audio::voice::VoiceStatus::Disabled => Text::new("Disabled")
-                .size(theme::TEXT_13)
-                .color(theme::TEXT_SECONDARY)
-                .into(),
+            crate::audio::voice::VoiceStatus::Disabled => disabled_status(),
             crate::audio::voice::VoiceStatus::LoadingModels => {
                 Text::new("Loading models…").size(theme::TEXT_13).into()
             }
             crate::audio::voice::VoiceStatus::ModelError => {
-                let retry_btn = button(Text::new("   Retry   ").size(theme::TEXT_13))
-                    .on_press(SettingsMessage::RetryVoiceModels)
-                    .style(theme::button_danger)
-                    .padding(theme::PAD_4);
-                row![
-                    Text::new("Model error").size(theme::TEXT_14),
-                    Space::new().width(theme::SPACE_8),
-                    retry_btn,
-                ]
-                .align_y(Alignment::Center)
-                .into()
+                retry_status_row("Model error", SettingsMessage::RetryVoiceModels)
             }
             crate::audio::voice::VoiceStatus::Listening => Text::new("Listening for wake word")
                 .size(theme::TEXT_13)
@@ -3129,10 +3103,7 @@ impl SettingsState {
         let tts_failed = crate::audio::tts::download_failed();
         let audio_ok = crate::audio::tts::audio_output_ready();
         let tts_status: Element<'_, SettingsMessage> = if !tts_enabled {
-            Text::new("Disabled")
-                .size(theme::TEXT_13)
-                .color(theme::TEXT_SECONDARY)
-                .into()
+            disabled_status()
         } else if tts_ready {
             if audio_ok {
                 Text::new("Ready").size(theme::TEXT_13).into()
@@ -3143,17 +3114,7 @@ impl SettingsState {
                     .into()
             }
         } else if tts_failed {
-            let retry_btn = button(Text::new("   Retry   ").size(theme::TEXT_13))
-                .on_press(SettingsMessage::TtsRetryModels)
-                .style(theme::button_danger)
-                .padding(theme::PAD_4);
-            row![
-                Text::new("Model download failed").size(theme::TEXT_14),
-                Space::new().width(theme::SPACE_8),
-                retry_btn,
-            ]
-            .align_y(Alignment::Center)
-            .into()
+            retry_status_row("Model download failed", SettingsMessage::TtsRetryModels)
         } else {
             Text::new("Downloading models…").size(theme::TEXT_13).into()
         };
@@ -3175,31 +3136,16 @@ impl SettingsState {
         // Enrolled-phrase display / phrase input / Enroll button (when voice
         // is on and transcription allows it — the push site below applies the
         // same guard, so the row collapses to nothing when either is off).
-        let wake_word_row = if let Some(phrase) = crate::audio::voice::get_enrolled_phrase() {
-            field_row(
-                "Wake Word",
-                Text::new(phrase).size(theme::TEXT_13).into(),
-                None,
-            )
-        } else if has_enrollment {
-            // V2 enrollment present but phrase unavailable (shouldn't
-            // happen) — surface it so the user can re-enroll.
-            field_row(
-                "Wake Word",
-                Text::new("Enrollment found — re-enroll to replace it")
-                    .size(theme::TEXT_13)
-                    .into(),
-                None,
-            )
-        } else {
-            field_row(
-                "Wake Word",
-                Text::new("Enroll a wake word to get started")
-                    .size(theme::TEXT_13)
-                    .into(),
-                None,
-            )
+        let wake_word_value: String = match crate::audio::voice::get_enrolled_phrase() {
+            Some(phrase) => phrase,
+            None if has_enrollment => "Enrollment found — re-enroll to replace it".into(),
+            None => "Enroll a wake word to get started".into(),
         };
+        let wake_word_row = field_row(
+            "Wake Word",
+            text(wake_word_value).size(theme::TEXT_13).into(),
+            None,
+        );
 
         // Text input for the wake word phrase (before enrollment).
         let phrase_input = if voice_enabled && transcription_enabled && !is_enrolling {
@@ -3302,13 +3248,7 @@ impl SettingsState {
                     lines.push("Processing…".to_string());
                 }
 
-                let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(theme::TEXT_13))
-                        .on_press(SettingsMessage::CancelVoiceEnrollment)
-                        .style(theme::button_danger)
-                        .padding(theme::PAD_6),
-                )
-                .into();
+                let cancel_btn = cancel_enrollment_button();
                 Some(
                     Column::new()
                         .push(Space::new().height(8))
@@ -3319,13 +3259,7 @@ impl SettingsState {
                 )
             }
             crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
-                let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(theme::TEXT_13))
-                        .on_press(SettingsMessage::CancelVoiceEnrollment)
-                        .style(theme::button_danger)
-                        .padding(theme::PAD_6),
-                )
-                .into();
+                let cancel_btn = cancel_enrollment_button();
                 Some(
                     Column::new()
                         .push(Space::new().height(8))
@@ -3336,13 +3270,7 @@ impl SettingsState {
                 )
             }
             crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
-                let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(theme::TEXT_13))
-                        .on_press(SettingsMessage::CancelVoiceEnrollment)
-                        .style(theme::button_danger)
-                        .padding(theme::PAD_6),
-                )
-                .into();
+                let cancel_btn = cancel_enrollment_button();
                 Some(
                     Column::new()
                         .push(Space::new().height(8))
@@ -3360,13 +3288,7 @@ impl SettingsState {
                 let pct = (accumulated_secs * 100)
                     .checked_div(target_secs)
                     .unwrap_or(0);
-                let cancel_btn: Element<'_, SettingsMessage> = container(
-                    button(Text::new("Cancel").size(theme::TEXT_13))
-                        .on_press(SettingsMessage::CancelVoiceEnrollment)
-                        .style(theme::button_danger)
-                        .padding(theme::PAD_6),
-                )
-                .into();
+                let cancel_btn = cancel_enrollment_button();
                 Some(
                     Column::new()
                         .push(Space::new().height(8))
@@ -3633,6 +3555,42 @@ fn inline_warning(msg: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
     container(text(msg).size(theme::TEXT_10).color(theme::STATUS_WARNING))
         .padding(iced::Padding::default().left(left_pad))
         .into()
+}
+
+/// The gray "Disabled" inline status label shared by the audio rows.
+fn disabled_status() -> Element<'static, SettingsMessage> {
+    text("Disabled")
+        .size(theme::TEXT_13)
+        .color(theme::TEXT_SECONDARY)
+        .into()
+}
+
+/// Inline "status label + Retry" row for a failed download / model load.
+fn retry_status_row(
+    label: &'static str,
+    on_retry: SettingsMessage,
+) -> Element<'static, SettingsMessage> {
+    row![
+        text(label).size(theme::TEXT_14),
+        Space::new().width(theme::SPACE_8),
+        button(text("   Retry   ").size(theme::TEXT_13))
+            .on_press(on_retry)
+            .style(theme::button_danger)
+            .padding(theme::PAD_4),
+    ]
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The Cancel button closing each live-enrollment progress column.
+fn cancel_enrollment_button() -> Element<'static, SettingsMessage> {
+    container(
+        button(text("Cancel").size(theme::TEXT_13))
+            .on_press(SettingsMessage::CancelVoiceEnrollment)
+            .style(theme::button_danger)
+            .padding(theme::PAD_6),
+    )
+    .into()
 }
 
 /// Like [`field_row`], with an optional inline error rendered under the
