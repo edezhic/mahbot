@@ -5,38 +5,29 @@
 //!
 //! Every schema creation, change, and removal in the codebase is an entry in
 //! [`MIGRATIONS`]. There is **no other place** that defines or alters a table
-//! schema. The catalog is a **strictly linear history** anchored at the **0.4.2
-//! baseline** (commit `4a68782`): the starter create-table entries encode the
-//! 0.4.2 table shapes, and every subsequent entry brings a database from 0.4.2
-//! to the current shape. Application order is **catalog position**, end to end.
+//! schema. `schema_migrations` records which ids have run per database; an
+//! entry is applied exactly once because the only control flow is the id-based
+//! applied check — there are **no runner guards** (no environment checks, no
+//! fresh-vs-upgrade branching). Idempotent DDL (`IF NOT EXISTS`) lives in the
+//! SQL text, and per-body idempotency logic (e.g. the [`run_add_chat_history_reply_columns`]
+//! existence probe, needed because Turso has no `ADD COLUMN IF NOT EXISTS`) is
+//! part of a migration body, never a conditional in the runner.
 //!
-//! # Id-only applied check
+//! # Current-shape baseline
 //!
-//! An entry is identified solely by its [`Migration::id`]. The runner's
-//! mechanism is exactly:
+//! The catalog no longer walks a 0.4.2→0.5.x delta chain. The old chain (ids
+//! `1`–`23`) and the one-time consolidation import are **retired**: every
+//! existing install is already fully current (either the 0.5.0 shape — no
+//! `chat_history` reply columns, one delta behind — the current-main shape, or
+//! a fresh file), and the id-only applied check makes their recorded ids
+//! `1`–`23` harmless no-ops. The baseline (`24`–`26`) creates the exact
+//! current shape on fresh installs and is a strict no-op on existing ones,
+//! except entry `25`, which genuinely upfills the retired delta `23`'s
+//! `chat_history` reply columns on a one-delta-behind database.
 //!
-//! - if the id is already recorded in that database's `schema_migrations` →
-//!   skip (already applied);
-//! - otherwise → run the entry's SQL text (or Rust function) and record its id.
-//!
-//! There are **no runner guards** (no environment checks, no fresh-vs-upgrade
-//! branching): the only control flow is the id-based applied check. Idempotent
-//! DDL (`IF NOT EXISTS`) simply lives in the SQL text, and per-body idempotency
-//! logic (e.g. the [`run_drop_jobs_paused_frozen`] existence probe, needed
-//! because Turso has no `DROP COLUMN IF EXISTS`) is part of a migration body,
-//! never a conditional in the runner.
-//!
-//! # Ids
-//!
-//! Existing already-deployed ids (e.g. `consolidate_003_jobs_ticket_id`,
-//! `001_drop_ticket_pipeline_reservation`) are preserved verbatim so they act
-//! as no-ops on databases that already recorded them. New migrations use plain
-//! monotonically increasing integer ids, unique and never reused across all
-//! physical Turso stores for the lifetime of the catalog. `schema_migrations.id`
-//! is `TEXT PRIMARY KEY`, so mixed string/integer ids coexist. Integer ids are
-//! assigned in the order entries were added, but the array groups entries by
-//! store/target for readability — numeric id order need not match array
-//! position (application order is always catalog position).
+//! Future schema changes resume the chain at id `27` with monotonically
+//! increasing, unique integer ids, never reused across any store for the
+//! lifetime of the catalog.
 //!
 //! # Failure semantics
 //!
@@ -59,8 +50,7 @@ pub(crate) enum TargetDb {
 }
 
 /// A Rust-function migration body. The function is called without a
-/// surrounding transaction (it owns its own transactional/FK semantics, e.g.
-/// the non-transactional consolidation import).
+/// surrounding transaction (it owns its own transactional/FK semantics).
 type RustFn = for<'a> fn(&'a Connection, &'a Path) -> BoxFuture<'a, anyhow::Result<()>>;
 
 /// The body of a migration: ready SQL text, or a Rust function.
@@ -78,39 +68,51 @@ pub(crate) struct Migration {
     pub(crate) body: MigrationBody,
 }
 
-// ── 0.4.2 baseline DDL ───────────────────────────────────────────────────
+// ── Current-shape baseline DDL ─────────────────────────────────────────
 //
-// The shape at commit `4a68782` (the 0.4.2 version bump). Fresh databases
-// create these tables, then the delta entries below evolve them to current.
+// The baseline encodes the exact current shape of the consolidated domain
+// database (core.db) and the logs database (logs.db) directly, without a
+// 0.4.2 delta chain. Every statement is `IF NOT EXISTS`, so on an already
+// current database the whole batch is a no-op. On a fresh install it
+// reproduces the shape that the retired chain (ids `1`–`23`) used to assemble
+// incrementally via ALTERs.
 
-/// Board baseline (0.4.2): `tickets` carries `assigned_to` and
-/// `pipeline_reservation`; `review_base_count` was added and removed *before*
-/// 0.4.2 and is deliberately absent (pre-baseline drift, out of scope).
-const BASELINE_BOARD_TABLES: &str = "\
+/// The full current-shape core schema: every domain table in its final shape
+/// (the 0.4.2 baseline minus the retired `assigned_to` / `pipeline_reservation`
+/// / `paused_frozen` / `user_roles` / `config_role` / `ticket_jobs` /
+/// `ticket_stage_jobs` artifacts, plus the `jobs.ticket_id`, `chat_history`
+/// `timestamp`/`reply_*`, and `ticket_chronicle`/`alarms` additions) and every
+/// core index — including the tickets FTS index and the `idx_jobs_phase_ticket`
+/// unique index.
+///
+/// `jobs` is created WITH `ticket_id` as its last column, matching the shape
+/// the retired `ALTER TABLE jobs ADD COLUMN ticket_id ...` produced, so
+/// `idx_jobs_phase_ticket` (which references `jobs.ticket_id`) is safe to
+/// create in the same batch. Every statement is `IF NOT EXISTS`.
+const BASELINE_CORE_SCHEMA: &str = "\
+-- ── Board (tickets, comments, counters) ────────────────────────────────
 CREATE TABLE IF NOT EXISTS tickets (
-    id              TEXT PRIMARY KEY,
-    title           TEXT NOT NULL,
-    description     TEXT NOT NULL,
-    phase          TEXT NOT NULL DEFAULT 'backlog',
-    assigned_to     TEXT,
-    workspace_name  TEXT NOT NULL,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL,
-    prerequisites   TEXT NOT NULL DEFAULT '[]',
-    supersedes      TEXT,
-    superseded_by   TEXT,
-    commit_hash     TEXT,
-    lines_added     INTEGER,
-    lines_removed   INTEGER,
-    reporter        TEXT NOT NULL DEFAULT '',
-    is_archived     INTEGER NOT NULL DEFAULT 0,
-    embedding       BLOB,
-    pipeline_reservation INTEGER NOT NULL DEFAULT 0,
-    priority        INTEGER NOT NULL DEFAULT 1,
-    reviewed_head   TEXT,
-    reviewed_tree   TEXT,
-    done_at         TEXT,
-    bounce_count    INTEGER NOT NULL DEFAULT 0
+    id               TEXT PRIMARY KEY,
+    title            TEXT NOT NULL,
+    description      TEXT NOT NULL,
+    phase            TEXT NOT NULL DEFAULT 'backlog',
+    workspace_name   TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    prerequisites    TEXT NOT NULL DEFAULT '[]',
+    supersedes       TEXT,
+    superseded_by    TEXT,
+    commit_hash      TEXT,
+    lines_added      INTEGER,
+    lines_removed    INTEGER,
+    reporter         TEXT NOT NULL DEFAULT '',
+    is_archived      INTEGER NOT NULL DEFAULT 0,
+    embedding        BLOB,
+    priority         INTEGER NOT NULL DEFAULT 1,
+    reviewed_head    TEXT,
+    reviewed_tree    TEXT,
+    done_at          TEXT,
+    bounce_count     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS ticket_comments (
     id          TEXT PRIMARY KEY,
@@ -123,11 +125,8 @@ CREATE TABLE IF NOT EXISTS ticket_comments (
 CREATE TABLE IF NOT EXISTS ticket_counters (
     workspace_name TEXT PRIMARY KEY,
     next_id        INTEGER NOT NULL DEFAULT 1
-);";
-
-/// Session/jobs baseline (0.4.2): `jobs` has no `ticket_id` and no
-/// `paused_frozen`; `ticket_stage_jobs` still carries `round`/`phase`/`stage`.
-const BASELINE_SESSION_TABLES: &str = "\
+);
+-- ── Sessions / jobs / agents ───────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS sessions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id    TEXT NOT NULL,
@@ -157,7 +156,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     role           TEXT NOT NULL,
     retry_count    INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
+    updated_at     TEXT NOT NULL,
+    ticket_id      TEXT REFERENCES tickets(id)
 );
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
@@ -175,20 +175,11 @@ CREATE TABLE IF NOT EXISTS pending_jobs (
     envelope        TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
-    id          TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    ticket_id   TEXT NOT NULL,
-    stage       TEXT NOT NULL,
-    phase       TEXT NOT NULL,
-    round       INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS research_jobs (
     id    TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     state TEXT NOT NULL
-);";
-
-/// Workspace baseline (0.4.2).
-const BASELINE_WORKSPACE_TABLES: &str = "\
+);
+-- ── Workspaces / editor ───────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS workspaces (
     name       TEXT PRIMARY KEY,
     path       TEXT NOT NULL UNIQUE,
@@ -220,10 +211,8 @@ CREATE TABLE IF NOT EXISTS editor_tabs (
     is_dirty       INTEGER NOT NULL DEFAULT 0,
     dirty_content  TEXT,
     PRIMARY KEY (workspace_name, file_path)
-);";
-
-/// Users baseline (0.4.2).
-const BASELINE_USERS_TABLES: &str = "\
+);
+-- ── Users / channels ───────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS users (
     name                TEXT PRIMARY KEY,
     permissions         TEXT,
@@ -237,46 +226,51 @@ CREATE TABLE IF NOT EXISTS user_channels (
     reply_target TEXT,
     UNIQUE(channel, identifier)
 );
-CREATE TABLE IF NOT EXISTS user_roles (
-    user_name   TEXT NOT NULL REFERENCES users(name),
-    role        TEXT NOT NULL,
-    PRIMARY KEY (user_name, role)
-);";
-
-/// Config baseline (0.4.2): `config_role` still exists (dropped by a delta).
-const BASELINE_CONFIG_TABLES: &str = "\
+-- ── Config ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS config_kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS config_role (
-    role             TEXT PRIMARY KEY,
-    model            TEXT,
-    reasoning_effort TEXT
 );
 CREATE TABLE IF NOT EXISTS config_model_routing (
     model              TEXT PRIMARY KEY,
     provider_order     TEXT,
     allow_fallbacks    INTEGER
-);";
-
-/// Chat-history baseline (0.4.2).
-const BASELINE_CHAT_HISTORY_TABLES: &str = "\
+);
+-- ── Chat history ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS chat_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT NOT NULL UNIQUE,
-    user_name TEXT NOT NULL,
-    direction TEXT NOT NULL,
-    content TEXT NOT NULL,
-    agent_role TEXT,
-    workspace TEXT NOT NULL
-);";
-
-/// 0.4.2 indexes / unique constraints that reference only 0.4.2 columns.
-/// `idx_jobs_phase_ticket` (references `jobs.ticket_id`), the FTS index, and
-/// `idx_tickets_board_active` are all **post-0.4.2** and live in the delta
-/// chain below.
-const BASELINE_CORE_INDEXES: &str = "\
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id    TEXT NOT NULL UNIQUE,
+    user_name     TEXT NOT NULL,
+    direction     TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    agent_role    TEXT,
+    workspace     TEXT NOT NULL,
+    timestamp     TEXT,
+    reply_author  TEXT,
+    reply_snippet TEXT
+);
+-- ── Ticket chronicle / alarms ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ticket_chronicle (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id      TEXT NOT NULL,
+    workspace_name TEXT NOT NULL,
+    source_phase   TEXT NOT NULL,
+    target_phase   TEXT NOT NULL,
+    at             TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alarms (
+    id               TEXT PRIMARY KEY,
+    session_id       TEXT NOT NULL,
+    user_name        TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    text             TEXT NOT NULL,
+    fire_at          TEXT,
+    interval_seconds INTEGER,
+    next_fire_at     TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    created_at       TEXT NOT NULL
+);
+-- ── Indexes ────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
@@ -286,12 +280,21 @@ CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target
 CREATE UNIQUE INDEX IF NOT EXISTS workspace_contexts_null_role ON workspace_contexts(workspace_name) WHERE role IS NULL;
 CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_name);
 CREATE INDEX IF NOT EXISTS idx_chat_history_workspace ON chat_history(workspace);
-CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);";
+CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);
+CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets USING fts (title) WITH (tokenizer = 'ngram');
+CREATE INDEX IF NOT EXISTS idx_tickets_board_active ON tickets (is_archived, priority ASC, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_phase_ticket ON jobs(kind, ticket_id) WHERE ticket_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ticket_chronicle_ws_id ON ticket_chronicle(workspace_name, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_chronicle_dedup ON ticket_chronicle(ticket_id, workspace_name, source_phase, target_phase, at);
+CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(status, next_fire_at);
+CREATE INDEX IF NOT EXISTS idx_tickets_workspace_phase ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);";
 
-/// Logs baseline (0.4.2): `logs`, `tool_calls`, and `llm_requests` (which
-/// already carried the cost/upstream_provider/system_fingerprint observability
-/// columns). `grep_telemetry` did not exist at 0.4.2 and is a delta.
-const BASELINE_LOGS_TABLES: &str = "\
+/// The full current-shape logs schema: `logs`, `tool_calls`, `llm_requests`
+/// (the observability tables) plus the `grep_telemetry` table and all of their
+/// indexes. Every statement is `IF NOT EXISTS`, so on an already-current
+/// database the whole batch is a no-op.
+const BASELINE_LOGS_SCHEMA: &str = "\
+-- ── Logs / tool calls / LLM requests ───────────────────────────────────
 CREATE TABLE IF NOT EXISTS logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp   TEXT NOT NULL,
@@ -338,60 +341,8 @@ CREATE TABLE IF NOT EXISTS llm_requests (
     cost_details        TEXT,
     upstream_provider   TEXT,
     system_fingerprint  TEXT
-);";
-
-const BASELINE_LOGS_INDEXES: &str = "\
-CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
-CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
-CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
-CREATE INDEX IF NOT EXISTS idx_logs_agent_role ON logs(agent_role);
-CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
-CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);";
-
-// ── Post-0.4.2 delta DDL ─────────────────────────────────────────────────
-
-/// `config_role` is dropped after the consolidation (it was mapped to `None`).
-const DELTA_DROP_CONFIG_ROLE: &str = "DROP TABLE IF EXISTS config_role;";
-
-/// `ticket_stage_jobs` is dropped by the delta chain (renamed to `ticket_jobs`,
-/// then dropped). On an already-current consolidated DB the baseline re-creates it
-/// (the drop/rename deltas are already-recorded and skipped), so this idempotent
-/// entry removes the leaked table. It is a safe no-op on fresh/0.4.2 installs.
-const DELTA_DROP_TICKET_STAGE_JOBS: &str = "DROP TABLE IF EXISTS ticket_stage_jobs;";
-
-/// The tickets FTS index must exist BEFORE the consolidation import so the
-/// bulk-inserted tickets maintain it (turso's `CREATE INDEX ... USING fts`
-/// does not backfill pre-existing rows). The runtime tokenizer-repair hook
-/// (`ensure_fts_index`) stays a repair, not a schema path.
-const DELTA_FTS_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
-USING fts (title) WITH (tokenizer = 'ngram');";
-
-/// `idx_tickets_board_active` is post-0.4.2; it references only baseline
-/// `tickets` columns, so it can run at any point after the baseline.
-const DELTA_BOARD_ACTIVE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_board_active ON tickets \
-(is_archived, priority ASC, created_at DESC);";
-
-/// Index backing the pipeline poll loop's claim and dispatch snapshot queries.
-/// The equality prefix `(workspace_name, phase, is_archived)` serves the
-/// pipeline-occupancy subqueries, both claim statements, and the working-phase
-/// snapshot; the trailing `priority ASC, created_at DESC` matches the
-/// snapshot's ORDER BY so live rows come out index-ordered instead of scanning
-/// thousands of archived rows.
-const DELTA_TICKETS_WORKSPACE_PHASE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_workspace_phase \
-ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);";
-
-/// `grep_telemetry` is the sole 0.4.2→current logs delta.
-const DELTA_GREP_TELEMETRY: &str = "\
+);
+-- ── Grep telemetry ─────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS grep_telemetry (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     recorded_at   TEXT NOT NULL,
@@ -410,321 +361,52 @@ CREATE TABLE IF NOT EXISTS grep_telemetry (
     duration_ms   INTEGER,
     exit_code     INTEGER
 );
+-- ── Indexes ────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
+CREATE INDEX IF NOT EXISTS idx_logs_agent_role ON logs(agent_role);
+CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
+CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
+CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
+CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
+CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_recorded_at ON grep_telemetry(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_served ON grep_telemetry(served);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_reason ON grep_telemetry(reason);
 CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command);";
 
-/// Alarm/reminder table backing the `add_alarm`/`list_alarms`/`remove_alarm`
-/// tools and the periodic sweep that routes due reminders back into the
-/// Assistant's own session.
-const DELTA_ALARMS: &str = "\
-CREATE TABLE IF NOT EXISTS alarms (
-    id               TEXT PRIMARY KEY,
-    session_id       TEXT NOT NULL,
-    user_name        TEXT NOT NULL,
-    kind             TEXT NOT NULL,
-    text             TEXT NOT NULL,
-    fire_at          TEXT,
-    interval_seconds INTEGER,
-    next_fire_at     TEXT NOT NULL,
-    status           TEXT NOT NULL DEFAULT 'active',
-    created_at       TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(status, next_fire_at);";
-
-/// Chat-history message timestamp: a nullable RFC 3339 column (`db::now()`)
-/// populated on every new row so the GUI can render relative times. Old rows
-/// stay NULL, which maps to no label.
-const DELTA_CHAT_HISTORY_TIMESTAMP: &str = "ALTER TABLE chat_history ADD COLUMN timestamp TEXT;";
-
-/// Chat-history reply reference: two nullable TEXT columns carrying the
-/// replied-to message's author and normalized snippet. Both are NULL for rows
-/// with no reply; a non-NULL reference requires both columns to be set.
-const DELTA_CHAT_HISTORY_REPLY_REFERENCE: &str = "ALTER TABLE chat_history ADD COLUMN reply_author TEXT; ALTER TABLE chat_history ADD COLUMN reply_snippet TEXT;";
-
-/// Rename the 'ready_for_development' phase value to 'queued'.
-///
-/// The phase rename (ReadyForDevelopment → Queued) changes the stored
-/// snake_case phase string. This data-only migration rewrites the
-/// structured columns that actually carry the phase value: `tickets.phase`
-/// and `ticket_chronicle.source_phase` / `target_phase`. `jobs.kind` is
-/// updated defensively too (it only ever holds working-phase kinds today,
-/// so this is a safe no-op). Free-text comment prose is deliberately
-/// untouched.
-const DELTA_RENAME_READY_FOR_DEVELOPMENT_TO_QUEUED: &str = "\
-UPDATE tickets SET phase = 'queued' WHERE phase = 'ready_for_development';\
-UPDATE ticket_chronicle SET source_phase = 'queued' WHERE source_phase = 'ready_for_development';\
-UPDATE ticket_chronicle SET target_phase = 'queued' WHERE target_phase = 'ready_for_development';\
-UPDATE jobs SET kind = 'queued' WHERE kind = 'ready_for_development';";
-
-/// The id of the one-time consolidation import (a Rust-function migration).
-pub(crate) const CONSOLIDATION_IMPORT_ID: &str = "consolidate_001_import_domain_stores";
-
 /// The complete, strictly-linear catalog. **Order is application order.**
+///
+/// Entries `24`–`26` are the consolidated current-shape baseline:
+/// - `24` builds the full core schema; on existing installs every statement is
+///   `IF NOT EXISTS`, so it is a strict no-op.
+/// - `25` upfills the retired delta `23`'s `chat_history` reply columns — the
+///   one genuine migration a 0.5.0 (one-delta-behind) database needs; it is a
+///   guarded, idempotent no-op on current-main and fresh installs.
+/// - `26` builds the logs baseline; a strict no-op on existing logs stores.
 pub(crate) const MIGRATIONS: &[Migration] = &[
-    // ── 0.4.2 baseline (head) ─────────────────────────────────────────
     Migration {
-        id: "1",
+        id: "24",
         target: TargetDb::Core,
-        body: MigrationBody::Sql(BASELINE_BOARD_TABLES),
+        body: MigrationBody::Sql(BASELINE_CORE_SCHEMA),
     },
     Migration {
-        id: "2",
+        id: "25",
         target: TargetDb::Core,
-        body: MigrationBody::Sql(BASELINE_SESSION_TABLES),
+        body: MigrationBody::Rust(add_chat_history_reply_columns),
     },
     Migration {
-        id: "3",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(BASELINE_WORKSPACE_TABLES),
-    },
-    Migration {
-        id: "4",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(BASELINE_USERS_TABLES),
-    },
-    Migration {
-        id: "5",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(BASELINE_CONFIG_TABLES),
-    },
-    Migration {
-        id: "6",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(BASELINE_CHAT_HISTORY_TABLES),
-    },
-    Migration {
-        id: "7",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(BASELINE_CORE_INDEXES),
-    },
-    // ── 0.4.2→current deltas (existing deployed ids preserved) ─────────
-    // Board deltas: drop the pre-job-centric reservation/assignment columns.
-    Migration {
-        id: "001_drop_ticket_pipeline_reservation",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql("ALTER TABLE tickets DROP COLUMN pipeline_reservation;"),
-    },
-    Migration {
-        id: "002_drop_ticket_assigned_to",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql("ALTER TABLE tickets DROP COLUMN assigned_to;"),
-    },
-    // The non-terminal-ticket reset (`003_reset_nonterminal_tickets`) is moved
-    // BELOW the consolidation import: it is a DATA reset, and only the imported
-    // legacy tickets (copied into the consolidated DB by consolidate_001) need
-    // it. On a current DB it is already-recorded and skipped, so live in-progress
-    // tickets are never touched.
-    // Session deltas: ticket_stage_jobs rework, then the job-per-phase rework.
-    Migration {
-        id: "003_drop_ticket_stage_jobs_round",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql("ALTER TABLE ticket_stage_jobs DROP COLUMN round;"),
-    },
-    // Note: the historical `004_reset_implementation_jobs` /
-    // `consolidate_004_discard_old_ticket_jobs` deletes are deliberately NOT
-    // catalog entries. They ran on the (empty) pre-import `jobs` table, and the
-    // post-import `13` cleanup deletes exactly the union of the kinds they
-    // removed. Keeping them would be dead code — a recorded id replays
-    // automatically via the id-only applied check, so their absence changes no
-    // behavior and does not create a divergent schema path (the append-only
-    // guarantee covers schema evolution, which this data-only reset does not).
-    Migration {
-        id: "005_drop_ticket_stage_jobs_phase",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql("ALTER TABLE ticket_stage_jobs DROP COLUMN phase;"),
-    },
-    Migration {
-        id: "006_rename_ticket_stage_jobs_to_ticket_jobs",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(
-            "DROP TABLE IF EXISTS ticket_jobs; \
-             ALTER TABLE ticket_stage_jobs RENAME TO ticket_jobs;",
-        ),
-    },
-    Migration {
-        id: "consolidate_002_drop_ticket_jobs_stage",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql("ALTER TABLE ticket_jobs DROP COLUMN stage;"),
-    },
-    // `paused_frozen` is ADDed then DROPped (historical add/drop round-trip).
-    // The add must precede the drop so a fresh 0.4.2 install never hits a
-    // `DROP COLUMN` on an absent column.
-    Migration {
-        id: "007_jobs_paused_frozen",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql("ALTER TABLE jobs ADD COLUMN paused_frozen INTEGER;"),
-    },
-    Migration {
-        id: "consolidate_003_jobs_ticket_id",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(
-            "ALTER TABLE jobs ADD COLUMN ticket_id TEXT REFERENCES tickets(id);",
-        ),
-    },
-    Migration {
-        id: "consolidate_005_drop_ticket_jobs",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql("DROP TABLE IF EXISTS ticket_jobs;"),
-    },
-    // `jobs.ticket_id` must exist before `idx_jobs_phase_ticket` runs — the
-    // ALTER (consolidate_003) precedes this unique index in the catalog.
-    Migration {
-        id: "consolidate_006_drop_jobs_paused_frozen",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql("ALTER TABLE jobs DROP COLUMN paused_frozen;"),
-    },
-    Migration {
-        id: "consolidate_007_jobs_phase_ticket_index",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_phase_ticket \
-             ON jobs(kind, ticket_id) WHERE ticket_id IS NOT NULL;",
-        ),
-    },
-    Migration {
-        id: "consolidate_008_create_ticket_chronicle",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(
-            "CREATE TABLE IF NOT EXISTS ticket_chronicle (\
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,\
-                ticket_id      TEXT NOT NULL,\
-                workspace_name TEXT NOT NULL,\
-                source_phase   TEXT NOT NULL,\
-                target_phase   TEXT NOT NULL,\
-                at             TEXT NOT NULL\
-             );\
-             CREATE INDEX IF NOT EXISTS idx_ticket_chronicle_ws_id \
-                ON ticket_chronicle(workspace_name, id);\
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_chronicle_dedup \
-                ON ticket_chronicle(ticket_id, workspace_name, source_phase, target_phase, at);",
-        ),
-    },
-    // ── Post-0.4.2 deltas that are new catalog entries (integer ids) ────
-    Migration {
-        id: "10",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_DROP_CONFIG_ROLE),
-    },
-    Migration {
-        id: "11",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_FTS_INDEX),
-    },
-    Migration {
-        id: "12",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_BOARD_ACTIVE_INDEX),
-    },
-    // The one-time consolidation import: non-transactional (FK off/on bulk
-    // load from the 6 legacy per-store files), re-runnable until applied, and
-    // recorded only after it succeeds. Positioned AFTER the FTS/index entries
-    // so imported tickets are already FTS-indexed, and BEFORE the post-import
-    // reset + cleanup below (which act on the imported rows).
-    Migration {
-        id: CONSOLIDATION_IMPORT_ID,
-        target: TargetDb::Core,
-        body: MigrationBody::Rust(import_domain_stores),
-    },
-    // Reset non-terminal legacy tickets to backlog. MUST run AFTER the import —
-    // the consolidated tickets table is empty until consolidate_001 fills it, so
-    // this reset only has an effect on the imported rows. On a current DB it is
-    // already-recorded and skipped.
-    Migration {
-        id: "003_reset_nonterminal_tickets",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(
-            "UPDATE tickets SET phase = 'backlog' \
-             WHERE phase NOT IN ('done','cancelled','failed') AND is_archived = 0;",
-        ),
-    },
-    // Post-import cleanup: discard pre-rework ticket job rows the import just
-    // rolled in. A DISTINCT id (not the earlier reset id), run with FK ON.
-    // This id is a new integer id never recorded by the old runner, so it also
-    // fires on a re-open of an already-current consolidated DB — a safe no-op
-    // there, because the job-per-phase model never produces these legacy kinds
-    // and the FK check is warn-only.
-    Migration {
-        id: "13",
-        target: TargetDb::Core,
-        body: MigrationBody::Rust(cleanup_legacy_ticket_jobs),
-    },
-    // Idempotent final-shape cleanups. The baseline re-creates 0.4.2 artifacts
-    // (these are NEW integer ids, never recorded by the old runner); on an
-    // already-current consolidated DB the drops/renames that removed them are
-    // already-recorded and skipped, so these entries remove the leaked table /
-    // column. They are safe no-ops on fresh and 0.4.2 installs.
-    Migration {
-        id: "15",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_DROP_TICKET_STAGE_JOBS),
-    },
-    Migration {
-        id: "16",
-        target: TargetDb::Core,
-        body: MigrationBody::Rust(drop_jobs_paused_frozen),
-    },
-    // ── 0.4.2 logs baseline + delta ────────────────────────────────────
-    Migration {
-        id: "8",
+        id: "26",
         target: TargetDb::Logs,
-        body: MigrationBody::Sql(BASELINE_LOGS_TABLES),
-    },
-    Migration {
-        id: "9",
-        target: TargetDb::Logs,
-        body: MigrationBody::Sql(BASELINE_LOGS_INDEXES),
-    },
-    Migration {
-        id: "14",
-        target: TargetDb::Logs,
-        body: MigrationBody::Sql(DELTA_GREP_TELEMETRY),
-    },
-    Migration {
-        id: "17",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_ALARMS),
-    },
-    // Chat-history message-timestamp delta.
-    Migration {
-        id: "18",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_CHAT_HISTORY_TIMESTAMP),
-    },
-    // Onboarding: drop the user_roles table (role pools are permission-derived
-    // now) and seed onboarding_state=finished for existing (non-fresh)
-    // installs, gated by the users-non-empty probe.
-    Migration {
-        id: "19",
-        target: TargetDb::Core,
-        body: MigrationBody::Rust(drop_user_roles_and_seed_onboarding),
-    },
-    // Rename the 'ready_for_development' phase value to 'queued'.
-    Migration {
-        id: "20",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_RENAME_READY_FOR_DEVELOPMENT_TO_QUEUED),
-    },
-    // Rewrite legacy score-based analysis verdict rows to the score-less graded
-    // shape (analysis-only; review/QA and the analyze tool are untouched).
-    Migration {
-        id: "21",
-        target: TargetDb::Core,
-        body: MigrationBody::Rust(rewrite_analysis_verdicts),
-    },
-    // Index backing the pipeline poll loop's claim + dispatch snapshot queries.
-    Migration {
-        id: "22",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_TICKETS_WORKSPACE_PHASE_INDEX),
-    },
-    // Chat-history reply reference columns (author + normalized snippet) for
-    // rendering the reply-to quote header on GUI messages.
-    Migration {
-        id: "23",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(DELTA_CHAT_HISTORY_REPLY_REFERENCE),
+        body: MigrationBody::Sql(BASELINE_LOGS_SCHEMA),
     },
 ];
 
@@ -739,6 +421,19 @@ pub(crate) async fn run_migrations(
     conn: &Connection,
     db: TargetDb,
     root: &Path,
+) -> anyhow::Result<()> {
+    run_catalog(conn, db, root, MIGRATIONS).await
+}
+
+/// The migration loop, parameterized by a catalog so tests can replay the
+/// retired `1`–`23` chain (see the test fixtures). Creates `schema_migrations`,
+/// reads the applied ids, and runs each entry once, in catalog order, targeting
+/// only `db`.
+async fn run_catalog(
+    conn: &Connection,
+    db: TargetDb,
+    root: &Path,
+    catalog: &[Migration],
 ) -> anyhow::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (\
@@ -758,7 +453,7 @@ pub(crate) async fn run_migrations(
         .filter_map(|row| row.get::<String>(0).ok())
         .collect();
 
-    for migration in MIGRATIONS {
+    for migration in catalog {
         if migration.target != db {
             continue;
         }
@@ -788,10 +483,10 @@ pub(crate) async fn run_migrations(
             MigrationBody::Rust(run) => {
                 // Unlike an SQL entry, a Rust body and its tracking row are not
                 // recorded atomically (the body runs without a transaction). This
-                // is safe because every Rust body — the consolidation import,
-                // the post-import cleanup, and the `jobs.paused_frozen` drop — is
-                // idempotent and re-runnable, so a crash between body success and
-                // id recording re-runs the body without corruption on the next boot.
+                // is safe because every Rust body — the `chat_history` reply-column
+                // upfill, which probes before altering — is idempotent and
+                // re-runnable, so a crash between body success and id recording
+                // re-runs the body without corruption on the next boot.
                 run(conn, root)
                     .await
                     .with_context(|| format!("Migration '{}' failed", migration.id))?;
@@ -811,237 +506,61 @@ pub(crate) async fn run_migrations(
 
 // ── Rust-function migrations (called without a surrounding transaction) ──
 
-fn import_domain_stores<'a>(
-    conn: &'a Connection,
-    root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
-    Box::pin(run_consolidation_import(conn, root))
-}
-
-fn cleanup_legacy_ticket_jobs<'a>(
+fn add_chat_history_reply_columns<'a>(
     conn: &'a Connection,
     _root: &'a Path,
 ) -> BoxFuture<'a, anyhow::Result<()>> {
-    Box::pin(run_import_cleanup(conn))
+    Box::pin(run_add_chat_history_reply_columns(conn))
 }
 
-fn drop_jobs_paused_frozen<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
-    Box::pin(run_drop_jobs_paused_frozen(conn))
-}
-
-/// The one-time consolidation import: copy user tables from the six legacy
-/// per-store files into the consolidated database. Non-transactional (FK
-/// enforcement is OFF during the bulk load and ON afterwards), re-runnable
-/// until applied.
-async fn run_consolidation_import(conn: &Connection, root: &Path) -> anyhow::Result<()> {
-    let any_legacy = crate::db::DOMAIN_STORE_NAMES
-        .iter()
-        .any(|name| crate::db::legacy_store_db_path(root, name).exists());
-    if !any_legacy {
-        return Ok(());
-    }
-    crate::db::import_legacy_stores(conn, root).await
-}
-
-/// The post-import cleanup: discard pre-rework ticket job rows (FK ON, so the
-/// cascade fires) and report — never fail on — any orphan rows the bulk load
-/// may have left behind.
-async fn run_import_cleanup(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute(
-        "DELETE FROM jobs WHERE kind IN \
-             ('ticket_stage', 'ticket_analysis', 'ticket_implementation')",
-        (),
-    )
-    .await
-    .context("Failed to discard legacy ticket jobs after consolidation import")?;
-
-    let violations = conn
-        .query("PRAGMA foreign_key_check", ())
-        .await
-        .context("Failed to run PRAGMA foreign_key_check after consolidation import")?;
-    if !violations.is_empty() {
-        tracing::warn!(
-            count = violations.len(),
-            "consolidation import found orphan rows violating the new FKs; \
-             preserving them as soft references (future writes still enforce the FK)",
-        );
-    }
-    Ok(())
-}
-
-/// Idempotently drop `jobs.paused_frozen`.
-///
-/// On a fresh/0.4.2 install the historical add/drop round-trip (`007_jobs_paused_frozen`
-/// → `consolidate_006`) already removes the column, so this is a no-op. On an
-/// already-current consolidated DB the catalog's baseline re-creates `jobs` without
-/// the column, delta `007` re-adds it, but `consolidate_006` is already recorded
-/// and skipped — leaving a dangling column. Turso has no `DROP COLUMN IF EXISTS`,
-/// so the existence probe lives inside this single self-contained migration body
-/// (idempotent cleanup, not a runner guard).
-async fn run_drop_jobs_paused_frozen(conn: &Connection) -> anyhow::Result<()> {
-    let has = conn
-        .query("PRAGMA table_info(jobs)", ())
-        .await
-        .context("Failed to probe jobs.paused_frozen")?
-        .into_iter()
-        .any(|row| row.get::<String>(1).ok().as_deref() == Some("paused_frozen"));
-    if has {
-        conn.execute("ALTER TABLE jobs DROP COLUMN paused_frozen", ())
-            .await
-            .context("Failed to drop jobs.paused_frozen")?;
-    }
-    Ok(())
-}
-
-fn drop_user_roles_and_seed_onboarding<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
-    Box::pin(run_drop_user_roles_and_seed_onboarding(conn))
-}
-
-/// Idempotently drop `user_roles` and seed the onboarding state for existing
-/// (non-fresh) installs. Fresh-vs-existing discriminator: at this tail-
-/// migration body the `users` table is EMPTY on a fresh install (the admin is
-/// seeded by `ensure_admin_user` as a POST-OPEN hook, AFTER migrations) and
-/// NON-EMPTY on an existing install.
-async fn run_drop_user_roles_and_seed_onboarding(conn: &Connection) -> anyhow::Result<()> {
-    // Probe user count. Non-empty → existing install.
-    let user_count: i64 = conn
-        .query("SELECT COUNT(*) FROM users", ())
-        .await
-        .context("Failed to probe users count")?
-        .into_iter()
-        .next()
-        .and_then(|row| row.get::<i64>(0).ok())
-        .unwrap_or(0);
-
-    if user_count > 0 {
-        // Existing install: mark onboarding complete (one-time; fresh installs
-        // are left at the default Init with no write).
-        conn.execute(
-            "INSERT OR REPLACE INTO config_kv (key, value) VALUES (?1, ?2)",
-            params![
-                crate::config::CONFIG_KEY_ONBOARDING_STATE,
-                crate::config::OnboardingState::Finished.as_str(),
-            ],
-        )
-        .await
-        .context("Failed to set onboarding_state=finished")?;
-
-        // Normalize selected_role values so existing installs land deterministically
-        // on the safe in-pool default:
-        // - a NULL/empty selection (legacy row) is set to Assistant, rather than
-        //   letting read-time resolution fall to pool.first() (Support for a full
-        //   admin); an existing install is NOT in onboarding, so Assistant is the
-        //   correct safe landing.
-        // - an out-of-pool selection is rewritten to Assistant; in-pool roles are
-        //   preserved.
-        let rows = conn
-            .query("SELECT name, permissions, selected_role FROM users", ())
-            .await?;
-        for row in rows {
-            let name: String = row.get(0)?;
-            let permissions: Option<String> = row.get(1)?;
-            let selected_role: Option<String> = row.get(2)?;
-            let sel = selected_role.unwrap_or_default();
-            let needs_default = sel.is_empty() || {
-                let in_pool = if permissions.as_deref() == Some("full") {
-                    matches!(sel.as_str(), "support" | "assistant" | "manager" | "artist")
-                } else {
-                    matches!(sel.as_str(), "assistant" | "artist")
-                };
-                !in_pool
-            };
-            if needs_default {
-                conn.execute(
-                    "UPDATE users SET selected_role = 'assistant' WHERE name = ?1",
-                    params![name],
-                )
+/// Upfill the retired delta `23` (`chat_history.reply_author` /
+/// `reply_snippet`) for databases that were fully current before the catalog
+/// consolidation: a 0.5.0 database has neither column, a current-main database
+/// already has both, and a fresh install got them from entry `24`'s
+/// `CREATE TABLE`. Turso has no `ADD COLUMN IF NOT EXISTS`, so the existence
+/// probe lives in this guarded, idempotent body (non-transactional like every
+/// Rust body, re-runnable until recorded).
+async fn run_add_chat_history_reply_columns(conn: &Connection) -> anyhow::Result<()> {
+    for (column, ddl) in [
+        (
+            "reply_author",
+            "ALTER TABLE chat_history ADD COLUMN reply_author TEXT",
+        ),
+        (
+            "reply_snippet",
+            "ALTER TABLE chat_history ADD COLUMN reply_snippet TEXT",
+        ),
+    ] {
+        if !column_exists(conn, "chat_history", column).await? {
+            conn.execute(ddl, ())
                 .await
-                .context("Failed to normalize selected_role")?;
-            }
+                .with_context(|| format!("Failed to add chat_history.{column}"))?;
         }
     }
-
-    // Drop the user_roles table (the pool is permission-derived now).
-    conn.execute("DROP TABLE IF EXISTS user_roles", ())
-        .await
-        .context("Failed to drop user_roles")?;
     Ok(())
 }
 
-fn rewrite_analysis_verdicts<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
-    Box::pin(run_rewrite_analysis_verdicts(conn))
-}
-
-/// One-time data migration: rewrite legacy score-based analysis verdict rows to
-/// the score-less graded shape.
+/// Return whether `column` exists in `table` (via `PRAGMA table_info`).
 ///
-/// Old analysis slots stored `{"verdict": {score, issues: [string]}}` in
-/// `agents.outcome`; review/QA keeps that shape. This rewrites ONLY rows whose
-/// `kind = 'analyst'` AND whose `outcome` carries a `verdict` with a numeric
-/// `score` and string `issues` — the exact envelope written by the pipeline
-/// verdict serializer. The analyze tool's analyst rows (raw prose) and the
-/// analysis escalation rows (`{"blocker_verification":...}`) never match. Each
-/// issue is graded deterministically: a sub-7 score (the old
-/// `ANALYST_PASS_THRESHOLD`) means the issues were flagged potential blockers,
-/// so they are graded `blocker`; a ≥7 score grades them `minor`. Idempotent and
-/// re-runnable until applied (a rewritten row has no `score`, so a re-run skips
-/// it).
-async fn run_rewrite_analysis_verdicts(conn: &Connection) -> anyhow::Result<()> {
-    let rows = conn
-        .query(
-            "SELECT job_id, agent_id, outcome FROM agents \
-             WHERE kind = 'analyst' AND outcome LIKE '{\"verdict\":%'",
-            (),
-        )
+/// This is the idempotency probe used by the guarded Rust migration bodies:
+/// Turso has no `ADD COLUMN IF NOT EXISTS` (or `DROP COLUMN IF EXISTS`), so a
+/// body probes before altering rather than relying on an `IF NOT EXISTS`.
+async fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let found = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
         .await
-        .context("Failed to read analysis verdict rows for migration")?;
-    for row in rows {
-        let job_id: String = row.get(0)?;
-        let agent_id: String = row.get(1)?;
-        let outcome: String = row.get(2)?;
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&outcome) else {
-            continue;
-        };
-        let Some(verdict) = value.get("verdict") else {
-            continue;
-        };
-        let Some(score) = verdict.get("score").and_then(serde_json::Value::as_u64) else {
-            continue;
-        };
-        let Some(issues) = verdict.get("issues").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        // Old sub-7 scores drove the blocker escalation.
-        let grade = if score < 7 { "blocker" } else { "minor" };
-        let graded: Vec<serde_json::Value> = issues
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(|text| serde_json::json!({ "text": text, "grade": grade }))
-            .collect();
-        let rewritten = serde_json::json!({ "verdict": { "issues": graded } }).to_string();
-        conn.execute(
-            "UPDATE agents SET outcome = ?1 WHERE job_id = ?2 AND agent_id = ?3",
-            params![rewritten, job_id, agent_id],
-        )
-        .await
-        .context("Failed to rewrite analysis verdict row")?;
-    }
-    Ok(())
+        .with_context(|| format!("Failed to probe {table}.{column}"))?
+        .into_iter()
+        .any(|row| row.get::<String>(1).ok().as_deref() == Some(column));
+    Ok(found)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::Connection;
+
+    // ── Shared schema-inspection helpers ──────────────────────────────
 
     async fn column_names(conn: &Connection, table: &str) -> Vec<String> {
         conn.query(&format!("PRAGMA table_info({table})"), ())
@@ -1098,7 +617,8 @@ mod tests {
     async fn index_defs(conn: &Connection) -> std::collections::BTreeMap<String, String> {
         conn.query(
             "SELECT name, sql FROM sqlite_master \
-             WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'",
+             WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%' \
+             AND name NOT LIKE '__turso_internal_%' AND name NOT LIKE 'turso_cdc%'",
             (),
         )
         .await
@@ -1122,7 +642,8 @@ mod tests {
     async fn table_defs(conn: &Connection) -> std::collections::BTreeMap<String, String> {
         conn.query(
             "SELECT name, sql FROM sqlite_master \
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND name NOT LIKE '__turso_internal_%' AND name NOT LIKE 'turso_cdc%'",
             (),
         )
         .await
@@ -1139,11 +660,13 @@ mod tests {
         .collect()
     }
 
-    /// User table names (excludes `sqlite_*` internal tables).
+    /// User table names (excludes `sqlite_*` internal tables and Turso runtime
+    /// artifacts such as CDC/internal tables).
     async fn table_names(conn: &Connection) -> Vec<String> {
         conn.query(
             "SELECT name FROM sqlite_master \
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND name NOT LIKE '__turso_internal_%' AND name NOT LIKE 'turso_cdc%'",
             (),
         )
         .await
@@ -1153,16 +676,440 @@ mod tests {
         .collect()
     }
 
-    // ── 0.4.2 backward-compat baseline (verbatim 0.4.2 SCHEMA DDL) ───────────
+    // ── Expected-shape fixtures (hand-maintained, independent of the baseline)
     //
-    // The golden upgrade test seeds the legacy per-store files from these
-    // constants, which are the EXACT `SCHEMA` DDL each store shipped at the
-    // 0.4.2 baseline (the commit `4a68782` bump; the DDL is unchanged from its
-    // parent, which is where these were transcribed from). They are
-    // deliberately independent of the catalog's BASELINE_* constants so the
-    // test catches a mistaken "reverse-engineered" baseline instead of
-    // validating it against itself.
-    const LEGACY_0_4_2_BOARD_SCHEMA: &str = r#"
+    // These are deliberately typed out literally, NOT derived from the baseline
+    // DDL constants above, so a wrong baseline cannot validate itself.
+
+    /// Hand-maintained expected current core shape: table → its full column
+    /// set. Column sets are compared order-insensitively because ALTER-produced
+    /// shapes (the retired chain) must compare equal to CREATE-produced ones
+    /// (the baseline).
+    const EXPECTED_CORE_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+        (
+            "agents",
+            &[
+                "job_id", "agent_id", "kind", "idx", "status", "outcome", "task",
+            ],
+        ),
+        (
+            "alarms",
+            &[
+                "id",
+                "session_id",
+                "user_name",
+                "kind",
+                "text",
+                "fire_at",
+                "interval_seconds",
+                "next_fire_at",
+                "status",
+                "created_at",
+            ],
+        ),
+        (
+            "chat_history",
+            &[
+                "id",
+                "message_id",
+                "user_name",
+                "direction",
+                "content",
+                "agent_role",
+                "workspace",
+                "timestamp",
+                "reply_author",
+                "reply_snippet",
+            ],
+        ),
+        ("config_kv", &["key", "value"]),
+        (
+            "config_model_routing",
+            &["model", "provider_order", "allow_fallbacks"],
+        ),
+        (
+            "editor_tabs",
+            &[
+                "workspace_name",
+                "file_path",
+                "tab_order",
+                "is_active",
+                "is_dirty",
+                "dirty_content",
+            ],
+        ),
+        (
+            "jobs",
+            &[
+                "id",
+                "kind",
+                "status",
+                "task",
+                "workspace_name",
+                "user_name",
+                "channel",
+                "role",
+                "retry_count",
+                "created_at",
+                "updated_at",
+                "ticket_id",
+            ],
+        ),
+        (
+            "pending_jobs",
+            &["id", "target_agent_id", "envelope", "created_at"],
+        ),
+        ("research_jobs", &["id", "state"]),
+        ("schema_migrations", &["id", "applied_at"]),
+        (
+            "session_metadata",
+            &[
+                "agent_id",
+                "last_activity",
+                "channel",
+                "user_name",
+                "workspace_name",
+                "role",
+                "active_models",
+                "token_length",
+                "message_count",
+            ],
+        ),
+        (
+            "sessions",
+            &["id", "agent_id", "role", "content", "created_at"],
+        ),
+        (
+            "ticket_chronicle",
+            &[
+                "id",
+                "ticket_id",
+                "workspace_name",
+                "source_phase",
+                "target_phase",
+                "at",
+            ],
+        ),
+        (
+            "ticket_comments",
+            &["id", "ticket_id", "role", "content", "created_at"],
+        ),
+        ("ticket_counters", &["workspace_name", "next_id"]),
+        (
+            "tickets",
+            &[
+                "id",
+                "title",
+                "description",
+                "phase",
+                "workspace_name",
+                "created_at",
+                "updated_at",
+                "prerequisites",
+                "supersedes",
+                "superseded_by",
+                "commit_hash",
+                "lines_added",
+                "lines_removed",
+                "reporter",
+                "is_archived",
+                "embedding",
+                "priority",
+                "reviewed_head",
+                "reviewed_tree",
+                "done_at",
+                "bounce_count",
+            ],
+        ),
+        (
+            "user_channels",
+            &["user_name", "channel", "identifier", "reply_target"],
+        ),
+        (
+            "users",
+            &["name", "permissions", "selected_workspace", "selected_role"],
+        ),
+        (
+            "workspace_contexts",
+            &["workspace_name", "role", "content", "created_at"],
+        ),
+        (
+            "workspaces",
+            &[
+                "name",
+                "path",
+                "status",
+                "created_at",
+                "updated_at",
+                "maintenance",
+                "paused",
+                "maintainer_debounce_mins",
+                "maintainer_last_run_at",
+                "diagnostics",
+                "diagnostics_generation",
+                "notes",
+                "last_analyzed_commit",
+                "discovery_generation",
+            ],
+        ),
+    ];
+
+    const EXPECTED_CORE_INDEXES: &[&str] = &[
+        "idx_ticket_comments_ticket_id",
+        "idx_sessions_agent_id",
+        "idx_jobs_kind_status",
+        "idx_jobs_updated_at",
+        "idx_agents_anchor",
+        "idx_pending_jobs_agent_created",
+        "workspace_contexts_null_role",
+        "idx_chat_history_user",
+        "idx_chat_history_workspace",
+        "idx_chat_history_user_ws_id",
+        "idx_tickets_title_fts",
+        "idx_tickets_board_active",
+        "idx_jobs_phase_ticket",
+        "idx_ticket_chronicle_ws_id",
+        "idx_ticket_chronicle_dedup",
+        "idx_alarms_due",
+        "idx_tickets_workspace_phase",
+    ];
+
+    const EXPECTED_LOGS_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+        (
+            "grep_telemetry",
+            &[
+                "id",
+                "recorded_at",
+                "command",
+                "served",
+                "reason",
+                "recursive",
+                "piped",
+                "operand_count",
+                "flags",
+                "mode",
+                "workspace",
+                "grep_count",
+                "served_count",
+                "skipped_count",
+                "duration_ms",
+                "exit_code",
+            ],
+        ),
+        (
+            "llm_requests",
+            &[
+                "id",
+                "recorded_at",
+                "purpose",
+                "agent_id",
+                "role",
+                "workspace",
+                "ticket_id",
+                "model",
+                "routing",
+                "input_tokens",
+                "output_tokens",
+                "cached_input_tokens",
+                "cache_miss_tokens",
+                "duration_ms",
+                "retry_attempts",
+                "finish_reason",
+                "failure_class",
+                "success",
+                "cost",
+                "cost_details",
+                "upstream_provider",
+                "system_fingerprint",
+            ],
+        ),
+        (
+            "logs",
+            &[
+                "id",
+                "timestamp",
+                "level",
+                "target",
+                "message",
+                "fields",
+                "agent_id",
+                "agent_role",
+                "workspace",
+            ],
+        ),
+        ("schema_migrations", &["id", "applied_at"]),
+        (
+            "tool_calls",
+            &[
+                "id",
+                "agent_id",
+                "role",
+                "tool_name",
+                "arguments",
+                "duration_ms",
+                "success",
+                "error_message",
+                "workspace",
+                "recorded_at",
+            ],
+        ),
+    ];
+
+    const EXPECTED_LOGS_INDEXES: &[&str] = &[
+        "idx_logs_timestamp",
+        "idx_logs_level",
+        "idx_logs_target",
+        "idx_logs_agent_role",
+        "idx_logs_agent_id",
+        "idx_logs_workspace",
+        "idx_tool_calls_agent_id",
+        "idx_tool_calls_role",
+        "idx_tool_calls_tool_name",
+        "idx_tool_calls_recorded_at",
+        "idx_tool_calls_workspace",
+        "idx_tool_calls_error_message",
+        "idx_llm_requests_recorded_at",
+        "idx_llm_requests_agent_id",
+        "idx_llm_requests_model",
+        "idx_llm_requests_purpose",
+        "idx_grep_telemetry_recorded_at",
+        "idx_grep_telemetry_served",
+        "idx_grep_telemetry_reason",
+        "idx_grep_telemetry_command",
+    ];
+
+    /// All expected core table names.
+    fn expected_core_table_names() -> Vec<&'static str> {
+        EXPECTED_CORE_TABLE_COLUMNS
+            .iter()
+            .map(|(n, _)| *n)
+            .collect()
+    }
+
+    /// Expected core table names, excluding `schema_migrations` (whose row
+    /// count legitimately grows when a new catalog entry is applied).
+    fn expected_core_domain_tables() -> Vec<&'static str> {
+        expected_core_table_names()
+            .into_iter()
+            .filter(|n| *n != "schema_migrations")
+            .collect()
+    }
+
+    /// Expected core table names, excluding `schema_migrations` and `excluded`.
+    fn expected_core_tables_except(excluded: &str) -> Vec<&'static str> {
+        expected_core_table_names()
+            .into_iter()
+            .filter(|n| *n != "schema_migrations" && *n != excluded)
+            .collect()
+    }
+
+    fn expected_logs_domain_tables() -> Vec<&'static str> {
+        EXPECTED_LOGS_TABLE_COLUMNS
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| *n != "schema_migrations")
+            .collect()
+    }
+
+    // ── Schema assertion helper ────────────────────────────────────────
+
+    /// Assert that `conn`'s schema matches `expected_tables` (table name-set
+    /// equality + per-table column-name SET equality, order-insensitive) and
+    /// `expected_indexes` (explicit index name-set equality). Errors list the
+    /// missing/extra items with `context` for a helpful message.
+    async fn assert_schema_matches(
+        conn: &Connection,
+        expected_tables: &[(&str, &[&str])],
+        expected_indexes: &[&str],
+        context: &str,
+    ) {
+        let actual_names: Vec<String> = table_names(conn).await;
+        let actual_set: std::collections::HashSet<&str> =
+            actual_names.iter().map(String::as_str).collect();
+        let expected_set: std::collections::HashSet<&str> =
+            expected_tables.iter().map(|(n, _)| *n).collect();
+        let missing: Vec<&str> = expected_set.difference(&actual_set).copied().collect();
+        let extra: Vec<&str> = actual_set.difference(&expected_set).copied().collect();
+        assert!(missing.is_empty(), "{context}: missing tables {missing:?}");
+        assert!(extra.is_empty(), "{context}: unexpected tables {extra:?}");
+
+        for (table, expected_cols) in expected_tables {
+            let actual = column_names(conn, table).await;
+            let actual_set: std::collections::HashSet<&str> =
+                actual.iter().map(String::as_str).collect();
+            let expected_set: std::collections::HashSet<&str> =
+                expected_cols.iter().copied().collect();
+            let miss: Vec<&str> = expected_set.difference(&actual_set).copied().collect();
+            let ex: Vec<&str> = actual_set.difference(&expected_set).copied().collect();
+            assert!(
+                miss.is_empty(),
+                "{context}: table '{table}' missing columns {miss:?}"
+            );
+            assert!(
+                ex.is_empty(),
+                "{context}: table '{table}' has extra columns {ex:?}"
+            );
+        }
+
+        let idx_names: Vec<String> = index_defs(conn).await.into_keys().collect();
+        let actual_idx: std::collections::HashSet<&str> =
+            idx_names.iter().map(String::as_str).collect();
+        let expected_idx: std::collections::HashSet<&str> =
+            expected_indexes.iter().copied().collect();
+        let missing_idx: Vec<&str> = expected_idx.difference(&actual_idx).copied().collect();
+        let extra_idx: Vec<&str> = actual_idx.difference(&expected_idx).copied().collect();
+        assert!(
+            missing_idx.is_empty(),
+            "{context}: missing indexes {missing_idx:?}"
+        );
+        assert!(
+            extra_idx.is_empty(),
+            "{context}: unexpected indexes {extra_idx:?}"
+        );
+    }
+
+    /// Table → ordered column names, for before/after snapshots.
+    async fn column_sets(
+        conn: &Connection,
+        tables: &[&str],
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut m = std::collections::BTreeMap::new();
+        for t in tables {
+            m.insert(t.to_string(), column_names(conn, t).await);
+        }
+        m
+    }
+
+    /// Table → row count, for before/after data snapshots.
+    async fn table_row_counts(
+        conn: &Connection,
+        tables: &[&str],
+    ) -> std::collections::BTreeMap<String, i64> {
+        let mut m = std::collections::BTreeMap::new();
+        for t in tables {
+            let count: i64 = conn
+                .query(&format!("SELECT COUNT(*) FROM {t}"), ())
+                .await
+                .expect("count rows")[0]
+                .get::<i64>(0)
+                .expect("count");
+            m.insert(t.to_string(), count);
+        }
+        m
+    }
+
+    // ── Old-catalog fixture (simulated pre-consolidation databases) ─────
+    //
+    // The production catalog was rewritten to the current-shape baseline
+    // (ids `24`–`26`), so the retired `1`–`23` chain can no longer be observed
+    // by running `run_migrations`. These fixtures replay that chain (verbatim
+    // old DDL + old Rust bodies) so the baseline can be proven to be a strict
+    // no-op against a database built by the REAL pre-consolidation DDL text,
+    // not a hand-shaped imitation. They cover the three supported states:
+    // a 0.5.0 DB (one delta behind), a current-main DB (all columns), and a
+    // fresh install.
+
+    const OLD_BASELINE_BOARD_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS tickets (
     id              TEXT PRIMARY KEY,
     title           TEXT NOT NULL,
@@ -1196,14 +1143,12 @@ CREATE TABLE IF NOT EXISTS ticket_comments (
     created_at  TEXT NOT NULL,
     FOREIGN KEY (ticket_id) REFERENCES tickets(id)
 );
-CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
 CREATE TABLE IF NOT EXISTS ticket_counters (
     workspace_name TEXT PRIMARY KEY,
     next_id        INTEGER NOT NULL DEFAULT 1
-);
-"#;
+);";
 
-    const LEGACY_0_4_2_SESSIONS_SCHEMA: &str = r#"
+    const OLD_BASELINE_SESSION_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS sessions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id    TEXT NOT NULL,
@@ -1211,8 +1156,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     content     TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id, id);
-
 CREATE TABLE IF NOT EXISTS session_metadata (
     agent_id      TEXT PRIMARY KEY,
     last_activity TEXT NOT NULL,
@@ -1224,7 +1167,6 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     token_length  INTEGER,
     message_count INTEGER NOT NULL DEFAULT 0
 );
-
 CREATE TABLE IF NOT EXISTS jobs (
     id             TEXT PRIMARY KEY,
     kind           TEXT NOT NULL,
@@ -1238,9 +1180,6 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
-CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
-
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
     agent_id   TEXT NOT NULL,
@@ -1251,16 +1190,12 @@ CREATE TABLE IF NOT EXISTS agents (
     task       TEXT NOT NULL,
     PRIMARY KEY (job_id, agent_id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_anchor ON agents(agent_id) WHERE job_id IS NULL;
-
 CREATE TABLE IF NOT EXISTS pending_jobs (
     id              TEXT PRIMARY KEY,
     target_agent_id TEXT NOT NULL,
     envelope        TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target_agent_id, created_at);
-
 CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
     id          TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     ticket_id   TEXT NOT NULL,
@@ -1268,14 +1203,12 @@ CREATE TABLE IF NOT EXISTS ticket_stage_jobs (
     phase       TEXT NOT NULL,
     round       INTEGER NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS research_jobs (
     id    TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     state TEXT NOT NULL
-);
-"#;
+);";
 
-    const LEGACY_0_4_2_WORKSPACES_SCHEMA: &str = r#"
+    const OLD_BASELINE_WORKSPACE_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS workspaces (
     name       TEXT PRIMARY KEY,
     path       TEXT NOT NULL UNIQUE,
@@ -1299,7 +1232,6 @@ CREATE TABLE IF NOT EXISTS workspace_contexts (
     created_at     TEXT NOT NULL,
     UNIQUE(workspace_name, role)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS workspace_contexts_null_role ON workspace_contexts(workspace_name) WHERE role IS NULL;
 CREATE TABLE IF NOT EXISTS editor_tabs (
     workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
     file_path      TEXT NOT NULL,
@@ -1308,10 +1240,9 @@ CREATE TABLE IF NOT EXISTS editor_tabs (
     is_dirty       INTEGER NOT NULL DEFAULT 0,
     dirty_content  TEXT,
     PRIMARY KEY (workspace_name, file_path)
-);
-"#;
+);";
 
-    const LEGACY_0_4_2_USERS_SCHEMA: &str = r#"
+    const OLD_BASELINE_USERS_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS users (
     name                TEXT PRIMARY KEY,
     permissions         TEXT,
@@ -1329,29 +1260,25 @@ CREATE TABLE IF NOT EXISTS user_roles (
     user_name   TEXT NOT NULL REFERENCES users(name),
     role        TEXT NOT NULL,
     PRIMARY KEY (user_name, role)
-);
-"#;
+);";
 
-    const LEGACY_0_4_2_CONFIG_SCHEMA: &str = r#"
+    const OLD_BASELINE_CONFIG_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS config_kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-
 CREATE TABLE IF NOT EXISTS config_role (
     role             TEXT PRIMARY KEY,
     model            TEXT,
     reasoning_effort TEXT
 );
-
 CREATE TABLE IF NOT EXISTS config_model_routing (
     model              TEXT PRIMARY KEY,
     provider_order     TEXT,
     allow_fallbacks    INTEGER
-);
-"#;
+);";
 
-    const LEGACY_0_4_2_CHAT_HISTORY_SCHEMA: &str = r#"
+    const OLD_BASELINE_CHAT_HISTORY_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS chat_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id TEXT NOT NULL UNIQUE,
@@ -1360,13 +1287,21 @@ CREATE TABLE IF NOT EXISTS chat_history (
     content TEXT NOT NULL,
     agent_role TEXT,
     workspace TEXT NOT NULL
-);
+);";
+
+    const OLD_BASELINE_CORE_INDEXES: &str = "\
+CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id, id);
+CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_anchor ON agents(agent_id) WHERE job_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_pending_jobs_agent_created ON pending_jobs(target_agent_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS workspace_contexts_null_role ON workspace_contexts(workspace_name) WHERE role IS NULL;
 CREATE INDEX IF NOT EXISTS idx_chat_history_user ON chat_history(user_name);
 CREATE INDEX IF NOT EXISTS idx_chat_history_workspace ON chat_history(workspace);
-CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);
-"#;
+CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name, workspace, id);";
 
-    const LEGACY_0_4_2_LOGS_SCHEMA: &str = r#"
+    const OLD_BASELINE_LOGS_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp   TEXT NOT NULL,
@@ -1378,13 +1313,6 @@ CREATE TABLE IF NOT EXISTS logs (
     agent_role  TEXT NOT NULL DEFAULT '',
     workspace   TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
-CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
-CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
-CREATE INDEX IF NOT EXISTS idx_logs_agent_role ON logs(agent_role);
-CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
-CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);
-
 CREATE TABLE IF NOT EXISTS tool_calls (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id       TEXT NOT NULL,
@@ -1397,13 +1325,6 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     workspace      TEXT NOT NULL DEFAULT '',
     recorded_at    TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
-
 CREATE TABLE IF NOT EXISTS llm_requests (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     recorded_at         TEXT NOT NULL,
@@ -1427,203 +1348,534 @@ CREATE TABLE IF NOT EXISTS llm_requests (
     cost_details        TEXT,
     upstream_provider   TEXT,
     system_fingerprint  TEXT
-);
+);";
+
+    const OLD_BASELINE_LOGS_INDEXES: &str = "\
+CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+CREATE INDEX IF NOT EXISTS idx_logs_target ON logs(target);
+CREATE INDEX IF NOT EXISTS idx_logs_agent_role ON logs(agent_role);
+CREATE INDEX IF NOT EXISTS idx_logs_agent_id ON logs(agent_id);
+CREATE INDEX IF NOT EXISTS idx_logs_workspace ON logs(workspace);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_agent_id ON tool_calls(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_role ON tool_calls(role);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_name ON tool_calls(tool_name);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_recorded_at ON tool_calls(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_workspace ON tool_calls(workspace);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_error_message ON tool_calls(error_message);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_recorded_at ON llm_requests(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_agent_id ON llm_requests(agent_id);
 CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(model);
-CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
-"#;
+CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);";
 
-    /// A fresh 0.4.2-anchored install must converge exactly to the current
-    /// shape: 0.4.2 tables are created, then the full delta chain is applied.
-    #[tokio::test]
-    async fn fresh_install_converges_to_current_shape() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let conn = crate::db::open_consolidated_store(tmp.path())
-            .await
-            .expect("fresh consolidated store");
+    const OLD_DELTA_DROP_CONFIG_ROLE: &str = "DROP TABLE IF EXISTS config_role;";
 
-        for table in [
-            "tickets",
-            "ticket_comments",
-            "ticket_counters",
-            "sessions",
-            "session_metadata",
-            "jobs",
-            "agents",
-            "pending_jobs",
-            "research_jobs",
-            "workspaces",
-            "workspace_contexts",
-            "editor_tabs",
-            "users",
-            "user_channels",
-            "config_kv",
-            "config_model_routing",
-            "chat_history",
-            "ticket_chronicle",
-        ] {
-            assert!(
-                crate::db::table_exists(&conn, table).await.unwrap(),
-                "missing {table}"
-            );
-        }
-        for table in [
-            "config_role",
-            "ticket_jobs",
-            "ticket_stage_jobs",
-            "user_roles",
-        ] {
-            assert!(
-                !crate::db::table_exists(&conn, table).await.unwrap(),
-                "{table} must be gone"
-            );
-        }
+    const OLD_DELTA_FTS_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
+USING fts (title) WITH (tokenizer = 'ngram');";
 
-        let jobs_cols = column_names(&conn, "jobs").await;
-        assert!(jobs_cols.contains(&"ticket_id".to_string()));
-        assert!(!jobs_cols.contains(&"paused_frozen".to_string()));
-        let tickets_cols = column_names(&conn, "tickets").await;
-        assert!(!tickets_cols.contains(&"pipeline_reservation".to_string()));
-        assert!(!tickets_cols.contains(&"assigned_to".to_string()));
+    const OLD_DELTA_BOARD_ACTIVE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_board_active ON tickets \
+(is_archived, priority ASC, created_at DESC);";
 
-        for id in [
-            "001_drop_ticket_pipeline_reservation",
-            "002_drop_ticket_assigned_to",
-            "003_reset_nonterminal_tickets",
-            "003_drop_ticket_stage_jobs_round",
-            "005_drop_ticket_stage_jobs_phase",
-            "006_rename_ticket_stage_jobs_to_ticket_jobs",
-            "consolidate_002_drop_ticket_jobs_stage",
-            "007_jobs_paused_frozen",
-            "consolidate_003_jobs_ticket_id",
-            "consolidate_005_drop_ticket_jobs",
-            "consolidate_006_drop_jobs_paused_frozen",
-            "consolidate_007_jobs_phase_ticket_index",
-            "consolidate_008_create_ticket_chronicle",
-            CONSOLIDATION_IMPORT_ID,
-            "1",
-            "2",
-            "3",
-            "4",
-            "5",
-            "6",
-            "7",
-            "10",
-            "11",
-            "12",
-            "13",
-            "15",
-            "16",
-            "19",
-            "22",
-        ] {
-            assert!(
-                applied_ids(&conn).await.contains(&id.to_string()),
-                "missing applied id {id}"
-            );
-        }
+    const OLD_DELTA_GREP_TELEMETRY: &str = "\
+CREATE TABLE IF NOT EXISTS grep_telemetry (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at   TEXT NOT NULL,
+    command       TEXT NOT NULL,
+    served        INTEGER NOT NULL DEFAULT 0,
+    reason        TEXT NOT NULL DEFAULT '',
+    recursive     INTEGER NOT NULL DEFAULT 0,
+    piped         INTEGER NOT NULL DEFAULT 0,
+    operand_count INTEGER NOT NULL DEFAULT 0,
+    flags         TEXT NOT NULL DEFAULT '',
+    mode          TEXT NOT NULL DEFAULT '',
+    workspace     TEXT NOT NULL DEFAULT '',
+    grep_count    INTEGER NOT NULL DEFAULT 0,
+    served_count  INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    duration_ms   INTEGER,
+    exit_code     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_recorded_at ON grep_telemetry(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_served ON grep_telemetry(served);
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_reason ON grep_telemetry(reason);
+CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command);";
+
+    const OLD_DELTA_ALARMS: &str = "\
+CREATE TABLE IF NOT EXISTS alarms (
+    id               TEXT PRIMARY KEY,
+    session_id       TEXT NOT NULL,
+    user_name        TEXT NOT NULL,
+    kind             TEXT NOT NULL,
+    text             TEXT NOT NULL,
+    fire_at          TEXT,
+    interval_seconds INTEGER,
+    next_fire_at     TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(status, next_fire_at);";
+
+    const OLD_DELTA_CHAT_HISTORY_TIMESTAMP: &str =
+        "ALTER TABLE chat_history ADD COLUMN timestamp TEXT;";
+
+    const OLD_DELTA_RENAME_READY_FOR_DEVELOPMENT_TO_QUEUED: &str = "\
+UPDATE tickets SET phase = 'queued' WHERE phase = 'ready_for_development';\
+UPDATE ticket_chronicle SET source_phase = 'queued' WHERE source_phase = 'ready_for_development';\
+UPDATE ticket_chronicle SET target_phase = 'queued' WHERE target_phase = 'ready_for_development';\
+UPDATE jobs SET kind = 'queued' WHERE kind = 'ready_for_development';";
+
+    const OLD_DELTA_TICKETS_WORKSPACE_PHASE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_workspace_phase \
+ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);";
+
+    // The one-time consolidation import is retired and not preserved in tests:
+    // its schema effects (dropping user_roles/config_role/ticket_jobs/
+    // ticket_stage_jobs) are fully duplicated by the later chain entries
+    // (19, 10, consolidate_005, 15), and its data effects are simulated by
+    // direct seeding. The no-op yields the identical final shape.
+    fn noop_import<'a>(
+        _conn: &'a Connection,
+        _root: &'a Path,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
     }
 
-    /// Migration 19's existing-install branch: once the `users` table is
-    /// non-empty (admin seeded by `ensure_admin_user` AFTER the catalog), the
-    /// body seeds `onboarding_state=finished`, reads a NULL/out-of-pool
-    /// `selected_role` as Assistant (preserving in-pool roles), and drops
-    /// `user_roles`.
-    #[tokio::test]
-    async fn migration_19_existing_install_seeds_finished_and_normalizes_roles() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        // Open a fresh consolidated store: the catalog runs (users table present,
-        // user_roles dropped, onboarding_state untouched since users was empty).
-        let conn = crate::db::open_consolidated_store(tmp.path())
+    fn cleanup_legacy_ticket_jobs<'a>(
+        conn: &'a Connection,
+        _root: &'a Path,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(run_import_cleanup(conn))
+    }
+
+    /// The post-import cleanup: discard pre-rework ticket job rows (FK ON, so
+    /// the cascade fires) and report — never fail on — any orphan rows the
+    /// bulk load may have left behind.
+    async fn run_import_cleanup(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute(
+            "DELETE FROM jobs WHERE kind IN \
+                 ('ticket_stage', 'ticket_analysis', 'ticket_implementation')",
+            (),
+        )
+        .await
+        .context("Failed to discard legacy ticket jobs after consolidation import")?;
+
+        let violations = conn
+            .query("PRAGMA foreign_key_check", ())
             .await
-            .expect("fresh consolidated store");
+            .context("Failed to run PRAGMA foreign_key_check after consolidation import")?;
+        if !violations.is_empty() {
+            tracing::warn!(
+                count = violations.len(),
+                "consolidation import found orphan rows violating the new FKs; \
+                 preserving them as soft references (future writes still enforce the FK)",
+            );
+        }
+        Ok(())
+    }
 
-        // Simulate an existing install by inserting rows into `users`, then
-        // re-invoking migration 19's body (idempotent) — exactly what a real
-        // existing install's post-upgrade boot does.
-        conn.execute(
-            "INSERT INTO users (name, permissions, selected_role) VALUES ('admin', 'full', 'manager')",
-            (),
-        )
-        .await
-        .expect("seed full admin");
-        conn.execute(
-            "INSERT INTO users (name, permissions, selected_role) VALUES ('bob', NULL, 'analyst')",
-            (),
-        )
-        .await
-        .expect("seed non-full out-of-pool user");
-        conn.execute(
-            "INSERT INTO users (name, permissions, selected_role) VALUES ('carol', 'full', NULL)",
-            (),
-        )
-        .await
-        .expect("seed full admin with NULL selected_role");
+    fn drop_jobs_paused_frozen<'a>(
+        conn: &'a Connection,
+        _root: &'a Path,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(run_drop_jobs_paused_frozen(conn))
+    }
 
-        run_drop_user_roles_and_seed_onboarding(&conn)
+    /// Idempotently drop `jobs.paused_frozen` — the finalized add/drop
+    /// round-trip cleanup of the retired chain. Turso has no
+    /// `DROP COLUMN IF EXISTS`, so the existence probe lives inside the body.
+    async fn run_drop_jobs_paused_frozen(conn: &Connection) -> anyhow::Result<()> {
+        let has = conn
+            .query("PRAGMA table_info(jobs)", ())
             .await
-            .expect("re-run migration 19 body");
+            .context("Failed to probe jobs.paused_frozen")?
+            .into_iter()
+            .any(|row| row.get::<String>(1).ok().as_deref() == Some("paused_frozen"));
+        if has {
+            conn.execute("ALTER TABLE jobs DROP COLUMN paused_frozen", ())
+                .await
+                .context("Failed to drop jobs.paused_frozen")?;
+        }
+        Ok(())
+    }
 
-        // Existing install → onboarding_state=finished.
-        let state: String = conn
-            .query(
-                &format!(
-                    "SELECT value FROM config_kv WHERE key = '{}'",
+    fn drop_user_roles_and_seed_onboarding<'a>(
+        conn: &'a Connection,
+        _root: &'a Path,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(run_drop_user_roles_and_seed_onboarding(conn))
+    }
+
+    /// Idempotently drop `user_roles` and seed the onboarding state for
+    /// existing (non-fresh) installs. Fresh-vs-existing discriminator: the
+    /// `users` table is EMPTY on a fresh install (the admin is seeded by
+    /// `ensure_admin_user` as a POST-OPEN hook, AFTER migrations) and
+    /// NON-EMPTY on an existing install.
+    async fn run_drop_user_roles_and_seed_onboarding(conn: &Connection) -> anyhow::Result<()> {
+        let user_count: i64 = conn
+            .query("SELECT COUNT(*) FROM users", ())
+            .await
+            .context("Failed to probe users count")?
+            .into_iter()
+            .next()
+            .and_then(|row| row.get::<i64>(0).ok())
+            .unwrap_or(0);
+
+        if user_count > 0 {
+            conn.execute(
+                "INSERT OR REPLACE INTO config_kv (key, value) VALUES (?1, ?2)",
+                params![
                     crate::config::CONFIG_KEY_ONBOARDING_STATE,
-                ),
+                    crate::config::OnboardingState::Finished.as_str(),
+                ],
+            )
+            .await
+            .context("Failed to set onboarding_state=finished")?;
+
+            let rows = conn
+                .query("SELECT name, permissions, selected_role FROM users", ())
+                .await?;
+            for row in rows {
+                let name: String = row.get(0)?;
+                let permissions: Option<String> = row.get(1)?;
+                let selected_role: Option<String> = row.get(2)?;
+                let sel = selected_role.unwrap_or_default();
+                let needs_default = sel.is_empty() || {
+                    let in_pool = if permissions.as_deref() == Some("full") {
+                        matches!(sel.as_str(), "support" | "assistant" | "manager" | "artist")
+                    } else {
+                        matches!(sel.as_str(), "assistant" | "artist")
+                    };
+                    !in_pool
+                };
+                if needs_default {
+                    conn.execute(
+                        "UPDATE users SET selected_role = 'assistant' WHERE name = ?1",
+                        params![name],
+                    )
+                    .await
+                    .context("Failed to normalize selected_role")?;
+                }
+            }
+        }
+
+        conn.execute("DROP TABLE IF EXISTS user_roles", ())
+            .await
+            .context("Failed to drop user_roles")?;
+        Ok(())
+    }
+
+    fn rewrite_analysis_verdicts<'a>(
+        conn: &'a Connection,
+        _root: &'a Path,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(run_rewrite_analysis_verdicts(conn))
+    }
+
+    /// One-time data migration: rewrite legacy score-based analysis verdict
+    /// rows to the score-less graded shape. Idempotent and re-runnable until
+    /// applied.
+    async fn run_rewrite_analysis_verdicts(conn: &Connection) -> anyhow::Result<()> {
+        let rows = conn
+            .query(
+                "SELECT job_id, agent_id, outcome FROM agents \
+                 WHERE kind = 'analyst' AND outcome LIKE '{\"verdict\":%'",
                 (),
             )
             .await
-            .expect("read onboarding_state")
-            .into_iter()
-            .next()
-            .and_then(|row| row.get::<String>(0).ok())
-            .expect("onboarding_state row");
-        assert_eq!(state, crate::config::OnboardingState::Finished.as_str());
-
-        // In-pool role preserved (full admin at manager is in-pool).
-        let admin_sel: String = conn
-            .query("SELECT selected_role FROM users WHERE name = 'admin'", ())
+            .context("Failed to read analysis verdict rows for migration")?;
+        for row in rows {
+            let job_id: String = row.get(0)?;
+            let agent_id: String = row.get(1)?;
+            let outcome: String = row.get(2)?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&outcome) else {
+                continue;
+            };
+            let Some(verdict) = value.get("verdict") else {
+                continue;
+            };
+            let Some(score) = verdict.get("score").and_then(serde_json::Value::as_u64) else {
+                continue;
+            };
+            let Some(issues) = verdict.get("issues").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            let grade = if score < 7 { "blocker" } else { "minor" };
+            let graded: Vec<serde_json::Value> = issues
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|text| serde_json::json!({ "text": text, "grade": grade }))
+                .collect();
+            let rewritten = serde_json::json!({ "verdict": { "issues": graded } }).to_string();
+            conn.execute(
+                "UPDATE agents SET outcome = ?1 WHERE job_id = ?2 AND agent_id = ?3",
+                params![rewritten, job_id, agent_id],
+            )
             .await
-            .expect("read admin role")
-            .into_iter()
-            .next()
-            .and_then(|row| row.get::<String>(0).ok())
-            .expect("admin row");
-        assert_eq!(admin_sel, "manager");
-
-        // Out-of-pool role normalized to assistant (non-full user at analyst).
-        let bob_sel: String = conn
-            .query("SELECT selected_role FROM users WHERE name = 'bob'", ())
-            .await
-            .expect("read bob role")
-            .into_iter()
-            .next()
-            .and_then(|row| row.get::<String>(0).ok())
-            .expect("bob row");
-        assert_eq!(bob_sel, "assistant");
-
-        // Legacy NULL selection lands on Assistant (not Support, which would be
-        // the read-time pool.first() fallback for a full admin).
-        let carol_sel: String = conn
-            .query("SELECT selected_role FROM users WHERE name = 'carol'", ())
-            .await
-            .expect("read carol role")
-            .into_iter()
-            .next()
-            .and_then(|row| row.get::<String>(0).ok())
-            .expect("carol row");
-        assert_eq!(carol_sel, "assistant");
-
-        // user_roles dropped (DROP TABLE IF EXISTS is idempotent).
-        assert!(!crate::db::table_exists(&conn, "user_roles").await.unwrap());
+            .context("Failed to rewrite analysis verdict row")?;
+        }
+        Ok(())
     }
 
-    /// A fresh logs store runs the catalog and gets the current logs shape
-    /// (logs/tool_calls/llm_requests + the `grep_telemetry` delta).
+    /// The ENTIRE retired `1`–`23` catalog in original order, except entry
+    /// `consolidate_001_import_domain_stores` (see [`noop_import`]). The
+    /// relative order is preserved exactly — the add-before-drop round-trips
+    /// (`007`/`consolidate_006`, the `ticket_jobs` rename/drop) depend on it.
+    const OLD_CATALOG: &[Migration] = &[
+        Migration {
+            id: "1",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_BASELINE_BOARD_TABLES),
+        },
+        Migration {
+            id: "2",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_BASELINE_SESSION_TABLES),
+        },
+        Migration {
+            id: "3",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_BASELINE_WORKSPACE_TABLES),
+        },
+        Migration {
+            id: "4",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_BASELINE_USERS_TABLES),
+        },
+        Migration {
+            id: "5",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_BASELINE_CONFIG_TABLES),
+        },
+        Migration {
+            id: "6",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_BASELINE_CHAT_HISTORY_TABLES),
+        },
+        Migration {
+            id: "7",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_BASELINE_CORE_INDEXES),
+        },
+        Migration {
+            id: "001_drop_ticket_pipeline_reservation",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("ALTER TABLE tickets DROP COLUMN pipeline_reservation;"),
+        },
+        Migration {
+            id: "002_drop_ticket_assigned_to",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("ALTER TABLE tickets DROP COLUMN assigned_to;"),
+        },
+        Migration {
+            id: "003_drop_ticket_stage_jobs_round",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("ALTER TABLE ticket_stage_jobs DROP COLUMN round;"),
+        },
+        Migration {
+            id: "005_drop_ticket_stage_jobs_phase",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("ALTER TABLE ticket_stage_jobs DROP COLUMN phase;"),
+        },
+        Migration {
+            id: "006_rename_ticket_stage_jobs_to_ticket_jobs",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(
+                "DROP TABLE IF EXISTS ticket_jobs; ALTER TABLE ticket_stage_jobs RENAME TO ticket_jobs;",
+            ),
+        },
+        Migration {
+            id: "consolidate_002_drop_ticket_jobs_stage",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("ALTER TABLE ticket_jobs DROP COLUMN stage;"),
+        },
+        Migration {
+            id: "007_jobs_paused_frozen",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("ALTER TABLE jobs ADD COLUMN paused_frozen INTEGER;"),
+        },
+        Migration {
+            id: "consolidate_003_jobs_ticket_id",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(
+                "ALTER TABLE jobs ADD COLUMN ticket_id TEXT REFERENCES tickets(id);",
+            ),
+        },
+        Migration {
+            id: "consolidate_005_drop_ticket_jobs",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("DROP TABLE IF EXISTS ticket_jobs;"),
+        },
+        Migration {
+            id: "consolidate_006_drop_jobs_paused_frozen",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("ALTER TABLE jobs DROP COLUMN paused_frozen;"),
+        },
+        Migration {
+            id: "consolidate_007_jobs_phase_ticket_index",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_phase_ticket ON jobs(kind, ticket_id) WHERE ticket_id IS NOT NULL;",
+            ),
+        },
+        Migration {
+            id: "consolidate_008_create_ticket_chronicle",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(
+                "CREATE TABLE IF NOT EXISTS ticket_chronicle (\
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,\
+                    ticket_id      TEXT NOT NULL,\
+                    workspace_name TEXT NOT NULL,\
+                    source_phase   TEXT NOT NULL,\
+                    target_phase   TEXT NOT NULL,\
+                    at             TEXT NOT NULL\
+                 );\
+                 CREATE INDEX IF NOT EXISTS idx_ticket_chronicle_ws_id \
+                    ON ticket_chronicle(workspace_name, id);\
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_chronicle_dedup \
+                    ON ticket_chronicle(ticket_id, workspace_name, source_phase, target_phase, at);",
+            ),
+        },
+        Migration {
+            id: "10",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_DELTA_DROP_CONFIG_ROLE),
+        },
+        Migration {
+            id: "11",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_DELTA_FTS_INDEX),
+        },
+        Migration {
+            id: "12",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_DELTA_BOARD_ACTIVE_INDEX),
+        },
+        Migration {
+            id: "consolidate_001_import_domain_stores",
+            target: TargetDb::Core,
+            body: MigrationBody::Rust(noop_import),
+        },
+        Migration {
+            id: "003_reset_nonterminal_tickets",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(
+                "UPDATE tickets SET phase = 'backlog' WHERE phase NOT IN ('done','cancelled','failed') AND is_archived = 0;",
+            ),
+        },
+        Migration {
+            id: "13",
+            target: TargetDb::Core,
+            body: MigrationBody::Rust(cleanup_legacy_ticket_jobs),
+        },
+        Migration {
+            id: "15",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql("DROP TABLE IF EXISTS ticket_stage_jobs;"),
+        },
+        Migration {
+            id: "16",
+            target: TargetDb::Core,
+            body: MigrationBody::Rust(drop_jobs_paused_frozen),
+        },
+        Migration {
+            id: "8",
+            target: TargetDb::Logs,
+            body: MigrationBody::Sql(OLD_BASELINE_LOGS_TABLES),
+        },
+        Migration {
+            id: "9",
+            target: TargetDb::Logs,
+            body: MigrationBody::Sql(OLD_BASELINE_LOGS_INDEXES),
+        },
+        Migration {
+            id: "14",
+            target: TargetDb::Logs,
+            body: MigrationBody::Sql(OLD_DELTA_GREP_TELEMETRY),
+        },
+        Migration {
+            id: "17",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_DELTA_ALARMS),
+        },
+        Migration {
+            id: "18",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_DELTA_CHAT_HISTORY_TIMESTAMP),
+        },
+        Migration {
+            id: "19",
+            target: TargetDb::Core,
+            body: MigrationBody::Rust(drop_user_roles_and_seed_onboarding),
+        },
+        Migration {
+            id: "20",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_DELTA_RENAME_READY_FOR_DEVELOPMENT_TO_QUEUED),
+        },
+        Migration {
+            id: "21",
+            target: TargetDb::Core,
+            body: MigrationBody::Rust(rewrite_analysis_verdicts),
+        },
+        Migration {
+            id: "22",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(OLD_DELTA_TICKETS_WORKSPACE_PHASE_INDEX),
+        },
+        Migration {
+            id: "23",
+            target: TargetDb::Core,
+            body: MigrationBody::Sql(
+                "ALTER TABLE chat_history ADD COLUMN reply_author TEXT; ALTER TABLE chat_history ADD COLUMN reply_snippet TEXT;",
+            ),
+        },
+    ];
+
+    /// [`OLD_CATALOG`] minus entry `"23"` — the chain state of a 0.5.0 release
+    /// database (one delta behind: no `chat_history` reply columns). `Migration`
+    /// is `Copy`, so this is a cheap filter.
+    fn old_catalog_without_reply_delta() -> Vec<Migration> {
+        OLD_CATALOG
+            .iter()
+            .filter(|m| m.id != "23")
+            .copied()
+            .collect()
+    }
+
+    // ── Tests ──────────────────────────────────────────────────────────
+
+    /// A fresh install runs the baseline (`24`/`25`) and converges to the exact
+    /// current core shape: the table set (which also proves the required
+    /// absences of `user_roles` / `config_role` / `ticket_jobs` /
+    /// `ticket_stage_jobs`) and the per-table column sets (which prove the
+    /// absences of `assigned_to` / `pipeline_reservation` / `paused_frozen`).
     #[tokio::test]
-    async fn fresh_logs_install_runs_catalog() {
+    async fn fresh_install_converges_to_expected_shape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_consolidated_store(tmp.path())
+            .await
+            .expect("fresh consolidated store");
+
+        assert_schema_matches(
+            &conn,
+            EXPECTED_CORE_TABLE_COLUMNS,
+            EXPECTED_CORE_INDEXES,
+            "fresh core",
+        )
+        .await;
+
+        let mut applied = applied_ids(&conn).await;
+        applied.sort();
+        assert_eq!(
+            applied,
+            vec!["24".to_string(), "25".to_string()],
+            "fresh core applies baseline 24/25 exactly"
+        );
+    }
+
+    /// A fresh logs store runs the baseline (`26`) and converges to the exact
+    /// current logs shape (logs/tool_calls/llm_requests + grep_telemetry).
+    #[tokio::test]
+    async fn fresh_logs_install_converges_to_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let conn = crate::db::open_with_schema(
@@ -1636,711 +1888,369 @@ CREATE INDEX IF NOT EXISTS idx_llm_requests_purpose ON llm_requests(purpose);
             .await
             .expect("run logs catalog");
 
-        for table in [
-            "logs",
-            "tool_calls",
-            "llm_requests",
-            "grep_telemetry",
-            "schema_migrations",
-        ] {
-            assert!(
-                crate::db::table_exists(&conn, table).await.unwrap(),
-                "missing {table}"
-            );
-        }
-        let applied = applied_ids(&conn).await;
-        for id in ["8", "9", "14"] {
-            assert!(applied.contains(&id.to_string()), "missing applied id {id}");
-        }
-    }
-
-    /// The golden upgrade: bring a 0.4.2 per-store install (multi-file, per-store
-    /// `SESSION_MIGRATIONS`) to the current consolidated shape without losing
-    /// data. This is the one-time validation of the 0.4.2→current delta chain.
-    ///
-    /// The legacy stores are seeded from the [`LEGACY_0_4_2_*`] constants, copied
-    /// verbatim from the `SCHEMA` DDL each store shipped at commit `4a68782`.
-    /// These fixtures are independent of the catalog's [`BASELINE_*`] constants,
-    /// so the test catches a mistaken "reverse-engineered" baseline instead of
-    /// validating it against itself.
-    #[tokio::test]
-    async fn golden_upgrade_from_0_4_2_per_store() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let now = crate::db::now();
-
-        let board = crate::db::open_with_schema(
-            &crate::db::legacy_store_db_path(root, "board"),
-            LEGACY_0_4_2_BOARD_SCHEMA,
+        assert_schema_matches(
+            &conn,
+            EXPECTED_LOGS_TABLE_COLUMNS,
+            EXPECTED_LOGS_INDEXES,
+            "fresh logs",
         )
-        .await
-        .expect("legacy board");
-        board
-            .execute(
-                "INSERT INTO tickets (id, title, description, phase, assigned_to, workspace_name, \
-                 created_at, updated_at, pipeline_reservation, priority) \
-                 VALUES ('T1', 'Done ticket', 'd', 'done', 'eng', 'ws', ?1, ?1, 0, 1)",
-                params![now.clone()],
-            )
-            .await
-            .unwrap();
-        board
-            .execute(
-                "INSERT INTO tickets (id, title, description, phase, assigned_to, workspace_name, \
-                 created_at, updated_at, pipeline_reservation, priority) \
-                 VALUES ('T2', 'Wip ticket', 'd', 'in_development', 'eng', 'ws', ?1, ?1, 0, 1)",
-                params![now.clone()],
-            )
-            .await
-            .unwrap();
-        board
-            .execute(
-                "INSERT INTO ticket_comments (id, ticket_id, role, content, created_at) \
-                 VALUES ('C1', 'T1', 'manager', 'ship it', ?1)",
-                params![now.clone()],
-            )
-            .await
-            .unwrap();
+        .await;
 
-        let sessions = crate::db::open_with_schema(
-            &crate::db::legacy_store_db_path(root, "sessions"),
-            LEGACY_0_4_2_SESSIONS_SCHEMA,
-        )
-        .await
-        .expect("legacy sessions");
-        sessions
-            .execute(
-                "INSERT INTO sessions (agent_id, role, content, created_at) \
-                 VALUES ('sess1', 'assistant', 'hello', ?1)",
-                params![now.clone()],
-            )
-            .await
-            .unwrap();
-        sessions
-            .execute(
-                "INSERT INTO session_metadata (agent_id, last_activity, role, message_count) \
-                 VALUES ('sess1', ?1, 'assistant', 1)",
-                params![now.clone()],
-            )
-            .await
-            .unwrap();
-        sessions
-            .execute(
-                "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, channel, \
-                 retry_count, status, created_at, updated_at) \
-                 VALUES ('job_research', 'research', '', 'ws', '', '', '', 0, 'launched', ?1, ?1)",
-                params![now.clone()],
-            )
-            .await
-            .unwrap();
-        sessions
-            .execute(
-                "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, channel, \
-                 retry_count, status, created_at, updated_at) \
-                 VALUES ('job_stage', 'ticket_stage', '', 'ws', '', '', '', 0, 'launched', ?1, ?1)",
-                params![now.clone()],
-            )
-            .await
-            .unwrap();
-        sessions
-            .execute(
-                "INSERT INTO ticket_stage_jobs (id, ticket_id, stage, phase, round) \
-                 VALUES ('job_stage', 'T1', 'implementation', 'in_development', 1)",
-                (),
-            )
-            .await
-            .unwrap();
-
-        let workspaces = crate::db::open_with_schema(
-            &crate::db::legacy_store_db_path(root, "workspaces"),
-            LEGACY_0_4_2_WORKSPACES_SCHEMA,
-        )
-        .await
-        .expect("legacy workspaces");
-        workspaces
-            .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at) \
-                 VALUES ('ws', '/ws', ?1, ?1)",
-                params![now.clone()],
-            )
-            .await
-            .unwrap();
-
-        let users = crate::db::open_with_schema(
-            &crate::db::legacy_store_db_path(root, "users"),
-            LEGACY_0_4_2_USERS_SCHEMA,
-        )
-        .await
-        .expect("legacy users");
-        users
-            .execute(
-                "INSERT INTO users (name, selected_workspace) VALUES ('alice', 'ws')",
-                (),
-            )
-            .await
-            .unwrap();
-
-        let config = crate::db::open_with_schema(
-            &crate::db::legacy_store_db_path(root, "config"),
-            LEGACY_0_4_2_CONFIG_SCHEMA,
-        )
-        .await
-        .expect("legacy config");
-        config
-            .execute("INSERT INTO config_kv (key, value) VALUES ('k', 'v')", ())
-            .await
-            .unwrap();
-        config
-            .execute(
-                "INSERT INTO config_role (role, model) VALUES ('manager', 'm')",
-                (),
-            )
-            .await
-            .unwrap();
-
-        let chat_history = crate::db::open_with_schema(
-            &crate::db::legacy_store_db_path(root, "chat_history"),
-            LEGACY_0_4_2_CHAT_HISTORY_SCHEMA,
-        )
-        .await
-        .expect("legacy chat_history");
-        chat_history
-            .execute(
-                "INSERT INTO chat_history (message_id, user_name, direction, content, workspace) \
-                 VALUES ('m1', 'alice', 'in', 'hi', 'ws')",
-                (),
-            )
-            .await
-            .unwrap();
-
-        drop(board);
-        drop(sessions);
-        drop(workspaces);
-        drop(users);
-        drop(config);
-        drop(chat_history);
-
-        let conn = crate::db::open_consolidated_store(root)
-            .await
-            .expect("consolidate 0.4.2 install");
-
+        let mut applied = applied_ids(&conn).await;
+        applied.sort();
         assert_eq!(
-            conn.query("SELECT count(*) FROM tickets WHERE id='T1'", ())
-                .await
-                .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "ticket survives"
-        );
-        assert_eq!(
-            conn.query("SELECT count(*) FROM ticket_comments WHERE id='C1'", ())
-                .await
-                .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "ticket comment survives"
-        );
-        assert_eq!(
-            conn.query("SELECT count(*) FROM sessions WHERE agent_id='sess1'", ())
-                .await
-                .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "session survives"
-        );
-        assert_eq!(
-            conn.query(
-                "SELECT count(*) FROM session_metadata WHERE agent_id='sess1'",
-                ()
-            )
-            .await
-            .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "session_metadata survives"
-        );
-        assert_eq!(
-            conn.query("SELECT count(*) FROM workspaces WHERE name='ws'", ())
-                .await
-                .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "workspace survives"
-        );
-        assert_eq!(
-            conn.query("SELECT count(*) FROM users WHERE name='alice'", ())
-                .await
-                .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "user survives"
-        );
-        assert_eq!(
-            conn.query("SELECT count(*) FROM config_kv WHERE key='k'", ())
-                .await
-                .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "config_kv survives"
-        );
-        assert_eq!(
-            conn.query(
-                "SELECT count(*) FROM chat_history WHERE message_id='m1'",
-                ()
-            )
-            .await
-            .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "chat_history survives"
-        );
-        // The AUTOINCREMENT watermark is carried across the consolidation so
-        // future `chat_history` inserts do not collide with the moved rows.
-        assert_eq!(
-            conn.query(
-                "SELECT seq FROM sqlite_sequence WHERE name='chat_history'",
-                ()
-            )
-            .await
-            .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "AUTOINCREMENT watermark preserved after consolidation"
-        );
-        assert_eq!(
-            conn.query("SELECT count(*) FROM jobs WHERE kind='research'", ())
-                .await
-                .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            1,
-            "research job survives"
-        );
-
-        // The deliberate reset/drop contract holds on the imported rows: the
-        // non-terminal legacy ticket is reset to backlog, and the pre-rework
-        // `ticket_stage` job the import rolled in is dropped.
-        assert_eq!(
-            conn.query("SELECT phase FROM tickets WHERE id='T2'", ())
-                .await
-                .unwrap()[0]
-                .get::<String>(0)
-                .unwrap(),
-            "backlog",
-            "non-terminal legacy ticket reset to backlog"
-        );
-        assert_eq!(
-            conn.query("SELECT count(*) FROM jobs WHERE kind='ticket_stage'", ())
-                .await
-                .unwrap()[0]
-                .get::<i64>(0)
-                .unwrap(),
-            0,
-            "pre-rework ticket_stage jobs dropped after import"
-        );
-
-        assert!(!crate::db::table_exists(&conn, "config_role").await.unwrap());
-        assert!(!crate::db::table_exists(&conn, "ticket_jobs").await.unwrap());
-        assert!(
-            !crate::db::table_exists(&conn, "ticket_stage_jobs")
-                .await
-                .unwrap()
-        );
-
-        assert_eq!(
-            conn.query("PRAGMA foreign_key_check", ())
-                .await
-                .unwrap()
-                .len(),
-            0,
-            "no orphan rows after the import"
+            applied,
+            vec!["26".to_string()],
+            "fresh logs applies baseline 26 exactly"
         );
     }
 
-    /// A current-code consolidated DB — shaped by the pre-catalog SCHEMA +
-    /// migration runner, holding ONLY the historical ids in `schema_migrations`
-    /// — must CONVERGE when the catalog re-runs. The new integer baseline ids
-    /// re-create 0.4.2 artifacts (`ticket_stage_jobs`, `jobs.paused_frozen`)
-    /// that the already-recorded drops/renames then skip; the idempotent
-    /// cleanup entries (`15`, `16`) remove them so the reopen leaves no stray
-    /// table or column.
-    #[tokio::test]
-    async fn current_consolidated_db_reopen_converges() {
-        // The ids the OLD per-store + consolidated runner recorded on a
-        // current-main DB (from the pre-change src/db/migrations.rs). Note
-        // `007_jobs_paused_frozen` is ABSENT — the old runner dropped the ADD
-        // from its list at the job-per-phase refactor — while
-        // `consolidate_006_drop_jobs_paused_frozen` is present.
-        const OLD_DEPLOYED_IDS: &[&str] = &[
-            "001_session_token_length",
-            "002_session_message_count",
-            "003_drop_ticket_stage_jobs_round",
-            "004_reset_implementation_jobs",
-            "005_drop_ticket_stage_jobs_phase",
-            "006_rename_ticket_stage_jobs_to_ticket_jobs",
-            "consolidate_002_drop_ticket_jobs_stage",
-            "consolidate_003_jobs_ticket_id",
-            "consolidate_004_discard_old_ticket_jobs",
-            "consolidate_005_drop_ticket_jobs",
-            "consolidate_006_drop_jobs_paused_frozen",
-            "consolidate_007_jobs_phase_ticket_index",
-            "001_drop_ticket_pipeline_reservation",
-            "002_drop_ticket_assigned_to",
-            "003_reset_nonterminal_tickets",
-            "004_drop_tickets_review_base_count",
-            "consolidate_008_create_ticket_chronicle",
-            CONSOLIDATION_IMPORT_ID,
-        ];
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let conn = crate::db::open_with_schema(
-            &crate::db::store_db_path(root, crate::db::CONSOLIDATED_DB_NAME),
-            "",
-        )
-        .await
-        .expect("open core");
-        run_migrations(&conn, TargetDb::Core, root)
-            .await
-            .expect("fresh catalog");
-
-        // Simulate a pre-change "current" DB: the same current shape, but
-        // `schema_migrations` holds ONLY the historical ids.
-        conn.execute("DELETE FROM schema_migrations", ())
-            .await
-            .unwrap();
-        // Migration "18" (chat_history.timestamp) is a genuine one-time schema
-        // addition, not an idempotent cleanup like "15"/"16". The pre-change
-        // DB had no such column, so drop it to restore that shape before the
-        // reopen re-applies it. Same for the migration "23" reply columns.
-        conn.execute("ALTER TABLE chat_history DROP COLUMN timestamp;", ())
-            .await
-            .unwrap();
-        conn.execute("ALTER TABLE chat_history DROP COLUMN reply_author;", ())
-            .await
-            .unwrap();
-        conn.execute("ALTER TABLE chat_history DROP COLUMN reply_snippet;", ())
-            .await
-            .unwrap();
-        for id in OLD_DEPLOYED_IDS {
-            conn.execute(
-                "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)",
-                params![id, crate::db::now()],
-            )
-            .await
-            .unwrap();
-        }
-
-        // Reopen: the catalog re-runs on the existing current-shape DB.
-        run_migrations(&conn, TargetDb::Core, root)
-            .await
-            .expect("reopen catalog");
-
-        assert!(
-            !crate::db::table_exists(&conn, "ticket_stage_jobs")
-                .await
-                .unwrap()
-        );
-        assert!(!crate::db::table_exists(&conn, "config_role").await.unwrap());
-        let jobs_cols = column_names(&conn, "jobs").await;
-        assert!(jobs_cols.contains(&"ticket_id".to_string()));
-        assert!(!jobs_cols.contains(&"paused_frozen".to_string()));
-        let tickets_cols = column_names(&conn, "tickets").await;
-        assert!(!tickets_cols.contains(&"pipeline_reservation".to_string()));
-        assert!(!tickets_cols.contains(&"assigned_to".to_string()));
-        // Migrations "18"/"23" re-applied on the reopened shape.
-        let chat_cols = column_names(&conn, "chat_history").await;
-        assert!(chat_cols.contains(&"timestamp".to_string()));
-        assert!(chat_cols.contains(&"reply_author".to_string()));
-        assert!(chat_cols.contains(&"reply_snippet".to_string()));
-
-        let applied = applied_ids(&conn).await;
-        for id in ["15", "16"] {
-            assert!(applied.contains(&id.to_string()), "missing applied id {id}");
-        }
-    }
-
-    /// One-time migration `21` rewrites legacy score-based analysis verdict
-    /// rows (only `kind='analyst'` rows carrying a `verdict` with a numeric
-    /// `score`) to the score-less graded shape. Review/QA (`verifier`) rows
-    /// keep their score shape, and raw-prose analyze-tool rows are untouched.
-    #[tokio::test]
-    async fn migration_21_rewrites_analysis_verdicts() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let conn = crate::db::open_with_schema(
-            &crate::db::store_db_path(root, crate::db::CONSOLIDATED_DB_NAME),
-            "",
-        )
-        .await
-        .expect("open core");
-        run_migrations(&conn, TargetDb::Core, root)
-            .await
-            .expect("fresh catalog");
-
+    /// Seed representative domain rows into a fully current-shape core
+    /// database, so the no-op reopen has data to protect.
+    async fn seed_current_core_rows(conn: &Connection) {
         let now = crate::db::now();
         conn.execute(
-            "INSERT INTO jobs (id, kind, role, workspace_name, created_at, updated_at) \
-             VALUES ('J1', 'analysis', 'analyst', 'ws', ?1, ?2)",
-            params![now.clone(), now.clone()],
-        )
-        .await
-        .unwrap();
-
-        conn.execute(
-            "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
-             VALUES ('J1', 'A1', 'analyst', 0, 'done', ?1, 'task')",
-            params!["{\"verdict\":{\"score\":5,\"issues\":[\"issue a\",\"issue b\"]}}"],
+            "INSERT INTO tickets (id, title, description, phase, workspace_name, created_at, updated_at) \
+             VALUES ('T1', 't', 'd', 'backlog', 'ws', ?1, ?1)",
+            params![now.clone()],
         )
         .await
         .unwrap();
         conn.execute(
-            "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
-             VALUES ('J1', 'A2', 'analyst', 1, 'done', ?1, 'task')",
-            params!["{\"verdict\":{\"score\":8,\"issues\":[\"note\"]}}"],
+            "INSERT INTO ticket_comments (id, ticket_id, role, content, created_at) \
+             VALUES ('C1', 'T1', 'manager', 'ship it', ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs (id, kind, role, workspace_name, task, user_name, channel, retry_count, \
+             status, created_at, updated_at, ticket_id) \
+             VALUES ('J1', 'analysis', 'analyst', 'ws', '', 'bob', '', 0, 'launched', ?1, ?1, 'T1')",
+            params![now.clone()],
         )
         .await
         .unwrap();
         conn.execute(
             "INSERT INTO agents (job_id, agent_id, kind, idx, status, outcome, task) \
-             VALUES ('J1', 'A3', 'verifier', 2, 'done', ?1, 'task')",
-            params!["{\"verdict\":{\"score\":9,\"issues\":[]}}"],
+             VALUES ('J1', 'A1', 'analyst', 0, 'done', NULL, 'task')",
+            (),
         )
         .await
         .unwrap();
+        conn.execute(
+            "INSERT INTO users (name, permissions, selected_workspace, selected_role) \
+             VALUES ('bob', NULL, 'ws', 'assistant')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_history (message_id, user_name, direction, content, agent_role, workspace) \
+             VALUES ('m1', 'bob', 'in', 'hello', NULL, 'ws')",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ticket_chronicle (ticket_id, workspace_name, source_phase, target_phase, at) \
+             VALUES ('T1', 'ws', 'backlog', 'queued', ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO alarms (id, session_id, user_name, kind, text, next_fire_at, created_at) \
+             VALUES ('a1', 's1', 'bob', 'reminder', 'ping', ?1, ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute("INSERT INTO config_kv (key, value) VALUES ('k', 'v')", ())
+            .await
+            .unwrap();
+    }
 
-        run_rewrite_analysis_verdicts(&conn).await.unwrap();
+    /// A snapshot of everything the reopen must leave untouched.
+    struct CoreSnapshot {
+        tables: std::collections::BTreeMap<String, String>,
+        indexes: std::collections::BTreeMap<String, String>,
+        cols: std::collections::BTreeMap<String, Vec<String>>,
+        counts: std::collections::BTreeMap<String, i64>,
+        chat: Vec<String>,
+        tickets: Vec<(String, String)>,
+    }
 
-        async fn outcome(conn: &Connection, agent_id: &str) -> String {
-            conn.query(
-                "SELECT outcome FROM agents WHERE agent_id = ?1",
-                params![agent_id],
-            )
+    async fn snapshot_core_state(conn: &Connection) -> CoreSnapshot {
+        CoreSnapshot {
+            tables: table_defs(conn).await,
+            indexes: index_defs(conn).await,
+            cols: column_sets(conn, &expected_core_table_names()).await,
+            counts: table_row_counts(conn, &expected_core_domain_tables()).await,
+            chat: conn
+                .query("SELECT content FROM chat_history", ())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.get::<String>(0).unwrap())
+                .collect(),
+            tickets: conn
+                .query("SELECT title, phase FROM tickets", ())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.get::<String>(0).unwrap(), r.get::<String>(1).unwrap()))
+                .collect(),
+        }
+    }
+
+    async fn assert_core_catalog_unchanged(conn: &Connection, before: &CoreSnapshot) {
+        assert_eq!(
+            table_defs(conn).await,
+            before.tables,
+            "core table DDL must be unchanged on reopen"
+        );
+        assert_eq!(
+            index_defs(conn).await,
+            before.indexes,
+            "core index definitions must be unchanged on reopen"
+        );
+        assert_eq!(
+            column_sets(conn, &expected_core_table_names()).await,
+            before.cols,
+            "core column sets must be unchanged on reopen"
+        );
+        assert_eq!(
+            table_row_counts(conn, &expected_core_domain_tables()).await,
+            before.counts,
+            "core row counts must be unchanged on reopen"
+        );
+        let after_chat: Vec<String> = conn
+            .query("SELECT content FROM chat_history", ())
             .await
             .unwrap()
             .into_iter()
-            .next()
-            .unwrap()
-            .get::<String>(0)
-            .unwrap()
-        }
-
-        // serde_json (without `preserve_order`) backs its object map with a
-        // `BTreeMap`, so the re-serialized `text`/`grade` keys come out in
-        // sorted order. Assert on the parsed `Value` (order-independent) to
-        // verify the exact graded shape rather than the key ordering.
+            .map(|r| r.get::<String>(0).unwrap())
+            .collect();
         assert_eq!(
-            outcome(&conn, "A1")
-                .await
-                .parse::<serde_json::Value>()
-                .unwrap(),
-            serde_json::json!({
-                "verdict": { "issues": [
-                    { "text": "issue a", "grade": "blocker" },
-                    { "text": "issue b", "grade": "blocker" },
-                ] }
-            })
+            after_chat, before.chat,
+            "chat_history content must be unchanged"
         );
+        let after_tickets: Vec<(String, String)> = conn
+            .query("SELECT title, phase FROM tickets", ())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.get::<String>(0).unwrap(), r.get::<String>(1).unwrap()))
+            .collect();
         assert_eq!(
-            outcome(&conn, "A2")
-                .await
-                .parse::<serde_json::Value>()
-                .unwrap(),
-            serde_json::json!({
-                "verdict": { "issues": [ { "text": "note", "grade": "minor" } ] }
-            })
-        );
-        assert_eq!(
-            outcome(&conn, "A3").await,
-            "{\"verdict\":{\"score\":9,\"issues\":[]}}"
+            after_tickets, before.tickets,
+            "tickets content must be unchanged"
         );
     }
 
-    /// The catalog's 0.4.2 baseline must be structurally identical to the
-    /// verbatim per-store `SCHEMA` fixtures (including the `SESSION_MIGRATIONS`
-    /// 001/002 effects, already folded into `session_metadata`). This is the
-    /// "double-check all schemas" verification requested on the ticket: each
-    /// legacy store's full per-table DDL (which pins columns, ordering,
-    /// defaults, PK, inline UNIQUE, CHECK, and FK clauses) and explicit index
-    /// definitions (SQL/uniqueness) are compared against the consolidated
-    /// baseline, in BOTH directions (so a baseline-extra table/index is caught).
-    /// The fixtures are independently byte-verified against commit `24c92d2`, so
-    /// this test validates the baseline structure and the delta chain, not the
-    /// fixtures themselves.
+    /// The core fleet-wide boot-safety pin: a database shaped by the REAL
+    /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
+    /// the new baseline (`24`/`25`) as a STRICT no-op — no schema, index, or
+    /// data change. This also proves Turso honors `IF NOT EXISTS` on the FTS
+    /// index when the baseline re-runs it.
     #[tokio::test]
-    async fn catalog_baseline_matches_verbatim_0_4_2_schema() {
+    async fn old_catalog_current_db_reopens_as_noop() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(root, crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        run_catalog(&conn, TargetDb::Core, root, OLD_CATALOG)
+            .await
+            .expect("old catalog");
+        seed_current_core_rows(&conn).await;
 
-        // Build the consolidated 0.4.2 anchor from ONLY the BASELINE_* DDL
-        // (not the delta chain), so it represents the baseline shape.
-        let core = crate::db::open_with_schema(&root.join("baseline-core.db"), "")
-            .await
-            .expect("open baseline core");
-        for sql in [
-            BASELINE_BOARD_TABLES,
-            BASELINE_SESSION_TABLES,
-            BASELINE_WORKSPACE_TABLES,
-            BASELINE_USERS_TABLES,
-            BASELINE_CONFIG_TABLES,
-            BASELINE_CHAT_HISTORY_TABLES,
-            BASELINE_CORE_INDEXES,
-        ] {
-            core.execute_batch(sql).await.expect("apply baseline core");
-        }
-        let logs = crate::db::open_with_schema(&root.join("baseline-logs.db"), "")
-            .await
-            .expect("open baseline logs");
-        logs.execute_batch(BASELINE_LOGS_TABLES)
-            .await
-            .expect("apply baseline logs tables");
-        logs.execute_batch(BASELINE_LOGS_INDEXES)
-            .await
-            .expect("apply baseline logs indexes");
+        let before_ids = applied_ids(&conn).await;
+        let before = snapshot_core_state(&conn).await;
 
-        // Core: every legacy 0.4.2 per-store table/index must appear in the
-        // consolidated baseline with the exact definition — and the baseline
-        // must not carry a table/index that 0.4.2 did not have. The full-DDL
-        // `table_defs` comparison pins columns, ordering, defaults, PK, inline
-        // UNIQUE, CHECK, and FK clauses in one shot; the index comparison pins
-        // index SQL/uniqueness.
-        let mut legacy_core_tables: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut legacy_core_indexes: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        let mut legacy_core_table_defs: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        for (store, schema) in [
-            ("board", LEGACY_0_4_2_BOARD_SCHEMA),
-            ("sessions", LEGACY_0_4_2_SESSIONS_SCHEMA),
-            ("workspaces", LEGACY_0_4_2_WORKSPACES_SCHEMA),
-            ("users", LEGACY_0_4_2_USERS_SCHEMA),
-            ("config", LEGACY_0_4_2_CONFIG_SCHEMA),
-            ("chat_history", LEGACY_0_4_2_CHAT_HISTORY_SCHEMA),
-        ] {
-            let legacy =
-                crate::db::open_with_schema(&crate::db::legacy_store_db_path(root, store), schema)
-                    .await
-                    .expect("open legacy store");
-            for table in table_names(&legacy).await {
-                assert!(
-                    legacy_core_tables.insert(table.clone()),
-                    "duplicate table {table} across legacy 0.4.2 stores"
-                );
-            }
-            for (name, sql) in index_defs(&legacy).await {
-                assert!(
-                    legacy_core_indexes.insert(name.clone(), sql).is_none(),
-                    "duplicate index {name} across legacy 0.4.2 stores"
-                );
-            }
-            for t in table_defs(&legacy).await {
-                assert!(
-                    legacy_core_table_defs.insert(t.0, t.1).is_none(),
-                    "duplicate table DDL across legacy 0.4.2 stores"
-                );
-            }
-        }
-        let core_tables: std::collections::HashSet<String> =
-            table_names(&core).await.into_iter().collect();
+        run_migrations(&conn, TargetDb::Core, root)
+            .await
+            .expect("new catalog");
+
+        let mut expected_ids = before_ids.clone();
+        expected_ids.push("24".to_string());
+        expected_ids.push("25".to_string());
+        expected_ids.sort();
+        let mut after_ids = applied_ids(&conn).await;
+        after_ids.sort();
         assert_eq!(
-            core_tables, legacy_core_tables,
-            "baseline core tables diverge from the 0.4.2 per-store schemas",
-        );
-        assert_eq!(
-            index_defs(&core).await,
-            legacy_core_indexes,
-            "baseline core indexes diverge from the 0.4.2 per-store schemas",
-        );
-        assert_eq!(
-            table_defs(&core).await,
-            legacy_core_table_defs,
-            "baseline core table DDL diverges from the 0.4.2 per-store schemas",
+            after_ids, expected_ids,
+            "reopen must record exactly old ids ∪ 24/25"
         );
 
-        // Logs: the 0.4.2 logs store must be captured by the logs baseline,
-        // bidirectionally.
-        let legacy_logs =
-            crate::db::open_with_schema(&root.join("legacy-logs.db"), LEGACY_0_4_2_LOGS_SCHEMA)
-                .await
-                .expect("open legacy logs");
-        let legacy_logs_tables: std::collections::HashSet<String> =
-            table_names(&legacy_logs).await.into_iter().collect();
-        let logs_tables: std::collections::HashSet<String> =
-            table_names(&logs).await.into_iter().collect();
-        assert_eq!(
-            logs_tables, legacy_logs_tables,
-            "baseline logs tables diverge from the 0.4.2 logs schema",
-        );
-        assert_eq!(
-            index_defs(&logs).await,
-            index_defs(&legacy_logs).await,
-            "baseline logs indexes diverge from the 0.4.2 logs schema",
-        );
-        assert_eq!(
-            table_defs(&logs).await,
-            table_defs(&legacy_logs).await,
-            "baseline logs table DDL diverges from the 0.4.2 logs schema",
-        );
+        assert_core_catalog_unchanged(&conn, &before).await;
     }
 
-    /// A 0.4.2-era logs store (no `schema_migrations`, no `grep_telemetry`)
-    /// upgraded by the catalog: the baseline entries no-op on the already-created
-    /// tables and the sole logs delta (`grep_telemetry`) is added, with existing
-    /// log rows preserved. This covers the 0.4.2→current logs upgrade path.
+    /// The logs fleet-wide boot-safety pin: an old-catalog logs store (ids
+    /// `8`/`9`/`14`) reopens through the logs baseline (`26`) as a strict
+    /// no-op — schema and data unchanged.
     #[tokio::test]
-    async fn logs_upgrade_from_0_4_2_adds_grep_telemetry() {
+    async fn old_catalog_logs_db_reopens_as_noop() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let conn = crate::db::open_with_schema(
             &crate::db::store_db_path(root, crate::db::LOG_DB_NAME),
-            LEGACY_0_4_2_LOGS_SCHEMA,
+            "",
         )
         .await
-        .expect("open legacy logs");
+        .expect("open logs");
+        run_catalog(&conn, TargetDb::Logs, root, OLD_CATALOG)
+            .await
+            .expect("old catalog");
         conn.execute(
-            "INSERT INTO logs (timestamp, level, target, message) \
-             VALUES (?1, 'INFO', 'test', 'hello')",
+            "INSERT INTO grep_telemetry (recorded_at, command) VALUES (?1, 'grep foo')",
             params![crate::db::now()],
         )
         .await
         .unwrap();
 
+        let before_ids = applied_ids(&conn).await;
+        let before_tables = table_defs(&conn).await;
+        let before_indexes = index_defs(&conn).await;
+        let before_counts = table_row_counts(&conn, &expected_logs_domain_tables()).await;
+
         run_migrations(&conn, TargetDb::Logs, root)
             .await
-            .expect("upgrade logs catalog");
+            .expect("new catalog");
 
+        let mut expected_ids = before_ids.clone();
+        expected_ids.push("26".to_string());
+        expected_ids.sort();
+        let mut after_ids = applied_ids(&conn).await;
+        after_ids.sort();
+        assert_eq!(
+            after_ids, expected_ids,
+            "logs reopen must record exactly old ids ∪ 26"
+        );
+
+        assert_eq!(
+            table_defs(&conn).await,
+            before_tables,
+            "logs table DDL must be unchanged on reopen"
+        );
+        assert_eq!(
+            index_defs(&conn).await,
+            before_indexes,
+            "logs index definitions must be unchanged on reopen"
+        );
+        assert_eq!(
+            table_row_counts(&conn, &expected_logs_domain_tables()).await,
+            before_counts,
+            "logs row counts must be unchanged on reopen"
+        );
+    }
+
+    /// The 0.5.0 (one-delta-behind) upgrade: a database built by the retired
+    /// chain WITHOUT entry `23` has no `chat_history` reply columns; the
+    /// baseline entry `25` upfills exactly those two columns, leaving every
+    /// row and every other table's schema untouched.
+    #[tokio::test]
+    async fn one_delta_behind_db_upgrades_reply_columns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(root, crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        run_catalog(
+            &conn,
+            TargetDb::Core,
+            root,
+            &old_catalog_without_reply_delta(),
+        )
+        .await
+        .expect("old catalog minus 23");
+
+        let now = crate::db::now();
+        conn.execute(
+            "INSERT INTO chat_history (message_id, user_name, direction, content, agent_role, workspace, timestamp) \
+             VALUES ('m1', 'alice', 'in', 'hello', NULL, 'ws', ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_history (message_id, user_name, direction, content, agent_role, workspace, timestamp) \
+             VALUES ('m2', 'assistant', 'out', 'hi alice', 'assistant', 'ws', ?1)",
+            params![now.clone()],
+        )
+        .await
+        .unwrap();
+
+        let before_chat_cols = column_names(&conn, "chat_history").await;
         assert!(
-            crate::db::table_exists(&conn, "grep_telemetry")
-                .await
-                .unwrap()
+            !before_chat_cols.contains(&"reply_author".to_string()),
+            "0.5.0 DB must not have reply_author"
         );
         assert!(
-            crate::db::table_exists(&conn, "llm_requests")
-                .await
-                .unwrap()
+            !before_chat_cols.contains(&"reply_snippet".to_string()),
+            "0.5.0 DB must not have reply_snippet"
         );
-        let count = conn
-            .query("SELECT COUNT(*) FROM logs WHERE message = 'hello'", ())
+        let before_other = column_sets(&conn, &expected_core_tables_except("chat_history")).await;
+        let mut before_ids = applied_ids(&conn).await;
+        before_ids.sort();
+
+        run_migrations(&conn, TargetDb::Core, root)
             .await
-            .expect("count logs")
+            .expect("new catalog");
+
+        let after_chat_cols = column_names(&conn, "chat_history").await;
+        assert!(
+            after_chat_cols.contains(&"reply_author".to_string()),
+            "reply_author must be added"
+        );
+        assert!(
+            after_chat_cols.contains(&"reply_snippet".to_string()),
+            "reply_snippet must be added"
+        );
+
+        let reply_nulls: i64 = conn
+            .query(
+                "SELECT COUNT(*) FROM chat_history \
+                 WHERE reply_author IS NULL AND reply_snippet IS NULL",
+                (),
+            )
+            .await
+            .unwrap()[0]
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(reply_nulls, 2, "both rows must keep NULL reply columns");
+
+        let contents: Vec<String> = conn
+            .query("SELECT content FROM chat_history ORDER BY id", ())
+            .await
+            .unwrap()
             .into_iter()
-            .next()
-            .map(|row| row.get::<i64>(0).expect("count"))
-            .unwrap_or(0);
-        assert_eq!(count, 1, "existing logs rows must survive the logs upgrade");
-        let applied = applied_ids(&conn).await;
-        for id in ["8", "9", "14"] {
-            assert!(applied.contains(&id.to_string()), "missing applied id {id}");
-        }
+            .map(|r| r.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(contents, vec!["hello".to_string(), "hi alice".to_string()]);
+
+        let mut expected_ids = before_ids.clone();
+        expected_ids.push("24".to_string());
+        expected_ids.push("25".to_string());
+        expected_ids.sort();
+        let mut after_ids = applied_ids(&conn).await;
+        after_ids.sort();
+        assert_eq!(
+            after_ids, expected_ids,
+            "upgrade must record exactly old ids ∪ 24/25"
+        );
+
+        assert_eq!(
+            column_sets(&conn, &expected_core_tables_except("chat_history")).await,
+            before_other,
+            "only chat_history columns may change on the 0.5.0 upgrade"
+        );
     }
 }

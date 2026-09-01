@@ -256,7 +256,7 @@ impl BenchOptions {
             i += 1;
         }
 
-        // Model resolution: --model > env > read-only config.db > default.
+        // Model resolution: --model > env > read-only config store > default.
         let model = match model {
             Some(m) => m,
             None => model_from_env_or_config(),
@@ -351,7 +351,7 @@ fn resolve_key(opts: &BenchOptions) -> Result<(String, &'static str), CliError> 
 /// When the daemon is up it holds the single-process instance lock, so the
 /// lookup is routed through the debug IPC endpoint (the same query-only
 /// guard `mahbot debug` uses). When the daemon is down the consolidated
-/// `core.db` (or legacy `config.db`) is opened directly with `ReadOnly|NoLock`
+/// `core.db` is opened directly with `ReadOnly|NoLock`
 /// and never creates or mutates files. Any failure — missing file, unreadable
 /// store, missing row, IPC hiccup — degrades to `Ok(None)` with a
 /// `tracing::warn`: this is a fallback resolution path, never fatal.
@@ -375,39 +375,28 @@ pub(crate) fn read_config_kv(storage_root: &Path, key: &str) -> anyhow::Result<O
 
 fn read_config_kv_inner(storage_root: &Path, key: &str) -> anyhow::Result<Option<String>> {
     // In the consolidated layout the config store lives in the single domain
-    // database; fall back to the legacy per-store config.db when the
-    // consolidated file has not been created yet (pre-consolidation install).
+    // database; a not-yet-created consolidated file means no config store yet.
     let db_path = crate::db::store_db_path(storage_root, "config");
     if !db_path.exists() {
-        let legacy = crate::db::legacy_store_db_path(storage_root, "config");
-        if !legacy.exists() {
-            return Ok(None);
-        }
-        return read_config_kv_impl(storage_root, &legacy, "config", key);
+        return Ok(None);
     }
-    read_config_kv_impl(storage_root, &db_path, "core", key)
+    read_config_kv_impl(storage_root, &db_path, key)
 }
 
 fn read_config_kv_impl(
     storage_root: &Path,
     db_path: &Path,
-    physical: &str,
     key: &str,
 ) -> anyhow::Result<Option<String>> {
     // When the daemon holds the instance lock it is the single-process writer;
     // `bench-openrouter` must NOT open a second connection to the live store.
     // Route the lookup through the debug IPC endpoint (same query-only guard as
     // `mahbot debug`). When the daemon is down, open the store directly in
-    // single-process mode (ReadOnly|NoLock reads committed WAL frames).
-    //
-    // The legacy pre-consolidation `config.db` (`physical == "config"`) is the
-    // one exception: the IPC endpoint only routes `"core"`/`"logs"`, and this
-    // path is only reachable when the consolidated core.db is absent (daemon
-    // down), so the legacy file is always opened directly. The settled lock
-    // probe also avoids a direct open mid self-update handoff.
-    if physical != "config" && crate::util::lock::daemon_holds_lock_settled(storage_root) {
+    // single-process mode (ReadOnly|NoLock reads committed WAL frames). The
+    // settled lock probe also avoids a direct open mid self-update handoff.
+    if crate::util::lock::daemon_holds_lock_settled(storage_root) {
         let req = crate::db::ipc::QueryRequest {
-            store: physical.to_string(),
+            store: "core".to_string(),
             sql: "SELECT value FROM config_kv WHERE key = ?1".to_string(),
             params: vec![crate::db::ipc::WireValue::Text(key.to_string())],
         };

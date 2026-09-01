@@ -1244,18 +1244,6 @@ pub(crate) async fn ensure_fts_index(
 // catalog (see [`crate::db::migrations`]); the only tracking mechanism is the
 // id-based applied check in [`crate::db::migrations::run_migrations`].
 
-/// Check whether a table currently exists under `name`.
-pub(crate) async fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
-    let rows = conn
-        .query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
-            params![table],
-        )
-        .await
-        .context("Failed to read table schema (sqlite_master)")?;
-    Ok(!rows.is_empty())
-}
-
 /// Open a database, create parent directories if needed, and run schema init.
 ///
 /// `schema` is executed via `execute_batch` (multiple DDL statements).
@@ -1310,16 +1298,6 @@ pub(crate) fn store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
         CONSOLIDATED_DB_NAME
     };
     root.join("db").join(format!("{stem}.db"))
-}
-
-/// Resolve a logical store name to its **legacy** per-store file path
-/// (`root/db/{name}.db`), as it existed before consolidation.
-///
-/// Used only by the one-time consolidation import (reading pre-consolidation
-/// store files) and the fresh-install probe, so the upgrade path can detect an
-/// existing install that still uses the legacy layout.
-pub(crate) fn legacy_store_db_path(root: &Path, name: &str) -> std::path::PathBuf {
-    root.join("db").join(format!("{name}.db"))
 }
 
 /// Sidecar files (`-wal`, `-shm`) beside a store's database file.
@@ -1579,12 +1557,14 @@ pub(crate) async fn open_store(
 ///
 /// # Catalog, not SCHEMA
 ///
-/// The catalog is a strictly linear history anchored at the 0.4.2 baseline:
-/// the starter entries create the 0.4.2 table shapes, then every later entry
-/// brings a database to the current shape. The only control flow is the
-/// id-based applied check (skip if the id is already recorded, otherwise run
-/// and record). A catalog failure is a hard boot failure — it is never
-/// classified as corruption and never triggers a quarantine/recreate.
+/// The catalog is now a current-shape baseline (ids `24`–`26`): the entries
+/// create the exact current schema directly (every statement `IF NOT EXISTS`),
+/// so a fresh install converges in one pass and an existing install is a
+/// no-op (except the one-delta-behind `chat_history` reply-column upfill).
+/// The only control flow is the id-based applied check (skip if the id is
+/// already recorded, otherwise run and record). A catalog failure is a hard
+/// boot failure — it is never classified as corruption and never triggers a
+/// quarantine/recreate.
 ///
 /// # Why tables → ALTER → indexes is baked into the catalog order
 ///
@@ -1592,30 +1572,8 @@ pub(crate) async fn open_store(
 /// jobs(kind, ticket_id)` while `ticket_id` was only added by a later ALTER.
 /// `CREATE TABLE IF NOT EXISTS jobs` left the old table unchanged; the index
 /// failed with `no such column` and the store was misclassified as corruption
-/// and recreated empty. In the catalog, `jobs.ticket_id` is ADDed
-/// (consolidate_003) strictly before the `idx_jobs_phase_ticket` unique index
-/// (consolidate_007) — the linear order preserves the invariant.
-///
-/// # Catalog ordering around the import
-///
-/// The FTS/board indexes run **before** the one-time consolidation import (a
-/// Rust-function catalog entry) so imported tickets are already FTS-searchable.
-/// The import copies the legacy user tables **verbatim** (FK off → bulk load →
-/// FK on), then two post-import entries shape the migrated rows:
-///
-/// - `003_reset_nonterminal_tickets` — non-terminal legacy tickets are reset to
-///   `backlog` (it is a DATA reset, so it must run after the import fills the
-///   consolidated tickets table; on an already-current DB it is recorded and
-///   skipped, never touching live in-progress tickets).
-/// - the `13` post-import cleanup DELETE — pre-rework `kind='ticket_stage'`,
-///   `'ticket_analysis'`, `'ticket_implementation'` jobs the import rolled in
-///   are discarded, and a `PRAGMA foreign_key_check` reports (never fails on)
-///   any orphan rows.
-///
-/// So the consolidation contract is *migrate without losing data* (rows that
-/// should survive are preserved) while the deliberate resets/drops are applied
-/// to the imported rows, and no destructive operation re-fires on an
-/// already-current DB.
+/// and recreated empty. In the baseline, `jobs` is created WITH `ticket_id`, so
+/// `idx_jobs_phase_ticket` is safe to create in the same batch.
 ///
 /// Returns a **fresh** connection. Production shares it across all domain
 /// stores via [`DOMAIN_CONN`]; isolated test opens (`open_test_store!`) drop it
@@ -1629,392 +1587,14 @@ pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Conne
     let conn = open_store(root, CONSOLIDATED_DB_NAME, "").await?;
     migrations::run_migrations(&conn, migrations::TargetDb::Core, root).await?;
 
-    // Enable CDC on the FINAL connection, after all migrations/import, so
-    // boot-time schema + import writes are not captured. This single chokepoint
+    // Enable CDC on the FINAL connection, after all migrations, so
+    // boot-time schema writes are not captured. This single chokepoint
     // covers every connection-recreation path (open_store's heal/recreate arms
     // all funnel back through here) and the test-store opens (open_test_store!
     // and init_test_stores both call open_consolidated_store).
     cdc::enable_capture(&conn).await?;
 
     Ok(conn)
-}
-
-/// Copy user tables from the 6 legacy per-store files into the consolidated
-/// database, preserving the AUTOINCREMENT watermark (`sqlite_sequence`).
-///
-/// *FK handling*: FK enforcement is OFF during the bulk load (children may be
-/// copied before their parents, and the target schema's FKs must not fire
-/// mid-copy). It is restored to ON afterwards; the post-import cleanup DELETE
-/// and `PRAGMA foreign_key_check` live in the catalog's own cleanup migration
-/// ([`crate::db::migrations`]).
-pub(crate) async fn import_legacy_stores(conn: &Connection, root: &Path) -> anyhow::Result<()> {
-    conn.execute("PRAGMA foreign_keys = OFF;", ())
-        .await
-        .context("Failed to disable FK enforcement during consolidation import")?;
-
-    let result = import_legacy_stores_inner(conn, root).await;
-
-    // Restore FK enforcement regardless of the import outcome so the connection
-    // is left in a sane state, but surface the import (root-cause) error
-    // preferentially over a secondary FK-re-enable failure.
-    let reenabled = conn
-        .execute("PRAGMA foreign_keys = ON;", ())
-        .await
-        .context("Failed to re-enable FK enforcement after consolidation import");
-    match (result, reenabled) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Err(e), _) | (Ok(()), Err(e)) => Err(e),
-    }
-}
-
-async fn import_legacy_stores_inner(conn: &Connection, root: &Path) -> anyhow::Result<()> {
-    for name in DOMAIN_STORE_NAMES {
-        let legacy_path = legacy_store_db_path(root, name);
-        if !legacy_path.exists() {
-            continue;
-        }
-        if let Err(e) = import_one_legacy_store(conn, name, &legacy_path).await {
-            return Err(e).with_context(|| format!("consolidation import failed for '{name}'"));
-        }
-    }
-    Ok(())
-}
-
-/// Copy one legacy store's user tables into the consolidated database.
-///
-/// The source is opened READ-ONLY (`ReadOnly | NoLock`) with the same
-/// experimental feature set as the daemon so the WAL is read correctly. Turso
-/// internals (`sqlite_%`, `__turso_internal_%`) are never
-/// copied — the consolidated schema recreates them. A source table that has no
-/// matching target table (schema drift) is skipped; the removed rework-child
-/// tables (`ticket_jobs`, `ticket_stage_jobs`) fall through to `None` and are
-/// dropped rather than imported.
-async fn import_one_legacy_store(
-    conn: &Connection,
-    store_name: &str,
-    legacy_path: &Path,
-) -> anyhow::Result<()> {
-    use std::sync::Arc;
-
-    let io: Arc<dyn turso::core::IO> = Arc::new(turso::core::PlatformIO::new()?);
-    let path_str = legacy_path
-        .to_str()
-        .with_context(|| format!("legacy store path must be UTF-8: {}", legacy_path.display()))?;
-    let db = turso::core::Database::open_file_with_flags(
-        io.clone(),
-        path_str,
-        turso::core::OpenFlags::ReadOnly | turso::core::OpenFlags::NoLock,
-        experimental_database_opts(),
-        None,
-    )
-    .with_context(|| format!("failed to open legacy store '{store_name}' read-only"))?;
-    let src = db
-        .connect()
-        .with_context(|| format!("failed to connect to legacy store '{store_name}'"))?;
-    // NB: `turso::core::Connection` (the source) is SYNCHRONOUS — rows are
-    // read via `stmt.step()`; the consolidated target `conn` is our async
-    // wrapper. The source is read fully into memory per table so the sync
-    // statement is never held across an await (keeps the future `Send`).
-
-    // Enumerate source user tables.
-    let src_tables = read_sync_rows(
-        &io,
-        &src,
-        &format!("SELECT name FROM sqlite_master WHERE type='table' AND {USER_OBJECT_FILTER}"),
-        1,
-    )?;
-
-    for table_row in src_tables {
-        let Some(src_table) = table_row.first().and_then(|v| match v {
-            Value::Text(s) => Some(s.as_str()),
-            _ => None,
-        }) else {
-            continue;
-        };
-        let Some(target_table) = consolidate_table_name(src_table) else {
-            continue;
-        };
-        if !table_exists(conn, target_table).await? {
-            continue;
-        }
-        copy_table(conn, &io, &src, src_table, target_table).await?;
-    }
-
-    // Preserve the AUTOINCREMENT watermark (sqlite_sequence) so id counters
-    // keep incrementing correctly after consolidation.
-    copy_sqlite_sequence(conn, &io, &src).await?;
-
-    Ok(())
-}
-
-/// Map a legacy source table name to its consolidated target name. Returns
-/// `None` for tables that have no consolidated counterpart (schema drift).
-///
-/// There are no renames across the consolidation — every legacy table either
-/// keeps its name or maps to `None`.
-///
-/// **Dormant legacy tables are deliberately dropped** (mapped to `None`): the
-/// consolidated schema catalog never recreates them and no production code
-/// reads them. These include `config_role` — historically created for the
-/// (removed) per-role config override rows (no code references, not part of the
-/// config tables) — and the old `ticket_jobs` child table, which the
-/// job-per-phase model removed (it stores `ticket_id` directly on `jobs`).
-/// The consolidated `schema_migrations`/fresh-install probe paths do not depend
-/// on them.
-///
-/// `user_roles` is an explicit `None` arm (a deliberate, documented drop — the
-/// role pool is permission-derived now) even though the wildcard already maps
-/// unknown tables to `None`; `#[allow]` on the function documents the intent
-/// without a wildcard-only match.
-#[allow(clippy::match_same_arms)]
-fn consolidate_table_name(src: &str) -> Option<&'static str> {
-    match src {
-        // All other current user tables keep their name.
-        "tickets" => Some("tickets"),
-        "ticket_comments" => Some("ticket_comments"),
-        "ticket_counters" => Some("ticket_counters"),
-        "sessions" => Some("sessions"),
-        "session_metadata" => Some("session_metadata"),
-        "jobs" => Some("jobs"),
-        "agents" => Some("agents"),
-        "pending_jobs" => Some("pending_jobs"),
-        "research_jobs" => Some("research_jobs"),
-        "workspaces" => Some("workspaces"),
-        "workspace_contexts" => Some("workspace_contexts"),
-        "editor_tabs" => Some("editor_tabs"),
-        "users" => Some("users"),
-        "user_channels" => Some("user_channels"),
-        // `user_roles` is dropped: role pools are permission-derived now, so
-        // no production code reads it and the consolidated schema never
-        // recreates it. Rows are discarded during the import.
-        "user_roles" => None,
-        "config_kv" => Some("config_kv"),
-        "config_model_routing" => Some("config_model_routing"),
-        "chat_history" => Some("chat_history"),
-        // Anything else — including the dormant `config_role` table — is a
-        // pre-consolidation artifact with no consolidated counterpart; drop it.
-        _ => None,
-    }
-}
-
-/// Copy one table's rows (intersecting columns) from the read-only source to
-/// the consolidated target.
-///
-/// The clear + bulk insert run inside **one transaction** (FK enforcement is
-/// already OFF during the import): a large table is copied with a single fsync
-/// rather than one per row, and a crash mid-copy rolls back the whole table so
-/// a re-run leaves no partial rows.
-///
-/// The source is read in BOUNDED batches via `LIMIT/OFFSET` pagination, ordered
-/// by `rowid` so each batch is deterministic and does not depend on an
-/// unspecified scan order — a large legacy table (e.g. the ~251MB sessions
-/// store) is never fully materialized in memory, bounding the deploy-time OOM
-/// risk that a whole-table `Vec<Vec<Value>>` would pose. Each batch statement is
-/// fully consumed before the next await, keeping the future `Send`. (The source
-/// is opened read-only and unmodified during the import; every copied user table
-/// is a rowid table, so `ORDER BY rowid` is always valid.)
-///
-/// *Batch size*: [`IMPORT_READ_BATCH`]. Offset scans re-scan from the start, so
-/// the cost is one full rescan per batch — acceptable for a one-time migration
-/// versus unbounded memory.
-const IMPORT_READ_BATCH: usize = 10_000;
-
-async fn copy_table(
-    conn: &Connection,
-    io: &std::sync::Arc<dyn turso::core::IO>,
-    src: &std::sync::Arc<turso::core::Connection>,
-    src_table: &str,
-    target_table: &str,
-) -> anyhow::Result<()> {
-    let src_cols = column_names_sync(io, src, src_table)?;
-    let target_cols = column_names_async(conn, target_table).await?;
-
-    // Intersect on column name, preserving the target's column order.
-    let common: Vec<String> = target_cols
-        .iter()
-        .filter(|c| src_cols.contains(*c))
-        .cloned()
-        .collect();
-    if common.is_empty() {
-        return Ok(());
-    }
-    let col_list = common.join(", ");
-    let placeholders = vec!["?"; common.len()].join(", ");
-    let insert_sql = format!("INSERT INTO {target_table} ({col_list}) VALUES ({placeholders})");
-
-    // Empty the target table before re-copy so a re-run (crash mid-import) does
-    // not leave duplicate rows — atomically with the inserts so a failure rolls
-    // back both.
-    let tx = conn
-        .begin_tx()
-        .await
-        .with_context(|| format!("failed to begin import for '{target_table}'"))?;
-    tx.execute(&format!("DELETE FROM {target_table}"), ())
-        .await
-        .with_context(|| format!("failed to clear target table '{target_table}'"))?;
-
-    // Read bounded batches from the (read-only, unmodified) source and insert
-    // each into the same per-table transaction, bounding peak memory to one
-    // batch.
-    let mut offset = 0usize;
-    loop {
-        let batch_select = format!(
-            "SELECT {col_list} FROM {src_table} ORDER BY rowid LIMIT {IMPORT_READ_BATCH} OFFSET {offset}"
-        );
-        let rows = read_sync_rows(io, src, &batch_select, common.len())?;
-        if rows.is_empty() {
-            break;
-        }
-        for vals in rows {
-            tx.execute(&insert_sql, vals).await.with_context(|| {
-                format!("failed to insert row into '{target_table}' during import")
-            })?;
-        }
-        offset += IMPORT_READ_BATCH;
-    }
-
-    tx.commit()
-        .await
-        .with_context(|| format!("failed to commit import for '{target_table}'"))?;
-    Ok(())
-}
-
-/// Run a read-only SQL that returns `ncols` columns and collect every row's
-/// values as owned [`Value`]s. The source connection is synchronous; the
-/// statement is fully consumed here so no non-`Send` statement is held across
-/// an await in the caller.
-fn read_sync_rows(
-    io: &std::sync::Arc<dyn turso::core::IO>,
-    src: &std::sync::Arc<turso::core::Connection>,
-    sql: &str,
-    ncols: usize,
-) -> anyhow::Result<Vec<Vec<Value>>> {
-    use turso::core::StepResult;
-    let Some(mut stmt) = src
-        .query(sql)
-        .with_context(|| format!("failed to prepare read: {sql}"))?
-    else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    loop {
-        match stmt.step() {
-            Ok(StepResult::Row) => {
-                let row = stmt.row().context("row missing after StepResult::Row")?;
-                let mut vals = Vec::with_capacity(ncols);
-                for idx in 0..ncols {
-                    vals.push(row_to_value(row.get_value(idx)));
-                }
-                out.push(vals);
-            }
-            Ok(StepResult::Done) => break,
-            Ok(StepResult::IO | StepResult::Yield) => {
-                io.step().context("I/O step during read-only import")?;
-            }
-            Ok(StepResult::Interrupt) => {
-                return Err(anyhow::anyhow!("read-only import query interrupted"));
-            }
-            Ok(StepResult::Busy) => {
-                return Err(anyhow::anyhow!(
-                    "read-only import query busy; try again later"
-                ));
-            }
-            Err(e) => return Err(anyhow::anyhow!("read-only import query failed: {e}")),
-        }
-    }
-    Ok(out)
-}
-
-/// Enumerate a source table's column names (synchronous core connection).
-fn column_names_sync(
-    io: &std::sync::Arc<dyn turso::core::IO>,
-    src: &std::sync::Arc<turso::core::Connection>,
-    table: &str,
-) -> anyhow::Result<Vec<String>> {
-    let rows = read_sync_rows(io, src, &format!("PRAGMA table_info({table})"), 2)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| match r.get(1) {
-            Some(Value::Text(s)) => Some(s.as_str().to_string()),
-            _ => None,
-        })
-        .collect())
-}
-
-/// Enumerate a target table's column names (our async wrapper).
-async fn column_names_async(conn: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
-    let rows = conn
-        .query(&format!("PRAGMA table_info({table})"), ())
-        .await
-        .with_context(|| format!("failed to read columns of target '{table}'"))?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| r.get::<String>(1).ok())
-        .collect())
-}
-
-/// Convert a `turso::core::Value` into a `turso::Value` for the async insert.
-fn row_to_value(v: &turso::core::Value) -> Value {
-    match v {
-        turso::core::Value::Null => Value::Null,
-        turso::core::Value::Numeric(turso::core::Numeric::Integer(i)) => Value::Integer(*i),
-        turso::core::Value::Numeric(turso::core::Numeric::Float(f)) => {
-            let f64_val: f64 = (*f).into();
-            Value::Real(f64_val)
-        }
-        turso::core::Value::Text(t) => Value::Text(t.as_str().to_string()),
-        turso::core::Value::Blob(b) => Value::Blob(b.clone()),
-    }
-}
-
-/// Copy the `sqlite_sequence` AUTOINCREMENT watermark (only for tables present
-/// in both source and target) so `sessions.id` / `chat_history.id` keep
-/// incrementing correctly after consolidation.
-///
-/// `sqlite_sequence` is created as `CREATE TABLE sqlite_sequence(name,seq)` —
-/// no PRIMARY KEY or UNIQUE on `name`, and Turso rejects indexes on it — so
-/// `ON CONFLICT(name)` is invalid SQL. Delete-then-insert is the portable
-/// upsert (the engine's AUTOINCREMENT path maintains one row per name).
-async fn copy_sqlite_sequence(
-    conn: &Connection,
-    io: &std::sync::Arc<dyn turso::core::IO>,
-    src: &std::sync::Arc<turso::core::Connection>,
-) -> anyhow::Result<()> {
-    // `sqlite_sequence` only exists when the source has AUTOINCREMENT tables;
-    // a missing table makes the query return an error, which we treat as empty.
-    let Ok(rows) = read_sync_rows(io, src, "SELECT name, seq FROM sqlite_sequence", 2) else {
-        return Ok(());
-    };
-    for row in rows {
-        let (Some(name), Some(seq)) = (
-            row.first().and_then(|v| match v {
-                Value::Text(s) => Some(s.as_str().to_string()),
-                _ => None,
-            }),
-            row.get(1).and_then(|v| match v {
-                Value::Integer(i) => Some(*i),
-                _ => None,
-            }),
-        ) else {
-            continue;
-        };
-        if !table_exists(conn, &name).await? {
-            continue;
-        }
-        conn.execute(
-            "DELETE FROM sqlite_sequence WHERE name = ?1",
-            params![name.clone()],
-        )
-        .await
-        .with_context(|| format!("failed to clear AUTOINCREMENT watermark for '{name}'"))?;
-        conn.execute(
-            "INSERT INTO sqlite_sequence (name, seq) VALUES (?1, ?2)",
-            params![name.clone(), seq],
-        )
-        .await
-        .with_context(|| format!("failed to preserve AUTOINCREMENT watermark for '{name}'"))?;
-    }
-    Ok(())
 }
 
 /// Format a catch_unwind panic payload into a store-open error.

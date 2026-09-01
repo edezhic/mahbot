@@ -292,8 +292,9 @@ pub struct ConfigData {
     /// for the voice assistant.  Owned exclusively by the voice pipeline.
     pub wake_word_templates: Option<String>,
     /// Onboarding state machine: "init" | "welcomed" | "finished".
-    /// Absent = Init (fresh install). Set by the onboarding flow and by the
-    /// user_roles-removal migration for existing installs.
+    /// Absent = Init (fresh install). Set by the onboarding flow; existing
+    /// installs keep the `finished` value seeded by the retired catalog's
+    /// one-time migration.
     pub onboarding_state: Option<String>,
     /// Per-model provider routing.
     pub model_routings: Vec<ModelRouting>,
@@ -973,8 +974,7 @@ pub async fn load_or_init() -> Result<()> {
     // BEFORE any store open creates it, so reload_from_db() can seed
     // fresh-install defaults into brand-new databases only. In the consolidated
     // layout the config store lives in the single `core.db`; an existing
-    // install is detected by EITHER that file OR a legacy per-store
-    // `config.db` (pre-consolidation). Probing any other location would
+    // install is detected by that file. Probing any other location would
     // classify every existing install as fresh and re-seed it on each boot,
     // violating the zero-write hard constraint.
     CONFIG_DB_FRESH_AT_BOOT.store(config_db_is_fresh(&mahbot_dir), Ordering::Release);
@@ -994,18 +994,14 @@ pub async fn load_or_init() -> Result<()> {
 /// file does not yet exist at its real location.
 ///
 /// In the consolidated layout the config store lives in the single domain
-/// database ([`crate::db::CONSOLIDATED_DB_NAME`]). An existing install is
-/// detected by EITHER the consolidated file OR a legacy per-store `config.db`
-/// (pre-consolidation) — probing only the consolidated file would classify a
-/// legacy install as fresh and re-seed it on the first consolidated boot,
-/// violating the zero-write hard constraint.
+/// database ([`crate::db::CONSOLIDATED_DB_NAME`]); the discriminator is simply
+/// whether that consolidated file exists.
 ///
 /// Must be probed BEFORE any store open creates the file, and must check the
 /// exact path the open uses (`init_all_stores` → `open_store` →
 /// `store_db_path`).
 fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
     !crate::db::store_db_path(mahbot_dir, "config").exists()
-        && !crate::db::legacy_store_db_path(mahbot_dir, "config").exists()
 }
 
 /// Provider routing a default model seeds on fresh installs: `deepseek/*`

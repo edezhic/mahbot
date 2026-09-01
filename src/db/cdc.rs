@@ -368,8 +368,7 @@ pub(crate) fn subscribe(table: &str) -> tokio::sync::broadcast::Receiver<ChangeE
 
 /// Enable CDC on `conn`: capture mode `full` into [`CDC_TABLE`]. Idempotent (the
 /// engine uses `CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE`). Must run AFTER
-/// migrations / consolidation import / boot hooks so those writes are not
-/// captured.
+/// migrations / boot hooks so those writes are not captured.
 pub(crate) async fn enable_capture(conn: &Connection) -> anyhow::Result<()> {
     conn.execute(
         &format!("PRAGMA capture_data_changes_conn('full,{CDC_TABLE}');"),
