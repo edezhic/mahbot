@@ -275,7 +275,8 @@ impl<T> PaginatedTabState<T> {
 
 // ── Debounce state ──────────────────────────────────────────────────
 
-/// Debounce state for search/filter text inputs.
+/// Debounce state shared by text inputs that persist or refresh only after
+/// the user stops typing.
 ///
 /// Groups the generation counter and pending flag from the manual debounce
 /// pattern into a single struct.  The caller keeps a `DebounceState` field,

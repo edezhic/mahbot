@@ -1025,6 +1025,7 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
     }
 
     // 6. Exit — spawn succeeded.
+    crate::channels::chat_draft::flush_global();
     std::process::exit(0);
 }
 

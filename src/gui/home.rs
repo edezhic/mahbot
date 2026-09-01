@@ -15,6 +15,7 @@ use iced::widget::{Column, Id, Space, button, column, container, row, scrollable
 use iced::{Alignment, Element, Length, Task};
 use iced_fonts::lucide;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::ToastMessage;
 use super::common::MAX_INPUT_CHARS;
@@ -24,6 +25,10 @@ use super::widgets::PickOption;
 
 /// Maximum number of message IDs to keep in the dedup set before pruning.
 const DEDUP_PRUNE_THRESHOLD: usize = 500;
+
+/// Debounce window (ms) after a text/reply change before the draft is
+/// persisted to disk.
+const DRAFT_SETTLE_MS: u64 = 700;
 
 /// Scrollable ID for the chat message list, used for snap-to-end after
 /// history loads.
@@ -281,6 +286,13 @@ pub enum HomeMessage {
     },
     /// Dismiss the pending reply preview (clears the captured reference).
     CancelReply,
+    /// A composer-draft debounce has settled — persist the current draft.
+    ///
+    /// `generation` is the debounce counter captured when the edit was staged;
+    /// a settle whose generation no longer matches the current counter is
+    /// stale and dropped, so per-keystroke and out-of-order writes are
+    /// impossible.
+    DraftSaveSettled { generation: u64 },
     /// Switch user's active role. Carries (user_name, new_role).
     SwitchRole(String, Role),
     /// Chat history cleared successfully — divider inserted.
@@ -369,6 +381,15 @@ pub struct HomeState {
     /// while a reply preview is shown above the composer; cleared on send,
     /// cancel, chat clear, or user/workspace switch.
     pending_reply: Option<ReplyReference>,
+    /// Persisted composer-draft store (draft text + pending reply per user
+    /// and resolved send-target workspace).
+    drafts: Arc<crate::channels::chat_draft::DraftStore>,
+    /// Debounce state for the asynchronous draft persistence.
+    draft_save: super::common::DebounceState,
+    /// True between a user switch and its workspace resolution completing —
+    /// draft capture is suppressed so it cannot land on the stale key;
+    /// restore runs at the completing cascade instead.
+    context_resolving: bool,
 }
 
 /// The chat view for the selected user: two workspaces — the picker-resolved
@@ -423,6 +444,9 @@ impl HomeState {
             undo_stack: super::common::UndoStack::new(),
             role_menu_open: false,
             pending_reply: None,
+            drafts: crate::channels::chat_draft::DraftStore::global().clone(),
+            draft_save: super::common::DebounceState::new(),
+            context_resolving: false,
         }
     }
 
@@ -614,6 +638,60 @@ impl HomeState {
         self.role_menu_open = false;
         self.pending_reply = None;
         self.reset_pagination_state();
+    }
+    /// Resolve the draft key: `(selected_user, resolved send-target
+    /// workspace)` — the visible-chat workspace exactly as chat history and
+    /// session queries resolve it.
+    fn draft_key(&self) -> Option<(String, String)> {
+        let user = self.selected_user.clone()?;
+        let ws = self.resolve_workspace_name()?;
+        Some((user, ws))
+    }
+
+    /// Snapshot the current composer state (text + pending reply) into the
+    /// draft store and schedule a debounced persist after `delay_ms`.
+    ///
+    /// The in-memory mutation happens synchronously at schedule time — the
+    /// file write lags behind the debounce, so the in-memory map is always
+    /// current.
+    fn capture_draft(&mut self, delay_ms: u64) -> Task<HomeMessage> {
+        // While a user switch is still resolving, the sidebar workspace is
+        // stale and the key would land on the wrong context. The completing
+        // cascade (`WorkspaceChanged`/`ResolveUserSelected`) restores instead.
+        if self.onboarding_script_active || self.context_resolving {
+            return Task::none();
+        }
+        let Some((user, ws)) = self.draft_key() else {
+            return Task::none();
+        };
+        let text = self.editor_content.text();
+        let reply = self.pending_reply.clone();
+        self.drafts.set(&user, &ws, text, reply);
+        self.draft_save
+            .trigger(delay_ms)
+            .map(|generation| HomeMessage::DraftSaveSettled { generation })
+    }
+
+    /// Restore the persisted composer draft for the current context, or clear
+    /// the composer when none exists (per-context swap, not leak).
+    fn restore_chat_draft(&mut self) {
+        let Some((user, ws)) = self.draft_key() else {
+            return;
+        };
+        let entry = self.drafts.get(&user, &ws);
+        self.editor_content
+            .set_text(entry.as_ref().map_or("", |e| e.text.as_str()));
+        self.undo_stack.clear();
+        self.pending_reply = entry.and_then(|e| e.reply);
+    }
+
+    /// Remove the persisted draft for the current context and schedule a
+    /// persist — used on send, after the composer has been cleared.
+    fn drop_current_draft(&mut self) {
+        if let Some((user, ws)) = self.draft_key() {
+            self.drafts.remove(&user, &ws);
+            self.drafts.clone().persist_async();
+        }
     }
 
     /// Produce a snap-to-end task if auto-scroll is enabled.
@@ -1293,6 +1371,11 @@ impl HomeState {
                     return Task::none();
                 }
                 self.selected_user = Some(user.clone());
+                // Suppress draft capture until the workspace resolution
+                // completes (`context_resolving`); reset_chat_state
+                // intentionally does not restore here — the stale sidebar
+                // workspace would restore the wrong context.
+                self.context_resolving = true;
                 self.reset_chat_state();
                 self.user_project_workspace = None; // re-resolved below
 
@@ -1312,6 +1395,9 @@ impl HomeState {
                     self.pending_workspace_refresh = true;
                     return Task::none();
                 };
+                // The workspace is final — a user switch (if any) is resolved.
+                self.context_resolving = false;
+                self.restore_chat_draft();
                 self.pending_workspace_refresh = false;
                 // At the Personal picker the view merges the user's DB-selected
                 // project workspace — re-read it so Users-page edits (which
@@ -1344,12 +1430,17 @@ impl HomeState {
                 }
             }
             HomeMessage::InputChanged(action) => {
+                let changes_text = action.changes_text();
                 super::common::apply_editor_action(
                     &mut self.editor_content,
                     &mut self.undo_stack,
                     action,
                 );
-                Task::none()
+                if changes_text {
+                    self.capture_draft(DRAFT_SETTLE_MS)
+                } else {
+                    Task::none()
+                }
             }
             HomeMessage::ResolveUserSelected {
                 user,
@@ -1384,6 +1475,11 @@ impl HomeState {
                     self.pending_workspace_refresh = false;
                     self.reset_chat_state();
                 }
+                // The workspace is final — the user switch is resolved. (The
+                // cascade branch above leaves it to the cascaded
+                // `WorkspaceChanged`.)
+                self.context_resolving = false;
+                self.restore_chat_draft();
                 self.refresh_history()
             }
             HomeMessage::SendMessage => {
@@ -1432,13 +1528,17 @@ impl HomeState {
                 self.role_menu_open = false;
                 self.pending_reply = None;
                 self.reset_pagination_state();
-
+                // Capture synchronously (not from the ChatCleared callback):
+                // the reply is dropped but the draft text is kept, and the
+                // entry must be snapshotted under the context that was
+                // visible when the clear was requested.
+                let draft = self.capture_draft(DRAFT_SETTLE_MS);
                 // Build agent ID and schedule async cleanup.
                 let sender = match &self.selected_user {
                     Some(s) => s.clone(),
-                    None => return Task::none(),
+                    None => return draft,
                 };
-                Task::perform(
+                let clear_task = Task::perform(
                     async move {
                         // Clear the session the user actually talks to — the
                         // same (role, workspace) resolution as routing and
@@ -1475,7 +1575,8 @@ impl HomeState {
                         Ok(()) => HomeMessage::ChatCleared,
                         Err(e) => HomeMessage::ChatClearError(e),
                     },
-                )
+                );
+                Task::batch([draft, clear_task])
             }
             HomeMessage::ChatCleared => {
                 // Belt and suspenders: ClearChat cleared the message list and
@@ -1506,13 +1607,23 @@ impl HomeState {
                     &content,
                     &user_name,
                 ));
+                let draft = self.capture_draft(DRAFT_SETTLE_MS);
                 // Refocus the composer so the user can type the reply
                 // immediately, matching the select-to-focus affordance
                 // established by the composer's `Id`.
-                iced::widget::operation::focus::<HomeMessage>(CHAT_COMPOSER_ID)
+                Task::batch([
+                    iced::widget::operation::focus::<HomeMessage>(CHAT_COMPOSER_ID),
+                    draft,
+                ])
             }
             HomeMessage::CancelReply => {
                 self.pending_reply = None;
+                self.capture_draft(DRAFT_SETTLE_MS)
+            }
+            HomeMessage::DraftSaveSettled { generation } => {
+                if self.draft_save.should_process(generation) {
+                    self.drafts.clone().persist_async();
+                }
                 Task::none()
             }
             HomeMessage::SwitchRole(user, role) => {
@@ -1851,16 +1962,21 @@ impl HomeState {
             if let Err(e) = tx.send(msg) {
                 tracing::error!("Home: failed to send message via GUI_MESSAGE_TX: {e}");
                 self.sending = false;
+                self.drop_current_draft();
                 return Task::none();
             }
         } else {
             tracing::error!("Home: GUI_MESSAGE_TX not initialized");
             self.sending = false;
+            self.drop_current_draft();
             return Task::none();
         }
 
         // The send was queued — drop the pending reply so the preview clears.
         self.pending_reply = None;
+        // The composer is cleared: remove the persisted draft for this context
+        // so it cannot resurrect on a later restore.
+        self.drop_current_draft();
 
         // Spawn a safety timeout: if sending stays true for 30 seconds
         // (silent agent failure, crash, cancellation), auto-clear it.
@@ -2024,9 +2140,60 @@ mod tests {
 
     fn make_home_state(user: &str, workspace: &str) -> HomeState {
         let mut state = HomeState::new();
+        // Hermetic draft store bound to a throwaway temp dir so tests never
+        // touch the real `~/.mahbot/chat-draft.json`.
+        state.drafts = hermetic_draft_store();
         state.selected_user = Some(user.to_string());
         state.selected_workspace = Some(workspace.to_string());
         state
+    }
+
+    /// A draft store backed by a unique throwaway file under one shared test
+    /// temp dir, so tests never touch the real `~/.mahbot/chat-draft.json`.
+    fn hermetic_draft_store() -> Arc<crate::channels::chat_draft::DraftStore> {
+        static DIR: std::sync::LazyLock<tempfile::TempDir> =
+            std::sync::LazyLock::new(|| tempfile::tempdir().unwrap());
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::channels::chat_draft::DraftStore::at(Some(
+            DIR.path().join(format!("draft-{n}.json")),
+        ))
+    }
+
+    #[test]
+    fn draft_capture_and_context_swap() {
+        let mut state = make_home_state("alice", "ws1");
+
+        // Typing captures synchronously into the store under the current key.
+        let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('h')));
+        assert_eq!(
+            state.drafts.get("alice", "ws1").map(|e| e.text).as_deref(),
+            Some("h")
+        );
+
+        // While the user switch is resolving, capture is suppressed: nothing
+        // may land under the stale (bob, ws1) key.
+        let _ = state.update(HomeMessage::UserSelected("bob".to_string()));
+        let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('x')));
+        assert_eq!(state.drafts.get("bob", "ws1"), None);
+
+        // Resolution completes: the incoming context restores — no entry means
+        // the composer is cleared (per-context swap, not leak).
+        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws2".to_string())));
+        assert_eq!(state.editor_content.text(), "");
+        assert!(!state.context_resolving);
+
+        // The resolved context captures under its own key...
+        let _ = state.update(HomeMessage::InputChanged(EditorAction::Insert('b')));
+        assert_eq!(
+            state.drafts.get("bob", "ws2").map(|e| e.text).as_deref(),
+            Some("b")
+        );
+
+        // ...and switching back swaps again, restoring alice's draft.
+        let _ = state.update(HomeMessage::UserSelected("alice".to_string()));
+        let _ = state.update(HomeMessage::WorkspaceChanged(Some("ws1".to_string())));
+        assert_eq!(state.editor_content.text(), "h");
     }
 
     fn make_msg(
@@ -2382,7 +2549,12 @@ mod tests {
             "personal picker without a project workspace shows only the personal chat"
         );
         assert!(!personal_only.workspace_visible("ws1"));
-        assert_eq!(HomeState::new().visible_workspaces(), None);
+        let mut state = HomeState::new();
+        // Hermetic store: `HomeState::new()` binds the global store first, so
+        // swap in a throwaway one before anything can use it. (The global
+        // bind itself only ever reads the real file, fail-open.)
+        state.drafts = hermetic_draft_store();
+        assert_eq!(state.visible_workspaces(), None);
     }
 
     #[test]

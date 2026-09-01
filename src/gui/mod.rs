@@ -708,6 +708,7 @@ impl Dashboard {
     }
 
     fn save_and_exit(&self) -> Task<Message> {
+        crate::channels::chat_draft::flush_global();
         self.persist_window_state();
         if crate::self_update::update_in_progress() && crate::self_update::update_is_finalizing() {
             // The update path has shut down the daemon and owns the exit:
