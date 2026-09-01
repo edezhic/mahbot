@@ -853,13 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn contains_glob_detects_wildcards() {
-        assert!(crate::tools::path::contains_glob("src/*.rs", true));
-        assert!(crate::tools::path::contains_glob("lib?.rs", true));
-        assert!(!crate::tools::path::contains_glob("src/main.rs", true));
-    }
-
-    #[test]
     fn normalize_tool_call_repairs_names_and_args() {
         let (name, args) = normalize_tool_call("bash", serde_json::json!({"cmd": "echo hi"}));
         assert_eq!(name, "shell");

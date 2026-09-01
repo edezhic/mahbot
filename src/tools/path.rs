@@ -2275,4 +2275,33 @@ mod tests {
             );
         }
     }
+
+    // ── shell_quote / contains_glob ─────────────────────────────────────
+
+    #[test]
+    fn shell_quoting_edge_cases() {
+        // Simple path
+        assert_eq!(shell_quote("/tmp/dir"), "'/tmp/dir'");
+        // Path with spaces
+        assert_eq!(shell_quote("/my dir/file"), "'/my dir/file'");
+        // Path with single quote
+        assert_eq!(shell_quote("/it's dir"), "'/it'\\''s dir'");
+        // Path with dollar sign
+        assert_eq!(shell_quote("/$dir"), "'/$dir'");
+        // Path with backtick
+        assert_eq!(shell_quote("/`dir`"), "'/`dir`'");
+        // Path with backslash
+        assert_eq!(shell_quote("/dir\\name"), "'/dir\\name'");
+        // Empty string
+        assert_eq!(shell_quote(""), "''");
+        // Already quoted — just wraps
+        assert_eq!(shell_quote("normal"), "'normal'");
+    }
+
+    #[test]
+    fn contains_glob_detects_wildcards() {
+        assert!(contains_glob("src/*.rs", true));
+        assert!(contains_glob("lib?.rs", true));
+        assert!(!contains_glob("src/main.rs", true));
+    }
 }
