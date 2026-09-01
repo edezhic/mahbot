@@ -42,7 +42,7 @@ pub struct ToolErrorEntry {
     pub recorded_at: String,
 }
 
-/// Query filters for [`crate::logs::LogStore::query_tool_errors`] / [`crate::logs::LogStore::count_tool_errors`].
+/// Query filters for [`crate::logs::LogStore::query_tool_errors`].
 ///
 /// All fields are optional — `None` means no filter is applied.
 #[derive(Debug, Clone, Default)]
@@ -67,21 +67,6 @@ impl crate::logs::LogStore {
             .map(|opt| opt.expect("COUNT(*) aggregate always returns a row"))
     }
 
-    /// Count the total number of tool call error rows matching the optional
-    /// query filters.
-    pub(crate) async fn count_tool_errors(&self, query: &ToolErrorQuery) -> Result<usize> {
-        let (where_clause, params) = build_tool_error_filter(query);
-        let sql = format!("SELECT COUNT(*) FROM tool_calls WHERE {where_clause}");
-        self.conn
-            .query_optional(&sql, params, |row| row.get::<i64>(0))
-            .await
-            .map(|opt| opt.expect("COUNT(*) aggregate always returns a row"))
-            .map(|n: i64| {
-                usize::try_from(n)
-                    .expect("count_tool_errors returned negative count; DB invariant violated")
-            })
-    }
-
     /// Query tool call error entries with optional filters and pagination.
     ///
     /// Returns `(entries, total_count)` where each entry corresponds to a
@@ -92,12 +77,21 @@ impl crate::logs::LogStore {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<ToolErrorEntry>, usize)> {
-        let total = self.count_tool_errors(query).await?;
+        let (where_clause, filter_params) = build_tool_error_filter(query);
+
+        let count_sql = format!("SELECT COUNT(*) FROM tool_calls WHERE {where_clause}");
+        let total = self
+            .conn
+            .query_row(&count_sql, filter_params.clone(), |row| row.get::<i64>(0))
+            .await
+            .map(|n: i64| {
+                usize::try_from(n)
+                    .expect("tool-error count returned a negative value; DB invariant violated")
+            })?;
         if total == 0 {
             return Ok((vec![], 0));
         }
 
-        let (where_clause, filter_params) = build_tool_error_filter(query);
         let limit_val = i64::try_from(limit)
             .expect("query_tool_errors limit overflowed i64; limit must be <= i64::MAX");
         let offset_val = i64::try_from(offset)
