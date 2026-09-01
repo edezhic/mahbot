@@ -210,7 +210,7 @@ fn extract_sender_user_name(message: &serde_json::Value) -> String {
         .get("from")
         .and_then(|from| from.get("username"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown")
+        .unwrap_or(crate::users::TELEGRAM_UNKNOWN_SENTINEL)
         .to_string()
 }
 
@@ -354,7 +354,7 @@ fn format_sender_label(from: &serde_json::Value) -> String {
     } else {
         from.get("first_name")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
+            .unwrap_or(crate::users::TELEGRAM_UNKNOWN_SENTINEL)
             .to_string()
     }
 }
@@ -642,6 +642,12 @@ async fn resolve_authorized_sender(
     chat_source: &serde_json::Value,
 ) -> Option<(String, String, String)> {
     let username = extract_sender_user_name(sender_source);
+    // Fail-closed: the sentinel is never a valid binding identity. Even if a
+    // legacy "unknown" row exists in user_channels, a username-less sender
+    // must stay unauthorized.
+    if username == crate::users::TELEGRAM_UNKNOWN_SENTINEL {
+        return None;
+    }
     // Look up the canonical user name via user_channels binding
     let canonical_user = crate::users::resolve_user_by_channel("telegram", &username).await?;
     let (chat_id, reply_target) = extract_chat_context(chat_source)?;

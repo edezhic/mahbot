@@ -92,23 +92,13 @@ impl Tool for BindTelegramTool {
         // full-permissions user.
         let user = "admin";
         let handle = super::get_str(&args, "telegram_handle")?;
-        let handle = handle.strip_prefix('@').unwrap_or(handle);
 
         let store = crate::users::store();
-        // Fail-closed anti-steal guard: reject a handle already bound to a different
-        // user before the INSERT OR REPLACE can silently reassign it. The store method
-        // propagates a read error (unlike the free helper, which swallows it).
-        if let Some(existing) = store.resolve_user_by_channel("telegram", handle).await?
-            && existing != user
-        {
-            return Err(err(format!(
-                "@{handle} is already bound to user '{existing}'"
-            )));
-        }
+        let handle = store.validate_telegram_bind(user, handle).await?;
 
-        store.bind_channel(user, "telegram", handle).await?;
+        store.bind_channel(user, "telegram", &handle).await?;
         store
-            .update_channel_contact("telegram", handle, handle)
+            .update_channel_contact("telegram", &handle, &handle)
             .await?;
         Ok(format!(
             "Bound @{handle} to your account. Messages sent to the bot from that @username \
@@ -212,21 +202,11 @@ impl Tool for AddUserTool {
         if !matches!(agent, Role::Assistant | Role::Artist) {
             return Err(err("default_agent must be 'assistant' or 'artist'"));
         }
-        let handle = handle.strip_prefix('@').unwrap_or(handle);
 
         let store = crate::users::store();
-        // Guard against silently stealing a handle already bound to another user
-        // (the underlying `bind_channel` is INSERT OR REPLACE) — checked before any
-        // mutation so a rejected handle leaves no partial state behind. The store
-        // method is fail-closed (propagates a read error) unlike the free helper,
-        // which swallows it and would let the reassignment proceed.
-        if let Some(existing) = store.resolve_user_by_channel("telegram", handle).await?
-            && existing != name
-        {
-            return Err(err(format!(
-                "@{handle} is already bound to user '{existing}'"
-            )));
-        }
+        // Normalize + guard the handle (reserved sentinel, anti-steal) before any
+        // other check so a rejected handle wins over e.g. "user already exists".
+        let handle = store.validate_telegram_bind(name, handle).await?;
 
         let mut existing_unbound = false;
         if store.user_exists(name).await? {
@@ -266,7 +246,7 @@ impl Tool for AddUserTool {
         }
 
         store.add_user(name, None, agent).await?;
-        store.bind_channel(name, "telegram", handle).await?;
+        store.bind_channel(name, "telegram", &handle).await?;
 
         let role_note = "They are a regular (non-admin) user: they can chat with the \
                          Assistant and Artist agents only.";

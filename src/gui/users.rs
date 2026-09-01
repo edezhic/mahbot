@@ -256,21 +256,17 @@ impl UsersState {
                 Task::none()
             }
             UsersMessage::SubmitBind(user_name) => {
-                if self.bind_input.text().trim().is_empty() {
-                    self.bind_error = Some("Telegram username required".into());
-                    return Task::none();
-                }
                 self.binding = true;
                 self.bind_error = None;
-                // Strip leading @ if the admin typed it.
-                let mut identifier = self.bind_input.text().trim().to_string();
-                if let Some(stripped) = identifier.strip_prefix('@') {
-                    identifier = stripped.to_string();
-                }
                 let user_clone = user_name.clone();
+                let input = self.bind_input.text().clone();
                 Task::perform(
                     async move {
                         let store = user_store()?;
+                        let identifier = store
+                            .validate_telegram_bind(&user_clone, &input)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         store
                             .bind_channel(&user_clone, "telegram", &identifier)
                             .await

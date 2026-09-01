@@ -753,6 +753,34 @@ fn test_extract_sender_user_name() {
     assert_eq!(username, "unknown");
 }
 
+#[tokio::test]
+async fn usernameless_sender_stays_unauthorized_despite_legacy_binding() {
+    // Initializes the shared global test store with alice/bob bound.
+    let _ch = test_channel().await;
+    // Simulate a legacy row binding the "unknown" sentinel to alice.
+    crate::users::store()
+        .bind_channel("alice", "telegram", "unknown")
+        .await
+        .unwrap();
+    // A username-less sender resolves to the sentinel, which the guard rejects
+    // before any user_channels lookup — so it stays unauthorized even though a
+    // legacy "unknown" row exists. The chat context is valid, so only the
+    // sentinel guard can produce None here.
+    assert!(
+        resolve_authorized_sender(
+            &serde_json::json!({"id": 1}),
+            &serde_json::json!({"chat": {"id": 42}}),
+        )
+        .await
+        .is_none()
+    );
+    // Clean up so the shared store isn't polluted for later tests.
+    crate::users::store()
+        .unbind_channel("alice", "telegram", "unknown")
+        .await
+        .unwrap();
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // extract_reply_context tests
 // ─────────────────────────────────────────────────────────────────────

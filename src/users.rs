@@ -26,6 +26,28 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+/// Sentinel that `extract_sender_user_name` (src/channels/telegram.rs)
+/// substitutes for Telegram senders without an @username. Never a valid
+/// binding identifier: a binding with this identifier would authorize every
+/// username-less sender as its owner.
+pub(crate) const TELEGRAM_UNKNOWN_SENTINEL: &str = "unknown";
+
+/// Normalize a Telegram handle for binding: trim surrounding whitespace and
+/// strip one leading `@`, then trim again. Rejects an empty handle and the
+/// reserved `TELEGRAM_UNKNOWN_SENTINEL` (matched case-sensitively — a real
+/// user legitimately named @Unknown stays bindable).
+fn normalize_telegram_handle(handle: &str) -> anyhow::Result<String> {
+    let handle = handle.trim();
+    let handle = handle.strip_prefix('@').unwrap_or(handle).trim();
+    if handle.is_empty() {
+        anyhow::bail!("Telegram handle is empty");
+    }
+    if handle == TELEGRAM_UNKNOWN_SENTINEL {
+        anyhow::bail!("'unknown' is a reserved Telegram handle and cannot be bound");
+    }
+    Ok(handle.to_string())
+}
+
 crate::define_store! {
     /// Global user store.
     pub(crate) static USER_STORE: UserStore,
@@ -168,10 +190,13 @@ impl UserStore {
 
     // ── Channel bindings ──────────────────────────────────────
 
-    /// Bind a channel to a user. `channel` is e.g. `"telegram"`, `identifier`
-    /// is the channel-specific identifier (Telegram @username without the @ prefix).
-    /// Uses INSERT OR REPLACE — binding a username already assigned to another
-    /// user silently reassigns it.
+    /// Low-level upsert binding a `(channel, identifier)` pair to a user.
+    /// `channel` is e.g. `"telegram"`, `identifier` is the channel-specific
+    /// identifier (Telegram @username without the @ prefix). Uses
+    /// INSERT OR REPLACE — a `(channel, identifier)` pair already bound to
+    /// another user is silently reassigned. User-facing Telegram bind paths
+    /// must call [`UserStore::validate_telegram_bind`] first (reserved-sentinel
+    /// + anti-steal guards).
     pub async fn bind_channel(
         &self,
         user_name: &str,
@@ -186,6 +211,22 @@ impl UserStore {
             )
             .await?;
         Ok(())
+    }
+
+    /// Validate a Telegram handle on a user-facing bind path and return the
+    /// normalized identifier (trimmed, leading `@` stripped) ready for
+    /// [`UserStore::bind_channel`]. Rejects the reserved "unknown" sentinel and
+    /// fails closed on a handle already bound to a DIFFERENT user (anti-steal:
+    /// `bind_channel` is INSERT OR REPLACE and would silently reassign it).
+    /// Rebinding the same user stays allowed.
+    pub async fn validate_telegram_bind(&self, user_name: &str, handle: &str) -> Result<String> {
+        let handle = normalize_telegram_handle(handle)?;
+        if let Some(existing) = self.resolve_user_by_channel("telegram", &handle).await?
+            && existing != user_name
+        {
+            anyhow::bail!("@{handle} is already bound to user '{existing}'");
+        }
+        Ok(handle)
     }
 
     /// Unbind a channel from a user.
@@ -990,6 +1031,63 @@ mod tests {
         assert!(
             store.find_by_name("doomed").await.unwrap().is_none(),
             "the user row must be deleted"
+        );
+    }
+
+    #[test]
+    fn normalize_telegram_handle_rules() {
+        assert_eq!(normalize_telegram_handle("alice").unwrap(), "alice");
+        assert_eq!(normalize_telegram_handle("  alice  ").unwrap(), "alice");
+        assert_eq!(normalize_telegram_handle("@alice").unwrap(), "alice");
+        // A leading @ is stripped once, then the remainder is trimmed.
+        assert_eq!(normalize_telegram_handle(" @ alice ").unwrap(), "alice");
+        // Reserved sentinel is rejected (case-sensitively — "Unknown" stays bindable).
+        assert!(normalize_telegram_handle("unknown").is_err());
+        assert!(normalize_telegram_handle("   ").is_err());
+        assert!(normalize_telegram_handle("@").is_err());
+        assert_eq!(normalize_telegram_handle("Unknown").unwrap(), "Unknown");
+    }
+
+    #[tokio::test]
+    async fn validate_telegram_bind_guards() {
+        crate::util::test::init_test_stores().await;
+        let store = store();
+        store
+            .add_user("bind_guard_owner", None, Role::Assistant)
+            .await
+            .unwrap();
+        store
+            .bind_channel("bind_guard_owner", "telegram", "guard_handle")
+            .await
+            .unwrap();
+
+        // Rebinding the same owner is allowed.
+        assert_eq!(
+            store
+                .validate_telegram_bind("bind_guard_owner", "@guard_handle")
+                .await
+                .unwrap(),
+            "guard_handle"
+        );
+
+        // Anti-steal: a different user cannot take over the handle.
+        let err = store
+            .validate_telegram_bind("bind_guard_other", "guard_handle")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("bind_guard_owner"),
+            "error must name the current owner: {err}"
+        );
+
+        // Reserved sentinel is rejected, fail-closed.
+        let err = store
+            .validate_telegram_bind("bind_guard_owner", "unknown")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("reserved"),
+            "error must mention 'reserved': {err}"
         );
     }
 
