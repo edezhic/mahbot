@@ -61,15 +61,23 @@ pub(crate) fn truncate_at_boundary(s: &str, max_chars: usize) -> String {
     format!("{}…", s[..end].trim_end())
 }
 
+/// Single-line display form of `s`: control characters (newlines, tabs)
+/// collapsed to spaces, collecting at most `max_chars + 1` chars — all that
+/// [`truncate_at_boundary`] can need to honour a `max_chars` cap, so a long
+/// source is never fully scanned per render.
+pub(crate) fn collapse_control_chars(s: &str, max_chars: usize) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max_chars + 1)
+        .collect()
+}
+
 /// Single-line display form of a value: control characters (newlines, tabs)
 /// collapsed to spaces, then truncated to [`MAX_TOOL_VALUE_CHARS`] chars at a
 /// word/path-delimiter boundary with "…" when cut. The bool reports whether
 /// the value was char-cut (drives the hover tooltip).
 fn value_display(value: &str) -> (String, bool) {
-    let single_line: String = value
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let single_line = collapse_control_chars(value, MAX_TOOL_VALUE_CHARS);
     let was_char_cut = single_line.chars().count() > MAX_TOOL_VALUE_CHARS;
     let display = truncate_at_boundary(&single_line, MAX_TOOL_VALUE_CHARS);
     (display, was_char_cut)

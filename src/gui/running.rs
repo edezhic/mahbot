@@ -18,10 +18,12 @@
 //!   line) starts on the second row at the card's left edge. Narration (the
 //!   assistant's short reasoning
 //!   text) is shown exactly once — as the current (latest) trace-group label,
-//!   which shows a neutral "thinking…" placeholder while its narration hasn't
+//!   which shows a neutral "clanking" placeholder while its narration hasn't
 //!   committed; a brand-new agent with no trace group shows a card-level
-//!   "thinking…" placeholder. The narration renders at 14px italic, never
-//!   truncated — the full reasoning text stays a hover tooltip. The live
+//!   "clanking" placeholder. The narration renders at 14px italic, never
+//!   truncated — the full reasoning text stays a hover tooltip — while a
+//!   silent round (empty narration) with a decoded Reasoning block promotes
+//!   that reasoning into the label: capped, plain, no tooltip. The live
 //!   activity phase label (a non-tool LLM call) renders as a separate line at
 //!   the very bottom of the card in both the collapsed and expanded state. The
 //!   currently-executing tool(s) are the "current toolcalls" and render at the
@@ -59,8 +61,8 @@ use crate::ChatRole;
 use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey, RunningTool};
 use crate::gui::dialog;
 use crate::gui::session_view::{
-    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, ToolBlockView, build_ledger, tool_block,
-    truncate_at_boundary,
+    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, ToolBlockView, build_ledger, collapse_control_chars,
+    promoted_reasoning, tool_block, truncate_at_boundary,
 };
 use crate::gui::theme;
 use crate::gui::widgets;
@@ -606,9 +608,9 @@ fn workspace_label_for(
 /// card is clickable to expand/collapse the trace groups.
 ///
 /// Narration (the assistant's short reasoning text) lives solely in the
-/// current trace-group label, which shows a "thinking…" placeholder while its
+/// current trace-group label, which shows a "clanking" placeholder while its
 /// narration hasn't committed; a brand-new agent with no trace group shows a
-/// card-level "thinking…" placeholder. The live activity phase label (an
+/// card-level "clanking" placeholder. The live activity phase label (an
 /// in-flight non-tool LLM call, e.g. extracting/summarizing/transcribing)
 /// renders as a separate accent line at the very bottom of the card in both
 /// the collapsed and expanded state. The currently-executing tools are the
@@ -650,11 +652,11 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         .push(render_metrics(token_count, &elapsed));
     content = content.push(first_row);
     // A brand-new agent with no trace group yet (no history to project from)
-    // shows a card-level "thinking…" placeholder. Once any group exists the
+    // shows a card-level "clanking" placeholder. Once any group exists the
     // current group's own label handles narration / thinking, so this fallback
     // must not render at card level.
     if groups.is_empty() {
-        content = content.push(thinking_placeholder());
+        content = content.push(clanking_placeholder());
     }
     // Trace groups from the live snapshot (current unless the agent has no
     // transcript yet). Content-only assistant messages (final answers) are
@@ -705,8 +707,10 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
 }
 
 /// The narration typography of the trace-group labels: italic at
-/// [`theme::NARRATION_TEXT_SIZE`], never truncated — the full reasoning stays
-/// a hover tooltip — and wrapping within the row.
+/// [`theme::NARRATION_TEXT_SIZE`] with wrapping within the row. A narration
+/// label is never truncated and keeps the full reasoning as a hover tooltip;
+/// a promoted reasoning label is pre-capped by
+/// [`promoted_reasoning_label`] and carries no tooltip.
 fn narration_text(narration: &str) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     text(narration.to_owned())
         .size(theme::NARRATION_TEXT_SIZE)
@@ -715,11 +719,27 @@ fn narration_text(narration: &str) -> iced::widget::Text<'static, iced::Theme, i
         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
 }
 
-/// The neutral "thinking…" placeholder shown while a narration has not
+/// Max display length (Unicode chars) of a promoted reasoning label. The
+/// narration itself never truncates, but a promoted long CoT fallback is
+/// capped so it cannot dominate the card.
+const MAX_PROMOTED_LABEL_CHARS: usize = 200;
+
+/// Single-line display form of a promoted reasoning label: control
+/// characters collapsed to spaces ([`collapse_control_chars`]), then capped
+/// at [`MAX_PROMOTED_LABEL_CHARS`] chars at a word/path-delimiter boundary
+/// with "…" ([`truncate_at_boundary`]).
+fn promoted_reasoning_label(reasoning: &str) -> String {
+    truncate_at_boundary(
+        &collapse_control_chars(reasoning, MAX_PROMOTED_LABEL_CHARS),
+        MAX_PROMOTED_LABEL_CHARS,
+    )
+}
+
+/// The neutral "clanking" placeholder shown while a narration has not
 /// committed yet (a brand-new agent with no trace groups, or a current
 /// group awaiting its first narration).
-fn thinking_placeholder() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
-    text("thinking…")
+fn clanking_placeholder() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
+    text("clanking")
         .size(theme::TEXT_13)
         .color(theme::TEXT_SECONDARY)
 }
@@ -786,11 +806,36 @@ fn render_visible_groups(
     rendered
 }
 
+/// The text a trace group renders as its narration label: the group's
+/// narration (wrapped in the reasoning hover tooltip), or — when the
+/// narration is empty (whitespace-only counts as empty) — the group's
+/// promoted reasoning as a capped label (no tooltip: the label already
+/// shows the text), or the neutral "clanking" placeholder for a silent
+/// group (no narration and no reasoning).
+enum GroupLabelText<'a> {
+    Narration(&'a str),
+    Promoted(String),
+    Placeholder,
+}
+
+fn group_label_text(group: &TraceGroup) -> GroupLabelText<'_> {
+    if let Some(reasoning) = promoted_reasoning(Some(&group.narration), group.reasoning.as_deref())
+    {
+        GroupLabelText::Promoted(promoted_reasoning_label(reasoning))
+    } else if !group.narration.trim().is_empty() {
+        GroupLabelText::Narration(&group.narration)
+    } else {
+        GroupLabelText::Placeholder
+    }
+}
+
 /// Render one trace group. `expand_current` renders the newest round's calls
 /// expanded (current group); otherwise every call collapses to a name-only
 /// line (previous groups). The group's narration label always renders (the
-/// short reasoning text, or the "thinking…" placeholder when empty); hovering
-/// the label reveals the group's full decoded Reasoning when it carried one.
+/// short reasoning text, its promoted capped reasoning, or the "clanking"
+/// placeholder); hovering the narration label — not the promoted one, which
+/// already shows the text — reveals the group's full decoded Reasoning when
+/// it carried one.
 fn render_trace_group(
     group: &TraceGroup,
     expand_current: bool,
@@ -798,16 +843,12 @@ fn render_trace_group(
     let mut column = Column::new()
         .spacing(theme::SPACE_4)
         .align_x(Alignment::Start);
-    let label: Element<'static, RunningMessage> = if group.narration.is_empty() {
-        // A group that has not committed its narration yet opens with the
-        // placeholder; it is deliberately neutral (never accent), and still
-        // reveals the group's reasoning on hover.
-        reasoning_tooltip(group.reasoning.as_deref(), thinking_placeholder().into())
-    } else {
-        reasoning_tooltip(
-            group.reasoning.as_deref(),
-            narration_text(&group.narration).into(),
-        )
+    let label: Element<'static, RunningMessage> = match group_label_text(group) {
+        GroupLabelText::Narration(narration) => {
+            reasoning_tooltip(group.reasoning.as_deref(), narration_text(narration).into())
+        }
+        GroupLabelText::Promoted(promoted) => narration_text(&promoted).into(),
+        GroupLabelText::Placeholder => clanking_placeholder().into(),
     };
     column = column.push(label);
 
@@ -907,15 +948,18 @@ pub(crate) fn prune_expanded(expanded: &mut HashSet<(String, u64)>, agents: &[Ag
 /// Derived from the shared session ledger: the group's narration comes from
 /// the decoded assistant `content` (the short visible reasoning text); its
 /// `reasoning` is the long decoded `Reasoning` block of the group's rounds,
-/// surfaced on hover. A group always carries at least one round.
+/// surfaced on hover or promoted into the label. A group always carries at
+/// least one round.
 struct TraceGroup {
-    /// The assistant's short visible narration (empty → rendered "thinking…").
+    /// The assistant's short visible narration (empty → renders "clanking",
+    /// or the promoted capped reasoning label when the group carries one).
     /// This is the decoded assistant `content`, NEVER the long `Reasoning`
     /// / `[thinking]` block.
     narration: String,
     /// The full decoded Reasoning of the group: the first non-empty reasoning
-    /// among its rounds. `None` when the rounds carried none (the narration
-    /// label then renders bare, no hover tooltip).
+    /// among its rounds. Surfaced on hover behind a narration label, or
+    /// promoted into the label itself when the narration is empty. `None` when
+    /// the rounds carried none (a silent group then renders "clanking").
     reasoning: Option<String>,
     /// Tool-call rounds in first-appearance order; the LAST round is the newest
     /// (expanded in the current group), earlier rounds collapse.
@@ -932,7 +976,7 @@ struct TraceGroup {
 ///   group.
 /// - A real user turn closes the current group; the next tool-call round then
 ///   starts a fresh one even with no narration (its `narration` slots to
-///   "thinking…").
+///   "clanking").
 /// - Synthetic tool-injected user messages (content starting with the
 ///   `crate::util::INJECTED_IMAGE_TAG` marker, `<injected-tool-result-image>`)
 ///   are part of the ongoing tool sequence and never reset the group.
@@ -1691,6 +1735,71 @@ mod tests {
             "read file x2, list files",
             "underscores become spaces; `xN` counts collapsed repetitions; first-appearance order"
         );
+    }
+
+    #[test]
+    fn promoted_reasoning_is_group_label() {
+        // A silent round (empty narration) that carries a decoded Reasoning
+        // block still forms exactly one group (boundary unchanged) and its
+        // label is the promoted reasoning text — not a placeholder. A later
+        // narrated round starts a second group (fragmentation did not grow).
+        let history = vec![
+            assistant_tool_call_reasoning(
+                "",
+                &[("read", serde_json::json!({"path": "a.rs"}))],
+                Some("Checking the file first"),
+            ),
+            assistant_tool_call_reasoning(
+                "Now editing",
+                &[("edit", serde_json::json!({"path": "b.rs"}))],
+                None,
+            ),
+        ];
+        let groups = derive_trace_groups(&build_ledger(&history));
+        assert_eq!(groups.len(), 2, "new narration starts a second group");
+        assert!(
+            groups[0].narration.is_empty(),
+            "silent round keeps empty narration"
+        );
+        assert!(
+            matches!(
+                group_label_text(&groups[0]),
+                GroupLabelText::Promoted(s) if s == "Checking the file first"
+            ),
+            "silent round with reasoning labels as its promoted reasoning"
+        );
+        assert_eq!(groups[1].narration, "Now editing");
+    }
+
+    #[test]
+    fn silent_round_without_reasoning_is_placeholder() {
+        let history = vec![assistant_tool_call(
+            "",
+            &[("read", serde_json::json!({"path": "a.rs"}))],
+        )];
+        let groups = derive_trace_groups(&build_ledger(&history));
+        assert_eq!(groups.len(), 1);
+        assert!(
+            matches!(group_label_text(&groups[0]), GroupLabelText::Placeholder),
+            "no narration and no reasoning → neutral placeholder"
+        );
+    }
+
+    #[test]
+    fn promoted_label_caps_at_limit() {
+        // A long multi-word reasoning is collapsed to one line and capped at
+        // the word/path-delimiter boundary with "…" (the narration itself is
+        // never truncated, but a promoted fallback must not dominate the card).
+        let long = "word ".repeat(80); // 400 chars
+        let capped = promoted_reasoning_label(&long);
+        assert!(capped.ends_with('…'));
+        assert!(
+            capped.chars().count() <= MAX_PROMOTED_LABEL_CHARS + 1,
+            "cap adds at most the trailing ellipsis"
+        );
+        // Short text passes through unchanged, with control chars collapsed.
+        assert_eq!(promoted_reasoning_label("do it now"), "do it now");
+        assert_eq!(promoted_reasoning_label("line1\nline2"), "line1 line2");
     }
 
     #[test]

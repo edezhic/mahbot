@@ -23,7 +23,9 @@ mod render;
 
 // Shared components re-exported for the Sessions page (full view) and the
 // Running Agents page (compact projection).
-pub(crate) use render::{MAX_TOOL_TOOLTIP_WIDTH, ToolBlockView, tool_block, truncate_at_boundary};
+pub(crate) use render::{
+    MAX_TOOL_TOOLTIP_WIDTH, ToolBlockView, collapse_control_chars, tool_block, truncate_at_boundary,
+};
 
 /// One entry of the flat session ledger: a regular message (system/user/
 /// assistant, optionally carrying a thinking block) or one assistant
@@ -177,6 +179,22 @@ pub(crate) fn parse_entry_bodies(entries: &[SessionEntry]) -> Vec<Option<Vec<mar
         .collect()
 }
 
+/// The reasoning promoted into a tool round's narration slot, if any: the
+/// assistant text content is empty (whitespace-only counts as empty) while a
+/// decoded Reasoning block is present. Render-only signal — the ledger itself
+/// is untouched, empty content stays empty in the history and in the model
+/// replay. Used by both the Sessions page (narration body) and the Running
+/// Agents page (trace-group label fallback).
+pub(crate) fn promoted_reasoning<'a>(
+    narration: Option<&'a str>,
+    reasoning: Option<&'a str>,
+) -> Option<&'a str> {
+    match reasoning {
+        Some(reasoning) if narration.is_none_or(|n| n.trim().is_empty()) => Some(reasoning),
+        _ => None,
+    }
+}
+
 /// Escape `<` → `&lt;` only inside the regions the markdown parser classifies
 /// as HTML (block-level `Event::Html` plus inline `Event::InlineHtml`), so
 /// angle-bracket tag blocks (`<system-notification>`, `<analyze-tool-result>`,
@@ -288,6 +306,116 @@ mod tests {
                 assert_eq!(content.as_deref(), Some("hello"));
             }
             other => panic!("expected a single Message entry, got {other:?}"),
+        }
+    }
+
+    /// Build an assistant tool-call message with an optional decoded `content`
+    /// (null when `None`) and an optional `reasoning` field, so the ledger's
+    /// `ToolRound` carries the promoted-reasoning signal under test.
+    fn assistant_tool_call(content: Option<&str>, reasoning: Option<&str>) -> ChatMessage {
+        let calls = vec![serde_json::json!({
+            "id": "call_1",
+            "name": "read",
+            "arguments": serde_json::to_string(&serde_json::json!({"path": "a.rs"})).unwrap(),
+        })];
+        let mut body = serde_json::json!({ "content": content, "tool_calls": calls });
+        if let Some(reasoning) = reasoning {
+            body["reasoning"] = serde_json::json!(reasoning);
+        }
+        ChatMessage::assistant(body.to_string())
+    }
+
+    #[test]
+    fn promoted_reasoning_textless_round_with_reasoning() {
+        let messages = vec![assistant_tool_call(None, Some("Checking the file first"))];
+        let entries = build_ledger(&messages);
+        match &entries[..] {
+            [
+                SessionEntry::ToolRound {
+                    narration,
+                    reasoning,
+                    ..
+                },
+            ] => {
+                assert_eq!(narration.as_deref(), None);
+                assert_eq!(reasoning.as_deref(), Some("Checking the file first"));
+                assert_eq!(
+                    promoted_reasoning(narration.as_deref(), reasoning.as_deref()),
+                    Some("Checking the file first"),
+                    "null content + reasoning promotes"
+                );
+            }
+            other => panic!("expected a single ToolRound entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promoted_reasoning_visible_content_does_not_promote() {
+        let messages = vec![assistant_tool_call(
+            Some("Doing it"),
+            Some("Reasoning here"),
+        )];
+        let entries = build_ledger(&messages);
+        match &entries[..] {
+            [
+                SessionEntry::ToolRound {
+                    narration,
+                    reasoning,
+                    ..
+                },
+            ] => {
+                assert_eq!(narration.as_deref(), Some("Doing it"));
+                assert!(
+                    promoted_reasoning(narration.as_deref(), reasoning.as_deref()).is_none(),
+                    "visible content blocks promotion"
+                );
+            }
+            other => panic!("expected a single ToolRound entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promoted_reasoning_whitespace_content_counts_as_empty() {
+        let messages = vec![assistant_tool_call(Some("   "), Some("Reasoning here"))];
+        let entries = build_ledger(&messages);
+        match &entries[..] {
+            [
+                SessionEntry::ToolRound {
+                    narration,
+                    reasoning,
+                    ..
+                },
+            ] => {
+                assert_eq!(narration.as_deref(), Some("   "));
+                assert!(
+                    promoted_reasoning(narration.as_deref(), reasoning.as_deref()).is_some(),
+                    "whitespace-only content counts as empty"
+                );
+            }
+            other => panic!("expected a single ToolRound entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promoted_reasoning_without_reasoning_does_not_promote() {
+        let messages = vec![assistant_tool_call(None, None)];
+        let entries = build_ledger(&messages);
+        match &entries[..] {
+            [
+                SessionEntry::ToolRound {
+                    narration,
+                    reasoning,
+                    ..
+                },
+            ] => {
+                assert_eq!(narration.as_deref(), None);
+                assert_eq!(reasoning.as_deref(), None);
+                assert!(
+                    promoted_reasoning(narration.as_deref(), reasoning.as_deref()).is_none(),
+                    "no reasoning → no promotion"
+                );
+            }
+            other => panic!("expected a single ToolRound entry, got {other:?}"),
         }
     }
 }

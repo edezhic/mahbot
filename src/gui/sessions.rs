@@ -881,7 +881,9 @@ fn result_block<'a>(
 
 /// Render one session round as a single assistant bubble containing the
 /// reasoning block, the narration body, and one tool block per call with its
-/// collapsible result beneath.
+/// collapsible result beneath. An empty narration slot with a decoded
+/// Reasoning block promotes the reasoning into the narration slot (plain
+/// text) instead of a separate Thinking block.
 fn render_tool_round<'a>(
     ctx: &TranscriptCtx<'a>,
     i: usize,
@@ -892,11 +894,19 @@ fn render_tool_round<'a>(
     let md = ctx.entry_md.get(i).and_then(|m| m.as_deref());
     let mut bubble_col = Column::new().spacing(theme::SPACE_4);
 
-    if let Some(reasoning) = reasoning {
-        bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), reasoning));
-    }
-    if let Some(narration) = narration {
-        bubble_col = bubble_col.push(body_block(ctx, (i, 0), narration, md, true));
+    if let Some(reasoning) = session_view::promoted_reasoning(narration, reasoning) {
+        // The reasoning IS the narration for this round: render it in the
+        // narration slot as plain text (md None — no markdown parse, so CoT
+        // characters never become formatting) and skip the Thinking block,
+        // whose text would duplicate it.
+        bubble_col = bubble_col.push(body_block(ctx, (i, 0), reasoning, None, true));
+    } else {
+        if let Some(reasoning) = reasoning {
+            bubble_col = bubble_col.push(thinking_block(ctx, (i, 1), reasoning));
+        }
+        if let Some(narration) = narration {
+            bubble_col = bubble_col.push(body_block(ctx, (i, 0), narration, md, true));
+        }
     }
 
     for (j, call) in calls.iter().enumerate() {
