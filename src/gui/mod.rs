@@ -2765,9 +2765,9 @@ impl Dashboard {
         ))
     }
 
-    /// Render the git sync indicator (refresh icon + behind/ahead counts, clickable).
-    /// Uses lucide arrow_up/arrow_down at 16px (same as number text) for
-    /// consistent vertical alignment with the 24px refresh icon.
+    /// Render the git sync indicator (behind/ahead counts, clickable).
+    /// Uses lucide arrow_up/arrow_down at 16px (same as the number text) so
+    /// all elements share the same vertical baseline.
     /// Returns `None` when there are no behind/ahead counts or both are zero.
     fn render_git_sync(&self) -> Option<Element<'_, Message>> {
         let (behind, ahead) = self.git_state.behind_ahead()?;
@@ -2814,21 +2814,8 @@ impl Dashboard {
                 .align_y(Alignment::Center)
                 .into()
         };
-        let sync_icon_color = if self.git_state.is_syncing() {
-            theme::TEXT_MUTED
-        } else {
-            theme::ACCENT
-        };
-        let sync_content = row![
-            lucide::refresh_cw::<iced::Theme, iced::Renderer>()
-                .size(theme::TEXT_24)
-                .color(sync_icon_color),
-            sync_text_label,
-        ]
-        .spacing(theme::SPACE_6)
-        .align_y(Alignment::Center);
         Some(widgets::icon_tooltip_button(
-            sync_content,
+            sync_text_label,
             "sync commits pull and push",
             if self.git_state.is_syncing() {
                 None
