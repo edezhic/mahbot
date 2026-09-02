@@ -242,6 +242,10 @@ async fn insert_messages_in_transaction(
     replace: bool,
 ) -> Result<()> {
     let now = db::now();
+    // `created_at` stamps the session_metadata row only on creation (the
+    // freshness gate key for sync resume); it must never be touched by the
+    // ON CONFLICT DO UPDATE clauses below.
+    let created_at = now.clone();
     for msg in messages {
         tx.execute(
             "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -272,8 +276,8 @@ async fn insert_messages_in_transaction(
             tx.execute(
                 &format!(
                     "INSERT INTO session_metadata (agent_id, last_activity, message_count, \
-                     channel, user_name, workspace_name, role) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     channel, user_name, workspace_name, role, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                      ON CONFLICT(agent_id) DO UPDATE SET \
                      last_activity = excluded.last_activity, \
                      channel = excluded.channel, \
@@ -290,6 +294,7 @@ async fn insert_messages_in_transaction(
                     user_name,
                     workspace_name,
                     role,
+                    created_at,
                 ],
             )
             .await?;
@@ -297,13 +302,13 @@ async fn insert_messages_in_transaction(
         None => {
             tx.execute(
                 &format!(
-                    "INSERT INTO session_metadata (agent_id, last_activity, message_count) \
-                     VALUES (?1, ?2, ?3) \
+                    "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
+                     VALUES (?1, ?2, ?3, ?4) \
                      ON CONFLICT(agent_id) DO UPDATE SET \
                      last_activity = excluded.last_activity, \
                      {count_clause}"
                 ),
-                params![agent_id, now, count],
+                params![agent_id, now, count, created_at],
             )
             .await?;
         }
@@ -406,6 +411,79 @@ impl MetadataColumn {
 }
 
 // ── Methods — callable on the static ──────────────────────────
+
+/// One row of the final post-frame sequence returned by
+/// [`SessionStore::settle_tool_results`] — freshly settled results, follow-up
+/// rows and previously captured rows in their final order; the caller replays
+/// it verbatim into memory.
+#[derive(Debug, Clone)]
+pub(crate) struct SettledRow {
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// Build the final post-frame session-row sequence for a settle. The last
+/// tool-call frame's tool results must appear in FRAME CALL ORDER (provider
+/// validity), so:
+///
+/// 1. Captured tool rows are keyed by their decoded `tool_call_id`.
+/// 2. For each frame call id IN ORDER: the new result for that id if present,
+///    else the captured tool row for that id if present.
+/// 3. Then the `follow_up` rows (synthetic user image messages).
+///
+/// The frame-order interleaving (steps 1–2) is the contract. The only
+/// production caller runs before `append_turn_message`, so the dangling frame
+/// is always the session tail and captured rows are only frame sibling tool
+/// rows — each is either consumed in step 2 or dropped by the post-frame
+/// rewrite.
+fn build_settle_sequence(
+    captured: &[SettledRow],
+    frame_calls: &[crate::ToolCall],
+    results: &[(String, String)],
+    follow_up: &[ChatMessage],
+    now: &str,
+) -> Result<Vec<SettledRow>> {
+    let mut captured_by_call_id: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (i, row) in captured.iter().enumerate() {
+        if row.role == "tool"
+            && let Ok(payload) = serde_json::from_str::<crate::ToolResultPayload>(&row.content)
+        {
+            captured_by_call_id.insert(payload.tool_call_id, i);
+        }
+    }
+
+    let new_results: std::collections::HashMap<&str, &str> = results
+        .iter()
+        .map(|(id, content)| (id.as_str(), content.as_str()))
+        .collect();
+
+    let mut sequence = Vec::new();
+    for call in frame_calls {
+        if let Some(content) = new_results.get(call.id.as_str()) {
+            let payload = crate::ToolResultPayload {
+                tool_call_id: call.id.clone(),
+                content: (*content).to_string(),
+            };
+            sequence.push(SettledRow {
+                role: "tool".to_string(),
+                content: serde_json::to_string(&payload)?,
+                created_at: now.to_string(),
+            });
+        } else if let Some(&i) = captured_by_call_id.get(&call.id) {
+            sequence.push(captured[i].clone());
+        }
+    }
+    for msg in follow_up {
+        sequence.push(SettledRow {
+            role: msg.role.to_string(),
+            content: msg.content.clone(),
+            created_at: now.to_string(),
+        });
+    }
+    Ok(sequence)
+}
 
 impl SessionStore {
     pub(crate) async fn load(&self, agent_id: &str) -> Vec<ChatMessage> {
@@ -548,6 +626,162 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Settle (re-)persisted tool results directly after the session's last
+    /// tool-call frame, in one transaction: the rows that follow that frame are
+    /// captured and deleted, the new tool results are inserted at the frame
+    /// boundary in frame call order (preserving any captured sibling tool
+    /// rows), then the follow-up rows (synthetic user image messages).
+    /// `session_metadata.message_count` is bumped by
+    /// `results.len() + follow_up.len()` — exact only because a call with a
+    /// committed result is never pending (the pending scan is the single settle
+    /// source), so no captured frame sibling is ever superseded here; a
+    /// double-settle of the same frame would drift the count and is out of
+    /// contract. Returns the full final post-frame sequence so the caller can
+    /// mirror the rewrite in memory. A no-op (warn + empty) when no tool-call
+    /// frame exists.
+    ///
+    /// The production caller runs before `append_turn_message`, so the dangling
+    /// frame is always the session tail and the captured rows are only the
+    /// frame's sibling tool rows; the frame-order interleaving is the contract
+    /// (see [`build_settle_sequence`]).
+    #[expect(clippy::too_many_lines)] // deliberate: one transactional frame-locate + rebuild
+    pub(crate) async fn settle_tool_results(
+        &self,
+        agent_id: &str,
+        results: &[(String, String)],
+        follow_up: &[ChatMessage],
+    ) -> Result<Vec<SettledRow>> {
+        // Frame location: scan assistant rows carrying the tool-call marker
+        // newest-first and pick the FIRST that structurally decodes as a
+        // tool-call frame. A later assistant text row may merely contain the
+        // substring — skip it. Tool results carry "tool_call_id", never
+        // "tool_calls" — the role filter already excludes them. The matching
+        // row's content is kept here so the frame's ordered calls can be
+        // decoded from it without a second SELECT.
+        let candidate_ids: Vec<i64> = self
+            .conn
+            .query(
+                "SELECT id FROM sessions \
+                 WHERE agent_id = ?1 AND role = 'assistant' AND content LIKE '%\"tool_calls\"%' \
+                 ORDER BY id DESC",
+                params![agent_id],
+            )
+            .await
+            .context("find tool-call frame candidates")?
+            .into_iter()
+            .map(|r| r.get::<i64>(0))
+            .collect::<Result<Vec<_>, _>>()
+            .context("decode tool-call frame candidate ids")?;
+
+        let mut frame: Option<(i64, String)> = None;
+        for id in candidate_ids {
+            let content = self
+                .conn
+                .query_optional(
+                    "SELECT content FROM sessions WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<String>(0),
+                )
+                .await
+                .context("load frame candidate content")?;
+            let Some(content) = content else { continue };
+            let msg = ChatMessage {
+                role: ChatRole::Assistant,
+                content,
+            };
+            if is_tool_call_frame(&msg) {
+                frame = Some((id, msg.content));
+                break;
+            }
+        }
+        let Some((frame_row_id, frame_content)) = frame else {
+            tracing::warn!(
+                agent_id,
+                "settle_tool_results: no tool-call frame found — no-op"
+            );
+            return Ok(Vec::new());
+        };
+
+        // Decode the frame's ordered tool-call ids (frame call order is the
+        // provider-valid result order).
+        let frame_calls = {
+            let msg = ChatMessage {
+                role: ChatRole::Assistant,
+                content: frame_content,
+            };
+            let Some(DecodedNativeHistoryMessage::Assistant {
+                tool_calls: Some(calls),
+                ..
+            }) = decode_native_history_message(&msg)
+            else {
+                unreachable!("is_tool_call_frame verified the frame decodes");
+            };
+            calls
+        };
+
+        let captured: Vec<SettledRow> = self
+            .conn
+            .query_map_strict(
+                "SELECT role, content, created_at FROM sessions WHERE agent_id = ?1 AND id > ?2 ORDER BY id",
+                params![agent_id, frame_row_id],
+                |row| {
+                    Ok::<_, anyhow::Error>(SettledRow {
+                        role: row.get(0)?,
+                        content: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                },
+            )
+            .await
+            .context("capture rows after tool-call frame")?;
+
+        let tx = self.conn.begin_tx().await?;
+        // Delete the rows that follow the frame (the frame itself stays). The
+        // sequence below replaces them.
+        tx.execute(
+            "DELETE FROM sessions WHERE agent_id = ?1 AND id > ?2",
+            params![agent_id, frame_row_id],
+        )
+        .await
+        .context("delete rows after tool-call frame")?;
+
+        let now = db::now();
+        let sequence = build_settle_sequence(&captured, &frame_calls, results, follow_up, &now)?;
+        for row in &sequence {
+            tx.execute(
+                "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    agent_id,
+                    row.role.clone(),
+                    row.content.clone(),
+                    row.created_at.clone()
+                ],
+            )
+            .await
+            .context("insert settled session row")?;
+        }
+
+        // Message count: the captured rows were deleted + re-inserted (net
+        // zero); the new results and follow-up rows add exactly `results.len()
+        // + follow_up.len()`. `created_at` stays INSERT-only (the freshness
+        // gate key).
+        let count = i64::try_from(results.len() + follow_up.len())
+            .context("settle result count exceeds i64")?;
+        tx.execute(
+            "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+             last_activity = excluded.last_activity, \
+             message_count = message_count + excluded.message_count",
+            params![agent_id, now.clone(), count, now],
+        )
+        .await
+        .context("bump settle message count")?;
+
+        tx.commit().await?;
+        Ok(sequence)
+    }
+
     pub(crate) async fn delete(&self, agent_id: &str) -> Result<bool> {
         let tx = self.conn.begin_tx().await?;
         let deleted = tx
@@ -657,13 +891,15 @@ impl SessionStore {
     ) -> Result<()> {
         let col = column.as_str();
         let now = db::now();
+        // `created_at` is stamped only on row creation (never on conflict).
+        let created_at = now.clone();
         let sql = format!(
-            "INSERT INTO session_metadata (agent_id, last_activity, {col}) \
-             VALUES (?1, ?2, ?3) \
+            "INSERT INTO session_metadata (agent_id, last_activity, {col}, created_at) \
+             VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(agent_id) DO UPDATE SET {col} = excluded.{col}"
         );
         self.conn
-            .execute(&sql, params![agent_id, now, value])
+            .execute(&sql, params![agent_id, now, value, created_at])
             .await?;
         Ok(())
     }
@@ -676,7 +912,10 @@ impl SessionStore {
         column: MetadataColumn,
         warn_context: &str,
         map: impl FnOnce(&Row) -> std::result::Result<Option<X>, ::turso::Error> + Send + 'static,
-    ) -> Option<X> {
+    ) -> Option<X>
+    where
+        X: Send + 'static,
+    {
         let col = column.as_str();
         let sql = format!("SELECT {col} FROM session_metadata WHERE agent_id = ?1");
         match self.conn.query_optional(&sql, params![agent_id], map).await {
@@ -1041,11 +1280,14 @@ mod tests {
 
     /// Build a freshly-initialized [`Session`] with the fixed test arguments
     /// (Assistant role, no ticket, "gui"/"tester" channel/user, no round_ts).
-    /// Message may be empty (recovery-retry semantics) or a real user turn.
+    /// Message may be empty (recovery-retry semantics) or a real user turn —
+    /// appended via `append_turn_message` after `init` (the split mirrors
+    /// `Agent::work`).
     async fn session_with_init(agent_id: &str, msg: &str, ws: &crate::Workspace) -> Session {
         let mut session = Session::default();
+        session.init(agent_id).await.unwrap();
         session
-            .init(
+            .append_turn_message(
                 agent_id,
                 msg,
                 ws,

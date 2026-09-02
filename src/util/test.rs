@@ -23,6 +23,10 @@
 //! and [`init_management_test_stores`] (initializing all stores plus the manager
 //! queue), relocated from `management.rs` tests so they are discoverable alongside
 //! the rest of the shared test infrastructure.
+//!
+//! Also provides [`seed_session_row`], a session-seeding helper shared by the
+//! analyze/implement tool tests (it exists because the session store's
+//! `batch_append` is `session`-module private).
 
 #![cfg(test)]
 
@@ -1053,6 +1057,22 @@ pub async fn create_test_workspace(path: &str, name: &str) -> crate::Workspace {
         .await
         .expect("insert test workspace");
     test_ws_named(path, name)
+}
+
+/// Seed one session row directly via SQL (the store's `batch_append` is
+/// `session`-module private).
+pub(crate) async fn seed_session_row(
+    conn: &crate::db::Connection,
+    agent_id: &str,
+    role: &str,
+    content: &str,
+) {
+    conn.execute(
+        "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+        db::params![agent_id, role, content, crate::db::now()],
+    )
+    .await
+    .unwrap();
 }
 
 /// Create a temporary directory initialized as a git repository with a

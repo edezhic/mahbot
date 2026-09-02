@@ -471,6 +471,7 @@ pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Resu
             task: prompt.clone(),
         }],
         &crate::jobs::SpawnChild::ResearchCleanup,
+        None,
     )
     .await
     .map_err(|e| {
@@ -1120,8 +1121,8 @@ mod tests {
         let conn = &crate::session::store().conn;
         let now = crate::db::now();
         conn.execute(
-            "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role) \
-             VALUES ('artist_a', ?1, 'alice', 'personal:alice', 'artist')",
+            "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role, created_at) \
+             VALUES ('artist_a', ?1, 'alice', 'personal:alice', 'artist', ?1)",
             params![now.clone()],
         )
         .await
@@ -1327,6 +1328,7 @@ mod tests {
             crate::Role::Sanitation,
             &[],
             &crate::jobs::SpawnChild::ResearchCleanup,
+            None,
         )
         .await
         .unwrap();
@@ -1374,8 +1376,8 @@ mod tests {
         let conn = &crate::session::store().conn;
         let now = crate::db::now();
         conn.execute(
-            "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role) \
-             VALUES (?1, ?2, ?3, ?4, 'artist')",
+            "INSERT INTO session_metadata (agent_id, last_activity, user_name, workspace_name, role, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'artist', ?2)",
             params![agent_id, now.clone(), user, format!("personal:{user}")],
         )
         .await

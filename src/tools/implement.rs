@@ -12,7 +12,7 @@
 //!   [`MessageKind::ImplementResult`] envelope.
 
 use crate::agent::message_router::{self, AgentJob, MessageKind};
-use crate::agent::{run_agent, run_default_agent};
+use crate::agent::run_agent;
 use crate::session::analyze_agent_id;
 use crate::tools::Tool;
 use crate::tools::analyze::DispatchMode;
@@ -138,46 +138,24 @@ impl Tool for ImplementTool {
             return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
         }
 
-        // Sync path — spawn one coder and block until it completes. The coder
-        // inherits the calling agent's DIRECT PARENT INVOCATION group (e.g. a
-        // ticket an engineer is working) via the tool task-local, so the Running
-        // Agents view groups it under the same parent.
-        let agent_id = analyze_agent_id(&ws.name, Role::Coder.as_str());
-        let parent_key = crate::agent::CURRENT_TOOL_PARENT_KEY
-            .try_with(std::clone::Clone::clone)
-            .unwrap_or(None);
-        let parent_label = crate::agent::CURRENT_TOOL_PARENT_LABEL
-            .try_with(std::clone::Clone::clone)
-            .unwrap_or(None);
-        let (agent, response) = run_default_agent(
-            &agent_id,
-            Role::Coder,
-            ws,
-            task,
-            false,
-            None,
-            parent_key,
-            parent_label,
-        )
-        .await;
-
-        if let Some(response) = response {
-            Ok(response)
-        } else if agent.is_cancelled() || crate::shutdown::aborting() {
-            anyhow::bail!("Sub-agent cancelled");
-        } else {
-            anyhow::bail!(
-                "Sub-agent failed: {}",
-                agent.failure.as_deref().unwrap_or("unknown error")
-            );
-        }
+        // Sync path — spawn one coder and block until it completes, through
+        // the durable implement core with a caller-owned jobs row keyed by the
+        // caller's session pin: a graceful drain mid-call surfaces
+        // [`crate::tools::CallSuspended`] — the call's result is left absent
+        // (the job stays launched) and the session's universal
+        // resume-completion step settles it before the next LLM call (this
+        // dispatch itself never binds to prior jobs — it spawns fresh).
+        // The coder inherits the calling agent's DIRECT PARENT INVOCATION group
+        // (e.g. a ticket an engineer is working) via the tool task-local, so
+        // the Running Agents view groups it under the same parent.
+        run_sync_implement(ws, task, self.caller_role).await
     }
 }
 
 // ── Durable async dispatch (SPAWN → run → CHECKPOINT → COMPLETE) ─────────
 
 /// Outcome of a durable implement round.
-enum ImplementRunOutcome {
+pub(crate) enum ImplementRunOutcome {
     /// The round produced a result (Ok or Err — both terminalize with a
     /// durable envelope).
     Result(anyhow::Result<String>),
@@ -208,25 +186,35 @@ async fn dispatch_durable_implement(
     channel: String,
 ) -> Option<AgentJob> {
     let job_id = crate::generate_id();
-    let result =
-        match run_implement_with_job(ws, task, &job_id, caller_role, &user_name, &channel, false)
-            .await
-        {
-            Ok(ImplementRunOutcome::DrainCut) => {
-                // Drain-cut: the coder's outcome is checkpointed — leave the job
-                // status='launched' for boot resume (recoverable from the roster
-                // outcome). No terminalization, no error envelope: a spurious
-                // envelope here would discard the checkpointed outcome and
-                // contradict "jobs stay status='launched' for boot resume".
-                tracing::info!(
-                    job = %job_id,
-                    "Implement round cut short by drain — job stays launched for boot resume",
-                );
-                return None;
-            }
-            Ok(ImplementRunOutcome::Result(result)) => result,
-            Err(e) => Err(e),
-        };
+    let result = match run_implement_with_job(
+        ws,
+        task,
+        crate::tools::CoreJobArgs {
+            job_id: &job_id,
+            caller_role,
+            user_name: &user_name,
+            channel: &channel,
+            resume: false,
+            caller_agent_id: None,
+        },
+    )
+    .await
+    {
+        Ok(ImplementRunOutcome::DrainCut) => {
+            // Drain-cut: the coder's outcome is checkpointed — leave the job
+            // status='launched' for boot resume (recoverable from the roster
+            // outcome). No terminalization, no error envelope: a spurious
+            // envelope here would discard the checkpointed outcome and
+            // contradict "jobs stay status='launched' for boot resume".
+            tracing::info!(
+                job = %job_id,
+                "Implement round cut short by drain — job stays launched for boot resume",
+            );
+            return None;
+        }
+        Ok(ImplementRunOutcome::Result(result)) => result,
+        Err(e) => Err(e),
+    };
     let envelope = crate::jobs::complete_durable_job(
         &job_id,
         build_async_implement_message(&result),
@@ -240,18 +228,36 @@ async fn dispatch_durable_implement(
     Some(envelope)
 }
 
+// ── Sync dispatch ────────────────────────────────────────────────────────
+
+/// Sync implement dispatch through the durable core: the jobs row + coder
+/// roster commit BEFORE any coder session write, keyed by the caller's
+/// session pin (`CURRENT_TOOL_AGENT_ID`) so a graceful drain mid-call leaves
+/// the job `launched` for deterministic resume — the emission-time frame is
+/// already durably recorded, so the call's result is simply absent until the
+/// universal resume-completion step settles it.
+async fn run_sync_implement(ws: &Workspace, task: &str, caller_role: Role) -> Result<String> {
+    crate::tools::SyncDurableCore::Implement
+        .run_sync_dispatch(ws, task, caller_role)
+        .await
+}
+
 /// Spawn the implement job + single-coder roster (one tx), then run the coder.
 /// `resume` reuses the stored roster (never regenerate ids — the PK would
 /// conflict AND the new id would not match the stored roster row).
-async fn run_implement_with_job(
+pub(crate) async fn run_implement_with_job(
     ws: &Workspace,
     task: &str,
-    job_id: &str,
-    caller_role: Role,
-    user_name: &str,
-    channel: &str,
-    resume: bool,
+    args: crate::tools::CoreJobArgs<'_>,
 ) -> anyhow::Result<ImplementRunOutcome> {
+    let crate::tools::CoreJobArgs {
+        job_id,
+        caller_role,
+        user_name,
+        channel,
+        resume,
+        caller_agent_id,
+    } = args;
     let (coder_agent_id, pre_done) = if resume {
         let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
         let row = rows
@@ -284,6 +290,7 @@ async fn run_implement_with_job(
             caller_role,
             &agents,
             &crate::jobs::SpawnChild::Implement,
+            caller_agent_id,
         )
         .await?;
         (coder_agent_id, None)
@@ -341,6 +348,12 @@ async fn run_implement_with_job(
     )
     .await
     {
+        // Sync calls (caller-owned job) fail the tool call on a checkpoint
+        // DB error so the model retries; async/boot-resume warn-and-continue
+        // (the outcome is recomputable on the next resume).
+        if caller_agent_id.is_some() {
+            return Err(e.context("failed to checkpoint implement outcome"));
+        }
         tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint implement outcome");
     }
 
@@ -368,35 +381,43 @@ async fn run_implement_with_job(
 /// Aborts quietly on shutdown/drain: no routing, no terminalization — the job
 /// row stays for the next boot (the checkpointed outcome is reused).
 pub(crate) async fn resume_implement_round(job_id: &str, ws: &Workspace) {
-    let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
-        &crate::session::store().conn,
-        job_id,
-        "Implement resume",
-        "Implement resume",
-    )
-    .await
-    else {
-        return;
-    };
-    let result = match run_implement_with_job(
-        ws,
-        &caller.task,
-        job_id,
-        caller_role,
-        &caller.user_name,
-        &caller.channel,
-        true,
-    )
-    .await
-    {
-        Ok(ImplementRunOutcome::Result(result)) => result,
-        // Drain-cut mid-resume: abort quietly — the outcome is checkpointed,
-        // the next boot reuses it.
-        Ok(ImplementRunOutcome::DrainCut) => {
-            tracing::info!(job = %job_id, "Implement resume aborted — job stays for next boot");
+    let (caller_role, caller, result) = match resume_implement_core(ws, job_id, None).await {
+        Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
+            (caller_role, caller, result)
+        }
+        // Drain-cut mid-resume / job row vanished: abort quietly — the core
+        // logs the reason; a missing job was already warned + terminalized.
+        Ok(
+            crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::JobMissing,
+        ) => return,
+        // Resume infra failure (roster load / checkpoint) — deliver an error
+        // envelope to the ORIGINAL caller, exactly like a round-level failure.
+        // The job row is still present (the core never terminalizes), so the
+        // caller identity can be re-loaded for the route.
+        Err(e) => {
+            let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
+                &crate::session::store().conn,
+                job_id,
+                "Implement resume",
+                "Implement resume",
+            )
+            .await
+            else {
+                return;
+            };
+            let envelope = crate::jobs::complete_durable_job(
+                job_id,
+                build_async_implement_message(&Err(e)),
+                MessageKind::ImplementResult,
+                caller_role,
+                &caller.user_name,
+                &caller.channel,
+                &ws.name,
+            )
+            .await;
+            message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
             return;
         }
-        Err(e) => Err(e),
     };
     // Drain/shutdown fired after the round returned: abort quietly WITHOUT
     // routing and WITHOUT deleting the row — the outcome is checkpointed (next
@@ -416,6 +437,24 @@ pub(crate) async fn resume_implement_round(job_id: &str, ws: &Workspace) {
     )
     .await;
     message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+}
+
+/// Run a drain-cut implement round to completion at the roster level. Returns a
+/// [`crate::jobs::SyncResumeOutcome`]: `Terminal` when the round reached a
+/// result, `DrainCut` when drain-cut (the outcome is checkpointed, job stays
+/// launched), `JobMissing` when the job row vanished. No routing/terminalization
+/// here — the caller decides. `caller_agent_id` selects checkpoint-error
+/// propagation: `Some` for a sync resume (a checkpoint DB error fails the tool
+/// call), `None` for async boot resume (warn-and-continue, exactly as today's
+/// async behavior).
+pub(crate) async fn resume_implement_core(
+    ws: &Workspace,
+    job_id: &str,
+    caller_agent_id: Option<&str>,
+) -> anyhow::Result<crate::jobs::SyncResumeOutcome> {
+    crate::tools::SyncDurableCore::Implement
+        .resume_sync_core(ws, job_id, caller_agent_id)
+        .await
 }
 
 /// Build the `<implement-tool-result>` envelope message for an async implement
@@ -445,5 +484,128 @@ mod tests {
                 .contains("Missing required field: task"),
             "Should mention missing task"
         );
+    }
+
+    /// (h) Mirror the analyze durability lifecycle for implement: with drain
+    /// active the sync dispatch surfaces [`CallSuspended`] and leaves the
+    /// caller-owned job launched; a Done-coder resume then reconstructs
+    /// "CODER_RESPONSE", settles it as the tool result contiguous after the
+    /// frame, and terminalizes the job.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    #[expect(clippy::too_many_lines)] // deliberate: the drain-cut + resume lifecycle is one cohesive assertion bed
+    async fn sync_implement_draincut_and_completion_resumes_durable_job() {
+        let _lock = crate::util::test::retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_sync_implement");
+        let pin = "sync_implement_pin";
+        let conn = &crate::session::store().conn;
+        crate::util::test::seed_session_row(conn, pin, "user", "implement this").await;
+
+        // (e) drain → CallSuspended; the durable job stays launched, caller-owned.
+        crate::shutdown::drain_begin();
+        let tool = ImplementTool::new(DispatchMode::Sync, crate::Role::Engineer);
+        let res = crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some(pin.to_string()), async {
+                tool.execute(&ws, json!({"task": "implement task"})).await
+            })
+            .await;
+        crate::shutdown::drain_clear();
+        let err = res.expect_err("drain must cut the sync implement dispatch");
+        assert!(
+            err.downcast_ref::<crate::tools::CallSuspended>().is_some(),
+            "CallSuspended carrier expected: {err:#}"
+        );
+
+        let jobs = conn
+            .query(
+                "SELECT id, status, caller_agent_id FROM jobs WHERE caller_agent_id = ?1 AND kind = 'implement'",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1, "one launched implement job");
+        assert_eq!(jobs[0].get::<String>(1).unwrap(), "launched");
+        assert_eq!(
+            jobs[0].get::<String>(2).unwrap(),
+            pin,
+            "job is caller-owned by the session pin"
+        );
+        let job_id = jobs[0].get::<String>(0).unwrap();
+
+        // Simulate the coder checkpointing Done just before the drain cut: the
+        // drain observed the round mid-flight, the durable outcome is intact.
+        let roster = crate::jobs::list_agents_for_job(conn, &job_id)
+            .await
+            .unwrap();
+        let coder_id = roster[0].agent_id.clone();
+        crate::jobs::write_agent_outcome(
+            conn,
+            &job_id,
+            &coder_id,
+            crate::jobs::RowStatus::Done,
+            Some("CODER_RESPONSE"),
+        )
+        .await
+        .unwrap();
+
+        // (f) completion: seed the caller frame and resume + settle.
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: "call_implement_h".to_string(),
+                name: "implement".to_string(),
+                arguments: json!({"task": "implement task"}),
+            }],
+            None,
+        )
+        .to_string();
+        crate::util::test::seed_session_row(conn, pin, "assistant", &frame).await;
+
+        let mut session = crate::session::Session::default();
+        session.init(pin).await.unwrap();
+        let pending = session
+            .pending_tool_calls()
+            .expect("dangling implement call");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "call_implement_h");
+
+        let outcome = resume_implement_core(&ws, &job_id, Some(pin))
+            .await
+            .unwrap();
+        let crate::jobs::SyncResumeOutcome::Terminal(_, _, result) = outcome else {
+            panic!("expected a terminal resume outcome");
+        };
+        let text = result.expect("resumed implement result");
+        assert_eq!(text, "CODER_RESPONSE");
+        crate::jobs::terminalize_job(conn, &job_id).await.unwrap();
+        session
+            .settle_tool_results(pin, &[("call_implement_h".to_string(), text.clone())], &[])
+            .await
+            .unwrap();
+
+        // Job terminalized; tool row CODER_RESPONSE contiguous after the frame.
+        let jobs = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert!(jobs.is_empty(), "resumed job must be terminalized");
+        let rows = conn
+            .query(
+                "SELECT id, role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].get::<String>(1).unwrap(), "assistant");
+        assert_eq!(rows[2].get::<String>(1).unwrap(), "tool");
+        let payload: crate::ToolResultPayload =
+            serde_json::from_str(&rows[2].get::<String>(2).unwrap()).unwrap();
+        assert_eq!(payload.tool_call_id, "call_implement_h");
+        assert_eq!(payload.content, "CODER_RESPONSE");
     }
 }

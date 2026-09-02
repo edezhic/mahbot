@@ -110,6 +110,9 @@ pub(crate) struct JobRow {
     pub workspace_name: String,
     pub retry_count: i64,
     pub ticket_id: Option<String>,
+    /// The caller agent's stable session pin for sync analyze/implement jobs;
+    /// NULL for async/boot-resumed jobs (see the sync-resume design).
+    pub caller_agent_id: Option<String>,
 }
 
 /// A row of the `agents` table. Carries the slot `idx` (in addition to the
@@ -140,6 +143,7 @@ fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
         workspace_name: row.get(2)?,
         retry_count: row.get(3)?,
         ticket_id: row.get(4)?,
+        caller_agent_id: row.get(5)?,
     })
 }
 
@@ -299,6 +303,7 @@ pub(crate) async fn spawn_job(
     role: Role,
     agents: &[NewAgent],
     child: &SpawnChild,
+    caller_agent_id: Option<&str>,
 ) -> Result<()> {
     let kind = child.kind_str();
     let ticket_id = child_ticket_id(child);
@@ -306,8 +311,8 @@ pub(crate) async fn spawn_job(
     let tx = conn.begin_tx().await?;
     tx.execute(
         "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-         ticket_id, retry_count, created_at, updated_at) \
-         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9)",
+         ticket_id, retry_count, created_at, updated_at, caller_agent_id) \
+         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10)",
         params![
             id,
             kind,
@@ -318,6 +323,7 @@ pub(crate) async fn spawn_job(
             role.as_str(),
             ticket_id,
             now.clone(),
+            caller_agent_id,
         ],
     )
     .await
@@ -488,6 +494,38 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
         .await
         .context("terminalize job")?;
     Ok(())
+}
+
+// ── Sync caller-owned resume primitives ────────────────────────────────
+//
+// A sync analyze/implement job is owned by the caller session that launched it
+// (`jobs.caller_agent_id` = the caller's stable session pin). The JOBS ROW is
+// the source of truth for ownership. The caller's universal resume-completion
+// step locates every launched caller-owned job by this pin and slot-resumes it.
+
+/// Launched sync analyze/implement jobs owned by `caller_agent_id` (the
+/// caller's stable session pin), newest first, freshness-gated, awaiting
+/// deterministic resume by the caller's universal resume-completion step. A
+/// job is resume-owned only if the caller session predates the job (session
+/// creation <= job created_at), so a FRESH caller cycle (new session after
+/// completion-delete/TTL purge) never resumes a prior cycle's orphan.
+pub(crate) async fn find_owned_launched_jobs(
+    conn: &Connection,
+    caller_agent_id: &str,
+) -> Result<Vec<JobRow>> {
+    let rows = conn
+        .query(
+            "SELECT id, kind, workspace_name, retry_count, ticket_id, caller_agent_id FROM jobs j \
+             WHERE j.caller_agent_id = ?1 AND j.kind IN ('analyze','implement') AND j.status = 'launched' \
+               AND j.created_at >= COALESCE( \
+                     (SELECT sm.created_at FROM session_metadata sm WHERE sm.agent_id = ?1), \
+                     (SELECT MIN(s.created_at) FROM sessions s WHERE s.agent_id = ?1)) \
+             ORDER BY j.created_at DESC",
+            params![caller_agent_id],
+        )
+        .await
+        .context("find owned launched jobs")?;
+    rows.iter().map(job_row_from).collect()
 }
 
 // ── Ticket phase-job substrate ─────────────────────────────────────────
@@ -753,6 +791,29 @@ pub(crate) struct JobCaller {
     pub channel: String,
 }
 
+/// Discriminated resume preamble so sync callers never mistake a missing job
+/// for a drain-cut.
+pub(crate) enum ResumePreamble {
+    /// Caller identity + parsed role — the resume may proceed.
+    Proceed(JobCaller, Role),
+    /// Drain/shutdown active — quiet abort, the job row is untouched.
+    DrainCut,
+    /// Job row gone (terminalized/purged) — already warned + terminalized
+    /// (no-op) by the preamble.
+    JobMissing,
+}
+
+/// Terminal outcome of a resumed sync (analyze/implement) round.
+pub(crate) enum SyncResumeOutcome {
+    /// The round reached a terminal result (Ok text or Err) — the caller owns
+    /// delivery and terminalization.
+    Terminal(Role, JobCaller, anyhow::Result<String>),
+    /// Drain-cut mid-resume — outcomes checkpointed, the job stays launched.
+    DrainCut,
+    /// Job row gone between the ownership lookup and the resume.
+    JobMissing,
+}
+
 /// Load the task + caller identity of a job from the `jobs` row alone.
 pub(crate) async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>> {
     conn.query_optional(
@@ -783,17 +844,33 @@ pub(crate) async fn resume_job_preamble(
     abort_site: &str,
     missing_site: &str,
 ) -> Option<(JobCaller, Role)> {
+    match resume_job_preamble_discrete(conn, job_id, abort_site, missing_site).await {
+        ResumePreamble::Proceed(caller, caller_role) => Some((caller, caller_role)),
+        ResumePreamble::DrainCut | ResumePreamble::JobMissing => None,
+    }
+}
+
+/// Discriminating core of [`resume_job_preamble`]: same order (aborting guard,
+/// then job_caller, then terminalize-on-missing) and same log texts, but the
+/// caller gets an explicit [`ResumePreamble`] so a sync caller can tell a
+/// missing job apart from a drain-cut.
+pub(crate) async fn resume_job_preamble_discrete(
+    conn: &Connection,
+    job_id: &str,
+    abort_site: &str,
+    missing_site: &str,
+) -> ResumePreamble {
     if crate::shutdown::aborting() {
         tracing::info!(job = %job_id, "{abort_site} aborted — drain/shutdown in progress");
-        return None;
+        return ResumePreamble::DrainCut;
     }
     let Ok(Some(caller)) = job_caller(conn, job_id).await else {
         tracing::warn!(job = %job_id, "{missing_site}: missing job row — terminalizing job");
         let _ = terminalize_job(conn, job_id).await;
-        return None;
+        return ResumePreamble::JobMissing;
     };
     let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(Role::Manager);
-    Some((caller, caller_role))
+    ResumePreamble::Proceed(caller, caller_role)
 }
 
 /// Read a job's boot-resume retry count (0 = never boot-resumed). Used by the
@@ -822,7 +899,7 @@ pub(crate) async fn job_retry_count(conn: &Connection, job_id: &str) -> i64 {
 pub(crate) async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
-            "SELECT id, kind, workspace_name, retry_count, ticket_id FROM jobs \
+            "SELECT id, kind, workspace_name, retry_count, ticket_id, caller_agent_id FROM jobs \
              WHERE status != 'done' ORDER BY created_at",
             (),
         )
@@ -1257,6 +1334,10 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
         } else if job.kind == "research" || job.kind == "analyze" {
             // Resume at the roster/state level (dispatch re-enters the
             // orchestrator with the stored task). Always bump retry_count.
+            if let Some(caller) = job.caller_agent_id.as_deref() {
+                info!(job = %job.id, caller = %caller, "sync caller-owned job — caller resumes it; skipping boot resume");
+                continue;
+            }
             let kind = job.kind.as_str();
             let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
             resumable.push(if kind == "research" {
@@ -1275,6 +1356,10 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             // A single-coder implement round interrupted by a crash: resume it
             // like any other durable envelope kind. The coder roster row holds
             // the terminal outcome; the job row holds the caller identity.
+            if let Some(caller) = job.caller_agent_id.as_deref() {
+                info!(job = %job.id, caller = %caller, "sync caller-owned job — caller resumes it; skipping boot resume");
+                continue;
+            }
             let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
             resumable.push(ResumableJob::Implement {
                 job_id: job.id.clone(),
@@ -1439,4 +1524,115 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
         info!(deleted, "Removed session pins for terminal tickets");
     }
     deleted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn status_retry(conn: &crate::db::Connection, job_id: &str) -> (String, i64) {
+        let rows = conn
+            .query(
+                "SELECT status, retry_count FROM jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "job row exists for {job_id}");
+        (
+            rows[0].get::<String>(0).unwrap(),
+            rows[0].get::<i64>(1).unwrap(),
+        )
+    }
+
+    /// (f) Boot recovery resumes only NULL-caller analyze/implement/research
+    /// jobs. Sync caller-owned jobs (analyze/implement with `caller_agent_id`)
+    /// are skipped — their caller session re-drives them — so they stay
+    /// `launched` with `retry_count` untouched; the NULL-caller job is
+    /// check-pointed (retry_count bumped, status re-armed to launched).
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn boot_recovery_skips_caller_owned_jobs() {
+        let _guard = crate::util::test::retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let ws_name = "boot_recovery_ws";
+
+        for (job_id, kind, child, caller) in [
+            (
+                "owned_analyze",
+                AgentKind::Analyst,
+                SpawnChild::Analyze,
+                Some("pin_a"),
+            ),
+            (
+                "owned_implement",
+                AgentKind::Coder,
+                SpawnChild::Implement,
+                Some("pin_b"),
+            ),
+            (
+                "null_analyze",
+                AgentKind::Analyst,
+                SpawnChild::Analyze,
+                None,
+            ),
+        ] {
+            spawn_job(
+                conn,
+                job_id,
+                "task",
+                ws_name,
+                "caller",
+                "telegram",
+                crate::Role::Engineer,
+                &[NewAgent {
+                    agent_id: format!("{job_id}_agent"),
+                    kind,
+                    idx: Some(0),
+                    task: "task".to_string(),
+                }],
+                &child,
+                caller,
+            )
+            .await
+            .unwrap();
+        }
+
+        let resumable = recover_from_restart().await.unwrap();
+
+        assert!(
+            resumable.iter().any(
+                |r| matches!(r, ResumableJob::Analyze { job_id, .. } if job_id == "null_analyze")
+            ),
+            "the NULL-caller analyze is selected for boot resume"
+        );
+        assert!(
+            !resumable.iter().any(
+                |r| matches!(r, ResumableJob::Analyze { job_id, .. } if job_id == "owned_analyze")
+            ),
+            "the caller-owned analyze is not boot-resumed"
+        );
+        assert!(
+            !resumable.iter().any(
+                |r| matches!(r, ResumableJob::Implement { job_id, .. } if job_id == "owned_implement")
+            ),
+            "the caller-owned implement is not boot-resumed"
+        );
+
+        // Owned jobs stay launched with retry_count unchanged (checkpoint NOT
+        // applied); the NULL-caller job is check-pointed.
+        for (job_id, _) in [("owned_analyze", "pin_a"), ("owned_implement", "pin_b")] {
+            assert_eq!(
+                status_retry(conn, job_id).await,
+                ("launched".to_string(), 0),
+                "{job_id} stays launched with retry_count unchanged"
+            );
+        }
+        assert_eq!(
+            status_retry(conn, "null_analyze").await,
+            ("launched".to_string(), 1),
+            "the NULL-caller analyze is check-pointed (retry_count bumped)"
+        );
+    }
 }

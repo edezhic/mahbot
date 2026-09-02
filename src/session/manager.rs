@@ -5,8 +5,9 @@
 //!
 //! ## Usage
 //! 1. `Session::default()` at turn start
-//! 2. `session.init(agent_id, msg, ws, role, ticket, channel, user_name, round_ts, full_access)` — loads history, builds prompt
-//!    for new sessions, persists user message, stores history internally
+//! 2. `session.init(agent_id)` — loads history and the token length, stores
+//!    history internally; the turn message is appended separately via
+//!    `append_turn_message` after the universal resume-completion step
 //! 3. Agent loop calls `session.push_assistant()`, `session.persist_messages()`,
 //!    `session.push_messages_unpersisted()`, etc. during tool rounds
 //! 4. `session.finalize(agent_id)` on success — persists the final assistant response
@@ -98,32 +99,50 @@ impl Session {
         "Session cleared. Starting fresh.".to_string()
     }
 
-    /// Begin a turn. Loads or builds history, stores the user message, and
-    /// populates internal history for the agent loop.
-    ///
-    /// ## First-turn caching
-    ///
-    /// On the first turn (new session), the full system prompt, ticket context,
-    /// workspace context, and skills are built via `build_turn_messages` and
-    /// cached in the session DB. On subsequent turns, only the new user
-    /// message is appended — the system prompt is **not** rebuilt. This avoids
-    /// regenerating workspace state and ticket data on every turn.
-    ///
-    /// If the system prompt logic changes, existing sessions will not pick up
-    /// the change until summarization fires or the user runs `/new`
-    /// ([`Session::delete`]).
-    ///
-    /// ## Summarization note
-    ///
-    /// Summarization is **not** handled here. It is run separately by
-    /// `Agent::work` when the conversation exceeds the token budget.
-    /// See [`crate::session`] for the summarization constants and helpers.
+    /// Begin a turn. Loads the persisted history and the real
+    /// provider-reported session length (last successful agent LLM call's
+    /// input + output tokens), records the persisted prefix, and publishes the
+    /// initial transcript snapshot. The turn's user message — and the
+    /// first-turn system-prompt caching that goes with it — is handled
+    /// separately via
+    /// [`append_turn_message`](Self::append_turn_message); the orchestrator
+    /// runs the universal resume-completion step between the two so any
+    /// dangling tool calls are settled BEFORE the new message lands.
+    pub(crate) async fn init(&mut self, agent_id: &str) -> Result<()> {
+        self.history = crate::session::store().load(agent_id).await;
+
+        // Load the real provider-reported session length (last successful
+        // agent LLM call's input + output tokens) so `maybe_summarize` and
+        // the Running Agents card see it from the start of the turn. `None`
+        // for sessions that never recorded a value — treated as below the
+        // summarization threshold.
+        self.token_length = crate::session::store().get_token_length(agent_id).await;
+
+        // All loaded history above is persisted — record the prefix so
+        // finalize only appends genuinely new assistant output.
+        self.persisted_len = self.history.len();
+
+        // Publish the initial live snapshot so the Running Agents card reflects
+        // the loaded/unpersisted transcript and the persisted token length from
+        // the very start of the turn.
+        self.publish_transcript();
+
+        Ok(())
+    }
+
+    /// Append this turn's user message and session context into the loaded
+    /// session. Moves the message-append half of [`init`](Self::init) here so
+    /// the orchestrator can run the universal resume-completion step in between
+    /// (see `Agent::work`): the session loads WITHOUT the new message, the
+    /// dangling tool calls are settled directly after their frame, and only then
+    /// does the user message land. An empty `msg` is a no-op (RecoveryRetry
+    /// re-triggers against the existing history without adding a turn).
     ///
     /// `round_ts` pins the timestamp of the appended user message (one value
     /// per round for byte-identical first messages across parallel members);
     /// `None` stamps now.
     #[expect(clippy::too_many_arguments)]
-    pub(crate) async fn init(
+    pub(crate) async fn append_turn_message(
         &mut self,
         agent_id: &str,
         msg: &str,
@@ -135,14 +154,8 @@ impl Session {
         round_ts: Option<&str>,
         full_access: bool,
     ) -> Result<()> {
-        // Load existing history from DB
-        let mut history = crate::session::store().load(agent_id).await;
-
-        // Empty messages carry no semantic content — skip append in all paths.
-        // Recovery retries pass an empty message to re-trigger the agent
-        // against the existing session history without adding a new turn.
         if !msg.is_empty() {
-            let is_new = history.is_empty();
+            let is_new = self.history.is_empty();
 
             if is_new {
                 let (msgs, snapshot) =
@@ -159,7 +172,7 @@ impl Session {
                         role.as_str(),
                     )
                     .await?;
-                history.extend(msgs);
+                self.history.extend(msgs);
 
                 if matches!(role, Role::Artist) {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
@@ -196,31 +209,13 @@ impl Session {
                 if let Some(snapshot) = new_snapshot {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
-                history.push(user_msg);
+                self.history.push(user_msg);
             }
+            // The appended message is durably written above — advance the
+            // persisted prefix and refresh the live transcript.
+            self.persisted_len = self.history.len();
+            self.publish_transcript();
         }
-        self.history = history;
-
-        // Load the real provider-reported session length (last successful
-        // agent LLM call's input + output tokens) so `maybe_summarize` and
-        // the Running Agents card see it from the start of the turn. `None`
-        // for sessions that never recorded a value — treated as below the
-        // summarization threshold.
-        self.token_length = crate::session::store().get_token_length(agent_id).await;
-
-        // Session context (channel, user_name, workspace_name, role) was
-        // already persisted atomically alongside the messages above —
-        // no separate write needed.
-
-        // All loaded/appended history above is persisted — record the prefix
-        // so finalize only appends genuinely new assistant output.
-        self.persisted_len = self.history.len();
-
-        // Publish the initial live snapshot so the Running Agents card reflects
-        // the loaded/unpersisted transcript and the persisted token length from
-        // the very start of the turn.
-        self.publish_transcript();
-
         Ok(())
     }
 
@@ -304,6 +299,93 @@ impl Session {
             .await?;
         self.persisted_len += batch.len();
         self.history.extend_from_slice(messages);
+        self.publish_transcript();
+        Ok(())
+    }
+
+    /// The tool calls of the session's LAST tool-call frame whose results are
+    /// not yet present — the universal resume-completion input.
+    ///
+    /// Walks back to the last assistant tool-call frame, then forward over the
+    /// immediately-following Tool-role entries, collecting the `tool_call_id`s
+    /// they resolved. Returns the frame's calls whose ids are missing: `None`
+    /// when nothing is missing, or when there is no (undecodable) frame.
+    pub(crate) fn pending_tool_calls(&self) -> Option<Vec<crate::ToolCall>> {
+        let frame_idx = self.history.iter().rposition(super::is_tool_call_frame)?;
+        let Some(super::DecodedNativeHistoryMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        }) = super::decode_native_history_message(&self.history[frame_idx])
+        else {
+            return None;
+        };
+        // Walk forward over Tool-role entries (stop at the first non-tool).
+        let mut completed: std::collections::HashSet<String> = std::collections::HashSet::default();
+        for msg in &self.history[frame_idx + 1..] {
+            if msg.role == ChatRole::Tool {
+                if let Some(super::DecodedNativeHistoryMessage::ToolResult {
+                    tool_call_id, ..
+                }) = super::decode_native_history_message(msg)
+                {
+                    completed.insert(tool_call_id);
+                }
+            } else {
+                break;
+            }
+        }
+        let pending: Vec<crate::ToolCall> = calls
+            .into_iter()
+            .filter(|c| !completed.contains(&c.id))
+            .collect();
+        if pending.is_empty() {
+            None
+        } else {
+            Some(pending)
+        }
+    }
+
+    /// Settle tool results directly after the session's last tool-call frame —
+    /// the durable+in-memory half of the universal resume-completion step.
+    ///
+    /// The store rewrites the rows after the frame (delete, then re-insert the
+    /// returned final sequence: new results in frame order, then the follow-up
+    /// rows — e.g. the synthetic `user(IMAGE_*)` message). The frame-order
+    /// interleaving is the contract; the only production caller runs before
+    /// `append_turn_message`, so the dangling frame is always the session tail
+    /// and captured rows are only its sibling tool rows. The in-memory history
+    /// is truncated at the frame and the store's returned settled-row sequence
+    /// is replayed verbatim; `persisted_len` is advanced to the full history
+    /// length.
+    pub(crate) async fn settle_tool_results(
+        &mut self,
+        agent_id: &str,
+        results: &[(String, String)],
+        follow_up: &[ChatMessage],
+    ) -> Result<()> {
+        let settled = crate::session::store()
+            .settle_tool_results(agent_id, results, follow_up)
+            .await?;
+        let Some(frame_idx) = self.history.iter().rposition(super::is_tool_call_frame) else {
+            debug_assert!(
+                false,
+                "settle_tool_results called without a tool-call frame in history"
+            );
+            return Ok(());
+        };
+        // Mirror the store rewrite: truncate after the frame and replay the
+        // store's returned final sequence verbatim (role via the strum parse
+        // path, content as-is).
+        self.history.truncate(frame_idx + 1);
+        for row in settled {
+            let role = row.role.parse::<ChatRole>().map_err(|e| {
+                anyhow::anyhow!("settled session role {} is invalid: {e}", row.role)
+            })?;
+            self.history.push(ChatMessage {
+                role,
+                content: row.content,
+            });
+        }
+        self.persisted_len = self.history.len();
         self.publish_transcript();
         Ok(())
     }
@@ -1033,5 +1115,245 @@ mod tests {
             session.history[1].content, "[IMAGE:/tmp/a.png] mine",
             "in-memory history untouched on persist failure (ordering invariant)"
         );
+    }
+
+    // ── Tool-call frame persist / settle ─────────────────────────────
+
+    /// Helper: the assistant frame JSON for an analyze tool call.
+    fn analyze_frame(call_id: &str) -> String {
+        crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: call_id.to_string(),
+                name: "analyze".to_string(),
+                arguments: serde_json::json!({"analyze": "analyze task"}),
+            }],
+            None,
+        )
+        .to_string()
+    }
+
+    /// (a) `pending_tool_calls` returns the session's LAST tool-call frame's
+    /// result-less calls. No frame → None; a frame with calls and no results →
+    /// all of them; one result present → only the missing one remains.
+    #[test]
+    fn pending_tool_calls_none_and_dangling_and_partial() {
+        // No frame → None.
+        assert!(Session::default().pending_tool_calls().is_none());
+
+        // Frame with two calls, no results → both dangling.
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[
+                crate::ToolCall {
+                    id: "call_a".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "a"}),
+                },
+                crate::ToolCall {
+                    id: "call_b".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "b"}),
+                },
+            ],
+            None,
+        )
+        .to_string();
+        let mut session = Session {
+            history: vec![ChatMessage::assistant(frame)],
+            persisted_len: 1,
+            ..Default::default()
+        };
+        let pending = session
+            .pending_tool_calls()
+            .expect("dangling calls present");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, "call_a");
+        assert_eq!(pending[1].id, "call_b");
+
+        // One result present → only the missing one remains.
+        session
+            .history
+            .push(ChatMessage::tool_result("call_a", "result a"));
+        let pending = session.pending_tool_calls().expect("still one dangling");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "call_b");
+
+        // All results present → None (nothing dangling).
+        session
+            .history
+            .push(ChatMessage::tool_result("call_b", "result b"));
+        assert!(session.pending_tool_calls().is_none());
+    }
+
+    /// (b) `settle_tool_results` inserts the settled result directly after the
+    /// session's dangling tool-call frame, bumps `message_count` by the result
+    /// count, and mirrors the insert in-memory with `persisted_len` ==
+    /// `history.len()`.
+    #[tokio::test]
+    async fn settle_tool_results_inserts_result_after_frame() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = "settle_tool_results_test";
+        let frame = analyze_frame("call_analyze_1");
+
+        let mut session = Session::default();
+        session
+            .persist_messages(
+                agent_id,
+                &[ChatMessage::user("first"), ChatMessage::assistant(frame)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.persisted_len, 2, "both seeded rows persisted");
+
+        let conn = &crate::session::store().conn;
+        let count_before: i64 = conn
+            .query_optional(
+                "SELECT message_count FROM session_metadata WHERE agent_id = ?1",
+                crate::db::params![agent_id],
+                |r| r.get::<i64>(0),
+            )
+            .await
+            .unwrap()
+            .expect("metadata row exists");
+
+        session
+            .settle_tool_results(
+                agent_id,
+                &[("call_analyze_1".to_string(), "the result".to_string())],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // DB rows by id: user, assistant(frame), tool(result).
+        let rows = conn
+            .query(
+                "SELECT id, role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
+                crate::db::params![agent_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3, "one result row inserted after the frame");
+        let roles: Vec<String> = rows.iter().map(|r| r.get::<String>(1).unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool"]);
+        assert_eq!(
+            rows[2].get::<String>(2).unwrap(),
+            serde_json::to_string(&crate::ToolResultPayload {
+                tool_call_id: "call_analyze_1".to_string(),
+                content: "the result".to_string(),
+            })
+            .unwrap(),
+            "the tool row carries the settled result with the original call id"
+        );
+
+        // message_count delta == 1 (the result row).
+        let count_after: i64 = conn
+            .query_optional(
+                "SELECT message_count FROM session_metadata WHERE agent_id = ?1",
+                crate::db::params![agent_id],
+                |r| r.get::<i64>(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count_after - count_before, 1);
+
+        // In-memory history mirrors the insert; persisted prefix covers it.
+        let roles: Vec<crate::ChatRole> = session.history().iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![ChatRole::User, ChatRole::Assistant, ChatRole::Tool]
+        );
+        assert_eq!(
+            session.history()[2].content,
+            serde_json::to_string(&crate::ToolResultPayload {
+                tool_call_id: "call_analyze_1".to_string(),
+                content: "the result".to_string(),
+            })
+            .unwrap()
+        );
+        assert_eq!(session.persisted_len, session.history().len());
+    }
+
+    /// (b2) `settle_tool_results` preserves the frame's tool-call ORDER when a
+    /// partial result set is settled: a frame with calls `call_a`/`call_b`,
+    /// only `call_b`'s row already committed, settles `call_a` — the final DB
+    /// order is frame, tool(call_a), tool(call_b) (the recovered result keeps
+    /// the frame call order; the captured sibling stays in the frame's tool
+    /// block, not displaced by "new results first").
+    #[tokio::test]
+    async fn settle_tool_results_preserves_frame_call_order() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = "settle_tool_results_order_test";
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[
+                crate::ToolCall {
+                    id: "call_a".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "a"}),
+                },
+                crate::ToolCall {
+                    id: "call_b".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "b"}),
+                },
+            ],
+            None,
+        )
+        .to_string();
+
+        let mut session = Session::default();
+        session
+            .persist_messages(
+                agent_id,
+                &[
+                    ChatMessage::user("first"),
+                    ChatMessage::assistant(frame),
+                    ChatMessage::tool_result("call_b", "result b"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Settle only call_a; call_b's row is the captured sibling.
+        session
+            .settle_tool_results(
+                agent_id,
+                &[("call_a".to_string(), "result a".to_string())],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        // DB rows by id: user, assistant(frame), tool(call_a), tool(call_b) —
+        // the recovered result keeps the frame's call order, and the captured
+        // sibling verbatim.
+        let conn = &crate::session::store().conn;
+        let rows = conn
+            .query(
+                "SELECT id, role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
+                crate::db::params![agent_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            4,
+            "frame + captured sibling + one recovered result"
+        );
+        let roles: Vec<String> = rows.iter().map(|r| r.get::<String>(1).unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "tool"]);
+        let mut ids: Vec<String> = Vec::new();
+        for row in &rows[2..] {
+            let payload: crate::ToolResultPayload =
+                serde_json::from_str(&row.get::<String>(2).unwrap()).unwrap();
+            ids.push(payload.tool_call_id);
+        }
+        assert_eq!(ids, vec!["call_a", "call_b"], "frame call order preserved");
+        let b_payload: crate::ToolResultPayload =
+            serde_json::from_str(&rows[3].get::<String>(2).unwrap()).unwrap();
+        assert_eq!(b_payload.content, "result b", "captured sibling verbatim");
     }
 }

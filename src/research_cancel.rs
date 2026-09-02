@@ -363,6 +363,7 @@ mod tests {
             crate::Role::Assistant,
             &[],
             &crate::jobs::SpawnChild::Research,
+            None,
         )
         .await
         .unwrap();

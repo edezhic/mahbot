@@ -251,6 +251,7 @@ pub(crate) async fn dispatch_temp_cleanup() -> Result<()> {
             task: prompt.clone(),
         }],
         &crate::jobs::SpawnChild::TempCleanup,
+        None,
     )
     .await
     .map_err(|e| {
@@ -350,6 +351,7 @@ mod tests {
             crate::Role::Sanitation,
             &[],
             &crate::jobs::SpawnChild::TempCleanup,
+            None,
         )
         .await
         .unwrap();

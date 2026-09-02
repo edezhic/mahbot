@@ -22,10 +22,12 @@
 //! a fresh file), and the id-only applied check makes their recorded ids
 //! `1`–`23` harmless no-ops. The baseline (`24`–`26`) creates the exact
 //! current shape on fresh installs and is a strict no-op on existing ones,
-//! except entry `25`, which genuinely upfills the retired delta `23`'s
-//! `chat_history` reply columns on a one-delta-behind database.
+//! except entries `25`/`27`/`28`, which genuinely upfill the retired delta
+//! `23`'s `chat_history` reply columns, the `workspaces.maintainer_recommendations`
+//! column, and the `jobs.caller_agent_id` / `session_metadata.created_at`
+//! columns on one-delta-behind / current databases.
 //!
-//! Future schema changes resume the chain at id `27` with monotonically
+//! Future schema changes resume the chain at id `29` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -80,13 +82,17 @@ pub(crate) struct Migration {
 /// The full current-shape core schema: every domain table in its final shape
 /// (the 0.4.2 baseline minus the retired `assigned_to` / `pipeline_reservation`
 /// / `paused_frozen` / `user_roles` / `config_role` / `ticket_jobs` /
-/// `ticket_stage_jobs` artifacts, plus the `jobs.ticket_id`, `chat_history`
+/// `ticket_stage_jobs` artifacts, plus the `jobs.ticket_id` /
+/// `jobs.caller_agent_id`, `session_metadata.created_at`, `chat_history`
 /// `timestamp`/`reply_*`, and `ticket_chronicle`/`alarms` additions) and every
 /// core index — including the tickets FTS index and the `idx_jobs_phase_ticket`
-/// unique index.
+/// unique index. The `idx_jobs_caller_agent` index is created by delta `28`
+/// (which also upfills `jobs.caller_agent_id` / `session_metadata.created_at`
+/// on upgraded databases), not in this batch — the batch cannot reference a
+/// column that a later Rust delta adds.
 ///
-/// `jobs` is created WITH `ticket_id` as its last column, matching the shape
-/// the retired `ALTER TABLE jobs ADD COLUMN ticket_id ...` produced, so
+/// `jobs` is created WITH `caller_agent_id` as its last column, matching the
+/// shape the retired `ALTER TABLE ...` plus delta `28` produce, so
 /// `idx_jobs_phase_ticket` (which references `jobs.ticket_id`) is safe to
 /// create in the same batch. Every statement is `IF NOT EXISTS`.
 const BASELINE_CORE_SCHEMA: &str = "\
@@ -143,7 +149,8 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     role          TEXT,
     active_models TEXT,
     token_length  INTEGER,
-    message_count INTEGER NOT NULL DEFAULT 0
+    message_count INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id             TEXT PRIMARY KEY,
@@ -157,7 +164,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     retry_count    INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
-    ticket_id      TEXT REFERENCES tickets(id)
+    ticket_id      TEXT REFERENCES tickets(id),
+    caller_agent_id TEXT
 );
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
@@ -416,6 +424,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_workspaces_maintainer_recommendations),
     },
+    Migration {
+        id: "28",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_jobs_caller_agent_and_session_created_at),
+    },
 ];
 
 /// Apply the migration catalog to `conn` for one physical database.
@@ -587,6 +600,45 @@ async fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::
         .into_iter()
         .any(|row| row.get::<String>(1).ok().as_deref() == Some(column));
     Ok(found)
+}
+
+fn add_jobs_caller_agent_and_session_created_at<'a>(
+    conn: &'a Connection,
+    _root: &'a Path,
+) -> BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(run_add_jobs_caller_agent_and_session_created_at(conn))
+}
+
+/// Upfill the sync-resume primitives for databases created before delta `28`:
+/// `jobs.caller_agent_id` (the caller agent's stable session pin for sync
+/// analyze/implement jobs; NULL for async/boot-resumed jobs) and
+/// `session_metadata.created_at` (the session creation timestamp for the
+/// freshness gate). Fresh installs get both columns from entry `24`'s
+/// `CREATE TABLE`, so the probes make this a no-op there — and the partial
+/// `idx_jobs_caller_agent` index is likewise a no-op on fresh installs.
+/// Idempotent, non-transactional like every Rust body (re-runnable until
+/// recorded).
+async fn run_add_jobs_caller_agent_and_session_created_at(conn: &Connection) -> anyhow::Result<()> {
+    if !column_exists(conn, "jobs", "caller_agent_id").await? {
+        conn.execute("ALTER TABLE jobs ADD COLUMN caller_agent_id TEXT", ())
+            .await
+            .with_context(|| "Failed to add jobs.caller_agent_id")?;
+    }
+    if !column_exists(conn, "session_metadata", "created_at").await? {
+        conn.execute(
+            "ALTER TABLE session_metadata ADD COLUMN created_at TEXT",
+            (),
+        )
+        .await
+        .with_context(|| "Failed to add session_metadata.created_at")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_caller_agent \
+         ON jobs(caller_agent_id) WHERE caller_agent_id IS NOT NULL;",
+    )
+    .await
+    .with_context(|| "Failed to create idx_jobs_caller_agent")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -787,6 +839,7 @@ mod tests {
                 "created_at",
                 "updated_at",
                 "ticket_id",
+                "caller_agent_id",
             ],
         ),
         (
@@ -807,6 +860,7 @@ mod tests {
                 "active_models",
                 "token_length",
                 "message_count",
+                "created_at",
             ],
         ),
         (
@@ -903,6 +957,7 @@ mod tests {
         "idx_tickets_title_fts",
         "idx_tickets_board_active",
         "idx_jobs_phase_ticket",
+        "idx_jobs_caller_agent",
         "idx_ticket_chronicle_ws_id",
         "idx_ticket_chronicle_dedup",
         "idx_alarms_due",
@@ -1870,7 +1925,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     // ── Tests ──────────────────────────────────────────────────────────
 
-    /// A fresh install runs the baseline (`24`/`25`/`27`) and converges to the
+    /// A fresh install runs the baseline (`24`/`25`/`27`/`28`) and converges to the
     /// exact current core shape: the table set (which also proves the required
     /// absences of `user_roles` / `config_role` / `ticket_jobs` /
     /// `ticket_stage_jobs`) and the per-table column sets (which prove the
@@ -1894,8 +1949,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         applied.sort();
         assert_eq!(
             applied,
-            vec!["24".to_string(), "25".to_string(), "27".to_string()],
-            "fresh core applies baseline 24/25/27 exactly"
+            vec![
+                "24".to_string(),
+                "25".to_string(),
+                "27".to_string(),
+                "28".to_string()
+            ],
+            "fresh core applies baseline 24/25/27/28 exactly"
         );
     }
 
@@ -2046,13 +2106,15 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// Assert that reopening the core catalog leaves the database unchanged,
     /// except for `except_tables`, whose table DDL and column set may differ on
-    /// reopen (the delta-27 `workspaces` column upfill). Index definitions, row
-    /// counts, `chat_history` content and `tickets` content are asserted to be
-    /// strictly unchanged.
+    /// reopen (the delta-27 `workspaces` column upfill, the delta-28
+    /// `jobs`/`session_metadata` column upfills), and `except_indexes`, whose
+    /// definitions may be added on reopen. Row counts, `chat_history` content
+    /// and `tickets` content are asserted to be strictly unchanged.
     async fn assert_core_catalog_unchanged(
         conn: &Connection,
         before: &CoreSnapshot,
         except_tables: &[&str],
+        except_indexes: &[&str],
     ) {
         assert_eq!(
             without(&table_defs(conn).await, except_tables),
@@ -2060,9 +2122,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "core table DDL (except {except_tables:?}) must be unchanged on reopen"
         );
         assert_eq!(
-            index_defs(conn).await,
-            before.indexes,
-            "core index definitions must be unchanged on reopen"
+            without(&index_defs(conn).await, except_indexes),
+            without(&before.indexes, except_indexes),
+            "core index definitions (except {except_indexes:?}) must be unchanged on reopen"
         );
         assert_eq!(
             without(
@@ -2103,8 +2165,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`) as a STRICT no-op except the delta-27
-    /// `workspaces.maintainer_recommendations` column upfill, which is asserted
+    /// the new baseline (`24`/`25`/`27`/`28`) as a STRICT no-op except the
+    /// delta-27 `workspaces.maintainer_recommendations` column upfill and the
+    /// delta-28 `jobs.caller_agent_id` / `session_metadata.created_at` column
+    /// upfills (plus the delta-28 `idx_jobs_caller_agent` index), all asserted
     /// explicitly. This also proves Turso honors `IF NOT EXISTS` on the FTS
     /// index when the baseline re-runs it.
     #[tokio::test]
@@ -2133,23 +2197,46 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("24".to_string());
         expected_ids.push("25".to_string());
         expected_ids.push("27".to_string());
+        expected_ids.push("28".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27"
+            "reopen must record exactly old ids ∪ 24/25/27/28"
         );
 
-        // Everything else is a strict no-op; only workspaces gains its delta-27
-        // column, appended at the end by the ALTER.
-        assert_core_catalog_unchanged(&conn, &before, &["workspaces"]).await;
+        // Everything else is a strict no-op; only workspaces (delta 27) plus
+        // jobs/session_metadata (delta 28) gain their columns, appended at the
+        // end by the ALTER, and the delta-28 `idx_jobs_caller_agent` index is
+        // added.
+        assert_core_catalog_unchanged(
+            &conn,
+            &before,
+            &["workspaces", "jobs", "session_metadata"],
+            &["idx_jobs_caller_agent"],
+        )
+        .await;
         let after_ws_cols = column_sets(&conn, &["workspaces"]).await;
         let mut expected_ws_cols = before.cols["workspaces"].clone();
         expected_ws_cols.push("maintainer_recommendations".to_string());
         assert_eq!(
             after_ws_cols["workspaces"], expected_ws_cols,
             "reopen must append exactly maintainer_recommendations to workspaces columns"
+        );
+        let after_jobs_cols = column_sets(&conn, &["jobs"]).await;
+        let mut expected_jobs_cols = before.cols["jobs"].clone();
+        expected_jobs_cols.push("caller_agent_id".to_string());
+        assert_eq!(
+            after_jobs_cols["jobs"], expected_jobs_cols,
+            "reopen must append exactly caller_agent_id to jobs columns"
+        );
+        let after_sm_cols = column_sets(&conn, &["session_metadata"]).await;
+        let mut expected_sm_cols = before.cols["session_metadata"].clone();
+        expected_sm_cols.push("created_at".to_string());
+        assert_eq!(
+            after_sm_cols["session_metadata"], expected_sm_cols,
+            "reopen must append exactly created_at to session_metadata columns"
         );
     }
 
@@ -2214,9 +2301,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The 0.5.0 (one-delta-behind) upgrade: a database built by the retired
     /// chain WITHOUT entry `23` has no `chat_history` reply columns; the
-    /// baseline entry `25` upfills exactly those two columns, and entry `27`
-    /// adds `workspaces.maintainer_recommendations`, leaving every row and every
-    /// other table's schema untouched.
+    /// baseline entry `25` upfills exactly those two columns, entry `27` adds
+    /// `workspaces.maintainer_recommendations`, and entry `28` adds
+    /// `jobs.caller_agent_id` / `session_metadata.created_at` (plus its
+    /// partial index), leaving every row and every other table's schema
+    /// untouched.
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2263,7 +2352,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
         let untouched_tables: Vec<&str> = expected_core_table_names()
             .into_iter()
-            .filter(|n| *n != "chat_history" && *n != "workspaces" && *n != "schema_migrations")
+            .filter(|n| {
+                *n != "chat_history"
+                    && *n != "workspaces"
+                    && *n != "jobs"
+                    && *n != "session_metadata"
+                    && *n != "schema_migrations"
+            })
             .collect();
         let before_other = column_sets(&conn, &untouched_tables).await;
         let mut before_ids = applied_ids(&conn).await;
@@ -2313,19 +2408,21 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("24".to_string());
         expected_ids.push("25".to_string());
         expected_ids.push("27".to_string());
+        expected_ids.push("28".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27"
+            "upgrade must record exactly old ids ∪ 24/25/27/28"
         );
 
         assert_eq!(
             column_sets(&conn, &untouched_tables).await,
             before_other,
-            "only chat_history (delta 25) and workspaces (delta 27) columns may change \
-             on the 0.5.0 upgrade"
+            "only chat_history (delta 25), workspaces (delta 27) and \
+             jobs/session_metadata (delta 28) columns may change on the \
+             0.5.0 upgrade"
         );
     }
 }

@@ -207,8 +207,14 @@ impl Tool for AnalyzeTool {
             return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
         }
 
-        // Sync path — blocks caller until the analysts complete.
-        run_parallel_analysts_and_consolidate(ws, analyze).await
+        // Sync path — blocks caller until the analysts complete. Runs through
+        // the durable analyze core with a caller-owned jobs row keyed by the
+        // caller's session pin: a graceful drain mid-call surfaces
+        // [`crate::tools::CallSuspended`] — the call's result is left absent
+        // (the job stays launched) and the session's universal
+        // resume-completion step settles it before the next LLM call (this
+        // dispatch itself never binds to prior jobs — it spawns fresh).
+        run_sync_analyze(ws, analyze, self.caller_role).await
     }
 }
 
@@ -219,7 +225,7 @@ struct AnalyzeSlot {
 }
 
 /// Outcome of a durable analyze round.
-enum AnalyzeRunOutcome {
+pub(crate) enum AnalyzeRunOutcome {
     /// The round produced a result (Ok or Err — both terminalize with a
     /// durable envelope).
     Result(anyhow::Result<String>),
@@ -253,11 +259,14 @@ async fn dispatch_durable_analyze(
     let result = match run_analyze_with_job(
         ws,
         analyze,
-        &job_id,
-        caller_role,
-        &user_name,
-        &channel,
-        false,
+        crate::tools::CoreJobArgs {
+            job_id: &job_id,
+            caller_role,
+            user_name: &user_name,
+            channel: &channel,
+            resume: false,
+            caller_agent_id: None,
+        },
     )
     .await
     {
@@ -294,15 +303,19 @@ async fn dispatch_durable_analyze(
 /// outcomes, consolidate. `pre_done` carries slots already completed (resume)
 /// with their stored raw-response outcomes.
 #[expect(clippy::too_many_lines)]
-async fn run_analyze_with_job(
+pub(crate) async fn run_analyze_with_job(
     ws: &Workspace,
     analyze: &str,
-    job_id: &str,
-    caller_role: Role,
-    user_name: &str,
-    channel: &str,
-    resume: bool,
+    args: crate::tools::CoreJobArgs<'_>,
 ) -> anyhow::Result<AnalyzeRunOutcome> {
+    let crate::tools::CoreJobArgs {
+        job_id,
+        caller_role,
+        user_name,
+        channel,
+        resume,
+        caller_agent_id,
+    } = args;
     let deadline = std::time::Instant::now() + round_timeout();
 
     // Fresh dispatch: build the roster and spawn the job BEFORE any analyst
@@ -355,6 +368,7 @@ async fn run_analyze_with_job(
             caller_role,
             &agents,
             &crate::jobs::SpawnChild::Analyze,
+            caller_agent_id,
         )
         .await?;
         (slots, Vec::new())
@@ -390,20 +404,7 @@ async fn run_analyze_with_job(
                 )),
                 Some(analyze.to_string()),
             );
-            let _ = agent
-                .session
-                .init(
-                    &slot.agent_id,
-                    "",
-                    ws,
-                    &crate::Role::Analyst,
-                    None,
-                    "",
-                    "",
-                    None,
-                    false,
-                )
-                .await;
+            let _ = agent.session.init(&slot.agent_id).await;
             runs.push(AnalyzeRun::Completed {
                 agent,
                 response: Some(raw.clone()),
@@ -436,6 +437,12 @@ async fn run_analyze_with_job(
             crate::jobs::write_agent_outcome(conn, job_id, &slot.agent_id, status, Some(&outcome))
                 .await
         {
+            // Sync calls (caller-owned job) fail the tool call on a checkpoint
+            // DB error so the model retries; async/boot-resume warn-and-continue
+            // (the outcomes are recomputable on the next resume).
+            if caller_agent_id.is_some() {
+                return Err(e.context("failed to checkpoint analyze outcome"));
+            }
             tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint analyze outcome");
         }
     }
@@ -528,38 +535,41 @@ async fn run_analyze_slots(
 /// row stays for the next boot (checkpointed outcomes are reused, so the
 /// already-completed LLM work is never lost or duplicated).
 pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
-    let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
-        &crate::session::store().conn,
-        job_id,
-        "Analyze resume",
-        "Analyze resume",
-    )
-    .await
-    else {
-        return;
-    };
-    let result = match run_analyze_with_job(
-        ws,
-        &caller.task,
-        job_id,
-        caller_role,
-        &caller.user_name,
-        &caller.channel,
-        true,
-    )
-    .await
-    {
-        Ok(AnalyzeRunOutcome::Result(result)) => result,
-        // Round drain-cut mid-resume: abort quietly — the outcomes are
-        // checkpointed, the next boot reuses them.
-        Ok(AnalyzeRunOutcome::DrainCut) => {
-            tracing::info!(
-                job = %job_id,
-                "Analyze resume aborted after analysts completed — job stays for next boot",
-            );
+    let (caller_role, caller, result) = match resume_analyze_core(ws, job_id, None).await {
+        Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
+            (caller_role, caller, result)
+        }
+        // Drain-cut mid-resume / job row vanished: abort quietly — the core
+        // logs the reason; a missing job was already warned + terminalized.
+        Ok(
+            crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::JobMissing,
+        ) => return,
+        // Resume infra failure (roster load / checkpoint) — deliver an error
+        // envelope to the ORIGINAL caller, exactly like a round-level failure.
+        // The job row is still present (the core never terminalizes), so the
+        // caller identity can be re-loaded for the route.
+        Err(e) => {
+            let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
+                &crate::session::store().conn,
+                job_id,
+                "Analyze resume",
+                "Analyze resume",
+            )
+            .await
+            else {
+                return;
+            };
+            complete_durable_job_and_route(
+                job_id,
+                build_async_analyze_message(&Err(e)),
+                MessageKind::AnalyzeToolResult,
+                caller_role,
+                &caller,
+                &ws.name,
+            )
+            .await;
             return;
         }
-        Err(e) => Err(e),
     };
     // Drain/shutdown fired after the round returned: abort quietly WITHOUT
     // routing and WITHOUT deleting the row — the outcomes are checkpointed
@@ -581,6 +591,24 @@ pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
         &ws.name,
     )
     .await;
+}
+
+/// Run a drain-cut analyze round to completion at the roster level. Returns a
+/// [`crate::jobs::SyncResumeOutcome`]: `Terminal` when the round reached a
+/// result, `DrainCut` when drain-cut (outcomes are checkpointed, job stays
+/// launched), `JobMissing` when the job row vanished. No routing/terminalization
+/// here — the caller decides. `caller_agent_id` selects checkpoint-error
+/// propagation: `Some` for a sync resume (a checkpoint DB error fails the tool
+/// call), `None` for async boot resume (warn-and-continue, exactly as today's
+/// async behavior).
+pub(crate) async fn resume_analyze_core(
+    ws: &Workspace,
+    job_id: &str,
+    caller_agent_id: Option<&str>,
+) -> anyhow::Result<crate::jobs::SyncResumeOutcome> {
+    crate::tools::SyncDurableCore::Analyze
+        .resume_sync_core(ws, job_id, caller_agent_id)
+        .await
 }
 
 /// Build the `<analyze-tool-result>` envelope message for an async analyze dispatch.
@@ -850,22 +878,18 @@ pub(crate) fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(
 /// Bounds the shared dispatch — never a per-run analyst budget.
 pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
 
-// ── Parallel analyst batch ───────────────────────────────────────────────
+// ── Sync dispatch ────────────────────────────────────────────────────────
 
-/// Spawn 3 decorrelated parallel analysts, then consolidate their claim-level
-/// findings into a single comprehensive answer.
-async fn run_parallel_analysts_and_consolidate(ws: &Workspace, analyze: &str) -> Result<String> {
-    // One round-wide bound shared by the analyst and extraction member waits
-    // — a stuck analyst is aborted at it, so no phase can hang the round.
-    // The sequential consolidation call after the deadline finishes within
-    // its own retry bounds.
-    let deadline = std::time::Instant::now() + round_timeout();
-    // Round key shared by the analysts and the consolidation call so the
-    // Running Agents view groups them under one analyze round.
-    let round_key = crate::generate_suffix();
-    let runs =
-        run_parallel_analysts(ws, analyze, PARALLEL_ANALYST_COUNT, deadline, &round_key).await;
-    consolidate_analyst_runs(ws, analyze, runs, deadline, &round_key).await
+/// Sync analyze dispatch through the durable core: the jobs row + analyst
+/// roster commit BEFORE any analyst session write, keyed by the caller's
+/// session pin (`CURRENT_TOOL_AGENT_ID`) so a graceful drain mid-call leaves
+/// the job `launched` for deterministic resume — the emission-time frame is
+/// already durably recorded, so the call's result is simply absent until the
+/// universal resume-completion step settles it.
+async fn run_sync_analyze(ws: &Workspace, analyze: &str, caller_role: Role) -> Result<String> {
+    crate::tools::SyncDurableCore::Analyze
+        .run_sync_dispatch(ws, analyze, caller_role)
+        .await
 }
 
 /// Load the decorrelation angles asset — one distinct research angle per
@@ -895,26 +919,6 @@ fn analyst_slot(
         agent_id: format!("analyze_{}_{}_{}_analyst", ws.name, suffix, i),
         task,
     }
-}
-
-/// Run `count` parallel analyst agents with decorrelated research angles,
-/// returning each member's outcome. The wait shares the round-wide `deadline`
-/// (see [`run_parallel_analysts_and_consolidate`]): a member still running at
-/// the deadline is aborted and reported as failed (with the reason) instead of
-/// stalling the round, and the completed members' results are still delivered.
-async fn run_parallel_analysts(
-    ws: &Workspace,
-    analyze: &str,
-    count: usize,
-    deadline: std::time::Instant,
-    round_key: &str,
-) -> Vec<AnalyzeRun> {
-    let angles = load_analyst_angles();
-    let slots: Vec<AnalyzeSlot> = (0..count)
-        .map(|i| analyst_slot(ws, &angles, round_key, i, analyze))
-        .collect();
-    let slot_refs: Vec<&AnalyzeSlot> = slots.iter().collect();
-    run_analyze_slots(ws, &slot_refs, deadline, false, round_key, analyze).await
 }
 
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
@@ -1796,10 +1800,13 @@ mod tests {
     }
 
     /// Tests that analyze dispatches analysts and returns the consolidated result.
-    /// Requires an LLM provider to be configured.
+    /// Requires an LLM provider to be configured. The sync path now runs through
+    /// the durable analyze core, so the stores must be initialized (like the
+    /// resume test).
     #[tokio::test]
     #[ignore = "requires LLM provider; runs only when explicitly invoked"]
     async fn test_analyze_analyst() {
+        crate::util::test::init_management_test_stores().await;
         let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
         let ws = test_ws("/tmp/test_ws");
         let args = json!({"analyze": "Say 'hello analyst' and nothing else."});
@@ -2633,6 +2640,7 @@ mod tests {
                 task: "question?".to_string(),
             }],
             &crate::jobs::SpawnChild::Analyze,
+            None,
         )
         .await
         .unwrap();
@@ -2675,6 +2683,205 @@ mod tests {
             "resumed envelope routes to the original caller role, not Manager"
         );
         assert_eq!(envelope.user_name, "caller-user");
+    }
+
+    /// Seed a caller-owned analyze job with a single roster slot. `outcome`
+    /// `Some` marks the slot Done with that stored outcome (reconstructable);
+    /// `None` leaves it launched. The caller session must be created BEFORE
+    /// this call so the job passes the freshness gate.
+    async fn seed_analyze_job(ws: &Workspace, job_id: &str, pin: &str, outcome: Option<&str>) {
+        let conn = &crate::session::store().conn;
+        let analyst_id = format!("{job_id}_analyst");
+        crate::jobs::spawn_job(
+            conn,
+            job_id,
+            "analyze task",
+            &ws.name,
+            "caller-user",
+            "telegram",
+            crate::Role::Engineer,
+            &[crate::jobs::NewAgent {
+                agent_id: analyst_id.clone(),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(0),
+                task: "analyze task".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Analyze,
+            Some(pin),
+        )
+        .await
+        .unwrap();
+        if let Some(outcome) = outcome {
+            crate::jobs::write_agent_outcome(
+                conn,
+                job_id,
+                &analyst_id,
+                crate::jobs::RowStatus::Done,
+                Some(outcome),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// (h) The freshness gate blocks a FRESH caller session from resuming a
+    /// prior cycle's stale orphan: the resume hook returns EMPTY, the stale job
+    /// stays launched and untouched, and NO rows are added to the session (no
+    /// synthesis — the stale-result protection for fresh caller cycles holds).
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn sync_analyze_freshness_gate_blocks_fresh_session() {
+        let _lock = retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_analyze_freshness");
+        let pin = "sync_analyze_freshness_pin";
+        let conn = &crate::session::store().conn;
+
+        // A FRESH caller session is NEWER than the stale orphan job.
+        crate::util::test::seed_session_row(conn, pin, "user", "fresh cycle").await;
+        seed_analyze_job(&ws, "stale_job", pin, Some("OLD_RESULT")).await;
+        // Backdate the stale job below the fresh session's creation so the gate
+        // rejects it.
+        conn.execute(
+            "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
+            crate::db::params!["2020-01-01T00:00:00+00:00", "stale_job"],
+        )
+        .await
+        .unwrap();
+
+        let owned = crate::jobs::find_owned_launched_jobs(conn, pin)
+            .await
+            .unwrap();
+        assert!(
+            owned.is_empty(),
+            "a fresh caller cycle resumes nothing from a prior cycle"
+        );
+
+        let stale = conn
+            .query(
+                "SELECT status, retry_count FROM jobs WHERE id = ?1",
+                crate::db::params!["stale_job"],
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.len(), 1, "stale job is untouched");
+        assert_eq!(stale[0].get::<String>(0).unwrap(), "launched");
+        assert_eq!(
+            stale[0].get::<i64>(1).unwrap(),
+            0,
+            "stale job was not checkpointed"
+        );
+
+        // No session rows were added (no synthesis — the stale-result
+        // protection for fresh caller cycles holds).
+        let session_rows = conn
+            .query(
+                "SELECT id FROM sessions WHERE agent_id = ?1",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session_rows.len(),
+            1,
+            "no session rows were added by the hook"
+        );
+    }
+
+    /// (k-extra) `find_owned_launched_jobs` returns only the caller's
+    /// launched analyze/implement jobs — a research-kind and a ticket-phase-kind
+    /// job owned by the same pin are ignored — newest first.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn find_owned_launched_jobs_ignores_other_kinds() {
+        let _lock = retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_find_owned");
+        let pin = "sync_analyze_find_pin";
+        let conn = &crate::session::store().conn;
+
+        // A caller session row so the freshness gate admits the live analyze
+        // jobs (without any session row OR metadata the tightened comparison is
+        // NULL and no job passes). Backdate the session so the `analyze_older`
+        // job (also backdated, but after the session) stays admissible.
+        crate::util::test::seed_session_row(conn, pin, "user", "...").await;
+        conn.execute(
+            "UPDATE sessions SET created_at = ?1 WHERE agent_id = ?2 AND role = 'user'",
+            crate::db::params!["2021-01-01T00:00:00+00:00", pin],
+        )
+        .await
+        .unwrap();
+
+        // A research-kind job owned by the pin.
+        crate::jobs::spawn_job(
+            conn,
+            "research_job",
+            "research task",
+            &ws.name,
+            "caller",
+            "telegram",
+            crate::Role::Analyst,
+            &[crate::jobs::NewAgent {
+                agent_id: "research_a".to_string(),
+                kind: crate::jobs::AgentKind::Analyst,
+                idx: Some(0),
+                task: "r".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Research,
+            Some(pin),
+        )
+        .await
+        .unwrap();
+        // A ticket-phase-kind job owned by the pin (requires a real ticket for
+        // the FK).
+        let ticket_id = crate::util::test::make_ticket(
+            crate::pipeline::board::store(),
+            &ws,
+            "FindOwnedJob",
+            crate::pipeline::board::TicketPhase::Analysis,
+        )
+        .await;
+        crate::jobs::spawn_job(
+            conn,
+            "phase_job",
+            "phase task",
+            &ws.name,
+            "caller",
+            "telegram",
+            crate::Role::Engineer,
+            &[crate::jobs::NewAgent {
+                agent_id: "phase_a".to_string(),
+                kind: crate::jobs::AgentKind::Engineer,
+                idx: Some(0),
+                task: "p".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Phase {
+                phase: crate::pipeline::board::TicketPhase::Analysis,
+                ticket_id: ticket_id.clone(),
+            },
+            Some(pin),
+        )
+        .await
+        .unwrap();
+
+        seed_analyze_job(&ws, "analyze_newer", pin, None).await;
+        seed_analyze_job(&ws, "analyze_older", pin, None).await;
+        conn.execute(
+            "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
+            crate::db::params!["2023-01-02T00:00:00+00:00", "analyze_older"],
+        )
+        .await
+        .unwrap();
+
+        let owned = crate::jobs::find_owned_launched_jobs(conn, pin)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = owned.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["analyze_newer", "analyze_older"],
+            "only analyze jobs returned, newest first"
+        );
     }
 
     // ── Analyze dispute-verification round helpers ────────────────────────
@@ -2861,6 +3068,233 @@ mod tests {
         assert!(
             !closed,
             "verification skipped when more than half the window elapsed"
+        );
+    }
+
+    // ── Emission-time durability: drain-cut + resume-completion ───────────
+
+    /// (e) With drain active, a sync analyze dispatch surfaces the
+    /// [`CallSuspended`] carrier and leaves the caller-owned job `launched` —
+    /// never terminalized.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn sync_analyze_draincut_returns_call_suspended_error() {
+        let _lock = retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_sync_analyze_draincut");
+        let pin = "sync_analyze_draincut_pin";
+        let conn = &crate::session::store().conn;
+        // A caller session row so the freshness gate admits the sync job.
+        crate::util::test::seed_session_row(conn, pin, "user", "analyze this").await;
+
+        crate::shutdown::drain_begin();
+        let tool = AnalyzeTool::new(DispatchMode::Sync, crate::Role::Engineer);
+        let res = crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some(pin.to_string()), async {
+                tool.execute(&ws, json!({"analyze": "analyze task"})).await
+            })
+            .await;
+        crate::shutdown::drain_clear();
+
+        let err = res.expect_err("drain must cut the sync analyze dispatch");
+        assert!(
+            err.downcast_ref::<crate::tools::CallSuspended>().is_some(),
+            "CallSuspended carrier expected: {err:#}"
+        );
+
+        // The durable job stays launched, caller-owned by the pin.
+        let rows = conn
+            .query(
+                "SELECT status, caller_agent_id FROM jobs WHERE caller_agent_id = ?1 AND kind = 'analyze'",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "one launched analyze job");
+        assert_eq!(rows[0].get::<String>(0).unwrap(), "launched");
+        assert_eq!(
+            rows[0].get::<String>(1).unwrap(),
+            pin,
+            "job is caller-owned by the session pin"
+        );
+    }
+
+    /// (f) The resume-completion path resumes a durable analyze job whose
+    /// roster is all-Done: the Done slot is reconstructed (zero LLM calls),
+    /// the consolidated result settles contiguously after the frame, and the
+    /// job is terminalized.
+    #[tokio::test]
+    async fn resume_hook_completion_resumes_durable_analyze() {
+        let fake = std::sync::Arc::new(FakeProvider::new());
+        let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_analyze_resume_hook");
+        let pin = "sync_analyze_resume_pin";
+        let conn = &crate::session::store().conn;
+        let job_id = "sync_analyze_resume_job";
+
+        // Caller session [user, assistant frame with an analyze tool call].
+        crate::util::test::seed_session_row(conn, pin, "user", "analyze task").await;
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: "call_analyze_f".to_string(),
+                name: "analyze".to_string(),
+                arguments: json!({"analyze": "analyze task"}),
+            }],
+            None,
+        )
+        .to_string();
+        crate::util::test::seed_session_row(conn, pin, "assistant", &frame).await;
+        // Owned analyze job with an all-Done roster (outcome RESULT_ONE).
+        seed_analyze_job(&ws, job_id, pin, Some("RESULT_ONE")).await;
+
+        // Load the caller session and run the resume+settle path.
+        let mut session = crate::session::Session::default();
+        session.init(pin).await.unwrap();
+        let pending = session.pending_tool_calls().expect("dangling analyze call");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "call_analyze_f");
+
+        let outcome = resume_analyze_core(&ws, job_id, Some(pin)).await.unwrap();
+        let crate::jobs::SyncResumeOutcome::Terminal(_, _, result) = outcome else {
+            panic!("expected a terminal resume outcome");
+        };
+        let text = result.expect("resumed analyze result");
+        assert_eq!(text, "RESULT_ONE");
+        crate::jobs::terminalize_job(conn, job_id).await.unwrap();
+
+        session
+            .settle_tool_results(pin, &[("call_analyze_f".to_string(), text.clone())], &[])
+            .await
+            .unwrap();
+
+        // The Done slot was reconstructed — the seam saw zero LLM calls.
+        assert!(
+            fake.request_fingerprints.lock().unwrap().is_empty(),
+            "resume of an all-Done roster must not call the model"
+        );
+
+        // Job terminalized.
+        let jobs = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert!(jobs.is_empty(), "resumed job must be terminalized");
+
+        // Tool result row contiguous after the frame; pending_jobs empty.
+        let rows = conn
+            .query(
+                "SELECT id, role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].get::<String>(1).unwrap(), "assistant");
+        assert_eq!(rows[2].get::<String>(1).unwrap(), "tool");
+        let tool_content = rows[2].get::<String>(2).unwrap();
+        let payload: crate::ToolResultPayload = serde_json::from_str(&tool_content).unwrap();
+        assert_eq!(payload.tool_call_id, "call_analyze_f");
+        assert_eq!(payload.content, "RESULT_ONE");
+        let pending_jobs = conn
+            .query(
+                "SELECT id FROM pending_jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert!(pending_jobs.is_empty(), "no envelope pending after resume");
+    }
+
+    /// (g) The freshness gate excludes a backdated owned job, so the
+    /// completion does NOT resume it (untouched) and instead re-executes the
+    /// call fresh — a NEW analyze job is spawned alongside the stale one.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn completion_freshness_gate_falls_through_to_reexecution() {
+        let _lock = retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_analyze_gate_reexec");
+        let pin = "sync_analyze_gate_pin";
+        let conn = &crate::session::store().conn;
+        let old_job = "sync_analyze_gate_stale";
+
+        crate::util::test::seed_session_row(conn, pin, "user", "analyze task").await;
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: "call_analyze_g".to_string(),
+                name: "analyze".to_string(),
+                arguments: json!({"analyze": "analyze task"}),
+            }],
+            None,
+        )
+        .to_string();
+        crate::util::test::seed_session_row(conn, pin, "assistant", &frame).await;
+        seed_analyze_job(&ws, old_job, pin, Some("OLD_RESULT")).await;
+        // Backdate the owned job below the caller session so the gate rejects it.
+        conn.execute(
+            "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
+            crate::db::params!["2020-01-01T00:00:00+00:00", old_job],
+        )
+        .await
+        .unwrap();
+
+        let mut session = crate::session::Session::default();
+        session.init(pin).await.unwrap();
+        let pending = session.pending_tool_calls().expect("dangling analyze call");
+        assert_eq!(pending.len(), 1);
+
+        // The freshness gate excludes the backdated job → nothing to resume.
+        let owned = crate::jobs::find_owned_launched_jobs(conn, pin)
+            .await
+            .unwrap();
+        assert!(
+            owned.is_empty(),
+            "backdated job excluded by the freshness gate"
+        );
+
+        // Re-execute the call fresh (drain active → the new job stays launched).
+        crate::shutdown::drain_begin();
+        let tool = AnalyzeTool::new(DispatchMode::Sync, crate::Role::Engineer);
+        let res = crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some(pin.to_string()), async {
+                tool.execute(&ws, json!({"analyze": "analyze task"})).await
+            })
+            .await;
+        crate::shutdown::drain_clear();
+        let err = res.expect_err("fresh re-execution must drain-cut");
+        assert!(
+            err.downcast_ref::<crate::tools::CallSuspended>().is_some(),
+            "CallSuspended carrier expected: {err:#}"
+        );
+
+        // Two jobs total: the stale one untouched + a NEW one spawned.
+        let rows = conn
+            .query(
+                "SELECT id, status, retry_count FROM jobs WHERE caller_agent_id = ?1 AND kind = 'analyze' ORDER BY created_at",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "a fresh job is spawned alongside the stale one"
+        );
+        let old = rows
+            .iter()
+            .find(|r| r.get::<String>(0).unwrap() == old_job)
+            .expect("stale job present");
+        assert_eq!(old.get::<String>(1).unwrap(), "launched");
+        assert_eq!(old.get::<i64>(2).unwrap(), 0, "stale job untouched");
+        assert!(
+            rows.iter().any(|r| r.get::<String>(0).unwrap() != old_job),
+            "a NEW analyze job was spawned"
         );
     }
 }

@@ -621,11 +621,67 @@ impl Connection {
     /// Both read and write callers should use this method — dangling
     /// transactions can affect read visibility in WAL mode if left active.
     async fn lock_and_cleanup(&self) -> tokio::sync::MutexGuard<'_, turso::Connection> {
-        let conn = self.conn.lock().await;
-        if self.has_dangling_tx.swap(false, Ordering::SeqCst) {
-            let _ = conn.execute("ROLLBACK", ()).await;
+        Self::lock_and_cleanup_owned(&self.conn, &self.has_dangling_tx).await
+    }
+
+    /// Owned-handle variant of [`Self::lock_and_cleanup`] for the detached
+    /// task in [`Self::run_detached`].
+    async fn lock_and_cleanup_owned<'a>(
+        conn: &'a tokio::sync::Mutex<turso::Connection>,
+        has_dangling_tx: &'a AtomicBool,
+    ) -> tokio::sync::MutexGuard<'a, turso::Connection> {
+        let guard = conn.lock().await;
+        if has_dangling_tx.swap(false, Ordering::SeqCst) {
+            let _ = guard.execute("ROLLBACK", ()).await;
         }
-        conn
+        guard
+    }
+
+    /// Drive a statement op to completion even if the caller's future is
+    /// dropped mid-await (a `select!` shutdown cut, a task abort, a timeout).
+    /// The op runs in a DETACHED task owned by the runtime, so a dropped
+    /// caller abandons only the RESULT, never a half-executed statement.
+    ///
+    /// Why this is mandatory: dropping a future mid-statement leaves the
+    /// shared connection's pager state inconsistent — a cache-published page
+    /// whose read never completes makes every later read of that page wait on
+    /// an explicit yield whose completion nothing will ever wake (turso's
+    /// yields assume a fiber scheduler steps other fibers; the tokio wrapper
+    /// has none). One poisoned page then hangs every subsequent op on the
+    /// connection, process-wide. The detached task always runs the statement
+    /// to completion, so cancellation can never strand the connection.
+    async fn run_detached<T, F>(&self, op: F) -> turso::Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a tokio::sync::MutexGuard<'a, turso::Connection>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = turso::Result<T>> + Send + 'a>,
+            > + Send
+            + 'static,
+    {
+        let conn = self.conn.clone();
+        let dangling = self.has_dangling_tx.clone();
+        match tokio::spawn(async move {
+            let guard = Self::lock_and_cleanup_owned(&conn, &dangling).await;
+            op(&guard).await
+        })
+        .await
+        {
+            Ok(inner) => inner,
+            Err(joined) => match joined.try_into_panic() {
+                // A panicking op propagates the ORIGINAL panic payload (the
+                // hook prints it); the unwind re-enters at this call site, so
+                // only the message, not the location, survives. Matches the
+                // inline pre-detached behavior where a DB op panicked its
+                // caller.
+                Ok(payload) => std::panic::resume_unwind(payload),
+                // A cancelled task means runtime shutdown, not a DB failure.
+                Err(_) => Err(turso::Error::Error(
+                    "database op cancelled (runtime shutdown)".to_string(),
+                )),
+            },
+        }
     }
 
     pub async fn execute(
@@ -633,8 +689,9 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<u64> {
-        let conn = self.lock_and_cleanup().await;
-        conn.execute(sql, params).await
+        let sql = sql.to_owned();
+        self.run_detached(move |conn| Box::pin(async move { conn.execute(&sql, params).await }))
+            .await
     }
 
     /// Execute a write via the engine's prepared-statement cache (turso's
@@ -645,14 +702,20 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<u64> {
-        let conn = self.lock_and_cleanup().await;
-        let mut stmt = conn.prepare_cached(sql).await?;
-        stmt.execute(params).await
+        let sql = sql.to_owned();
+        self.run_detached(move |conn| {
+            Box::pin(async move {
+                let mut stmt = conn.prepare_cached(&sql).await?;
+                stmt.execute(params).await
+            })
+        })
+        .await
     }
 
     pub(crate) async fn execute_batch(&self, sql: &str) -> turso::Result<()> {
-        let conn = self.lock_and_cleanup().await;
-        conn.execute_batch(sql).await
+        let sql = sql.to_owned();
+        self.run_detached(move |conn| Box::pin(async move { conn.execute_batch(&sql).await }))
+            .await
     }
 
     /// Begin a transaction and return a guard that keeps the connection locked
@@ -675,8 +738,11 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        let conn = self.lock_and_cleanup().await;
-        Self::query_impl(&conn, sql, params).await
+        let sql = sql.to_owned();
+        self.run_detached(move |conn| {
+            Box::pin(async move { Self::query_impl(conn, &sql, params).await })
+        })
+        .await
     }
 
     /// Execute a read-only query with engine-level write enforcement.
@@ -699,81 +765,87 @@ impl Connection {
         params: impl IntoParams + Send + 'static,
         row_limit: usize,
     ) -> turso::Result<ReadonlyRows> {
-        let conn = self.lock_and_cleanup().await;
-        conn.execute("PRAGMA query_only = 1;", ()).await?;
-        let result = AssertUnwindSafe(run_readonly_query(&conn, sql, params, row_limit))
-            .catch_unwind()
-            .await;
-        // Always restore the shared connection to its normal state (query_only
-        // off, autocommit) so daemon writes are never left disabled. The
-        // `query_only` reset happens first; then a transaction-control statement
-        // (BEGIN/SAVEPOINT) that a raw IPC client could send — not re-validated
-        // daemon-side — is rolled back to autocommit, since an open transaction
-        // on the shared connection would poison subsequent daemon writes. The
-        // whole reset is also panic-guarded: a turso engine panic here must not
-        // unwind (leaving query_only=1), so the caller gets an error instead.
-        let (reset, tx_reset) = match AssertUnwindSafe(async {
-            let reset = conn.execute("PRAGMA query_only = 0;", ()).await;
-            let tx_reset = match conn.is_autocommit() {
-                Ok(true) => Ok(()),
-                _ => conn.execute("ROLLBACK;", ()).await.map(|_| ()),
-            };
-            (reset, tx_reset)
+        let sql = sql.to_owned();
+        let dangling = self.has_dangling_tx.clone();
+        self.run_detached(move |conn| {
+            Box::pin(async move {
+                conn.execute("PRAGMA query_only = 1;", ()).await?;
+                let result =
+                    AssertUnwindSafe(run_readonly_query(conn, &sql, params, row_limit))
+                        .catch_unwind()
+                        .await;
+                // Always restore the shared connection to its normal state (query_only
+                // off, autocommit) so daemon writes are never left disabled. The
+                // `query_only` reset happens first; then a transaction-control statement
+                // (BEGIN/SAVEPOINT) that a raw IPC client could send — not re-validated
+                // daemon-side — is rolled back to autocommit, since an open transaction
+                // on the shared connection would poison subsequent daemon writes. The
+                // whole reset is also panic-guarded: a turso engine panic here must not
+                // unwind (leaving query_only=1), so the caller gets an error instead.
+                let (reset, tx_reset) = match AssertUnwindSafe(async {
+                    let reset = conn.execute("PRAGMA query_only = 0;", ()).await;
+                    let tx_reset = match conn.is_autocommit() {
+                        Ok(true) => Ok(()),
+                        _ => conn.execute("ROLLBACK;", ()).await.map(|_| ()),
+                    };
+                    (reset, tx_reset)
+                })
+                .catch_unwind()
+                .await
+                {
+                    Ok(ok) => ok,
+                    Err(payload) => {
+                        // The reset panicked: the connection state is unknown (`query_only`
+                        // may still be 1 and/or a transaction may be open). Flag it so the
+                        // next `lock_and_cleanup` attempts a rollback, and surface the error
+                        // rather than leaving daemon writes silently blocked.
+                        dangling.store(true, Ordering::SeqCst);
+                        return Err(turso::Error::Error(format!(
+                            "the database engine panicked while resetting the read-only query state: {}",
+                            crate::util::panic_message(&*payload)
+                        )));
+                    }
+                };
+                if let Err(e) = &reset {
+                    tracing::error!(
+                        error = %e,
+                        "query_readonly: failed to reset PRAGMA query_only — daemon writes may \
+                         be left disabled on the shared connection"
+                    );
+                }
+                if let Err(e) = &tx_reset {
+                    // Flag the leaked transaction so the next `lock_and_cleanup` retries
+                    // the rollback before a daemon write reuses the connection.
+                    dangling.store(true, Ordering::SeqCst);
+                    tracing::error!(
+                        error = %e,
+                        "query_readonly: failed to roll back a leaked transaction — daemon writes may \
+                         be left disabled on the shared connection"
+                    );
+                }
+                match result {                    Ok(Ok(rows)) => {
+                        reset?;
+                        tx_reset?;
+                        Ok(rows)
+                    }
+                    Ok(Err(e)) => {
+                        reset?;
+                        tx_reset?;
+                        Err(e)
+                    }
+                    Err(payload) => {
+                        // Always attempt the reset above; report the panic as a query error.
+                        reset?;
+                        tx_reset?;
+                        Err(turso::Error::Error(format!(
+                            "the database engine panicked while executing the query: {}",
+                            crate::util::panic_message(&*payload)
+                        )))
+                    }
+                }
+            })
         })
-        .catch_unwind()
         .await
-        {
-            Ok(ok) => ok,
-            Err(payload) => {
-                // The reset panicked: the connection state is unknown (`query_only`
-                // may still be 1 and/or a transaction may be open). Flag it so the
-                // next `lock_and_cleanup` attempts a rollback, and surface the error
-                // rather than leaving daemon writes silently blocked.
-                self.has_dangling_tx.store(true, Ordering::SeqCst);
-                return Err(turso::Error::Error(format!(
-                    "the database engine panicked while resetting the read-only query state: {}",
-                    crate::util::panic_message(&*payload)
-                )));
-            }
-        };
-        if let Err(e) = &reset {
-            tracing::error!(
-                error = %e,
-                "query_readonly: failed to reset PRAGMA query_only — daemon writes may \
-                 be left disabled on the shared connection"
-            );
-        }
-        if let Err(e) = &tx_reset {
-            // Flag the leaked transaction so the next `lock_and_cleanup` retries
-            // the rollback before a daemon write reuses the connection.
-            self.has_dangling_tx.store(true, Ordering::SeqCst);
-            tracing::error!(
-                error = %e,
-                "query_readonly: failed to roll back a leaked transaction — daemon writes may \
-                 be left disabled on the shared connection"
-            );
-        }
-        match result {
-            Ok(Ok(rows)) => {
-                reset?;
-                tx_reset?;
-                Ok(rows)
-            }
-            Ok(Err(e)) => {
-                reset?;
-                tx_reset?;
-                Err(e)
-            }
-            Err(payload) => {
-                // Always attempt the reset above; report the panic as a query error.
-                reset?;
-                tx_reset?;
-                Err(turso::Error::Error(format!(
-                    "the database engine panicked while executing the query: {}",
-                    crate::util::panic_message(&*payload)
-                )))
-            }
-        }
     }
 
     /// Core query logic shared by [`Connection::query`] and [`TxGuard::query`].
@@ -835,10 +907,14 @@ impl Connection {
         map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
     ) -> turso::Result<T>
     where
+        T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let conn = self.lock_and_cleanup().await;
-        Self::query_row_impl(&conn, sql, params, map).await
+        let sql = sql.to_owned();
+        self.run_detached(move |conn| {
+            Box::pin(async move { Self::query_row_impl(conn, &sql, params, map).await })
+        })
+        .await
     }
 
     /// Execute a query that returns zero or one row.
@@ -858,6 +934,7 @@ impl Connection {
         map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
     ) -> anyhow::Result<Option<T>>
     where
+        T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
         match self.query_row(sql, params, map).await {
@@ -877,6 +954,7 @@ impl Connection {
         map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
     ) -> turso::Result<T>
     where
+        T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
         let mut rows = conn.query(sql, params).await?;
@@ -905,8 +983,11 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        let conn = self.lock_and_cleanup().await;
-        Self::query_cached_impl(&conn, sql, params).await
+        let sql = sql.to_owned();
+        self.run_detached(move |conn| {
+            Box::pin(async move { Self::query_cached_impl(conn, &sql, params).await })
+        })
+        .await
     }
 
     /// Core query logic shared by [`Connection::query_cached`]. Operates on an
@@ -957,16 +1038,22 @@ impl Connection {
         map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
     ) -> turso::Result<T>
     where
+        T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let conn = self.lock_and_cleanup().await;
-        let mut stmt = conn.prepare_cached(sql).await?;
-        let mut rows = stmt.query(params).await?;
-        let row = rows
-            .next()
-            .await?
-            .ok_or(turso::Error::QueryReturnedNoRows)?;
-        map(&row).map_err(|e| turso::Error::Error(e.to_string()))
+        let sql = sql.to_owned();
+        self.run_detached(move |conn| {
+            Box::pin(async move {
+                let mut stmt = conn.prepare_cached(&sql).await?;
+                let mut rows = stmt.query(params).await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or(turso::Error::QueryReturnedNoRows)?;
+                map(&row).map_err(|e| turso::Error::Error(e.to_string()))
+            })
+        })
+        .await
     }
 
     /// Execute a query that returns zero or one row, using the cached
@@ -988,6 +1075,7 @@ impl Connection {
         map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
     ) -> anyhow::Result<Option<T>>
     where
+        T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
         match self.query_row_cached(sql, params, map).await {
@@ -1158,6 +1246,7 @@ impl TxGuard<'_> {
         map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
     ) -> turso::Result<T>
     where
+        T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
         Connection::query_row_impl(&self.conn, sql, params, map).await
@@ -2301,7 +2390,7 @@ async fn drop_create_index_fallback(
     // rolls the DROP back when the CREATE fails — the original (desynced)
     // index survives for operator review. The rollback is deferred: the
     // dropped guard flags the connection and the ROLLBACK fires at the next
-    // lock_and_cleanup (all wrapper methods route through it), so the
+    // detached access (`run_detached` / `lock_and_cleanup_owned`), so the
     // uncommitted DROP is undone before any further DB access.
     let outcome = async {
         let tx = conn.begin_tx().await?;

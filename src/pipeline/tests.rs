@@ -343,6 +343,7 @@ async fn phase_job_is_unique_and_terminalizes() {
             phase,
             ticket_id: ticket_id.clone(),
         },
+        None,
     )
     .await
     .unwrap();
@@ -361,6 +362,7 @@ async fn phase_job_is_unique_and_terminalizes() {
             phase,
             ticket_id: ticket_id.clone(),
         },
+        None,
     )
     .await
     .expect_err("duplicate phase job must be rejected by the unique index");
@@ -456,6 +458,7 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
             phase: TicketPhase::InReview,
             ticket_id: id.clone(),
         },
+        None,
     )
     .await
     .unwrap();
@@ -510,6 +513,7 @@ async fn bounce_breaker_trips_to_failed() {
             phase: TicketPhase::InReview,
             ticket_id: id.clone(),
         },
+        None,
     )
     .await
     .unwrap();
@@ -568,6 +572,7 @@ async fn reset_phase_attempt_destroys_attempt_and_pauses() {
             phase: TicketPhase::InDevelopment,
             ticket_id: id.clone(),
         },
+        None,
     )
     .await
     .unwrap();
@@ -636,6 +641,7 @@ async fn reset_phase_attempt_analysis_does_not_pause() {
             phase: TicketPhase::Analysis,
             ticket_id: id.clone(),
         },
+        None,
     )
     .await
     .unwrap();
@@ -691,6 +697,7 @@ async fn spawn_phase_job(
             phase,
             ticket_id: ticket_id.to_string(),
         },
+        None,
     )
     .await
     .unwrap();
@@ -2003,4 +2010,149 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         "the unpause re-drive must complete the QA round",
     );
     assert_workspace_paused(&ws, false).await;
+}
+
+/// (i) A stage re-drive whose session carries a dangling analyze call runs the
+/// universal resume-completion step BEFORE the engineer's model round: the
+/// owned analyze job (Done roster) is terminalized, its consolidated result
+/// settles contiguously after the frame, and only then does the engineer LLM
+/// round proceed (the Done-slot replay adds zero LLM calls).
+#[serial_test::serial(provider)]
+#[tokio::test]
+async fn stage_re_drive_completes_dangling_calls_before_model_round() {
+    let _guard = TEST_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/stage_re_drive_ws", "stage_re_drive_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    crate::workspace::store()
+        .set_paused(&ws.name, false)
+        .await
+        .unwrap();
+
+    let id = make_ticket(store, &ws, "StageReDrive", TicketPhase::InDevelopment).await;
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InDevelopment,
+        crate::Role::Engineer,
+        "implement",
+    )
+    .await;
+    let pin = crate::jobs::session_pin_id(&id, crate::Role::Engineer);
+    let conn = &crate::session::store().conn;
+
+    // Seed the stage pin session [user(task), assistant frame with an analyze
+    // tool call] + an owned analyze job (Done roster "STAGE_RESULT").
+    crate::util::test::seed_session_row(conn, &pin, "user", "implement the ticket").await;
+    let frame = crate::providers::reasoning::assistant_replay_payload(
+        Some(""),
+        &[crate::ToolCall {
+            id: "call_stage_analyze".to_string(),
+            name: "analyze".to_string(),
+            arguments: serde_json::json!({"analyze": "stage analysis"}),
+        }],
+        None,
+    )
+    .to_string();
+    crate::util::test::seed_session_row(conn, &pin, "assistant", &frame).await;
+    let analyze_job = "stage_re_drive_analyze";
+    let analyst_id = format!("{analyze_job}_analyst");
+    crate::jobs::spawn_job(
+        conn,
+        analyze_job,
+        "stage analysis",
+        &ws.name,
+        "caller-user",
+        "telegram",
+        crate::Role::Engineer,
+        &[crate::jobs::NewAgent {
+            agent_id: analyst_id.clone(),
+            kind: crate::jobs::AgentKind::Analyst,
+            idx: Some(0),
+            task: "stage analysis".to_string(),
+        }],
+        &crate::jobs::SpawnChild::Analyze,
+        Some(&pin),
+    )
+    .await
+    .unwrap();
+    crate::jobs::write_agent_outcome(
+        conn,
+        analyze_job,
+        &analyst_id,
+        crate::jobs::RowStatus::Done,
+        Some("STAGE_RESULT"),
+    )
+    .await
+    .unwrap();
+
+    // Engineer round: 2 responses (answer + summary extraction). The completion
+    // (Done-slot replay) adds zero LLM calls, so exactly 2 are consumed.
+    let fake = std::sync::Arc::new(
+        crate::util::test::FakeProvider::new()
+            .ok("implemented the ticket")
+            .ok(r#"{"items":["did the thing"],"summary":"done"}"#),
+    );
+    let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
+
+    super::development::run(
+        std::sync::Arc::new(expect_ticket(store, &id).await),
+        ws.clone(),
+        job_id.clone(),
+    )
+    .await;
+
+    // The dangling analyze job was terminalized by the completion (before the
+    // engineer's model round).
+    let jobs = conn
+        .query(
+            "SELECT id FROM jobs WHERE id = ?1",
+            crate::db::params![analyze_job],
+        )
+        .await
+        .unwrap();
+    assert!(
+        jobs.is_empty(),
+        "the dangling analyze job must be terminalized"
+    );
+
+    // The stage session carries the settled tool result contiguous after the
+    // frame, then the appended turn message.
+    let rows = conn
+        .query(
+            "SELECT id, role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
+            crate::db::params![pin],
+        )
+        .await
+        .unwrap();
+    let roles: Vec<String> = rows.iter().map(|r| r.get::<String>(1).unwrap()).collect();
+    assert_eq!(
+        roles,
+        vec!["user", "assistant", "tool", "user", "assistant"],
+        "stage session after completion + turn: {roles:?}"
+    );
+    let payload: crate::ToolResultPayload =
+        serde_json::from_str(&rows[2].get::<String>(2).unwrap()).unwrap();
+    assert_eq!(payload.tool_call_id, "call_stage_analyze");
+    assert_eq!(payload.content, "STAGE_RESULT");
+
+    // The engineer's model round proceeded AFTER the settle — its first request
+    // already carries the settled tool result, and the Done-slot replay added
+    // zero LLM calls (exactly the engineer answer + summary extraction ran).
+    let messages = fake.request_messages.lock().unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "engineer round made exactly two LLM calls"
+    );
+    assert!(
+        messages[0].contains("STAGE_RESULT"),
+        "the engineer's first model round sees the settled result"
+    );
 }

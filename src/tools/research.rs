@@ -542,6 +542,7 @@ async fn dispatch_durable_research(
             caller_role,
             &[],
             &crate::jobs::SpawnChild::Research,
+            None,
         )
         .await
     };

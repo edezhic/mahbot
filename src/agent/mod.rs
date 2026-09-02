@@ -120,6 +120,14 @@ const MAX_STATS_ARG_LENGTH: usize = 500;
 /// cosmetic-only (typed classification uses `RetryExhausted`).
 pub(crate) const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
 
+/// Boxed future returned by [`Agent::complete_pending_tool_calls`] — a pinned
+/// box so the caller (`Agent::work`) awaits a `dyn Future` instead of a concrete
+/// opaque type. Naming the boxed future breaks the async opaque-type Send cycle
+/// that a concrete `impl Future` return would create between `agent` and
+/// `tools::analyze` (the resume cores re-enter agent sub-agent runs).
+type CompletePendingToolCallsFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>;
+
 /// Extract file paths from successful media-generation tool outcomes.
 ///
 /// Scans the zipped tool calls and outcomes for media-generation tools,
@@ -228,6 +236,57 @@ async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> 
         ));
     }
     None
+}
+
+/// Format a tool's raw output for persistence and derive any fresh image
+/// payload — the shared "outcome → content" step used by both
+/// [`Agent::commit_tool_results`] and resume-completion re-execution.
+///
+/// Mirrors the commit path exactly: `format_output` (or the truncation
+/// fallback), then the outcome's own image payload takes precedence over a
+/// payload derived from a real on-disk `[IMAGE:path]` marker in a successful
+/// tool output. When a payload applies, the dedup key `seen` (computed lazily
+/// from `history` on first use) decides fresh/attached; the returned
+/// `Option<ImagePayload>` is `Some` only for a FRESH attachment (the caller
+/// injects it as a synthetic user message).
+async fn tool_result_content(
+    tools: &[Box<dyn Tool>],
+    call_name: &str,
+    raw_output: &str,
+    outcome_payload: Option<&ImagePayload>,
+    success: bool,
+    seen: &mut Option<std::collections::HashSet<String>>,
+    history: &[ChatMessage],
+) -> (String, Option<ImagePayload>) {
+    let output = match find_tool(tools, call_name) {
+        Some(t) => t.format_output(raw_output),
+        None => crate::util::truncate_tool_output(raw_output),
+    };
+
+    // The outcome's own payload (read tool) takes precedence; otherwise derive
+    // an injected image from a real on-disk `[IMAGE:path]` marker in a
+    // successful tool output (image_gen) so a tool-produced image reaches the
+    // agent's own context. Derivation fails open: a non-rasterizable path
+    // (e.g. SVG) yields no payload while the marker stays in the raw output.
+    let derived_payload = if outcome_payload.is_none() && success {
+        derive_image_payload_from_marker(raw_output).await
+    } else {
+        None
+    };
+    let payload = outcome_payload.or(derived_payload.as_ref());
+
+    if let Some(payload) = payload {
+        let seen = seen.get_or_insert_with(|| existing_image_marker_values(history));
+        if seen.insert(payload.data_uri.clone()) {
+            let output = payload.attached_annotation();
+            (output, Some(payload.clone()))
+        } else {
+            let output = payload.already_attached_annotation();
+            (output, None)
+        }
+    } else {
+        (output, None)
+    }
 }
 
 /// One-pass derivation of a role's advertised tools and their specs — the
@@ -581,20 +640,37 @@ impl Agent {
     /// Run a complete agent turn: initialize session, work loop (with shutdown
     /// cancellation), finalize session.
     pub async fn work(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
-        // Open or resume a session for this agent turn.
-        self.session
-            .init(
-                &self.agent_id,
-                msg,
-                &self.workspace,
-                &self.role,
-                self.ticket.as_ref(),
-                &self.channel,
-                &self.user_name,
-                self.round_ts.as_deref(),
-                self.full_access,
-            )
-            .await?;
+        // Load the session WITHOUT appending the turn message: the universal
+        // completion below must settle any dangling tool calls BEFORE the new
+        // message lands (results insert directly after their frame, so the
+        // history stays provider-valid even when the frame is not the tail).
+        self.session.init(&self.agent_id).await?;
+
+        // Universal deterministic resume-completion: settle the session's last
+        // tool-call frame's result-less calls BEFORE any LLM call, on every
+        // role/path (no resume-flag gating). Drain mid-call, a hard crash and a
+        // stage re-drive all go through this identical mechanism.
+        let settled = if crate::shutdown::aborting() {
+            false
+        } else {
+            self.complete_pending_tool_calls().await?
+        };
+
+        if !msg.is_empty() {
+            self.session
+                .append_turn_message(
+                    &self.agent_id,
+                    msg,
+                    &self.workspace,
+                    &self.role,
+                    self.ticket.as_ref(),
+                    &self.channel,
+                    &self.user_name,
+                    self.round_ts.as_deref(),
+                    self.full_access,
+                )
+                .await?;
+        }
 
         // Pre-maybe_summarize drain check: a fresh dispatch that starts during
         // the graceful drain (or a fired shutdown token) must not destructively
@@ -613,10 +689,15 @@ impl Agent {
         self.inject_outstanding_comments(resume, msg).await;
 
         // Mandatory: destructive over-threshold compaction is SKIPPED on resumed
-        // turns — the pre-crash trail the resume was meant to preserve must
-        // survive (the design's resume-flag rule; do NOT infer resume from an
-        // empty message — RecoveryRetry semantics are unchanged).
-        if !resume {
+        // turns AND on turns that just settled dangling tool results — the
+        // pre-crash trail the resume was meant to preserve must survive (the
+        // design's resume-flag rule; do NOT infer resume from an empty message
+        // — RecoveryRetry semantics are unchanged). A settlement is resume-like:
+        // the retention window excludes tool frames/results, so over-threshold
+        // compaction right after settling would drop the settled result (e.g. a
+        // stage re-drive on a >SUMMARIZATION_THRESHOLD session); summarization
+        // happens on the next plain turn instead.
+        if !resume && !settled {
             self.maybe_summarize().await;
         }
 
@@ -635,6 +716,190 @@ impl Agent {
 
         let response = response_result?;
         Ok(response)
+    }
+
+    /// Universal deterministic resume-completion: settle the session's last
+    /// tool-call frame's result-less calls BEFORE any LLM call, on every
+    /// role/path. Durable sync jobs (analyze/implement) owned by this session
+    /// pin (freshness-gated) are slot-resumed; every other call is re-executed.
+    /// Results settle contiguously after their frame — the history stays
+    /// provider-valid. No-op when nothing is dangling.
+    ///
+    /// The single position where dangling calls are completed is intentionally
+    /// ungated: a graceful drain mid-call, a hard crash and a stage re-drive all
+    /// converge here. Already-completed calls are never re-run (their result is
+    /// present, so `pending_tool_calls` excludes them).
+    ///
+    /// Returns `true` when any results were settled this run (used by `work`
+    /// to skip destructive summarization — a turn that just settled dangling
+    /// results is resume-like), `false` otherwise.
+    ///
+    /// Returns a boxed future (rather than an opaque `impl Future`) so the
+    /// agent/tools async-opaque Send cycle around the resume cores (which
+    /// re-enter agent sub-agent runs) is broken at the box boundary.
+    #[expect(clippy::too_many_lines)] // deliberate: one cohesive resume+settle path
+    fn complete_pending_tool_calls(&mut self) -> CompletePendingToolCallsFuture<'_> {
+        Box::pin(async move {
+            let Some(calls) = self.session.pending_tool_calls() else {
+                return Ok(false);
+            };
+            tracing::info!(
+                agent_id = %self.agent_id,
+                role = %self.role,
+                count = calls.len(),
+                "Completing pending tool calls before the LLM call"
+            );
+
+            let conn = &crate::session::store().conn;
+            // Hoist the owned-jobs lookup: if ANY pending call is
+            // analyze/implement, fetch the caller-owned launched-jobs pool ONCE
+            // before the loop (newest-first, freshness-gated). When only
+            // non-durable calls are pending, no jobs query runs at all. The
+            // pool is CONSUMED per call below, so two same-kind calls in one
+            // frame bind to two DISTINCT jobs — and because jobs are
+            // newest-first while frame calls are in dispatch order, each call
+            // binds the OLDEST remaining job (see the rposition below).
+            let has_durable = calls
+                .iter()
+                .any(|c| crate::tools::SyncDurableCore::from_tool_name(&c.name).is_some());
+            let mut owned = if has_durable {
+                crate::jobs::find_owned_launched_jobs(conn, &self.agent_id).await?
+            } else {
+                Vec::new()
+            };
+
+            let mut pairs: Vec<(String, String)> = Vec::with_capacity(calls.len());
+            let mut follow_up: Vec<ChatMessage> = Vec::new();
+            let mut terminalize: Vec<String> = Vec::new();
+            // Shared dedup key for fresh-image injection across the re-executed
+            // calls (computed lazily on first image payload).
+            let mut seen_data_uris: Option<std::collections::HashSet<String>> = None;
+
+            for call in calls {
+                // Durable-resume attempt for analyze/implement owned jobs: the
+                // JOBS ROW is the source of truth. A terminal job yields content
+                // (terminalized after settlement); a DrainCut stops the whole
+                // completion; a missing job falls through to re-execution.
+                let mut resumed_content: Option<String> = None;
+                let core = crate::tools::SyncDurableCore::from_tool_name(&call.name);
+                if let (Some(core), Some(pos)) =
+                    (core, owned.iter().rposition(|j| j.kind == call.name))
+                {
+                    // `rposition` (not `position`): jobs are newest-first while
+                    // frame calls are in dispatch order, so the FIRST call must
+                    // bind the OLDEST matching job — position would give the
+                    // first call the NEWEST job (crossed results).
+                    let job = owned.swap_remove(pos);
+                    let outcome = core
+                        .resume_sync_core(&self.workspace, &job.id, Some(&self.agent_id))
+                        .await;
+                    match outcome {
+                        Ok(crate::jobs::SyncResumeOutcome::Terminal(_, _, res)) => {
+                            terminalize.push(job.id);
+                            resumed_content = Some(match res {
+                                Ok(text) => text,
+                                Err(e) => e.to_string(),
+                            });
+                        }
+                        Ok(crate::jobs::SyncResumeOutcome::DrainCut) => {
+                            // Drain began mid-resume — leave everything dangling
+                            // for the next completion cycle.
+                            tracing::info!(
+                                tool = %call.name,
+                                "Drain-cut during resume-completion — leaving calls dangling"
+                            );
+                            return Ok(false);
+                        }
+                        Ok(crate::jobs::SyncResumeOutcome::JobMissing) => {
+                            // Job row gone — re-execute below.
+                        }
+                        Err(e) => {
+                            // A resume-core INFRA failure (roster/checkpoint DB
+                            // error) must fail the round rather than spawn a
+                            // duplicate fresh job — the job row stays launched
+                            // for the next drive.
+                            tracing::error!(
+                                job = %job.id,
+                                error = %e,
+                                "Resume-core infra failure — failing the round"
+                            );
+                            return Err(e).context("resume-core infra failure");
+                        }
+                    }
+                }
+
+                let formatted = if let Some(content) = resumed_content {
+                    // Format the resumed raw content exactly like the commit path.
+                    find_tool(&self.tools, &call.name)
+                        .map(|t| t.format_output(&content))
+                        .unwrap_or(content)
+                } else {
+                    // Re-execute the call (under the tool task-local context).
+                    let outcome = self
+                        .in_tool_context(async {
+                            self.execute_tool(&call.name, call.arguments.clone()).await
+                        })
+                        .await;
+                    if outcome.suspended {
+                        // Drain-cut mid-execution — leave the call dangling.
+                        tracing::info!(
+                            tool = %call.name,
+                            "Drain-cut during resume-completion — leaving calls dangling"
+                        );
+                        return Ok(false);
+                    }
+                    // Format through the tool exactly like the commit path and
+                    // capture any freshly-derived image payload (injected as a
+                    // synthetic user message after the tool-result block).
+                    let (formatted, fresh_payload) = tool_result_content(
+                        &self.tools,
+                        &call.name,
+                        &outcome.output,
+                        outcome.image_payload.as_ref(),
+                        outcome.success,
+                        &mut seen_data_uris,
+                        self.session.history(),
+                    )
+                    .await;
+                    if let Some(payload) = fresh_payload {
+                        follow_up.push(ChatMessage::user(
+                            crate::util::injected_image_user_message(&payload.data_uri),
+                        ));
+                    }
+                    formatted
+                };
+                pairs.push((call.id, formatted));
+            }
+
+            // Orphan sweep: before any model work (turn start), a launched
+            // caller-owned job NOT bound to a pending call is an orphan — its
+            // call was already settled but the terminalize transaction was lost
+            // to a crash between the settle and terminalize transactions.
+            // NOTE: this sweep only runs when a dangling frame exists, so it
+            // heals the crash window only when the settle did not also
+            // complete; a fully-settled orphan (no frame left) falls through
+            // to the ~8h stale purge. Drain-cut early returns happen before
+            // this point, so genuinely in-flight jobs are never swept.
+            for job in owned {
+                terminalize.push(job.id);
+            }
+
+            // Settle the results contiguously after their frame (strict path —
+            // a settle error propagates). Terminalize AFTER a successful settle:
+            // a drain-cut or settle failure can never lose a resumed job's
+            // result — the job stays launched and the next cycle re-delivers the
+            // checkpointed outcome without re-running sub-agents. The leftover
+            // sweep above closes the settle-then-crash terminalize gap.
+            if !pairs.is_empty() || !follow_up.is_empty() {
+                self.session
+                    .settle_tool_results(&self.agent_id, &pairs, &follow_up)
+                    .await?;
+            }
+            for id in terminalize {
+                crate::jobs::terminalize_job(conn, &id).await?;
+            }
+            Ok(!pairs.is_empty() || !follow_up.is_empty())
+        })
     }
 
     /// Run the full agent loop: LLM calls → tool execution → loop until final answer.
@@ -754,6 +1019,19 @@ impl Agent {
                     return Ok(display_text);
                 }
 
+                // EMISSION-TIME DURABILITY: the assistant frame with its tool
+                // calls is committed BEFORE the calls execute — a crash or drain
+                // mid-execution leaves the calls durably recorded with their
+                // results absent, and the universal resume-completion step (run
+                // before any LLM call on this session) re-runs or resumes them.
+                // The end-of-round commit below persists only the results.
+                self.session
+                    .persist_messages(
+                        &self.agent_id,
+                        &[ChatMessage::assistant(history_content.clone())],
+                    )
+                    .await?;
+
                 // Execute tool calls with ordering: read-only tools can run in
                 // parallel within a group; side-effecting tools run one at a time.
                 // Groups execute sequentially in order — the original ordering is
@@ -767,8 +1045,7 @@ impl Agent {
                     &all_outcomes,
                 ));
 
-                self.commit_tool_results(&tool_calls, &all_outcomes, &history_content)
-                    .await?;
+                self.commit_tool_results(&tool_calls, &all_outcomes).await?;
 
                 tool_rounds += 1;
             }
@@ -793,11 +1070,46 @@ impl Agent {
         let mut outcomes: Vec<ToolExecutionOutcome> = Vec::with_capacity(tool_calls.len());
         let mut i = 0usize;
 
-        // Set task-locals once for the entire batch of tool executions, rather
-        // than per-call inside execute_tool.  This avoids a race when multiple
-        // read-only tools execute concurrently via join_all in the same task:
-        // per-call scopes would interleave, causing concurrent tools to read
-        // each other's user context.
+        self.in_tool_context(async {
+            while i < tool_calls.len() {
+                if side_flags[i] {
+                    // Side-effecting: single-call group, executed alone.
+                    let outcome = self
+                        .execute_tool(&tool_calls[i].name, tool_calls[i].arguments.clone())
+                        .await;
+                    outcomes.push(outcome);
+                    i += 1;
+                } else {
+                    // Read-only group: extend while consecutive calls are also read-only.
+                    let group_start = i;
+                    while i < tool_calls.len() && !side_flags[i] {
+                        i += 1;
+                    }
+                    let group_calls = &tool_calls[group_start..i];
+
+                    // Execute the entire read-only group in parallel.
+                    let group_outcomes: Vec<_> = futures_util::future::join_all(
+                        group_calls
+                            .iter()
+                            .map(|call| self.execute_tool(&call.name, call.arguments.clone())),
+                    )
+                    .await;
+
+                    outcomes.extend(group_outcomes);
+                }
+            }
+        })
+        .await;
+
+        outcomes
+    }
+
+    /// Run `fut` under the `CURRENT_TOOL_*` task-local context derived from this
+    /// agent's fields. Set once per tool batch (not per-call), so concurrent
+    /// read-only tools never interleave each other's user context. Reused by
+    /// the universal resume-completion step, which re-executes dangling calls
+    /// and needs the same context.
+    async fn in_tool_context<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
         let user_name = self.user_name.clone();
         let channel = self.channel.clone();
         let parent_key = self.parent_key.clone();
@@ -823,67 +1135,20 @@ impl Agent {
                                                 CURRENT_TOOL_AGENT_ID
                                                     .scope(agent_id, async {
                                                         CURRENT_TOOL_AGENT_TRACKING
-                                                            .scope(agent_tracking, async {
-                                                                while i < tool_calls.len() {
-                                                                    if side_flags[i] {
-                                                                        // Side-effecting: single-call group, executed alone.
-                                                                        let outcome = self
-                                                                            .execute_tool(
-                                                                                &tool_calls[i].name,
-                                                                                tool_calls[i]
-                                                                                    .arguments
-                                                                                    .clone(),
-                                                                            )
-                                                                            .await;
-                                                                        outcomes.push(outcome);
-                                                                        i += 1;
-                                                                    } else {
-                                                                        // Read-only group: extend while consecutive calls are also read-only.
-                                                                        let group_start = i;
-                                                                        while i < tool_calls.len()
-                                                                            && !side_flags[i]
-                                                                        {
-                                                                            i += 1;
-                                                                        }
-                                                                        let group_calls =
-                                                                            &tool_calls
-                                                                                [group_start..i];
-
-                                                                        // Execute the entire read-only group in parallel.
-                                                                        let group_outcomes: Vec<_> =
-                                                                    futures_util::future::join_all(
-                                                                        group_calls.iter().map(
-                                                                            |call| {
-                                                                                self.execute_tool(
-                                                                                    &call.name,
-                                                                                    call.arguments
-                                                                                        .clone(),
-                                                                                )
-                                                                            },
-                                                                        ),
-                                                                    )
-                                                                    .await;
-
-                                                                        outcomes
-                                                                            .extend(group_outcomes);
-                                                                    }
-                                                                }
-                                                            })
-                                                            .await;
+                                                            .scope(agent_tracking, fut)
+                                                            .await
                                                     })
-                                                    .await;
+                                                    .await
                                             })
-                                            .await;
+                                            .await
                                     })
-                                    .await;
+                                    .await
                             })
-                            .await;
+                            .await
                     })
-                    .await;
+                    .await
             })
-            .await;
-
-        outcomes
+            .await
     }
 
     /// Construct a failure outcome tuple for an error reason.
@@ -909,12 +1174,14 @@ impl Agent {
                 output: format_tool_failure_feedback(call_name, call_arguments, &reason),
                 success: false,
                 image_payload: None,
+                suspended: false,
             },
             reason,
         )
     }
 
     /// Execute a single tool call and return the result.
+    #[expect(clippy::too_many_lines)]
     async fn execute_tool(
         &self,
         call_name: &str,
@@ -995,23 +1262,50 @@ impl Agent {
                                 output: scrub_tool_output(tool, &tool_arguments, &output_text),
                                 success: true,
                                 image_payload,
+                                suspended: false,
                             },
                             String::new(),
                         )
                     }
                     Err(e) => {
-                        let (outcome, error_reason) = Self::failure_outcome(
-                            &tool_name,
-                            &tool_arguments,
-                            &format!("Error executing {tool_name}: {e}"),
-                        );
-                        tracing::debug!(
-                            tool = %tool_name,
-                            duration_ms = duration.as_millis(),
-                            success = false,
-                            "Tool execution error: {error_reason}"
-                        );
-                        (outcome, error_reason)
+                        // Drain-cut suspension: the tool's durable work (e.g. a
+                        // sync analyze/implement round) was deliberately left
+                        // launched for deterministic resume. The outcome is
+                        // marked `suspended` so the tool-result commit SKIPS it
+                        // — the call's frame is already durably persisted and
+                        // its result is intentionally absent; the universal
+                        // resume-completion step re-runs/resumes it.
+                        if e.downcast_ref::<crate::tools::CallSuspended>().is_some() {
+                            tracing::debug!(
+                                tool = %tool_name,
+                                duration_ms = duration.as_millis(),
+                                success = false,
+                                suspended = true,
+                                "Tool execution drain-cut — durable work left launched"
+                            );
+                            (
+                                ToolExecutionOutcome {
+                                    output: crate::tools::CallSuspended.to_string(),
+                                    success: false,
+                                    image_payload: None,
+                                    suspended: true,
+                                },
+                                String::new(),
+                            )
+                        } else {
+                            let (outcome, error_reason) = Self::failure_outcome(
+                                &tool_name,
+                                &tool_arguments,
+                                &format!("Error executing {tool_name}: {e}"),
+                            );
+                            tracing::debug!(
+                                tool = %tool_name,
+                                duration_ms = duration.as_millis(),
+                                success = false,
+                                "Tool execution error: {error_reason}"
+                            );
+                            (outcome, error_reason)
+                        }
                     }
                 }
             }
@@ -1384,23 +1678,21 @@ impl Agent {
         }
     }
 
-    /// Persist tool results to the session store and push them into the in-memory
-    /// history (via the session) for the next tool round.
+    /// Persist tool results to the session store and push them into the
+    /// in-memory history (via the session) for the next tool round.
     ///
-    /// All messages (assistant call + tool results) are batch-persisted in a single
-    /// DB transaction, eliminating orphaned assistant calls on crash mid-loop.
+    /// The assistant frame with its tool calls is already durably persisted at
+    /// EMISSION time (before the calls executed), so this commit writes ONLY
+    /// the tool-result rows. Suspended outcomes (drain-cut durable work) are
+    /// SKIPPED — no row is written, the call stays dangling, and the universal
+    /// resume-completion step settles it later. Returns early with no DB write
+    /// when every outcome is suspended (nothing to settle this round).
     async fn commit_tool_results(
         &mut self,
         tool_calls: &[ToolCall],
         outcomes: &[ToolExecutionOutcome],
-        history_content: &str,
     ) -> anyhow::Result<()> {
         let tools = &self.tools;
-
-        // Build DB messages for batch persistence.
-        let assistant_call = ChatMessage::assistant(history_content.to_string());
-        let mut db_messages = Vec::with_capacity(1 + outcomes.len());
-        db_messages.push(assistant_call);
 
         // Data-URIs already attached in the session (prior rounds) — the dedup
         // key for the read-tool's "already attached" reference. Computed lazily
@@ -1414,35 +1706,26 @@ impl Agent {
         // per image inline would interleave a user message between tool results.
         let mut fresh_image_payloads: Vec<ImagePayload> = Vec::new();
 
+        let mut db_messages = Vec::with_capacity(outcomes.len());
         for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
-            let tool = find_tool(tools, &call.name);
-            let mut output = match tool {
-                Some(t) => t.format_output(&outcome.output),
-                None => crate::util::truncate_tool_output(&outcome.output),
-            };
-
-            // The outcome's own payload (read tool) takes precedence; otherwise
-            // derive an injected image from a real on-disk `[IMAGE:path]` marker in
-            // a successful tool output (image_gen) so a tool-produced image reaches
-            // the agent's own context. Derivation fails open: a non-rasterizable
-            // path (e.g. SVG) yields no payload while the marker stays in the raw
-            // output for user delivery.
-            let derived_payload = if outcome.image_payload.is_none() && outcome.success {
-                derive_image_payload_from_marker(&outcome.output).await
-            } else {
-                None
-            };
-            let payload = outcome.image_payload.as_ref().or(derived_payload.as_ref());
-
-            if let Some(payload) = payload {
-                let seen = seen_data_uris
-                    .get_or_insert_with(|| existing_image_marker_values(self.session.history()));
-                if seen.insert(payload.data_uri.clone()) {
-                    fresh_image_payloads.push(payload.clone());
-                    output = payload.attached_annotation();
-                } else {
-                    output = payload.already_attached_annotation();
-                }
+            // A suspended outcome has no result to commit — the frame is already
+            // durable and the durable work is left launched for the universal
+            // resume-completion step. Skip it entirely.
+            if outcome.suspended {
+                continue;
+            }
+            let (output, fresh_payload) = tool_result_content(
+                tools,
+                &call.name,
+                &outcome.output,
+                outcome.image_payload.as_ref(),
+                outcome.success,
+                &mut seen_data_uris,
+                self.session.history(),
+            )
+            .await;
+            if let Some(payload) = fresh_payload {
+                fresh_image_payloads.push(payload);
             }
 
             db_messages.push(ChatMessage::tool_result(&call.id, &output));
@@ -1463,8 +1746,14 @@ impl Agent {
             )));
         }
 
-        // Batch-persist all messages in a single transaction (preceded by
-        // any unpersisted history tail) and push them into in-memory history.
+        // Nothing to commit (all outcomes suspended — no results, no derived
+        // images): the frame is already durable, so no DB write is needed.
+        if db_messages.is_empty() {
+            return Ok(());
+        }
+
+        // Batch-persist the tool results (preceded by any unpersisted history
+        // tail) and push them into in-memory history.
         self.session
             .persist_messages(&self.agent_id, &db_messages)
             .await
@@ -2264,6 +2553,39 @@ mod tests {
         }
     }
 
+    /// Construct an agent with an explicit workspace and id (for tools that
+    /// resolve paths against a real directory, e.g. the read tool).
+    fn make_agent_on(tools: Vec<Box<dyn Tool>>, agent_id: &str, ws: crate::Workspace) -> Agent {
+        let tool_specs = tools.iter().map(|t| t.spec()).collect();
+        Agent {
+            agent_id: agent_id.to_string(),
+            role: crate::Role::Engineer,
+            session: Session::default(),
+            workspace: std::sync::Arc::new(ws),
+            tools,
+            tool_specs,
+            cancel_token: CancellationToken::new(),
+            pause_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused_frozen: std::sync::atomic::AtomicBool::new(false),
+            ticket: None,
+            generation: 0,
+            tool_stats: std::sync::Mutex::new(Vec::new()),
+            user_name: String::new(),
+            channel: String::new(),
+            full_access: false,
+            parent_key: None,
+            parent_label: None,
+            incoming_rx: None,
+            round_ts: None,
+            first_call_notify: None,
+            failure: None,
+            failure_class: None,
+            background_sessions: std::sync::Arc::new(
+                crate::tools::shell::BackgroundSessions::default(),
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn tool_with_scrub_disabled_preserves_output() {
         assert_scrubbed(false).await;
@@ -2594,6 +2916,7 @@ mod tests {
                     output: o.output.to_string(),
                     success: o.success,
                     image_payload: None,
+                    suspended: false,
                 })
                 .collect();
 
@@ -2815,7 +3138,6 @@ mod tests {
     async fn make_inject_agent(
         agent_id: &str,
         role: crate::Role,
-        ws: &crate::Workspace,
         ticket: crate::pipeline::board::Ticket,
         seed_content: Option<&str>,
     ) -> Agent {
@@ -2833,11 +3155,7 @@ mod tests {
         }
         let mut agent = make_agent_with_role(vec![], role);
         agent.agent_id = agent_id.to_string();
-        agent
-            .session
-            .init(agent_id, "", ws, &role, Some(&ticket), "", "", None, false)
-            .await
-            .unwrap();
+        agent.session.init(agent_id).await.unwrap();
         agent.ticket = Some(ticket);
         agent
     }
@@ -2886,8 +3204,7 @@ mod tests {
             let ticket =
                 crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
 
-            let mut agent =
-                make_inject_agent(agent_id, role, &ws, ticket, Some("round 1 task")).await;
+            let mut agent = make_inject_agent(agent_id, role, ticket, Some("round 1 task")).await;
             agent.inject_outstanding_comments(true, "").await;
 
             let history = agent.session.history();
@@ -2929,7 +3246,6 @@ mod tests {
         let mut agent = make_inject_agent(
             "inject-dedup-agent",
             crate::Role::Engineer,
-            &ws,
             ticket,
             Some(&seed),
         )
@@ -2969,7 +3285,6 @@ mod tests {
         let mut agent = make_inject_agent(
             "inject-own-role-agent",
             crate::Role::Engineer,
-            &ws,
             ticket,
             Some("round 1 task"),
         )
@@ -3008,7 +3323,6 @@ mod tests {
         let mut agent = make_inject_agent(
             "inject-noop-agent",
             crate::Role::Engineer,
-            &ws,
             ticket,
             Some("round 1 task"),
         )
@@ -3053,7 +3367,6 @@ mod tests {
         let mut agent = make_inject_agent(
             "inject-analyst-agent",
             crate::Role::Analyst,
-            &ws,
             ticket,
             Some("round 1 task"),
         )
@@ -4136,6 +4449,11 @@ mod tests {
         agent.session.push_messages_unpersisted(&[ChatMessage::user(
             "[IMAGE:data:image/jpeg;base64,prior]",
         )]);
+        // Mirror the emission-time durability: the assistant frame with the tool
+        // calls is persisted (in-memory here) before the results commit.
+        agent
+            .session
+            .push_assistant("assistant with tool_calls".to_string());
 
         let tool_calls = vec![
             ToolCall {
@@ -4162,6 +4480,7 @@ mod tests {
                     recovery_note: None,
                     source: crate::tools::ImagePayloadSource::Read,
                 }),
+                suspended: false,
             },
             ToolExecutionOutcome {
                 output: "Read image file /b.png (1x1, PNG).".into(),
@@ -4175,11 +4494,12 @@ mod tests {
                     recovery_note: None,
                     source: crate::tools::ImagePayloadSource::Read,
                 }),
+                suspended: false,
             },
         ];
 
         agent
-            .commit_tool_results(&tool_calls, &outcomes, "assistant with tool_calls")
+            .commit_tool_results(&tool_calls, &outcomes)
             .await
             .expect("commit_tool_results must succeed");
 
@@ -4295,6 +4615,7 @@ mod tests {
                     recovery_note: None,
                     source: crate::tools::ImagePayloadSource::Read,
                 }),
+                suspended: false,
             },
             ToolExecutionOutcome {
                 output: "Read image file /a.png (PNG).".into(),
@@ -4308,11 +4629,12 @@ mod tests {
                     recovery_note: None,
                     source: crate::tools::ImagePayloadSource::Read,
                 }),
+                suspended: false,
             },
         ];
 
         agent
-            .commit_tool_results(&tool_calls, &outcomes, "assistant with tool_calls")
+            .commit_tool_results(&tool_calls, &outcomes)
             .await
             .expect("commit_tool_results must succeed");
 
@@ -4382,10 +4704,11 @@ mod tests {
             output: marker.clone(),
             success: true,
             image_payload: None,
+            suspended: false,
         }];
 
         agent
-            .commit_tool_results(&tool_calls, &outcomes, "assistant with tool_call")
+            .commit_tool_results(&tool_calls, &outcomes)
             .await
             .expect("commit_tool_results must succeed");
 
@@ -4438,6 +4761,410 @@ mod tests {
             media,
             vec![("[IMAGE:", abs.display().to_string())],
             "marker preserved for user delivery: {media:?}"
+        );
+    }
+
+    // ── Universal resume-completion ──────────────────────────────────────
+
+    /// (c) `complete_pending_tool_calls` re-executes a non-durable dangling call
+    /// and settles the real output as its tool result with the ORIGINAL call id,
+    /// contiguously after the frame.
+    #[tokio::test]
+    async fn complete_pending_tool_calls_reexecutes_non_durable_call() {
+        crate::util::test::init_test_stores().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("seed.txt"), "completion-marker\n").unwrap();
+        let ws = crate::Workspace::from_path(dir.path());
+
+        // Emission-time frame: the caller's session durably records the read
+        // call; its result is absent (the "dangling" state).
+        let mut session = Session::default();
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: "call_read_c".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"path": "seed.txt"}),
+            }],
+            None,
+        )
+        .to_string();
+        session
+            .persist_messages(
+                "test-read-reexec",
+                &[
+                    ChatMessage::user("read the file"),
+                    ChatMessage::assistant(frame),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mut agent = make_agent_on(
+            vec![Box::new(crate::tools::ReadTool)],
+            "test-read-reexec",
+            ws,
+        );
+        agent.session = session;
+        let settled = agent.complete_pending_tool_calls().await.unwrap();
+        assert!(settled, "a re-executed non-durable call settles a result");
+
+        // The result sits contiguous after the frame with the ORIGINAL call id.
+        let history = agent.session.history();
+        let roles: Vec<crate::ChatRole> = history.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                crate::ChatRole::User,
+                crate::ChatRole::Assistant,
+                crate::ChatRole::Tool
+            ],
+            "result contiguous after the frame: {roles:?}"
+        );
+        let payload: crate::ToolResultPayload = serde_json::from_str(&history[2].content).unwrap();
+        assert_eq!(
+            payload.tool_call_id, "call_read_c",
+            "re-execution keeps the ORIGINAL call id"
+        );
+        assert!(
+            payload.content.contains("completion-marker"),
+            "real tool output recorded: {}",
+            payload.content
+        );
+        assert!(agent.session.pending_tool_calls().is_none());
+    }
+
+    /// (d) Full drain lifecycle: a sync analyze dispatch under an active drain
+    /// leaves the frame durably persisted with NO tool-result row and the
+    /// caller-owned job `launched` (the result is absent); after `drain_clear`,
+    /// the completion resumes the durable job — a reconstructable Done slot is
+    /// replayed (zero LLM calls), the consolidated tool result settles
+    /// contiguously after the frame, and only then is the resumed job
+    /// terminalized.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines)] // deliberate: the full drain lifecycle + resume is one cohesive assertion bed
+    async fn drain_mid_sync_analyze_leaves_call_dangling_then_completion_resumes() {
+        let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
+        let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/test_ws_drain_analyze");
+        let pin = "drain_sync_analyze_pin";
+        let conn = &crate::session::store().conn;
+
+        // Emission-time frame: the caller's session durably records the analyze
+        // call BEFORE the drain-cut execution leaves its result absent.
+        let mut session = Session::default();
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: "call_analyze_d".to_string(),
+                name: "analyze".to_string(),
+                arguments: serde_json::json!({"analyze": "analyze this"}),
+            }],
+            None,
+        )
+        .to_string();
+        session
+            .persist_messages(
+                pin,
+                &[
+                    ChatMessage::user("analyze this"),
+                    ChatMessage::assistant(frame),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Drive the sync analyze dispatch under the caller's task-local pin with
+        // an active drain: it leaves the durable job launched (DrainCut).
+        crate::shutdown::drain_begin();
+        let tool = crate::tools::analyze::AnalyzeTool::new(
+            crate::tools::analyze::DispatchMode::Sync,
+            crate::Role::Engineer,
+        );
+        let res = crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some(pin.to_string()), async {
+                tool.execute(&ws, serde_json::json!({"analyze": "analyze this"}))
+                    .await
+            })
+            .await;
+        crate::shutdown::drain_clear();
+        let err = res.expect_err("drain must cut the sync analyze dispatch");
+        assert!(
+            err.downcast_ref::<crate::tools::CallSuspended>().is_some(),
+            "CallSuspended carrier expected: {err:#}"
+        );
+
+        // The frame row is persisted, NO tool-result row, job launched caller-owned.
+        let jobs = conn
+            .query(
+                "SELECT id, status, caller_agent_id FROM jobs WHERE caller_agent_id = ?1 AND kind = 'analyze'",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1, "one launched analyze job");
+        assert_eq!(jobs[0].get::<String>(1).unwrap(), "launched");
+        assert_eq!(
+            jobs[0].get::<String>(2).unwrap(),
+            pin,
+            "job is caller-owned by the session pin"
+        );
+        let job_id = jobs[0].get::<String>(0).unwrap();
+        let session_rows = conn
+            .query(
+                "SELECT role FROM sessions WHERE agent_id = ?1 ORDER BY id",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        let roles: Vec<String> = session_rows
+            .iter()
+            .map(|r| r.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant"],
+            "frame persisted with NO tool-result row: {roles:?}"
+        );
+
+        // Simulate the durable checkpoint: exactly one analyst slot reconstructed
+        // as Done (its outcome) while the other slots produced no valid response.
+        let roster = crate::jobs::list_agents_for_job(conn, &job_id)
+            .await
+            .unwrap();
+        assert!(
+            roster.len() >= 2,
+            "analyze round spawns multiple analysts: {}",
+            roster.len()
+        );
+        for (i, row) in roster.iter().enumerate() {
+            let outcome = if i == 0 { "ANALYST_RAW" } else { "" };
+            crate::jobs::write_agent_outcome(
+                conn,
+                &job_id,
+                &row.agent_id,
+                crate::jobs::RowStatus::Done,
+                Some(outcome),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Run the completion: it resumes the durable job (Done slot replayed)
+        // and settles the consolidated result after the frame, then
+        // terminalizes the resumed job.
+        let mut agent = make_agent_on(vec![], pin, ws);
+        agent.session = session;
+        let settled = agent.complete_pending_tool_calls().await.unwrap();
+        assert!(settled, "resumed durable job settles a result");
+
+        // The resumed job is terminalized; zero LLM calls were made.
+        let jobs = conn
+            .query(
+                "SELECT id FROM jobs WHERE id = ?1",
+                crate::db::params![job_id.clone()],
+            )
+            .await
+            .unwrap();
+        assert!(jobs.is_empty(), "resumed job must be terminalized");
+        assert!(
+            fake.request_fingerprints.lock().unwrap().is_empty(),
+            "replaying a Done slot must not call the model"
+        );
+
+        // Tool result contiguous after the frame (in-memory + durable).
+        let history = agent.session.history();
+        let roles: Vec<crate::ChatRole> = history.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                crate::ChatRole::User,
+                crate::ChatRole::Assistant,
+                crate::ChatRole::Tool
+            ],
+            "tool result after the frame: {roles:?}"
+        );
+        let payload: crate::ToolResultPayload = serde_json::from_str(&history[2].content).unwrap();
+        assert_eq!(payload.tool_call_id, "call_analyze_d");
+        assert!(
+            payload.content.contains("ANALYST_RAW"),
+            "{}",
+            payload.content
+        );
+        let pending_jobs = conn
+            .query(
+                "SELECT id FROM pending_jobs WHERE id = ?1",
+                crate::db::params![job_id],
+            )
+            .await
+            .unwrap();
+        assert!(pending_jobs.is_empty(), "no envelope pending after resume");
+    }
+
+    /// (e) Two same-kind (analyze) calls in one dangling frame bind to the two
+    /// OLDEST matching caller-owned jobs (rposition — jobs are newest-first,
+    /// frame calls are in dispatch order), so the first frame call carries the
+    /// older job's result and the second the newer; each resumed job is
+    /// terminalized and its checkpointed outcome settles against its own call
+    /// id. A THIRD launched job for the pin that binds no call is terminalized
+    /// by the leftover sweep.
+    #[tokio::test]
+    async fn complete_pending_tool_calls_binds_same_kind_calls_to_distinct_jobs() {
+        let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
+        let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/test_ws_two_analyze_jobs");
+        let pin = "two_analyze_jobs_pin";
+        let conn = &crate::session::store().conn;
+
+        // Caller session with a TWO-call analyze frame (both ids dangling).
+        let mut session = Session::default();
+        let frame = assistant_replay_payload(
+            Some(""),
+            &[
+                crate::ToolCall {
+                    id: "call_analyze_g1".to_string(),
+                    name: "analyze".to_string(),
+                    arguments: serde_json::json!({"analyze": "analyze task one"}),
+                },
+                crate::ToolCall {
+                    id: "call_analyze_g2".to_string(),
+                    name: "analyze".to_string(),
+                    arguments: serde_json::json!({"analyze": "analyze task two"}),
+                },
+            ],
+            None,
+        )
+        .to_string();
+        session
+            .persist_messages(
+                pin,
+                &[
+                    ChatMessage::user("analyze this"),
+                    ChatMessage::assistant(frame),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Backdate the caller session so the distinct job created_at values set
+        // below (all after it) pass the freshness gate deterministically —
+        // `db::now()` is second-precision, so two jobs spawned in the same
+        // second would share created_at and `ORDER BY created_at DESC` would be
+        // ambiguous.
+        conn.execute(
+            "UPDATE session_metadata SET created_at = ?1 WHERE agent_id = ?2",
+            crate::db::params!["2024-01-01T00:00:00+00:00", pin],
+        )
+        .await
+        .unwrap();
+
+        // Seed THREE caller-owned analyze jobs, each with an all-Done roster
+        // slot (distinct stored outcomes) so each resume core replays Terminal
+        // with zero LLM calls. The two frame calls bind the two OLDEST jobs
+        // (first call → `two_analyze_job_0`, second → `two_analyze_job_1`);
+        // `two_analyze_job_2` binds no call and must be terminalized by the
+        // leftover sweep.
+        let jobs: [(&str, &str); 3] = [
+            ("two_analyze_job_0", "RESULT_ONE"),
+            ("two_analyze_job_1", "RESULT_TWO"),
+            ("two_analyze_job_2", "RESULT_THREE"),
+        ];
+        for (i, (job_id, outcome)) in jobs.iter().copied().enumerate() {
+            let task = format!("analyze task {i}");
+            let analyst_id = format!("{job_id}_analyst");
+            crate::jobs::spawn_job(
+                conn,
+                job_id,
+                &task,
+                &ws.name,
+                "caller-user",
+                "telegram",
+                crate::Role::Engineer,
+                &[crate::jobs::NewAgent {
+                    agent_id: analyst_id.clone(),
+                    kind: crate::jobs::AgentKind::Analyst,
+                    idx: Some(0),
+                    task: task.clone(),
+                }],
+                &crate::jobs::SpawnChild::Analyze,
+                Some(pin),
+            )
+            .await
+            .unwrap();
+            crate::jobs::write_agent_outcome(
+                conn,
+                job_id,
+                &analyst_id,
+                crate::jobs::RowStatus::Done,
+                Some(outcome),
+            )
+            .await
+            .unwrap();
+            // Distinct, strictly-increasing created_at (all after the session).
+            let created = format!("2024-01-0{}T00:00:00+00:00", i + 2);
+            conn.execute(
+                "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
+                crate::db::params![created, job_id],
+            )
+            .await
+            .unwrap();
+        }
+
+        // Run the completion: both frame calls are resumed (one per call,
+        // DISTINCT — the OLDEST first), all three jobs terminalized, and the
+        // two results settled with their own call ids.
+        let mut agent = make_agent_on(vec![], pin, ws);
+        agent.session = session;
+        let settled = agent.complete_pending_tool_calls().await.unwrap();
+        assert!(settled, "two resumed jobs settle results");
+
+        assert!(
+            fake.request_fingerprints.lock().unwrap().is_empty(),
+            "replaying Done slots must not call the model"
+        );
+        assert!(agent.session.pending_tool_calls().is_none());
+
+        // No launched analyze rows remain for the pin: both resumed jobs AND
+        // the unbound third job (leftover sweep) are terminalized.
+        let jobs = conn
+            .query(
+                "SELECT id FROM jobs WHERE caller_agent_id = ?1 AND kind = 'analyze' AND status = 'launched'",
+                crate::db::params![pin],
+            )
+            .await
+            .unwrap();
+        assert!(
+            jobs.is_empty(),
+            "no launched analyze rows remain for the pin: {jobs:?}"
+        );
+
+        // Both results settled with the frame's ORIGINAL call ids and the
+        // per-call mapping is exact: the FIRST frame call (call_analyze_g1)
+        // carries the OLDEST job's result (RESULT_ONE), the second
+        // (call_analyze_g2) the newer job's (RESULT_TWO) — rposition binding,
+        // not set equality.
+        let history = agent.session.history();
+        let mut per_call: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for msg in history {
+            if msg.role != crate::ChatRole::Tool {
+                continue;
+            }
+            let payload: crate::ToolResultPayload = serde_json::from_str(&msg.content).unwrap();
+            per_call.insert(payload.tool_call_id, payload.content);
+        }
+        assert_eq!(per_call.len(), 2, "both calls settled");
+        assert_eq!(
+            per_call.get("call_analyze_g1").map(String::as_str),
+            Some("RESULT_ONE"),
+            "first frame call binds the OLDEST job"
+        );
+        assert_eq!(
+            per_call.get("call_analyze_g2").map(String::as_str),
+            Some("RESULT_TWO"),
+            "second frame call binds the newer job"
         );
     }
 }
