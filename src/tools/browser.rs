@@ -546,26 +546,6 @@ async fn close_all_browser_sessions_inner() {
     join_all(close_futures).await;
 }
 
-/// Build a single action schema entry for the oneOf array.
-///
-/// Constructs the wrapping JSON structure for a browser action entry.
-/// When `required` is non-empty, an inner `"required"` key is included;
-/// otherwise (as with `snapshot` and `get_url`) it is omitted.
-fn action_schema(name: &str, description: &str, required: &[&str], properties: &Value) -> Value {
-    let mut inner = super::tool_params_schema(properties, required);
-    inner["additionalProperties"] = json!(false);
-
-    json!({
-        "type": "object",
-        "properties": {
-            (name): inner
-        },
-        "required": [name],
-        "additionalProperties": false,
-        "description": description
-    })
-}
-
 #[async_trait]
 impl Tool for BrowserTool {
     fn name(&self) -> &'static str {
@@ -583,13 +563,13 @@ impl Tool for BrowserTool {
             "properties": {
                 "action": {
                     "oneOf": [
-                        action_schema("open", "Navigate to a URL (returns page content automatically)", &["url"], &json!({
+                        super::action_entry_schema("open", "Navigate to a URL (returns page content automatically)", &["url"], &json!({
                             "url": {
                                 "type": "string",
                                 "description": "URL to navigate to"
                             }
                         })),
-                        action_schema("snapshot", "Get accessibility snapshot with element refs (@e1, @e2, ...)", &[], &json!({
+                        super::action_entry_schema("snapshot", "Get accessibility snapshot with element refs (@e1, @e2, ...)", &[], &json!({
                             "interactive_only": {
                                 "type": "boolean",
                                 "description": "Only show interactive elements (buttons, links, inputs)"
@@ -603,38 +583,38 @@ impl Tool for BrowserTool {
                                 "description": "Limit tree depth"
                             }
                         })),
-                        action_schema("click", "Click an element by ref or CSS selector", &["selector"], &json!({
+                        super::action_entry_schema("click", "Click an element by ref or CSS selector", &["selector"], &json!({
                             "selector": {
                                 "type": "string",
                                 "description": "Element ref (@e1) or CSS selector to click. Refs come from the most recent snapshot on this tab — they become stale after any navigation or re-snapshot"
                             }
                         })),
-                        action_schema("get_text", "Get text content of an element (uses DOM textContent — includes script/style content)", &["selector"], &json!({
+                        super::action_entry_schema("get_text", "Get text content of an element (uses DOM textContent — includes script/style content)", &["selector"], &json!({
                             "selector": {
                                 "type": "string",
                                 "description": "Element ref (@e1) or CSS selector. Refs come from the most recent snapshot — always snapshot before calling get_text with a ref"
                             }
                         })),
-                        action_schema("get_innertext", "Get visible rendered text of an element (uses innerText — no script/style content)", &["selector"], &json!({
+                        super::action_entry_schema("get_innertext", "Get visible rendered text of an element (uses innerText — no script/style content)", &["selector"], &json!({
                             "selector": {
                                 "type": "string",
                                 "description": "Element ref (@e1) or CSS selector. Uses innerText() — returns only visible rendered text, no script/style content"
                             }
                         })),
-                        action_schema("get_url", "Get current URL", &[], &json!({})),
-                        action_schema("press", "Press a keyboard key at the current focus (e.g. Enter to submit forms)", &["key"], &json!({
+                        super::action_entry_schema("get_url", "Get current URL", &[], &json!({})),
+                        super::action_entry_schema("press", "Press a keyboard key at the current focus (e.g. Enter to submit forms)", &["key"], &json!({
                             "key": {
                                 "type": "string",
                                 "description": "Key to press (e.g. Enter, Tab, Escape, Control+a, ArrowDown)"
                             }
                         })),
-                        action_schema("eval", "Run JavaScript in the page context. Use to inspect element attributes, check state, or debug.", &["js"], &json!({
+                        super::action_entry_schema("eval", "Run JavaScript in the page context. Use to inspect element attributes, check state, or debug.", &["js"], &json!({
                             "js": {
                                 "type": "string",
                                 "description": "JavaScript to run in the page context"
                             }
                         })),
-                        action_schema("find", "Find an element by semantic locator and perform an action", &["by", "value", "action"], &json!({
+                        super::action_entry_schema("find", "Find an element by semantic locator and perform an action", &["by", "value", "action"], &json!({
                             "by": {
         "type": "string",
                 "description": "Locator type: text (case-sensitive visible text match, second most reliable for buttons/links/headings), role (accessibility tree role, use 'name' field to filter — but name filter can fail even when snapshot shows a match; fall back to 'text' or 'first' if it fails), label (matches <label for='...'> only), placeholder (EXACT match of HTML placeholder attribute — not accessible name shown in snapshot), alt, title (exact HTML title attribute), testid, first (CSS selector — MOST reliable for any element type), last (CSS selector), nth (CSS selector + index). For text inputs: prefer `by: \"first\"` with CSS selector (e.g. `\"input\"`, `\"textarea\"`) — role-based textbox locators are unreliable."
@@ -664,7 +644,7 @@ impl Tool for BrowserTool {
                                 "description": "Zero-based index for `by: \"nth\"`. Required when by is 'nth'."
                             }
                         })),
-                        action_schema(
+                        super::action_entry_schema(
                             "screenshot",
                             "Capture a screenshot of the current page as a PNG and inject it into the conversation as a native image, so you can visually inspect the rendered page",
                             &[],

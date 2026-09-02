@@ -197,6 +197,33 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage
 candle-nn = { version = "0.11.0", features = ["accelerate"] }
 qwen-asr = { version = "0.11.0", default-features = false, features = ["blas", "vdsp"] }
 
+# Computer Use tool (GUI observe/act): accessibility (AXUIElement), input
+# synthesis (CGEvent) and capture (ScreenCaptureKit). Version-aligned objc2
+# family — the same 0.6.x/0.3.x series already resolved transitively via the
+# GUI stack, so the lock gains no additional objc2 base-version forks.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+# App enumeration (NSWorkspace/NSRunningApplication) for the `apps` action.
+objc2-app-kit = { version = "0.3", features = ["NSRunningApplication", "NSWorkspace", "NSApplication"] }
+objc2-application-services = "0.3"
+objc2-screen-capture-kit = "0.3"
+block2 = "0.6"
+dispatch2 = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Computer Use tool (GUI observe/act): AT-SPI2 accessibility tree (async
+# D-Bus), XTEST input synthesis and X11 capture. The backend is a thin adapter
+# over these mature crates; raw input requires X11 (Wayland surfaces report a
+# clear degraded error instead).
+atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "wrappers", "tokio"] }
+enigo = { version = "0.6", default-features = false, features = ["x11rb"] }
+xcap = "0.9"
+# Boxes the async AT-SPI tree walk (already a transitive zbus dependency — same
+# version, no new fork); the accessibility tree is inherently recursive.
+async-recursion = "1.1"
+
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 candle-nn = "0.11.0"
 qwen-asr = { version = "0.11.0", default-features = false }

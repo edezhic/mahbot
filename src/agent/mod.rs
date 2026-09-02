@@ -2088,6 +2088,9 @@ pub(crate) async fn run_agent(
     // Owner-deletes-at-end: remove the spill files this agent run created
     // (safe on macOS — the run is over, nothing will read them again).
     crate::tools::shell::cleanup_agent_spills(&agent_id_for_cleanup);
+    // Drop the per-agent computer registry entries (observation/target/capture)
+    // so they never leak into a later run.
+    crate::tools::computer::cleanup_agent_state(&agent_id_for_cleanup);
     outcome
 }
 

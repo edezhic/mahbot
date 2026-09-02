@@ -6,6 +6,7 @@ pub(crate) mod alarms;
 pub(crate) mod analyze;
 pub mod browser;
 pub mod browser_daemon;
+pub mod computer;
 pub(crate) mod edit;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
@@ -156,6 +157,7 @@ pub(crate) fn fit_request_body_budget(
 pub(crate) use alarms::{AddAlarmTool, ListAlarmsTool, RemoveAlarmTool};
 pub(crate) use analyze::{AnalyzeTool, DispatchMode};
 pub(crate) use browser::BrowserTool;
+pub(crate) use computer::ComputerTool;
 pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use implement::ImplementTool;
@@ -196,7 +198,7 @@ use crate::util::json::{
 /// Tools with non-standard top-level keys in their top-level schema
 /// (e.g., `oneOf` in WebSearchTool) should not use this directly;
 /// they may still use it internally as a building block (e.g.,
-/// BrowserTool's `action_schema` calls it for each inner entry).
+/// BrowserTool's [`action_entry_schema`] calls it for each inner entry).
 #[must_use]
 pub(crate) fn tool_params_schema(
     properties: &serde_json::Value,
@@ -210,6 +212,34 @@ pub(crate) fn tool_params_schema(
         schema["required"] = serde_json::json!(required);
     }
     schema
+}
+
+/// Build a single action entry for a `oneOf` action list.
+///
+/// Wraps a `"{"name": inner}"` object in the standard `{"type":"object",
+/// "properties":{name: inner}, "required":[name], "additionalProperties":false,
+/// "description":description}` envelope used by the browser and computer tools'
+/// nested action schemas. `inner` is built by [`tool_params_schema`], which adds
+/// `"required"` only when non-empty, and then hard-closes the action object.
+#[must_use]
+pub(crate) fn action_entry_schema(
+    name: &str,
+    description: &str,
+    required: &[&str],
+    properties: &serde_json::Value,
+) -> serde_json::Value {
+    let mut inner = tool_params_schema(properties, required);
+    inner["additionalProperties"] = serde_json::json!(false);
+
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            (name): inner
+        },
+        "required": [name],
+        "additionalProperties": false,
+        "description": description
+    })
 }
 
 // ── scrub ────────────────────────────────────────────────────────────
@@ -298,6 +328,9 @@ pub(crate) enum ImagePayloadSource {
     /// Screenshot captured by the browser tool (injected as a native image for
     /// the agent's own visual analysis).
     Browser,
+    /// Screen capture from the computer tool (injected as a native image for
+    /// the agent's own visual analysis).
+    Computer,
 }
 
 impl ImagePayloadSource {
@@ -310,6 +343,7 @@ impl ImagePayloadSource {
             Self::Read => "Read image file",
             Self::Generated => "Generated image file",
             Self::Browser => "Browser screenshot",
+            Self::Computer => "Computer screenshot",
         }
     }
 }

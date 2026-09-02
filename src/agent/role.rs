@@ -262,11 +262,12 @@ use crate::Workspace;
 use crate::config::CONFIG;
 use crate::tools::{
     AddAlarmTool, AddCommentTool, AddUserTool, AddWorkspaceTool, AnalyzeTool, BindTelegramTool,
-    BrowserTool, CreateTicketTool, DispatchMode, EditTool, FinalizeTool, GetTicketTool,
-    ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool, ListTicketsTool,
-    MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool, SearchArchivedTicketsTool,
-    SearchTool, SetupTelegramBotTool, SetupWebSearchTool, ShellMode, ShellTool, StrictReadTool,
-    UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
+    BrowserTool, ComputerTool, CreateTicketTool, DispatchMode, EditTool, FinalizeTool,
+    GetTicketTool, ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool,
+    ListTicketsTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
+    SearchArchivedTicketsTool, SearchTool, SetupTelegramBotTool, SetupWebSearchTool, ShellMode,
+    ShellTool, StrictReadTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend,
+    WebSearchTool,
 };
 
 impl Role {
@@ -390,6 +391,12 @@ impl Role {
                         Role::Assistant,
                     )));
                     t.push(Box::new(ResearchTool::new(Role::Assistant)));
+                    // Full access implies a trusted local session, so the
+                    // Assistant can also observe/act on the local GUI directly
+                    // (gated per-run by the accessibility grant at agent
+                    // construction). No structural authorization gate beyond
+                    // `full_access`, matching the full shell widening.
+                    t.push(Box::new(ComputerTool));
                 }
                 t
             }
@@ -596,14 +603,14 @@ mod tests {
     #[test]
     fn assistant_toolset_gates_full_access_tools() {
         // The Assistant toolset must differ by the triggering user's
-        // full-access (admin) flag: base mode has no shell/implement/research,
-        // full mode does. Base gets the workspace-only StrictReadTool; full
-        // keeps the general ReadTool (which also permits dependency sources).
+        // full-access (admin) flag: base mode has no shell/implement/research/
+        // computer, full mode does. Base gets the workspace-only StrictReadTool;
+        // full keeps the general ReadTool (which also permits dependency sources).
         let ws = crate::workspace::test_ws("test");
         let base = crate::Role::Assistant.tools(&ws, false);
         let full = crate::Role::Assistant.tools(&ws, true);
 
-        for name in ["shell", "implement", "research"] {
+        for name in ["shell", "implement", "research", "computer"] {
             assert!(
                 !base.iter().any(|t| t.name() == name),
                 "base Assistant toolset must not contain '{name}'"
@@ -631,6 +638,33 @@ mod tests {
             full_path_desc.contains("policy allowlist"),
             "full Assistant read must advertise the general allowlist boundary, got: {full_path_desc}"
         );
+    }
+
+    #[test]
+    fn computer_tool_only_in_full_access_assistant() {
+        // Acceptance pin: `computer` is granted ONLY to the full-access
+        // Assistant. Every other role (base or full) and the base Assistant
+        // rely on delegation (browser/analyze/shell) rather than direct local
+        // GUI access, so the tool must never leak into their toolset.
+        let ws = crate::workspace::test_ws("test");
+        for role in Role::iter() {
+            for full_access in [false, true] {
+                let has = role
+                    .tools(&ws, full_access)
+                    .iter()
+                    .any(|t| t.name() == "computer");
+                if role == crate::Role::Assistant && full_access {
+                    assert!(has, "full-access Assistant must advertise `computer`");
+                } else {
+                    assert!(
+                        !has,
+                        "{}{} must not advertise `computer`",
+                        role.as_str(),
+                        if full_access { " (full)" } else { "" }
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -261,6 +261,16 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::search_engine::init_all_engines(),
     );
 
+    // Warm the computer tool's capture-channel probe once at boot so the cached
+    // availability result is ready before the first agent runs; the probe would
+    // otherwise run lazily on the first capture request.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "computer-capabilities",
+        mahbot::tools::computer::warm_capture_probe(),
+    );
+
     // Periodic refresh of the shared update-availability cache. This is the
     // single writer of the cache: both the GUI update button and the Telegram
     // `/update` menu read the cached state, so the two surfaces cannot diverge.

@@ -1334,7 +1334,7 @@ impl Tool for ShellTool {
 /// temp sweep (the daemon builds no startup reclamation — crash leftovers are
 /// the operating system's job). Within a run, owner-deletes-at-end removes
 /// what the agent created.
-fn agent_temp_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn agent_temp_dir() -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(".agent");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
@@ -1355,7 +1355,7 @@ static SPILL_OWNERS: std::sync::LazyLock<
 /// so the diagnostics runner can clean up what it created. Agent ids are always
 /// prefixed (`ticket_*`, `manager_*`, etc.) and never equal bare `"diagnostics"`
 /// so no collision. Tests outside an agent also bucket there (acceptable).
-fn record_spill_owner(path: std::path::PathBuf) {
+pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
     let agent = crate::agent::CURRENT_TOOL_AGENT_ID
         .try_with(Clone::clone)
         .unwrap_or(None);
