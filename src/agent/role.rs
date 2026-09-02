@@ -331,7 +331,6 @@ impl Role {
             }
             Role::Analyst => {
                 let mut t = Self::readonly_core_tools();
-                t.push(Box::new(MahbotDebugTool));
                 t.push(Box::new(BrowserTool::default()));
                 t
             }
@@ -565,23 +564,21 @@ mod tests {
     }
 
     #[test]
-    fn analyst_and_support_expose_mahbot_debug_and_other_roles_do_not() {
-        // Acceptance pin for the in-process read-only SQL tool: only Analyst and
-        // Support advertise `mahbot_debug` — it must not appear for the
-        // Assistant (either base or full-access) or any other role.
+    fn support_exposes_mahbot_debug_and_other_roles_do_not() {
+        // Acceptance pin for the in-process read-only SQL tool: only Support
+        // advertises `mahbot_debug` — it must not appear for the Analyst, the
+        // Assistant (either base or full-access), or any other role.
         let ws = crate::workspace::test_ws("test");
-        for role in [crate::Role::Analyst, crate::Role::Support] {
-            let tools = role.tools(&ws, false);
-            assert!(
-                tools.iter().any(|t| t.name() == "mahbot_debug"),
-                "{} toolset must contain `mahbot_debug`",
-                role.as_str()
-            );
-        }
+        let tools = crate::Role::Support.tools(&ws, false);
+        assert!(
+            tools.iter().any(|t| t.name() == "mahbot_debug"),
+            "support toolset must contain `mahbot_debug`"
+        );
         for (role, full_access) in [
             (crate::Role::Manager, false),
             (crate::Role::Engineer, false),
             (crate::Role::Coder, false),
+            (crate::Role::Analyst, false),
             (crate::Role::Qa, false),
             (crate::Role::Reviewer, false),
             (crate::Role::Discovery, false),

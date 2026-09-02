@@ -169,7 +169,7 @@ pub(crate) fn store_names() -> Vec<&'static str> {
 }
 
 /// All accepted database selector values for the read-only debug/query surface
-/// (the CLI's `--db` argument and the Analyst `mahbot_debug` tool's `db`
+/// (the CLI's `--db` argument and the Support `mahbot_debug` tool's `db`
 /// parameter): the logical store names ([`store_names`]) plus the physical
 /// consolidated file name ([`CONSOLIDATED_DB_NAME`]).
 ///
