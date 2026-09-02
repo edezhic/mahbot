@@ -1358,6 +1358,24 @@ async fn is_fts_index(conn: &Connection, index: &str) -> bool {
     .is_some_and(|sql| sql.to_lowercase().contains("using fts"))
 }
 
+/// Name of the ticket-title FTS index. This const pair is the single shared
+/// known-good copy used by [`crate::db::ensure_fts_index`], the boot repair
+/// ([`crate::db::repair_ticket_title_fts_if_corrupt`]), and the runtime repair
+/// ([`crate::db::repair_ticket_title_fts_on_failed_checkpoint`]) — imported by
+/// `crate::pipeline::board::after_open`. The append-only migrations catalog
+/// independently carries its own raw-SQL schema entry (by design); the const
+/// pair is the authoritative known-good form.
+pub(crate) const TICKETS_FTS_INDEX_NAME: &str = "idx_tickets_title_fts";
+
+/// Known-good DDL for the ticket-title FTS index. The const pair is the single
+/// shared known-good copy used by [`crate::db::ensure_fts_index`] and the
+/// boot/runtime repairs — never rebuilt from `sqlite_master`, whose stored DDL
+/// for a corrupt index is untrusted. It is imported by
+/// `crate::pipeline::board::after_open`. The append-only migrations catalog
+/// carries its own raw-SQL schema entry (by design).
+pub(crate) const TICKETS_FTS_INDEX_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
+USING fts (title) WITH (tokenizer = 'ngram')";
+
 /// Functional MATCH probe for the ticket-title FTS index: any successful
 /// MATCH query proves the index is readable (the incident's corruption also
 /// failed plain MATCH queries while quick_check looked clean apart from
@@ -1460,66 +1478,94 @@ async fn verify_rebuilt_ticket_title_fts(conn: &Connection, index: &str) -> anyh
     Ok(())
 }
 
+/// Drop+CREATE and post-rebuild verification results, returned for callers
+/// that need to branch on them (the runtime recovery); the boot path ignores
+/// them (all outcomes are logged here, never propagated — fail-safe).
+struct TicketTitleFtsRebuildOutcome {
+    drop_create: anyhow::Result<()>,
+    verified: anyhow::Result<()>,
+}
+
 /// Rebuild the ticket-title FTS index from the KNOWN-GOOD DDL (threaded in by
 /// the caller), not from `sqlite_master` — the stored DDL of a corrupt index
 /// must not be trusted to be the right shape, and the known-good DDL is
 /// already threaded in. Mirrors `drop_create_index_fallback`'s transactional
 /// DROP+CREATE: a failed CREATE rolls the DROP back, leaving the original
 /// index for operator review; ticket rows are never touched. Then verify
-/// (filtered quick_check, index presence, MATCH smoke on a known title) and
-/// attempt a WAL checkpoint — successful checkpointing is the observable that
-/// the corruption is actually gone. All outcomes logged, never propagated
-/// (fail-safe).
-async fn rebuild_ticket_title_fts(conn: &Connection, index: &str, ddl: &str) {
+/// (filtered quick_check, index presence, MATCH smoke on a known title) and,
+/// on request (`checkpoint_truncate`), run a WAL checkpoint — successful
+/// checkpointing is the observable that the corruption is actually gone. All
+/// outcomes logged, never propagated (fail-safe).
+///
+/// `checkpoint_truncate` controls the post-rebuild checkpoint: `true` runs a
+/// TRUNCATE checkpoint (boot path, pre-serve, no live writers) so a clean store
+/// handoff is observable; `false` skips the internal checkpoint entirely — the
+/// runtime caller re-checkpoints itself right after in the failed attempt's
+/// mode, so a second back-to-back PASSIVE here would be redundant (and TRUNCATE
+/// under live writers is the corruption vector the periodic loop deliberately
+/// avoids).
+async fn rebuild_ticket_title_fts(
+    conn: &Connection,
+    index: &str,
+    ddl: &str,
+    checkpoint_truncate: bool,
+) -> TicketTitleFtsRebuildOutcome {
     let quoted = index.replace('"', "\"\"");
     // Transactional DROP+CREATE: a failed CREATE rolls the DROP back via the
     // dropped TxGuard, preserving the original index for operator review
     // (same deferred-rollback discipline as `drop_create_index_fallback`).
-    let outcome = async {
+    let drop_create = async {
         let tx = conn.begin_tx().await?;
         tx.execute_batch(&format!("DROP INDEX IF EXISTS \"{quoted}\"; {ddl};"))
             .await?;
         tx.commit().await
     }
-    .await;
+    .await
+    .map_err(anyhow::Error::from);
     let verified = verify_rebuilt_ticket_title_fts(conn, index).await;
-    match (&outcome, &verified) {
+    match (&drop_create, &verified) {
         (Ok(()), Ok(())) => {
             info!(index, "ticket-title FTS index rebuilt and verified");
         }
-        (outcome, verified) => {
+        (drop_create, verified) => {
             warn!(
                 index,
-                repair_error = ?outcome.as_ref().err(),
+                repair_error = ?drop_create.as_ref().err(),
                 verify_error = ?verified.as_ref().err(),
                 "ticket-title FTS rebuild finished with warnings — check earlier log lines"
             );
         }
     }
-    match conn.checkpoint().await {
-        Ok(o) if o.is_complete() => {
-            info!(
-                index,
-                checkpointed_frames = o.checkpointed_frames,
-                "post-repair WAL checkpoint complete — corruption cleared"
-            );
+    if checkpoint_truncate {
+        match conn.checkpoint().await {
+            Ok(o) if o.is_complete() => {
+                info!(
+                    index,
+                    checkpointed_frames = o.checkpointed_frames,
+                    "post-repair WAL checkpoint complete — corruption cleared"
+                );
+            }
+            Ok(o) => {
+                warn!(
+                    index,
+                    busy = o.busy,
+                    log_frames = o.log_frames,
+                    checkpointed_frames = o.checkpointed_frames,
+                    "post-repair WAL checkpoint incomplete"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    index,
+                    error = %e,
+                    "post-repair WAL checkpoint failed"
+                );
+            }
         }
-        Ok(o) => {
-            warn!(
-                index,
-                busy = o.busy,
-                log_frames = o.log_frames,
-                checkpointed_frames = o.checkpointed_frames,
-                "post-repair WAL checkpoint incomplete"
-            );
-        }
-        Err(e) => {
-            warn!(
-                index,
-                error = %e,
-                "post-repair WAL checkpoint failed"
-            );
-        }
+    }
+    TicketTitleFtsRebuildOutcome {
+        drop_create,
+        verified,
     }
 }
 
@@ -1571,7 +1617,7 @@ pub(crate) async fn repair_ticket_title_fts_if_corrupt(conn: &Connection, index:
         evidence = %evidence,
         "ticket-title FTS corruption signature detected at boot — rebuilding the index (ticket rows untouched)"
     );
-    let rebuilt = AssertUnwindSafe(rebuild_ticket_title_fts(conn, index, ddl))
+    let rebuilt = AssertUnwindSafe(rebuild_ticket_title_fts(conn, index, ddl, true))
         .catch_unwind()
         .await;
     if let Err(panic) = rebuilt {
@@ -1581,6 +1627,135 @@ pub(crate) async fn repair_ticket_title_fts_if_corrupt(conn: &Connection, index:
             "ticket-title FTS boot repair panicked — boot continues; index left as-is for operator review"
         );
     }
+}
+
+/// Outcome of the runtime (post-checkpoint-failure) ticket-title FTS repair.
+#[derive(Debug)]
+pub(crate) enum TicketTitleFtsRuntimeRepair {
+    /// Store carries no ticket-title FTS index — nothing to repair.
+    NotApplicable,
+    /// Index present and healthy — the checkpoint failure is not FTS-attributable.
+    Healthy,
+    /// Corruption detected and the rebuild ran; payload summarizes detection
+    /// evidence and repair outcome for the caller's report.
+    Rebuilt(String),
+    /// Detection errored/panicked or the rebuild panicked — repair incomplete.
+    Failed(String),
+}
+
+impl TicketTitleFtsRuntimeRepair {
+    /// Compact human-readable summary for the failure report (the enum's
+    /// derived Debug keeps the shape but is not report-friendly). Reads the
+    /// payload variants so the detection/repair evidence is surfaced.
+    #[must_use]
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::NotApplicable => "not applicable (no ticket-title FTS index)".to_string(),
+            Self::Healthy => "healthy (index present, probe clean)".to_string(),
+            Self::Rebuilt(evidence) => format!("rebuilt after detection — {evidence}"),
+            Self::Failed(reason) => format!("failed — {reason}"),
+        }
+    }
+}
+
+/// Runtime variant of the boot-time ticket-title FTS repair: invoked from the
+/// periodic checkpoint loop after a checkpoint failure. Runs the same boot
+/// primitives (see [`repair_ticket_title_fts_if_corrupt`]) — detection and the
+/// drop+recreate rebuild — via its own wrapper so the post-rebuild checkpoint
+/// mode and the caller-visible outcome can differ from the boot path. Blocking
+/// execution is intentional — a service stall while the repair runs is
+/// acceptable; no timeout/abort is applied. The `sqlite_master` presence check
+/// first makes stores that carry no ticket-title FTS index (e.g. logs.db)
+/// no-ops. Panics use the same `catch_unwind` discipline as the boot path.
+///
+/// Transient busy from a concurrent writer cannot fail the rebuild's DDL: the
+/// [`Connection`] wrapper serializes every operation behind one mutex, so no
+/// other in-process op (writer or checkpoint) can be in flight during the
+/// DROP+CREATE.
+pub(crate) async fn repair_ticket_title_fts_on_failed_checkpoint(
+    conn: &Connection,
+) -> TicketTitleFtsRuntimeRepair {
+    // Absent index → nothing to repair (non-domain stores never carry it).
+    // Panic-guarded like every probe on this path: a turso panic must reach
+    // the caller's Failed arm (→ drain), never the outer per-store catch.
+    let present = AssertUnwindSafe(conn.query_optional(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        params![TICKETS_FTS_INDEX_NAME.to_string()],
+        |_| Ok::<_, ::turso::Error>(()),
+    ))
+    .catch_unwind()
+    .await;
+    let present = match present {
+        Ok(Ok(present)) => present,
+        Ok(Err(e)) => {
+            return TicketTitleFtsRuntimeRepair::Failed(format!(
+                "index presence probe failed: {e}"
+            ));
+        }
+        Err(panic) => {
+            return TicketTitleFtsRuntimeRepair::Failed(format!(
+                "index presence probe panicked: {}",
+                crate::util::panic_message(&panic)
+            ));
+        }
+    };
+    if present.is_none() {
+        return TicketTitleFtsRuntimeRepair::NotApplicable;
+    }
+
+    let detected = AssertUnwindSafe(detect_ticket_title_fts_corruption(
+        conn,
+        TICKETS_FTS_INDEX_NAME,
+    ))
+    .catch_unwind()
+    .await;
+    let evidence = match detected {
+        // Present and probe-clean → the checkpoint failure is not FTS-shaped.
+        Ok(Ok(None)) => return TicketTitleFtsRuntimeRepair::Healthy,
+        Ok(Ok(Some(evidence))) => evidence,
+        Ok(Err(e)) => {
+            return TicketTitleFtsRuntimeRepair::Failed(format!("detection probe failed: {e}"));
+        }
+        // A panicking probe is itself corruption evidence (boot precedent) —
+        // attempt the rebuild.
+        Err(panic) => format!(
+            "detection probe panicked: {}",
+            crate::util::panic_message(&panic)
+        ),
+    };
+
+    let rebuilt = AssertUnwindSafe(rebuild_ticket_title_fts(
+        conn,
+        TICKETS_FTS_INDEX_NAME,
+        TICKETS_FTS_INDEX_DDL,
+        false,
+    ))
+    .catch_unwind()
+    .await;
+    let TicketTitleFtsRebuildOutcome {
+        drop_create,
+        verified,
+    } = match rebuilt {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            return TicketTitleFtsRuntimeRepair::Failed(format!(
+                "rebuild panicked: {}; evidence: {evidence}",
+                crate::util::panic_message(&panic)
+            ));
+        }
+    };
+    if drop_create.is_err() || verified.is_err() {
+        return TicketTitleFtsRuntimeRepair::Failed(format!(
+            "rebuild incomplete: drop_create error: {:?}; verify error: {:?}; evidence: {evidence}",
+            drop_create.as_ref().err(),
+            verified.as_ref().err(),
+        ));
+    }
+    // The rebuild logs its own verification (verify_rebuilt warns on residual
+    // quick_check problems) and the caller's terminal report runs its own
+    // panic-guarded quick_check — no extra probe here, keeping this path
+    // panic-free by construction.
+    TicketTitleFtsRuntimeRepair::Rebuilt(format!("corruption detected: {evidence}"))
 }
 
 // Any schema creation, change, or removal is an entry in the append-only
@@ -4262,6 +4437,7 @@ mod tests {
             "idx_tickets_title_fts",
             "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
              USING fts (title) WITH (tokenizer = 'ngram')",
+            true,
         )
         .await;
 
@@ -4377,5 +4553,27 @@ mod tests {
         title_fts_match_probe(&conn)
             .await
             .expect("probe must pass on a healthy populated FTS index");
+    }
+
+    /// Runtime entry point returns `NotApplicable` for a store without the
+    /// ticket-title FTS index and `Healthy` for a healthy index with content.
+    #[tokio::test]
+    async fn runtime_repair_classifies_missing_and_healthy_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plain_path = tmp.path().join("plain.db");
+        let plain = open_with_schema(&plain_path, "CREATE TABLE plain (id INTEGER PRIMARY KEY);")
+            .await
+            .unwrap();
+        assert!(matches!(
+            repair_ticket_title_fts_on_failed_checkpoint(&plain).await,
+            TicketTitleFtsRuntimeRepair::NotApplicable
+        ));
+
+        let conn = open_consolidated_store(tmp.path()).await.unwrap();
+        insert_fts_ticket(&conn, "t-1", "Important bug fix").await;
+        assert!(matches!(
+            repair_ticket_title_fts_on_failed_checkpoint(&conn).await,
+            TicketTitleFtsRuntimeRepair::Healthy
+        ));
     }
 }

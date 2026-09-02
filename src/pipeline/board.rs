@@ -49,11 +49,6 @@ pub async fn run_archive_cancelled_loop() {
     }
 }
 
-const TICKETS_FTS_INDEX_NAME: &str = "idx_tickets_title_fts";
-const TICKETS_FTS_INDEX_DDL: &str = "\
-CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
-USING fts (title) WITH (tokenizer = 'ngram')";
-
 /// Stale-cancelled archival window (hours): Cancelled tickets this old are
 /// archived by [`run_archive_cancelled_loop`].
 const CANCELLED_ARCHIVE_HOURS: i64 = 1;
@@ -685,15 +680,15 @@ impl BoardStore {
     pub(crate) async fn after_open(&self) -> anyhow::Result<()> {
         crate::db::ensure_fts_index(
             &self.conn,
-            TICKETS_FTS_INDEX_NAME,
+            crate::db::TICKETS_FTS_INDEX_NAME,
             "ngram",
-            TICKETS_FTS_INDEX_DDL,
+            crate::db::TICKETS_FTS_INDEX_DDL,
         )
         .await?;
         crate::db::repair_ticket_title_fts_if_corrupt(
             &self.conn,
-            TICKETS_FTS_INDEX_NAME,
-            TICKETS_FTS_INDEX_DDL,
+            crate::db::TICKETS_FTS_INDEX_NAME,
+            crate::db::TICKETS_FTS_INDEX_DDL,
         )
         .await;
         Ok(())
