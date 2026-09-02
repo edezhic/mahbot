@@ -54,6 +54,24 @@ fn is_tool_call_frame(msg: &ChatMessage) -> bool {
     )
 }
 
+/// True when the message decodes as a native assistant tool-call frame
+/// carrying at least one tool call — the dangling-tail signal used by the
+/// dead-session recovery poller. Mirrors [`Session::pending_tool_calls`]:
+/// a frame that is the session TAIL can have no following result rows, so
+/// non-empty calls there means unresolved calls.
+pub(crate) fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
+    matches!(
+        decode_native_history_message(&ChatMessage {
+            role,
+            content: content.to_string(),
+        }),
+        Some(DecodedNativeHistoryMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        }) if !calls.is_empty()
+    )
+}
+
 /// Select the latest [`RETENTION_PER_SIDE`] user messages and assistant answers
 /// from `history`, merged in chronological order. Tool-call frames and tool
 /// results are excluded from both sides. The triggering (in-flight) user
@@ -855,6 +873,21 @@ impl SessionStore {
         })
     }
 
+    /// Raw content of the session's last message row (`None` for an empty
+    /// session). Companion to [`Self::get_last_message_role`] for content-aware
+    /// tail classification (the dead-session poller's dangling-frame check).
+    pub(crate) async fn get_last_message_content(&self, agent_id: &str) -> Option<String> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT content FROM sessions WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![agent_id],
+            )
+            .await
+            .ok()?;
+        rows.first().and_then(|row| row.get::<String>(0).ok())
+    }
+
     /// Retrieve stored session context for a given agent ID.
     /// Returns `None` if the session has no metadata or the context columns
     /// are null.
@@ -1519,6 +1552,48 @@ mod tests {
             store().get_last_message_role(&agent_id).await,
             Some(ChatRole::Assistant)
         );
+    }
+
+    #[tokio::test]
+    async fn session_get_last_message_content_dangling_frame() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = unique_key();
+
+        // Empty session → None.
+        assert!(store().get_last_message_content(&agent_id).await.is_none());
+
+        // Emission-time assistant tool-call frame: the persisted content is the
+        // JSON replay payload, and the tail is the dangling-frame signal.
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            &[crate::ToolCall {
+                id: "call_tail".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "x"}),
+            }],
+            None,
+        )
+        .to_string();
+        store()
+            .batch_append(
+                &agent_id,
+                &[
+                    ChatMessage::user("read the file"),
+                    ChatMessage::assistant(frame.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let content = store()
+            .get_last_message_content(&agent_id)
+            .await
+            .expect("tail content should be readable");
+        assert_eq!(content, frame);
+        assert!(super::is_dangling_tool_call_frame(
+            crate::ChatRole::Assistant,
+            &content
+        ));
     }
 
     #[tokio::test]
