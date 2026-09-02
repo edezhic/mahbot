@@ -16,29 +16,34 @@
 //!   metrics (collapsed and expanded alike), with no fill spacers; the rest of
 //!   the card content (thinking fallback, trace groups, tool blocks, activity
 //!   line) starts on the second row at the card's left edge. Narration (the
-//!   assistant's short reasoning
-//!   text) is shown exactly once — as the current (latest) trace-group label,
-//!   which shows a neutral "clanking" placeholder while its narration hasn't
-//!   committed; a brand-new agent with no trace group shows a card-level
-//!   "clanking" placeholder. The narration renders at 14px italic, never
-//!   truncated — the full reasoning text stays a hover tooltip — while a
-//!   silent round (empty narration) with a decoded Reasoning block promotes
-//!   that reasoning into the label: capped, plain, no tooltip. The live
-//!   activity phase label (a non-tool LLM call) renders as a separate line at
-//!   the very bottom of the card in both the collapsed and expanded state. The
-//!   currently-executing tool(s) are the "current toolcalls" and render at the
-//!   bottom of the card. The transcript cannot see an in-flight tool or a
-//!   non-tool LLM phase (those are only committed after execution / produce no
-//!   message respectively), so this is the only record of "what's running
-//!   now".
+//!   assistant's short reasoning text) is shown exactly once — as the current
+//!   (latest) trace-group label, which shows a neutral "clanking" placeholder
+//!   while its narration hasn't committed; a brand-new agent — or a current
+//!   user turn with no tool rounds yet — shows a card-level "clanking"
+//!   placeholder. The narration renders at 14px italic, never truncated — the
+//!   full reasoning text stays a hover tooltip — while a silent round (empty
+//!   narration) with a decoded Reasoning block promotes that reasoning into
+//!   the label: capped, plain, no tooltip. The live activity phase label (a
+//!   non-tool LLM call) renders as a separate line at the very bottom of the
+//!   card in both the collapsed and expanded state.
+//!   In-flight tool state is derived from the live transcript history: a tool
+//!   call whose result has not been committed yet renders with a live
+//!   in-flight marker. Only non-tool LLM phases remain invisible in the
+//!   transcript and are still shown solely by the registry activity label.
 //! - Trace groups (below the LIVE line) are a projection of the shared
 //!   session ledger (the live transcript snapshot decoded via
 //!   `session_view::build_ledger`): tool-call assistant rounds grouped by
 //!   shared narration, bounded by real user turns. Content-only final answers
 //!   are omitted.
-//! - Parallel tool execution is represented honestly: every tool that
-//!   actually started executing appears as its own tool block; tools that never
-//!   execute (unknown tool, pre-flight cancellation) never show.
+//! - The trace groups shown on a card are scoped to the CURRENT user turn:
+//!   groups from before the last real user message are never shown.
+//! - Parallel tool execution is a history-derived over-approximation: a call
+//!   shows as in-flight while its result is uncommitted (its tool-call round
+//!   is already in the ledger) — finished-but-uncommitted calls in a parallel
+//!   batch, unknown/pre-flight-cancelled calls before their round commits,
+//!   and drain-suspended calls all appear in-flight. This is accepted for an
+//!   observability view; tools that never produce a committed round simply
+//!   never appear.
 //! - The instrumentation is purely observational — it never affects
 //!   shutdown/drain logic and gains no cancellation semantics.
 //! - The live view shows tool arguments EXACTLY as the agent passed them —
@@ -58,11 +63,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::ChatRole;
-use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey, RunningTool};
+use crate::agent::registry::{AgentHandle, NonAgentCallHandle, ParentKey};
 use crate::gui::dialog;
 use crate::gui::session_view::{
-    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, ToolBlockView, build_ledger, collapse_control_chars,
-    promoted_reasoning, tool_block, truncate_at_boundary,
+    MAX_TOOL_TOOLTIP_WIDTH, SessionEntry, ToolBlockView, ToolCallEntry, build_ledger,
+    collapse_control_chars, promoted_reasoning, tool_block, truncate_at_boundary,
 };
 use crate::gui::theme;
 use crate::gui::widgets;
@@ -604,20 +609,19 @@ fn workspace_label_for(
 }
 
 /// Render one running-agent card: the role icon and the token/elapsed metrics
-/// inline in the first row, trace groups, and the current toolcalls. The whole
-/// card is clickable to expand/collapse the trace groups.
+/// inline in the first row, then the current user turn's trace groups. The
+/// whole card is clickable to expand/collapse the trace groups.
 ///
 /// Narration (the assistant's short reasoning text) lives solely in the
 /// current trace-group label, which shows a "clanking" placeholder while its
-/// narration hasn't committed; a brand-new agent with no trace group shows a
-/// card-level "clanking" placeholder. The live activity phase label (an
+/// narration hasn't committed; a brand-new agent — or a current user turn
+/// with no tool rounds yet — shows a card-level "clanking" placeholder. The
+/// live activity phase label (an
 /// in-flight non-tool LLM call, e.g. extracting/summarizing/transcribing)
 /// renders as a separate accent line at the very bottom of the card in both
-/// the collapsed and expanded state. The currently-executing tools are the
-/// "current toolcalls" and render at the bottom above the activity line. Trace
-/// groups come from the live transcript snapshot (the unpersisted tail
-/// included): the current (latest) group, plus up to 5 previous groups when
-/// expanded.
+/// the collapsed and expanded state. Trace groups come from the live
+/// transcript snapshot (the unpersisted tail included): the current (latest)
+/// group, plus up to 5 previous groups when expanded.
 fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, RunningMessage> {
     let h = &card.handle;
     // Color resolution via the canonical string helper (handles derivative
@@ -629,15 +633,15 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     let elapsed = format_elapsed(h.started_at);
 
     // The live transcript snapshot feeds the trace groups below (and the
-    // current group's narration label), so fetch it once up front.
+    // current group's narration label), scoped to the current user turn, so
+    // fetch it once up front.
     let snapshot = crate::session::TRANSCRIPT_REGISTRY.snapshot(&h.agent_id);
     let groups = snapshot
         .as_ref()
-        .map(|s| derive_trace_groups(&build_ledger(&s.history)))
+        .map(|s| derive_trace_groups(current_turn_entries(&build_ledger(&s.history))))
         .unwrap_or_default();
 
     let token_count = snapshot.as_ref().and_then(|s| s.token_count);
-    let tools_running = !h.current_tools.is_empty();
 
     let mut content = Column::new()
         .spacing(theme::SPACE_6)
@@ -651,36 +655,22 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         .push(icon)
         .push(render_metrics(token_count, &elapsed));
     content = content.push(first_row);
-    // A brand-new agent with no trace group yet (no history to project from)
-    // shows a card-level "clanking" placeholder. Once any group exists the
-    // current group's own label handles narration / thinking, so this fallback
-    // must not render at card level.
+    // A brand-new agent — or the current user turn with no tool rounds yet —
+    // shows a card-level "clanking" placeholder. Once the current turn has any
+    // group, the current group's own label handles narration / thinking, so
+    // this fallback must not render at card level.
     if groups.is_empty() {
         content = content.push(clanking_placeholder());
     }
-    // Trace groups from the live snapshot (current unless the agent has no
-    // transcript yet). Content-only assistant messages (final answers) are
-    // deliberately omitted — only tool-call assistant messages form groups.
-    if !groups.is_empty() {
-        for group in render_visible_groups(&groups, expanded) {
-            content = content.push(group);
-        }
-    }
-    // The currently-executing tools are the "current toolcalls" and render at
-    // the bottom of the card, below the committed trace groups, above the
-    // activity line, in either view.
-    if tools_running {
-        let mut tools = Column::new()
-            .spacing(theme::SPACE_4)
-            .align_x(Alignment::Start);
-        for tool in &h.current_tools {
-            tools = tools.push(tool_block(tool, ToolBlockView::Compact));
-        }
-        content = content.push(tools);
+    // Trace groups from the live snapshot, scoped to the current user turn.
+    // Content-only assistant messages (final answers) are deliberately
+    // omitted — only tool-call assistant messages form groups.
+    for group in render_visible_groups(&groups, expanded) {
+        content = content.push(group);
     }
     // The live activity phase label (an in-flight non-tool LLM call) renders
     // as a separate accent line at the very bottom of the card, below the
-    // trace groups and tool blocks, in both the collapsed and expanded view.
+    // trace groups, in both the collapsed and expanded view.
     if let Some(activity) = &h.activity {
         content = content.push(
             text(activity.to_owned())
@@ -784,17 +774,18 @@ fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, R
 }
 
 /// Render the visible trace groups for a card: the current (latest) group
-/// always (last, chronologically), plus up to 5 previous groups when the card
-/// is expanded. Returns owned elements. Every group renders its narration
-/// label (see [`render_trace_group`]).
+/// always (last, chronologically, newest round expanded), plus up to 5
+/// previous groups (collapsed) when the card is expanded. Every group renders
+/// its narration label (see [`render_trace_group`]). Empty input renders
+/// nothing.
 fn render_visible_groups(
     groups: &[TraceGroup],
     expanded: bool,
 ) -> Vec<Element<'static, RunningMessage>> {
     let mut rendered = Vec::new();
-    let (current, previous) = groups
-        .split_last()
-        .expect("caller guarantees at least one group");
+    let Some((current, previous)) = groups.split_last() else {
+        return rendered;
+    };
     if expanded {
         // The 5 most-recent previous groups, oldest first, then current.
         for group in previous.iter().rev().take(5).rev() {
@@ -864,8 +855,8 @@ fn render_trace_group(
                     .color(theme::TEXT_SECONDARY),
             );
         }
-        for call in newest {
-            column = column.push(tool_block(call, ToolBlockView::Compact));
+        for entry in newest {
+            column = column.push(tool_row(entry));
         }
     } else {
         column = column.push(
@@ -875,6 +866,27 @@ fn render_trace_group(
         );
     }
     column.into()
+}
+
+/// A single expanded tool-call row in the current group. Settled calls render
+/// exactly as [`tool_block`]; an in-flight call (result not yet committed)
+/// gains a small accent `loader_circle` marker after the block.
+fn tool_row(entry: &ToolCallEntry) -> Element<'static, RunningMessage> {
+    let block = tool_block(&entry.tool, ToolBlockView::Compact);
+    if entry.result.is_none() {
+        Row::new()
+            .spacing(theme::SPACE_6)
+            .align_y(Alignment::Center)
+            .push(block)
+            .push(
+                lucide::loader_circle::<iced::Theme, iced::Renderer>()
+                    .size(theme::TEXT_14)
+                    .color(theme::ACCENT),
+            )
+            .into()
+    } else {
+        block
+    }
 }
 
 /// Wrap a narration label in a hover tooltip revealing the full decoded
@@ -904,17 +916,24 @@ fn reasoning_tooltip<'a>(
 /// Compose the collapsed name-only line for a set of tool-call rounds: tool
 /// names with underscores replaced by spaces, in first-appearance order, each
 /// unique name suffixed with `xN` when it appears more than once within the
-/// collapsed set (e.g. `read file x2, list files`).
-fn collapsed_calls_line(rounds: &[Vec<RunningTool>]) -> String {
+/// collapsed set (e.g. `read file x2, list files`). An in-flight call
+/// (result not yet committed) gets its display name suffixed with a running
+/// marker (`…`) before the xN counting, so it never looks settled.
+fn collapsed_calls_line(rounds: &[Vec<ToolCallEntry>]) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
     for round in rounds {
         for call in round {
-            let name = call.name.replace('_', " ");
-            if !counts.contains_key(&name) {
-                order.push(name.clone());
+            let base = call.tool.name.replace('_', " ");
+            let display = if call.result.is_none() {
+                format!("{base} …")
+            } else {
+                base
+            };
+            if !counts.contains_key(&display) {
+                order.push(display.clone());
             }
-            *counts.entry(name).or_default() += 1;
+            *counts.entry(display).or_default() += 1;
         }
     }
     order
@@ -962,8 +981,34 @@ struct TraceGroup {
     /// the rounds carried none (a silent group then renders "clanking").
     reasoning: Option<String>,
     /// Tool-call rounds in first-appearance order; the LAST round is the newest
-    /// (expanded in the current group), earlier rounds collapse.
-    rounds: Vec<Vec<RunningTool>>,
+    /// (expanded in the current group), earlier rounds collapse. Each round
+    /// carries the full ledger tool-call entries (name/args pairs plus the
+    /// tool_call_id-matched result), so the display can distinguish an in-flight
+    /// call (result not yet committed) from a settled one.
+    rounds: Vec<Vec<ToolCallEntry>>,
+}
+
+/// A real user turn boundary in the ledger: a User message that is neither
+/// an injected tool-result-image message (content starting with
+/// [`crate::util::INJECTED_IMAGE_TAG`]) nor an empty resume signal (no/empty
+/// content). Only such a message starts a new user turn.
+fn is_user_turn_boundary(entry: &SessionEntry) -> bool {
+    matches!(entry, SessionEntry::Message { role: ChatRole::User, content, .. }
+    if content.as_deref().is_some_and(|c| {
+        !c.trim().is_empty() && !c.starts_with(crate::util::INJECTED_IMAGE_TAG)
+    }))
+}
+
+/// The slice of the ledger belonging to the CURRENT user turn: everything
+/// after the last real user turn boundary ([`is_user_turn_boundary`]). The
+/// running card shows only the current turn, so groups from previous turns
+/// never leak onto it. When no boundary exists the whole ledger is current.
+fn current_turn_entries(entries: &[SessionEntry]) -> &[SessionEntry] {
+    let start = entries
+        .iter()
+        .rposition(is_user_turn_boundary)
+        .map_or(0, |i| i + 1);
+    &entries[start..]
 }
 
 /// Project the shared session ledger into a running agent's trace groups, in
@@ -976,10 +1021,9 @@ struct TraceGroup {
 ///   group.
 /// - A real user turn closes the current group; the next tool-call round then
 ///   starts a fresh one even with no narration (its `narration` slots to
-///   "clanking").
-/// - Synthetic tool-injected user messages (content starting with the
-///   `crate::util::INJECTED_IMAGE_TAG` marker, `<injected-tool-result-image>`)
-///   are part of the ongoing tool sequence and never reset the group.
+///   "clanking"). An empty (whitespace) User message or a synthetic
+///   tool-injected one (content starting with the
+///   [`crate::util::INJECTED_IMAGE_TAG`] marker) is NOT a boundary.
 fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup> {
     let mut groups: Vec<TraceGroup> = Vec::new();
     let mut current: Option<TraceGroup> = None;
@@ -1008,25 +1052,15 @@ fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup> {
                 {
                     group.reasoning = Some(reasoning.clone());
                 }
-                group
-                    .rounds
-                    .push(calls.iter().map(|c| c.tool.clone()).collect());
+                group.rounds.push(calls.clone());
             }
-            SessionEntry::Message {
-                role: ChatRole::User,
-                content,
-                ..
-            } => {
-                let injected_image = content
-                    .as_deref()
-                    .is_some_and(|c| c.starts_with(crate::util::INJECTED_IMAGE_TAG));
-                if !injected_image {
-                    if let Some(group) = current.take() {
-                        groups.push(group);
-                    }
+            SessionEntry::Message { .. } => {
+                if is_user_turn_boundary(entry)
+                    && let Some(group) = current.take()
+                {
+                    groups.push(group);
                 }
             }
-            SessionEntry::Message { .. } => {}
         }
     }
     if let Some(group) = current.take() {
@@ -1093,7 +1127,7 @@ fn format_elapsed(started_at: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use crate::ChatMessage;
-    use crate::agent::registry::AgentHandle;
+    use crate::agent::registry::{AgentHandle, RunningTool};
     use crate::gui::session_view::build_ledger;
 
     fn agent_handle(
@@ -1114,7 +1148,6 @@ mod tests {
             started_at: Utc::now(),
             label: role.to_string(),
             generation: 0,
-            current_tools: Vec::new(),
             activity: None,
         }
     }
@@ -1672,6 +1705,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_user_message_is_not_a_turn_boundary() {
+        // An empty User message (resume signal) is NOT a real turn boundary:
+        // tool rounds on both sides still form ONE group.
+        let history = vec![
+            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
+            ChatMessage::user(""),
+            assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
+        ];
+        let groups = derive_trace_groups(&build_ledger(&history));
+        assert_eq!(groups.len(), 1, "empty user message is not a boundary");
+        assert_eq!(groups[0].rounds.len(), 2);
+    }
+
+    #[test]
     fn trace_group_reasoning_is_first_non_empty_round() {
         // Reasoning is captured from the first non-empty reasoning among the
         // group's rounds; rounds with no reasoning are skipped, and a group
@@ -1709,31 +1756,135 @@ mod tests {
         assert_eq!(groups[0].reasoning, None);
     }
 
+    /// Build a ledger tool-call entry for the collapsed/in-flight projection
+    /// tests: `result: None` marks the call in-flight.
+    fn entry(name: &str, args: serde_json::Value, result: Option<&str>) -> ToolCallEntry {
+        ToolCallEntry {
+            tool_call_id: String::new(),
+            tool: RunningTool::from_tool_call(&crate::ToolCall {
+                id: String::new(),
+                name: name.to_string(),
+                arguments: args,
+            }),
+            result: result.map(ToString::to_string),
+        }
+    }
+
     #[test]
     fn collapsed_calls_line_counts_and_orders() {
         let rounds = vec![
             vec![
-                RunningTool::from_tool_call(&crate::ToolCall {
-                    id: "1".into(),
-                    name: "read_file".into(),
-                    arguments: serde_json::json!({"path": "a.rs"}),
-                }),
-                RunningTool::from_tool_call(&crate::ToolCall {
-                    id: "2".into(),
-                    name: "list_files".into(),
-                    arguments: serde_json::json!({"path": "."}),
-                }),
+                entry("read_file", serde_json::json!({"path": "a.rs"}), Some("ok")),
+                entry("list_files", serde_json::json!({"path": "."}), Some("ok")),
             ],
-            vec![RunningTool::from_tool_call(&crate::ToolCall {
-                id: "3".into(),
-                name: "read_file".into(),
-                arguments: serde_json::json!({"path": "b.rs"}),
-            })],
+            vec![
+                entry("read_file", serde_json::json!({"path": "b.rs"}), Some("ok")),
+                entry("read_file", serde_json::json!({"path": "c.rs"}), None),
+            ],
         ];
         assert_eq!(
             collapsed_calls_line(&rounds),
-            "read file x2, list files",
-            "underscores become spaces; `xN` counts collapsed repetitions; first-appearance order"
+            "read file x2, list files, read file …",
+            "underscores become spaces; settled names stay exact, an in-flight call gets a running suffix; `xN` counts collapsed repetitions; first-appearance order"
+        );
+    }
+
+    #[test]
+    fn card_shows_only_current_turn_groups() {
+        // The card shows only the CURRENT user turn: the pre-turn group is gone.
+        let history = vec![
+            assistant_tool_call("First", &[("read", serde_json::json!({"path": "a.rs"}))]),
+            ChatMessage::user("ok now do it\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
+            assistant_tool_call("Second", &[("edit", serde_json::json!({"path": "b.rs"}))]),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(current_turn_entries(&ledger));
+        assert_eq!(groups.len(), 1, "only the post-turn group is shown");
+        assert_eq!(groups[0].narration, "Second");
+    }
+
+    #[test]
+    fn no_user_turn_shows_whole_history() {
+        let history = vec![
+            assistant_tool_call("A", &[("read", serde_json::json!({"path": "a.rs"}))]),
+            assistant_tool_call("B", &[("edit", serde_json::json!({"path": "b.rs"}))]),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(current_turn_entries(&ledger));
+        assert_eq!(groups.len(), 2, "no boundary → whole ledger is current");
+        assert_eq!(groups[0].narration, "A");
+        assert_eq!(groups[1].narration, "B");
+    }
+
+    #[test]
+    fn current_turn_without_tool_rounds_is_empty() {
+        let history = vec![
+            assistant_tool_call("A", &[("read", serde_json::json!({"path": "a.rs"}))]),
+            ChatMessage::user("stop now\n\n<timestamp>2026-01-01 00:00:00 (UTC)</timestamp>"),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(current_turn_entries(&ledger));
+        assert!(
+            groups.is_empty(),
+            "no tool rounds after the last user turn → empty (clanking placeholder)"
+        );
+    }
+
+    #[test]
+    fn injected_image_and_empty_user_do_not_start_a_turn() {
+        let history = vec![
+            assistant_tool_call("", &[("read", serde_json::json!({"path": "a.rs"}))]),
+            ChatMessage::user(crate::util::injected_image_user_message(
+                "data:image/png;base64,xxx",
+            )),
+            ChatMessage::user(""),
+            assistant_tool_call("", &[("edit", serde_json::json!({"path": "b.rs"}))]),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(current_turn_entries(&ledger));
+        assert_eq!(
+            groups.len(),
+            1,
+            "injected + empty user messages are not boundaries"
+        );
+        assert_eq!(groups[0].rounds.len(), 2);
+    }
+
+    #[test]
+    fn rounds_carry_results_for_in_flight_distinction() {
+        // One assistant tool-call round with two calls; a tool result arrives
+        // for only one of the two ids. After the ledger, one call is settled
+        // and the other in-flight — both preserved in the group's round.
+        let calls_json = serde_json::json!([
+            {"id": "call_a", "name": "read", "arguments": "{\"path\": \"a.rs\"}"},
+            {"id": "call_b", "name": "edit", "arguments": "{\"path\": \"b.rs\"}"},
+        ]);
+        let body = serde_json::json!({ "content": null, "tool_calls": calls_json });
+        let history = vec![
+            ChatMessage::assistant(body.to_string()),
+            ChatMessage::tool_result("call_a", "contents of a.rs"),
+        ];
+        let ledger = build_ledger(&history);
+        let groups = derive_trace_groups(&ledger);
+        assert_eq!(groups.len(), 1);
+        let round = &groups[0].rounds[0];
+        assert_eq!(round.len(), 2, "both calls preserved in the round");
+        let settled = round
+            .iter()
+            .find(|c| c.tool_call_id == "call_a")
+            .expect("call_a present");
+        assert_eq!(
+            settled.result.as_deref(),
+            Some("contents of a.rs"),
+            "matched tool result attaches to call_a"
+        );
+        let in_flight = round
+            .iter()
+            .find(|c| c.tool_call_id == "call_b")
+            .expect("call_b present");
+        assert_eq!(
+            in_flight.result, None,
+            "call_b has no result yet → in-flight"
         );
     }
 

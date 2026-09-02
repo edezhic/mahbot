@@ -1227,20 +1227,6 @@ impl Agent {
                 Self::failure_outcome(&tool_name, &tool_arguments, &reason)
             }
             Some(tool) => {
-                // Live-view instrumentation: register this tool as currently
-                // executing (purely observational — no cancellation semantics).
-                // Registered ONLY here, after the pre-flight cancellation check
-                // and after `find_tool` succeeded — unknown tools and
-                // pre-flight-cancelled calls never show a phantom tool. The
-                // guard removes the entry when execution completes (RAII).
-                // Parallel read-only tools each carry their own instance, so a
-                // single "current tool" slot is never a lie.
-                let _live_tool = crate::agent::registry::AGENT_REGISTRY.tool_started(
-                    &self.agent_id,
-                    self.generation,
-                    &tool_name,
-                    &tool_arguments,
-                );
                 let exec_result = tool.execute(&self.workspace, tool_arguments.clone()).await;
                 let duration = start.elapsed();
                 match exec_result {

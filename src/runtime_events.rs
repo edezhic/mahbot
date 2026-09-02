@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 /// A GUI-relevant in-memory runtime source changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeEvent {
-    /// Agent/non-agent registry lifecycle, live tool/activity instrumentation,
-    /// or live transcript content changed.
+    /// Agent/non-agent registry lifecycle, activity instrumentation, or live
+    /// transcript content changed.
     Registries,
     /// The voice pipeline status value changed.
     VoiceStatus,

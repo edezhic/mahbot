@@ -9,8 +9,8 @@
 //! no cancellation semantics and never affects call behavior, retries, or
 //! results.
 //!
-//! Every mutation that changes the live view (agent/call lifecycle, in-flight
-//! tool or activity instrumentation) publishes
+//! Every mutation that changes the live view (agent/call lifecycle, activity
+//! instrumentation) publishes
 //! [`RuntimeEvent::Registries`](crate::runtime_events::RuntimeEvent::Registries)
 //! so the GUI re-renders — see the per-method broadcast points below.
 
@@ -33,12 +33,6 @@ use tokio_util::sync::CancellationToken;
 /// the new entry, so `deregister` will not incorrectly remove the replacement.
 static NEXT_ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-/// Monotonically increasing tool-instance id for live tool instrumentation.
-/// Each tool execution inside an agent gets a unique id so parallel tools can
-/// coexist in [`AgentEntry::current_tools`] and each guard removes exactly its
-/// own entry.
-static NEXT_TOOL_ID: AtomicU64 = AtomicU64::new(1);
-
 /// Grouping key for the Running Agents live view: the DIRECT PARENT
 /// INVOCATION a running work item belongs to.
 ///
@@ -60,8 +54,9 @@ pub enum ParentKey {
     Research(String),
 }
 
-/// One tool currently executing inside a running agent — the live
-/// instrumentation shown on the Running Agents page.
+/// One tool transmitted in the running-agent ledger projection — the tool
+/// payload carried by the GUI's session ledger (see `session_view`) for the
+/// Running Agents page.
 ///
 /// `args` holds the tool's arguments as STRUCTURED key-value pairs with FULL,
 /// untruncated values, deliberately NOT credential-scrubbed: the Running
@@ -70,21 +65,22 @@ pub enum ParentKey {
 /// divergence — durable logs (tool-call stats) and failure feedback remain
 /// scrubbed.
 ///
-/// Pairs are derived from the JSON argument object at registration (keys in
-/// the object's iteration order): string values are taken verbatim, nested
-/// objects/arrays/scalars are compact-JSON-stringified. Non-object arguments
-/// (bare strings/arrays/null) collapse to a single `("args", …)` pair. The
-/// row view truncates values at display time; the hover tooltip shows
-/// everything untruncated.
-#[derive(Clone, Debug, Serialize)]
-pub struct RunningTool {
+/// Pairs are derived from the JSON argument object at flattening/decode time
+/// (keys in the object's iteration order): string values are taken verbatim,
+/// nested objects/arrays/scalars are compact-JSON-stringified. Non-object
+/// arguments (bare strings/arrays/null) collapse to a single `("args", …)`
+/// pair. The row view truncates values at display time; the hover tooltip
+/// shows everything untruncated.
+#[derive(Clone, Debug)]
+pub(crate) struct RunningTool {
     pub name: String,
     pub args: Vec<(String, String)>,
 }
 
 impl RunningTool {
-    /// Build a `RunningTool` from a decoded native-history tool call, using the
-    /// same full-unscrubbed argument flattening as the live tool registry.
+    /// Build a `RunningTool` from a decoded native-history tool call. This is
+    /// the flattening used by the GUI ledger projection (`session_view`):
+    /// full-unscrubbed argument pairs from the call's JSON arguments.
     pub(crate) fn from_tool_call(call: &crate::ToolCall) -> Self {
         Self {
             name: call.name.clone(),
@@ -121,10 +117,6 @@ pub struct AgentHandle {
     /// page to key expanded-state by (agent_id, generation) so a recycled
     /// agent_id never inherits a stale expansion.
     pub generation: u64,
-    /// Snapshot of the tools currently executing inside this agent, taken at
-    /// `list()` time. Empty when the agent is between tool executions (in an
-    /// LLM call, between rounds) — absence is honest.
-    pub current_tools: Vec<RunningTool>,
     /// Live activity indicator for non-tool LLM phases inside this agent
     /// (e.g. "extracting", "summarizing", "transcribing"), taken at `list()`
     /// time. `None` between phases — the agent's card is the single tracker
@@ -153,33 +145,12 @@ struct AgentEntry {
     /// agent's workspace is paused — a FREEZE distinct from a code-driven
     /// cancellation.
     pause_stop: Arc<AtomicBool>,
-    /// Live tool instrumentation for this agent (mutable across the agent's
-    /// lifetime; snapshot into [`AgentHandle::current_tools`] by `list()`).
-    /// Every access is already serialized by the outer
-    /// [`AgentRegistry::inner`] lock (tool_started/tool_finished/list all
-    /// hold it), so the Vec needs no further synchronization. Each entry
-    /// carries the unique tool instance id for exact removal.
-    current_tools: Vec<RunningToolEntry>,
     /// Live activity label (e.g. "extracting", "transcribing") for the
     /// non-tool LLM phase currently running inside this agent; `None` between
     /// phases. Single slot: an agent runs sequentially, so at most one
     /// activity can be live at a time. Snapshot into
     /// [`AgentHandle::activity`] by `list()`.
     activity: Option<String>,
-}
-
-/// Internal live-tool entry: the public tool fields plus the unique instance
-/// id used for exact removal by [`RunningToolGuard`].
-#[derive(Clone, Debug)]
-struct RunningToolEntry {
-    id: u64,
-    tool: RunningTool,
-}
-
-impl RunningToolEntry {
-    fn to_handle(&self) -> RunningTool {
-        self.tool.clone()
-    }
 }
 
 /// Flatten a tool's JSON arguments into structured key-value display pairs.
@@ -246,7 +217,6 @@ impl AgentRegistry {
             started_at: Utc::now(),
             label,
             generation,
-            current_tools: Vec::new(),
             activity: None,
         };
         let mut map = self.inner.lock().unwrap_poison();
@@ -262,67 +232,11 @@ impl AgentRegistry {
                 handle,
                 cancel_token,
                 pause_stop,
-                current_tools: Vec::new(),
                 activity: None,
             },
         );
         publish(RuntimeEvent::Registries);
         generation
-    }
-
-    /// Register a tool as currently executing inside a running agent.
-    ///
-    /// The returned guard removes the entry on drop (RAII — guaranteed
-    /// cleanup on completion AND on failure, including early returns and task
-    /// cancellation). Each tool execution gets a unique instance id, so
-    /// parallel read-only tools coexist in the entry's `current_tools` and
-    /// each guard removes exactly its own entry.
-    ///
-    /// Generation-safety: the entry is only mutated when `generation` matches
-    /// the current entry — a stale guard from a finished/restarted agent can
-    /// never mutate a different (replacement) agent's live card.
-    pub fn tool_started(
-        &self,
-        agent_id: &str,
-        generation: u64,
-        name: &str,
-        args: &serde_json::Value,
-    ) -> RunningToolGuard {
-        let tool_id = NEXT_TOOL_ID.fetch_add(1, Ordering::Relaxed);
-        let args = tool_arg_pairs(args);
-        {
-            let mut map = self.inner.lock().unwrap_poison();
-            if let Some(entry) = map.get_mut(agent_id)
-                && entry.generation == generation
-            {
-                entry.current_tools.push(RunningToolEntry {
-                    id: tool_id,
-                    tool: RunningTool {
-                        name: name.to_string(),
-                        args,
-                    },
-                });
-                publish(RuntimeEvent::Registries);
-            }
-        }
-        RunningToolGuard {
-            agent_id: agent_id.to_string(),
-            generation,
-            tool_id,
-        }
-    }
-
-    /// Remove a specific tool instance from the entry's live tools. No-op when
-    /// the agent is gone or the generation no longer matches (stale guard).
-    fn tool_finished(&self, agent_id: &str, generation: u64, tool_id: u64) {
-        let mut map = self.inner.lock().unwrap_poison();
-        if let Some(entry) = map.get_mut(agent_id)
-            && entry.generation == generation
-            && let Some(pos) = entry.current_tools.iter().position(|t| t.id == tool_id)
-        {
-            entry.current_tools.remove(pos);
-            publish(RuntimeEvent::Registries);
-        }
     }
 
     /// Register a live activity label on a running agent's card (e.g.
@@ -498,11 +412,6 @@ impl AgentRegistry {
             .map(|e| {
                 let mut handle = e.handle.clone();
                 handle.generation = e.generation;
-                handle.current_tools = e
-                    .current_tools
-                    .iter()
-                    .map(RunningToolEntry::to_handle)
-                    .collect();
                 handle.activity.clone_from(&e.activity);
                 handle
             })
@@ -539,24 +448,6 @@ impl AgentRegistry {
             map.remove(agent_id);
             publish(RuntimeEvent::Registries);
         }
-    }
-}
-
-/// RAII guard: removes its tool instance from the agent's live tools on drop.
-///
-/// Creation is generation-gated (the entry is only mutated when the agent's
-/// current generation matches); removal is generation-gated the same way — a
-/// stale guard from a finished/restarted agent can never remove a tool from
-/// the replacement agent's card.
-pub struct RunningToolGuard {
-    agent_id: String,
-    generation: u64,
-    tool_id: u64,
-}
-
-impl Drop for RunningToolGuard {
-    fn drop(&mut self) {
-        AGENT_REGISTRY.tool_finished(&self.agent_id, self.generation, self.tool_id);
     }
 }
 
@@ -760,82 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_started_shows_in_list_and_guard_removes_it() {
-        let agent_id = format!("tool_guard_{}", crate::generate_suffix());
-        let generation = register_test_agent(&agent_id, "/tmp/ws");
-        {
-            let guard = AGENT_REGISTRY.tool_started(
-                &agent_id,
-                generation,
-                "read",
-                &serde_json::json!({"path": "/tmp/ws/file.rs"}),
-            );
-            let handles = AGENT_REGISTRY.list();
-            let h = handles
-                .iter()
-                .find(|h| h.agent_id == agent_id)
-                .expect("agent registered");
-            assert_eq!(h.current_tools.len(), 1);
-            assert_eq!(h.current_tools[0].name, "read");
-            assert!(
-                h.current_tools[0]
-                    .args
-                    .iter()
-                    .any(|(k, v)| k == "path" && v == "/tmp/ws/file.rs")
-            );
-            drop(guard);
-        }
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("agent still registered");
-        assert!(
-            h.current_tools.is_empty(),
-            "guard drop must remove the tool entry"
-        );
-        AGENT_REGISTRY.deregister(&agent_id, generation);
-    }
-
-    #[test]
-    fn parallel_tools_coexist_and_remove_individually() {
-        let agent_id = format!("tool_par_{}", crate::generate_suffix());
-        let generation = register_test_agent(&agent_id, "/tmp/ws");
-        let guard_a = AGENT_REGISTRY.tool_started(
-            &agent_id,
-            generation,
-            "search",
-            &serde_json::json!({"query": "alpha"}),
-        );
-        let guard_b = AGENT_REGISTRY.tool_started(
-            &agent_id,
-            generation,
-            "read",
-            &serde_json::json!({"path": "/tmp/ws/b.rs"}),
-        );
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("agent registered");
-        assert_eq!(
-            h.current_tools.len(),
-            2,
-            "parallel tools must both be visible (honest representation)"
-        );
-        drop(guard_a);
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("agent registered");
-        assert_eq!(h.current_tools.len(), 1);
-        assert_eq!(h.current_tools[0].name, "read");
-        drop(guard_b);
-        AGENT_REGISTRY.deregister(&agent_id, generation);
-    }
-
-    #[test]
     fn activity_shows_in_list_and_guard_clears_it() {
         let agent_id = format!("activity_guard_{}", crate::generate_suffix());
         let generation = register_test_agent(&agent_id, "/tmp/ws");
@@ -892,72 +707,31 @@ mod tests {
     }
 
     #[test]
-    fn stale_guard_cannot_mutate_replacement_agent() {
-        let agent_id = format!("tool_stale_{}", crate::generate_suffix());
-        let generation = register_test_agent(&agent_id, "/tmp/ws");
-        // A tool starts, then the agent is deregistered (finished/restarted).
-        let stale_guard = AGENT_REGISTRY.tool_started(
-            &agent_id,
-            generation,
-            "shell",
-            &serde_json::json!({"command": "ls"}),
-        );
-        AGENT_REGISTRY.deregister(&agent_id, generation);
-        // Replacement registers with a NEW generation.
-        let new_gen = register_test_agent(&agent_id, "/tmp/ws");
-        // Stale guard drops — must NOT remove the replacement's tool.
-        drop(stale_guard);
-        let fresh_guard = AGENT_REGISTRY.tool_started(
-            &agent_id,
-            new_gen,
-            "read",
-            &serde_json::json!({"path": "/tmp/ws/new.rs"}),
-        );
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("replacement registered");
-        assert_eq!(
-            h.current_tools.len(),
-            1,
-            "stale guard must not mutate the replacement's card"
-        );
-        assert_eq!(h.current_tools[0].name, "read");
-        drop(fresh_guard);
-        AGENT_REGISTRY.deregister(&agent_id, new_gen);
-    }
-
-    #[test]
     fn tool_args_are_full_and_structured() {
-        let agent_id = format!("tool_full_{}", crate::generate_suffix());
-        let generation = register_test_agent(&agent_id, "/tmp/ws");
         let secret = format!("token-{}", crate::generate_suffix());
         let long_command = format!("echo {}", "a".repeat(1000));
         let args = serde_json::json!({
             "command": long_command,
             "api_key": secret,
         });
-        let guard = AGENT_REGISTRY.tool_started(&agent_id, generation, "shell", &args);
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("agent registered");
-        assert_eq!(h.current_tools.len(), 1);
-        let pairs = &h.current_tools[0].args;
+        let call = crate::ToolCall {
+            id: "1".to_string(),
+            name: "shell".to_string(),
+            arguments: args,
+        };
+        let tool = RunningTool::from_tool_call(&call);
         assert!(
-            pairs.iter().any(|(k, v)| k == "api_key" && v == &secret),
+            tool.args
+                .iter()
+                .any(|(k, v)| k == "api_key" && v == &secret),
             "live view shows full unscrubbed values (deliberate divergence from durable logs)"
         );
         assert!(
-            pairs
+            tool.args
                 .iter()
                 .any(|(k, v)| k == "command" && v == &long_command),
-            "values are not truncated at registration"
+            "values are not truncated at flattening"
         );
-        drop(guard);
-        AGENT_REGISTRY.deregister(&agent_id, generation);
     }
 
     #[test]
