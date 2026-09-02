@@ -678,6 +678,10 @@ impl BoardStore {
     /// schema changes are NOT run here — every schema change is an entry in the
     /// append-only catalog ([`crate::db::migrations`]) applied once by
     /// [`crate::db::open_consolidated_store`].
+    ///
+    /// After the FTS index is ensured, a boot-time detect+repair of corruption
+    /// localized to the title FTS index runs (fail-safe: it never fails the
+    /// boot — see [`crate::db::repair_ticket_title_fts_if_corrupt`]).
     pub(crate) async fn after_open(&self) -> anyhow::Result<()> {
         crate::db::ensure_fts_index(
             &self.conn,
@@ -686,6 +690,12 @@ impl BoardStore {
             TICKETS_FTS_INDEX_DDL,
         )
         .await?;
+        crate::db::repair_ticket_title_fts_if_corrupt(
+            &self.conn,
+            TICKETS_FTS_INDEX_NAME,
+            TICKETS_FTS_INDEX_DDL,
+        )
+        .await;
         Ok(())
     }
 

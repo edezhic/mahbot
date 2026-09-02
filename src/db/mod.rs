@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use turso::Builder;
 pub(crate) use turso::{IntoParams, Row, Value, params};
 
@@ -1329,6 +1329,260 @@ pub(crate) async fn ensure_fts_index(
     Ok(())
 }
 
+/// Probe term for the MATCH smoke probe — a plain alphanumeric token, valid
+/// for any ngram width; returns zero rows on an empty index but still proves
+/// the FTS index is queryable end-to-end.
+const FTS_PROBE_TERM: &str = "mahbot";
+
+/// True when a `quick_check` problem is attributable to the ticket-title FTS
+/// index: it either names the user-visible index or the internal FTS backing
+/// dir (the benign exact count-mismatch message is already filtered by
+/// `scan_integrity_rows`; any other internal-dir row is real corruption).
+/// core.db carries exactly one FTS index, so internal-dir rows cannot belong
+/// to anything else.
+fn names_ticket_title_fts(problem: &str, index: &str) -> bool {
+    problem.contains(index) || problem.contains(FTS_INTERNAL_INDEX_PREFIX)
+}
+
+/// True when the named index is a turso `USING fts` index (its sqlite_master
+/// DDL carries the index-method clause).
+async fn is_fts_index(conn: &Connection, index: &str) -> bool {
+    conn.query_optional(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (index.to_string(),),
+        |row| row.get::<String>(0),
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_some_and(|sql| sql.to_lowercase().contains("using fts"))
+}
+
+/// Functional MATCH probe for the ticket-title FTS index: any successful
+/// MATCH query proves the index is readable (the incident's corruption also
+/// failed plain MATCH queries while quick_check looked clean apart from
+/// masked rows). An Err is a detection signal, not a row-count assertion.
+async fn title_fts_match_probe(conn: &Connection) -> anyhow::Result<()> {
+    conn.query_optional(
+        "SELECT id FROM tickets WHERE title MATCH ?1 LIMIT 1",
+        params![FTS_PROBE_TERM.to_string()],
+        |_| Ok::<_, ::turso::Error>(()),
+    )
+    .await
+    .map(|_: Option<()>| ())
+}
+
+/// Boot-time corruption probe for the ticket-title FTS index. Returns
+/// `Some(evidence)` when the corruption signature is detected (quick_check
+/// problems attributable to the index, or a failing MATCH probe), `None`
+/// when healthy.
+async fn detect_ticket_title_fts_corruption(
+    conn: &Connection,
+    index: &str,
+) -> anyhow::Result<Option<String>> {
+    let problems = conn.quick_check_problems().await?;
+    let fts_problems: Vec<&str> = problems
+        .iter()
+        .map(String::as_str)
+        .filter(|p| names_ticket_title_fts(p, index))
+        .collect();
+    if !fts_problems.is_empty() {
+        return Ok(Some(fts_problems.join("; ")));
+    }
+    if let Err(e) = title_fts_match_probe(conn).await {
+        return Ok(Some(format!("MATCH probe failed: {e}")));
+    }
+    Ok(None)
+}
+
+/// Post-rebuild verification: filtered quick_check result, index presence in
+/// sqlite_master, and a MATCH smoke assertion against a token drawn from a
+/// sampled ticket title.
+async fn verify_rebuilt_ticket_title_fts(conn: &Connection, index: &str) -> anyhow::Result<()> {
+    let problems = conn.quick_check_problems().await?;
+    if !problems.is_empty() {
+        warn!(
+            index,
+            ?problems,
+            "ticket-title FTS post-rebuild quick_check still reports problems"
+        );
+    }
+    let present = conn
+        .query_optional(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![index.to_string()],
+            |_| Ok::<_, ::turso::Error>(()),
+        )
+        .await?;
+    anyhow::ensure!(
+        present.is_some(),
+        "rebuilt index '{index}' not found in sqlite_master"
+    );
+    // MATCH-smoke on a single whitespace-separated token (>= 3 chars,
+    // ngram-matchable) taken from a sampled title: a token drawn from a title
+    // must match its own row — robust against multi-token titles and titles
+    // whose sanitized form is too short to tokenize.
+    let titles: Vec<String> = conn
+        .query_map(
+            "SELECT title FROM tickets WHERE title IS NOT NULL AND title != '' LIMIT 16",
+            (),
+            |row| row.get::<String>(0),
+        )
+        .await?
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let Some((title, term)) = titles.iter().find_map(|title| {
+        let sanitized = sanitize_fts_query(title);
+        let term = sanitized.split(' ').find(|tok| tok.chars().count() >= 3)?;
+        Some((title.clone(), term.to_string()))
+    }) else {
+        debug!(
+            index,
+            "no ticket title with an ngram-matchable token — MATCH smoke skipped"
+        );
+        return Ok(());
+    };
+    let hit = conn
+        .query_optional(
+            "SELECT id FROM tickets WHERE title MATCH ?1 LIMIT 1",
+            params![term.clone()],
+            |_| Ok::<_, ::turso::Error>(()),
+        )
+        .await?;
+    anyhow::ensure!(
+        hit.is_some(),
+        "MATCH smoke failed: token '{term}' from title '{title}' not found via MATCH"
+    );
+    info!(
+        index,
+        title, "ticket-title FTS MATCH smoke assertion passed"
+    );
+    Ok(())
+}
+
+/// Rebuild the ticket-title FTS index from the KNOWN-GOOD DDL (threaded in by
+/// the caller), not from `sqlite_master` — the stored DDL of a corrupt index
+/// must not be trusted to be the right shape, and the known-good DDL is
+/// already threaded in. Mirrors `drop_create_index_fallback`'s transactional
+/// DROP+CREATE: a failed CREATE rolls the DROP back, leaving the original
+/// index for operator review; ticket rows are never touched. Then verify
+/// (filtered quick_check, index presence, MATCH smoke on a known title) and
+/// attempt a WAL checkpoint — successful checkpointing is the observable that
+/// the corruption is actually gone. All outcomes logged, never propagated
+/// (fail-safe).
+async fn rebuild_ticket_title_fts(conn: &Connection, index: &str, ddl: &str) {
+    let quoted = index.replace('"', "\"\"");
+    // Transactional DROP+CREATE: a failed CREATE rolls the DROP back via the
+    // dropped TxGuard, preserving the original index for operator review
+    // (same deferred-rollback discipline as `drop_create_index_fallback`).
+    let outcome = async {
+        let tx = conn.begin_tx().await?;
+        tx.execute_batch(&format!("DROP INDEX IF EXISTS \"{quoted}\"; {ddl};"))
+            .await?;
+        tx.commit().await
+    }
+    .await;
+    let verified = verify_rebuilt_ticket_title_fts(conn, index).await;
+    match (&outcome, &verified) {
+        (Ok(()), Ok(())) => {
+            info!(index, "ticket-title FTS index rebuilt and verified");
+        }
+        (outcome, verified) => {
+            warn!(
+                index,
+                repair_error = ?outcome.as_ref().err(),
+                verify_error = ?verified.as_ref().err(),
+                "ticket-title FTS rebuild finished with warnings — check earlier log lines"
+            );
+        }
+    }
+    match conn.checkpoint().await {
+        Ok(o) if o.is_complete() => {
+            info!(
+                index,
+                checkpointed_frames = o.checkpointed_frames,
+                "post-repair WAL checkpoint complete — corruption cleared"
+            );
+        }
+        Ok(o) => {
+            warn!(
+                index,
+                busy = o.busy,
+                log_frames = o.log_frames,
+                checkpointed_frames = o.checkpointed_frames,
+                "post-repair WAL checkpoint incomplete"
+            );
+        }
+        Err(e) => {
+            warn!(
+                index,
+                error = %e,
+                "post-repair WAL checkpoint failed"
+            );
+        }
+    }
+}
+
+/// Boot-time detection + repair of corruption localized to the ticket-title
+/// FTS index (incident: recurring "FTS Drop: transaction already committed" /
+/// "non-index page" panics and a WAL that never checkpoints). Runs from
+/// `BoardStore::after_open` on the consolidated connection, after
+/// `ensure_fts_index` and after the class-B open repair (which now vetoes
+/// FTS-shaped indexes and delegates here). Idempotent; ticket rows untouched.
+///
+/// Fail-safe: detection and rebuild are separate `catch_unwind` boundaries
+/// (a panicking turso op re-enters the caller via `run_detached`'s
+/// `resume_unwind`). A panicking probe is itself corruption evidence — the
+/// rebuild is still attempted; a panicking rebuild is logged loudly and boot
+/// continues. The daemon must never crash-loop over this path, and detection
+/// must never be silently skipped.
+pub(crate) async fn repair_ticket_title_fts_if_corrupt(conn: &Connection, index: &str, ddl: &str) {
+    let detected = AssertUnwindSafe(detect_ticket_title_fts_corruption(conn, index))
+        .catch_unwind()
+        .await;
+    let evidence = match detected {
+        Ok(Ok(evidence)) => evidence,
+        Ok(Err(e)) => {
+            error!(
+                index,
+                error = %e,
+                "ticket-title FTS boot probe failed — boot continues; index left as-is for operator review"
+            );
+            return;
+        }
+        Err(panic) => {
+            warn!(
+                index,
+                panic = %crate::util::panic_message(&panic),
+                "ticket-title FTS boot probe panicked — treating as corruption evidence, attempting the rebuild"
+            );
+            Some("detection probe panicked".to_string())
+        }
+    };
+    let Some(evidence) = evidence else {
+        info!(
+            index,
+            "ticket-title FTS boot probe: index healthy — no repair"
+        );
+        return;
+    };
+    warn!(
+        index,
+        evidence = %evidence,
+        "ticket-title FTS corruption signature detected at boot — rebuilding the index (ticket rows untouched)"
+    );
+    let rebuilt = AssertUnwindSafe(rebuild_ticket_title_fts(conn, index, ddl))
+        .catch_unwind()
+        .await;
+    if let Err(panic) = rebuilt {
+        error!(
+            index,
+            panic = %crate::util::panic_message(&panic),
+            "ticket-title FTS boot repair panicked — boot continues; index left as-is for operator review"
+        );
+    }
+}
+
 // Any schema creation, change, or removal is an entry in the append-only
 // catalog (see [`crate::db::migrations`]); the only tracking mechanism is the
 // id-based applied check in [`crate::db::migrations::run_migrations`].
@@ -1886,6 +2140,18 @@ async fn repair_btree_index_if_desynced(
                 crate::boot::boot_diagnostic(format!(
                     "store '{name}' quick_check flagged the known FTS false positive — \
                      not repairing",
+                ));
+                return Ok((RepairOutcome::NoRepair, conn));
+            }
+            // FTS indexes are never rebuilt in place here: REINDEX/DROP+CREATE on
+            // the FTS backing dir is the documented "FTS Drop" panic class, and
+            // the dedicated boot repair (`repair_ticket_title_fts_if_corrupt`, run
+            // from BoardStore::after_open) owns FTS rebuilds. Leave the desync
+            // reported.
+            if is_fts_index(&conn, &index).await {
+                crate::boot::boot_diagnostic(format!(
+                    "store '{name}' quick_check flagged FTS index '{index}' — in-place repair \
+                     out of scope; the after_open FTS repair owns its rebuild",
                 ));
                 return Ok((RepairOutcome::NoRepair, conn));
             }
@@ -3892,5 +4158,224 @@ mod tests {
             matches!(&err, turso::Error::Error(msg) if msg == "Disk I/O error"),
             "the original non-lock error must be returned"
         );
+    }
+
+    // ── ticket-title FTS boot repair tests ─────────────────────────────
+
+    /// Insert a minimal ticket row whose title is FTS-indexed (the
+    /// `CREATE INDEX ... USING fts` index is auto-maintained).
+    async fn insert_fts_ticket(conn: &Connection, id: &str, title: &str) {
+        conn.execute(
+            "INSERT INTO tickets (id, title, description, workspace_name, created_at, updated_at) \
+             VALUES (?1, ?2, 'desc', 'ws', ?3, ?3)",
+            params![id.to_string(), title.to_string(), now()],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Classification of quick_check problems as attributable to the
+    /// ticket-title FTS index (user-visible index name or the internal FTS dir).
+    #[test]
+    fn names_ticket_title_fts_classification() {
+        let index = "idx_tickets_title_fts";
+        assert!(names_ticket_title_fts(
+            "wrong # of entries in index idx_tickets_title_fts",
+            index
+        ));
+        assert!(names_ticket_title_fts(
+            "row 5 missing from index __turso_internal_fts_dir_3_key",
+            index
+        ));
+        // Already filtered upstream by scan_integrity_rows (exact count
+        // mismatch), but the predicate still classifies it as FTS-attributable.
+        assert!(names_ticket_title_fts(
+            "wrong # of entries in index __turso_internal_fts_dir_3_key",
+            index
+        ));
+        assert!(!names_ticket_title_fts(
+            "wrong # of entries in index idx_sessions_created",
+            index
+        ));
+        assert!(!names_ticket_title_fts(
+            "cell_index_read_payload_ptr called on non-index page",
+            index
+        ));
+    }
+
+    /// `is_fts_index` recognizes the turso `USING fts` index-method clause
+    /// and rejects plain btree indexes and unknown names.
+    #[tokio::test]
+    async fn is_fts_index_classifies_index_method() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let conn = open_with_schema(
+            &db_path,
+            "CREATE TABLE IF NOT EXISTS ft (title TEXT NOT NULL); \
+             CREATE INDEX IF NOT EXISTS idx_ft_fts ON ft USING fts (title) \
+             WITH (tokenizer = 'ngram'); \
+             CREATE TABLE IF NOT EXISTS t (x INTEGER); \
+             CREATE INDEX IF NOT EXISTS idx_plain ON t(x);",
+        )
+        .await
+        .unwrap();
+        assert!(is_fts_index(&conn, "idx_ft_fts").await);
+        assert!(!is_fts_index(&conn, "idx_plain").await);
+        assert!(!is_fts_index(&conn, "does_not_exist").await);
+    }
+
+    /// A healthy FTS index (with content) is a clean no-op: the corruption
+    /// probe reports no evidence.
+    #[tokio::test]
+    async fn detect_healthy_title_fts_is_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = open_consolidated_store(tmp.path()).await.unwrap();
+        insert_fts_ticket(&conn, "t-1", "Important bug fix").await;
+        let evidence = detect_ticket_title_fts_corruption(&conn, "idx_tickets_title_fts")
+            .await
+            .unwrap();
+        assert!(
+            evidence.is_none(),
+            "healthy FTS index must not report corruption: {evidence:?}"
+        );
+    }
+
+    /// The post-detection repair rebuilds the FTS index without touching ticket
+    /// rows, verifies the rebuilt index, and leaves a healthy, idempotent store.
+    #[tokio::test]
+    async fn rebuild_ticket_title_fts_repairs_and_verifies() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = open_consolidated_store(tmp.path()).await.unwrap();
+        insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
+        insert_fts_ticket(&conn, "t-2", "Another relevant thing").await;
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tickets", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(before, 2);
+
+        // Simulate the post-detection repair (real pager-level corruption
+        // cannot be fabricated deterministically).
+        rebuild_ticket_title_fts(
+            &conn,
+            "idx_tickets_title_fts",
+            "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
+             USING fts (title) WITH (tokenizer = 'ngram')",
+        )
+        .await;
+
+        // Idempotent re-run safety: healthy again after the rebuild.
+        let evidence = detect_ticket_title_fts_corruption(&conn, "idx_tickets_title_fts")
+            .await
+            .unwrap();
+        assert!(
+            evidence.is_none(),
+            "rebuilt FTS index must be healthy: {evidence:?}"
+        );
+
+        // MATCH smoke on the known title returns that ticket.
+        let sanitized = sanitize_fts_query("Important bug fix one");
+        let matched: String = conn
+            .query_row(
+                "SELECT id FROM tickets WHERE title MATCH ?1 LIMIT 1",
+                params![sanitized],
+                |r| r.get::<String>(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(matched, "t-1");
+
+        // Ticket rows untouched by the FTS rebuild.
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tickets", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(after, 2, "ticket rows must be untouched by the FTS rebuild");
+
+        // Index present in sqlite_master.
+        let present = conn
+            .query_optional(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                params!["idx_tickets_title_fts".to_string()],
+                |_| Ok::<_, ::turso::Error>(()),
+            )
+            .await
+            .unwrap();
+        assert!(present.is_some());
+    }
+
+    /// End-to-end: a store whose title FTS index no longer serves MATCH is
+    /// detected by the boot probe and actually repaired — the index is rebuilt
+    /// FTS-shaped from the known DDL, MATCH works again, ticket rows survive,
+    /// and a re-run of the probe is clean (idempotent). Real pager-level
+    /// corruption of an FTS-shaped index cannot be fabricated deterministically;
+    /// substituting a same-named plain btree index is the closest deterministic
+    /// stand-in for "MATCH unusable" (in a real boot, ensure_fts_index would fix
+    /// this exact shape first — the repair path is exercised directly here).
+    #[tokio::test]
+    async fn broken_title_fts_store_is_detected_and_repaired_end_to_end() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = open_consolidated_store(tmp.path()).await.unwrap();
+        insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
+
+        // Break it: replace the FTS index with a same-named plain btree.
+        conn.execute_batch(
+            "DROP INDEX idx_tickets_title_fts; \
+             CREATE INDEX idx_tickets_title_fts ON tickets(title);",
+        )
+        .await
+        .unwrap();
+        assert!(!is_fts_index(&conn, "idx_tickets_title_fts").await);
+
+        // Full boot entry: detection must fire and the repair must rebuild.
+        repair_ticket_title_fts_if_corrupt(
+            &conn,
+            "idx_tickets_title_fts",
+            "CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets \
+             USING fts (title) WITH (tokenizer = 'ngram')",
+        )
+        .await;
+
+        // Index is FTS-shaped again and MATCH finds the known ticket.
+        assert!(is_fts_index(&conn, "idx_tickets_title_fts").await);
+        let matched: String = conn
+            .query_row(
+                "SELECT id FROM tickets WHERE title MATCH ?1 LIMIT 1",
+                params![sanitize_fts_query("Important bug fix one")],
+                |r| r.get::<String>(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(matched, "t-1");
+
+        // Probe is clean afterwards (idempotent re-run safety) and rows survived.
+        assert!(
+            detect_ticket_title_fts_corruption(&conn, "idx_tickets_title_fts")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tickets", (), |r| r.get::<i64>(0))
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The functional MATCH probe succeeds on a healthy store both with an
+    /// empty index and with populated content.
+    #[tokio::test]
+    async fn title_fts_match_probe_ok_on_healthy_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = open_consolidated_store(tmp.path()).await.unwrap();
+        title_fts_match_probe(&conn)
+            .await
+            .expect("probe must pass on an empty FTS index");
+
+        insert_fts_ticket(&conn, "t-1", "Important bug fix").await;
+        title_fts_match_probe(&conn)
+            .await
+            .expect("probe must pass on a healthy populated FTS index");
     }
 }
