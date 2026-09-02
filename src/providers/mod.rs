@@ -40,7 +40,6 @@ pub(crate) fn test_request(
 }
 
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 
 pub(crate) use crate::providers::transcribe::{MediaTranscriber, transcribe_video_file};
 
@@ -307,19 +306,14 @@ pub(crate) fn media_transcriber() -> Option<MediaTranscriber> {
 /// Single-attempt scoped chat for the outer retry loops (see [`crate::retry`]).
 ///
 /// Suppresses provider-internal retries (the outer loop is the single retry
-/// authority), applies idle-timeout semantics, and bounds the attempt by the
-/// remaining operation deadline. See [`Provider::chat_scoped`].
-pub(crate) async fn chat_scoped(
-    request: ChatRequest,
-    idle_timeout: std::time::Duration,
-    deadline: Instant,
-) -> Result<ChatResponse, ScopedCallError> {
+/// authority) and applies idle-timeout semantics. See [`Provider::chat_scoped`].
+pub(crate) async fn chat_scoped(request: ChatRequest) -> Result<ChatResponse, ScopedCallError> {
     let provider = PROVIDER
         .read()
         .unwrap_poison()
         .clone()
         .expect("PROVIDER not initialized");
-    provider.chat_scoped(request, idle_timeout, deadline).await
+    provider.chat_scoped(request).await
 }
 
 /// Swap the global provider for tests, returning the previous value so the

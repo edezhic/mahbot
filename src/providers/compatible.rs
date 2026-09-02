@@ -19,7 +19,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 pub(crate) struct OpenAiCompatibleProvider {
@@ -27,30 +27,33 @@ pub(crate) struct OpenAiCompatibleProvider {
     base_url: String,
     credential: Option<String>,
 
-    /// HTTP request timeout in seconds for LLM API calls. Default: 120.
-    timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
-    /// Cached HTTP client with connection reuse across all API calls.
-    /// Initialized lazily on first `http_client()` call.
-    http_client: OnceLock<Client>,
-    /// Cached HTTP client for scoped calls: NO total request
-    /// timeout — per-attempt total is enforced by the scoped caller against
-    /// the remaining operation budget, and idle timeouts reset while data
-    /// flows. Initialized lazily on first `http_client_scoped()` call.
+    /// Cached warmup HTTP client (bounded total timeout — see
+    /// [`Self::warmup_client`]).
+    /// Initialized lazily on first `warmup_client()` call.
+    warmup_http_client: OnceLock<Client>,
+    /// Cached HTTP client for scoped calls: NO total request timeout — the
+    /// 600 s idle timeout is the only bound; it resets while data flows.
+    /// Initialized lazily on first `http_client_scoped()` call.
     http_client_scoped: OnceLock<Client>,
 }
 
 impl OpenAiCompatibleProvider {
+    /// Total timeout for the warmup request ONLY. Chat requests have NO total
+    /// timeout — the 600 s idle timeout (crate::retry::DEFAULT_IDLE_TIMEOUT)
+    /// is their only bound; this constant exists so a warmup against an
+    /// unreachable endpoint cannot hang the warmup indefinitely.
+    const WARMUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+
     #[must_use]
     pub fn new(name: &str, base_url: &str, credential: Option<&str>) -> Self {
         Self {
             name: name.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
-            timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
-            http_client: OnceLock::new(),
+            warmup_http_client: OnceLock::new(),
             http_client_scoped: OnceLock::new(),
         }
     }
@@ -67,11 +70,11 @@ impl OpenAiCompatibleProvider {
 
     /// Build the shared HTTP client with the given total request timeout.
     ///
-    /// `Some(timeout)` yields the default client (120 s total request
-    /// timeout); `None` yields the scoped client (no total timeout — the
-    /// scoped call paths enforce their own per-attempt deadline and idle
-    /// timeout). Connection pool, connect timeout, and extra headers are
-    /// identical in both.
+    /// `Some(timeout)` yields the warmup client (bounded total timeout — see
+    /// [`Self::WARMUP_TOTAL_TIMEOUT`]); `None` yields the scoped client (no
+    /// total request timeout — the 600 s idle timeout is the only bound).
+    /// Connection pool, connect timeout, and extra headers are identical in
+    /// both.
     fn build_client(&self, timeout: Option<Duration>) -> Client {
         crate::util::http::install_ring_provider();
         let mut builder = Client::builder().connect_timeout(Duration::from_secs(10));
@@ -102,14 +105,18 @@ impl OpenAiCompatibleProvider {
             .expect("Failed to build HTTP client — check TLS/network configuration")
     }
 
-    pub(crate) fn http_client(&self) -> &Client {
-        self.http_client
-            .get_or_init(|| self.build_client(Some(Duration::from_secs(self.timeout_secs))))
+    /// Warmup HTTP client: same connection pool and headers as the scoped
+    /// client but with a bounded total timeout ([`Self::WARMUP_TOTAL_TIMEOUT`])
+    /// so a warmup against an unreachable endpoint cannot hang indefinitely.
+    pub(crate) fn warmup_client(&self) -> &Client {
+        self.warmup_http_client
+            .get_or_init(|| self.build_client(Some(Self::WARMUP_TOTAL_TIMEOUT)))
     }
 
     /// Scoped HTTP client: same connection pool and headers as
-    /// [`Self::http_client`] but WITHOUT the total request timeout. The scoped
-    /// call paths enforce their own per-attempt deadline and idle timeout.
+    /// [`Self::warmup_client`] but WITHOUT the total request timeout. Scoped
+    /// call paths rely on the 600 s idle timeout ([`crate::retry::DEFAULT_IDLE_TIMEOUT`]),
+    /// which resets while data flows.
     pub(crate) fn http_client_scoped(&self) -> &Client {
         self.http_client_scoped
             .get_or_init(|| self.build_client(None))
@@ -968,49 +975,23 @@ enum BodyReadOutcome {
 }
 
 /// Read a response body chunk-by-chunk with an idle timeout that resets while
-/// data flows, also bounding the whole read by `deadline`.
+/// data flows.
 ///
 /// `idle_timeout` guards against a stalled connection mid-body — the
 /// truncation signature this hardening targets. The read is shutdown-abortable
 /// via [`crate::shutdown::race_shutdown`].
 ///
-/// Every chunk wait is bounded by `min(idle_timeout, remaining_budget)`, so a
-/// stalled chunk can never overshoot the operation deadline by more than the
-/// scheduling latency between the timeout firing and the next check — the
-/// wall-clock cap holds precisely for the body-read phase, not just the send
-/// phase. When the tighter bound was the wall budget, the failure classifies
-/// as [`FailureClass::WallClockExceeded`] rather than a truncation idle
-/// timeout.
-async fn read_body_idle(
-    response: reqwest::Response,
-    idle_timeout: Duration,
-    deadline: Instant,
-) -> BodyReadOutcome {
+/// Every chunk wait is bounded by `idle_timeout`. A stalled chunk classifies as
+/// [`FailureClass::TruncatedEnvelope`] (retryable) — there is no total request
+/// timeout, so a body that keeps delivering bytes is never cut.
+async fn read_body_idle(response: reqwest::Response, idle_timeout: Duration) -> BodyReadOutcome {
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return BodyReadOutcome::Failed {
-                partial: body,
-                message: "response body read exceeded remaining operation budget".to_string(),
-                class: FailureClass::WallClockExceeded,
-            };
-        }
-        let wait_bound = idle_timeout.min(remaining);
+        let wait_bound = idle_timeout;
         let next_chunk = crate::shutdown::race_shutdown(stream.next());
         let chunk = match tokio::time::timeout(wait_bound, next_chunk).await {
             Err(_) => {
-                if Instant::now() >= deadline {
-                    // The tighter bound was the wall budget — classify as such,
-                    // not as an idle timeout.
-                    return BodyReadOutcome::Failed {
-                        partial: body,
-                        message: "response body read exceeded remaining operation budget"
-                            .to_string(),
-                        class: FailureClass::WallClockExceeded,
-                    };
-                }
                 return BodyReadOutcome::Failed {
                     partial: body,
                     message: format!(
@@ -1069,51 +1050,40 @@ impl Provider for OpenAiCompatibleProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         // Hit the chat completions URL with a GET to establish the connection pool.
         // The server will likely return 405 Method Not Allowed, which is fine -
-        // the goal is TLS handshake and HTTP/2 negotiation.
+        // the goal is TLS handshake and HTTP/2 negotiation. The warmup client
+        // carries a bounded total timeout ([`Self::WARMUP_TOTAL_TIMEOUT`]) so
+        // an unreachable endpoint cannot hang the warmup indefinitely.
         let url = ensure_chat_completions_url(&self.base_url);
-        let builder = self.http_client().get(&url);
+        let builder = self.warmup_client().get(&url);
         let _ = self.attach_auth_header(builder).send().await?;
         Ok(())
     }
 
     /// Scoped single-attempt chat: one HTTP request, no
-    /// provider-internal retries, idle-timeout body reads, per-attempt total
-    /// bounded by the remaining operation deadline.
+    /// provider-internal retries, idle-timeout body reads; no total request
+    /// timeout — the 600 s idle timeout ([`crate::retry::DEFAULT_IDLE_TIMEOUT`])
+    /// is the only stall bound.
     async fn chat_scoped(
         &self,
         request: ProviderChatRequest,
-        idle_timeout: Duration,
-        deadline: Instant,
     ) -> Result<ProviderChatResponse, ScopedCallError> {
         let req_builder = self.build_http_request_with_client(self.http_client_scoped(), &request);
         let model = request.model;
+        let idle_timeout = crate::retry::DEFAULT_IDLE_TIMEOUT;
 
-        // ── Send — bounded by the idle timeout (TTFB) AND the remaining budget ──
-        // A pre-header server stall must not consume the whole operation
-        // budget on attempt 1 (burst-shaped recovery needs later attempts), so
-        // the header wait is capped by `idle_timeout`; the remaining wall
-        // budget remains the outer bound.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let send_timeout = idle_timeout.min(remaining);
+        // ── Send — bounded by the idle timeout (TTFB) ──
+        // A pre-header server stall must not consume an unbounded amount of
+        // the retry budget on attempt 1 (burst-shaped recovery needs later
+        // attempts), so the header wait is capped by `idle_timeout`.
         let send_fut = crate::shutdown::race_shutdown(req_builder.send());
-        let response = match tokio::time::timeout(send_timeout, send_fut).await {
+        let response = match tokio::time::timeout(idle_timeout, send_fut).await {
             Err(_) => {
-                let budget_expired = remaining <= idle_timeout;
-                let err = if budget_expired {
-                    anyhow::anyhow!("{} request exceeded remaining operation budget", self.name)
-                } else {
-                    anyhow::anyhow!(
-                        "{} request timed out waiting for response headers \
-                         (idle timeout {idle_timeout:?})",
-                        self.name
-                    )
-                };
-                let class = if budget_expired {
-                    FailureClass::WallClockExceeded
-                } else {
-                    FailureClass::Transport
-                };
-                return Err(scoped_simple_error(err, class));
+                let err = anyhow::anyhow!(
+                    "{} request timed out waiting for response headers \
+                     (idle timeout {idle_timeout:?})",
+                    self.name
+                );
+                return Err(scoped_simple_error(err, FailureClass::Transport));
             }
             Ok(Err(_)) => {
                 let err = anyhow::anyhow!("shutdown during request");
@@ -1130,19 +1100,18 @@ impl Provider for OpenAiCompatibleProvider {
         let content_length = response.content_length();
 
         if !response.status().is_success() {
-            return Err(scoped_http_error(self, response, idle_timeout, deadline).await);
+            return Err(scoped_http_error(self, response, idle_timeout).await);
         }
 
         // ── Read body with idle timeout ──
-        let (body_bytes, read_failure) =
-            match read_body_idle(response, idle_timeout, deadline).await {
-                BodyReadOutcome::Complete(bytes) => (bytes, None),
-                BodyReadOutcome::Failed {
-                    partial,
-                    message,
-                    class,
-                } => (partial, Some((message, class))),
-            };
+        let (body_bytes, read_failure) = match read_body_idle(response, idle_timeout).await {
+            BodyReadOutcome::Complete(bytes) => (bytes, None),
+            BodyReadOutcome::Failed {
+                partial,
+                message,
+                class,
+            } => (partial, Some((message, class))),
+        };
         let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
         let actual_len = body_bytes.len();
 
@@ -1198,17 +1167,16 @@ fn scoped_metadata_error(
 /// Build a [`ScopedCallError`] from an HTTP error response (non-2xx).
 ///
 /// Reads the error body with idle-timeout semantics so a stalled error-body
-/// read cannot hang past the operation deadline, and classifies via the
-/// provider error classifier.
+/// read cannot hang the call, and classifies via the provider error
+/// classifier.
 async fn scoped_http_error(
     provider: &OpenAiCompatibleProvider,
     response: reqwest::Response,
     idle_timeout: Duration,
-    deadline: Instant,
 ) -> ScopedCallError {
     let status = response.status().as_u16();
     let retry_after_ms = retry_after_header(response.headers());
-    let (body_bytes, message) = match read_body_idle(response, idle_timeout, deadline).await {
+    let (body_bytes, message) = match read_body_idle(response, idle_timeout).await {
         BodyReadOutcome::Complete(bytes) => (bytes, None),
         BodyReadOutcome::Failed {
             partial, message, ..
@@ -1258,13 +1226,8 @@ mod tests {
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
         let p = OpenAiCompatibleProvider::new("Local", "http://127.0.0.1:1", None);
-        let policy = crate::retry::RetryPolicy::default();
         let result = p
-            .chat_scoped(
-                test_request(vec![ChatMessage::user("hello")], None),
-                policy.idle_timeout,
-                std::time::Instant::now() + policy.operation_timeout,
-            )
+            .chat_scoped(test_request(vec![ChatMessage::user("hello")], None))
             .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();

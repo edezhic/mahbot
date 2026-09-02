@@ -295,8 +295,6 @@ impl crate::Provider for FakeProvider {
     async fn chat_scoped(
         &self,
         request: crate::ChatRequest,
-        _idle_timeout: std::time::Duration,
-        _deadline: std::time::Instant,
     ) -> Result<crate::ChatResponse, crate::providers::ScopedCallError> {
         self.request_fingerprints
             .lock()

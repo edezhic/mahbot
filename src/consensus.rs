@@ -734,9 +734,8 @@ fn append_repair_instructions(
 /// Validation and parse rejections consume a round immediately (no backoff);
 /// transport failures keep the synthesis backoff schedule (indexed by the
 /// transport-failure count, not the round number, so a validation-rejected
-/// round never advances the backoff slot). The 600 s operation cap stays
-/// binding (the synthesis policy hardcodes a 10-minute `operation_timeout`,
-/// independent of the general hardcoded `DEFAULT_OPERATION_TIMEOUT`).
+/// round never advances the backoff slot). The synthesis schedule is bounded
+/// by attempts (3 total calls), not wall time.
 ///
 /// A round-1 parse failure permanently converts the run to the repair-delta
 /// schema — the model never gets a chance to emit a corrected full output.
@@ -791,20 +790,11 @@ pub(crate) async fn run_grouping_repair(
     let mut transport_failures: u32 = 0;
 
     for round in 1..=policy.max_attempts {
-        if loop_state.expired() {
-            break;
-        }
         if round > 1 {
             append_repair_instructions(&mut request, round, &state, &rejections, prev_round);
         }
         let attempt_started = Instant::now();
-        let resp = match crate::providers::chat_scoped(
-            request.clone(),
-            policy.idle_timeout,
-            loop_state.deadline(),
-        )
-        .await
-        {
+        let resp = match crate::providers::chat_scoped(request.clone()).await {
             Ok(resp) => resp,
             Err(err) => {
                 let non_retryable = !err.class.is_retryable();
@@ -936,9 +926,9 @@ pub(crate) async fn run_grouping_repair(
             "Grouping synthesis exhausted — writing deterministic fail-open output",
         );
         // A Fallback with an empty failure trail (e.g. a summary-only round at
-        // max_attempts=1, or a deadline hit before any attempt) would be
-        // classified `transport`/`retry_attempts=0` — spurious. Record the
-        // real cause so the operation-level row reflects what happened.
+        // max_attempts=1) would be classified `transport`/`retry_attempts=0`
+        // — spurious. Record the real cause so the operation-level row
+        // reflects what happened.
         if !loop_state.has_failures() {
             let detail = if state.summary.is_some() {
                 "operation exhausted after accepting only a summary — no groups ever frozen"

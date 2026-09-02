@@ -1450,8 +1450,9 @@ impl Agent {
     /// never reach the user.
     ///
     /// Bounded by [`crate::retry::RetryPolicy::continuation`] (3 attempts,
-    /// 90 s wall clock), checked against [`crate::shutdown::aborting`], the
-    /// agent's cancel token, and the deadline between attempts. Each attempt
+    /// no wall-clock cap — the 600 s idle timeout is the only bound),
+    /// checked against [`crate::shutdown::aborting`] and the agent's cancel
+    /// token between attempts. Each attempt
     /// is a single [`crate::providers::chat_scoped`] call; retryable provider
     /// errors re-send the same bytes, non-retryable errors break immediately
     /// (a payload-rejecting 400 never burns the budget).
@@ -1469,8 +1470,7 @@ impl Agent {
     /// Exhaustion returns a [`crate::retry::RetryExhausted`] with
     /// `last_raw: None` and a final class derived from the last recorded
     /// failure ([`FailureClass::NoResponse`] for a pure thinking-only
-    /// exhaustion, [`FailureClass::Shutdown`] when the global abort fired,
-    /// [`FailureClass::WallClockExceeded`] when the budget ran out) — the
+    /// exhaustion, [`FailureClass::Shutdown`] when the global abort fired) — the
     /// thinking text is never embedded in the error, so failure
     /// comments/logs cannot leak it, and it is not misclassified as LLM
     /// provider retry exhaustion (no
@@ -1482,7 +1482,6 @@ impl Agent {
         purpose: &'static str,
     ) -> Result<ChatResponse, crate::retry::RetryExhausted> {
         let policy = crate::retry::RetryPolicy::continuation();
-        let deadline = Instant::now() + policy.operation_timeout;
         let operation_started = Instant::now();
         let nudge = crate::prompt::load_prompt("resume_unfinished_turn.md")
             .trim()
@@ -1521,14 +1520,6 @@ impl Agent {
             if self.cancel_token.is_cancelled() {
                 break;
             }
-            if Instant::now() >= deadline {
-                failures.push(crate::retry::RetryFailureRecord::new_simple(
-                    crate::retry::FailureClass::WallClockExceeded,
-                    &anyhow::anyhow!("continuation wall-clock budget exceeded"),
-                    None,
-                ));
-                break;
-            }
 
             let request = if tail_grew {
                 tail_grew = false;
@@ -1543,9 +1534,7 @@ impl Agent {
                     .expect("the first iteration always builds a request")
             };
 
-            match crate::providers::chat_scoped(request.clone(), policy.idle_timeout, deadline)
-                .await
-            {
+            match crate::providers::chat_scoped(request.clone()).await {
                 // Still thinking with no answer — record the attempt (with its
                 // finish_reason, so the terminal failure row keeps it), append
                 // the NEW reasoning as the next tail pair, and continue.
@@ -3845,7 +3834,7 @@ mod tests {
     }
 
     /// A non-retryable provider error mid-recovery breaks immediately instead
-    /// of burning the remaining budget, and keeps the granular class.
+    /// of burning the remaining attempts, and keeps the granular class.
     #[tokio::test]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_non_retryable_error_breaks_immediately() {

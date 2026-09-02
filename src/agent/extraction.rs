@@ -16,11 +16,11 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 // ── Scoped retry extraction ────────────────────────────────
 
 /// Scoped structured extraction with the hardened outer retry loop
-/// ([`crate::retry`] — default 13 attempts / 720 s wall cap). Used by
+/// ([`crate::retry`] — default 13 attempts). Used by
 /// verdict extraction, diagnostics discovery, comment summaries, and
 /// research orchestration. `policy_override` supplies a shorter schedule
 /// for fail-open comment-only callers ([`crate::retry::RetryPolicy::comment`]
-/// — 3 attempts / 90 s); `None` uses the default policy.
+/// — 3 attempts); `None` uses the default policy.
 ///
 /// The outer loop is the SINGLE retry authority — provider-internal retries
 /// are suppressed via [`crate::providers::chat_scoped`], so total provider
@@ -42,7 +42,6 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 /// Terminal failure is [`RetryExhausted`] — it carries the
 /// last-attempt raw text (`last_raw`, for verdict-extraction ticket comments) plus
 /// the per-attempt diagnostics trail.
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     history: &[ChatMessage],
     extraction_prompt: &str,
@@ -76,23 +75,12 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     let mut last_raw: Option<String> = None;
 
     for attempt in 1..=policy.max_attempts {
-        if loop_state.expired() {
-            let exhausted = RetryExhausted::with_last_raw(
-                loop_state.into_failures(),
-                FailureClass::WallClockExceeded,
-                last_raw,
-            );
-            return fail_exhausted(&record_request, operation_started, exhausted).await;
-        }
-
         let request = ChatRequest {
             messages: extraction_history.clone(),
             ..record_request.clone()
         };
 
-        match crate::providers::chat_scoped(request, policy.idle_timeout, loop_state.deadline())
-            .await
-        {
+        match crate::providers::chat_scoped(request).await {
             Ok(response) => {
                 last_raw = Some(response.text_or_empty().to_string());
 
@@ -450,37 +438,6 @@ mod tests {
                 .all(|r| r.class == crate::retry::FailureClass::OutOfRangeScore)
         );
         assert_eq!(failure.failures.len(), 3);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
-    async fn wall_clock_cap_binds_before_attempt_exhaustion() {
-        let _guard = retry_tests_lock();
-        // 7 attempts but a 100 ms wall cap and 1 s backoff — the cap binds.
-        let _policy_guard =
-            crate::util::test::install_test_retry_policy(crate::retry::RetryPolicy {
-                max_attempts: 7,
-                base_backoff_ms: 1_000,
-                max_backoff_ms: 1_000,
-                operation_timeout: std::time::Duration::from_millis(100),
-                idle_timeout: std::time::Duration::from_secs(1),
-            });
-        let fake = Arc::new(
-            FakeProvider::new()
-                .err(crate::retry::FailureClass::Transport, "slow outage")
-                .err(crate::retry::FailureClass::Transport, "slow outage"),
-        );
-        let result = extract_with(fake).await;
-        let failure = result.expect_err("wall-clock cap must bind");
-        assert_eq!(
-            failure.final_class,
-            crate::retry::FailureClass::WallClockExceeded
-        );
-        assert!(
-            failure.failures.len() <= 2,
-            "cap must stop the loop before 7 attempts"
-        );
     }
 
     /// End-to-end regression guard for the retry telemetry: recorded

@@ -1219,14 +1219,15 @@ async fn wrap_up_timed_out(
             tokio::spawn(async move {
                 let mut messages = p.history;
                 messages.push(ChatMessage::user(&wrap_up_prompt));
-                // Ticket-mandated ~3 attempts / ~90s. The policy's
-                // operation_timeout is a whole-operation wall-clock deadline
-                // (retry.rs), NOT per-attempt — on the worst-case cache-miss
-                // tail (~170K tokens of prefill) all attempts share the 90s;
-                // the stage deadline caps the batch but cannot extend a
-                // task's 90s. Post-rollout telemetry distinguishes cache-hit
-                // from policy starvation (the policy's own backoff/attempts
-                // apply; the wrap-up adds nothing beyond them).
+                // ~3 attempts, no wall-clock cap: the only per-attempt bound is
+                // the 600 s idle timeout (retry.rs). On the worst-case
+                // cache-miss tail (~170K tokens of prefill) a generation can
+                // legitimately spend minutes before its first byte; a genuinely
+                // stalled attempt is cut at the idle bound. The stage deadline
+                // caps the batch but cannot extend a task's attempts.
+                // Post-rollout telemetry distinguishes cache-hit from policy
+                // starvation (the policy's own backoff/attempts apply; the
+                // wrap-up adds nothing beyond them).
                 crate::agent::extraction::retry_extract_structured_scoped::<AnalystFindings>(
                     &messages,
                     "",
@@ -2656,7 +2657,8 @@ struct SynthesisOutput {
 }
 
 /// Final synthesis from the accumulated evidence with the shared synthesis
-/// policy (≤3 informed attempts, transport-only backoff, hard time cap).
+/// policy (≤3 informed attempts, transport-only backoff; no wall-clock cap —
+/// the 600 s idle timeout is the only per-attempt bound).
 /// A truncated, empty, or failed attempt counts toward the budget; the next
 /// attempt carries feedback to shorten/compress. The last produced output
 /// wins — a provider-truncated report is delivered with an explicit marker,
@@ -2706,9 +2708,6 @@ async fn synthesize(
     let mut transport_failures = 0u32;
 
     for attempt in 1..=policy.max_attempts {
-        if loop_state.expired() {
-            break;
-        }
         let mut user = base_user.clone();
         if !feedback.is_empty() {
             let _ = writeln!(user, "\n\n# Previous Attempt Feedback\n\n{feedback}");
@@ -2716,13 +2715,7 @@ async fn synthesize(
         let mut messages = prefix.clone();
         messages.push(ChatMessage::user(&user));
         params.messages = messages;
-        match crate::providers::chat_scoped(
-            params.clone(),
-            policy.idle_timeout,
-            loop_state.deadline(),
-        )
-        .await
-        {
+        match crate::providers::chat_scoped(params.clone()).await {
             Ok(resp) => {
                 let text = resp.text_or_empty().to_string();
                 let truncated = resp.finish_reason.as_deref() == Some("length");

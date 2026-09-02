@@ -1444,11 +1444,11 @@ pub(crate) trait Provider: Send + Sync {
     ///
     /// - **No provider-internal retries** — this call makes exactly one HTTP
     ///   request; the outer loop is the single retry authority.
-    /// - **Idle-timeout semantics** — `idle_timeout` resets while data flows
-    ///   (a stalled connection mid-body is the truncation signature this
-    ///   hardening targets).
-    /// - **Per-attempt total = remaining wall budget** — implementations
-    ///   should not outlive `deadline`.
+    /// - **Idle-timeout semantics** — the 600 s idle timeout
+    ///   ([`crate::retry::DEFAULT_IDLE_TIMEOUT`]) bounds the TTFB wait and each
+    ///   body-read chunk wait, resetting while data flows; a stalled
+    ///   connection mid-body is the truncation signature this hardening
+    ///   targets. No total request timeout applies.
     /// - On failure the returned [`ScopedCallError`] carries per-attempt
     ///   diagnostics (classification, error chain, finish_reason) for the
     ///   retry trail.
@@ -1457,8 +1457,6 @@ pub(crate) trait Provider: Send + Sync {
     async fn chat_scoped(
         &self,
         request: ChatRequest,
-        idle_timeout: std::time::Duration,
-        deadline: std::time::Instant,
     ) -> Result<ChatResponse, crate::providers::ScopedCallError>;
 
     async fn warmup(&self) -> anyhow::Result<()> {

@@ -540,9 +540,6 @@ impl From<anyhow::Error> for DiscoveryRunError {
 ///   wait in Pending for the user to correct the settings rather than go
 ///   terminal Failed. The escalating cooldown bounds the retry rate, so a
 ///   permanently-wrong config cannot burn unbounded tokens.
-/// * **`WallClockExceeded` → Transient** — the 12-minute retry budget being
-///   exhausted is almost always the symptom of sustained provider
-///   unavailability, which the cooldown is designed to ride out.
 /// * **`Parse`/validation classes → Fatal** — the provider answered, so the
 ///   failure is a genuine pipeline/format defect; retrying later would not
 ///   help.
@@ -572,7 +569,6 @@ fn classify_discovery_failure(
         | crate::retry::FailureClass::NoResponse
         | crate::retry::FailureClass::TruncatedOutput
         | crate::retry::FailureClass::NonRetryable
-        | crate::retry::FailureClass::WallClockExceeded
         | crate::retry::FailureClass::Shutdown => DiscoveryFailureKind::Transient,
         crate::retry::FailureClass::Parse
         | crate::retry::FailureClass::OutOfRangeScore
@@ -646,9 +642,8 @@ const PENDING_PICKUP_COOLDOWN_MAX_MINS: u64 = 240;
 /// Memory-only by design: no DB writes, no new columns; after a
 /// restart a pending workspace may be retried once immediately (acceptable).
 /// Escalation bounds the long-run retry duty cycle of a persistently-down
-/// provider — the full 12-minute retry budget no longer burns every 15
-/// minutes forever, which would violate the ticket's "no repeated 12-minute
-/// LLM-burn loops" criterion.
+/// provider — the full LLM retry budget no longer burns every 15 minutes
+/// forever.
 fn pending_pickup_cooldown_duration(attempts: u32) -> Duration {
     let exponent = attempts.saturating_sub(1).min(4);
     let minutes = (PENDING_PICKUP_COOLDOWN_BASE_MINS * 2u64.pow(exponent))
@@ -2485,7 +2480,6 @@ mod tests {
             crate::retry::FailureClass::NoResponse,
             crate::retry::FailureClass::TruncatedOutput,
             crate::retry::FailureClass::NonRetryable, // auth / quota / invalid model
-            crate::retry::FailureClass::WallClockExceeded,
             crate::retry::FailureClass::Shutdown,
         ] {
             assert_eq!(
