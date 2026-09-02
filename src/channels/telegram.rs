@@ -20,6 +20,8 @@ const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 
 /// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
 pub const CLEAR_COMMAND_DESC: &str = "Reset your session";
+/// Description for the `/agents` command (inline role picker).
+pub const AGENTS_COMMAND_DESC: &str = "Switch your active role";
 /// Description for the `/image_models` command (Artist role).
 pub const IMAGE_MODELS_COMMAND_DESC: &str = "Select image generation model";
 /// Description for the `/video_models` command (Artist role).
@@ -1176,14 +1178,15 @@ impl TelegramChannel {
     }
 
     /// Register the bot's global (unscoped) commands via Telegram's
-    /// `setMyCommands` API. Only `/clear` is global — per-user commands are
-    /// registered per chat via [`Self::spawn_menu_refresh`].
+    /// `setMyCommands` API. `/clear` and `/agents` are global — per-user
+    /// commands are registered per chat via [`Self::spawn_menu_refresh`].
     ///
     /// Failure is logged as a warning and does not block the caller.
     pub async fn set_my_commands(&self) {
         let body = serde_json::json!({
             "commands": [
                 {"command": "clear", "description": CLEAR_COMMAND_DESC},
+                {"command": "agents", "description": AGENTS_COMMAND_DESC},
             ]
         });
         post_set_my_commands(self.http_client(), &self.api_url("setMyCommands"), &body).await;
@@ -1764,7 +1767,7 @@ impl TelegramChannel {
         // role switches are human-paced, so contention is negligible).
         let _guard = self.pin_lock.lock().await;
         let (chat_id, thread_id) = parse_recipient(reply_target);
-        // Same command-menu "(current)" refresh the normal send path triggers.
+        // Same command-menu refresh the normal send path triggers.
         self.spawn_menu_refresh(chat_id);
         let html = to_telegram_html(text);
 
@@ -2659,8 +2662,8 @@ pub fn format_board_line(
 }
 
 /// (command, description) entries for a user's Telegram command menu,
-/// derived from their role pool, active role, admin status, and the state of
-/// their selected shared workspace. Shared by the per-chat `setMyCommands`
+/// derived from their role pool, admin status, and the state of their
+/// selected shared workspace. Shared by the per-chat `setMyCommands`
 /// refresh and the `/start` welcome message.
 ///
 /// State-aware entries: exactly one of `/pause` or `/unpause` appears (the
@@ -2672,19 +2675,10 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = Vec::new();
 
     let pool = crate::users::role_pool(user_name).await;
-    let active_role = crate::users::resolve_active_role_from_pool(user_name, &pool).await;
 
-    // Each pool role is a direct command; the active role's entry is marked.
-    // Role switches lead the menu — the most frequent action.
-    for role in &pool {
-        let label = crate::agent::role::role_info(role).display_label;
-        let desc = if Some(*role) == active_role {
-            format!("{label} (current)")
-        } else {
-            label.to_string()
-        };
-        entries.push((role.as_str().to_string(), desc));
-    }
+    // Single role-switch entry — opens the inline role picker listing only
+    // the user's pool roles. Registered for every user; leads the menu.
+    entries.push(("agents".to_string(), AGENTS_COMMAND_DESC.to_string()));
 
     if crate::users::is_admin(user_name).await {
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));

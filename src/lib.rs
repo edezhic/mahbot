@@ -75,7 +75,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
-use strum::IntoEnumIterator;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -394,8 +393,8 @@ pub enum BotCommand {
     /// `/update` — run a self-update and restart the daemon (admin, shown only
     /// when the shared availability cache confirms an update is available).
     Update,
-    /// `/role_name` — switch the user's active role (pool-gated).
-    SwitchRole(Role),
+    /// `/agents` — open the inline role picker (pool-gated buttons).
+    Agents,
 }
 
 /// Parse a Telegram bot text command from message content.
@@ -420,12 +419,8 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
         "/maintenance_on" => Some(BotCommand::MaintenanceOn),
         "/maintenance_off" => Some(BotCommand::MaintenanceOff),
         "/update" => Some(BotCommand::Update),
-        other => {
-            let name = other.strip_prefix('/')?;
-            Role::iter()
-                .find(|r| r.as_str() == name)
-                .map(BotCommand::SwitchRole)
-        }
+        "/agents" => Some(BotCommand::Agents),
+        _ => None,
     }
 }
 
@@ -1608,21 +1603,11 @@ mod tests {
             ("/UPDATE", Some(Update)),
             ("/update foo", Some(Update)),
             ("  /update  ", Some(Update)),
-            // Role-switch commands: each pool role is a direct command
-            ("/manager", Some(SwitchRole(Role::Manager))),
-            ("/engineer", Some(SwitchRole(Role::Engineer))),
-            ("/analyst", Some(SwitchRole(Role::Analyst))),
-            ("/coder", Some(SwitchRole(Role::Coder))),
-            ("/qa", Some(SwitchRole(Role::Qa))),
-            ("/reviewer", Some(SwitchRole(Role::Reviewer))),
-            ("/discovery", Some(SwitchRole(Role::Discovery))),
-            ("/artist", Some(SwitchRole(Role::Artist))),
-            ("/maintainer", Some(SwitchRole(Role::Maintainer))),
-            ("/sanitation", Some(SwitchRole(Role::Sanitation))),
-            ("/assistant", Some(SwitchRole(Role::Assistant))),
-            ("/ARTIST", Some(SwitchRole(Role::Artist))),
-            ("/engineer foo", Some(SwitchRole(Role::Engineer))),
-            ("  /coder  ", Some(SwitchRole(Role::Coder))),
+            // /agents inline role picker
+            ("/agents", Some(Agents)),
+            ("/AGENTS", Some(Agents)),
+            ("/agents foo", Some(Agents)),
+            ("  /agents  ", Some(Agents)),
             // Negative: partial /-prefix matches
             ("/", None),
             ("/s", None),
@@ -1641,6 +1626,11 @@ mod tests {
             ("/engineerr", None),
             ("/managr", None),
             ("/artiste", None),
+            // Former per-role switch commands — removed, fall through
+            ("/manager", None),
+            ("/engineer", None),
+            ("/artist", None),
+            ("/assistant", None),
             ("/ reset", None),
             // Negative: missing slash or empty
             ("start", None),

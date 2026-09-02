@@ -2242,10 +2242,10 @@ async fn mirrors_media_only_with_reply_reference() {
 }
 
 #[tokio::test]
-async fn user_command_entries_reflect_role_and_admin() {
+async fn user_command_entries_reflect_admin_state() {
     // Serialized with the sibling mirror tests: this test mutates the
-    // shared user/workspace stores (alice's workspace + role, menu_ws
-    // INSERT), so it must not run concurrently with other store users.
+    // shared user/workspace stores (alice's workspace + menu_ws state), so it
+    // must not run concurrently with other store users.
     let _lock = acquire_mirror_lock().await;
     crate::users::test_util::init_test_store().await;
     let store = crate::users::store();
@@ -2262,12 +2262,14 @@ async fn user_command_entries_reflect_role_and_admin() {
         .await
         .unwrap();
 
-    // alice: admin (full permissions), pool = all roles → role commands,
-    // Artist commands, and state-aware admin commands. In the (LocalCheckout)
-    // test environment the shared availability cache seeds `available = true`,
-    // so `/update` is present for the admin.
+    // alice: admin (full permissions), pool = onboarding roles + Artist →
+    // the single role-switch entry plus Artist model commands and
+    // state-aware admin commands. In the (LocalCheckout) test environment
+    // the shared availability cache seeds `available = true`, so `/update`
+    // is present for the admin.
     let alice = user_command_entries("alice").await;
     let cmds: Vec<&str> = alice.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(cmds[0], "agents");
     assert!(cmds.contains(&"board"));
     assert!(cmds.contains(&"update"));
     // State-aware pairs reflect the workspace state: not paused →
@@ -2276,63 +2278,21 @@ async fn user_command_entries_reflect_role_and_admin() {
     assert!(!cmds.contains(&"unpause"));
     assert!(cmds.contains(&"maintenance_on"));
     assert!(!cmds.contains(&"maintenance_off"));
-    // Pool roles are direct commands (full permissions → onboarding pool:
-    // Support, Assistant, Manager, Artist).
-    assert!(cmds.contains(&"support"));
-    assert!(cmds.contains(&"manager"));
-    assert!(cmds.contains(&"artist"));
-    assert!(!cmds.contains(&"engineer"));
+    // Per-role switch commands are removed — the inline picker replaces them
+    // (the pool is still reflected in the picker's buttons, not the menu).
+    for cmd in ["manager", "support", "assistant", "artist", "engineer"] {
+        assert!(!cmds.contains(&cmd));
+    }
     // Artist is in the pool → model commands present.
     assert!(cmds.contains(&"image_models"));
     assert!(cmds.contains(&"video_models"));
-    assert_eq!(cmds[0], "support");
-    // Menu order: role commands first, then board/admin (+ /update), then
-    // workspace-state pairs, then model commands, with /clear last.
+    // Menu order: role-switch entry first, then board/admin (+ /update),
+    // then workspace-state pairs, then model commands, with /clear last.
     assert_eq!(cmds.last(), Some(&"clear"));
     let pos = |cmd: &str| cmds.iter().position(|c| *c == cmd).unwrap();
-    assert!(pos("support") < pos("board"));
     assert!(pos("board") < pos("update"));
     assert!(pos("update") < pos("image_models"));
     assert!(pos("image_models") < pos("clear"));
-
-    // The active role's entry is marked. add_user seeds the selection to the
-    // default role — Support for a full admin.
-    let support_desc = alice
-        .iter()
-        .find(|(c, _)| c == "support")
-        .map(|(_, d)| d.as_str())
-        .unwrap();
-    assert!(support_desc.contains("current"));
-    let manager_desc = alice
-        .iter()
-        .find(|(c, _)| c == "manager")
-        .map(|(_, d)| d.as_str())
-        .unwrap();
-    assert!(!manager_desc.contains("current"));
-
-    // Switching the active role moves the marker.
-    store
-        .update_user(
-            "alice",
-            crate::users::FieldUpdate::Set("artist"),
-            crate::users::FieldUpdate::Unchanged,
-            crate::users::FieldUpdate::Unchanged,
-        )
-        .await
-        .unwrap();
-    let entries = user_command_entries("alice").await;
-    let artist_desc = entries
-        .iter()
-        .find(|(c, _)| c == "artist")
-        .map(|(_, d)| d.as_str())
-        .unwrap();
-    assert!(artist_desc.contains("current"));
-    let manager_desc2 = entries
-        .iter()
-        .find(|(c, _)| c == "manager")
-        .map(|(_, d)| d.as_str())
-        .unwrap();
-    assert!(!manager_desc2.contains("current"));
 
     // Flipping the workspace state reverses the pairs (the ticket's
     // headline criterion): paused → /unpause, maintenance on →
@@ -2362,17 +2322,21 @@ async fn user_command_entries_reflect_role_and_admin() {
         assert!(!hidden_cmds.contains(&"update"));
     }
 
-    // bob: restricted user — pool commands but no admin commands (and no
-    // `/update`, even though an update is available).
+    // bob: restricted user — no admin commands and no per-role switch
+    // commands (the inline picker replaces them), but Artist being in his
+    // pool still exposes the model commands.
     let bob = user_command_entries("bob").await;
     let cmds: Vec<&str> = bob.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(cmds[0], "agents");
     assert!(!cmds.contains(&"board"));
     assert!(!cmds.contains(&"update"));
     assert!(!cmds.contains(&"pause"));
     assert!(!cmds.contains(&"unpause"));
-    // Restricted user: pool is [Assistant, Artist] — no admin/board commands,
-    // no engineer.
-    assert!(cmds.contains(&"assistant"));
-    assert!(cmds.contains(&"artist"));
-    assert!(!cmds.contains(&"engineer"));
+    // Restricted user: pool is [Assistant, Artist] — per-role commands are
+    // removed, but Artist in the pool keeps the model commands present.
+    assert!(!cmds.contains(&"assistant"));
+    assert!(!cmds.contains(&"artist"));
+    assert!(!cmds.contains(&"manager"));
+    assert!(cmds.contains(&"image_models"));
+    assert!(cmds.contains(&"video_models"));
 }
