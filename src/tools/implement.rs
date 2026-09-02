@@ -154,16 +154,6 @@ impl Tool for ImplementTool {
 
 // ── Durable async dispatch (SPAWN → run → CHECKPOINT → COMPLETE) ─────────
 
-/// Outcome of a durable implement round.
-pub(crate) enum ImplementRunOutcome {
-    /// The round produced a result (Ok or Err — both terminalize with a
-    /// durable envelope).
-    Result(anyhow::Result<String>),
-    /// Round cut by drain/shutdown — the job stays status='launched' for boot
-    /// resume; nothing is routed or terminalized now.
-    DrainCut,
-}
-
 /// Durable async implement dispatch (SPAWN → run → CHECKPOINT → COMPLETE).
 ///
 /// 1. SPAWN: one tx — INSERT jobs (kind=implement, task) + INSERT agents (the
@@ -196,11 +186,12 @@ async fn dispatch_durable_implement(
             channel: &channel,
             resume: false,
             caller_agent_id: None,
+            fail_on_checkpoint_error: false,
         },
     )
     .await
     {
-        Ok(ImplementRunOutcome::DrainCut) => {
+        Ok(crate::tools::SyncCoreOutcome::DrainCut) => {
             // Drain-cut: the coder's outcome is checkpointed — leave the job
             // status='launched' for boot resume (recoverable from the roster
             // outcome). No terminalization, no error envelope: a spurious
@@ -212,7 +203,7 @@ async fn dispatch_durable_implement(
             );
             return None;
         }
-        Ok(ImplementRunOutcome::Result(result)) => result,
+        Ok(crate::tools::SyncCoreOutcome::Terminal(result)) => result,
         Err(e) => Err(e),
     };
     let envelope = crate::jobs::complete_durable_job(
@@ -245,11 +236,12 @@ async fn run_sync_implement(ws: &Workspace, task: &str, caller_role: Role) -> Re
 /// Spawn the implement job + single-coder roster (one tx), then run the coder.
 /// `resume` reuses the stored roster (never regenerate ids — the PK would
 /// conflict AND the new id would not match the stored roster row).
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn run_implement_with_job(
     ws: &Workspace,
     task: &str,
     args: crate::tools::CoreJobArgs<'_>,
-) -> anyhow::Result<ImplementRunOutcome> {
+) -> anyhow::Result<crate::tools::SyncCoreOutcome> {
     let crate::tools::CoreJobArgs {
         job_id,
         caller_role,
@@ -257,6 +249,7 @@ pub(crate) async fn run_implement_with_job(
         channel,
         resume,
         caller_agent_id,
+        fail_on_checkpoint_error,
     } = args;
     let (coder_agent_id, pre_done) = if resume {
         let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
@@ -299,7 +292,7 @@ pub(crate) async fn run_implement_with_job(
     // A completed coder's stored outcome IS the final response — deliver it
     // without re-running (the LLM work is never lost or duplicated).
     if let Some(outcome) = pre_done {
-        return Ok(ImplementRunOutcome::Result(Ok(outcome)));
+        return Ok(crate::tools::SyncCoreOutcome::Terminal(Ok(outcome)));
     }
 
     // Fresh (or resume-without-outcome) run: run the single coder. On resume the
@@ -348,10 +341,10 @@ pub(crate) async fn run_implement_with_job(
     )
     .await
     {
-        // Sync calls (caller-owned job) fail the tool call on a checkpoint
-        // DB error so the model retries; async/boot-resume warn-and-continue
-        // (the outcome is recomputable on the next resume).
-        if caller_agent_id.is_some() {
+        // Sync calls fail the tool call on a checkpoint DB error so the model
+        // retries; async/boot-resume warn-and-continue (the outcome is
+        // recomputable on the next resume).
+        if fail_on_checkpoint_error {
             return Err(e.context("failed to checkpoint implement outcome"));
         }
         tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint implement outcome");
@@ -361,10 +354,10 @@ pub(crate) async fn run_implement_with_job(
     // resume (the checkpointed outcome is the resume boundary). No routing, no
     // terminalization.
     if crate::shutdown::aborting() {
-        return Ok(ImplementRunOutcome::DrainCut);
+        return Ok(crate::tools::SyncCoreOutcome::DrainCut);
     }
 
-    Ok(ImplementRunOutcome::Result(match response {
+    Ok(crate::tools::SyncCoreOutcome::Terminal(match response {
         Some(r) => Ok(r),
         None => Err(anyhow!(
             "Sub-agent failed: {}",
@@ -381,7 +374,10 @@ pub(crate) async fn run_implement_with_job(
 /// Aborts quietly on shutdown/drain: no routing, no terminalization — the job
 /// row stays for the next boot (the checkpointed outcome is reused).
 pub(crate) async fn resume_implement_round(job_id: &str, ws: &Workspace) {
-    let (caller_role, caller, result) = match resume_implement_core(ws, job_id, None).await {
+    let (caller_role, caller, result) = match crate::tools::SyncDurableCore::Implement
+        .resume_sync_core(ws, job_id, false)
+        .await
+    {
         Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
             (caller_role, caller, result)
         }
@@ -437,24 +433,6 @@ pub(crate) async fn resume_implement_round(job_id: &str, ws: &Workspace) {
     )
     .await;
     message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
-}
-
-/// Run a drain-cut implement round to completion at the roster level. Returns a
-/// [`crate::jobs::SyncResumeOutcome`]: `Terminal` when the round reached a
-/// result, `DrainCut` when drain-cut (the outcome is checkpointed, job stays
-/// launched), `JobMissing` when the job row vanished. No routing/terminalization
-/// here — the caller decides. `caller_agent_id` selects checkpoint-error
-/// propagation: `Some` for a sync resume (a checkpoint DB error fails the tool
-/// call), `None` for async boot resume (warn-and-continue, exactly as today's
-/// async behavior).
-pub(crate) async fn resume_implement_core(
-    ws: &Workspace,
-    job_id: &str,
-    caller_agent_id: Option<&str>,
-) -> anyhow::Result<crate::jobs::SyncResumeOutcome> {
-    crate::tools::SyncDurableCore::Implement
-        .resume_sync_core(ws, job_id, caller_agent_id)
-        .await
 }
 
 /// Build the `<implement-tool-result>` envelope message for an async implement
@@ -570,7 +548,8 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_implement_h");
 
-        let outcome = resume_implement_core(&ws, &job_id, Some(pin))
+        let outcome = crate::tools::SyncDurableCore::Implement
+            .resume_sync_core(&ws, &job_id, true)
             .await
             .unwrap();
         let crate::jobs::SyncResumeOutcome::Terminal(_, _, result) = outcome else {

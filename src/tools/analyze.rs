@@ -224,16 +224,6 @@ struct AnalyzeSlot {
     task: String,
 }
 
-/// Outcome of a durable analyze round.
-pub(crate) enum AnalyzeRunOutcome {
-    /// The round produced a result (Ok or Err — both terminalize with a
-    /// durable envelope).
-    Result(anyhow::Result<String>),
-    /// Round cut by drain/shutdown — the job stays status='launched' for boot
-    /// resume; nothing is routed or terminalized now.
-    DrainCut,
-}
-
 /// Durable async analyze dispatch (SPAWN → run → CHECKPOINT → COMPLETE).
 ///
 /// 1. SPAWN: one tx — INSERT jobs (kind=analyze, task=question) + INSERT agents
@@ -266,11 +256,12 @@ async fn dispatch_durable_analyze(
             channel: &channel,
             resume: false,
             caller_agent_id: None,
+            fail_on_checkpoint_error: false,
         },
     )
     .await
     {
-        Ok(AnalyzeRunOutcome::DrainCut) => {
+        Ok(crate::tools::SyncCoreOutcome::DrainCut) => {
             // Drain-cut: analyst outcomes are already
             // checkpointed — leave the job status='launched' for boot resume
             // (recoverable from the agent outcome checkpoints). No terminalization, no
@@ -283,7 +274,7 @@ async fn dispatch_durable_analyze(
             );
             return None;
         }
-        Ok(AnalyzeRunOutcome::Result(result)) => result,
+        Ok(crate::tools::SyncCoreOutcome::Terminal(result)) => result,
         Err(e) => Err(e),
     };
     let envelope = crate::jobs::complete_durable_job(
@@ -307,7 +298,7 @@ pub(crate) async fn run_analyze_with_job(
     ws: &Workspace,
     analyze: &str,
     args: crate::tools::CoreJobArgs<'_>,
-) -> anyhow::Result<AnalyzeRunOutcome> {
+) -> anyhow::Result<crate::tools::SyncCoreOutcome> {
     let crate::tools::CoreJobArgs {
         job_id,
         caller_role,
@@ -315,6 +306,7 @@ pub(crate) async fn run_analyze_with_job(
         channel,
         resume,
         caller_agent_id,
+        fail_on_checkpoint_error,
     } = args;
     let deadline = std::time::Instant::now() + round_timeout();
 
@@ -437,10 +429,10 @@ pub(crate) async fn run_analyze_with_job(
             crate::jobs::write_agent_outcome(conn, job_id, &slot.agent_id, status, Some(&outcome))
                 .await
         {
-            // Sync calls (caller-owned job) fail the tool call on a checkpoint
-            // DB error so the model retries; async/boot-resume warn-and-continue
-            // (the outcomes are recomputable on the next resume).
-            if caller_agent_id.is_some() {
+            // Sync calls fail the tool call on a checkpoint DB error so the
+            // model retries; async/boot-resume warn-and-continue (the outcomes
+            // are recomputable on the next resume).
+            if fail_on_checkpoint_error {
                 return Err(e.context("failed to checkpoint analyze outcome"));
             }
             tracing::warn!(job = %job_id, error = %e, "Failed to checkpoint analyze outcome");
@@ -451,11 +443,11 @@ pub(crate) async fn run_analyze_with_job(
     // (no new LLM work during the drain) — the checkpointed outcomes are
     // reused by the next boot's resume; the caller leaves the job launched.
     if crate::shutdown::aborting() {
-        return Ok(AnalyzeRunOutcome::DrainCut);
+        return Ok(crate::tools::SyncCoreOutcome::DrainCut);
     }
 
     let result = consolidate_analyst_runs(ws, analyze, runs, deadline, job_id).await;
-    Ok(AnalyzeRunOutcome::Result(result))
+    Ok(crate::tools::SyncCoreOutcome::Terminal(result))
 }
 
 /// Run the given analyst slots concurrently (deadline-bounded).
@@ -535,7 +527,10 @@ async fn run_analyze_slots(
 /// row stays for the next boot (checkpointed outcomes are reused, so the
 /// already-completed LLM work is never lost or duplicated).
 pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
-    let (caller_role, caller, result) = match resume_analyze_core(ws, job_id, None).await {
+    let (caller_role, caller, result) = match crate::tools::SyncDurableCore::Analyze
+        .resume_sync_core(ws, job_id, false)
+        .await
+    {
         Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
             (caller_role, caller, result)
         }
@@ -591,24 +586,6 @@ pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
         &ws.name,
     )
     .await;
-}
-
-/// Run a drain-cut analyze round to completion at the roster level. Returns a
-/// [`crate::jobs::SyncResumeOutcome`]: `Terminal` when the round reached a
-/// result, `DrainCut` when drain-cut (outcomes are checkpointed, job stays
-/// launched), `JobMissing` when the job row vanished. No routing/terminalization
-/// here — the caller decides. `caller_agent_id` selects checkpoint-error
-/// propagation: `Some` for a sync resume (a checkpoint DB error fails the tool
-/// call), `None` for async boot resume (warn-and-continue, exactly as today's
-/// async behavior).
-pub(crate) async fn resume_analyze_core(
-    ws: &Workspace,
-    job_id: &str,
-    caller_agent_id: Option<&str>,
-) -> anyhow::Result<crate::jobs::SyncResumeOutcome> {
-    crate::tools::SyncDurableCore::Analyze
-        .resume_sync_core(ws, job_id, caller_agent_id)
-        .await
 }
 
 /// Build the `<analyze-tool-result>` envelope message for an async analyze dispatch.
@@ -3156,7 +3133,10 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_analyze_f");
 
-        let outcome = resume_analyze_core(&ws, job_id, Some(pin)).await.unwrap();
+        let outcome = crate::tools::SyncDurableCore::Analyze
+            .resume_sync_core(&ws, job_id, true)
+            .await
+            .unwrap();
         let crate::jobs::SyncResumeOutcome::Terminal(_, _, result) = outcome else {
             panic!("expected a terminal resume outcome");
         };

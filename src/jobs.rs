@@ -1288,6 +1288,20 @@ pub(crate) fn is_ticket_phase_kind(kind: &str) -> bool {
     )
 }
 
+/// Sync caller-owned analyze/implement jobs are settled by the owner's live
+/// resume-completion step ([`find_owned_launched_jobs`]) — boot resume must
+/// never race it. Research jobs always spawn with `caller_agent_id = None`,
+/// so within the research/analyze branch only the analyze half can fire.
+fn skip_sync_caller_owned(job: &JobRow) -> bool {
+    match job.caller_agent_id.as_deref() {
+        Some(caller) => {
+            info!(job = %job.id, caller = %caller, "sync caller-owned job — caller resumes it; skipping boot resume");
+            true
+        }
+        None => false,
+    }
+}
+
 /// Boot recovery scan: first statement of run_management. Order: (0) replay
 /// pending_jobs; (1) one scan over the active jobs — ticket phase jobs only get
 /// their stale launched roster cleared (the puller re-drives them), the
@@ -1334,8 +1348,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
         } else if job.kind == "research" || job.kind == "analyze" {
             // Resume at the roster/state level (dispatch re-enters the
             // orchestrator with the stored task). Always bump retry_count.
-            if let Some(caller) = job.caller_agent_id.as_deref() {
-                info!(job = %job.id, caller = %caller, "sync caller-owned job — caller resumes it; skipping boot resume");
+            if skip_sync_caller_owned(job) {
                 continue;
             }
             let kind = job.kind.as_str();
@@ -1356,8 +1369,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             // A single-coder implement round interrupted by a crash: resume it
             // like any other durable envelope kind. The coder roster row holds
             // the terminal outcome; the job row holds the caller identity.
-            if let Some(caller) = job.caller_agent_id.as_deref() {
-                info!(job = %job.id, caller = %caller, "sync caller-owned job — caller resumes it; skipping boot resume");
+            if skip_sync_caller_owned(job) {
                 continue;
             }
             let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;

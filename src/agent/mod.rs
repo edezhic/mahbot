@@ -790,9 +790,7 @@ impl Agent {
                     // bind the OLDEST matching job — position would give the
                     // first call the NEWEST job (crossed results).
                     let job = owned.swap_remove(pos);
-                    let outcome = core
-                        .resume_sync_core(&self.workspace, &job.id, Some(&self.agent_id))
-                        .await;
+                    let outcome = core.resume_sync_core(&self.workspace, &job.id, true).await;
                     match outcome {
                         Ok(crate::jobs::SyncResumeOutcome::Terminal(_, _, res)) => {
                             terminalize.push(job.id);
@@ -1271,7 +1269,9 @@ impl Agent {
                             );
                             (
                                 ToolExecutionOutcome {
-                                    output: crate::tools::CallSuspended.to_string(),
+                                    // Never read: consumers skip suspended
+                                    // outcomes before reading their output.
+                                    output: String::new(),
                                     success: false,
                                     image_payload: None,
                                     suspended: true,

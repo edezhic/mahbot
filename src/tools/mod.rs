@@ -328,10 +328,11 @@ impl std::error::Error for CallSuspended {}
 // durable core with a caller-owned jobs row, then terminalize-or-surface
 // `CallSuspended`), and the resume cores are twins too. This glue lives here
 // so both tools share ONE implementation instead of four near-identical
-// bodies; the per-tool wrappers in analyze.rs / implement.rs delegate to it.
+// bodies; the sync-dispatch wrappers (`run_sync_analyze`/`run_sync_implement`)
+// and the boot-resume rounds delegate to it.
 
 /// The job-scoped parameters every durable sync core takes. Beyond
-/// `(ws, task)` these are the six values the sync wrappers read from the
+/// `(ws, task)` these are the values the sync wrappers read from the
 /// task-locals / job row, so the core never touches `CURRENT_TOOL_*` itself.
 pub(crate) struct CoreJobArgs<'a> {
     pub job_id: &'a str,
@@ -339,12 +340,21 @@ pub(crate) struct CoreJobArgs<'a> {
     pub user_name: &'a str,
     pub channel: &'a str,
     pub resume: bool,
+    /// Caller session pin persisted on the jobs row at fresh spawn so the
+    /// live resume-completion step can find caller-owned launched jobs.
+    /// Always `None` on resume — the row already carries it.
     pub caller_agent_id: Option<&'a str>,
+    /// Sync-call discriminator: a checkpoint DB error fails the tool call /
+    /// round so it is retried; async & boot-resume paths warn-and-continue
+    /// (the outcome is recomputable on the next resume).
+    pub fail_on_checkpoint_error: bool,
 }
 
-/// Tool-agnostic normalization of a durable core run: `Terminal` wraps a
-/// produced result (Ok or Err — both terminalize), `DrainCut` means the
-/// round was cut by drain/shutdown (the job stays `launched`).
+/// The single outcome form of the durable sync cores (analyze/implement):
+/// `Terminal` wraps a produced result (Ok or Err — both terminalize with a
+/// durable envelope), `DrainCut` means the round was cut by drain/shutdown —
+/// the job stays status='launched' for resume (boot or live), nothing is
+/// routed or terminalized now.
 pub(crate) enum SyncCoreOutcome {
     Terminal(Result<String, anyhow::Error>),
     DrainCut,
@@ -379,8 +389,8 @@ impl SyncDurableCore {
         }
     }
 
-    /// Run the durable core, normalizing its own `*RunOutcome` into
-    /// [`SyncCoreOutcome`].
+    /// Run the durable core — both per-tool bodies return [`SyncCoreOutcome`]
+    /// directly.
     pub(crate) async fn run(
         self,
         ws: &crate::Workspace,
@@ -388,26 +398,9 @@ impl SyncDurableCore {
         args: CoreJobArgs<'_>,
     ) -> anyhow::Result<SyncCoreOutcome> {
         match self {
-            Self::Analyze => {
-                let outcome = crate::tools::analyze::run_analyze_with_job(ws, task, args).await?;
-                Ok(match outcome {
-                    crate::tools::analyze::AnalyzeRunOutcome::Result(result) => {
-                        SyncCoreOutcome::Terminal(result)
-                    }
-                    crate::tools::analyze::AnalyzeRunOutcome::DrainCut => SyncCoreOutcome::DrainCut,
-                })
-            }
+            Self::Analyze => crate::tools::analyze::run_analyze_with_job(ws, task, args).await,
             Self::Implement => {
-                let outcome =
-                    crate::tools::implement::run_implement_with_job(ws, task, args).await?;
-                Ok(match outcome {
-                    crate::tools::implement::ImplementRunOutcome::Result(result) => {
-                        SyncCoreOutcome::Terminal(result)
-                    }
-                    crate::tools::implement::ImplementRunOutcome::DrainCut => {
-                        SyncCoreOutcome::DrainCut
-                    }
-                })
+                crate::tools::implement::run_implement_with_job(ws, task, args).await
             }
         }
     }
@@ -444,6 +437,7 @@ impl SyncDurableCore {
             channel: &channel,
             resume: false,
             caller_agent_id: caller_agent_id.as_deref(),
+            fail_on_checkpoint_error: caller_agent_id.is_some(),
         };
         match self.run(ws, task, args).await? {
             SyncCoreOutcome::Terminal(Ok(text)) => {
@@ -476,12 +470,18 @@ impl SyncDurableCore {
 
     /// Shared sync resume: run the [`crate::jobs::resume_job_preamble_discrete`]
     /// preamble, then the core with `resume: true`, mapping the outcome to
-    /// [`crate::jobs::SyncResumeOutcome`] exactly as the per-tool cores did.
+    /// [`crate::jobs::SyncResumeOutcome`].
+    ///
+    /// `sync_resume` selects checkpoint-error propagation: a live sync resume
+    /// (the caller's resume-completion step, agent/mod.rs) passes `true` — a
+    /// checkpoint DB error fails the round; the async boot-resume rounds pass
+    /// `false` — warn-and-continue, the outcomes are recomputable on the next
+    /// resume.
     pub(crate) async fn resume_sync_core(
         self,
         ws: &crate::Workspace,
         job_id: &str,
-        caller_agent_id: Option<&str>,
+        sync_resume: bool,
     ) -> anyhow::Result<crate::jobs::SyncResumeOutcome> {
         let label = self.label();
         let (caller, caller_role) = match crate::jobs::resume_job_preamble_discrete(
@@ -506,7 +506,8 @@ impl SyncDurableCore {
             user_name: &caller.user_name,
             channel: &caller.channel,
             resume: true,
-            caller_agent_id,
+            caller_agent_id: None,
+            fail_on_checkpoint_error: sync_resume,
         };
         let run = self.run(ws, &caller.task, args).await;
         match run {
