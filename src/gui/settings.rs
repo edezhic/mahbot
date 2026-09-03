@@ -840,17 +840,30 @@ impl SettingsState {
         None
     }
 
-    /// Schedule an immediate (delay-0) settle for a field.
-    fn settle_now(&mut self, field: &str, value: String) -> Task<SettingsMessage> {
+    /// Schedule a settle for a field: bump its generation, then emit
+    /// `ConfigFieldSettled` after `delay_ms`. The bumped generation is captured
+    /// into the settle message so a stale settle is dropped by its handler.
+    fn schedule_settle(
+        &mut self,
+        field: &str,
+        value: String,
+        delay_ms: u64,
+    ) -> Task<SettingsMessage> {
         let generation = self.bump_gen(field);
         let f = field.to_string();
-        Task::perform(super::widgets::debounce_sleep(0, generation), move |g| {
-            SettingsMessage::ConfigFieldSettled {
+        Task::perform(
+            super::widgets::debounce_sleep(delay_ms, generation),
+            move |g| SettingsMessage::ConfigFieldSettled {
                 field: f,
                 value,
                 generation: g,
-            }
-        })
+            },
+        )
+    }
+
+    /// Schedule an immediate (delay-0) settle for a field.
+    fn settle_now(&mut self, field: &str, value: String) -> Task<SettingsMessage> {
+        self.schedule_settle(field, value, 0)
     }
 
     /// Spawn the async persist for a settled field. The generation captured
@@ -1000,16 +1013,7 @@ impl SettingsState {
                 if TEXT_INPUT_KEYS.contains(&key) {
                     // Text input: persist only after the value settles
                     // (debounce), never per keystroke.
-                    let generation = self.bump_gen(&field);
-                    let f = field.clone();
-                    Task::perform(
-                        super::widgets::debounce_sleep(SETTLE_MS, generation),
-                        move |g| SettingsMessage::ConfigFieldSettled {
-                            field: f,
-                            value,
-                            generation: g,
-                        },
-                    )
+                    self.schedule_settle(&field, value, SETTLE_MS)
                 } else if IMMEDIATE_KEYS.contains(&key) {
                     // Toggles / pick lists are discrete: persist right away.
                     self.settle_now(&field, value)
@@ -1176,16 +1180,7 @@ impl SettingsState {
                 if submit {
                     self.settle_now(&field, order)
                 } else if changes_text {
-                    let generation = self.bump_gen(&field);
-                    let f = field.clone();
-                    Task::perform(
-                        super::widgets::debounce_sleep(SETTLE_MS, generation),
-                        move |g| SettingsMessage::ConfigFieldSettled {
-                            field: f,
-                            value: order,
-                            generation: g,
-                        },
-                    )
+                    self.schedule_settle(&field, order, SETTLE_MS)
                 } else {
                     Task::none()
                 }
