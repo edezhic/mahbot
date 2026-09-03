@@ -1585,7 +1585,7 @@ mod tests {
         }
 
         // Zero the header's page-size field (big-endian u16 at byte offset 16)
-        // so the file cannot be opened at all — Limbo bails with a corruption
+        // so the file cannot be opened at all — Turso bails with a corruption
         // error ("invalid page size in database header") rather than an IO error.
         let db_path = db::store_db_path(root, "logs");
         let mut bytes = std::fs::read(&db_path).expect("read db file");

@@ -346,7 +346,7 @@ pub(crate) fn sanitize_fts_query(query: &str) -> String {
 /// Returns an empty string for `count == 0`. Callers MUST guard against
 /// empty lists to avoid producing invalid SQL like `WHERE id IN ()`.
 ///
-/// Note: libSQL/SQLite binds `Vec<Value>` positionally regardless of whether
+/// Note: Turso/SQLite binds `Vec<Value>` positionally regardless of whether
 /// the SQL uses `?` or `?N`, so numbered placeholders (`?1, ?2, ...`) are
 /// never necessary — use this helper everywhere.
 #[must_use]
@@ -380,7 +380,7 @@ pub(crate) fn sql_in_placeholders(count: usize) -> String {
 #[derive(Clone, Debug)]
 pub(crate) struct Connection {
     /// Persistent turso connection — reused for all execute/query calls.
-    /// Mutex serializes concurrent access since libsql connections
+    /// Mutex serializes concurrent access since turso connections
     /// do not support concurrent operations.
     conn: Arc<tokio::sync::Mutex<turso::Connection>>,
     /// Set when a TxGuard is dropped without explicit commit/rollback.
@@ -398,9 +398,9 @@ pub(crate) struct ReadonlyRows {
     pub truncated: bool,
 }
 
-/// Message prefix of a known Limbo quick_check false positive.
+/// Message prefix of a known Turso quick_check false positive.
 ///
-/// Limbo's FTS keeps tantivy chunks in an internal backing index while the
+/// Turso's FTS keeps tantivy chunks in an internal backing index while the
 /// dir table stays empty, so the index-cardinality comparison always
 /// mismatches once the index has content (upstream tursodatabase/turso#7611,
 /// unfixed through 0.7.x). Only this exact count-mismatch message is masked;
@@ -1096,7 +1096,7 @@ impl Connection {
     /// treat this as a no-op (the result row reports `log == checkpointed == -1`).
     ///
     /// The result row is parsed into a [`CheckpointOutcome`] so callers can
-    /// distinguish a complete checkpoint from a busy or partial one — Limbo
+    /// distinguish a complete checkpoint from a busy or partial one — Turso
     /// never reports a busy result in the row's first column on its success
     /// path, so incompleteness must be derived from `log > checkpointed`.
     pub(crate) async fn checkpoint(&self) -> anyhow::Result<CheckpointOutcome> {
@@ -1180,7 +1180,7 @@ fn scan_integrity_rows(rows: &[Row]) -> anyhow::Result<Vec<String>> {
 /// Outcome of `PRAGMA wal_checkpoint`, parsed from its 3-column result row
 /// (`busy`, `log`, `checkpointed`).
 ///
-/// Limbo's `op_checkpoint` writes `busy == 0` on its success path; `busy == 1`
+/// Turso's `op_checkpoint` writes `busy == 0` on its success path; `busy == 1`
 /// is set only on the pager checkpoint error path. A partial checkpoint is
 /// therefore detected via `log > checkpointed` (frames remaining in the WAL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
