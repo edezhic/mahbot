@@ -391,13 +391,14 @@ pub(crate) fn update_in_progress() -> bool {
     update_availability().in_progress
 }
 
-/// Pure visibility predicate for the `/update` command (and the GUI button):
-/// shown only to full-permission (admin) users when an update is available.
-/// The menu reflects the shared cached availability — it does NOT issue a
-/// network request per refresh.
+/// Pure visibility predicate for the `/update` menu entry in Telegram: the
+/// entry is offered when the shared availability cache reports an update.
+/// The menu reflects the cached state — it does NOT issue a network request
+/// per refresh. (The GUI update button reads [`update_availability`] directly
+/// and does not go through this predicate.)
 #[must_use]
-pub(crate) fn should_show_update(availability: UpdateAvailability, is_admin: bool) -> bool {
-    is_admin && availability.available
+pub(crate) fn should_show_update(availability: UpdateAvailability) -> bool {
+    availability.available
 }
 
 /// RAII guard returned by [`set_update_cache_for_test`] that restores the
@@ -701,7 +702,7 @@ pub(crate) async fn execute_update() -> Result<()> {
     // Concurrent guard — only one update at a time. A second trigger while an
     // update is in progress gets an immediate error.
     let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
-        anyhow::bail!("An update is already in progress. Please wait for it to complete.");
+        anyhow::bail!("{UPDATE_IN_PROGRESS_MSG}");
     };
     // Mark the shared in-progress state so both the GUI and the Telegram
     // `/update` gate report the update, and the GUI's window-close/finalize
@@ -1146,6 +1147,11 @@ pub async fn notify_admin(message: &str, target: Option<&str>) {
 /// so the denial wording stays consistent.
 pub const ADMIN_ONLY_CMD_MSG: &str = "This command is only available to admin users.";
 
+/// Reply for concurrent `/update` attempts — used both in the fast pre-check
+/// and the atomic claim below, and as the `execute_update` contention error.
+const UPDATE_IN_PROGRESS_MSG: &str =
+    "An update is already in progress. Please wait for it to complete.";
+
 /// Handle a Telegram `/update` command.
 ///
 /// Gated on the shared availability cache (admin + update available), with a
@@ -1164,15 +1170,11 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
 
     // Fast path for an already-running update, then the atomic claim below.
     if update_availability().in_progress {
-        crate::channels::telegram::send_reply(
-            &msg.reply_target,
-            "An update is already in progress. Please wait for it to complete.",
-        )
-        .await;
+        crate::channels::telegram::send_reply(&msg.reply_target, UPDATE_IN_PROGRESS_MSG).await;
         return;
     }
 
-    if !should_show_update(update_availability(), true) {
+    if !should_show_update(update_availability()) {
         crate::channels::telegram::send_reply(
             &msg.reply_target,
             "No update is available at the moment.",
@@ -1204,11 +1206,7 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        crate::channels::telegram::send_reply(
-            &msg.reply_target,
-            "An update is already in progress. Please wait for it to complete.",
-        )
-        .await;
+        crate::channels::telegram::send_reply(&msg.reply_target, UPDATE_IN_PROGRESS_MSG).await;
         return;
     }
 
@@ -1349,7 +1347,10 @@ async fn copy_to_cargo_bin(source: &Path, dest: &Path, admin_target: Option<&str
         return;
     }
 
-    // Atomically replace the target with the temp file.
+    // Atomically replace the target with the temp file. Deliberately not
+    // routed through `stale_binary_notification` like the copy failure above:
+    // this message is more actionable — it names the exact rename error and
+    // the temp path instead of the generic remediation.
     if let Err(e) = fs::rename(&tmp_path, dest) {
         warn!(
             error = %e,

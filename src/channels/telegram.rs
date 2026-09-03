@@ -2687,7 +2687,7 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
         // local-checkout mode, registry mode only when a strictly newer stable
         // version exists. The menu reflects the cached state, never a network
         // call per refresh.
-        if crate::self_update::should_show_update(crate::self_update::update_availability(), true) {
+        if crate::self_update::should_show_update(crate::self_update::update_availability()) {
             entries.push(("update".to_string(), UPDATE_COMMAND_DESC.to_string()));
         }
 
