@@ -294,6 +294,16 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::browser_daemon::run_watchdog(),
     );
 
+    // chrome-use auto-update: best-effort once-per-boot check that upgrades an
+    // existing installation (binary + native host) to the latest release; skips
+    // silently when offline and never blocks or first-installs without consent.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "chrome-use-updater",
+        mahbot::tools::browser_daemon::run_auto_update(),
+    );
+
     // Voice assistant pipeline — runs in background, manages wake word
     // detection, command recording, transcription, and routing.
     spawn_cancellable(

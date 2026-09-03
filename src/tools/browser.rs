@@ -1,5 +1,6 @@
 //! Browser automation tool.
 
+use super::browser_daemon::{envelope_success, envelope_verdict};
 use crate::util::{UnwrapPoison, is_http_url};
 use crate::{Tool, Workspace};
 use anyhow::Context;
@@ -19,11 +20,27 @@ use tracing::debug;
 /// Response from chrome-use `--json` commands.
 #[derive(Debug, Deserialize)]
 struct BrowserResponse {
-    success: bool,
+    /// Classic `success` envelope key — absent on newer `ok`-keyed envelopes.
+    #[serde(default)]
+    success: Option<bool>,
+    /// Latest chrome-use envelopes replace `success` with `ok` on some commands
+    /// (e.g. `session list --json`).
+    #[serde(default)]
+    ok: Option<bool>,
     data: Option<Value>,
     error: Option<String>,
     /// Stable error-envelope code (v1.5.78+) — present on structured errors.
     code: Option<String>,
+}
+
+impl BrowserResponse {
+    /// Success gate accepting both the classic `success: true` envelope and
+    /// the latest `ok: true` one — delegates to the shared
+    /// [`super::browser_daemon::envelope_success`] predicate (failure
+    /// precedence) so the typed and Value-based paths cannot drift.
+    fn is_success(&self) -> bool {
+        envelope_success(self.success, self.ok)
+    }
 }
 
 /// Actions for navigating and extracting content from web pages.
@@ -314,7 +331,7 @@ impl BrowserTool {
         let response: BrowserResponse =
             serde_json::from_str(&stdout).context("Failed to parse chrome-use JSON response")?;
 
-        if !response.success {
+        if !response.is_success() {
             let err = response.error.as_deref().unwrap_or("unknown error");
             let enhanced = enhance_browser_error(err.to_string());
             Self::fail_fast_if_daemon_down(&enhanced, response.code.as_deref())?;
@@ -463,6 +480,32 @@ pub async fn close_all_browser_sessions() {
 /// be cleaned up, and the watchdog recovers it after restart).
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Session names from a `session list --json` payload. Tolerant across
+/// chrome-use envelopes: latest returns `{"ok":true,"sessions":[{"name":..}]}`;
+/// older builds return `{"success":true,"data":{"sessions":["name",..]}}`.
+/// Entries may be objects (keyed by `name`) or plain strings. Callers gate on
+/// [`envelope_verdict`] first — this only extracts the names and returns an
+/// empty list when no session array is present.
+fn parse_session_list(v: &Value) -> Vec<String> {
+    let array = v
+        .get("sessions")
+        .or_else(|| v.get("data").and_then(|d| d.get("sessions")))
+        .and_then(Value::as_array);
+    array
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| match entry {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Object(_) => {
+                        entry.get("name").and_then(|v| v.as_str()).map(String::from)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn close_all_browser_sessions_inner() {
     let Some(cmd) = super::browser_daemon::cli_path() else {
         tracing::debug!("chrome-use not available, skipping browser cleanup");
@@ -481,23 +524,21 @@ async fn close_all_browser_sessions_inner() {
         }
     };
 
-    let sessions: Vec<String> = match serde_json::from_slice::<BrowserResponse>(&list_output.stdout)
-    {
-        Ok(resp) if resp.success => resp
-            .data
-            .and_then(|d| d.get("sessions")?.as_array().cloned())
-            .map(|arr| {
-                arr.into_iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Ok(resp) => {
-            tracing::warn!(
-                "chrome-use session list failed: {}",
-                resp.error.as_deref().unwrap_or("unknown error")
-            );
-            return;
+    let sessions: Vec<String> = match serde_json::from_slice::<Value>(&list_output.stdout) {
+        Ok(v) => {
+            // Gate only on an explicit failure verdict; a payload with neither
+            // verdict key proceeds (tolerance-first — unknown future envelopes
+            // still get their sessions closed if they carry a sessions array).
+            if envelope_verdict(&v) == Some(false) {
+                tracing::warn!(
+                    "chrome-use session list failed: {}",
+                    v.get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("unknown error")
+                );
+                return;
+            }
+            parse_session_list(&v)
         }
         Err(e) => {
             tracing::warn!("failed to parse chrome-use session list output: {e}");
@@ -2146,5 +2187,80 @@ mod tests {
             payload.is_none(),
             "non-screenshot action must yield no payload"
         );
+    }
+
+    // ── parse_session_list: chrome-use envelope tolerance ───────────────
+
+    #[test]
+    fn parse_session_list_latest_object_envelope() {
+        let v = serde_json::json!({
+            "ok": true,
+            "sessions": [{"name": "default", "pid": 1, "owner": "me"}]
+        });
+        assert_eq!(parse_session_list(&v), vec!["default"]);
+    }
+
+    #[test]
+    fn parse_session_list_legacy_data_strings() {
+        let v = serde_json::json!({
+            "success": true,
+            "data": {"sessions": ["default", "docs"]}
+        });
+        assert_eq!(parse_session_list(&v), vec!["default", "docs"]);
+    }
+
+    #[test]
+    fn parse_session_list_object_entries_under_data() {
+        let v = serde_json::json!({
+            "success": true,
+            "data": {"sessions": [{"name": "docs", "pid": 2}, "default"]}
+        });
+        assert_eq!(parse_session_list(&v), vec!["docs", "default"]);
+    }
+
+    #[test]
+    fn parse_session_list_extracts_names_from_both_envelopes() {
+        // Envelope-verdict gating lives in the caller (close_all_browser_sessions_inner);
+        // this helper only extracts names.
+        let v = serde_json::json!({"ok": false, "error": "boom"});
+        assert!(parse_session_list(&v).is_empty());
+        let v2 = serde_json::json!({"success": false, "data": {"sessions": ["default"]}});
+        assert_eq!(parse_session_list(&v2), vec!["default"]);
+    }
+
+    #[test]
+    fn parse_session_list_garbage_is_empty() {
+        let v = serde_json::json!({"ok": true, "sessions": "nope"});
+        assert!(parse_session_list(&v).is_empty());
+        let v2 = serde_json::json!(null);
+        assert!(parse_session_list(&v2).is_empty());
+    }
+
+    #[test]
+    fn parse_session_list_missing_sessions_key_is_empty() {
+        let v = serde_json::json!({"ok": true, "data": {}});
+        assert!(parse_session_list(&v).is_empty());
+    }
+
+    #[test]
+    fn browser_response_accepts_ok_envelope() {
+        let resp: BrowserResponse =
+            serde_json::from_str(r#"{"ok":true,"data":{}}"#).expect("tolerant deserialize");
+        assert!(resp.is_success());
+    }
+
+    #[test]
+    fn browser_response_accepts_success_envelope() {
+        let resp: BrowserResponse =
+            serde_json::from_str(r#"{"success":true}"#).expect("tolerant deserialize");
+        assert!(resp.is_success());
+        let failed: BrowserResponse =
+            serde_json::from_str(r#"{"success":false}"#).expect("tolerant deserialize");
+        assert!(!failed.is_success());
+        // Failure precedence — mirrors envelope_verdict: an explicit false on
+        // either key loses over a contradicting success key.
+        let mixed: BrowserResponse =
+            serde_json::from_str(r#"{"success":false,"ok":true}"#).expect("tolerant deserialize");
+        assert!(!mixed.is_success());
     }
 }

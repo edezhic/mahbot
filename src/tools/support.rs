@@ -2,15 +2,9 @@
 //! workspaces, other users, web search, chrome-use, finalize).
 use crate::users::FieldUpdate;
 use crate::{Role, Tool, Workspace};
-use anyhow::Context;
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use serde_json::json;
-
-/// Timeout for the chrome-use curl|sh install and native-host registration: the
-/// download can legitimately take a minute or two, but a hung install must not
-/// block the Support agent's tool call indefinitely.
-const CHROME_USE_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The user the Support agent operates as, derived from the personal workspace
 /// it runs in (`personal:<user>`). Support always pins to a personal workspace,
@@ -351,55 +345,9 @@ impl Tool for InstallChromeUseTool {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let install = tokio::time::timeout(
-                CHROME_USE_INSTALL_TIMEOUT,
-                tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(format!(
-                        "curl -fsSL {} | sh",
-                        crate::tools::browser_daemon::CHROME_USE_INSTALL_URL
-                    ))
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await
-            .context("chrome-use installer timed out")??;
-            if !install.status.success() {
-                let stdout = crate::util::truncate(&String::from_utf8_lossy(&install.stdout), 2048);
-                let stderr = crate::util::truncate(&String::from_utf8_lossy(&install.stderr), 2048);
-                return Err(err(format!(
-                    "chrome-use installer failed ({}).\nstdout: {stdout}\nstderr: {stderr}",
-                    install.status
-                )));
-            }
-
-            // Install the native-messaging host. A freshly curl-installed binary may not
-            // be on the daemon's PATH yet, so prefer the resolved path (PATH + common
-            // install locations) and fall back to the bare name.
-            let bin = crate::tools::browser_daemon::cli_path().map_or_else(
-                || "chrome-use".to_string(),
-                |p| p.to_string_lossy().into_owned(),
-            );
-            let extension = tokio::time::timeout(
-                CHROME_USE_INSTALL_TIMEOUT,
-                tokio::process::Command::new(&bin)
-                    .arg("extension")
-                    .arg("install")
-                    .kill_on_drop(true)
-                    .output(),
-            )
-            .await
-            .context("`chrome-use extension install` timed out")??;
-            if !extension.status.success() {
-                let stdout =
-                    crate::util::truncate(&String::from_utf8_lossy(&extension.stdout), 2048);
-                let stderr =
-                    crate::util::truncate(&String::from_utf8_lossy(&extension.stderr), 2048);
-                return Err(err(format!(
-                    "`chrome-use extension install` failed ({}).\nstdout: {stdout}\nstderr: {stderr}",
-                    extension.status
-                )));
-            }
+            crate::tools::browser_daemon::install_chrome_use()
+                .await
+                .map_err(err)?;
 
             Ok(
                 "chrome-use is installed: the CLI binary and skill were fetched by the \

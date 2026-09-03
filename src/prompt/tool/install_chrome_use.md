@@ -10,3 +10,5 @@ What the user must still do manually (this tool CANNOT automate it):
 3. Pin it so the native host can reach it.
 
 Important: this is invasive. chrome-use gains full control over the user's real browser. You (the Support agent) must explain what it does and get the user's explicit confirmation BEFORE running this tool. On Windows this fails — the curl|sh installer is macOS/Linux only, and the user must download the .exe instead.
+
+Note: this tool is only for the FIRST install. mahbot auto-updates an existing chrome-use installation (binary + native host) at every service startup, so you do not need to re-run this to get updates — and that auto-update never first-installs silently (only the initial, user-confirmed install goes through you).

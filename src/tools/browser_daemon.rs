@@ -365,8 +365,14 @@ impl std::fmt::Display for CliProbeFailure {
 
 /// The chrome-use curl|sh install URL — single source of truth, shared by the
 /// not-found install hint and the Support `install_chrome_use` tool.
-pub(crate) const CHROME_USE_INSTALL_URL: &str =
+const CHROME_USE_INSTALL_URL: &str =
     "https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh";
+
+/// Timeout for the chrome-use curl|sh install and native-host registration:
+/// the download can legitimately take a minute or two, but a hung install must
+/// not block the Support agent's tool call indefinitely. Single source of
+/// truth next to [`CHROME_USE_INSTALL_URL`], used by the auto-updater too.
+const CHROME_USE_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Install hint for the definitive not-found case — shared by every
 /// user-facing message that names the chrome-use CLI as missing. Derived from
@@ -397,6 +403,16 @@ pub(crate) fn cli_path() -> Option<PathBuf> {
     let found = find_cli_binary();
     cache.clone_from(&found);
     found
+}
+
+/// Clear the cached CLI path so a relocated binary is re-resolved on the next
+/// probe — the curl installer may move the binary between `/usr/local/bin` and
+/// `~/.local/bin`, so a stale cache would pin the pre-update path.
+fn invalidate_cli_path() {
+    *CLI_PATH
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_poison() = None;
 }
 
 /// Locate the chrome-use binary: PATH lookup first, then the common install
@@ -486,6 +502,43 @@ pub(crate) async fn cli_probe() -> CliStatus {
     }
 }
 
+/// Parse a chrome-use release version (`v1.5.100` or `1.5.100`) into a semver.
+/// GitHub tags are `v`-prefixed; the CLI's `--version` output is bare — both
+/// flow through here.
+fn parse_release_version(s: &str) -> Option<semver::Version> {
+    semver::Version::parse(s.strip_prefix('v').unwrap_or(s)).ok()
+}
+
+/// Extract the chrome-use version from `--version` stdout. The banner carries
+/// extra lines (bug-report URL etc.), so scan every whitespace token for the
+/// first parseable semver rather than assuming a position.
+fn parse_cli_version(stdout: &str) -> Option<semver::Version> {
+    stdout.split_whitespace().find_map(parse_release_version)
+}
+
+/// Parse the local chrome-use version from `--version` stdout, bounded by
+/// [`CLI_TIMEOUT`]. `None` when the CLI is missing, times out, exits non-zero,
+/// or its output is not a parseable semver — callers distinguish "not
+/// installed" (via [`cli_path`]) from "unparseable version" (proceed assuming
+/// outdated).
+async fn cli_version() -> Option<semver::Version> {
+    let path = cli_path()?;
+    let mut cmd = Command::new(&path);
+    ensure_browser_env(&mut cmd);
+    cmd.arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(CLI_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_cli_version(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Set HOME, `CHROMIUM_FLAGS`, and default timeout env vars on the command
 /// so that the Chromium spawned by chrome-use works in service/docker
 /// environments.
@@ -554,7 +607,7 @@ async fn run_cli_json_opt(args: &[&str], session: Option<&str>) -> Result<Value,
         return Err(extract_error(&out.stdout));
     }
     let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| None)?;
-    if v.get("success").and_then(Value::as_bool) != Some(true) {
+    if envelope_verdict(&v) != Some(true) {
         return Err(extract_error(&out.stdout));
     }
     Ok(v)
@@ -569,16 +622,18 @@ async fn run_cli_json(args: &[&str]) -> Option<Value> {
 
 /// Daemon-free service-state snapshot: `status --json` classifies extension /
 /// native-host / relay problems without spawning a daemon or tab. Returns a
-/// classified failure when the service is unusable; `None` when it looks
-/// healthy. Note: pre-1.5.86 CLIs whose `status` lacks extension data fall
-/// through to `None` (healthy) — wedge detection for those hosts relies
-/// entirely on the per-call fail-fast path.
+/// classified failure when the service is unusable; `None` when the status is
+/// unavailable (old CLI or broken binary) or it looks healthy — wedge
+/// detection then relies entirely on the per-call fail-fast path.
 async fn service_state() -> Option<ProbeFailure> {
-    let Some(status) = run_cli_json(&["status"]).await else {
-        // Status unavailable (old CLI or broken binary) — treat as healthy;
-        // the per-call fail-fast path still catches wedges.
-        return None;
-    };
+    let status = run_cli_json(&["status"]).await?;
+    classify_service_state(&status).await
+}
+
+/// Classify a `status --json` snapshot (see [`service_state`]). Note:
+/// pre-1.5.86 CLIs whose `status` lacks extension data fall through to `None`
+/// (healthy).
+async fn classify_service_state(status: &Value) -> Option<ProbeFailure> {
     let ext = status.get("data")?.get("extension")?;
     if ext.get("hostInstalled").and_then(Value::as_bool) == Some(false) {
         return Some(ProbeFailure::NotInstalled);
@@ -618,11 +673,19 @@ async fn extension_disabled() -> bool {
 /// invisible to this check by design — a real browser call that fails with the
 /// daemon-unavailable signature marks the daemon unhealthy via [`note_unhealthy`]
 /// (fail-fast) and wakes the watchdog, which recovers from that stored cause.
+/// A healthy snapshot also drives the extension-skew advisory (single `status`
+/// spawn per evaluation).
 async fn evaluate_health() -> ProbeOutcome {
-    match service_state().await {
-        Some(failure) => ProbeOutcome::Down(failure),
-        None => ProbeOutcome::Healthy,
+    let Some(status) = run_cli_json(&["status"]).await else {
+        // Status unavailable (old CLI or broken binary) — treat as healthy;
+        // the per-call fail-fast path still catches wedges.
+        return ProbeOutcome::Healthy;
+    };
+    if let Some(failure) = classify_service_state(&status).await {
+        return ProbeOutcome::Down(failure);
     }
+    advise_extension_skew(&status);
+    ProbeOutcome::Healthy
 }
 
 /// One tab in a session's tab group, from `tab list --json`. The `active` flag
@@ -636,8 +699,8 @@ struct SweepTab {
     target_id: String,
 }
 
-// chrome-use CLI behaviors this sweep relies on (pinned against v1.5.87;
-// live-verified against the 1.5.86 binary):
+// chrome-use CLI behaviors this sweep relies on (live-verified against
+// 1.5.100):
 // - `tab list --session <name>` enumerates only that session's tab group (the
 //   relay scopes `Target.getTargets` per announced group, issue #40). When the
 //   session has no daemon the CLI spawns one: an empty group makes it create a
@@ -991,6 +1054,29 @@ fn extract_error(stdout: &[u8]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Core envelope-success predicate with failure precedence: an explicit
+/// `false` on either key loses over a contradicting success key (conservative
+/// — the error text surfaces), and a payload with neither key is not a
+/// success. Shared by [`envelope_verdict`] (Value-based) and
+/// `BrowserResponse::is_success` (typed) so the two cannot drift.
+pub(crate) fn envelope_success(success: Option<bool>, ok: Option<bool>) -> bool {
+    !(success == Some(false) || ok == Some(false)) && (success == Some(true) || ok == Some(true))
+}
+
+/// Tri-state verdict of a chrome-use JSON envelope: `Some(true)` when either
+/// `success` or `ok` reports success, `Some(false)` when either reports
+/// failure, `None` when the payload carries no verdict key (callers decide
+/// their own default). Newer chrome-use commands replaced `success` with `ok`
+/// (e.g. `session list`).
+pub(crate) fn envelope_verdict(v: &Value) -> Option<bool> {
+    let success = v.get("success").and_then(Value::as_bool);
+    let ok = v.get("ok").and_then(Value::as_bool);
+    if success.is_none() && ok.is_none() {
+        return None;
+    }
+    Some(envelope_success(success, ok))
+}
+
 fn set_health(outcome: ProbeOutcome) {
     let mut h = health().lock().unwrap_poison();
     h.apply_outcome(outcome, Instant::now(), true);
@@ -1223,6 +1309,212 @@ pub async fn run_watchdog() {
             () = shutdown.cancelled() => break,
         };
     }
+}
+
+// ── Extension-skew advisory ───────────────────────────────────────────
+/// Last (expected, live) extension-version pair that was advised on. Log the
+/// extension-skew notice only on a transition (pair changed, or re-skewed
+/// after an in-sync clear) — mirrors the sweep's anti-spam pattern.
+static LAST_EXTENSION_SKEW: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+
+/// Extension-skew advisory from an already-fetched `status --json` snapshot:
+/// the Chrome Web Store extension is NEVER force-updated — the Store
+/// auto-updates it in the background — so a `liveVersion` behind the CLI's
+/// `expectedVersion` only logs once per skew transition. Older CLIs without
+/// these fields skip silently.
+fn advise_extension_skew(status: &Value) {
+    let ext = status.get("data").and_then(|d| d.get("extension"));
+    let (Some(expected), Some(live)) = (
+        ext.and_then(|e| e.get("expectedVersion"))
+            .and_then(Value::as_str),
+        ext.and_then(|e| e.get("liveVersion"))
+            .and_then(Value::as_str),
+    ) else {
+        // Older CLIs without these fields — nothing to advise on.
+        return;
+    };
+    if expected.is_empty() || live.is_empty() {
+        return;
+    }
+    let mut last = LAST_EXTENSION_SKEW
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_poison();
+    if expected == live {
+        // In sync — clear the stored skew so a later re-skew re-logs.
+        *last = None;
+        return;
+    }
+    if *last == Some((expected.to_string(), live.to_string())) {
+        return;
+    }
+    *last = Some((expected.to_string(), live.to_string()));
+    info!(
+        "chrome-use browser extension version mismatch: installed {live}, CLI expects {expected} — \
+         Chrome updates Web Store extensions automatically in the background; reloading the \
+         extension at chrome://extensions (or waiting for the Store auto-update) clears this"
+    );
+}
+
+/// Install or update chrome-use: run the headless curl|sh installer (binary +
+/// skill), then re-register the native-messaging host — install.sh skips that
+/// step without a TTY. Shared by the Support install tool and the boot
+/// auto-updater. `Err` names the failing step and carries truncated
+/// stdout/stderr for diagnosis.
+pub(crate) async fn install_chrome_use() -> Result<(), String> {
+    let mut installer = Command::new("sh");
+    installer
+        .arg("-c")
+        .arg(format!("curl -fsSL {CHROME_USE_INSTALL_URL} | sh"));
+    run_install_step("chrome-use installer", installer).await?;
+
+    // Drop the cached CLI path before resolving for host registration: the
+    // installer may have relocated the binary (e.g. between /usr/local/bin and
+    // ~/.local/bin), and a stale cache would register the host against the
+    // pre-update location.
+    invalidate_cli_path();
+
+    // A freshly curl-installed binary may not be on the daemon's PATH yet, so
+    // prefer the resolved path (PATH + common install locations) and fall back
+    // to the bare name.
+    let mut host = Command::new(cli_path().map_or_else(
+        || "chrome-use".to_string(),
+        |p| p.to_string_lossy().into_owned(),
+    ));
+    host.args(["extension", "install"]);
+    run_install_step("`chrome-use extension install`", host).await
+}
+
+/// Run one install subprocess bounded by [`CHROME_USE_INSTALL_TIMEOUT`].
+async fn run_install_step(label: &str, mut cmd: Command) -> Result<(), String> {
+    let out = tokio::time::timeout(CHROME_USE_INSTALL_TIMEOUT, cmd.kill_on_drop(true).output())
+        .await
+        .map_err(|_| format!("{label} timed out"))?
+        .map_err(|e| format!("{label} failed to spawn: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{label} failed ({}).\nstdout: {}\nstderr: {}",
+        out.status,
+        crate::util::truncate(&String::from_utf8_lossy(&out.stdout), 2048),
+        crate::util::truncate(&String::from_utf8_lossy(&out.stderr), 2048),
+    ))
+}
+
+// ── Once-per-boot auto-update ─────────────────────────────────────────
+/// Best-effort once-per-boot auto-update of an existing chrome-use install.
+/// Runs ~5 minutes after startup (never competes with boot), is skipped when
+/// offline, and never first-installs — the first install stays behind the
+/// Support consent flow. After success there is no periodic re-check (once per
+/// boot).
+pub async fn run_auto_update() {
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+    const RETRY_WAIT: Duration = Duration::from_mins(10);
+    const MAX_RETRIES: u32 = 3;
+
+    if cfg!(target_os = "windows") {
+        debug!("chrome-use auto-update skipped: unsupported platform");
+        return;
+    }
+
+    // Spawned task — sleep first so it never competes with service startup.
+    tokio::time::sleep(Duration::from_mins(5)).await;
+
+    if cli_path().is_none() {
+        debug!("chrome-use not installed — first install stays user-confirmed (Support)");
+        return;
+    }
+    let local = cli_version().await;
+
+    // Resolve the latest release tag (curl the redirect target — no
+    // api.github.com rate limit). Retry on network failure; a non-semver tag
+    // gives up immediately (cannot compare).
+    let mut latest: Option<semver::Version> = None;
+    for attempt in 0..MAX_RETRIES {
+        match fetch_latest_tag(RELEASE_TIMEOUT).await {
+            Ok(tag) => {
+                if let Some(v) = parse_release_version(&tag) {
+                    latest = Some(v);
+                    break;
+                }
+                info!(
+                    "chrome-use auto-update: latest release tag '{tag}' is not a semver version; giving up"
+                );
+                return;
+            }
+            Err(e) => {
+                debug!(
+                    "chrome-use auto-update: release check failed (attempt {}/{}): {e}",
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                if attempt + 1 < MAX_RETRIES {
+                    tokio::time::sleep(RETRY_WAIT).await;
+                }
+            }
+        }
+    }
+    let Some(latest) = latest else {
+        debug!("chrome-use auto-update skipped: release check kept failing (offline?)");
+        return;
+    };
+
+    if let Some(local) = local.as_ref()
+        && local >= &latest
+    {
+        debug!("chrome-use is up to date ({local})");
+        return;
+    }
+    let local = local.map_or_else(|| "unknown version".to_string(), |v| v.to_string());
+    debug!("chrome-use auto-update: updating {local} → {latest}");
+
+    // Run the same headless installer + native-host registration. On failure
+    // there is no retry and no rollback (v1 policy) — log and give up for
+    // this boot. The failing step is named in the error (binary install vs
+    // host registration), so partial progress stays diagnosable.
+    match install_chrome_use().await {
+        Ok(()) => info!("chrome-use auto-updated to {latest} (binary + native host)"),
+        Err(e) => info!(
+            "chrome-use auto-update failed: {}",
+            crate::util::truncate(&e, 1024)
+        ),
+    }
+}
+
+/// Follow the GitHub `releases/latest` redirect and return the last path
+/// segment (the release tag) — same technique install.sh uses, and it avoids
+/// the api.github.com rate limit. Plain curl, no browser env.
+async fn fetch_latest_tag(timeout: Duration) -> Result<String, String> {
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-fsSLI",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{url_effective}",
+        "https://github.com/leeguooooo/chrome-use/releases/latest",
+    ]);
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| "release check timed out".to_string())?
+        .map_err(|e| format!("release check spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("release check exited with {}", out.status));
+    }
+    let url = String::from_utf8_lossy(&out.stdout);
+    let tag = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if tag.is_empty() {
+        return Err("release redirect resolved to an empty tag".to_string());
+    }
+    Ok(tag.to_string())
 }
 
 /// One-time cleanup of stale mahbot-owned browser-session artifacts at watchdog
@@ -1709,5 +2001,59 @@ mod tests {
                 "kind {kind:?} must classify as transient, not missing"
             );
         }
+    }
+
+    #[test]
+    fn release_version_parsing_strips_v_prefix() {
+        // GitHub release tags are v-prefixed; `--version` output is bare.
+        // Both must parse — a v-prefixed tag is NOT valid semver verbatim.
+        assert_eq!(
+            parse_release_version("v1.5.100"),
+            Some(semver::Version::new(1, 5, 100))
+        );
+        assert_eq!(
+            parse_release_version("1.5.100"),
+            Some(semver::Version::new(1, 5, 100))
+        );
+        assert_eq!(parse_release_version("latest"), None);
+        assert_eq!(parse_release_version(""), None);
+    }
+
+    #[test]
+    fn cli_version_parsing_scans_the_real_banner() {
+        // The --version banner ends with a bug-report URL — the version must
+        // be found by scanning, not by assuming the last token.
+        let banner = "chrome-use 1.5.100\n\
+             report bugs / rough edges: https://github.com/leeguooooo/chrome-use/issues";
+        assert_eq!(
+            parse_cli_version(banner),
+            Some(semver::Version::new(1, 5, 100))
+        );
+        assert_eq!(
+            parse_cli_version("chrome-use v1.5.99"),
+            Some(semver::Version::new(1, 5, 99))
+        );
+        assert_eq!(parse_cli_version("chrome-use\nno version here"), None);
+    }
+
+    #[test]
+    fn envelope_verdict_covers_both_envelopes() {
+        let v = |json: serde_json::Value| envelope_verdict(&json);
+        assert_eq!(v(serde_json::json!({"success": true})), Some(true));
+        assert_eq!(v(serde_json::json!({"ok": true})), Some(true));
+        assert_eq!(
+            v(serde_json::json!({"success": false, "error": "x"})),
+            Some(false)
+        );
+        assert_eq!(
+            v(serde_json::json!({"ok": false, "error": "x"})),
+            Some(false)
+        );
+        // Failure beats an unrelated success key; no verdict key → None.
+        assert_eq!(
+            v(serde_json::json!({"success": false, "ok": true})),
+            Some(false)
+        );
+        assert_eq!(v(serde_json::json!({"data": {}})), None);
     }
 }
