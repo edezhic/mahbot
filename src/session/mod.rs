@@ -261,7 +261,7 @@ async fn insert_messages_in_transaction(
 ) -> Result<()> {
     let now = db::now();
     // `created_at` stamps the session_metadata row only on creation (the
-    // freshness gate key for sync resume); it must never be touched by the
+    // session's creation timestamp); it must never be touched by the
     // ON CONFLICT DO UPDATE clauses below.
     let created_at = now.clone();
     for msg in messages {
@@ -644,6 +644,25 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Test-only thin wrapper: begin a transaction, run the tx-core settle, and
+    /// commit. Production uses [`Self::settle_tool_results_tx`] inside the
+    /// agent's atomic settle+terminalize transaction.
+    #[cfg(test)]
+    #[expect(clippy::too_many_lines)] // deliberate: locate + rebuild in one tx
+    pub(crate) async fn settle_tool_results(
+        &self,
+        agent_id: &str,
+        results: &[(String, String)],
+        follow_up: &[ChatMessage],
+    ) -> Result<Vec<SettledRow>> {
+        let tx = self.conn.begin_tx().await?;
+        let rows = self
+            .settle_tool_results_tx(&tx, agent_id, results, follow_up)
+            .await?;
+        tx.commit().await?;
+        Ok(rows)
+    }
+
     /// Settle (re-)persisted tool results directly after the session's last
     /// tool-call frame, in one transaction: the rows that follow that frame are
     /// captured and deleted, the new tool results are inserted at the frame
@@ -662,9 +681,14 @@ impl SessionStore {
     /// frame is always the session tail and the captured rows are only the
     /// frame's sibling tool rows; the frame-order interleaving is the contract
     /// (see [`build_settle_sequence`]).
-    #[expect(clippy::too_many_lines)] // deliberate: one transactional frame-locate + rebuild
-    pub(crate) async fn settle_tool_results(
+    ///
+    /// The frame-locate SELECTs run on the SAME tx as the delete/rebuild so the
+    /// locate+write is one unit — a crash (or concurrent writer) can never
+    /// observe a half-settled frame. The caller owns `commit`/`rollback`.
+    #[expect(clippy::too_many_lines)] // deliberate: locate + rebuild in one tx
+    pub(crate) async fn settle_tool_results_tx(
         &self,
+        tx: &crate::db::TxGuard<'_>,
         agent_id: &str,
         results: &[(String, String)],
         follow_up: &[ChatMessage],
@@ -676,8 +700,7 @@ impl SessionStore {
         // "tool_calls" — the role filter already excludes them. The matching
         // row's content is kept here so the frame's ordered calls can be
         // decoded from it without a second SELECT.
-        let candidate_ids: Vec<i64> = self
-            .conn
+        let candidate_ids: Vec<i64> = tx
             .query(
                 "SELECT id FROM sessions \
                  WHERE agent_id = ?1 AND role = 'assistant' AND content LIKE '%\"tool_calls\"%' \
@@ -693,8 +716,7 @@ impl SessionStore {
 
         let mut frame: Option<(i64, String)> = None;
         for id in candidate_ids {
-            let content = self
-                .conn
+            let content = tx
                 .query_optional(
                     "SELECT content FROM sessions WHERE id = ?1",
                     params![id],
@@ -737,8 +759,7 @@ impl SessionStore {
             calls
         };
 
-        let captured: Vec<SettledRow> = self
-            .conn
+        let captured: Vec<SettledRow> = tx
             .query_map_strict(
                 "SELECT role, content, created_at FROM sessions WHERE agent_id = ?1 AND id > ?2 ORDER BY id",
                 params![agent_id, frame_row_id],
@@ -753,7 +774,6 @@ impl SessionStore {
             .await
             .context("capture rows after tool-call frame")?;
 
-        let tx = self.conn.begin_tx().await?;
         // Delete the rows that follow the frame (the frame itself stays). The
         // sequence below replaces them.
         tx.execute(
@@ -781,8 +801,8 @@ impl SessionStore {
 
         // Message count: the captured rows were deleted + re-inserted (net
         // zero); the new results and follow-up rows add exactly `results.len()
-        // + follow_up.len()`. `created_at` stays INSERT-only (the freshness
-        // gate key).
+        // + follow_up.len()`. `created_at` is the session's creation timestamp
+        // (INSERT-only).
         let count = i64::try_from(results.len() + follow_up.len())
             .context("settle result count exceeds i64")?;
         tx.execute(
@@ -796,7 +816,6 @@ impl SessionStore {
         .await
         .context("bump settle message count")?;
 
-        tx.commit().await?;
         Ok(sequence)
     }
 
@@ -1045,9 +1064,11 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     };
 
     // Delete session messages for matching transient sessions. The agents
-    // table IS the marker: live sessions referenced by unfinished jobs are
-    // NEVER purged (agents rows cascade-delete when the job goes terminal, so
-    // protection self-heals ≤10 min after the next tick).
+    // table IS the protection marker: a session referenced by any agents row
+    // is never purged. For ticket-phase jobs that protection ends when the
+    // phase purge removes the job row; launched non-phase jobs are never
+    // time-deleted, so their protection is indefinite by design (released by
+    // completion or explicit abandon).
     tx.execute(
         &format!(
             "DELETE FROM sessions WHERE agent_id IN ( \
@@ -1236,9 +1257,15 @@ pub(crate) fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> St
     }
 }
 
-/// Clear the session for a user/role/workspace, returning the result message.
-pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> String {
-    Session::delete(&resolve_agent_id(user_name, role, ws_name)).await
+/// Clear the session for a user/role/workspace, returning the confirmation
+/// message. Fail-closed: the session's unfinished sync jobs are abandoned
+/// FIRST, and a failed abandon aborts the clear so the caller can surface the
+/// error — deleting the session rows despite a failed abandon would orphan the
+/// jobs with no caller session left to resume them.
+pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> anyhow::Result<String> {
+    let agent_id = resolve_agent_id(user_name, role, ws_name);
+    crate::jobs::abandon_session_jobs(&agent_id).await?;
+    Session::delete(&agent_id).await
 }
 
 /// Build a transient agent ID shared by the suffixed builder family
@@ -1469,6 +1496,43 @@ mod tests {
             .unwrap();
         assert!(store().delete(&k).await.unwrap());
         assert!(!store().delete(&k).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn clear_session_abandons_owned_sync_jobs() {
+        crate::util::test::init_test_stores().await;
+        let conn = &crate::session::store().conn;
+        // clear_session resolves the pin internally from user/role/workspace, so
+        // the sync job must be owned by that resolved agent id.
+        let agent_id = resolve_agent_id("clear_user", "engineer", "clear_ws");
+
+        crate::jobs::spawn_job(
+            conn,
+            "clear_sess_sync",
+            "task",
+            "clear_ws",
+            "clear_user",
+            "telegram",
+            crate::Role::Engineer,
+            &[],
+            &crate::jobs::SpawnChild::Analyze,
+            Some(&agent_id),
+        )
+        .await
+        .unwrap();
+
+        crate::session::clear_session("clear_user", "engineer", "clear_ws")
+            .await
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT id FROM jobs WHERE id = 'clear_sess_sync'", ())
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "clear_session abandoned the session's sync job"
+        );
     }
 
     #[tokio::test]

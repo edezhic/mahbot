@@ -156,12 +156,8 @@ pub async fn run_management() {
             warn!(
                 job = %job_id,
                 workspace = %workspace_name,
-                "Resume workspace unresolvable — deleting job row",
+                "Resume workspace unresolvable — job left in place (deleted only by explicit abandon)",
             );
-            if matches!(&stage, crate::jobs::ResumableJob::ResearchCleanup { .. }) {
-                crate::research_cleanup::release_run_folder(job_id).await;
-            }
-            let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
             continue;
         };
         match stage {

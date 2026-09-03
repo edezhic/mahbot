@@ -496,8 +496,15 @@ impl SyncDurableCore {
             crate::jobs::ResumePreamble::DrainCut => {
                 return Ok(crate::jobs::SyncResumeOutcome::DrainCut);
             }
-            crate::jobs::ResumePreamble::JobMissing => {
-                return Ok(crate::jobs::SyncResumeOutcome::JobMissing);
+            crate::jobs::ResumePreamble::Gone => {
+                return Ok(crate::jobs::SyncResumeOutcome::Gone);
+            }
+            // An unreadable row is a resume-core infra failure, not an abandon:
+            // fail the round so the caller-driven path never surfaces an
+            // "explicitly abandoned" note for a live job (the row stays
+            // launched and the next cycle retries).
+            crate::jobs::ResumePreamble::Unreadable(e) => {
+                return Err(e.context(format!("{label} resume: job row unreadable")));
             }
         };
         let args = CoreJobArgs {

@@ -13,10 +13,9 @@
 //!
 //! The folder is removed via [`release_run_folder`], the single run-folder
 //! release point, invoked per-job (never as a sweep) from the completion tail
-//! ([`run_cleanup_agent_and_finish`]), the cancel sweep
-//! ([`crate::research_cancel::sweep_cancelled_run`]), and the boot-resume paths
-//! (an unloadable cleanup row in [`resume_research_cleanup`], an unresolvable
-//! workspace in the pipeline resume). There is no periodic or scan-based
+//! ([`run_cleanup_agent_and_finish`]) and the cancel sweep
+//! ([`crate::research_cancel::sweep_cancelled_run`], including the workspace
+//! abandon's research-run cancellation). There is no periodic or scan-based
 //! run-folder sweep anywhere in the daemon, so folders of crashed runs are
 //! left for the OS temp sweep (see `crate::temp` — the temp-dir cleaner
 //! protects research run folders only by prompt instruction, never
@@ -100,9 +99,8 @@ pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
 /// its outside-folder scratch leaks to the OS temp sweep — the safe direction.
 /// The alternative (fail-open on error) would re-dispatch a cleanup LLM round
 /// for a run that ALREADY completed, per boot, until the envelope is delivered
-/// or the row ages into the 8h purge (`crate::jobs::PURGE_CUTOFF_HOURS`) — a
-/// bounded but avoidable cost for a transient read error that is far more
-/// likely than a genuine crash-window hit.
+/// — an avoidable, unbounded-until-delivery cost for a transient read error
+/// that is far more likely than a genuine crash-window hit.
 async fn run_folder_exists(job_id: &str) -> bool {
     tokio::fs::try_exists(run_root_path(job_id))
         .await
@@ -115,11 +113,10 @@ async fn run_folder_exists(job_id: &str) -> bool {
 /// folder (the ephemeral search tracker lives inside it and dies with it).
 ///
 /// Called by the completion tail ([`run_cleanup_agent_and_finish`], folder
-/// before row terminalize), the cancel sweep
-/// ([`crate::research_cancel::sweep_cancelled_run`]), and the boot-resume
-/// paths (unloadable cleanup row in [`resume_research_cleanup`], unresolvable
-/// workspace in the pipeline resume). The cleanup jobs row is NOT touched
-/// here: callers own row removal/aging.
+/// before row terminalize) and the cancel sweep
+/// ([`crate::research_cancel::sweep_cancelled_run`], including the workspace
+/// abandon's research-run cancellation). The cleanup jobs row is NOT touched
+/// here: callers own row removal.
 ///
 /// Removal failure is swallowed (the folder is "left for the OS") and the row
 /// is still terminalized by the caller — the crash-window classifier then
@@ -612,22 +609,10 @@ pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
     )
     .await
     else {
-        // The shared preamble returns None either on a drain abort (the row
-        // STAYS — the folder stays held for the next boot) or on a missing /
-        // unloadable row (the preamble terminalized it). Only the terminalize
-        // path removes a research_cleanup row, so release the run folder there
-        // to keep the invariant "row removal ⟹ folder released in the same
-        // operation" (no sweep is a backstop anymore). The row-existence check
-        // is the discriminator (more robust than re-reading the abort flag:
-        // a drain that starts between the preamble's guard and here must not
-        // suppress the release of an already-removed row). A row that still
-        // exists after a failed terminalize keeps its folder for the boot scan.
-        if !research_cleanup_row_exists(&crate::session::store().conn, job_id)
-            .await
-            .unwrap_or(true)
-        {
-            release_run_folder(job_id).await;
-        }
+        // None = drain abort (the row STAYS — the folder stays held for the
+        // next boot) or a gone row (explicit abandon — every row-removal path
+        // releases the run folder in the same operation, so there is nothing
+        // left to release here).
         return;
     };
     let prompt = caller.task.clone();

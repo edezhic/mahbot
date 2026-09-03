@@ -1550,12 +1550,22 @@ impl HomeState {
                         // a phantom Analyst session in the personal workspace.
                         let (effective_role, ws) =
                             crate::users::resolve_session_target(&sender).await;
-                        let _ = crate::session::clear_session(
+                        // Fail-closed: a failed abandon aborts the clear — the
+                        // session was not cleared, so no divider is inserted.
+                        if let Err(e) = crate::session::clear_session(
                             &sender,
                             effective_role.as_str(),
                             &ws.name,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(
+                                user = %sender,
+                                error = %e,
+                                "Home: clear failed — session kept"
+                            );
+                            return Err(e.to_string());
+                        }
                         // Insert a divider marker instead of deleting history.
                         let store = crate::channels::chat_history::store();
                         match store.insert_divider(&sender, &ws.name).await {

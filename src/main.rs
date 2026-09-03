@@ -860,7 +860,13 @@ async fn handle_clear_session(msg: &ChannelMessage) {
     // with Assistant fallback, personal-workspace Manager→Assistant remap, and
     // Assistant/Artist/Support pinning.
     let (effective_role, ws) = mahbot::users::resolve_session_target(&msg.user_name).await;
-    let reply = clear_session(&msg.user_name, effective_role.as_str(), &ws.name).await;
+    let reply = match clear_session(&msg.user_name, effective_role.as_str(), &ws.name).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            tracing::warn!(user = %msg.user_name, error = %e, "/clear failed — session kept");
+            format!("Failed to clear the session: {e:#}")
+        }
+    };
     deliver_clear_reply(&reply, msg, &ws, effective_role).await;
 }
 

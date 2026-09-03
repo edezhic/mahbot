@@ -93,10 +93,17 @@ pub(crate) enum RewriteOutcome {
 impl Session {
     // ── Session lifecycle ──────────────────────────────────────────────
 
-    /// Delete a session. Intended for `/new` command handling.
-    pub async fn delete(agent_id: &str) -> String {
-        let _ = crate::session::store().delete(agent_id).await;
-        "Session cleared. Starting fresh.".to_string()
+    /// Delete a session row and return the confirmation message. Reached via
+    /// [`crate::session::clear_session`] — the user-initiated /clear command
+    /// (Telegram), the inline clear button, and the GUI Home clear. Those paths
+    /// abandon the session's unfinished sync jobs first; BOTH the abandon and
+    /// the delete propagate errors, so the confirmation is only returned when
+    /// the session rows are really gone. Internal cleanup paths (maintainer
+    /// self-cleanup, transient TTL cleanup) call `store().delete` directly and
+    /// deliberately skip the abandon.
+    pub async fn delete(agent_id: &str) -> anyhow::Result<String> {
+        crate::session::store().delete(agent_id).await?;
+        Ok("Session cleared. Starting fresh.".to_string())
     }
 
     /// Begin a turn. Loads the persisted history and the real
@@ -352,18 +359,11 @@ impl Session {
         }
     }
 
-    /// Settle tool results directly after the session's last tool-call frame —
-    /// the durable+in-memory half of the universal resume-completion step.
-    ///
-    /// The store rewrites the rows after the frame (delete, then re-insert the
-    /// returned final sequence: new results in frame order, then the follow-up
-    /// rows — e.g. the synthetic `user(IMAGE_*)` message). The frame-order
-    /// interleaving is the contract; the only production caller runs before
-    /// `append_turn_message`, so the dangling frame is always the session tail
-    /// and captured rows are only its sibling tool rows. The in-memory history
-    /// is truncated at the frame and the store's returned settled-row sequence
-    /// is replayed verbatim; `persisted_len` is advanced to the full history
-    /// length.
+    /// Test-only thin wrapper: run the store's self-transactional settle and
+    /// mirror the rewrite into the in-memory history. Production uses
+    /// [`Self::settle_tool_results_tx`] inside the agent's atomic
+    /// settle+terminalize transaction.
+    #[cfg(test)]
     pub(crate) async fn settle_tool_results(
         &mut self,
         agent_id: &str,
@@ -373,6 +373,42 @@ impl Session {
         let settled = crate::session::store()
             .settle_tool_results(agent_id, results, follow_up)
             .await?;
+        self.mirror_settled(settled)?;
+        Ok(())
+    }
+
+    /// Settle tool results directly after the session's last tool-call frame —
+    /// the durable half of the universal resume-completion step.
+    ///
+    /// The store rewrites the rows after the frame (delete, then re-insert the
+    /// returned final sequence: new results in frame order, then the follow-up
+    /// rows — e.g. the synthetic `user(IMAGE_*)` message). The frame-order
+    /// interleaving is the contract; the only production caller runs before
+    /// `append_turn_message`, so the dangling frame is always the session tail
+    /// and captured rows are only its sibling tool rows. Returns the settled
+    /// rows for the caller to mirror via [`Self::mirror_settled`] — which MUST
+    /// happen only after the caller's transaction commits, so a commit failure
+    /// never leaves the in-memory history settled while the DB is not.
+    ///
+    /// Runs against an IN-FLIGHT transaction so the agent's atomic
+    /// settle+terminalize commits the store rewrite and the job deletion in one
+    /// transaction. The caller owns `commit`/`rollback`.
+    pub(crate) async fn settle_tool_results_tx(
+        &self,
+        tx: &crate::db::TxGuard<'_>,
+        agent_id: &str,
+        results: &[(String, String)],
+        follow_up: &[ChatMessage],
+    ) -> Result<Vec<super::SettledRow>> {
+        crate::session::store()
+            .settle_tool_results_tx(tx, agent_id, results, follow_up)
+            .await
+    }
+
+    /// Mirror a store settle's returned sequence into the in-memory history:
+    /// truncate after the tool-call frame and replay the final sequence
+    /// verbatim (role via the strum parse path, content as-is).
+    pub(crate) fn mirror_settled(&mut self, settled: Vec<super::SettledRow>) -> Result<()> {
         let Some(frame_idx) = self.history.iter().rposition(super::is_tool_call_frame) else {
             debug_assert!(
                 false,
@@ -380,9 +416,6 @@ impl Session {
             );
             return Ok(());
         };
-        // Mirror the store rewrite: truncate after the frame and replay the
-        // store's returned final sequence verbatim (role via the strum parse
-        // path, content as-is).
         self.history.truncate(frame_idx + 1);
         for row in settled {
             let role = row.role.parse::<ChatRole>().map_err(|e| {

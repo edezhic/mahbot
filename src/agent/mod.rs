@@ -721,9 +721,11 @@ impl Agent {
     /// Universal deterministic resume-completion: settle the session's last
     /// tool-call frame's result-less calls BEFORE any LLM call, on every
     /// role/path. Durable sync jobs (analyze/implement) owned by this session
-    /// pin (freshness-gated) are slot-resumed; every other call is re-executed.
-    /// Results settle contiguously after their frame — the history stays
-    /// provider-valid. No-op when nothing is dangling.
+    /// pin are slot-resumed; every other call is re-executed. Result settlement
+    /// and job terminalization commit in ONE transaction — a crash rolls back
+    /// both, the job stays launched, and the next cycle re-settles
+    /// idempotently. Results settle contiguously after their frame — the
+    /// history stays provider-valid. No-op when nothing is dangling.
     ///
     /// The single position where dangling calls are completed is intentionally
     /// ungated: a graceful drain mid-call, a hard crash and a stage re-drive all
@@ -753,12 +755,12 @@ impl Agent {
             let conn = &crate::session::store().conn;
             // Hoist the owned-jobs lookup: if ANY pending call is
             // analyze/implement, fetch the caller-owned launched-jobs pool ONCE
-            // before the loop (newest-first, freshness-gated). When only
-            // non-durable calls are pending, no jobs query runs at all. The
-            // pool is CONSUMED per call below, so two same-kind calls in one
-            // frame bind to two DISTINCT jobs — and because jobs are
-            // newest-first while frame calls are in dispatch order, each call
-            // binds the OLDEST remaining job (see the rposition below).
+            // before the loop (newest-first). When only non-durable calls are
+            // pending, no jobs query runs at all. The pool is CONSUMED per
+            // call below, so two same-kind calls in one frame bind to two
+            // DISTINCT jobs — and because jobs are newest-first while frame
+            // calls are in dispatch order, each call binds the OLDEST remaining
+            // job (see the rposition below).
             let has_durable = calls
                 .iter()
                 .any(|c| crate::tools::SyncDurableCore::from_tool_name(&c.name).is_some());
@@ -779,7 +781,8 @@ impl Agent {
                 // Durable-resume attempt for analyze/implement owned jobs: the
                 // JOBS ROW is the source of truth. A terminal job yields content
                 // (terminalized after settlement); a DrainCut stops the whole
-                // completion; a missing job falls through to re-execution.
+                // completion; a gone job was explicitly abandoned — the call is
+                // not re-executed, it surfaces a short model-facing note.
                 let mut resumed_content: Option<String> = None;
                 let core = crate::tools::SyncDurableCore::from_tool_name(&call.name);
                 if let (Some(core), Some(pos)) =
@@ -808,8 +811,21 @@ impl Agent {
                             );
                             return Ok(false);
                         }
-                        Ok(crate::jobs::SyncResumeOutcome::JobMissing) => {
-                            // Job row gone — re-execute below.
+                        Ok(crate::jobs::SyncResumeOutcome::Gone) => {
+                            // The job was explicitly abandoned (session /clear or
+                            // workspace deletion) racing this resume — no result
+                            // is available and the row is already gone, so do NOT
+                            // push onto `terminalize`. Surface a short note to
+                            // the model instead of re-executing or erroring.
+                            tracing::info!(
+                                job = %job.id,
+                                "Job row gone (explicitly abandoned) — surfacing note instead of re-executing"
+                            );
+                            resumed_content = Some(
+                                "The durable job behind this call was explicitly abandoned — \
+                                 no result is available. Re-issue the call if the work is still needed."
+                                    .to_string(),
+                            );
                         }
                         Err(e) => {
                             // A resume-core INFRA failure (roster/checkpoint DB
@@ -869,32 +885,40 @@ impl Agent {
                 pairs.push((call.id, formatted));
             }
 
-            // Orphan sweep: before any model work (turn start), a launched
-            // caller-owned job NOT bound to a pending call is an orphan — its
-            // call was already settled but the terminalize transaction was lost
-            // to a crash between the settle and terminalize transactions.
-            // NOTE: this sweep only runs when a dangling frame exists, so it
-            // heals the crash window only when the settle did not also
-            // complete; a fully-settled orphan (no frame left) falls through
-            // to the ~8h stale purge. Drain-cut early returns happen before
-            // this point, so genuinely in-flight jobs are never swept.
-            for job in owned {
-                terminalize.push(job.id);
-            }
-
-            // Settle the results contiguously after their frame (strict path —
-            // a settle error propagates). Terminalize AFTER a successful settle:
-            // a drain-cut or settle failure can never lose a resumed job's
-            // result — the job stays launched and the next cycle re-delivers the
-            // checkpointed outcome without re-running sub-agents. The leftover
-            // sweep above closes the settle-then-crash terminalize gap.
+            // Settle + terminalize in ONE transaction: the settle rewrites the
+            // post-frame session rows and the terminalize deletes each resumed
+            // job's row, so a crash rolls back BOTH — the job stays launched
+            // and the next cycle re-settles idempotently (the settle DELETEs
+            // the rows after the frame and reinserts, so re-settling an
+            // already-settled frame is a structural no-op). No orphan sweep is
+            // needed: the settle-succeeded/terminalize-lost crash window is
+            // gone by construction. Every terminalize id also pushed a pair,
+            // so the guard only needs the pairs/follow_up terms.
             if !pairs.is_empty() || !follow_up.is_empty() {
+                let tx = conn
+                    .begin_tx()
+                    .await
+                    .context("begin settle+terminalize tx")?;
+                let settled = self
+                    .session
+                    .settle_tool_results_tx(&tx, &self.agent_id, &pairs, &follow_up)
+                    .await
+                    .context("settle resumed results")?;
+                for id in terminalize {
+                    tx.execute(
+                        "DELETE FROM jobs WHERE id = ?1",
+                        crate::db::params![id.as_str()],
+                    )
+                    .await
+                    .with_context(|| format!("terminalize job {id}"))?;
+                }
+                tx.commit().await.context("commit settle+terminalize tx")?;
+                // Mirror into the in-memory history only AFTER the durable
+                // commit: a commit failure rolls the DB back, and a pre-commit
+                // mirror would leave the history settled while the DB is not.
                 self.session
-                    .settle_tool_results(&self.agent_id, &pairs, &follow_up)
-                    .await?;
-            }
-            for id in terminalize {
-                crate::jobs::terminalize_job(conn, &id).await?;
+                    .mirror_settled(settled)
+                    .context("mirror settled results")?;
             }
             Ok(!pairs.is_empty() || !follow_up.is_empty())
         })
@@ -4986,8 +5010,8 @@ mod tests {
     /// frame calls are in dispatch order), so the first frame call carries the
     /// older job's result and the second the newer; each resumed job is
     /// terminalized and its checkpointed outcome settles against its own call
-    /// id. A THIRD launched job for the pin that binds no call is terminalized
-    /// by the leftover sweep.
+    /// id. A THIRD launched job for the pin that binds no call stays launched
+    /// (unfinished jobs are never deleted except by explicit abandon).
     #[tokio::test]
     async fn complete_pending_tool_calls_binds_same_kind_calls_to_distinct_jobs() {
         let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
@@ -5027,24 +5051,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Backdate the caller session so the distinct job created_at values set
-        // below (all after it) pass the freshness gate deterministically —
-        // `db::now()` is second-precision, so two jobs spawned in the same
-        // second would share created_at and `ORDER BY created_at DESC` would be
-        // ambiguous.
-        conn.execute(
-            "UPDATE session_metadata SET created_at = ?1 WHERE agent_id = ?2",
-            crate::db::params!["2024-01-01T00:00:00+00:00", pin],
-        )
-        .await
-        .unwrap();
-
-        // Seed THREE caller-owned analyze jobs, each with an all-Done roster
-        // slot (distinct stored outcomes) so each resume core replays Terminal
-        // with zero LLM calls. The two frame calls bind the two OLDEST jobs
-        // (first call → `two_analyze_job_0`, second → `two_analyze_job_1`);
-        // `two_analyze_job_2` binds no call and must be terminalized by the
-        // leftover sweep.
+        // Backdate nothing: the gate is gone. Seed THREE caller-owned analyze
+        // jobs, each with an all-Done roster slot (distinct stored outcomes)
+        // so each resume core replays Terminal with zero LLM calls. The two
+        // frame calls bind the two OLDEST jobs (first call →
+        // `two_analyze_job_0`, second → `two_analyze_job_1`);
+        // `two_analyze_job_2` binds no call and stays launched.
         let jobs: [(&str, &str); 3] = [
             ("two_analyze_job_0", "RESULT_ONE"),
             ("two_analyze_job_1", "RESULT_TWO"),
@@ -5081,7 +5093,8 @@ mod tests {
             )
             .await
             .unwrap();
-            // Distinct, strictly-increasing created_at (all after the session).
+            // Distinct, strictly-increasing created_at so the rposition
+            // newest-first binding is deterministic at second precision.
             let created = format!("2024-01-0{}T00:00:00+00:00", i + 2);
             conn.execute(
                 "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
@@ -5092,8 +5105,8 @@ mod tests {
         }
 
         // Run the completion: both frame calls are resumed (one per call,
-        // DISTINCT — the OLDEST first), all three jobs terminalized, and the
-        // two results settled with their own call ids.
+        // DISTINCT — the OLDEST first), the two bound jobs terminalized, and
+        // the two results settled with their own call ids.
         let mut agent = make_agent_on(vec![], pin, ws);
         agent.session = session;
         let settled = agent.complete_pending_tool_calls().await.unwrap();
@@ -5105,8 +5118,9 @@ mod tests {
         );
         assert!(agent.session.pending_tool_calls().is_none());
 
-        // No launched analyze rows remain for the pin: both resumed jobs AND
-        // the unbound third job (leftover sweep) are terminalized.
+        // Only the two bound jobs are terminalized; the unbound third job
+        // stays launched (no orphan sweep — unfinished jobs survive unless
+        // explicitly abandoned).
         let jobs = conn
             .query(
                 "SELECT id FROM jobs WHERE caller_agent_id = ?1 AND kind = 'analyze' AND status = 'launched'",
@@ -5114,10 +5128,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            jobs.is_empty(),
-            "no launched analyze rows remain for the pin: {jobs:?}"
-        );
+        assert_eq!(jobs.len(), 1, "only the unbound job remains launched");
+        assert_eq!(jobs[0].get::<String>(0).unwrap(), "two_analyze_job_2");
 
         // Both results settled with the frame's ORIGINAL call ids and the
         // per-call mapping is exact: the FIRST frame call (call_analyze_g1)

@@ -1,5 +1,5 @@
 //! Durable jobs layer: jobs/agents/pending_jobs lifecycle, boot recovery
-//! scan, and stale purge orchestration.
+//! scan, and the phase-only stale purge orchestrator.
 //!
 //! All rows live in the consolidated domain database (`core.db`) behind the
 //! one shared connection — the jobs/session/board tables now share a single
@@ -8,7 +8,10 @@
 //!
 //! Table ownership: the DDL lives in the append-only schema catalog
 //! ([`crate::db::migrations`]); this module owns the row model, the lifecycle
-//! helpers, the boot scan, and the purge orchestrator.
+//! helpers, the boot scan, and the purge orchestrator. Purge scope is
+//! phase-only: ticket-phase jobs are time-deleted (the puller re-creates them
+//! from `tickets.phase`); non-phase launched jobs are never purged by time
+//! alone — explicit abandon only.
 
 use crate::Role;
 use crate::agent::message_router::{AgentJob, MessageKind};
@@ -59,6 +62,45 @@ impl std::str::FromStr for RowStatus {
     }
 }
 
+/// Explicit dispatch mode of a job — replaces the NULL-sentinel overload of
+/// `caller_agent_id`. `Sync` jobs are owned by the caller session pin
+/// (`caller_agent_id`); `Async` jobs (research/research_cleanup/temp_cleanup,
+/// ticket phases, and pin-less analyze/implement dispatches) resume at boot.
+///
+/// The string values are intrinsic Rust/SQL coupling: `as_str()`, the SQL
+/// literals in [`find_owned_launched_jobs`] / [`abandon_session_jobs`], and
+/// migration delta `30`'s backfill CASE must stay in sync on a rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobMode {
+    Sync,
+    Async,
+}
+
+impl JobMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+}
+
+impl std::str::FromStr for JobMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Case-sensitive to mirror the schema dictionary exactly.
+        match s {
+            "sync" => Ok(Self::Sync),
+            "async" => Ok(Self::Async),
+            _ => Err(anyhow::anyhow!(
+                "Invalid job mode '{s}'. Valid modes: sync, async"
+            )),
+        }
+    }
+}
+
 /// Values of `agents.kind` — dispatch-slot kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -91,9 +133,11 @@ impl AgentKind {
 /// then stragglers are force-cancelled.
 pub const DRAIN_CAP_SECS: u64 = 10 * 60;
 
-/// Stale-purge cutoff (hours): `jobs` rows older than this are purged
-/// (stranded blocking-phase tickets rolled back in place). `pending_jobs`
-/// envelopes are never purged — at-least-once keeps unconfirmed rows alive.
+/// Stale-purge cutoff (hours): only ticket-phase `jobs` rows older than this
+/// are purged (they are recoverable from `tickets.phase`). Non-phase launched
+/// jobs (researches, cleanups, sync/async envelope kinds) are never
+/// time-deleted — explicit abandon only. `pending_jobs` envelopes are never
+/// purged — at-least-once keeps unconfirmed rows alive.
 pub const PURGE_CUTOFF_HOURS: i64 = 8;
 
 // ── Row model ───────────────────────────────────────────────────────────
@@ -113,6 +157,9 @@ pub(crate) struct JobRow {
     /// The caller agent's stable session pin for sync analyze/implement jobs;
     /// NULL for async/boot-resumed jobs (see the sync-resume design).
     pub caller_agent_id: Option<String>,
+    /// Explicit dispatch mode (see [`JobMode`]) — the discriminator that
+    /// replaces the NULL-sentinel overload of `caller_agent_id`.
+    pub mode: JobMode,
 }
 
 /// A row of the `agents` table. Carries the slot `idx` (in addition to the
@@ -144,6 +191,16 @@ fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
         retry_count: row.get(3)?,
         ticket_id: row.get(4)?,
         caller_agent_id: row.get(5)?,
+        // Defensive fallback: the migration backfills every row, so a NULL or
+        // bogus value here is a legacy edge — treat it as async rather than
+        // dropping the job at boot.
+        mode: match row.get::<Option<String>>(6)? {
+            Some(s) => s.parse().unwrap_or_else(|e| {
+                warn!(mode = %s, error = %e, "Invalid jobs.mode — falling back to async");
+                JobMode::Async
+            }),
+            None => JobMode::Async,
+        },
     })
 }
 
@@ -307,12 +364,20 @@ pub(crate) async fn spawn_job(
 ) -> Result<()> {
     let kind = child.kind_str();
     let ticket_id = child_ticket_id(child);
+    // The mode is derived from the caller pin (sync ⇔ pin present). A sync
+    // dispatch executed without a pin resolves to mode=async, preserving the
+    // NULL-sentinel behavior the discriminator replaces.
+    let mode = if caller_agent_id.is_some() {
+        JobMode::Sync
+    } else {
+        JobMode::Async
+    };
     let now = db::now();
     let tx = conn.begin_tx().await?;
     tx.execute(
         "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
-         ticket_id, retry_count, created_at, updated_at, caller_agent_id) \
-         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10)",
+         ticket_id, retry_count, created_at, updated_at, caller_agent_id, mode) \
+         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11)",
         params![
             id,
             kind,
@@ -324,6 +389,7 @@ pub(crate) async fn spawn_job(
             ticket_id,
             now.clone(),
             caller_agent_id,
+            mode.as_str(),
         ],
     )
     .await
@@ -368,8 +434,8 @@ pub(crate) struct NewAgent {
 
 // ── Checkpoint ──────────────────────────────────────────────────────────
 
-/// Checkpoint a job row: bump retry_count and touch `updated_at`
-/// (every jobs write sets updated_at = now — the 8h purge keys off it).
+/// Checkpoint a job row: bump retry_count and touch `updated_at` (a plain
+/// recency marker — the phase-only purge keys off it).
 pub(crate) async fn checkpoint_job(conn: &Connection, id: &str, retry_count: i64) -> Result<()> {
     // Boot resumes re-arm status to Launched (failed → launched re-activation).
     let status = RowStatus::Launched;
@@ -496,6 +562,68 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
     Ok(())
 }
 
+// ── Explicit abandon (the only deletion path for unfinished non-phase jobs) ──
+//
+// Sync caller-owned jobs are never purged by time — only the caller's /clear or
+// the deletion of the owning workspace abandons them. This is that path.
+
+/// User-initiated /clear or session-row delete abandons the session's
+/// unfinished sync jobs before the session is deleted — no silent orphaning.
+/// CASCADE removes the roster rows; sync analyze/implement jobs carry no run
+/// folders and never create pending_jobs rows.
+#[expect(clippy::cast_possible_truncation)] // u64 row count fits usize on all supported targets
+pub(crate) async fn abandon_session_jobs(caller_agent_id: &str) -> Result<usize> {
+    let conn = &crate::session::store().conn;
+    let deleted = conn
+        .execute(
+            "DELETE FROM jobs WHERE mode = 'sync' AND caller_agent_id = ?1",
+            params![caller_agent_id],
+        )
+        .await
+        .context("abandon session sync jobs")?;
+    info!(
+        caller_agent_id,
+        count = deleted,
+        "abandoned session sync jobs"
+    );
+    Ok(deleted as usize)
+}
+
+/// Cancel + sweep the workspace's research/research_cleanup runs before its
+/// workspace-row deletion: fires each run's cancel signal, cancels its agents,
+/// removes the pending_jobs envelope, deletes the jobs row (roster/child
+/// cascade) and releases the run folder + results archive. Returns the swept
+/// run count. Fail-closed callers abort the workspace deletion when this
+/// fails. The remaining job rows (ticket phases, sync jobs) are deleted by
+/// the CALLER's workspace-row transaction, so the jobs/workspace deletion
+/// commits atomically.
+pub(crate) async fn abandon_workspace_research_runs(workspace_name: &str) -> Result<usize> {
+    let conn = &crate::session::store().conn;
+    let research_rows = conn
+        .query(
+            "SELECT id FROM jobs WHERE workspace_name = ?1 AND kind IN ('research','research_cleanup')",
+            params![workspace_name],
+        )
+        .await
+        .context("list research jobs for workspace abandon")?;
+    let mut swept = 0usize;
+    for row in &research_rows {
+        let id: String = row.get(0)?;
+        // A failed cancel leaves the jobs row for the caller's blanket DELETE,
+        // so it is counted exactly once either way. The sweep's other durable
+        // traces are compensated directly (envelope + folder + archive) — the
+        // blanket DELETE would otherwise remove the row while they leak.
+        match crate::research_cancel::cancel_research_run(&id).await {
+            Ok(()) => swept += 1,
+            Err(e) => {
+                warn!(run = %id, error = %e, "research run cancel failed during workspace abandon — compensating directly");
+                crate::research_cancel::compensate_failed_cancel(&id).await;
+            }
+        }
+    }
+    Ok(swept)
+}
+
 // ── Sync caller-owned resume primitives ────────────────────────────────
 //
 // A sync analyze/implement job is owned by the caller session that launched it
@@ -504,22 +632,20 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
 // step locates every launched caller-owned job by this pin and slot-resumes it.
 
 /// Launched sync analyze/implement jobs owned by `caller_agent_id` (the
-/// caller's stable session pin), newest first, freshness-gated, awaiting
-/// deterministic resume by the caller's universal resume-completion step. A
-/// job is resume-owned only if the caller session predates the job (session
-/// creation <= job created_at), so a FRESH caller cycle (new session after
-/// completion-delete/TTL purge) never resumes a prior cycle's orphan.
+/// caller's stable session pin), newest first, awaiting deterministic resume
+/// by the caller's universal resume-completion step. There is no freshness
+/// gate: unfinished jobs are never deleted except by explicit abandon (the
+/// /clear abandon path terminalizes a cleared session's jobs, which is what
+/// previously made the fresh-cycle gate necessary).
 pub(crate) async fn find_owned_launched_jobs(
     conn: &Connection,
     caller_agent_id: &str,
 ) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
-            "SELECT id, kind, workspace_name, retry_count, ticket_id, caller_agent_id FROM jobs j \
+            "SELECT id, kind, workspace_name, retry_count, ticket_id, caller_agent_id, mode FROM jobs j \
              WHERE j.caller_agent_id = ?1 AND j.kind IN ('analyze','implement') AND j.status = 'launched' \
-               AND j.created_at >= COALESCE( \
-                     (SELECT sm.created_at FROM session_metadata sm WHERE sm.agent_id = ?1), \
-                     (SELECT MIN(s.created_at) FROM sessions s WHERE s.agent_id = ?1)) \
+               AND j.mode = 'sync' \
              ORDER BY j.created_at DESC",
             params![caller_agent_id],
         )
@@ -715,8 +841,10 @@ pub(crate) async fn interrupt_phase_job_roster(conn: &Connection, job_id: &str) 
 /// Re-arm a resumed round's not-Done roster slots as `launched` so the
 /// `job_has_launched_agents` running-signal blocks a concurrent re-drive and
 /// the Running Agents view lists the in-flight members. Also touches the job's
-/// `updated_at` so a long-running resumed round is not sweep-purged (the 8h
-/// purge keys off `jobs.updated_at`). The stored `idx`/`task` are preserved.
+/// `updated_at` — phase jobs are still purge-eligible on stale updated_at (the
+/// phase-only purge keys off `jobs.updated_at`), so the touch keeps a
+/// long-running resumed round from being swept. The stored `idx`/`task` are
+/// preserved.
 pub(crate) async fn rearm_roster_launched(
     conn: &Connection,
     job_id: &str,
@@ -791,16 +919,21 @@ pub(crate) struct JobCaller {
     pub channel: String,
 }
 
-/// Discriminated resume preamble so sync callers never mistake a missing job
-/// for a drain-cut.
+/// Discriminated resume preamble so sync callers never mistake a gone job
+/// for a drain-cut, or a transient DB read error for an abandon.
 pub(crate) enum ResumePreamble {
     /// Caller identity + parsed role — the resume may proceed.
     Proceed(JobCaller, Role),
     /// Drain/shutdown active — quiet abort, the job row is untouched.
     DrainCut,
-    /// Job row gone (terminalized/purged) — already warned + terminalized
-    /// (no-op) by the preamble.
-    JobMissing,
+    /// The jobs row is absent — only possible via an explicit abandon (session
+    /// /clear or workspace deletion) racing this resume; no terminalization
+    /// happens (the row is already gone). The old terminalize-on-missing
+    /// compensation existed only because jobs could be purged.
+    Gone,
+    /// The job row could not be READ (transient DB error) — NOT an abandon.
+    /// The row is untouched; the error is carried for infra-failure reporting.
+    Unreadable(anyhow::Error),
 }
 
 /// Terminal outcome of a resumed sync (analyze/implement) round.
@@ -810,8 +943,9 @@ pub(crate) enum SyncResumeOutcome {
     Terminal(Role, JobCaller, anyhow::Result<String>),
     /// Drain-cut mid-resume — outcomes checkpointed, the job stays launched.
     DrainCut,
-    /// Job row gone between the ownership lookup and the resume.
-    JobMissing,
+    /// The job row was explicitly abandoned between the ownership lookup and
+    /// the resume.
+    Gone,
 }
 
 /// Load the task + caller identity of a job from the `jobs` row alone.
@@ -834,10 +968,10 @@ pub(crate) async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option
 
 /// Boot-resume preamble shared by the analyze/research resume paths. Order is
 /// load-bearing: aborting-guard FIRST (quiet return — the job row stays for the
-/// then job_caller, then terminalize-on-missing — the guard fires on Err (DB
-/// read failure) too, not just Ok(None). Returns the caller + parsed role, or
-/// None when the caller should quiet-return. `abort_site`/`missing_site` keep
-/// each site's log texts byte-identical (warn-vs-info distinction preserved).
+/// next boot), then job_caller, then the gone-missing note. Returns the caller
+/// and parsed role, or None when the caller should quiet-return. The
+/// `abort_site`/`missing_site` params inject each call site's label into its
+/// log line so the two callers' texts stay distinguishable.
 pub(crate) async fn resume_job_preamble(
     conn: &Connection,
     job_id: &str,
@@ -846,14 +980,17 @@ pub(crate) async fn resume_job_preamble(
 ) -> Option<(JobCaller, Role)> {
     match resume_job_preamble_discrete(conn, job_id, abort_site, missing_site).await {
         ResumePreamble::Proceed(caller, caller_role) => Some((caller, caller_role)),
-        ResumePreamble::DrainCut | ResumePreamble::JobMissing => None,
+        // Quiet abort for boot-resume paths: the row is untouched (drain),
+        // already gone (abandon), or unreadable (transient DB error — retried
+        // at the next boot).
+        ResumePreamble::DrainCut | ResumePreamble::Gone | ResumePreamble::Unreadable(_) => None,
     }
 }
 
 /// Discriminating core of [`resume_job_preamble`]: same order (aborting guard,
-/// then job_caller, then terminalize-on-missing) and same log texts, but the
-/// caller gets an explicit [`ResumePreamble`] so a sync caller can tell a
-/// missing job apart from a drain-cut.
+/// then job_caller, then the gone-missing note) and same log texts, but the
+/// caller gets an explicit [`ResumePreamble`] so a sync caller can tell a gone
+/// job apart from a drain-cut.
 pub(crate) async fn resume_job_preamble_discrete(
     conn: &Connection,
     job_id: &str,
@@ -864,13 +1001,25 @@ pub(crate) async fn resume_job_preamble_discrete(
         tracing::info!(job = %job_id, "{abort_site} aborted — drain/shutdown in progress");
         return ResumePreamble::DrainCut;
     }
-    let Ok(Some(caller)) = job_caller(conn, job_id).await else {
-        tracing::warn!(job = %job_id, "{missing_site}: missing job row — terminalizing job");
-        let _ = terminalize_job(conn, job_id).await;
-        return ResumePreamble::JobMissing;
-    };
-    let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(Role::Manager);
-    ResumePreamble::Proceed(caller, caller_role)
+    match job_caller(conn, job_id).await {
+        Ok(Some(caller)) => {
+            let caller_role = std::str::FromStr::from_str(&caller.role).unwrap_or(Role::Manager);
+            ResumePreamble::Proceed(caller, caller_role)
+        }
+        // The row is only ever absent because an explicit abandon raced this
+        // resume — report it as such.
+        Ok(None) => {
+            tracing::info!(job = %job_id, "{missing_site}: job row gone (explicitly abandoned) — skipping resume");
+            ResumePreamble::Gone
+        }
+        // A transient DB read error is NOT an abandon — warn, and surface it
+        // as an infra failure for the sync caller (fail-safe: no deletion,
+        // the row is untouched either way).
+        Err(e) => {
+            tracing::warn!(job = %job_id, error = %e, "{missing_site}: failed to read job row — skipping resume");
+            ResumePreamble::Unreadable(e)
+        }
+    }
 }
 
 /// Read a job's boot-resume retry count (0 = never boot-resumed). Used by the
@@ -899,7 +1048,7 @@ pub(crate) async fn job_retry_count(conn: &Connection, job_id: &str) -> i64 {
 pub(crate) async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
-            "SELECT id, kind, workspace_name, retry_count, ticket_id, caller_agent_id FROM jobs \
+            "SELECT id, kind, workspace_name, retry_count, ticket_id, caller_agent_id, mode FROM jobs \
              WHERE status != 'done' ORDER BY created_at",
             (),
         )
@@ -1204,34 +1353,37 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
 
 /// Stale-job purge.
 ///
-/// Cutoff = 8h. Deletes jobs whose updated_at predates the cutoff AND whose
+/// Cutoff = 8h. Deletes only stale TICKET-PHASE jobs (kinds matching
+/// [`is_ticket_phase_kind`]) whose updated_at predates the cutoff AND whose
 /// roster agents' sessions are all stale too (live sessions referenced by
 /// unfinished jobs are NEVER purged — the agents table IS the marker).
 /// A stale ticket phase job is deleted here; the puller re-creates it for the
 /// ticket (which stays in its phase) on the next tick — `tickets.phase` is the
 /// sole authority, so no board rollback is needed. Paused workspaces' phase
 /// jobs are purge-immune (they hold the running slot while frozen).
+/// Unfinished non-phase jobs are never time-deleted (explicit abandon only).
 pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     let conn = &crate::session::store().conn;
 
     // A paused (frozen) phase job is purge-immune: it holds the workspace's
-    // running slot while frozen, and must survive an arbitrarily long pause.
-    // The freeze authority is the workspace `paused` flag. Non-ticket jobs
-    // (researches, temp cleanups) are handled by their own lifecycle.
-    //
-    // A stale ticket phase job is deleted here; the puller re-creates it for
-    // the ticket (which stays in its phase) on the next tick — no rollback is
-    // needed because `tickets.phase` is the sole authority and the puller is
-    // the sole dispatch driver.
+    // running slot while frozen. The kind filter mirrors `is_ticket_phase_kind`.
+    let phase_kinds = TICKET_PHASE_KINDS
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let rows = conn
         .query(
-            "SELECT j.id, j.kind, j.workspace_name, j.ticket_id \
-             FROM jobs j \
-             WHERE j.updated_at < ?1 \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM agents a \
-                 JOIN session_metadata sm ON sm.agent_id = a.agent_id \
-                 WHERE a.job_id = j.id AND sm.last_activity >= ?1)",
+            &format!(
+                "SELECT j.id, j.kind, j.workspace_name, j.ticket_id \
+                 FROM jobs j \
+                 WHERE j.updated_at < ?1 \
+                   AND j.kind IN ({phase_kinds}) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM agents a \
+                     JOIN session_metadata sm ON sm.agent_id = a.agent_id \
+                     WHERE a.job_id = j.id AND sm.last_activity >= ?1)"
+            ),
             params![cutoff],
         )
         .await
@@ -1253,10 +1405,9 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     let mut purge_ids: Vec<String> = Vec::with_capacity(rows.len());
     for row in &rows {
         let id: String = row.get(0)?;
-        let kind: String = row.get(1)?;
         let workspace_name: String = row.get(2)?;
         // A paused workspace's phase job is frozen — purge-immune.
-        if is_ticket_phase_kind(&kind) && paused_ws.contains(&workspace_name) {
+        if paused_ws.contains(&workspace_name) {
             continue;
         }
         purge_ids.push(id);
@@ -1280,33 +1431,65 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     Ok(deleted as u64)
 }
 
+/// `jobs.kind` values of the ticket working-phase kinds — the single source
+/// shared by [`is_ticket_phase_kind`] and the purge's SQL filter.
+pub(crate) const TICKET_PHASE_KINDS: &[&str] = &[
+    "analysis",
+    "in_development",
+    "in_diagnostics",
+    "in_review",
+    "in_qa",
+    "in_sanitation",
+];
+
 /// Is this `jobs.kind` one of the ticket working-phase kinds?
+#[must_use]
 pub(crate) fn is_ticket_phase_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "analysis" | "in_development" | "in_diagnostics" | "in_review" | "in_qa" | "in_sanitation"
-    )
+    TICKET_PHASE_KINDS.contains(&kind)
 }
 
-/// Sync caller-owned analyze/implement jobs are settled by the owner's live
-/// resume-completion step ([`find_owned_launched_jobs`]) — boot resume must
-/// never race it. Research jobs always spawn with `caller_agent_id = None`,
-/// so within the research/analyze branch only the analyze half can fire.
-fn skip_sync_caller_owned(job: &JobRow) -> bool {
-    match job.caller_agent_id.as_deref() {
-        Some(caller) => {
-            info!(job = %job.id, caller = %caller, "sync caller-owned job — caller resumes it; skipping boot resume");
-            true
-        }
-        None => false,
+/// Sync jobs (mode='sync') are settled by the owner's live resume-completion
+/// step ([`find_owned_launched_jobs`]) — boot resume must never race it.
+/// Research jobs always spawn with mode='async', so within the research/analyze
+/// branch only the analyze half can fire.
+fn skip_sync_job(job: &JobRow) -> bool {
+    if job.mode == JobMode::Sync {
+        info!(
+            job = %job.id,
+            caller = ?job.caller_agent_id,
+            "sync job — caller resumes it; skipping boot resume",
+        );
+        true
+    } else {
+        false
     }
+}
+
+/// Binding 3: a resume-eligible job whose workspace can no longer be resolved
+/// is left in place, not terminalized — the row is deleted only by explicit
+/// abandon, so the boot loop skips it without bumping retry_count or touching
+/// the roster. Returns `true` when the job should be skipped.
+async fn workspace_unresolvable(job: &JobRow) -> bool {
+    if crate::users::resolve_workspace(&job.workspace_name)
+        .await
+        .is_ok_and(|ws| ws.is_some())
+    {
+        return false;
+    }
+    warn!(
+        job = %job.id,
+        workspace = %job.workspace_name,
+        "workspace unresolvable — job stays launched, skipped (no boot resume, no checkpoint)",
+    );
+    true
 }
 
 /// Boot recovery scan: first statement of run_management. Order: (0) replay
 /// pending_jobs; (1) one scan over the active jobs — ticket phase jobs only get
 /// their stale launched roster cleared (the puller re-drives them), the
-/// research/analyze/research_cleanup kinds resume, and temp_cleanup rows are
-/// terminalized.
+/// research/analyze/implement/research_cleanup kinds resume, and temp_cleanup
+/// rows are terminalized. A resume-eligible job whose workspace is unresolvable
+/// is skipped in place (binding 3), never terminalized.
 ///
 /// Every resumed job gets updated_at = now (the boot bump — the ONLY
 /// protection for the pre-first-commit window; Session::init with an empty
@@ -1348,7 +1531,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
         } else if job.kind == "research" || job.kind == "analyze" {
             // Resume at the roster/state level (dispatch re-enters the
             // orchestrator with the stored task). Always bump retry_count.
-            if skip_sync_caller_owned(job) {
+            if skip_sync_job(job) || workspace_unresolvable(job).await {
                 continue;
             }
             let kind = job.kind.as_str();
@@ -1369,7 +1552,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             // A single-coder implement round interrupted by a crash: resume it
             // like any other durable envelope kind. The coder roster row holds
             // the terminal outcome; the job row holds the caller identity.
-            if skip_sync_caller_owned(job) {
+            if skip_sync_job(job) || workspace_unresolvable(job).await {
                 continue;
             }
             let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
@@ -1383,6 +1566,9 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             // crash. Resume it like any other durable job. Any path that
             // removes a research_cleanup row must release the run folder in
             // the same operation.
+            if workspace_unresolvable(job).await {
+                continue;
+            }
             let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
             resumable.push(ResumableJob::ResearchCleanup {
                 job_id: job.id.clone(),
@@ -1542,6 +1728,19 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
 mod tests {
     use super::*;
 
+    /// Insert a minimal ticket row so a [`SpawnChild::Phase`] job's `ticket_id`
+    /// FK resolves (the phase job row links to tickets).
+    async fn seed_ticket(conn: &crate::db::Connection, ticket_id: &str, ws_name: &str) {
+        let now = crate::db::now();
+        conn.execute(
+            "INSERT INTO tickets (id, title, description, workspace_name, created_at, updated_at) \
+             VALUES (?1, 'title', 'desc', ?2, ?3, ?3)",
+            crate::db::params![ticket_id, ws_name, now],
+        )
+        .await
+        .unwrap();
+    }
+
     async fn status_retry(conn: &crate::db::Connection, job_id: &str) -> (String, i64) {
         let rows = conn
             .query(
@@ -1557,11 +1756,12 @@ mod tests {
         )
     }
 
-    /// (f) Boot recovery resumes only NULL-caller analyze/implement/research
-    /// jobs. Sync caller-owned jobs (analyze/implement with `caller_agent_id`)
-    /// are skipped — their caller session re-drives them — so they stay
-    /// `launched` with `retry_count` untouched; the NULL-caller job is
-    /// check-pointed (retry_count bumped, status re-armed to launched).
+    /// (f) Boot recovery resumes only async analyze/implement/research jobs.
+    /// Sync caller-owned jobs (mode='sync' from a Some(caller) spawn) are
+    /// skipped — their caller session re-drives them — so they stay `launched`
+    /// with `retry_count` untouched; the async job is check-pointed
+    /// (retry_count bumped, status re-armed to launched). The mode discriminator
+    /// replaces the NULL-sentinel overload of `caller_agent_id`.
     #[tokio::test]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
     async fn boot_recovery_skips_caller_owned_jobs() {
@@ -1569,6 +1769,10 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let ws_name = "boot_recovery_ws";
+        // Binding 3: boot recovery skips (not terminalizes) a resume-eligible
+        // job whose workspace is unresolvable — so the spawns need a registered
+        // workspace for the async analyze to be check-pointed.
+        crate::util::test::create_test_workspace("/tmp/boot_recovery_ws", ws_name).await;
 
         for (job_id, kind, child, caller) in [
             (
@@ -1611,30 +1815,47 @@ mod tests {
             .unwrap();
         }
 
+        // Spawn derives mode from the caller pin (sync ⇔ pin present).
+        let modes: Vec<String> = conn
+            .query(
+                "SELECT mode FROM jobs WHERE id IN ('owned_analyze','owned_implement','null_analyze') ORDER BY id",
+                (),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            modes,
+            ["async".to_string(), "sync".to_string(), "sync".to_string()],
+            "spawn derives mode from the caller pin (sync ⇔ pin present)"
+        );
+
         let resumable = recover_from_restart().await.unwrap();
 
         assert!(
             resumable.iter().any(
                 |r| matches!(r, ResumableJob::Analyze { job_id, .. } if job_id == "null_analyze")
             ),
-            "the NULL-caller analyze is selected for boot resume"
+            "the async analyze is selected for boot resume"
         );
         assert!(
             !resumable.iter().any(
                 |r| matches!(r, ResumableJob::Analyze { job_id, .. } if job_id == "owned_analyze")
             ),
-            "the caller-owned analyze is not boot-resumed"
+            "the sync caller-owned analyze is not boot-resumed"
         );
         assert!(
             !resumable.iter().any(
                 |r| matches!(r, ResumableJob::Implement { job_id, .. } if job_id == "owned_implement")
             ),
-            "the caller-owned implement is not boot-resumed"
+            "the sync caller-owned implement is not boot-resumed"
         );
 
-        // Owned jobs stay launched with retry_count unchanged (checkpoint NOT
-        // applied); the NULL-caller job is check-pointed.
-        for (job_id, _) in [("owned_analyze", "pin_a"), ("owned_implement", "pin_b")] {
+        // Sync jobs stay launched with retry_count unchanged (checkpoint NOT
+        // applied); the async job is check-pointed.
+        for job_id in ["owned_analyze", "owned_implement"] {
             assert_eq!(
                 status_retry(conn, job_id).await,
                 ("launched".to_string(), 0),
@@ -1644,7 +1865,168 @@ mod tests {
         assert_eq!(
             status_retry(conn, "null_analyze").await,
             ("launched".to_string(), 1),
-            "the NULL-caller analyze is check-pointed (retry_count bumped)"
+            "the async analyze is check-pointed (retry_count bumped)"
         );
+    }
+
+    /// The /clear abandon path deletes ONLY the cleared session's sync jobs —
+    /// async and ticket-phase jobs for the same workspace survive, and the sync
+    /// job's roster cascades away with it.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn clear_abandons_session_sync_jobs() {
+        let _guard = crate::util::test::retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let ws_name = "clear_abandon_ws";
+        seed_ticket(conn, "t_clear", ws_name).await;
+
+        for (job_id, child, caller) in [
+            ("clear_sync", SpawnChild::Analyze, Some("pin_clear")),
+            ("clear_async", SpawnChild::Analyze, None),
+            (
+                "clear_phase",
+                SpawnChild::Phase {
+                    phase: crate::pipeline::board::TicketPhase::Analysis,
+                    ticket_id: "t_clear".to_string(),
+                },
+                None,
+            ),
+        ] {
+            spawn_job(
+                conn,
+                job_id,
+                "task",
+                ws_name,
+                "caller",
+                "telegram",
+                crate::Role::Engineer,
+                &[NewAgent {
+                    agent_id: format!("{job_id}_agent"),
+                    kind: AgentKind::Analyst,
+                    idx: Some(0),
+                    task: "task".to_string(),
+                }],
+                &child,
+                caller,
+            )
+            .await
+            .unwrap();
+        }
+
+        let abandoned = abandon_session_jobs("pin_clear").await.unwrap();
+        assert_eq!(abandoned, 1, "only the caller-owned sync job is abandoned");
+
+        let remaining: Vec<String> = conn
+            .query(
+                "SELECT id FROM jobs WHERE id IN ('clear_sync','clear_async','clear_phase') ORDER BY id",
+                (),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String>(0).unwrap())
+            .collect();
+        assert_eq!(
+            remaining,
+            ["clear_async", "clear_phase"],
+            "async + phase jobs survive the session abandon"
+        );
+
+        let roster: Vec<String> = conn
+            .query(
+                "SELECT agent_id FROM agents WHERE job_id = 'clear_sync'",
+                (),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String>(0).unwrap())
+            .collect();
+        assert!(roster.is_empty(), "sync job roster cascaded away");
+    }
+
+    /// Workspace deletion abandons every job for the workspace uniformly: sync,
+    /// phase, research, and research_cleanup rows all go, research run folders
+    /// are released via the run cancel, and the rosters cascade away.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn workspace_delete_abandons_all_jobs() {
+        let _guard = crate::util::test::retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let ws_name = "ws_abandon_test";
+        seed_ticket(conn, "t_abandon", ws_name).await;
+
+        for (job_id, child, caller) in [
+            ("abandon_sync", SpawnChild::Analyze, Some("pin_abandon")),
+            (
+                "abandon_phase",
+                SpawnChild::Phase {
+                    phase: crate::pipeline::board::TicketPhase::Analysis,
+                    ticket_id: "t_abandon".to_string(),
+                },
+                None,
+            ),
+            ("abandon_research", SpawnChild::Research, None),
+            ("abandon_cleanup", SpawnChild::ResearchCleanup, None),
+        ] {
+            spawn_job(
+                conn,
+                job_id,
+                "task",
+                ws_name,
+                "caller",
+                "telegram",
+                crate::Role::Engineer,
+                &[NewAgent {
+                    agent_id: format!("{job_id}_agent"),
+                    kind: AgentKind::Analyst,
+                    idx: Some(0),
+                    task: "task".to_string(),
+                }],
+                &child,
+                caller,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Full integration: the WorkspaceStore built over the shared test conn
+        // (production shares one connection across domain stores) runs the
+        // research-run sweep fail-closed, then deletes the remaining job rows
+        // atomically with the workspace row.
+        let ws_store = crate::workspace::WorkspaceStore { conn: conn.clone() };
+        ws_store.delete(ws_name).await.unwrap();
+
+        let jobs = conn
+            .query(
+                "SELECT id FROM jobs WHERE workspace_name = ?1",
+                crate::db::params![ws_name],
+            )
+            .await
+            .unwrap();
+        assert!(jobs.is_empty(), "every job row for the workspace is gone");
+
+        let research = conn
+            .query(
+                "SELECT id FROM research_jobs WHERE id IN ('abandon_research','abandon_cleanup')",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            research.is_empty(),
+            "research_jobs child rows cascaded away"
+        );
+
+        let roster = conn
+            .query(
+                "SELECT agent_id FROM agents WHERE job_id IN ('abandon_sync','abandon_phase','abandon_research','abandon_cleanup')",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(roster.is_empty(), "every seeded agent roster cascaded away");
     }
 }

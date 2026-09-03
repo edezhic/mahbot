@@ -162,6 +162,26 @@ pub(crate) async fn sweep_cancelled_run(job_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Best-effort compensation for a FAILED [`cancel_research_run`] during
+/// workspace abandon: the row-level tx failed, so remove the pending_jobs
+/// envelope and the results archive and release the run folder directly
+/// (every step idempotent). The jobs row itself is left for the caller's
+/// workspace-jobs DELETE.
+pub(crate) async fn compensate_failed_cancel(job_id: &str) {
+    let conn = &crate::session::store().conn;
+    if let Err(e) = conn
+        .execute(
+            "DELETE FROM pending_jobs WHERE id = ?1",
+            crate::db::params![job_id],
+        )
+        .await
+    {
+        tracing::warn!(run = %job_id, error = %e, "pending_jobs removal failed during abandon compensation");
+    }
+    crate::research_cleanup::release_run_folder(job_id).await;
+    delete_results_archive(job_id).await;
+}
+
 /// Delete the run's results.md archive
 /// (`<storage_root>/research/results/{run_id}.md`). Fail-open: a leftover
 /// archive is a bounded race with a racing terminalize write (the accepted

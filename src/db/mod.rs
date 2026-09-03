@@ -1262,6 +1262,44 @@ impl TxGuard<'_> {
         Connection::query_impl(&self.conn, sql, params).await
     }
 
+    /// Execute a query that returns zero or one row, mapping it through a
+    /// closure. Returns `Ok(None)` when no row matches.
+    pub async fn query_optional<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnOnce(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Option<T>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        match self.query_row(sql, params, map).await {
+            Ok(val) => Ok(Some(val)),
+            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Execute a query, mapping each row through a closure, failing on the
+    /// first per-row error.
+    pub async fn query_map_strict<T, E>(
+        &self,
+        sql: &str,
+        params: impl IntoParams + Send + 'static,
+        map: impl FnMut(&Row) -> std::result::Result<T, E> + Send + 'static,
+    ) -> anyhow::Result<Vec<T>>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+    {
+        let rows = self.query(sql, params).await?;
+        map_rows(&rows, map)
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Commit the transaction and release the lock.
     pub async fn commit(mut self) -> turso::Result<()> {
         self.conn.execute("COMMIT", ()).await?;

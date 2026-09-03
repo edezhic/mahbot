@@ -534,11 +534,11 @@ pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace) {
         Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
             (caller_role, caller, result)
         }
-        // Drain-cut mid-resume / job row vanished: abort quietly — the core
-        // logs the reason; a missing job was already warned + terminalized.
-        Ok(
-            crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::JobMissing,
-        ) => return,
+        // Drain-cut mid-resume / job row gone (explicitly abandoned): abort
+        // quietly — the core logs the reason; a gone job was already noted.
+        Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
+            return;
+        }
         // Resume infra failure (roster load / checkpoint) — deliver an error
         // envelope to the ORIGINAL caller, exactly like a round-level failure.
         // The job row is still present (the core never terminalizes), so the
@@ -2664,8 +2664,7 @@ mod tests {
 
     /// Seed a caller-owned analyze job with a single roster slot. `outcome`
     /// `Some` marks the slot Done with that stored outcome (reconstructable);
-    /// `None` leaves it launched. The caller session must be created BEFORE
-    /// this call so the job passes the freshness gate.
+    /// `None` leaves it launched.
     async fn seed_analyze_job(ws: &Workspace, job_id: &str, pin: &str, outcome: Option<&str>) {
         let conn = &crate::session::store().conn;
         let analyst_id = format!("{job_id}_analyst");
@@ -2701,70 +2700,6 @@ mod tests {
         }
     }
 
-    /// (h) The freshness gate blocks a FRESH caller session from resuming a
-    /// prior cycle's stale orphan: the resume hook returns EMPTY, the stale job
-    /// stays launched and untouched, and NO rows are added to the session (no
-    /// synthesis — the stale-result protection for fresh caller cycles holds).
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
-    async fn sync_analyze_freshness_gate_blocks_fresh_session() {
-        let _lock = retry_tests_lock();
-        crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_analyze_freshness");
-        let pin = "sync_analyze_freshness_pin";
-        let conn = &crate::session::store().conn;
-
-        // A FRESH caller session is NEWER than the stale orphan job.
-        crate::util::test::seed_session_row(conn, pin, "user", "fresh cycle").await;
-        seed_analyze_job(&ws, "stale_job", pin, Some("OLD_RESULT")).await;
-        // Backdate the stale job below the fresh session's creation so the gate
-        // rejects it.
-        conn.execute(
-            "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
-            crate::db::params!["2020-01-01T00:00:00+00:00", "stale_job"],
-        )
-        .await
-        .unwrap();
-
-        let owned = crate::jobs::find_owned_launched_jobs(conn, pin)
-            .await
-            .unwrap();
-        assert!(
-            owned.is_empty(),
-            "a fresh caller cycle resumes nothing from a prior cycle"
-        );
-
-        let stale = conn
-            .query(
-                "SELECT status, retry_count FROM jobs WHERE id = ?1",
-                crate::db::params!["stale_job"],
-            )
-            .await
-            .unwrap();
-        assert_eq!(stale.len(), 1, "stale job is untouched");
-        assert_eq!(stale[0].get::<String>(0).unwrap(), "launched");
-        assert_eq!(
-            stale[0].get::<i64>(1).unwrap(),
-            0,
-            "stale job was not checkpointed"
-        );
-
-        // No session rows were added (no synthesis — the stale-result
-        // protection for fresh caller cycles holds).
-        let session_rows = conn
-            .query(
-                "SELECT id FROM sessions WHERE agent_id = ?1",
-                crate::db::params![pin],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            session_rows.len(),
-            1,
-            "no session rows were added by the hook"
-        );
-    }
-
     /// (k-extra) `find_owned_launched_jobs` returns only the caller's
     /// launched analyze/implement jobs — a research-kind and a ticket-phase-kind
     /// job owned by the same pin are ignored — newest first.
@@ -2776,18 +2711,6 @@ mod tests {
         let ws = test_ws("/tmp/test_ws_find_owned");
         let pin = "sync_analyze_find_pin";
         let conn = &crate::session::store().conn;
-
-        // A caller session row so the freshness gate admits the live analyze
-        // jobs (without any session row OR metadata the tightened comparison is
-        // NULL and no job passes). Backdate the session so the `analyze_older`
-        // job (also backdated, but after the session) stays admissible.
-        crate::util::test::seed_session_row(conn, pin, "user", "...").await;
-        conn.execute(
-            "UPDATE sessions SET created_at = ?1 WHERE agent_id = ?2 AND role = 'user'",
-            crate::db::params!["2021-01-01T00:00:00+00:00", pin],
-        )
-        .await
-        .unwrap();
 
         // A research-kind job owned by the pin.
         crate::jobs::spawn_job(
@@ -2843,6 +2766,8 @@ mod tests {
 
         seed_analyze_job(&ws, "analyze_newer", pin, None).await;
         seed_analyze_job(&ws, "analyze_older", pin, None).await;
+        // Backdate `analyze_older` so the newest-first assertion is
+        // deterministic at `created_at` second precision.
         conn.execute(
             "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
             crate::db::params!["2023-01-02T00:00:00+00:00", "analyze_older"],
@@ -3061,8 +2986,6 @@ mod tests {
         let ws = test_ws("/tmp/test_ws_sync_analyze_draincut");
         let pin = "sync_analyze_draincut_pin";
         let conn = &crate::session::store().conn;
-        // A caller session row so the freshness gate admits the sync job.
-        crate::util::test::seed_session_row(conn, pin, "user", "analyze this").await;
 
         crate::shutdown::drain_begin();
         let tool = AnalyzeTool::new(DispatchMode::Sync, crate::Role::Engineer);
@@ -3188,93 +3111,5 @@ mod tests {
             .await
             .unwrap();
         assert!(pending_jobs.is_empty(), "no envelope pending after resume");
-    }
-
-    /// (g) The freshness gate excludes a backdated owned job, so the
-    /// completion does NOT resume it (untouched) and instead re-executes the
-    /// call fresh — a NEW analyze job is spawned alongside the stale one.
-    #[tokio::test]
-    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
-    async fn completion_freshness_gate_falls_through_to_reexecution() {
-        let _lock = retry_tests_lock();
-        crate::util::test::init_management_test_stores().await;
-        let ws = test_ws("/tmp/test_ws_analyze_gate_reexec");
-        let pin = "sync_analyze_gate_pin";
-        let conn = &crate::session::store().conn;
-        let old_job = "sync_analyze_gate_stale";
-
-        crate::util::test::seed_session_row(conn, pin, "user", "analyze task").await;
-        let frame = crate::providers::reasoning::assistant_replay_payload(
-            Some(""),
-            &[crate::ToolCall {
-                id: "call_analyze_g".to_string(),
-                name: "analyze".to_string(),
-                arguments: json!({"analyze": "analyze task"}),
-            }],
-            None,
-        )
-        .to_string();
-        crate::util::test::seed_session_row(conn, pin, "assistant", &frame).await;
-        seed_analyze_job(&ws, old_job, pin, Some("OLD_RESULT")).await;
-        // Backdate the owned job below the caller session so the gate rejects it.
-        conn.execute(
-            "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
-            crate::db::params!["2020-01-01T00:00:00+00:00", old_job],
-        )
-        .await
-        .unwrap();
-
-        let mut session = crate::session::Session::default();
-        session.init(pin).await.unwrap();
-        let pending = session.pending_tool_calls().expect("dangling analyze call");
-        assert_eq!(pending.len(), 1);
-
-        // The freshness gate excludes the backdated job → nothing to resume.
-        let owned = crate::jobs::find_owned_launched_jobs(conn, pin)
-            .await
-            .unwrap();
-        assert!(
-            owned.is_empty(),
-            "backdated job excluded by the freshness gate"
-        );
-
-        // Re-execute the call fresh (drain active → the new job stays launched).
-        crate::shutdown::drain_begin();
-        let tool = AnalyzeTool::new(DispatchMode::Sync, crate::Role::Engineer);
-        let res = crate::agent::CURRENT_TOOL_AGENT_ID
-            .scope(Some(pin.to_string()), async {
-                tool.execute(&ws, json!({"analyze": "analyze task"})).await
-            })
-            .await;
-        crate::shutdown::drain_clear();
-        let err = res.expect_err("fresh re-execution must drain-cut");
-        assert!(
-            err.downcast_ref::<crate::tools::CallSuspended>().is_some(),
-            "CallSuspended carrier expected: {err:#}"
-        );
-
-        // Two jobs total: the stale one untouched + a NEW one spawned.
-        let rows = conn
-            .query(
-                "SELECT id, status, retry_count FROM jobs WHERE caller_agent_id = ?1 AND kind = 'analyze' ORDER BY created_at",
-                crate::db::params![pin],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            rows.len(),
-            2,
-            "a fresh job is spawned alongside the stale one"
-        );
-        let old = rows
-            .iter()
-            .find(|r| r.get::<String>(0).unwrap() == old_job)
-            .expect("stale job present");
-        assert_eq!(old.get::<String>(1).unwrap(), "launched");
-        assert_eq!(old.get::<i64>(2).unwrap(), 0, "stale job untouched");
-        assert!(
-            rows.iter().any(|r| r.get::<String>(0).unwrap() != old_job),
-            "a NEW analyze job was spawned"
-        );
     }
 }

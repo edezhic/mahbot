@@ -49,6 +49,23 @@ impl Tool for ImplementTool {
         "implement"
     }
 
+    /// Mode-keyed tool description (see [`DispatchMode`]).
+    ///
+    /// The sync variant returns the shared `tool/implement.md` asset verbatim.
+    /// The async variant appends the `tool/implement_async.md` note so an agent
+    /// reading the schema instantly understands that the coder's result arrives
+    /// later as an injected follow-up result message, not in the tool's return
+    /// value.
+    fn description(&self) -> String {
+        let base = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
+        if self.dispatch_mode.is_async() {
+            let async_note = crate::prompt::load_prompt("tool/implement_async.md");
+            format!("{base}\n\n{async_note}")
+        } else {
+            base
+        }
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
         super::tool_params_schema(
             &json!({
@@ -381,11 +398,11 @@ pub(crate) async fn resume_implement_round(job_id: &str, ws: &Workspace) {
         Ok(crate::jobs::SyncResumeOutcome::Terminal(caller_role, caller, result)) => {
             (caller_role, caller, result)
         }
-        // Drain-cut mid-resume / job row vanished: abort quietly — the core
-        // logs the reason; a missing job was already warned + terminalized.
-        Ok(
-            crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::JobMissing,
-        ) => return,
+        // Drain-cut mid-resume / job row gone (explicitly abandoned): abort
+        // quietly — the core logs the reason; a gone job was already noted.
+        Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
+            return;
+        }
         // Resume infra failure (roster load / checkpoint) — deliver an error
         // envelope to the ORIGINAL caller, exactly like a round-level failure.
         // The job row is still present (the core never terminalizes), so the
@@ -461,6 +478,29 @@ mod tests {
                 .to_string()
                 .contains("Missing required field: task"),
             "Should mention missing task"
+        );
+    }
+
+    /// Mode-keyed description: the sync variant is the base asset; the async
+    /// variant appends the async-note so an agent sees the result arrives later
+    /// as an injected envelope, not in the return value.
+    #[test]
+    fn implement_description_mode_keyed() {
+        let sync = ImplementTool::new(DispatchMode::Sync, Role::Coder);
+        assert!(
+            !sync.description().contains("dispatched asynchronously"),
+            "sync description must not carry the async note"
+        );
+
+        let async_tool = ImplementTool::new(DispatchMode::Async, Role::Coder);
+        let async_desc = async_tool.description();
+        assert!(
+            async_desc.contains("dispatched asynchronously"),
+            "async description must carry the async note"
+        );
+        assert!(
+            async_desc.contains("<implement-tool-result>"),
+            "async note names the result envelope"
         );
     }
 

@@ -272,6 +272,13 @@ impl SessionsState {
             }
             SessionsMessage::DeleteSession(key) => Task::perform(
                 async move {
+                    // User-initiated deletion: abandon the session's unfinished
+                    // sync jobs first — a delete must not orphan them. A failure
+                    // surfaces via the error toast and the delete is skipped so
+                    // the user can retry.
+                    crate::jobs::abandon_session_jobs(&key)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let store = crate::session::store();
                     let deleted = store.delete(&key).await.map_err(|e| e.to_string())?;
                     Ok::<_, String>((key, deleted))

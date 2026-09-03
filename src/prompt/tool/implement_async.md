@@ -1,0 +1,1 @@
+The call is dispatched asynchronously, so the tool returns immediately without the result. The coder's result arrives later in your session as an injected follow-up result message (wrapped in an `<implement-tool-result>` envelope).

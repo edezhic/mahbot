@@ -1055,9 +1055,17 @@ impl WorkspaceStore {
     /// Delete a workspace by name. Context rows are cascaded automatically, and
     /// any `users.selected_workspace` referencing the deleted workspace is
     /// cleared (NULL = personal workspace) in the same transaction so the DB
-    /// never holds a dangling selection. The associated search engine is also
-    /// removed from the in-memory registry.
+    /// never holds a dangling selection. The workspace's research runs are
+    /// cancelled and swept first (releasing run folders + archives), and the
+    /// remaining job rows are deleted IN the workspace-row transaction so the
+    /// jobs/workspace deletion commits atomically. The associated search
+    /// engine is removed from the in-memory registry.
     pub async fn delete(&self, name: &str) -> Result<()> {
+        // Fail-closed: boot SKIPS jobs whose workspace is unresolvable (their
+        // only deletion path is this abandon), so a failed abandon followed by
+        // a deleted workspace row would orphan the jobs permanently. The
+        // deletion aborts instead and the caller surfaces the error.
+        let swept = crate::jobs::abandon_workspace_research_runs(name).await?;
         let tx = self.conn.begin_tx().await?;
         tx.execute("DELETE FROM workspaces WHERE name = ?1", db::params![name])
             .await?;
@@ -1066,7 +1074,24 @@ impl WorkspaceStore {
             db::params![name],
         )
         .await?;
+        // Remaining job rows (ticket phases, sync jobs, cancelled-run leftovers)
+        // go with the workspace row in ONE atomic commit; CASCADE removes their
+        // rosters.
+        let remaining = tx
+            .execute(
+                "DELETE FROM jobs WHERE workspace_name = ?1",
+                db::params![name],
+            )
+            .await?;
         tx.commit().await?;
+        if swept > 0 || remaining > 0 {
+            tracing::info!(
+                workspace_name = name,
+                swept_runs = swept,
+                remaining_jobs = remaining,
+                "abandoned workspace jobs"
+            );
+        }
         crate::search_engine::remove_engine(name);
         clear_pending_pickup_cooldown(name);
         Ok(())
@@ -2985,6 +3010,13 @@ mod tests {
 
     #[tokio::test]
     async fn delete_clears_dangling_user_workspace_references() {
+        // delete() now abandons the workspace's jobs via the jobs layer, which
+        // reads the shared session store — initialize all stores first. NOTE:
+        // the workspace store under test uses its own temp DB, so the abandon
+        // inside delete() runs against the GLOBAL session store and is a no-op
+        // here (this test exercises the dangling-selection cleanup only; the
+        // abandon integration is covered by jobs::workspace_delete_abandons_all_jobs).
+        crate::util::test::init_test_stores().await;
         let (store, _tmp) = test_store().await;
         // delete() removes the workspace's search engine from the global
         // registry (init_global is idempotent).
