@@ -203,7 +203,7 @@ impl ConfigStore {
         Ok(())
     }
 
-    // ── config_kv ────────────────────────────────────────────
+    // ── shared row loading ───────────────────────────────────
 
     /// Execute a read-only query with a row mapper, collecting all results into
     /// a `Vec`.  Shared implementation for all `get_all_*` methods.

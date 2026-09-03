@@ -11,6 +11,9 @@
 //! `Init`: the admin's active role is set to Support and a single real
 //! "hi mah bot" user message is routed through the normal pipeline.
 
+use crate::config::{
+    CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY, CONFIG_KEY_PROVIDER_KEY,
+};
 use crate::{ChannelMessage, Role};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -110,17 +113,18 @@ fn is_clean_url_line(s: &str) -> bool {
 pub async fn persist_provider_input(input: &ProviderInput) -> anyhow::Result<()> {
     match input {
         ProviderInput::OpenRouterKey(key) => {
-            crate::config::persist_settled_string_field("provider_key", key).await?;
+            crate::config::persist_settled_string_field(CONFIG_KEY_PROVIDER_KEY, key).await?;
         }
         ProviderInput::CustomEndpoint { url, key } => {
             if let Some(k) = key {
-                crate::config::persist_settled_string_field("provider_endpoint_key", k).await?;
+                crate::config::persist_settled_string_field(CONFIG_KEY_PROVIDER_ENDPOINT_KEY, k)
+                    .await?;
             }
             // Persist the endpoint LAST — it is the gating field for
             // `provider_configured()`, so a failure here leaves the provider
             // unconfigured and the script re-prompts instead of proceeding with a
             // keyless endpoint the user did not intend.
-            crate::config::persist_settled_string_field("provider_endpoint", url).await?;
+            crate::config::persist_settled_string_field(CONFIG_KEY_PROVIDER_ENDPOINT, url).await?;
         }
         ProviderInput::Invalid => anyhow::bail!("invalid provider input"),
     }

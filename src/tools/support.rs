@@ -1,5 +1,9 @@
 //! Support-agent setup tools: onboarding for the admin user (Telegram binding,
 //! workspaces, other users, web search, chrome-use, finalize).
+use crate::config::{
+    CONFIG_KEY_EXA_KEY, CONFIG_KEY_FIRECRAWL_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
+    CONFIG_KEY_WEB_SEARCH_PROVIDER,
+};
 use crate::users::FieldUpdate;
 use crate::{Role, Tool, Workspace};
 use anyhow::{Context, anyhow};
@@ -44,7 +48,7 @@ impl Tool for SetupTelegramBotTool {
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         let token = super::get_str(&args, "bot_token")?;
-        crate::config::persist_settled_string_field("telegram_bot_token", token).await?;
+        crate::config::persist_settled_string_field(CONFIG_KEY_TELEGRAM_BOT_TOKEN, token).await?;
         Ok(
             "Telegram bot token saved — the Telegram listener hot-reloads it immediately. \
              Next, send `/start` to your bot in Telegram, then use `bind_telegram` to bind \
@@ -298,12 +302,13 @@ impl Tool for SetupWebSearchTool {
         }
         let api_key = super::get_str(&args, "api_key")?;
 
-        crate::config::persist_settled_string_field("web_search_provider", &provider).await?;
+        crate::config::persist_settled_string_field(CONFIG_KEY_WEB_SEARCH_PROVIDER, &provider)
+            .await?;
         crate::config::persist_settled_string_field(
             if firecrawl {
-                "firecrawl_key"
+                CONFIG_KEY_FIRECRAWL_KEY
             } else {
-                "exa_key"
+                CONFIG_KEY_EXA_KEY
             },
             api_key,
         )
