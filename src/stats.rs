@@ -241,36 +241,6 @@ pub(crate) struct LlmCallMeta {
     pub provider_order: Option<String>,
 }
 
-/// Build an [`LlmRequestRecord`] from a request + optional response envelope.
-/// `None` when the request carries no metadata (context-free calls — test
-/// doubles, ad-hoc requests) — such rows are never recorded.
-///
-/// Failure-path semantics: `upstream_provider` / `system_fingerprint` /
-/// `cost` / `cost_details` are only populated from a successful response
-/// envelope — failed requests have no response, so those columns stay NULL.
-fn llm_request_record(
-    request: &crate::ChatRequest,
-    duration_ms: u64,
-    attempts: u32,
-    response: Option<&crate::ChatResponse>,
-    finish_reason: Option<&str>,
-    failure_class: Option<&'static str>,
-) -> Option<LlmRequestRecord> {
-    let meta = request.meta.as_ref()?;
-    Some(llm_request_record_meta(
-        &LlmCallMeta {
-            meta: meta.clone(),
-            model: request.model.clone(),
-            provider_order: request.provider_order.clone(),
-        },
-        duration_ms,
-        attempts,
-        response,
-        finish_reason,
-        failure_class,
-    ))
-}
-
 /// Build an [`LlmRequestRecord`] from explicit metadata (see
 /// [`record_llm_operation_meta`]).
 fn llm_request_record_meta(
@@ -349,6 +319,10 @@ pub(crate) fn log_store_for_stats() -> Option<crate::logs::LogStore> {
 ///
 /// Skips when the request carries no metadata (context-free calls — test
 /// doubles, ad-hoc requests) and when the logs store is not yet open.
+///
+/// Failure-path semantics: `upstream_provider` / `system_fingerprint` /
+/// `cost` / `cost_details` are only populated from a successful response
+/// envelope — failed requests have no response, so those columns stay NULL.
 pub(crate) async fn record_llm_operation(
     request: &crate::ChatRequest,
     duration_ms: u64,
@@ -357,26 +331,32 @@ pub(crate) async fn record_llm_operation(
     finish_reason: Option<&str>,
     failure_class: Option<&'static str>,
 ) {
-    let Some(rec) = llm_request_record(
-        request,
+    let Some(meta) = request.meta.as_ref() else {
+        return;
+    };
+    record_llm_operation_meta(
+        &LlmCallMeta {
+            meta: meta.clone(),
+            model: request.model.clone(),
+            provider_order: request.provider_order.clone(),
+        },
         duration_ms,
         attempts,
         response,
         finish_reason,
         failure_class,
-    ) else {
-        return;
-    };
-    persist_llm_request(&rec).await;
+    )
+    .await;
 }
 
-/// Emit one per-operation LLM request stat row from explicit metadata — for
-/// calls made outside the `ChatRequest` retry pipeline (e.g. raw-HTTP media
-/// transcription), which carry no response envelope. `attempts` is supplied
-/// by the caller: the transcription paths always pass 1 (a single-shot
-/// fail-open call never retries). Same fail-open semantics as
-/// [`record_llm_operation`]: a store write failure is logged and never
-/// propagates.
+/// Emit one per-operation LLM request stat row from explicit metadata.
+/// [`record_llm_operation`] delegates here after extracting metadata from a
+/// `ChatRequest`; direct callers are for calls made outside the `ChatRequest`
+/// retry pipeline (e.g. raw-HTTP media transcription), which carry no response
+/// envelope. `attempts` is supplied by the caller: the transcription paths
+/// always pass 1 (a single-shot fail-open call never retries). Same fail-open
+/// semantics as [`record_llm_operation`]: a store write failure is logged and
+/// never propagates.
 pub(crate) async fn record_llm_operation_meta(
     call: &LlmCallMeta,
     duration_ms: u64,
