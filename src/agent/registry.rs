@@ -112,7 +112,6 @@ pub struct AgentHandle {
     /// behavior.
     pub parent_label: Option<String>,
     pub started_at: DateTime<Utc>,
-    pub label: String,
     /// Registry generation for this agent run — used by the Running Agents
     /// page to key expanded-state by (agent_id, generation) so a recycled
     /// agent_id never inherits a stale expansion.
@@ -199,7 +198,6 @@ impl AgentRegistry {
         role: String,
         ticket_id: Option<String>,
         ws: &crate::Workspace,
-        label: String,
         cancel_token: CancellationToken,
         parent_key: Option<ParentKey>,
         parent_label: Option<String>,
@@ -215,7 +213,6 @@ impl AgentRegistry {
             parent_key,
             parent_label,
             started_at: Utc::now(),
-            label,
             generation,
             activity: None,
         };
@@ -254,7 +251,12 @@ impl AgentRegistry {
     /// activity is live at a time; a second registration overwrites the label
     /// and both guards clear on drop (the slot is `Option`-reset, not
     /// reference-counted).
-    pub fn activity_started(&self, agent_id: &str, generation: u64, label: &str) -> ActivityGuard {
+    pub(crate) fn activity_started(
+        &self,
+        agent_id: &str,
+        generation: u64,
+        label: &str,
+    ) -> ActivityGuard {
         {
             let mut map = self.inner.lock().unwrap_poison();
             if let Some(entry) = map.get_mut(agent_id)
@@ -286,8 +288,9 @@ impl AgentRegistry {
     ///
     /// Prefer [`cancel_by_ticket_id`](AgentRegistry::cancel_by_ticket_id) or
     /// [`cancel_by_role_and_workspace_path`](AgentRegistry::cancel_by_role_and_workspace_path)
-    /// for external callers — this method bypasses the generation-based safety check
-    /// that guards against stale `agent_id` references.
+    /// — those match on a stable predicate, whereas this method bypasses the
+    /// generation-based safety check that guards against stale `agent_id`
+    /// references.
     fn cancel(&self, agent_id: &str) {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.remove(agent_id) {
@@ -389,19 +392,6 @@ impl AgentRegistry {
         self.cancel_matching(move |entry| entry.handle.parent_key.as_ref() == Some(&parent));
     }
 
-    /// Whether any agent currently running is parented to `ticket_id`. Used to
-    /// distinguish an idle/frozen round (no running agents) from a mid-flight
-    /// one (agents registered) when the DB roster alone can't (cancelled
-    /// analysts check out as 'failed', not 'launched').
-    #[must_use]
-    pub fn has_agents_for_ticket(&self, ticket_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap_poison()
-            .values()
-            .any(|e| e.handle.ticket_id.as_deref() == Some(ticket_id))
-    }
-
     /// Snapshot of all currently running agents (serializable).
     #[must_use]
     pub fn list(&self) -> Vec<AgentHandle> {
@@ -411,7 +401,6 @@ impl AgentRegistry {
             .values()
             .map(|e| {
                 let mut handle = e.handle.clone();
-                handle.generation = e.generation;
                 handle.activity.clone_from(&e.activity);
                 handle
             })
@@ -456,7 +445,7 @@ impl AgentRegistry {
 /// Creation is generation-gated; removal is generation-gated the same way — a
 /// stale guard from a finished/restarted agent can never clear the
 /// replacement agent's card.
-pub struct ActivityGuard {
+pub(crate) struct ActivityGuard {
     agent_id: String,
     generation: u64,
 }
@@ -642,7 +631,6 @@ mod tests {
             "analyst".to_string(),
             None,
             &ws,
-            "test".to_string(),
             CancellationToken::new(),
             None,
             None,
@@ -747,7 +735,6 @@ mod tests {
             "engineer".to_string(),
             Some("T-42".to_string()),
             &ws,
-            "label".to_string(),
             CancellationToken::new(),
             Some(ParentKey::Ticket("T-42".to_string())),
             Some("Fix login bug".to_string()),
@@ -814,7 +801,6 @@ mod tests {
                 "analyst".to_string(),
                 None,
                 &ws,
-                "test".to_string(),
                 CancellationToken::new(),
                 Some(parent),
                 None,

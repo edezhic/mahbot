@@ -1140,7 +1140,6 @@ mod tests {
             parent_key: parent,
             parent_label: None,
             started_at: Utc::now(),
-            label: role.to_string(),
             generation: 0,
             activity: None,
         }

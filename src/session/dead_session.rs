@@ -912,7 +912,6 @@ mod tests {
             "engineer".into(),
             None,
             &ws,
-            "live".into(),
             tokio_util::sync::CancellationToken::new(),
             None,
             None,

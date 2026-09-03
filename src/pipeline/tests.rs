@@ -732,7 +732,11 @@ fn fake_clean_verifiers(count: usize) -> crate::util::test::FakeProvider {
 async fn wait_for_agent_registered(ticket_id: &str, timeout: std::time::Duration) {
     tokio::time::timeout(timeout, async {
         loop {
-            if crate::agent::registry::AGENT_REGISTRY.has_agents_for_ticket(ticket_id) {
+            if crate::agent::registry::AGENT_REGISTRY
+                .list()
+                .iter()
+                .any(|h| h.ticket_id.as_deref() == Some(ticket_id))
+            {
                 break;
             }
             tokio::task::yield_now().await;

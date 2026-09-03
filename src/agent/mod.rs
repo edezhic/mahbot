@@ -417,11 +417,6 @@ impl Agent {
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let label = if let Some(ref t) = ticket {
-            format!("{}: {}", role.as_str(), t.title)
-        } else {
-            role.to_string()
-        };
         // Ticket agents group by their ticket; an explicit parent key (analyze
         // round / research run) takes precedence when both are present.
         let parent_key = parent_key.or_else(|| {
@@ -454,7 +449,6 @@ impl Agent {
             role.to_string(),
             ticket.as_ref().map(|t| t.id.clone()),
             ws,
-            label,
             cancel_token.clone(),
             parent_key.clone(),
             parent_label.clone(),
