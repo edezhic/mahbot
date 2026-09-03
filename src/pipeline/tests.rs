@@ -1435,12 +1435,19 @@ async fn review_qa_dynamic_count_calibration() {
         DEFAULT_REVIEW_COUNT_LOW_CHURN,
         DEFAULT_REVIEW_COUNT_HIGH_CHURN,
     );
-    assert_eq!(review_base_from_signals(50, tiny, low, high), 1);
-    assert_eq!(review_base_from_signals(tiny, tiny, low, high), 2);
-    assert_eq!(review_base_from_signals(low, tiny, low, high), 2);
-    assert_eq!(review_base_from_signals(low + 1, tiny, low, high), 3);
-    assert_eq!(review_base_from_signals(high, tiny, low, high), 3);
-    assert_eq!(review_base_from_signals(high + 1, tiny, low, high), 4);
+    // Literal calibration spec (ticket mahbot-2431): 1–199 → 1 reviewer,
+    // 200–999 → 2, 1000–2999 → 3, 3000+ → 4. Each threshold belongs to the
+    // higher band.
+    assert_eq!(tiny, 200);
+    assert_eq!(low, 1000);
+    assert_eq!(high, 3000);
+    assert_eq!(review_base_from_signals(0, tiny, low, high), 1);
+    assert_eq!(review_base_from_signals(199, tiny, low, high), 1);
+    assert_eq!(review_base_from_signals(200, tiny, low, high), 2);
+    assert_eq!(review_base_from_signals(999, tiny, low, high), 2);
+    assert_eq!(review_base_from_signals(1000, tiny, low, high), 3);
+    assert_eq!(review_base_from_signals(2999, tiny, low, high), 3);
+    assert_eq!(review_base_from_signals(3000, tiny, low, high), 4);
     // P0 floor: priority-0 tickets never drop below 2 reviewers.
     assert_eq!(review_agent_count(1, 0), 2);
     assert_eq!(review_agent_count(2, 0), 2);
@@ -1448,11 +1455,11 @@ async fn review_qa_dynamic_count_calibration() {
     assert_eq!(review_agent_count(1, 5), 1);
 
     // `compute_reviewer_count` reads real working-tree churn: a 3000+-line
-    // untracked file yields the `> high` band (4 reviewers).
+    // untracked file yields the highest band (4 reviewers).
     std::fs::write(repo_path.join("big.txt"), "x\n".repeat(3000)).unwrap();
     let ticket = expect_ticket(store, &id).await;
     let count = crate::pipeline::review::compute_reviewer_count(&ticket, repo_path.as_path()).await;
-    assert_eq!(count, 4, "churn > 2000 must calibrate to 4 reviewers");
+    assert_eq!(count, 4, "churn >= 3000 must calibrate to 4 reviewers");
 
     // QA runs exactly one tester per round.
     assert_eq!(crate::pipeline::qa::QA_PARALLEL_AGENT_COUNT, 1);
