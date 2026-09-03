@@ -1278,8 +1278,9 @@ fn unescape_c_style(input: &str) -> Option<String> {
 /// Resample PCM audio from one sample rate to another using linear
 /// interpolation with a 3-tap binomial anti-aliasing filter for downsampling.
 ///
-/// This is the canonical implementation. All other resample functions in the
-/// codebase delegate to this one.
+/// This is the canonical implementation. All other resample call sites
+/// delegate to this one, except `audio::local_transcriber`, which uses
+/// `qwen_asr::audio::resample` directly.
 ///
 /// When `from_rate > to_rate` (downsampling), a simple binomial low-pass filter
 /// is applied to attenuate frequencies above the new Nyquist before decimation.
@@ -1296,7 +1297,8 @@ fn unescape_c_style(input: &str) -> Option<String> {
 /// pre-filter — the filter only provides ~6 dB stopband attenuation. This is
 /// acceptable for speech processing and wake word training data augmentation.
 /// If aliasing artifacts prove problematic, a sinc-based resampler can be
-/// substituted here — all call sites benefit automatically.
+/// substituted here — all call sites except `local_transcriber` (which
+/// resamples via `qwen_asr` itself) benefit automatically.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,

@@ -46,8 +46,7 @@ const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
 /// the final serialized body is checked against this budget and references are
 /// compressed further until it fits. The 2 MB figure is a client-side sanity
 /// budget mirroring the pre-existing ~2 MB provider body-limit premise (not a
-/// documented OpenRouter number); the dev-time /videos acceptance test verified
-/// the common case against the live provider.
+/// documented OpenRouter number).
 const MAX_REQUEST_BODY_BYTES: usize = 2_000_000;
 
 /// Conservative cap on reference images per generation request, applied only

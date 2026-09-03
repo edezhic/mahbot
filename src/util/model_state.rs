@@ -3,25 +3,27 @@
 //! Extracted from the duplicated `AtomicU8` lifecycle blocks (Uninit→Loading→
 //! Ready/Failed) in `audio::tts`, `audio::local_transcriber`, and `embedder`.
 //! `ModelState`/`AtomicModelState` provide the shared state representation;
-//! [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop guard used
-//! by `embedder` and `audio::tts` for panic safety in background download tasks.
+//! [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop guard
+//! used for panic safety in background download tasks (directly by `embedder`
+//! and `audio::local_transcriber`, and inside `audio`'s shared TTS
+//! download-retry loop that `audio::tts` runs through).
 //!
 //! Deliberate non-unifications (semantics-preserving scope):
 //! * The per-module singletons keep their own container/value types — `embedder`
 //!   uses `RwLock<Option<_>>`, `tts` `OnceLock<RwLock<Option<_>>>`, and
 //!   `local_transcriber` `Mutex<Option<_>>`.  Unifying these would change
 //!   synchronization semantics (poisoning, init-once, contention).
-//! * All four consumers use [`ModelLoadGuard`] in their background download
-//!   loops. `local_transcriber` gained its guard when its init moved off the
-//!   awaited boot path: the boot-time background load/download
-//!   must never leave its state stuck in `Loading` — a panic in the spawned
-//!   chain now flips it to `Failed` (the honest terminal state).
+//! * `local_transcriber` gained its guard when its init moved off the awaited
+//!   boot path: the boot-time background load/download must never leave its
+//!   state stuck in `Loading` — a panic in the spawned chain now flips it to
+//!   `Failed` (the honest terminal state).
 //!
 //! Memory-ordering semantics are preserved exactly from the original copies:
 //! `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.
 //!
-//! All consumers (`audio::voice`, `audio::tts`, `audio::local_transcriber`,
-//! `embedder`) use this shared copy; no module-local duplicates remain.
+//! All consumers (`audio` shared TTS helpers, `audio::tts`,
+//! `audio::local_transcriber`, `embedder`) use this shared copy; no
+//! module-local duplicates remain.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -36,7 +38,9 @@ pub(crate) enum ModelState {
 }
 
 impl ModelState {
-    /// Decode a raw `u8` (used by test hooks that set state numerically).
+    /// Decode a raw `u8` back into a [`ModelState`]. Production decoder for
+    /// [`AtomicModelState::load`] and [`AtomicModelState::compare_exchange`]
+    /// (and a test hook in `audio::tts` that sets state numerically).
     pub(crate) const fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Loading,
