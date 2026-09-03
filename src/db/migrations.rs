@@ -226,7 +226,9 @@ CREATE TABLE IF NOT EXISTS users (
     name                TEXT PRIMARY KEY,
     permissions         TEXT,
     selected_workspace  TEXT,
-    selected_role       TEXT
+    selected_role       TEXT,
+    image_gen_model     TEXT,
+    video_model         TEXT
 );
 CREATE TABLE IF NOT EXISTS user_channels (
     user_name   TEXT NOT NULL REFERENCES users(name),
@@ -428,6 +430,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "28",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_jobs_caller_agent_and_session_created_at),
+    },
+    Migration {
+        id: "29",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_users_image_and_video_models),
     },
 ];
 
@@ -638,6 +645,29 @@ async fn run_add_jobs_caller_agent_and_session_created_at(conn: &Connection) -> 
     )
     .await
     .with_context(|| "Failed to create idx_jobs_caller_agent")?;
+    Ok(())
+}
+
+fn add_users_image_and_video_models<'a>(
+    conn: &'a Connection,
+    _root: &'a Path,
+) -> BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(run_add_users_image_and_video_models(conn))
+}
+
+/// Upfill the per-user image/video model columns for databases created before
+/// delta `29`. Fresh installs get both columns from entry `24`'s `CREATE
+/// TABLE`, so the probes make this a no-op there. Turso has no `ADD COLUMN IF
+/// NOT EXISTS`, so the existence probe lives in this guarded, idempotent body
+/// (non-transactional like every Rust body, re-runnable until recorded).
+async fn run_add_users_image_and_video_models(conn: &Connection) -> anyhow::Result<()> {
+    for column in ["image_gen_model", "video_model"] {
+        if !column_exists(conn, "users", column).await? {
+            conn.execute(&format!("ALTER TABLE users ADD COLUMN {column} TEXT"), ())
+                .await
+                .with_context(|| format!("Failed to add users.{column}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -915,7 +945,14 @@ mod tests {
         ),
         (
             "users",
-            &["name", "permissions", "selected_workspace", "selected_role"],
+            &[
+                "name",
+                "permissions",
+                "selected_workspace",
+                "selected_role",
+                "image_gen_model",
+                "video_model",
+            ],
         ),
         (
             "workspace_contexts",
@@ -1953,9 +1990,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "24".to_string(),
                 "25".to_string(),
                 "27".to_string(),
-                "28".to_string()
+                "28".to_string(),
+                "29".to_string()
             ],
-            "fresh core applies baseline 24/25/27/28 exactly"
+            "fresh core applies baseline 24/25/27/28/29 exactly"
         );
     }
 
@@ -2198,22 +2236,23 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("25".to_string());
         expected_ids.push("27".to_string());
         expected_ids.push("28".to_string());
+        expected_ids.push("29".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27/28"
+            "reopen must record exactly old ids ∪ 24/25/27/28/29"
         );
 
-        // Everything else is a strict no-op; only workspaces (delta 27) plus
-        // jobs/session_metadata (delta 28) gain their columns, appended at the
-        // end by the ALTER, and the delta-28 `idx_jobs_caller_agent` index is
-        // added.
+        // Everything else is a strict no-op; only workspaces (delta 27),
+        // jobs/session_metadata (delta 28) and users (delta 29) gain their
+        // columns, appended at the end by the ALTER, and the delta-28
+        // `idx_jobs_caller_agent` index is added.
         assert_core_catalog_unchanged(
             &conn,
             &before,
-            &["workspaces", "jobs", "session_metadata"],
+            &["workspaces", "jobs", "session_metadata", "users"],
             &["idx_jobs_caller_agent"],
         )
         .await;
@@ -2237,6 +2276,14 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert_eq!(
             after_sm_cols["session_metadata"], expected_sm_cols,
             "reopen must append exactly created_at to session_metadata columns"
+        );
+        let after_users_cols = column_sets(&conn, &["users"]).await;
+        let mut expected_users_cols = before.cols["users"].clone();
+        expected_users_cols.push("image_gen_model".to_string());
+        expected_users_cols.push("video_model".to_string());
+        assert_eq!(
+            after_users_cols["users"], expected_users_cols,
+            "reopen must append exactly image_gen_model/video_model to users columns"
         );
     }
 
@@ -2357,6 +2404,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                     && *n != "workspaces"
                     && *n != "jobs"
                     && *n != "session_metadata"
+                    && *n != "users"
                     && *n != "schema_migrations"
             })
             .collect();
@@ -2409,20 +2457,31 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("25".to_string());
         expected_ids.push("27".to_string());
         expected_ids.push("28".to_string());
+        expected_ids.push("29".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27/28"
+            "upgrade must record exactly old ids ∪ 24/25/27/28/29"
+        );
+
+        let after_users_cols = column_names(&conn, "users").await;
+        assert!(
+            after_users_cols.contains(&"image_gen_model".to_string()),
+            "image_gen_model must be added to users"
+        );
+        assert!(
+            after_users_cols.contains(&"video_model".to_string()),
+            "video_model must be added to users"
         );
 
         assert_eq!(
             column_sets(&conn, &untouched_tables).await,
             before_other,
-            "only chat_history (delta 25), workspaces (delta 27) and \
-             jobs/session_metadata (delta 28) columns may change on the \
-             0.5.0 upgrade"
+            "only chat_history (delta 25), workspaces (delta 27), \
+             jobs/session_metadata (delta 28) and users (delta 29) columns may \
+             change on the 0.5.0 upgrade"
         );
     }
 }

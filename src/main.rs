@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use mahbot::agent::message_router;
 use mahbot::channels::broadcast_and_persist_incoming_message;
 use mahbot::channels::telegram::{decode_action, user_command_entries};
-use mahbot::config::{CONFIG, CONFIG_KEY_IMAGE_GEN_MODEL, CONFIG_KEY_VIDEO_MODEL};
+use mahbot::config::CONFIG;
 use mahbot::gui::{BOOT_LOG_STORE, Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::parse_bot_command;
 use mahbot::session::clear_session;
@@ -894,7 +894,7 @@ async fn deliver_clear_reply(
 /// Handle `/image_models` / `/video_models` commands for Telegram — shows
 /// the image or video model selection keyboard (Artist role).
 async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
-    let reply_markup = build_models_keyboard(is_image);
+    let reply_markup = build_models_keyboard(is_image, &msg.user_name).await;
     let content = if is_image {
         "Select an image model:".to_string()
     } else {
@@ -908,25 +908,25 @@ async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
         .await;
 }
 
-/// Build inline keyboard for image or video model selection.
+/// Build inline keyboard for image or video model selection for `user_name`.
 ///
 /// Returns the full Telegram `inline_keyboard` JSON array, where each element
 /// is a row (list of buttons in that row). Each button gets its own row,
 /// followed by a clear-session button.
-fn build_models_keyboard(is_image: bool) -> serde_json::Value {
+async fn build_models_keyboard(is_image: bool, user_name: &str) -> serde_json::Value {
     let mut rows: Vec<serde_json::Value> = Vec::new();
 
     // Model buttons — each on its own row
     let (mut models, active, action_prefix) = if is_image {
         (
             CONFIG.image_gen_models(),
-            CONFIG.image_gen_model(),
+            mahbot::users::resolve_image_gen_model(user_name).await,
             "__act__set_image_model",
         )
     } else {
         (
             CONFIG.video_models(),
-            CONFIG.video_model(),
+            mahbot::users::resolve_video_model(user_name).await,
             "__act__set_video_model",
         )
     };
@@ -1115,17 +1115,10 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
 
     match action.as_str() {
         "set_image_model" => {
-            handle_set_model_action(
-                &msg,
-                &payload,
-                CONFIG_KEY_IMAGE_GEN_MODEL,
-                "Image generation",
-                true,
-            )
-            .await;
+            handle_set_model_action(&msg, &payload, "Image generation", true).await;
         }
         "set_video_model" => {
-            handle_set_model_action(&msg, &payload, CONFIG_KEY_VIDEO_MODEL, "Video", false).await;
+            handle_set_model_action(&msg, &payload, "Video", false).await;
         }
         "clear_session" => {
             // Acknowledge callback silently first (dismiss spinner)
@@ -1148,18 +1141,6 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
     }
 }
 
-/// Common handler for setting a model config field via callback action.
-///
-/// Validates payload, writes to `config_kv` table, updates the in-memory
-/// config, and acknowledges the callback with a toast.
-///
-/// The write spans a DB write plus an in-memory update as separate steps, and
-/// handlers are spawned (the dispatch loop must stay non-blocking), so a lock
-/// preserves the previous inline ordering — interleaved writes would leave
-/// `config_kv` and `CONFIG` divergent. Acquired before validation so rapid
-/// taps apply in tap order.
-static MODEL_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
 /// Handle a role-picker tap (`__act__set_role|<role_name>`). Delegates to the
 /// shared switch path, which revalidates the tapped role against the user's
 /// CURRENT pool — a stale tap on a role no longer available gets the standard
@@ -1172,43 +1153,72 @@ async fn handle_set_role_action(msg: &ChannelMessage, payload: &str) {
     handle_role_switch(msg, role).await;
 }
 
+/// Serializes per-user model writes (see [`handle_set_model_action`]).
+static MODEL_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+/// Common handler for setting a per-user model via callback action.
+///
+/// Validates the payload (image models against the catalog, fail-open),
+/// writes the user's `image_gen_model`/`video_model` column, and acknowledges
+/// the callback with a toast.
 async fn handle_set_model_action(
     msg: &ChannelMessage,
     payload: &str,
-    config_key: &str,
     display_name: &str,
     validate_image: bool,
 ) {
-    let _guard = MODEL_WRITE_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
+    // Handlers are spawned (the dispatch loop must stay non-blocking), so the
+    // lock serializes rapid taps of the same picker — without it, concurrent
+    // single-statement upserts would commit last-write-wins in
+    // nondeterministic order instead of tap order. Acquired before validation;
+    // held only over the decision+write, not the callback ack (network I/O).
+    let toast = {
+        let _guard = MODEL_WRITE_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        set_user_model(&msg.user_name, payload, display_name, validate_image).await
+    };
+    answer_telegram_callback(msg, toast).await;
+}
+
+/// Validate and write one per-user model pick, returning the callback toast.
+/// Validation order: payload presence, image-model catalog check (fail-open
+/// when the catalog is unavailable — matching the generation tool's
+/// semantics), user existence (a stale keyboard tapped by an unknown sender
+/// must not mint a bare users row), then the direct column write (no config
+/// warmup).
+async fn set_user_model(
+    user_name: &str,
+    payload: &str,
+    display_name: &str,
+    validate_image: bool,
+) -> Option<String> {
     if payload.is_empty() {
-        tracing::warn!(config_key, "{config_key} action with empty payload");
-        answer_telegram_callback(msg, Some("No model specified.".to_string())).await;
-        return;
+        tracing::warn!(display_name, "{display_name} action with empty payload");
+        return Some("No model specified.".to_string());
     }
-    // Write-time validation: reject image models that cannot generate images
-    // (fail-open when the catalog is unavailable — matching the generation
-    // tool's semantics).
     if validate_image
         && let Err(e) = mahbot::tools::media_catalog::image::validate_image_model(payload).await
     {
-        answer_telegram_callback(msg, Some(format!("Invalid image model: {e}"))).await;
-        return;
+        return Some(format!("Invalid image model: {e}"));
     }
-    // Direct-write to config_kv table (bypasses the per-field persist path
-    // which triggers provider warmup — unnecessary for a model name change).
-    let store = mahbot::config_db::store();
-    if let Err(e) = store.set_kv(config_key, payload).await {
-        tracing::error!(config_key, error = %e, "Failed to save {config_key}");
-        answer_telegram_callback(msg, Some(format!("Failed to save model: {e}"))).await;
-        return;
+    let store = mahbot::users::store();
+    if !store.user_exists(user_name).await.unwrap_or(false) {
+        return Some("User is not registered.".to_string());
     }
-    // Lightweight in-memory update — no DB read, no provider warmup
-    let _ = CONFIG.set_string_field(config_key, payload);
-
-    answer_telegram_callback(msg, Some(format!("{display_name} model set to: {payload}"))).await;
+    let result = if validate_image {
+        store.set_image_gen_model(user_name, payload).await
+    } else {
+        store.set_video_model(user_name, payload).await
+    };
+    match result {
+        Ok(()) => Some(format!("{display_name} model set to: {payload}")),
+        Err(e) => {
+            tracing::error!(user_name, error = %e, "Failed to save per-user model");
+            Some(format!("Failed to save model: {e}"))
+        }
+    }
 }
 
 /// Acknowledge a Telegram callback query with an optional toast message.

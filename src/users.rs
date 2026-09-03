@@ -50,7 +50,7 @@ fn normalize_telegram_handle(handle: &str) -> anyhow::Result<String> {
 
 crate::define_store! {
     /// Global user store.
-    pub(crate) static USER_STORE: UserStore,
+    pub static USER_STORE: UserStore,
     post_open = ensure_admin_user,
     expect = "USER_STORE not initialized — call init_all_stores() first",
 }
@@ -382,6 +382,24 @@ impl UserStore {
         tx.commit().await?;
         Ok(())
     }
+
+    /// Set the user's active image-generation model (their Telegram picker
+    /// choice). An empty/whitespace value resolves to the default at read time.
+    pub async fn set_image_gen_model(&self, name: &str, model: &str) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        upsert_user_column(&tx, name, "image_gen_model", FieldUpdate::Set(model)).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Set the user's active video model (their Telegram picker choice).
+    /// An empty/whitespace value resolves to the default at read time.
+    pub async fn set_video_model(&self, name: &str, model: &str) -> Result<()> {
+        let tx = self.conn.begin_tx().await?;
+        upsert_user_column(&tx, name, "video_model", FieldUpdate::Set(model)).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 /// Represents an optional update to a user column.
@@ -577,6 +595,38 @@ pub(crate) async fn ensure_personal_workspace(name: &str) {
 /// a personal workspace fallback — the caller decides how to interpret NULL.
 pub async fn get_raw_selected_workspace(user_name: &str) -> Result<Option<String>> {
     store().get_selected_workspace_name(user_name).await
+}
+
+/// Active image-gen model for `user_name`: the user's explicit Telegram
+/// picker choice, or the hardcoded default when unset/unresolvable.
+pub async fn resolve_image_gen_model(user_name: &str) -> String {
+    resolve_user_model_column(user_name, "image_gen_model")
+        .await
+        .unwrap_or_else(|| crate::config::DEFAULT_IMAGE_GEN_MODEL.to_string())
+}
+
+/// Active video model for `user_name`: the user's explicit Telegram
+/// picker choice, or the hardcoded default when unset/unresolvable.
+pub async fn resolve_video_model(user_name: &str) -> String {
+    resolve_user_model_column(user_name, "video_model")
+        .await
+        .unwrap_or_else(|| crate::config::DEFAULT_VIDEO_MODEL.to_string())
+}
+
+/// Read a user's model column via a single-column SELECT (this is a
+/// per-tool-call/per-Artist-turn hot path, so no full `UserRecord` load).
+/// `None` — user missing, column unset/empty, or a DB error (logged; fail-open
+/// to the default, matching the generation tools' semantics).
+async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<String> {
+    match store().user_column(column, user_name).await {
+        Ok(value) => value
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty()),
+        Err(e) => {
+            tracing::warn!(user_name, column, error = %e, "user model lookup failed; using default");
+            None
+        }
+    }
 }
 
 /// Get the current active workspace for a user.

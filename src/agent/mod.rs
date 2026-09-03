@@ -2046,6 +2046,7 @@ impl Agent {
                             &self.role,
                             self.ticket.as_ref(),
                             self.full_access,
+                            &self.user_name,
                         )
                         .await;
                 }

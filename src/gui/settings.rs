@@ -64,9 +64,8 @@ fn add_model_to_list(input: &mut SingleLineEditorState, list: &mut Option<String
     }
 }
 
-/// Remove a model from a list. If the removed model was the active model,
-/// resets the active model to the first remaining entry (or clears it).
-fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut Option<String>) {
+/// Remove a model from a list.
+fn remove_model_from_list(model: &str, list: &mut Option<String>) {
     let mut models = parse_models(list.as_deref());
     models.retain(|m| m != model);
     *list = if models.is_empty() {
@@ -74,78 +73,36 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>, active: &mut O
     } else {
         Some(models.join("\n"))
     };
-    if active.as_deref() == Some(model) {
-        *active = models.first().cloned();
-    }
 }
 
-/// Build one model-picker entry row: a secondary-styled button with an
-/// active/inactive circle indicator plus a gray X removal button (omitted for
-/// merged display-only entries).
-///
-/// Active rows keep the same appearance as inactive ones; the accent-colored
-/// check is the only selected-state affordance. The X is the shared compact
-/// gray [`widgets::compact_x_button`] with a 24px-wide hit area.
-fn model_entry_row(
-    target: ModelPickerTarget,
-    model: String,
-    is_active: bool,
-    is_merged: bool,
-) -> Element<'static, SettingsMessage> {
-    let indicator = if is_active {
-        lucide::circle_check::<iced::Theme, iced::Renderer>()
-            .size(theme::TEXT_12)
-            .color(theme::ACCENT)
-    } else {
-        lucide::circle::<iced::Theme, iced::Renderer>()
-            .size(theme::TEXT_12)
-            .color(theme::TEXT_SECONDARY)
-    };
-    let model_btn = button(
-        row![
-            indicator,
-            Space::new().width(theme::SPACE_4),
-            text(model.clone()).size(theme::TEXT_12)
-        ]
-        .align_y(Alignment::Center),
-    )
-    .padding(theme::PAD_4)
-    .style(theme::button_secondary)
-    .on_press(SettingsMessage::ModelPicker {
-        target,
-        action: ModelPickerAction::SetActive(model.clone()),
-    });
-
-    let mut entry = row![model_btn];
-    if !is_merged {
-        // 12px glyph + 6px padding on every side = the same 24px-wide
-        // hit area the old 24px glyph button provided.
-        entry = entry
-            .push(Space::new().width(theme::SPACE_4))
-            .push(widgets::compact_x_button(
-                theme::SPACE_6,
-                Some(SettingsMessage::ModelPicker {
-                    target,
-                    action: ModelPickerAction::RemoveModel(model),
-                }),
-                None,
-            ));
-    }
+/// Build one model-picker entry row: a plain model label plus a gray X
+/// removal button. The active-selection indicator is gone — the current model
+/// is per-user and not managed here. The X is the shared compact gray
+/// [`widgets::compact_x_button`] with a 24px-wide hit area.
+fn model_entry_row(target: ModelPickerTarget, model: String) -> Element<'static, SettingsMessage> {
+    let mut entry = row![text(model.clone()).size(theme::TEXT_12)];
+    // 12px glyph + 6px padding on every side = the same 24px-wide
+    // hit area the old 24px glyph button provided.
+    entry = entry
+        .push(Space::new().width(theme::SPACE_4))
+        .push(widgets::compact_x_button(
+            theme::SPACE_6,
+            Some(SettingsMessage::ModelPicker {
+                target,
+                action: ModelPickerAction::RemoveModel(model),
+            }),
+            None,
+        ));
     entry.align_y(Alignment::Center).into()
 }
 
-/// Render a model picker with a list of model entries, active indicator,
-/// remove buttons per entry, and an add-model row (text input + "Add" button).
-///
-/// The active model is always merged into the rendered list (it may have been
-/// set independently of the list, e.g. via Telegram), so the active indicator
-/// is unambiguous even when the list omits it; merged entries render without
-/// a remove button. Accepts a `target` to build the correct parameterized
-/// `SettingsMessage::ModelPicker` values internally.
+/// Render a model picker with a list of model entries, remove buttons per
+/// entry, and an add-model row (text input + "Add" button). The current active
+/// selection is per-user and not shown here. Accepts a `target` to build the
+/// correct parameterized `SettingsMessage::ModelPicker` values internally.
 fn model_picker_list<'a>(
     target: ModelPickerTarget,
     models_field: Option<&'a str>,
-    active_field: Option<&'a str>,
     add_input: &'a SingleLineEditorState,
     add_placeholder: &'static str,
     error: Option<&'a str>,
@@ -158,18 +115,7 @@ fn model_picker_list<'a>(
         target,
         action: ModelPickerAction::AddModel,
     };
-    let mut models = parse_models(models_field);
-    let original_models = models.clone();
-    let active = active_field;
-
-    // Always merge the active model into the rendered list so the active
-    // indicator is unambiguous even when the list omits it (the active model
-    // may have been set independently of the list, e.g. via Telegram).
-    if !models.iter().any(|m| Some(m.as_str()) == active)
-        && let Some(active_model) = active
-    {
-        models.push(active_model.to_string());
-    }
+    let models = parse_models(models_field);
 
     let items: Vec<Element<'a, SettingsMessage>> = if models.is_empty() {
         vec![
@@ -181,14 +127,7 @@ fn model_picker_list<'a>(
     } else {
         models
             .iter()
-            .map(|model| {
-                let is_active = Some(model.as_str()) == active;
-                // A merged display-only entry (active model absent from the
-                // list) must not offer removal — it is not in the list to
-                // remove, and removing it would silently repoint the active.
-                let is_merged = is_active && !original_models.iter().any(|m| m == model);
-                model_entry_row(target, model.clone(), is_active, is_merged)
-            })
+            .map(|model| model_entry_row(target, model.clone()))
             .collect()
     };
 
@@ -247,18 +186,17 @@ pub enum ModelPickerAction {
     AddInput(EditorAction),
     AddModel,
     RemoveModel(String),
-    SetActive(String),
 }
 
-/// Map a `ModelPickerTarget` to the corresponding `(models_list, active_model)` fields
-/// in `ConfigData`.
-fn picker_config_fields<'a>(
+/// Map a `ModelPickerTarget` to the corresponding model-list field in
+/// `ConfigData`.
+fn picker_list_field<'a>(
     t: &'a ModelPickerTarget,
     config: &'a mut ConfigData,
-) -> (&'a mut Option<String>, &'a mut Option<String>) {
+) -> &'a mut Option<String> {
     match t {
-        ModelPickerTarget::ImageGen => (&mut config.image_gen_models, &mut config.image_gen_model),
-        ModelPickerTarget::Video => (&mut config.video_models, &mut config.video_model),
+        ModelPickerTarget::ImageGen => &mut config.image_gen_models,
+        ModelPickerTarget::Video => &mut config.video_models,
     }
 }
 
@@ -371,7 +309,7 @@ pub enum SettingsMessage {
     /// Escape key pressed (dismisses modal if open).
     Escape,
     // ── Model picker messages ─────────────────────────────
-    /// Operations on a model picker (add/remove/set-active model).
+    /// Operations on a model picker (add/remove list models).
     ModelPicker {
         target: ModelPickerTarget,
         action: ModelPickerAction,
@@ -1009,7 +947,7 @@ impl SettingsState {
 
     /// Whether a failed persist should roll the control back to the last
     /// persisted value. Discrete-state controls (toggles, pick lists, and the
-    /// model pickers' optimistic active/list markers) revert; free-text inputs
+    /// model pickers' optimistic list markers) revert; free-text inputs
     /// keep the typed value so the user can correct it.
     ///
     /// `config:provider_endpoint` is treated as discrete because it defines the
@@ -1021,9 +959,7 @@ impl SettingsState {
         matches!(
             field,
             "config:web_search_provider"
-                | "config:image_gen_model"
                 | "config:image_gen_models"
-                | "config:video_model"
                 | "config:video_models"
                 | "config:provider_endpoint"
         )
@@ -1040,23 +976,6 @@ impl SettingsState {
             ModelPickerTarget::Video => (
                 "config:video_models",
                 self.config.video_models.clone().unwrap_or_default(),
-            ),
-        };
-        self.field_errors.remove(field);
-        self.settle_now(field, value)
-    }
-
-    /// Persist a model-picker's active-model field immediately. Clears the
-    /// picker's inline error and settles now.
-    fn persist_picker_active(&mut self, target: ModelPickerTarget) -> Task<SettingsMessage> {
-        let (field, value) = match target {
-            ModelPickerTarget::ImageGen => (
-                "config:image_gen_model",
-                self.config.image_gen_model.clone().unwrap_or_default(),
-            ),
-            ModelPickerTarget::Video => (
-                "config:video_model",
-                self.config.video_model.clone().unwrap_or_default(),
             ),
         };
         self.field_errors.remove(field);
@@ -1628,32 +1547,15 @@ impl SettingsState {
                             )
                         }
                         ModelPickerTarget::Video => {
-                            let (models, _active) = picker_config_fields(&t, &mut self.config);
+                            let models = picker_list_field(&t, &mut self.config);
                             add_model_to_list(&mut self.model_picker_inputs[t.idx()], models);
                             self.persist_picker_list(t)
                         }
                     },
                     (t, ModelPickerAction::RemoveModel(model)) => {
-                        let (models, active) = picker_config_fields(&t, &mut self.config);
-                        remove_model_from_list(&model, models, active);
-                        // The active model may have been reset by the removal —
-                        // persist both the list and the active model.
-                        Task::batch([self.persist_picker_list(t), self.persist_picker_active(t)])
-                    }
-                    (t, ModelPickerAction::SetActive(model)) => {
-                        let (_models, active) = picker_config_fields(&t, &mut self.config);
-                        *active = Some(model.clone());
-                        // Persist immediately. For the image target the persist
-                        // validates the model against the endpoint-keyed catalog
-                        // and fails without writing on rejection (the optimistic
-                        // active marker is then reverted inline).
-                        let key = match t {
-                            ModelPickerTarget::ImageGen => "config:image_gen_model",
-                            ModelPickerTarget::Video => "config:video_model",
-                        };
-                        let field = key.to_string();
-                        self.field_errors.remove(&field);
-                        self.settle_now(&field, model)
+                        let models = picker_list_field(&t, &mut self.config);
+                        remove_model_from_list(&model, models);
+                        self.persist_picker_list(t)
                     }
                 }
             }
@@ -1663,7 +1565,7 @@ impl SettingsState {
                     // Append the validated model directly — never route through
                     // the input buffer, which may hold text the user typed while
                     // the catalog validation was in flight.
-                    let (models, _active) = picker_config_fields(&target, &mut self.config);
+                    let models = picker_list_field(&target, &mut self.config);
                     let mut list = parse_models(models.as_deref());
                     if !list.contains(&model) {
                         list.push(model.clone());
@@ -2948,12 +2850,10 @@ impl SettingsState {
                 model_picker_list(
                     ModelPickerTarget::ImageGen,
                     self.config.image_gen_models.as_deref(),
-                    self.config.image_gen_model.as_deref(),
                     &self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()],
                     "model name (e.g. google/gemini-...)",
                     self.field_errors
                         .get("config:image_gen_models")
-                        .or_else(|| self.field_errors.get("config:image_gen_model"))
                         .map(String::as_str),
                 ),
                 Space::new().height(12),
@@ -2962,12 +2862,10 @@ impl SettingsState {
                 model_picker_list(
                     ModelPickerTarget::Video,
                     self.config.video_models.as_deref(),
-                    self.config.video_model.as_deref(),
                     &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
                     "model name (e.g. minimax/hailuo-3)",
                     self.field_errors
                         .get("config:video_models")
-                        .or_else(|| self.field_errors.get("config:video_model"))
                         .map(String::as_str),
                 ),
             ]
@@ -3916,68 +3814,43 @@ mod tests {
             name: &'static str,
             model: &'static str,
             initial_list: Option<&'static str>,
-            initial_active: Option<&'static str>,
             expected_list: Option<&'static str>,
-            expected_active: Option<&'static str>,
         }
 
         let cases = [
             Case {
-                name: "removes and updates active",
+                name: "removes matching model",
                 model: "model-b",
                 initial_list: Some("model-a\nmodel-b\nmodel-c"),
-                initial_active: Some("model-b"),
                 expected_list: Some("model-a\nmodel-c"),
-                expected_active: Some("model-a"),
             },
             Case {
-                name: "non-active removal keeps active",
-                model: "model-b",
+                name: "non-matching removal keeps list",
+                model: "model-d",
                 initial_list: Some("model-a\nmodel-b\nmodel-c"),
-                initial_active: Some("model-a"),
-                expected_list: Some("model-a\nmodel-c"),
-                expected_active: Some("model-a"),
+                expected_list: Some("model-a\nmodel-b\nmodel-c"),
             },
             Case {
-                name: "last entry clears active",
+                name: "last entry clears list",
                 model: "model-a",
                 initial_list: Some("model-a"),
-                initial_active: Some("model-a"),
                 expected_list: None,
-                expected_active: None,
             },
             Case {
-                name: "not found no change",
-                model: "model-c",
-                initial_list: Some("model-a\nmodel-b"),
-                initial_active: Some("model-a"),
-                expected_list: Some("model-a\nmodel-b"),
-                expected_active: Some("model-a"),
-            },
-            Case {
-                name: "empty list with matching active clears active",
+                name: "empty list stays empty",
                 model: "model-a",
                 initial_list: None,
-                initial_active: Some("model-a"),
                 expected_list: None,
-                expected_active: None,
             },
         ];
 
         for case in &cases {
             let mut list = case.initial_list.map(String::from);
-            let mut active = case.initial_active.map(String::from);
-            remove_model_from_list(case.model, &mut list, &mut active);
+            remove_model_from_list(case.model, &mut list);
             assert_eq!(
                 list,
                 case.expected_list.map(String::from),
                 "case: {} — list mismatch",
-                case.name
-            );
-            assert_eq!(
-                active,
-                case.expected_active.map(String::from),
-                "case: {} — active mismatch",
                 case.name
             );
         }

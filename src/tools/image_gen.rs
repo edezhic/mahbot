@@ -53,7 +53,10 @@ impl Tool for ImageGenTool {
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         let prompt = super::get_str(&args, "prompt")?;
-        let model = crate::config::CONFIG.image_gen_model();
+        let user_name = crate::agent::CURRENT_TOOL_USER_NAME
+            .try_with(String::clone)
+            .unwrap_or_default();
+        let model = crate::users::resolve_image_gen_model(&user_name).await;
         let aspect_ratio_arg = super::get_opt_str(&args, "aspect_ratio");
         let size = super::get_opt_str(&args, "size");
         let images: Vec<String> = super::get_str_array(&args, "images");

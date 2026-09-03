@@ -158,8 +158,16 @@ impl Session {
             let is_new = self.history.is_empty();
 
             if is_new {
-                let (msgs, snapshot) =
-                    Self::build_turn_messages(msg, ws, role, ticket, round_ts, full_access).await;
+                let (msgs, snapshot) = Self::build_turn_messages(
+                    msg,
+                    ws,
+                    role,
+                    ticket,
+                    round_ts,
+                    full_access,
+                    user_name,
+                )
+                .await;
 
                 // Batch-write all messages + session context atomically.
                 crate::session::store()
@@ -183,7 +191,7 @@ impl Session {
                 // first-turn message set. The only rebuild path is
                 // `apply_summary` below.
                 let (content, new_snapshot) = if matches!(role, Role::Artist) {
-                    Self::prepend_model_change(agent_id, msg).await
+                    Self::prepend_model_change(agent_id, msg, user_name).await
                 } else {
                     (msg.to_string(), None)
                 };
@@ -451,6 +459,7 @@ impl Session {
     ///
     /// On persist failure, the full in-memory history is preserved — the
     /// next turn reloads from DB and retries (self-healing).
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn apply_summary(
         &mut self,
         agent_id: &str,
@@ -459,10 +468,11 @@ impl Session {
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
         full_access: bool,
+        user_name: &str,
     ) {
         // Build fresh system prompt (may have changed since session start).
         let (mut compacted, snapshot) =
-            Self::build_context_messages(ws, role, ticket, full_access).await;
+            Self::build_context_messages(ws, role, ticket, full_access, user_name).await;
 
         // Append conversation summary, then the retained latest turns in
         // chronological order. The in-flight user message is already among
@@ -551,6 +561,7 @@ impl Session {
         role: &Role,
         ticket: Option<&crate::pipeline::board::Ticket>,
         full_access: bool,
+        user_name: &str,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (stored_context, board_context) = tokio::join!(
             lookup_workspace_context(ws, role),
@@ -605,7 +616,8 @@ impl Session {
         // block when nothing renders (catalogs unavailable, no nuances).
         let mut snapshot = ModelSnapshot::default();
         if matches!(role, Role::Artist)
-            && let Some((block, rendered)) = crate::tools::active_models::render_block().await
+            && let Some((block, rendered)) =
+                crate::tools::active_models::render_block(user_name).await
         {
             msgs.push(ChatMessage::system(block));
             snapshot = rendered;
@@ -646,9 +658,10 @@ impl Session {
         ticket: Option<&crate::pipeline::board::Ticket>,
         round_ts: Option<&str>,
         full_access: bool,
+        user_name: &str,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (mut msgs, snapshot) =
-            Self::build_context_messages(ws, role, ticket, full_access).await;
+            Self::build_context_messages(ws, role, ticket, full_access, user_name).await;
         msgs.push(crate::session::user_msg_with_ts(msg, round_ts));
         (msgs, snapshot)
     }
@@ -698,11 +711,16 @@ impl Session {
     }
 
     /// Detect a mid-session image/video model change against the persisted
-    /// baseline. When one occurred, returns the message with a change-info
-    /// block prepended plus the new snapshot to persist (the caller persists
-    /// it only after the message is stored); otherwise the message is
-    /// returned unchanged with no snapshot.
-    async fn prepend_model_change(agent_id: &str, msg: &str) -> (String, Option<ModelSnapshot>) {
+    /// baseline, driven by `user_name`'s per-user model picks. When one
+    /// occurred, returns the message with a change-info block prepended plus
+    /// the new snapshot to persist (the caller persists it only after the
+    /// message is stored); otherwise the message is returned unchanged with no
+    /// snapshot.
+    async fn prepend_model_change(
+        agent_id: &str,
+        msg: &str,
+        user_name: &str,
+    ) -> (String, Option<ModelSnapshot>) {
         let Some(previous) = crate::session::store()
             .get_active_models(agent_id)
             .await
@@ -710,7 +728,7 @@ impl Session {
         else {
             return (msg.to_string(), None);
         };
-        let current = ModelSnapshot::from_config();
+        let current = ModelSnapshot::from_user(user_name).await;
 
         // Advance only the changed model(s) from the persisted baseline — a
         // model whose section never rendered (partial-block fail-open session)
@@ -813,19 +831,6 @@ async fn lookup_workspace_context(ws: &Workspace, role: &Role) -> Option<String>
 mod tests {
     use super::*;
 
-    /// Panic-safe guard restoring the config model fields mutated by the test.
-    struct ModelConfigGuard {
-        image: String,
-        video: String,
-    }
-
-    impl Drop for ModelConfigGuard {
-        fn drop(&mut self) {
-            let _ = crate::config::CONFIG.set_string_field("image_gen_model", &self.image);
-            let _ = crate::config::CONFIG.set_string_field("video_model", &self.video);
-        }
-    }
-
     /// Mid-session change detection: switching image AND video models against
     /// a persisted baseline fires one change-info per model (change-only
     /// lines — both shared catalog caches are seeded fail-open, so the change
@@ -835,6 +840,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(active_models)]
     async fn prepend_model_change_detects_switch_and_refreshes_baseline() {
+        let user = "test_artist_change_user";
         crate::util::test::init_test_stores().await;
         // Empty-catalog seeds: both catalog lookups return a fresh (empty)
         // catalog with no network fetch, so render_section finds no model and
@@ -849,22 +855,30 @@ mod tests {
         )));
         let agent_id = "test_artist_change";
 
-        let _guard = ModelConfigGuard {
-            image: crate::config::CONFIG.image_gen_model(),
-            video: crate::config::CONFIG.video_model(),
-        };
-        let _ = crate::config::CONFIG.set_string_field("image_gen_model", "model-a");
-        let _ = crate::config::CONFIG.set_string_field("video_model", "video-a");
-        let baseline = ModelSnapshot::from_config();
+        crate::users::store()
+            .set_image_gen_model(user, "model-a")
+            .await
+            .expect("set image model");
+        crate::users::store()
+            .set_video_model(user, "video-a")
+            .await
+            .expect("set video model");
+        let baseline = ModelSnapshot::from_user(user).await;
         crate::session::store()
             .set_active_models(agent_id, Some(&baseline.to_json()))
             .await
             .expect("baseline persisted");
 
         // Switch both models mid-session → one change-info per model.
-        let _ = crate::config::CONFIG.set_string_field("image_gen_model", "model-b");
-        let _ = crate::config::CONFIG.set_string_field("video_model", "video-b");
-        let (out, new_snapshot) = Session::prepend_model_change(agent_id, "hello").await;
+        crate::users::store()
+            .set_image_gen_model(user, "model-b")
+            .await
+            .expect("set image model");
+        crate::users::store()
+            .set_video_model(user, "video-b")
+            .await
+            .expect("set video model");
+        let (out, new_snapshot) = Session::prepend_model_change(agent_id, "hello", user).await;
         assert!(
             out.starts_with(
                 "<model-change>Active image model changed from model-a to model-b.</model-change>\n\
@@ -881,7 +895,7 @@ mod tests {
             .set_active_models(agent_id, Some(&new_snapshot.to_json()))
             .await
             .expect("baseline advanced");
-        let (out, snapshot) = Session::prepend_model_change(agent_id, "again").await;
+        let (out, snapshot) = Session::prepend_model_change(agent_id, "again", user).await;
         assert_eq!(out, "again");
         assert!(snapshot.is_none());
     }
@@ -890,7 +904,7 @@ mod tests {
     async fn prepend_model_change_without_baseline_is_noop() {
         crate::util::test::init_test_stores().await;
         let (out, snapshot) =
-            Session::prepend_model_change("test_artist_no_baseline", "hello").await;
+            Session::prepend_model_change("test_artist_no_baseline", "hello", "no_such_user").await;
         assert_eq!(out, "hello");
         assert!(snapshot.is_none());
     }
@@ -901,6 +915,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(active_models)]
     async fn prepend_model_change_preserves_absent_sections() {
+        let user = "test_artist_partial_user";
         crate::util::test::init_test_stores().await;
         crate::tools::media_catalog::image::seed_cache(Some(std::sync::Arc::new(
             crate::tools::media_catalog::image::ImageCatalog::default(),
@@ -910,13 +925,12 @@ mod tests {
         )));
         let agent_id = "test_artist_partial";
 
-        let _guard = ModelConfigGuard {
-            image: crate::config::CONFIG.image_gen_model(),
-            video: crate::config::CONFIG.video_model(),
-        };
         // Session started with only the video section rendered (image catalog
         // was down at session start) — the image id is NOT in the baseline.
-        let _ = crate::config::CONFIG.set_string_field("video_model", "video-a");
+        crate::users::store()
+            .set_video_model(user, "video-a")
+            .await
+            .expect("set video model");
         let baseline = ModelSnapshot {
             image: None,
             video: Some("video-a".into()),
@@ -929,8 +943,11 @@ mod tests {
         // Switch the video model → change-info for video; the returned
         // snapshot advances only video, leaving the absent image baseline
         // untouched.
-        let _ = crate::config::CONFIG.set_string_field("video_model", "video-b");
-        let (out, new_snapshot) = Session::prepend_model_change(agent_id, "hello").await;
+        crate::users::store()
+            .set_video_model(user, "video-b")
+            .await
+            .expect("set video model");
+        let (out, new_snapshot) = Session::prepend_model_change(agent_id, "hello", user).await;
         assert!(
             out.starts_with("<model-change>Active video model changed from video-a to video-b.")
         );
@@ -943,8 +960,11 @@ mod tests {
             .expect("baseline advanced");
 
         // A later image switch stays silent — the image id was never rendered.
-        let _ = crate::config::CONFIG.set_string_field("image_gen_model", "image-b");
-        let (out, snapshot) = Session::prepend_model_change(agent_id, "again").await;
+        crate::users::store()
+            .set_image_gen_model(user, "image-b")
+            .await
+            .expect("set image model");
+        let (out, snapshot) = Session::prepend_model_change(agent_id, "again", user).await;
         assert_eq!(out, "again");
         assert!(snapshot.is_none());
     }

@@ -12,7 +12,6 @@
 
 use std::fmt::Write;
 
-use crate::config::CONFIG;
 use crate::tools::media_catalog::image::{self, ImageModelInfo, ParameterConstraint};
 use crate::tools::media_catalog::video::{self, VideoModelInfo};
 
@@ -35,12 +34,12 @@ pub(crate) struct ModelSnapshot {
 }
 
 impl ModelSnapshot {
-    /// Read the currently configured image/video models.
-    #[must_use]
-    pub(crate) fn from_config() -> Self {
+    /// Read the currently active image/video models for `user_name` (their
+    /// per-user picker choice, falling back to the hardcoded default).
+    pub(crate) async fn from_user(user_name: &str) -> Self {
         Self {
-            image: Some(CONFIG.image_gen_model()),
-            video: Some(CONFIG.video_model()),
+            image: Some(crate::users::resolve_image_gen_model(user_name).await),
+            video: Some(crate::users::resolve_video_model(user_name).await),
         }
     }
 
@@ -85,14 +84,16 @@ impl ModelKind {
     }
 }
 
-/// Render the full `<active-models-opts>` block for the currently configured
-/// models, or `None` when no section renders. Image and video sections render
+/// Render the full `<active-models-opts>` block for `user_name`'s active
+/// models (their per-user picker choice, falling back to the hardcoded
+/// default), or `None` when no section renders. Image and video sections render
 /// independently — an unavailable catalog suppresses only its own section, and
 /// static video-edit nuances still render without a catalog entry. The
 /// returned snapshot records exactly which model ids were rendered (the
-/// persisted baseline must never be re-derived from config).
-pub(crate) async fn render_block() -> Option<(String, ModelSnapshot)> {
-    let current = ModelSnapshot::from_config();
+/// persisted baseline must never be re-derived from the live per-user
+/// resolution).
+pub(crate) async fn render_block(user_name: &str) -> Option<(String, ModelSnapshot)> {
+    let current = ModelSnapshot::from_user(user_name).await;
     let (image, video) = tokio::join!(
         render_side(ModelKind::Image, current.image.as_deref()),
         render_side(ModelKind::Video, current.video.as_deref()),

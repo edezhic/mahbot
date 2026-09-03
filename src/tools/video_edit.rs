@@ -21,8 +21,8 @@ const MAX_IMAGE_BYTES: u64 = 30 * 1024 * 1024;
 const MAX_REFERENCE_IMAGES: usize = 9;
 
 /// Per-model video edit capability classification, driving validation and the
-/// tool description. The active model is user-switchable via
-/// `video_model` in the config.
+/// tool description. The active model is user-switchable via the per-user
+/// Telegram `/video_models` picker (see `crate::users::resolve_video_model`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoEditModel {
     /// minimax/hailuo-3 (default): 5-15s output, 2K fixed, always audio, no seed.
@@ -674,7 +674,10 @@ impl Tool for VideoEditTool {
         let first_frame = super::get_opt_str(&args, "first_frame").filter(|s| !s.is_empty());
         let last_frame = super::get_opt_str(&args, "last_frame").filter(|s| !s.is_empty());
 
-        let model = crate::config::CONFIG.video_model();
+        let user_name = crate::agent::CURRENT_TOOL_USER_NAME
+            .try_with(String::clone)
+            .unwrap_or_default();
+        let model = crate::users::resolve_video_model(&user_name).await;
         let spec = classify_model(&model);
 
         let char_count = instruction.chars().count();

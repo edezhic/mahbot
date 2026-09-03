@@ -30,9 +30,8 @@
 //! * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
 //! * `or(DEFAULT)` — returns `String`, falls back to a compile-time constant
 //!   (e.g. `DEFAULT_PROVIDER_ENDPOINT`).
-//! * `list_or(fallback = …, default = …)` — returns `Vec<String>`, parses a
-//!   newline-separated list, falling back to a singular field then to a hardcoded
-//!   default.
+//! * `list_or(default = …)` — returns `Vec<String>`, parses a
+//!   newline-separated list, falling back to a hardcoded default when unset.
 //!
 //! At reload time [`reload_from_db`] loads key–value pairs from the `config_kv`
 //! table (via [`crate::config_db::ConfigStore::get_all_kv`]) and applies them
@@ -131,18 +130,16 @@ const OLD_DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
 // targets OpenRouter.
 pub(crate) const VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.8-flash";
 
-const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
-const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
+pub(crate) const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-3.1-flash-image";
+pub(crate) const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
 
 /// Fresh-install seeded image-generation model list (newline-separated, in
-/// picker order; the first entry is the active model). Mirrors the curated
-/// set the live install ships.
+/// picker order). Mirrors the curated set the live install ships.
 const FRESH_INSTALL_IMAGE_GEN_MODELS: &str =
     "google/gemini-3.1-flash-image\nmicrosoft/mai-image-2.5\nqwen/qwen-image-3-pro";
 
 /// Fresh-install seeded video-generation model list (newline-separated, in
-/// picker order; the second entry is the active model). Mirrors the curated
-/// set the live install ships.
+/// picker order). Mirrors the curated set the live install ships.
 const FRESH_INSTALL_VIDEO_MODELS: &str = "bytedance/seedance-2.0-mini\nminimax/hailuo-3";
 
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
@@ -244,12 +241,8 @@ pub struct ConfigData {
     /// Model slot for all worker roles (Artist, Analyst, Coder, QA,
     /// Reviewer, Sanitation).
     pub worker_model: Option<String>,
-    /// Image generation model.
-    pub image_gen_model: Option<String>,
     /// Newline-separated list of available image generation models (for selection UI).
     pub image_gen_models: Option<String>,
-    /// Video model — shared by the video_gen and video_edit tools.
-    pub video_model: Option<String>,
     /// Newline-separated list of available video models (for selection UI).
     pub video_models: Option<String>,
     /// Firecrawl API key for web search.
@@ -337,9 +330,9 @@ pub struct ConfigData {
 //
 // * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
 // * `or(DEFAULT)` — returns `String`, falls back to the given default constant.
-// * `list_or(fallback = <field>, default = <const>)` — returns `Vec<String>`,
-//   parses a newline-separated list, falls back to the named field then
-//   the default constant.
+// * `list_or(default = <const>)` — returns `Vec<String>`, parses a
+//   newline-separated list, falls back to a single-element list of the
+//   default constant when unset/empty.
 //
 // Generated accessors live on `impl ConfigReload`, created by `string_config_fields!`.
 
@@ -348,7 +341,7 @@ pub struct ConfigData {
 /// — all from a single annotated list of `Option<String>` field names.
 ///
 /// Each field is declared as `$field [$annotation]` where `$annotation` is one of
-/// `non_empty`, `or($default)`, or `list_or(fallback = $fallback, default = $default)`.
+/// `non_empty`, `or($default)`, or `list_or(default = $default)`.
 ///
 /// All generated items are guaranteed to stay synchronised because they expand
 /// from the same source.
@@ -518,26 +511,23 @@ macro_rules! string_config_fields {
         }
     };
 
-    // ── Accessor pattern: list_or(fallback = <field>, default = <const>) ──
+    // ── Accessor pattern: list_or(default = <const>) ──
     //
     // Returns Vec<String>. Tries parsing `$field` as a newline-separated list.
     // If non-empty, returns the parsed entries. Otherwise falls back to the
-    // named `$fallback` field, then to the hardcoded `$default` constant.
-    (@accessor $field:ident list_or(fallback = $fallback:ident, default = $default:expr)) => {
+    // hardcoded `$default` constant. Used for the model picker lists, whose
+    // active selection is now per-user (not a global config field) — the only
+    // fallback is the default model.
+    (@accessor $field:ident list_or(default = $default:expr)) => {
         #[doc = concat!(
             "Returns the list of available `", stringify!($field), "`.",
             "\n\nIf unset or the parsed newline-separated list is empty,",
-            " falls back to `", stringify!($fallback),
-            "`, then to a built-in default."
+            " falls back to a built-in default."
         )]
         #[must_use]
         pub fn $field(&self) -> Vec<String> {
             let guard = self.read();
-            resolve_list_or(
-                guard.$field.as_deref(),
-                guard.$fallback.clone(),
-                $default,
-            )
+            resolve_list_or(guard.$field.as_deref(), $default)
         }
     };
 }
@@ -548,10 +538,8 @@ string_config_fields! {
     provider_endpoint_key [non_empty],
     manager_model [or(DEFAULT_MANAGER_MODEL)],
     worker_model [or(DEFAULT_WORKER_MODEL)],
-    image_gen_model [or(DEFAULT_IMAGE_GEN_MODEL)],
-    image_gen_models [list_or(fallback = image_gen_model, default = DEFAULT_IMAGE_GEN_MODEL)],
-    video_model [or(DEFAULT_VIDEO_MODEL)],
-    video_models [list_or(fallback = video_model, default = DEFAULT_VIDEO_MODEL)],
+    image_gen_models [list_or(default = DEFAULT_IMAGE_GEN_MODEL)],
+    video_models [list_or(default = DEFAULT_VIDEO_MODEL)],
     firecrawl_key [non_empty],
     exa_key [non_empty],
     web_search_provider [non_empty],
@@ -633,25 +621,20 @@ pub(crate) fn resolve_or(val: Option<String>, fallback: &str) -> String {
     non_empty(val).unwrap_or(fallback.to_string())
 }
 
-/// Parse a newline-separated list field, falling back to a singular field, then to a hardcoded
-/// default.
+/// Parse a newline-separated list field, falling back to a hardcoded default.
 ///
 /// If `list_field` is `Some` and contains at least one non-empty line (after trimming), the parsed
-/// lines are returned as a `Vec<String>`. Otherwise a single-element vec containing the resolved
-/// value of `fallback_field` (or `default_value`) is returned.
+/// lines are returned as a `Vec<String>`. Otherwise a single-element vec containing
+/// `default_value` is returned.
 #[must_use]
-fn resolve_list_or(
-    list_field: Option<&str>,
-    fallback_field: Option<String>,
-    default_value: &str,
-) -> Vec<String> {
+fn resolve_list_or(list_field: Option<&str>, default_value: &str) -> Vec<String> {
     if let Some(raw) = list_field {
         let parsed = parse_newline_list(raw);
         if !parsed.is_empty() {
             return parsed;
         }
     }
-    vec![resolve_or(fallback_field, default_value)]
+    vec![default_value.to_string()]
 }
 
 /// Normalize an endpoint URL for comparison: trim surrounding whitespace,
@@ -1025,12 +1008,12 @@ fn default_model_routing(model: &str) -> Option<&'static str> {
 /// `"false"` (the existing reading semantics are unchanged: absence of the
 /// row = enabled, `"false"` = disabled). It must also show populated model
 /// pickers: the Settings GUI reads the raw snapshot fields
-/// (`config.image_gen_models` / `config.image_gen_model`,
-/// `config.video_models` / `config.video_model`), not the default-resolving
-/// `list_or`/`or` accessors, so the image/video generation model lists and
-/// their active selections are seeded too. `fresh` is the pre-open
-/// file-existence discriminator captured in [`load_or_init`] — existing
-/// databases receive zero writes.
+/// (`config.image_gen_models` / `config.video_models`), not the
+/// default-resolving `list_or` accessors, so the image/video generation model
+/// lists are seeded too. The active selection is per-user (see
+/// `crate::users`), not a config field, so no singular key is seeded. `fresh`
+/// is the pre-open file-existence discriminator captured in [`load_or_init`] —
+/// existing databases receive zero writes.
 async fn seed_fresh_install_defaults(
     fresh: bool,
     store: &crate::config_db::ConfigStore,
@@ -1042,13 +1025,7 @@ async fn seed_fresh_install_defaults(
         .set_kv(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, "false")
         .await?;
     store
-        .set_kv(CONFIG_KEY_IMAGE_GEN_MODEL, DEFAULT_IMAGE_GEN_MODEL)
-        .await?;
-    store
         .set_kv(CONFIG_KEY_IMAGE_GEN_MODELS, FRESH_INSTALL_IMAGE_GEN_MODELS)
-        .await?;
-    store
-        .set_kv(CONFIG_KEY_VIDEO_MODEL, DEFAULT_VIDEO_MODEL)
         .await?;
     store
         .set_kv(CONFIG_KEY_VIDEO_MODELS, FRESH_INSTALL_VIDEO_MODELS)
@@ -1137,7 +1114,8 @@ pub async fn reload_from_db() -> Result<()> {
     // Fresh-install seed: a brand-new config
     // database gets the transcription-off default (so no audio model is
     // downloaded or loaded at boot) plus the image/video generation model
-    // lists and active selections (so the Settings GUI pickers are populated).
+    // lists (so the Settings GUI pickers are populated; the active selection
+    // is per-user, not a config field).
     // Existing installs are never written (the flag is only set when the config
     // store did not exist before the store open).
     seed_fresh_install_defaults_from_flag(store).await?;
@@ -1255,14 +1233,14 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         // `probe_validate_write`; the endpoint-specific cascade, warmup, and
         // recreate follow.
         //
-        // Note: the active image model is deliberately NOT re-validated here.
-        // The image-model catalog is endpoint-keyed, and validating the
-        // committed model against the new endpoint would deadlock a provider
-        // switch to a disjoint catalog (endpoint rejects until the model
-        // changes, model rejects until the endpoint changes). The image model
-        // is instead validated when it itself settles, against the then-
-        // committed endpoint — so a switch is two steps (endpoint first, then
-        // model), each independently valid.
+        // Note: the active image model is per-user (see `crate::users`) and is
+        // not re-validated here. The image-model catalog is endpoint-keyed;
+        // validating committed models against the new endpoint could deadlock
+        // a provider switch to a disjoint catalog (endpoint rejects until the
+        // model changes, model rejects until the endpoint changes). Telegram
+        // picker taps validate image models against the default endpoint
+        // instead — so a switch is two steps (endpoint first, then model),
+        // each independently valid.
         CONFIG_KEY_PROVIDER_ENDPOINT => {
             let probe = probe_validate_write(key, &trimmed).await?;
 
@@ -1350,27 +1328,6 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
             if persisted != old_token {
                 crate::channels::telegram::restart_telegram_listener(persisted.as_deref()).await?;
             }
-        }
-        // The active image model must exist in the endpoint-keyed catalog
-        // (fail-open when the catalog is unreachable — matching the
-        // generation tool's semantics). A cleared model falls back to the
-        // default — the model that would actually be used — so it is
-        // validated too.
-        //
-        // Image models always run on OpenRouter — the catalog is
-        // endpoint-keyed on the default, so validation never
-        // consults a custom chat endpoint.
-        CONFIG_KEY_IMAGE_GEN_MODEL => {
-            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string();
-            let model_opt = trimmed_or_none(&trimmed);
-            let model: &str = model_opt.as_deref().unwrap_or(DEFAULT_IMAGE_GEN_MODEL);
-            if model != CONFIG.image_gen_model() {
-                crate::tools::media_catalog::image::validate_image_model_for_endpoint(
-                    model, &endpoint,
-                )
-                .await?;
-            }
-            write_kv_and_update_config(CONFIG_KEY_IMAGE_GEN_MODEL, &trimmed).await?;
         }
         // Everything else is read dynamically at use time — persist only.
         _ => {
@@ -1662,12 +1619,12 @@ mod tests {
             "empty string is collapsed to None"
         );
 
-        // ── list_or: falls back to active model when list is unset ──
+        // ── list_or: falls back to default when list is unset ──
         reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
         assert_eq!(
             reload.image_gen_models(),
             vec![DEFAULT_IMAGE_GEN_MODEL.to_string()],
-            "unset image_gen_models falls back to active model"
+            "unset image_gen_models falls back to default"
         );
 
         // When list is set, returns parsed entries
@@ -2013,7 +1970,6 @@ mod tests {
             CONFIG_KEY_PROVIDER_KEY,
             CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
             CONFIG_KEY_TELEGRAM_BOT_TOKEN,
-            CONFIG_KEY_IMAGE_GEN_MODEL,
             CONFIG_KEY_WAKE_WORD_TEMPLATES,
         ] {
             assert!(
@@ -2029,8 +1985,9 @@ mod tests {
     ///
     /// The seeded set is the transcription-off default (so no audio model is
     /// downloaded or loaded at boot) plus the image/video generation model
-    /// lists and active selections (so the Settings GUI model pickers, which
-    /// read the raw snapshot fields, are populated on fresh installs).
+    /// lists (so the Settings GUI model pickers, which read the raw snapshot
+    /// fields, are populated on fresh installs). The active selection is
+    /// per-user (see `crate::users`), not a config field.
     ///
     /// This test drives the real boot chain end-to-end instead of hand-picking
     /// `fresh` values: the discriminator probe (`config_db_is_fresh` — the
@@ -2081,15 +2038,10 @@ mod tests {
                     "false".to_string()
                 ),
                 (
-                    "image_gen_model".to_string(),
-                    "google/gemini-3.1-flash-image".to_string()
-                ),
-                (
                     "image_gen_models".to_string(),
                     "google/gemini-3.1-flash-image\nmicrosoft/mai-image-2.5\nqwen/qwen-image-3-pro"
                         .to_string()
                 ),
-                ("video_model".to_string(), "minimax/hailuo-3".to_string()),
                 (
                     "video_models".to_string(),
                     "bytedance/seedance-2.0-mini\nminimax/hailuo-3".to_string()
