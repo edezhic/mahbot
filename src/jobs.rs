@@ -183,18 +183,30 @@ pub(crate) struct PendingJobRow {
     pub created_at: String,
 }
 
+crate::columns! {
+    JOB_COLUMNS [JOB] {
+        ID              => "id",
+        KIND            => "kind",
+        WORKSPACE_NAME  => "workspace_name",
+        RETRY_COUNT     => "retry_count",
+        TICKET_ID       => "ticket_id",
+        CALLER_AGENT_ID => "caller_agent_id",
+        MODE            => "mode",
+    }
+}
+
 fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
     Ok(JobRow {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        workspace_name: row.get(2)?,
-        retry_count: row.get(3)?,
-        ticket_id: row.get(4)?,
-        caller_agent_id: row.get(5)?,
+        id: row.get(COL_JOB_ID)?,
+        kind: row.get(COL_JOB_KIND)?,
+        workspace_name: row.get(COL_JOB_WORKSPACE_NAME)?,
+        retry_count: row.get(COL_JOB_RETRY_COUNT)?,
+        ticket_id: row.get(COL_JOB_TICKET_ID)?,
+        caller_agent_id: row.get(COL_JOB_CALLER_AGENT_ID)?,
         // Defensive fallback: the migration backfills every row, so a NULL or
         // bogus value here is a legacy edge — treat it as async rather than
         // dropping the job at boot.
-        mode: match row.get::<Option<String>>(6)? {
+        mode: match row.get::<Option<String>>(COL_JOB_MODE)? {
             Some(s) => s.parse().unwrap_or_else(|e| {
                 warn!(mode = %s, error = %e, "Invalid jobs.mode — falling back to async");
                 JobMode::Async
@@ -729,10 +741,12 @@ pub(crate) async fn find_owned_launched_jobs(
 ) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
-            "SELECT id, kind, workspace_name, retry_count, ticket_id, caller_agent_id, mode FROM jobs j \
-             WHERE j.caller_agent_id = ?1 AND j.kind IN ('analyze','implement') AND j.status = 'launched' \
-               AND j.mode = 'sync' \
-             ORDER BY j.created_at DESC",
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs j \
+                 WHERE j.caller_agent_id = ?1 AND j.kind IN ('analyze','implement') AND j.status = 'launched' \
+                   AND j.mode = 'sync' \
+                 ORDER BY j.created_at DESC"
+            ),
             params![caller_agent_id],
         )
         .await
@@ -1134,8 +1148,10 @@ pub(crate) async fn job_retry_count(conn: &Connection, job_id: &str) -> i64 {
 pub(crate) async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
-            "SELECT id, kind, workspace_name, retry_count, ticket_id, caller_agent_id, mode FROM jobs \
-             WHERE status != 'done' ORDER BY created_at",
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs \
+                 WHERE status != 'done' ORDER BY created_at"
+            ),
             (),
         )
         .await
