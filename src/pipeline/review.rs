@@ -115,9 +115,8 @@ pub(crate) async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> an
 /// Gather the working-tree churn at review dispatch.
 async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
     let snapshot = run_git_worktree_snapshot(repo_path).await?;
-    // An unborn HEAD is not a valid churn baseline (same semantics as the
-    // pre-snapshot numstat failure): surface as Err so the caller defaults
-    // the reviewer base instead of calibrating on a zero diff.
+    // An unborn HEAD is not a valid churn baseline: surface as Err so the
+    // caller defaults the reviewer base instead of calibrating on a zero diff.
     if snapshot.unborn_head {
         anyhow::bail!("Repository has no commits — no churn baseline");
     }

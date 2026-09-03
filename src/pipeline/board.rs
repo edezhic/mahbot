@@ -794,7 +794,7 @@ impl BoardStore {
     /// # Correctness (TOCTOU)
     ///
     /// Correctness relies on both the tokio mutex inside `conn` (serializes
-    /// Rust-level writes) and the SQLite transaction `tx` (provides
+    /// Rust-level writes) and the Turso transaction `tx` (provides
     /// database-level isolation) — no concurrent write can change
     /// prerequisite tickets between validation and the caller's INSERT.
     /// Validation runs inside the transaction via `tx.query()` (which
@@ -1203,7 +1203,7 @@ impl BoardStore {
     /// ticket IDs.
     ///
     /// Callers must ensure `ids` is non-empty — the resulting SQL is invalid
-    /// (syntax error from SQLite) when the list is empty.
+    /// (syntax error from Turso) when the list is empty.
     fn in_clause_for_ids(ids: &[String]) -> (String, Vec<Value>) {
         let suffix = format!("WHERE id IN ({})", db::sql_in_placeholders(ids.len()));
         let params: Vec<Value> = ids.iter().map(|id| Value::Text(id.clone())).collect();
@@ -1676,7 +1676,7 @@ impl BoardStore {
         prerequisite_ids: &[String],
         workspace_name: &str,
     ) -> Result<()> {
-        // Guard against empty list — SQLite rejects WHERE id IN ().
+        // Guard against empty list — Turso rejects WHERE id IN ().
         if prerequisite_ids.is_empty() {
             return Ok(());
         }
@@ -1926,16 +1926,13 @@ impl BoardStore {
         // newest-first (DESC) below them.
         // Priority is an integer — 0 = highest, so ASC puts urgent tickets first.
         // Ticket created_at is an ISO 8601 string, so lexical sort = chronological sort
-        pending.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then(a.created_at.cmp(&b.created_at))
-        });
-        pipeline.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then(a.created_at.cmp(&b.created_at))
-        });
+        for column in [&mut pending, &mut pipeline] {
+            column.sort_by(|a, b| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then(a.created_at.cmp(&b.created_at))
+            });
+        }
         completed.sort_by(|a, b| {
             let (a_done, b_done) = (a.phase == TicketPhase::Done, b.phase == TicketPhase::Done);
             match (a_done, b_done) {

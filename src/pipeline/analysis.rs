@@ -497,16 +497,8 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
     let message = load_prompt(prompt_key);
 
     let conn = &crate::session::store().conn;
-    let roster = match crate::jobs::list_agents_for_job(conn, job_id).await {
-        Ok(roster) => roster,
-        Err(e) => {
-            // A read failure must NOT degrade to a fresh dispatch: doing so would
-            // re-derive a new-suffix roster and orphan the interrupted round's
-            // rows. Bail and let the poller re-drive (the job stays occupied,
-            // with no running agents, so re-dispatch is safe).
-            warn!(ticket = %ticket.id, error = %e, "Failed to read analysis roster — bailing to preserve interrupted round");
-            return;
-        }
+    let Some(roster) = super::read_roster_or_bail(&ticket.id, job_id).await else {
+        return;
     };
     if roster.is_empty() {
         let slots =
@@ -743,7 +735,10 @@ async fn run_analysis_round(
     .await;
 }
 
-/// Finalize an analysis round — always advances to Planning (fail-open).
+/// Finalize an analysis round — hands the verdicts to
+/// [`process_analyst_verdicts`], which normally advances to Planning
+/// (fail-open) but resets the round (ticket stays in Analysis) when no
+/// analyst produced usable output; see its docs.
 async fn finalize_analysis_round(
     ticket: &Ticket,
     base_results: &[ParallelVerdict],

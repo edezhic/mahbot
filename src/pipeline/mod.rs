@@ -1586,20 +1586,20 @@ pub(crate) async fn bounce_to_development(
 
     if matches!(outcome, FinalizeOutcome::Applied) {
         let conn = &crate::session::store().conn;
+        // Delete the phase job in both paths: a non-exhausting bounce gets a
+        // fresh InDevelopment attempt from the puller on the next tick; a
+        // tripped breaker leaves the ticket failed.
+        let _ = crate::jobs::terminalize_job(conn, job_id).await;
         if trip {
             if drains_siblings {
                 drain_queued_siblings(ticket).await;
             }
-            let _ = crate::jobs::terminalize_job(conn, job_id).await;
             info!(
                 ticket = %ticket.id,
                 "Bounce circuit breaker tripped ({} bounces) — ticket failed",
                 MAX_BOUNCES,
             );
         } else {
-            // Non-exhausting bounce: delete the phase job; the puller creates a
-            // fresh InDevelopment attempt on the next tick.
-            let _ = crate::jobs::terminalize_job(conn, job_id).await;
             info!(
                 ticket = %ticket.id,
                 target = %target,
@@ -1635,10 +1635,8 @@ async fn finalize_verifier_round(
 ) {
     let transitioned = process_verifier_verdicts(ws, ticket, results, vi, job_id).await;
     if !transitioned && crate::shutdown::aborting() {
-        info!(
-            ticket = %ticket.id,
-            "Verifier round cut short by drain — job stays launched for boot resume",
-        );
+        // Return early to skip recording the reviewed base during drain; the
+        // drain-abort log lives in `process_verifier_verdicts`.
         return;
     }
 
@@ -1656,6 +1654,23 @@ async fn finalize_verifier_round(
     }
 }
 
+/// Read a phase roster for slot-resume detection, bailing on read failure.
+///
+/// A read failure must NOT degrade to a fresh dispatch: doing so would
+/// re-derive a new-suffix roster and orphan the interrupted round's rows.
+/// Returns `None` after warning — the caller returns and lets the poller
+/// re-drive (the job stays occupied, with no running agents, so
+/// re-dispatch is safe).
+async fn read_roster_or_bail(ticket_id: &str, job_id: &str) -> Option<Vec<crate::jobs::AgentRow>> {
+    match crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await {
+        Ok(roster) => Some(roster),
+        Err(e) => {
+            warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to read phase roster — bailing to preserve interrupted round");
+            None
+        }
+    }
+}
+
 /// Shared dispatch logic for parallel verifiers (reviewers and QA): guards the
 /// job phase (derived from the VerifierInfo), then dispatches the round.
 async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo, job_id: String) {
@@ -1667,7 +1682,6 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
         return;
     }
 
-    let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
     let conn = &crate::session::store().conn;
 
     // Slot-resume detection: a non-empty roster marks an interrupted round —
@@ -1675,16 +1689,8 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     // with their stored tasks. An empty roster (body crashed before its first
     // roster write) degrades to a fresh dispatch re-derived from live ticket
     // state.
-    let roster = match crate::jobs::list_agents_for_job(conn, &job_id).await {
-        Ok(roster) => roster,
-        Err(e) => {
-            // A read failure must NOT degrade to a fresh dispatch: doing so would
-            // re-derive a new-suffix roster and orphan the interrupted round's
-            // rows. Bail and let the poller re-drive (the job stays occupied,
-            // with no running agents, so re-dispatch is safe).
-            warn!(ticket = %ticket.id, job = %job_id, error = %e, "Failed to read phase roster — bailing to preserve interrupted round");
-            return;
-        }
+    let Some(roster) = read_roster_or_bail(&ticket.id, &job_id).await else {
+        return;
     };
 
     if roster.is_empty() {
@@ -1695,6 +1701,7 @@ async fn dispatch_verifiers(ticket: Arc<Ticket>, ws: Workspace, vi: VerifierInfo
     // Resume: reuse the stored roster. The stored per-slot task is the round's
     // prompt (no re-derivation from live ticket state); the count is the roster
     // length (recomputed churn could differ across the interruption).
+    let extraction_prompt = crate::prompt::load_prompt(vi.extraction_prompt_path);
     let slots: Vec<AgentSlot> = roster.iter().map(agent_slot_from_roster_row).collect();
     let split = crate::jobs::split_slot_resume(&roster);
     let count = slots.len();

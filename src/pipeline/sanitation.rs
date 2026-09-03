@@ -122,6 +122,21 @@ async fn finalize_ticket_with_git_status(
     }
 }
 
+/// Shared sanitation finalize tail: clear the implementation roster and
+/// finalize the ticket at Done via its git status. A `None` status (git
+/// unavailable → ticket moved to Done without commit; transient status
+/// failure → ticket stays in phase for retry) simply returns.
+async fn finalize_sanitation_ticket(ticket: Ticket, ws: &Workspace, job_id: &str) {
+    clear_implementation_roster(&crate::session::store().conn, job_id, &ticket.id).await;
+    let Some(porcelain) =
+        ensure_git_or_done_and_get_status(&ticket, ws, TicketPhase::InSanitation, "finalize").await
+    else {
+        return;
+    };
+    finalize_ticket_with_git_status(ticket, ws.clone(), TicketPhase::InSanitation, &porcelain)
+        .await;
+}
+
 /// After a successful `git commit`, persist the metadata and transition the
 /// ticket to Done atomically.
 async fn finalize_commit_and_transition(
@@ -240,24 +255,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
             // No new/untracked files — skip the sanitation agent entirely and
             // commit straight to Done (no bounce budget consumed). The skip is
             // silent in ticket history.
-            clear_implementation_roster(&crate::session::store().conn, job_id, &ticket.id).await;
-            let Some(porcelain) = ensure_git_or_done_and_get_status(
-                &ticket,
-                &ws,
-                TicketPhase::InSanitation,
-                "finalize",
-            )
-            .await
-            else {
-                return;
-            };
-            finalize_ticket_with_git_status(
-                ticket.as_ref().clone(),
-                ws.clone(),
-                TicketPhase::InSanitation,
-                &porcelain,
-            )
-            .await;
+            finalize_sanitation_ticket((*ticket).clone(), &ws, job_id).await;
             return;
         }
         Ok(files) => files.join("\n"),
@@ -309,20 +307,7 @@ async fn process_sanitation_verdict(
         {
             warn!(ticket = %ticket.id, error = %e, "Failed to record sanitation pass comment");
         }
-        clear_implementation_roster(&crate::session::store().conn, job_id, &ticket.id).await;
-        let Some(porcelain) =
-            ensure_git_or_done_and_get_status(ticket, ws, TicketPhase::InSanitation, "finalize")
-                .await
-        else {
-            return;
-        };
-        finalize_ticket_with_git_status(
-            ticket.clone(),
-            ws.clone(),
-            TicketPhase::InSanitation,
-            &porcelain,
-        )
-        .await;
+        finalize_sanitation_ticket(ticket.clone(), ws, job_id).await;
     } else {
         let garbage_list = verdict.garbage_files.join("\n- ");
         let comment = substitute(
