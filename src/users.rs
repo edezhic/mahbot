@@ -23,7 +23,7 @@ use crate::db::{self, TxGuard};
 use crate::git::commands::run_git_output;
 use anyhow::Result;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::warn;
 
 /// Sentinel that `extract_sender_user_name` (src/channels/telegram.rs)
@@ -82,11 +82,7 @@ impl UserStore {
     /// Runs idempotently from both [`crate::db::init_all_stores`] (production,
     /// on the shared consolidated connection) and each isolated user store open.
     pub(crate) async fn ensure_admin_user(&self) -> Result<()> {
-        let rows = self
-            .conn
-            .query("SELECT 1 FROM users WHERE name = 'admin'", db::params![])
-            .await?;
-        if rows.is_empty() {
+        if !self.user_exists("admin").await? {
             // Fresh admin: full permissions + selected_role=Support (the first
             // onboarding-pool role).
             self.add_user("admin", Some("full"), Role::Support).await?;
@@ -127,7 +123,6 @@ impl UserStore {
         }
         tx.commit().await?;
 
-        // Create personal workspace directory.
         ensure_personal_workspace(name).await;
 
         Ok(())
@@ -151,8 +146,7 @@ impl UserStore {
 
     /// Fetch a single nullable column from the user's row, if the user exists.
     ///
-    /// A NULL column and a missing row both yield `None` (NULL-vs-missing
-    /// conflation preserved from the pre-helper implementation).
+    /// A NULL column and a missing row both yield `None`.
     async fn user_column(&self, column: &str, user_name: &str) -> Result<Option<String>> {
         self.conn
             .query_optional(
@@ -338,17 +332,9 @@ impl UserStore {
     /// Find a single user by exact name, returning their full record with channel bindings.
     /// Returns `None` if no such user exists.
     pub async fn find_by_name(&self, user_name: &str) -> Result<Option<UserRecord>> {
-        let rows = self
-            .conn
-            .query(
-                &format!("SELECT {USERS_COLUMNS} FROM users WHERE name = ?1"),
-                db::params![user_name],
-            )
-            .await?;
-        match rows.into_iter().next() {
-            Some(row) => Ok(Some(self.user_record_from_row(&row).await?)),
-            None => Ok(None),
-        }
+        self.list_users_where("WHERE name = ?1", db::params![user_name])
+            .await
+            .map(|users| users.into_iter().next())
     }
 
     /// List all users.
@@ -638,12 +624,9 @@ async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
     let s = store();
     let selected = s.get_selected_workspace_name(user_name).await?;
     if let Some(ws_name) = selected {
-        // Shared workspace: look up from the workspaces table
         crate::workspace::get_by_name(&ws_name).await
     } else {
-        // Personal workspace: construct from userspace path
-        let path = personal_workspace_path(user_name);
-        Ok(Some(personal_workspace_struct(user_name, &path)))
+        Ok(Some(personal_workspace_struct(user_name)))
     }
 }
 
@@ -668,8 +651,7 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
     } else if is_personal_workspace(workspace_name) {
         let user_name = personal_user_name(workspace_name)
             .expect("invariant: is_personal_workspace checked the prefix");
-        let path = personal_workspace_path(user_name);
-        Ok(Some(personal_workspace_struct(user_name, &path)))
+        Ok(Some(personal_workspace_struct(user_name)))
     } else {
         Ok(None)
     }
@@ -678,8 +660,8 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
 /// Build a `Workspace` struct for a personal workspace.
 /// Has no diagnostics, no maintenance, no discovery — minimal defaults.
 #[must_use]
-fn personal_workspace_struct(user_name: &str, path: &Path) -> Workspace {
-    let mut ws = Workspace::from_path(path);
+fn personal_workspace_struct(user_name: &str) -> Workspace {
+    let mut ws = Workspace::from_path(&personal_workspace_path(user_name));
     ws.name = personal_workspace_name(user_name);
     ws.status = WorkspaceStatus::Ready;
     ws
@@ -696,8 +678,7 @@ pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
                 "workspace resolution: selected_workspace points to non-existent workspace; \
                  falling back to personal workspace",
             );
-            let path = personal_workspace_path(user_name);
-            personal_workspace_struct(user_name, &path)
+            personal_workspace_struct(user_name)
         }
         Err(e) => {
             warn!(
@@ -705,8 +686,7 @@ pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
                 error = %e,
                 "workspace resolution: database error; falling back to personal workspace",
             );
-            let path = personal_workspace_path(user_name);
-            personal_workspace_struct(user_name, &path)
+            personal_workspace_struct(user_name)
         }
     }
 }
@@ -833,8 +813,7 @@ pub(crate) fn effective_workspace_for_role(
     user_name: &str,
 ) -> Workspace {
     if pins_to_personal(role, &ws.name, user_name) {
-        let path = personal_workspace_path(user_name);
-        personal_workspace_struct(user_name, &path)
+        personal_workspace_struct(user_name)
     } else {
         ws
     }
