@@ -37,7 +37,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::debug;
-use x11rb::connection::Connection as _;
+use x11rb::connection::{Connection as _, RequestConnection as _};
 use x11rb::protocol::{randr, xproto};
 use x11rb::rust_connection::RustConnection;
 
