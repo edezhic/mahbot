@@ -81,7 +81,7 @@ pub fn page_bare<'a, Message: 'a>(
 
 /// A single shared-editor field frame matching the app's `text_input` visual
 /// language (`BG_ELEVATED` fill, radius 4, hairline border).
-pub(crate) fn editor_field_style(border_color: Color) -> impl Fn(&iced::Theme) -> container::Style {
+fn editor_field_style(border_color: Color) -> impl Fn(&iced::Theme) -> container::Style {
     move |_theme: &iced::Theme| theme::container_style(theme::BG_ELEVATED, 4.0, 1.0, border_color)
 }
 
@@ -1152,7 +1152,7 @@ pub const LUCIDE_ADVANCE: f32 = 1.0;
 /// Exact for every glyph the tree renders — see [`JETBRAINS_MONO_ADVANCE`].
 #[must_use]
 #[expect(clippy::cast_precision_loss)] // usize glyph count → px width
-pub fn mono_text_width(chars: usize, size: f32) -> f32 {
+fn mono_text_width(chars: usize, size: f32) -> f32 {
     chars as f32 * size * JETBRAINS_MONO_ADVANCE
 }
 
@@ -1258,7 +1258,7 @@ pub fn collect_tree_row_widths(
 /// rows all fit at the minimum width stays at [`TREE_MIN_WIDTH`].
 #[must_use]
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // viewport px → row index
-pub fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
+fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
     let widest = match file_tree.viewport_h {
         Some(viewport_h) if viewport_h > 0.0 => {
             let row_h = ESTIMATED_TREE_ROW_HEIGHT;
@@ -1282,7 +1282,7 @@ pub fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
 /// Controls whether [`scroll_to_tree_focus`] snaps to the focused row or
 /// uses viewport-aware scroll-into-view logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScrollMode {
+enum ScrollMode {
     /// Scroll so that the focused row is at the top of the viewport.
     SnapToTop,
     /// Only scroll when the focused row is outside the visible viewport.
@@ -1320,7 +1320,7 @@ pub const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_ICON_SIZE * 1.3;
 /// calls during the same frame see an accurate scroll offset even before the
 /// `on_scroll` callback fires.
 #[expect(clippy::cast_precision_loss)]
-pub fn scroll_to_tree_focus<Message: 'static>(
+fn scroll_to_tree_focus<Message: 'static>(
     file_tree: &mut FileTree,
     mode: ScrollMode,
 ) -> Task<Message> {

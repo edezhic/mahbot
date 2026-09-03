@@ -1823,7 +1823,7 @@ impl EditorState {
     /// Scroll the tab bar to keep the active tab visible.
     ///
     /// Reveal semantics (deliberately stricter than the file tree's
-    /// [`ScrollMode::ScrollIntoView`], which tolerates partial visibility at
+    /// `widgets::ScrollMode::ScrollIntoView`, which tolerates partial visibility at
     /// an edge to avoid micro-jumps during wheel scrolling): a tab counts as
     /// visible only when both estimated edges are inside the viewport, so
     /// selecting an already-visible tab never scrolls. A clipped tab is

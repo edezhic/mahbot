@@ -925,6 +925,7 @@ impl HomeState {
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .style(theme::base_container_style)
+            .into()
         } else {
             // Build message bubbles with typing indicator.
             let mut children: Vec<Element<'_, HomeMessage>> = self
@@ -1120,7 +1121,7 @@ impl HomeState {
                 children.insert(0, container(load_btn).padding(theme::PAD_4).into());
             }
 
-            container(super::widgets::vscroll_tracked(
+            super::widgets::page_bare(super::widgets::vscroll_tracked(
                 Column::with_children(children)
                     .spacing(super::widgets::CHAT_VERTICAL_RHYTHM)
                     .padding([theme::PAD_8, 0.0]),
@@ -1129,9 +1130,6 @@ impl HomeState {
                 CHAT_SCROLL_ID,
                 HomeMessage::ScrollChanged,
             ))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::base_container_style)
         };
 
         // ── Input area ───────────────────────────────────────────
@@ -1228,32 +1226,26 @@ impl HomeState {
             .into(),
         );
 
-        let mic_btn = tooltip(
-            button(
-                lucide::mic::<iced::Theme, iced::Renderer>()
-                    .size(theme::TEXT_14)
-                    .color(if recording_unavailable {
-                        theme::TEXT_MUTED
-                    } else {
-                        theme::TEXT_SECONDARY
-                    }),
-            )
-            .on_press_maybe(
-                (self.selected_user.is_some() && !recording_unavailable)
-                    .then_some(HomeMessage::StartVoiceRecording),
-            )
-            .style(theme::icon_button_style(recording_unavailable))
-            .padding(theme::PAD_3),
-            text(if transcription_disabled {
-                "voice recording unavailable — local transcription is disabled"
-            } else {
-                "record voice message"
-            })
-            .size(theme::TEXT_11),
+        let mic_tooltip = if transcription_disabled {
+            "voice recording unavailable — local transcription is disabled"
+        } else {
+            "record voice message"
+        };
+        controls.push(super::widgets::icon_tooltip_button(
+            lucide::mic::<iced::Theme, iced::Renderer>()
+                .size(theme::TEXT_14)
+                .color(if recording_unavailable {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::TEXT_SECONDARY
+                }),
+            mic_tooltip,
+            (self.selected_user.is_some() && !recording_unavailable)
+                .then_some(HomeMessage::StartVoiceRecording),
+            theme::PAD_3,
+            theme::icon_button_style(recording_unavailable),
             tooltip::Position::Top,
-        )
-        .style(theme::tooltip_style);
-        controls.push(mic_btn.into());
+        ));
 
         // Composer strip matches the BG_BASE chat pane so the empty space around
         // the rounded bubble blends with the page instead of showing a gray panel;
