@@ -2082,6 +2082,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::case_sensitive_file_extension_comparisons)] // the tool itself always emits a lowercase .png name
     fn screenshot_output_path_is_safe_and_unique() {
         // A hostile tab name must not escape the temp dir.
         let p = BrowserTool::screenshot_output_path("../../etc/cron.d").unwrap();

@@ -524,6 +524,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::io::Cursor;
 
+    #[expect(clippy::too_many_lines)] // large table-driven fixture
     #[test]
     fn preprocess_table() {
         // Real fixture files so the classifier accepts the local image markers
@@ -687,6 +688,7 @@ mod tests {
             .expect("test JPEG must encode");
         let mismatched_uri = format!("data:image/png;base64,{}", STANDARD.encode(&jbuf));
 
+        #[expect(clippy::type_complexity)] // one-off test table tuple
         let cases: &[(&str, String, Option<(u32, u32, Vec<u8>)>)] = &[
             (
                 "decodes a solid-red 2×1 PNG",

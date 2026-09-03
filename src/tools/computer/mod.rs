@@ -959,8 +959,7 @@ mod tests {
     /// (`{"name": payload}`) for the deserialization half of the lockstep check.
     fn action_payload(name: &str) -> Value {
         match name {
-            "observe" | "screenshot" | "windows" => json!({}),
-            "apps" | "cursor" => json!({}),
+            "observe" | "screenshot" | "windows" | "apps" | "cursor" => json!({}),
             "zoom" => json!({"region": [0, 0, 1, 1]}),
             "click" => json!({"x": 1, "y": 1}),
             "type" => json!({"text": "x"}),

@@ -434,6 +434,28 @@ fn ipc_query_sync_once(storage_root: &Path, req: &QueryRequest) -> std::io::Resu
     Ok(resp)
 }
 
+fn write_frame_sync(stream: &mut impl std::io::Write, payload: &[u8]) -> std::io::Result<()> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::other("payload too large for IPC frame"))?;
+    stream.write_all(&len.to_le_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()
+}
+
+fn read_frame_sync(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; FRAME_LEN];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(std::io::Error::other(format!(
+            "IPC frame too large: {len} bytes (max {MAX_FRAME_LEN})"
+        )));
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,7 +467,7 @@ mod tests {
         let payload = serde_json::to_vec(&WireValue::Real(f64::NAN)).unwrap();
         match serde_json::from_slice::<WireValue>(&payload).unwrap() {
             WireValue::Real(f) => {
-                assert!(f.is_nan(), "non-finite REAL must round-trip as NaN")
+                assert!(f.is_nan(), "non-finite REAL must round-trip as NaN");
             }
             other => panic!("expected Real, got {other:?}"),
         }
@@ -519,26 +541,4 @@ mod tests {
         listener.abort();
         let _ = listener.await;
     }
-}
-
-fn write_frame_sync(stream: &mut impl std::io::Write, payload: &[u8]) -> std::io::Result<()> {
-    let len = u32::try_from(payload.len())
-        .map_err(|_| std::io::Error::other("payload too large for IPC frame"))?;
-    stream.write_all(&len.to_le_bytes())?;
-    stream.write_all(payload)?;
-    stream.flush()
-}
-
-fn read_frame_sync(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; FRAME_LEN];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(std::io::Error::other(format!(
-            "IPC frame too large: {len} bytes (max {MAX_FRAME_LEN})"
-        )));
-    }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
 }

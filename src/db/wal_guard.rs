@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(s.class, StoreClass::DurableB);
 
         // Fresh store: no main DB file → healthy.
-        let _ = std::fs::remove_file(&dir.join("db/core.db"));
+        let _ = std::fs::remove_file(dir.join("db/core.db"));
         let s = inspect_store(&dir, "config");
         assert_eq!(s.class, StoreClass::Healthy);
 
@@ -399,7 +399,7 @@ mod tests {
 
         // (3) Healthy: 64 KiB page size (raw 1 in the header field) must not be
         // misclassified as structural (quarantine + recreate).
-        let _ = std::fs::remove_file(&dir.join("db/core.db-wal"));
+        let _ = std::fs::remove_file(dir.join("db/core.db-wal"));
         let mut db = vec![0u8; 4096];
         db[..16].copy_from_slice(b"SQLite format 3\0");
         db[16..18].copy_from_slice(&1u16.to_be_bytes());
@@ -414,7 +414,7 @@ mod tests {
         );
 
         // (4) Healthy: fresh store state (no main DB file yet).
-        let _ = std::fs::remove_file(&dir.join("db/core.db"));
+        let _ = std::fs::remove_file(dir.join("db/core.db"));
         crate::db::wal_guard::diagnose_all_stores(&dir);
         assert_eq!(
             crate::db::wal_guard::take_boot_diagnosis(&crate::db::store_db_path(&dir, "users")),

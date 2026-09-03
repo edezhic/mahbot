@@ -2402,6 +2402,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `jobs.caller_agent_id` / `session_metadata.created_at` (plus its
     /// partial index), leaving every row and every other table's schema
     /// untouched.
+    #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
         let tmp = tempfile::TempDir::new().unwrap();

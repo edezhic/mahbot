@@ -4346,6 +4346,7 @@ mod tests {
     /// Exercises the routing render path directly (no voice/audio pipeline) by
     /// calling `routing_section()` and dropping the returned Element before
     /// mutating state again.
+    #[expect(clippy::too_many_lines)] // long but linear state-transition fixture
     #[test]
     fn routing_rows_never_panic_when_manager_or_worker_model_edits() {
         let mut state = SettingsState::new();
@@ -4373,7 +4374,7 @@ mod tests {
             state
                 .field_editors
                 .get("routing_order:custom-model")
-                .map(|e| e.text()),
+                .map(super::super::common::SingleLineEditorState::text),
             Some(String::new()),
             "mid-edit: routing row seeded for the newly-typed model"
         );
@@ -4388,7 +4389,7 @@ mod tests {
             state
                 .field_editors
                 .get("routing_order:saved-routing-model")
-                .map(|e| e.text()),
+                .map(super::super::common::SingleLineEditorState::text),
             Some("SavedOrder".into()),
             "a model with a saved routing order shows that order"
         );
@@ -4418,7 +4419,7 @@ mod tests {
             state
                 .field_editors
                 .get("routing_order:saved-routing-model")
-                .map(|e| e.text()),
+                .map(super::super::common::SingleLineEditorState::text),
             Some("SavedOrder".into()),
             "post-persist: the routing editor is not reset to empty"
         );
@@ -4438,7 +4439,7 @@ mod tests {
             state
                 .field_editors
                 .get("routing_order:saved-routing-model")
-                .map(|e| e.text()),
+                .map(super::super::common::SingleLineEditorState::text),
             Some("SavedOrder".into()),
             "routing-order persist with identical value preserves the editor (undo/caret kept)"
         );
@@ -4518,7 +4519,7 @@ mod tests {
             "ON must not stage or persist an endpoint — a reveal alone must not configure one"
         );
         assert!(
-            state.field_gen.get("config:provider_endpoint").is_none(),
+            !state.field_gen.contains_key("config:provider_endpoint"),
             "ON must not arm a settle — no spurious persisted row"
         );
 

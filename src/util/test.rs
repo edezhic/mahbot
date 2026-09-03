@@ -846,7 +846,7 @@ impl<'a> TicketBuilder<'a> {
 ///
 /// Required schema columns live in the constructor (`id`, `kind`, `role`,
 /// `workspace_name`); the columns the fixtures vary between (user identity,
-/// channel, caller pin, mode, retry count) are opt-in setters, and `task`
+/// channel, retry count) are opt-in setters, and `task`
 /// defaults to `''`. Timestamps are required via [`Self::timestamps`] and
 /// transcribed verbatim — the helper never generates timestamps internally
 /// (tests assert exact equality on them).
@@ -863,8 +863,6 @@ pub(crate) struct JobRowBuilder<'a> {
     task: String,
     user_name: Option<String>,
     channel: Option<String>,
-    caller_agent_id: Option<String>,
-    mode: Option<String>,
     retry_count: Option<i64>,
     timestamps: Option<String>,
 }
@@ -887,8 +885,6 @@ impl<'a> JobRowBuilder<'a> {
             task: String::new(),
             user_name: None,
             channel: None,
-            caller_agent_id: None,
-            mode: None,
             retry_count: None,
             timestamps: None,
         }
@@ -914,20 +910,6 @@ impl<'a> JobRowBuilder<'a> {
         self
     }
 
-    /// Set `caller_agent_id` explicitly (default: column omitted → NULL).
-    /// Only sync analyze/implement fixtures need it.
-    pub(crate) fn caller_agent_id(mut self, caller_agent_id: impl Into<String>) -> Self {
-        self.caller_agent_id = Some(caller_agent_id.into());
-        self
-    }
-
-    /// Set `mode` explicitly (default: column omitted → NULL, which the row
-    /// loader treats as async). Pass `"sync"`/`"async"` to force the value.
-    pub(crate) fn mode(mut self, mode: impl Into<String>) -> Self {
-        self.mode = Some(mode.into());
-        self
-    }
-
     /// Set `created_at` AND `updated_at` (both required, transcribed
     /// verbatim — the helper never generates timestamps internally).
     pub(crate) fn timestamps(mut self, timestamps: impl Into<String>) -> Self {
@@ -946,8 +928,6 @@ impl<'a> JobRowBuilder<'a> {
             task,
             user_name,
             channel,
-            caller_agent_id,
-            mode,
             retry_count,
             timestamps,
         } = self;
@@ -966,14 +946,6 @@ impl<'a> JobRowBuilder<'a> {
         if let Some(channel) = channel {
             columns.push("channel");
             values.push(crate::db::Value::Text(channel));
-        }
-        if let Some(caller_agent_id) = caller_agent_id {
-            columns.push("caller_agent_id");
-            values.push(crate::db::Value::Text(caller_agent_id));
-        }
-        if let Some(mode) = mode {
-            columns.push("mode");
-            values.push(crate::db::Value::Text(mode));
         }
         if let Some(retry_count) = retry_count {
             columns.push("retry_count");

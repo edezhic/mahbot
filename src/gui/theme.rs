@@ -1154,6 +1154,7 @@ mod tests {
     /// button_text/button_text_danger pair, the pick_list field/menu styles,
     /// and the toggler style so parameterization cannot silently change any
     /// rendered style.
+    #[expect(clippy::too_many_lines)] // exhaustive style-lock fixture
     #[test]
     fn style_factory_values_unchanged() {
         let theme = iced::Theme::Dark;
@@ -1340,7 +1341,7 @@ mod tests {
             .with_ymd_and_hms(2026, 8, 28, 12, 0, 0)
             .single()
             .unwrap();
-        let off = now.offset().clone();
+        let off = *now.offset();
         assert_eq!(
             format_relative_time(&format!("2026-08-28T09:15:00{off}"), now),
             "09:15"
@@ -1362,7 +1363,7 @@ mod tests {
             .with_ymd_and_hms(2026, 8, 28, 12, 0, 0)
             .single()
             .unwrap();
-        let off = now.offset().clone();
+        let off = *now.offset();
         assert_eq!(
             format_relative_time(&format!("2026-08-29T09:15:00{off}"), now),
             "09:15"

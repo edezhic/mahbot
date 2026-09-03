@@ -892,6 +892,14 @@ mod tests {
         // absent, text-only) and the shape-drift case (drift/model missing
         // output_modalities → fails open as capable). `ImageCatalog` is not
         // Clone/Copy, so a single merged catalog is built here directly.
+        struct Case {
+            name: &'static str,
+            model: &'static str,
+            // Empty → expect Ok; otherwise every fragment must appear in the
+            // error message (preserving the rejects test's substring checks).
+            expect_err_fragments: &'static [&'static str],
+        }
+
         let catalog = parse_catalog(&json!({
             "data": [
                 {
@@ -915,14 +923,6 @@ mod tests {
             ]
         }))
         .expect("valid merged catalog");
-
-        struct Case {
-            name: &'static str,
-            model: &'static str,
-            // Empty → expect Ok; otherwise every fragment must appear in the
-            // error message (preserving the rejects test's substring checks).
-            expect_err_fragments: &'static [&'static str],
-        }
 
         let cases = [
             Case {

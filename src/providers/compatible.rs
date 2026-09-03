@@ -1344,6 +1344,7 @@ mod tests {
     /// siblings, case-insensitivity, and first-match-wins ordering. Also
     /// asserts requirement 2: the OpenRouter path stays byte-identical
     /// ("xhigh"/"high" unchanged) for every case.
+    #[expect(clippy::too_many_lines)] // exhaustive translation table fixture
     #[test]
     fn reasoning_translation_table_for_custom_endpoints() {
         use ReasoningFields::{Effort, Omit, ThinkingEnabled};

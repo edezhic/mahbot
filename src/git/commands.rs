@@ -1444,6 +1444,7 @@ mod tests {
         );
     }
 
+    #[expect(clippy::cast_possible_wrap)] // MAX_UNTRACKED_FILES_COUNTED is a small compile-time cap
     #[tokio::test]
     async fn test_run_git_worktree_snapshot_bounded_file_count_cap() {
         let (_dir, repo_path) = init_temp_repo();

@@ -1244,9 +1244,8 @@ fn test_rename_request_sets_target() {
     state.selected_workspace_path = Some("/tmp".to_string());
     let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
     assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
-    let rt = match state.active_modal {
-        Some(ModalKind::Rename(rt)) => rt,
-        _ => panic!("expected Rename modal"),
+    let Some(ModalKind::Rename(rt)) = state.active_modal else {
+        panic!("expected Rename modal")
     };
     assert_eq!(rt.path, "Cargo.toml");
     assert_eq!(rt.input_text.text(), "Cargo.toml");
@@ -1272,9 +1271,8 @@ fn test_rename_request_on_directory_sets_is_dir() {
     );
     let _ = state.update(EditorMessage::RenameRequested("src".into()));
     assert!(matches!(state.active_modal, Some(ModalKind::Rename(_))));
-    let rt = match state.active_modal {
-        Some(ModalKind::Rename(rt)) => rt,
-        _ => panic!("expected Rename modal"),
+    let Some(ModalKind::Rename(rt)) = state.active_modal else {
+        panic!("expected Rename modal")
     };
     assert_eq!(rt.path, "src");
     assert_eq!(rt.input_text.text(), "src");

@@ -743,8 +743,10 @@ fn test_ime_surface_activation() {
             .is_active_surface(&EditorWidgetState::default())
     );
     // The window must be focused.
-    let mut unfocused = EditorWidgetState::default();
-    unfocused.is_window_focused = false;
+    let unfocused = EditorWidgetState {
+        is_window_focused: false,
+        ..EditorWidgetState::default()
+    };
     assert!(!EditorWidget::new(&buf).is_active_surface(&unfocused));
     // A focus-id field activates only while focused.
     let field = EditorWidget::new(&buf).id("field");
@@ -771,12 +773,14 @@ fn test_ime_surface_activation() {
 fn test_input_method_preedit_reported() {
     let buf = EditorBuffer::with_text("", None);
     let widget = EditorWidget::new(&buf);
-    let mut state = EditorWidgetState::default();
-    state.preedit = Some(input_method::Preedit {
-        content: "你好".to_string(),
-        selection: Some(1..2),
-        text_size: None,
-    });
+    let state = EditorWidgetState {
+        preedit: Some(input_method::Preedit {
+            content: "你好".to_string(),
+            selection: Some(1..2),
+            text_size: None,
+        }),
+        ..EditorWidgetState::default()
+    };
     let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 200.0));
     let ime = widget.input_method(&state, bounds);
     assert!(ime.to_owned().is_enabled());

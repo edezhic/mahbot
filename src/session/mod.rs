@@ -648,7 +648,6 @@ impl SessionStore {
     /// commit. Production uses [`Self::settle_tool_results_tx`] inside the
     /// agent's atomic settle+terminalize transaction.
     #[cfg(test)]
-    #[expect(clippy::too_many_lines)] // deliberate: locate + rebuild in one tx
     pub(crate) async fn settle_tool_results(
         &self,
         agent_id: &str,

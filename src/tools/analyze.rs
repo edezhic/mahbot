@@ -2822,7 +2822,7 @@ mod tests {
 
     #[test]
     fn verification_units_single_group_is_one_unit() {
-        let groups = vec![disputed_group("Alpha", &[0, 1])];
+        let groups = [disputed_group("Alpha", &[0, 1])];
         let units = verification_units(&groups.iter().collect::<Vec<_>>());
         assert_eq!(units.len(), 1, "exactly one disputed group → one unit");
         assert_eq!(units[0].len(), 1);
@@ -2833,7 +2833,7 @@ mod tests {
     fn verification_units_splits_by_group_count_first_takes_extra() {
         let group = |h: &str| disputed_group(h, &[]);
         // 3 groups → 2 units: first takes the extra (2), second gets 1.
-        let groups = vec![group("A"), group("B"), group("C")];
+        let groups = [group("A"), group("B"), group("C")];
         let refs = groups.iter().collect::<Vec<_>>();
         let units = verification_units(&refs);
         assert_eq!(units.len(), 2);
@@ -2843,7 +2843,7 @@ mod tests {
         assert_eq!(units[1][0].heading, "C");
 
         // 4 groups → 2 units of 2/2.
-        let groups = vec![group("A"), group("B"), group("C"), group("D")];
+        let groups = [group("A"), group("B"), group("C"), group("D")];
         let refs = groups.iter().collect::<Vec<_>>();
         let units = verification_units(&refs);
         assert_eq!(units[0].len(), 2);
@@ -2882,7 +2882,7 @@ mod tests {
         let table = crate::consensus::ItemTable::new(&items);
         let group = |heading: &str, ids: &[usize]| disputed_group(heading, ids);
         // Unit = one disputed group (Alpha over ids 0 and 1).
-        let groups = vec![group("Alpha", &[0, 1])];
+        let groups = [group("Alpha", &[0, 1])];
         let unit = groups.iter().collect::<Vec<_>>();
         let target = synthesize_verification_target(&unit, &table, &outcomes);
         assert!(
@@ -2975,6 +2975,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::unchecked_time_subtraction)] // fixture deliberately constructs a past deadline from monotonic arithmetic
     fn verification_window_open_guards_half_round_window() {
         // A fresh round (deadline = now + window) is open: verification runs.
         let open = verification_window_open(std::time::Instant::now() + round_timeout());

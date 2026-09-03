@@ -1235,6 +1235,7 @@ mod tests {
         );
     }
 
+    #[expect(clippy::unchecked_time_subtraction)] // fixture shifts a monotonic clock backwards by a small fixed offset
     #[test]
     fn test_file_changed_fires_when_throttle_elapsed() {
         let mut s = GitState::new();
@@ -1293,6 +1294,7 @@ mod tests {
         assert_eq!(s.remote_generation, before_remote + 1);
     }
 
+    #[expect(clippy::unchecked_time_subtraction)] // fixture shifts a monotonic clock backwards by a small fixed offset
     #[test]
     fn test_deferred_local_refresh_fires_after_window() {
         let mut s = GitState::new();
@@ -1327,6 +1329,7 @@ mod tests {
         assert_eq!(s.local_generation, before);
     }
 
+    #[expect(clippy::unchecked_time_subtraction)] // fixture shifts a monotonic clock backwards by a small fixed offset
     #[test]
     fn test_deferred_local_refresh_without_pending_is_noop() {
         let mut s = GitState::new();

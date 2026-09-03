@@ -414,7 +414,7 @@ mod tests {
             crate::util::test::create_test_workspace(tmp.path().to_str().unwrap(), "cdc-ws").await;
         let board = crate::pipeline::board::store();
         let ticket_id =
-            crate::util::test::make_ticket(&board, &ws, "CDC ticket", TicketPhase::Backlog).await;
+            crate::util::test::make_ticket(board, &ws, "CDC ticket", TicketPhase::Backlog).await;
         board
             .transition_to(
                 &ticket_id,
