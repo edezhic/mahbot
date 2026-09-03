@@ -571,11 +571,7 @@ async fn dispatch_durable_research(
                 job = %job_id,
                 "Research run manually cancelled — permanent stop, nothing delivered"
             );
-            if let Err(e) =
-                crate::research_cancel::hand_off_cancelled_run(&job_id, ws, question).await
-            {
-                tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
-            }
+            hand_off_cancelled_or_warn(&job_id, ws, question).await;
             return None;
         }
         ResearchExit::Terminal(result) => result,
@@ -649,9 +645,7 @@ async fn terminalize_research(
     // alive for the cleanup agent.
     if crate::research_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research terminalization suppressed by manual cancel");
-        if let Err(e) = crate::research_cancel::hand_off_cancelled_run(job_id, ws, question).await {
-            tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
-        }
+        hand_off_cancelled_or_warn(job_id, ws, question).await;
         return None;
     }
     let delivered = build_async_research_message(result);
@@ -689,9 +683,7 @@ async fn terminalize_research(
     // cleanup agent.
     if crate::research_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research completion suppressed by manual cancel — not routed");
-        if let Err(e) = crate::research_cancel::hand_off_cancelled_run(job_id, ws, question).await {
-            tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
-        }
+        hand_off_cancelled_or_warn(job_id, ws, question).await;
         return None;
     }
     // Cleanup dispatch AFTER the exactly-once boundary: the cleanup jobs row
@@ -710,6 +702,15 @@ async fn terminalize_research(
         );
     }
     Some(envelope)
+}
+
+/// Dispatches the cancelled-run handoff, warning on failure — rows stay for
+/// boot resume (the documented failure-mode contract). Callers keep their own
+/// site-specific `tracing::info!` and early exit.
+async fn hand_off_cancelled_or_warn(job_id: &str, ws: &Workspace, question: &str) {
+    if let Err(e) = crate::research_cancel::hand_off_cancelled_run(job_id, ws, question).await {
+        tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
+    }
 }
 
 /// Boot resume of a research run: re-enter the orchestrator at the
@@ -745,11 +746,7 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
                 job = %job_id,
                 "Research resume manually cancelled — permanent stop, nothing delivered",
             );
-            if let Err(e) =
-                crate::research_cancel::hand_off_cancelled_run(job_id, ws, &caller.task).await
-            {
-                tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
-            }
+            hand_off_cancelled_or_warn(job_id, ws, &caller.task).await;
             return;
         }
         ResearchExit::Terminal(result) => result,
