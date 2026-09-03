@@ -67,7 +67,7 @@ const MEDIA_VIDEO_EXTS: &[&str] = &[".mp4", ".mov", ".webm", ".mkv", ".avi", ".m
 /// root (after the TMPDIR pin, `temp_dir()` IS the root) — inside the
 /// readonly-shell's allowed temp roots, so analysts can write scratch there.
 #[must_use]
-pub(crate) fn research_root_base() -> PathBuf {
+fn research_root_base() -> PathBuf {
     std::env::temp_dir().join("mahbot-research")
 }
 

@@ -153,7 +153,6 @@ pub(crate) fn iter_checkpoint_stores()
 ///
 /// Used by:
 /// - `mahbot debug` — validates `--db` argument values.
-/// - Callers that previously referenced `ALL_STORE_NAMES`.
 ///
 /// # Consolidated layout
 ///

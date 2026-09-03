@@ -19,27 +19,27 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 
 /// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
-pub const CLEAR_COMMAND_DESC: &str = "Reset your session";
+const CLEAR_COMMAND_DESC: &str = "Reset your session";
 /// Description for the `/agents` command (inline role picker).
-pub const AGENTS_COMMAND_DESC: &str = "Switch your active role";
+const AGENTS_COMMAND_DESC: &str = "Switch your active role";
 /// Description for the `/image_models` command (Artist role).
-pub const IMAGE_MODELS_COMMAND_DESC: &str = "Select image generation model";
+const IMAGE_MODELS_COMMAND_DESC: &str = "Select image generation model";
 /// Description for the `/video_models` command (Artist role).
-pub const VIDEO_MODELS_COMMAND_DESC: &str = "Select video model";
+const VIDEO_MODELS_COMMAND_DESC: &str = "Select video model";
 /// Description for the `/board` command (admin).
-pub const BOARD_COMMAND_DESC: &str = "List active workspace tickets";
+const BOARD_COMMAND_DESC: &str = "List active workspace tickets";
 /// Description for the `/archive` command (admin).
-pub const ARCHIVE_COMMAND_DESC: &str = "Archive done & cancelled tickets";
+const ARCHIVE_COMMAND_DESC: &str = "Archive done & cancelled tickets";
 /// Description for the `/pause` command (admin).
-pub const PAUSE_COMMAND_DESC: &str = "Pause the workspace pipeline";
+const PAUSE_COMMAND_DESC: &str = "Pause the workspace pipeline";
 /// Description for the `/unpause` command (admin).
-pub const UNPAUSE_COMMAND_DESC: &str = "Resume the workspace pipeline";
+const UNPAUSE_COMMAND_DESC: &str = "Resume the workspace pipeline";
 /// Description for the `/maintenance_on` command (admin, menu form).
-pub const MAINTENANCE_ON_COMMAND_DESC: &str = "Enable workspace maintenance";
+const MAINTENANCE_ON_COMMAND_DESC: &str = "Enable workspace maintenance";
 /// Description for the `/maintenance_off` command (admin, menu form).
-pub const MAINTENANCE_OFF_COMMAND_DESC: &str = "Disable workspace maintenance";
+const MAINTENANCE_OFF_COMMAND_DESC: &str = "Disable workspace maintenance";
 /// Description for the `/update` command (admin, menu form).
-pub const UPDATE_COMMAND_DESC: &str = "Update MahBot to the latest version";
+const UPDATE_COMMAND_DESC: &str = "Update MahBot to the latest version";
 
 // ── Action prefixes (__act__) ───────────────────────────────────────
 
@@ -629,10 +629,8 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
             // semantics (an http(s) URL or an existing regular file); prose
             // quoting the marker syntax must stay visible and never abort the
             // send of other attachments in the same message.
-            if matches!(
-                TelegramAttachmentKind::from_marker(kind_str),
-                Some(TelegramAttachmentKind::Image)
-            ) {
+            let k = TelegramAttachmentKind::from_marker(kind_str);
+            if k == Some(TelegramAttachmentKind::Image) {
                 // Telegram cannot attach an inline data URI — keep it literal
                 // WITHOUT a wasted bounded decode (classifying it would fully
                 // decode, then reject it). Local raster / URL targets use the
@@ -652,7 +650,7 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
                 return caps.get_match().as_str().to_string();
             }
 
-            if let Some(kind) = TelegramAttachmentKind::from_marker(kind_str) {
+            if let Some(kind) = k {
                 attachments.push(TelegramAttachment {
                     kind,
                     target: path.to_string(),
