@@ -782,6 +782,9 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
             let content =
                 telegram_delivery_content(channel_name, Role::Manager, &user.roles, response);
             for binding in &user.channels {
+                if binding.channel != *channel_name {
+                    continue;
+                }
                 let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
                 if let DeliverOutcome::Failed(e) =
                     deliver_on_channel(channel.as_ref(), &user.name, reply_target, &content).await
@@ -812,8 +815,7 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
 ///
 /// `job.reply_target` is not used to scope transport delivery for registered
 /// users — each binding supplies its own reply_target on its own channel, the
-/// broadcast model the Manager generalizes (though the Manager transport loop
-/// currently does not filter a binding to its channel; this function does).
+/// broadcast model the Manager generalizes.
 async fn deliver_single_user_response(
     response: &str,
     user: &UserRecord,
@@ -1414,6 +1416,68 @@ mod tests {
         };
 
         deliver_manager_response("manager response", &[user], &job).await;
+    }
+
+    /// Regression: the Manager transport loop must skip bindings whose channel
+    /// differs from the delivering transport (same filter the single-user path
+    /// applies). The user is bound only to `SPY_MATCH`; a second registered spy
+    /// channel must capture nothing — without the channel filter, the loop
+    /// would replay the matching binding's delivery on every registered
+    /// channel. Uses a dedicated user because the users store and channel
+    /// registry are process-global and other tests deliver for `admin`
+    /// concurrently.
+    #[tokio::test]
+    async fn test_deliver_manager_response_skips_foreign_channel_bindings() {
+        const SPY_MATCH: &str = "__test_mgr_spy_match";
+        const SPY_OTHER: &str = "__test_mgr_spy_other";
+        const USER: &str = "__test_mgr_skip_user";
+        setup_response_test_infra().await;
+
+        let store = crate::users::USER_STORE.get().unwrap();
+        store
+            .add_user(USER, None, Role::Assistant)
+            .await
+            .expect("create dedicated test user");
+        store
+            .bind_channel(USER, SPY_MATCH, "mgr-spy-target")
+            .await
+            .expect("bind user to matching spy channel");
+        store
+            .update_channel_contact(SPY_MATCH, "mgr-spy-target", "mgr-spy-target")
+            .await
+            .expect("set reply_target on the spy binding");
+
+        let (match_spy, match_sent) = crate::util::test::SpyChannel::new(SPY_MATCH);
+        let (other_spy, other_sent) = crate::util::test::SpyChannel::new(SPY_OTHER);
+        crate::channel_registry().register(Arc::new(match_spy) as Arc<dyn crate::Channel>);
+        crate::channel_registry().register(Arc::new(other_spy) as Arc<dyn crate::Channel>);
+
+        let user = resolve_single_user(USER).await.unwrap();
+        let job = AgentJob {
+            content: "manager broadcast".to_string(),
+            workspace_name: "default".to_string(),
+            user_name: USER.to_string(),
+            channel: "gui".to_string(),
+            kind: MessageKind::TicketNotify,
+            role: Role::Manager,
+            reply_target: None,
+            pending_job_id: None,
+        };
+
+        deliver_manager_response("manager response", &[user], &job).await;
+
+        let captured = match_sent.lock().unwrap_poison();
+        assert!(
+            captured.len() == 1
+                && captured[0].recipient == "mgr-spy-target"
+                && captured[0].content == "manager response",
+            "matching spy channel should deliver exactly once to the binding's \
+             reply_target, got: {captured:?}",
+        );
+        assert!(
+            other_sent.lock().unwrap_poison().is_empty(),
+            "spy channel without a matching binding must not receive the manager response",
+        );
     }
 
     // ── register_agent / unregister_agent / try_route tests ────────────
