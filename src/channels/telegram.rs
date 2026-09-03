@@ -44,7 +44,7 @@ const UPDATE_COMMAND_DESC: &str = "Update MahBot to the latest version";
 // ── Action prefixes (__act__) ───────────────────────────────────────
 
 /// Callback data prefix for action callbacks (e.g., model selection, clear session).
-pub(crate) const ACTION_PREFIX: &str = "__act__";
+const ACTION_PREFIX: &str = "__act__";
 
 /// Decode action callback data.
 ///
@@ -245,7 +245,7 @@ impl MessageContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TelegramAttachmentKind {
+enum TelegramAttachmentKind {
     Image,
     Document,
     Video,
@@ -381,7 +381,7 @@ fn format_sender_label(from: &serde_json::Value) -> String {
 /// `<` / `>` are stripped from the resulting label since `first_name` /
 /// `title` may contain user-controlled angle brackets.
 #[must_use]
-pub(crate) fn replied_to_sender_label(message: &serde_json::Value) -> String {
+fn replied_to_sender_label(message: &serde_json::Value) -> String {
     let label = if let Some(sender_chat) = message.get("sender_chat") {
         sender_chat
             .get("title")
@@ -466,7 +466,7 @@ fn reply_to_snippet(reply_to: &serde_json::Value) -> String {
 /// text, a media-kind placeholder. The author label comes from
 /// [`replied_to_sender_label`].
 #[must_use]
-pub(crate) fn build_reply_reference(message: &serde_json::Value) -> Option<ReplyReference> {
+fn build_reply_reference(message: &serde_json::Value) -> Option<ReplyReference> {
     let reply_to = message.get("reply_to_message")?;
     if !reply_to.is_object() {
         return None;
@@ -584,7 +584,7 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     // Only a real image target may be attached as a photo — a bare path to a
     // non-image or an existing non-raster file stays plain text, matching the
     // `[IMAGE:...]` marker gate. Audio/video/document keep their existing
-    // URL-or-existing-file semantics.
+    // URL-or-existing-regular-file semantics.
     if kind == TelegramAttachmentKind::Image {
         if !matches!(
             media_target::classify_media_image_target(candidate),
@@ -592,7 +592,7 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
         ) {
             return None;
         }
-    } else if !is_http_url(candidate) && !Path::new(candidate).exists() {
+    } else if !is_http_url(candidate) && !Path::new(candidate).is_file() {
         return None;
     }
 
@@ -631,19 +631,14 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
             // send of other attachments in the same message.
             let k = TelegramAttachmentKind::from_marker(kind_str);
             if k == Some(TelegramAttachmentKind::Image) {
-                // Telegram cannot attach an inline data URI — keep it literal
-                // WITHOUT a wasted bounded decode (classifying it would fully
-                // decode, then reject it). Local raster / URL targets use the
-                // shared classifier.
-                let ok = if path.starts_with("data:") {
-                    false
-                } else {
-                    matches!(
-                        media_target::classify_media_image_target(path),
-                        MediaTarget::LocalImage | MediaTarget::RemoteUrl
-                    )
-                };
-                if !ok {
+                // Only a valid image target is attached; everything else —
+                // including a data-URI, which the classifier rejects cheaply
+                // (no decode, and Telegram cannot send inline data URIs) —
+                // stays as literal text.
+                if !matches!(
+                    media_target::classify_media_image_target(path),
+                    MediaTarget::LocalImage | MediaTarget::RemoteUrl
+                ) {
                     return caps.get_match().as_str().to_string();
                 }
             } else if path.is_empty() || (!is_http_url(path) && !Path::new(path).is_file()) {
@@ -665,6 +660,11 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 
 /// Base URL for the Telegram Bot API.
 const API_BASE: &str = "https://api.telegram.org";
+
+/// Bot-API URL for `method` on the bot identified by `token`.
+fn bot_api_url(token: &str, method: &str) -> String {
+    format!("{API_BASE}/bot{token}/{method}")
+}
 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
@@ -1026,7 +1026,7 @@ impl TelegramChannel {
     /// previous instance. Used during hot-reload to avoid replaying
     /// already-processed Telegram updates.
     #[must_use]
-    pub fn with_offset(
+    fn with_offset(
         bot_token: String,
         inherited_offset: std::sync::Arc<std::sync::atomic::AtomicI64>,
     ) -> Self {
@@ -1166,12 +1166,12 @@ impl TelegramChannel {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("{API_BASE}/bot{}/{method}", self.bot_token)
+        bot_api_url(&self.bot_token, method)
     }
 
     /// Signal this specific channel's listener to stop, without affecting
     /// the global shutdown token or other channels.
-    pub fn cancel_own(&self) {
+    fn cancel_own(&self) {
         self.cancel.cancel();
     }
 
@@ -1248,7 +1248,7 @@ impl TelegramChannel {
                 return;
             }
 
-            let url = format!("{API_BASE}/bot{bot_token}/setMyCommands");
+            let url = bot_api_url(&bot_token, "setMyCommands");
             let body = serde_json::json!({
                 "scope": {
                     "type": "chat",
@@ -1280,7 +1280,7 @@ impl TelegramChannel {
         if token.trim().is_empty() {
             anyhow::bail!("Telegram bot token is empty");
         }
-        let url = format!("{API_BASE}/bot{token}/getMe");
+        let url = bot_api_url(token, "getMe");
         let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
         let resp = client
             .get(&url)
@@ -1948,8 +1948,8 @@ impl TelegramChannel {
         }
 
         let path = Path::new(&target);
-        if !path.exists() {
-            anyhow::bail!("Telegram attachment path not found: {target}");
+        if !path.is_file() {
+            anyhow::bail!("Telegram attachment target is not an existing regular file: {target}");
         }
 
         self.send_media_file(chat_id, thread_id, attachment.kind, path)

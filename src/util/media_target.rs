@@ -12,10 +12,10 @@
 //! workspace-boundary containment — a valid raster anywhere on disk is valid.
 //! Local files are validated by a real raster decode (memoized per canonical
 //! path + mtime); remote URLs by well-formedness. A `data:...` URI is NOT
-//! classified here — it is an inline payload the provider sends verbatim and is
-//! validated by its own [`is_native_data_uri`] gate (used by the provider and by
-//! the GUI/Telegram consumers, which short-circuit `data:` before calling the
-//! classifier).
+//! classified here — it is an inline payload validated by its own
+//! [`is_native_data_uri`] gate, which only the provider uses directly; other
+//! consumers route through the classifier, which rejects a `data:` target
+//! cheaply before any decode.
 
 use crate::util::UnwrapPoison;
 use base64::{
