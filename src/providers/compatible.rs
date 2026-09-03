@@ -29,14 +29,10 @@ pub(crate) struct OpenAiCompatibleProvider {
 
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
-    /// Cached warmup HTTP client (bounded total timeout — see
-    /// [`Self::warmup_client`]).
-    /// Initialized lazily on first `warmup_client()` call.
-    warmup_http_client: OnceLock<Client>,
-    /// Cached HTTP client for scoped calls: NO total request timeout — the
-    /// 600 s idle timeout is the only bound; it resets while data flows.
-    /// Initialized lazily on first `http_client_scoped()` call.
-    http_client_scoped: OnceLock<Client>,
+    /// Cached HTTP client shared by warmup and scoped calls: NO total
+    /// request timeout — the 600 s idle timeout is the only bound for chats.
+    /// Initialized lazily on first `http_client()` call.
+    http_client: OnceLock<Client>,
 }
 
 impl OpenAiCompatibleProvider {
@@ -53,8 +49,7 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             credential: credential.map(ToString::to_string),
             extra_headers: std::collections::HashMap::new(),
-            warmup_http_client: OnceLock::new(),
-            http_client_scoped: OnceLock::new(),
+            http_client: OnceLock::new(),
         }
     }
 
@@ -68,19 +63,12 @@ impl OpenAiCompatibleProvider {
         self
     }
 
-    /// Build the shared HTTP client with the given total request timeout.
-    ///
-    /// `Some(timeout)` yields the warmup client (bounded total timeout — see
-    /// [`Self::WARMUP_TOTAL_TIMEOUT`]); `None` yields the scoped client (no
-    /// total request timeout — the 600 s idle timeout is the only bound).
-    /// Connection pool, connect timeout, and extra headers are identical in
-    /// both.
-    fn build_client(&self, timeout: Option<Duration>) -> Client {
+    /// Build the shared HTTP client: no total request timeout — the 600 s
+    /// idle timeout is the only bound for chats. 10 s connect timeout, extra
+    /// headers as default headers.
+    fn build_client(&self) -> Client {
         crate::util::http::install_ring_provider();
         let mut builder = Client::builder().connect_timeout(Duration::from_secs(10));
-        if let Some(timeout) = timeout {
-            builder = builder.timeout(timeout);
-        }
 
         if !self.extra_headers.is_empty() {
             let mut headers = HeaderMap::new();
@@ -105,21 +93,10 @@ impl OpenAiCompatibleProvider {
             .expect("Failed to build HTTP client — check TLS/network configuration")
     }
 
-    /// Warmup HTTP client: same connection pool and headers as the scoped
-    /// client but with a bounded total timeout ([`Self::WARMUP_TOTAL_TIMEOUT`])
-    /// so a warmup against an unreachable endpoint cannot hang indefinitely.
-    pub(crate) fn warmup_client(&self) -> &Client {
-        self.warmup_http_client
-            .get_or_init(|| self.build_client(Some(Self::WARMUP_TOTAL_TIMEOUT)))
-    }
-
-    /// Scoped HTTP client: same connection pool and headers as
-    /// [`Self::warmup_client`] but WITHOUT the total request timeout. Scoped
-    /// call paths rely on the 600 s idle timeout ([`crate::retry::DEFAULT_IDLE_TIMEOUT`]),
-    /// which resets while data flows.
-    pub(crate) fn http_client_scoped(&self) -> &Client {
-        self.http_client_scoped
-            .get_or_init(|| self.build_client(None))
+    /// Shared pool for warmup + scoped calls, no total timeout; warmup
+    /// bounds itself per-request via [`Self::WARMUP_TOTAL_TIMEOUT`].
+    pub(crate) fn http_client(&self) -> &Client {
+        self.http_client.get_or_init(|| self.build_client())
     }
 }
 
@@ -745,8 +722,8 @@ impl OpenAiCompatibleProvider {
     /// Build the HTTP request for [`Provider::chat_scoped`].
     /// This function itself is synchronous; the caller sends the request asynchronously.
     ///
-    /// The request BYTES are identical regardless of which client is used —
-    /// the scoped client only differs in timeout semantics, never in payload.
+    /// The request payload is fixed; timeout semantics live with the caller
+    /// (chat has no total timeout, warmup applies a per-request timeout).
     fn build_http_request_with_client(
         &self,
         client: &Client,
@@ -1053,13 +1030,15 @@ fn envelope_telemetry(body: &str) -> Option<String> {
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
-        // Hit the chat completions URL with a GET to establish the connection pool.
-        // The server will likely return 405 Method Not Allowed, which is fine -
-        // the goal is TLS handshake and HTTP/2 negotiation. The warmup client
-        // carries a bounded total timeout ([`Self::WARMUP_TOTAL_TIMEOUT`]) so
-        // an unreachable endpoint cannot hang the warmup indefinitely.
+        // Hit the chat completions URL with a GET to pre-warm the shared
+        // connection pool (TLS/HTTP2). Per-request 120 s bound so an
+        // unreachable endpoint cannot hang; the server will likely return
+        // 405 Method Not Allowed, which is fine.
         let url = ensure_chat_completions_url(&self.base_url);
-        let builder = self.warmup_client().get(&url);
+        let builder = self
+            .http_client()
+            .get(&url)
+            .timeout(Self::WARMUP_TOTAL_TIMEOUT);
         let _ = self.attach_auth_header(builder).send().await?;
         Ok(())
     }
@@ -1072,7 +1051,7 @@ impl Provider for OpenAiCompatibleProvider {
         &self,
         request: ProviderChatRequest,
     ) -> Result<ProviderChatResponse, ScopedCallError> {
-        let req_builder = self.build_http_request_with_client(self.http_client_scoped(), &request);
+        let req_builder = self.build_http_request_with_client(self.http_client(), &request);
         let model = request.model;
         let idle_timeout = crate::retry::DEFAULT_IDLE_TIMEOUT;
 
@@ -1255,7 +1234,7 @@ mod tests {
 
         let body = |p: &OpenAiCompatibleProvider| {
             let req = p
-                .build_http_request_with_client(p.http_client_scoped(), &request)
+                .build_http_request_with_client(p.http_client(), &request)
                 .build()
                 .expect("request builds");
             String::from_utf8(
@@ -1297,7 +1276,7 @@ mod tests {
         no_routing.provider_order = None;
         let no_routing_body = {
             let req = or_provider
-                .build_http_request_with_client(or_provider.http_client_scoped(), &no_routing)
+                .build_http_request_with_client(or_provider.http_client(), &no_routing)
                 .build()
                 .expect("request builds");
             String::from_utf8(
