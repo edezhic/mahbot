@@ -822,25 +822,15 @@ impl Connection {
                          be left disabled on the shared connection"
                     );
                 }
-                match result {                    Ok(Ok(rows)) => {
-                        reset?;
-                        tx_reset?;
-                        Ok(rows)
-                    }
-                    Ok(Err(e)) => {
-                        reset?;
-                        tx_reset?;
-                        Err(e)
-                    }
-                    Err(payload) => {
-                        // Always attempt the reset above; report the panic as a query error.
-                        reset?;
-                        tx_reset?;
-                        Err(turso::Error::Error(format!(
-                            "the database engine panicked while executing the query: {}",
-                            crate::util::panic_message(&*payload)
-                        )))
-                    }
+                reset?;
+                tx_reset?;
+                match result {
+                    Ok(Ok(rows)) => Ok(rows),
+                    Ok(Err(e)) => Err(e),
+                    Err(payload) => Err(turso::Error::Error(format!(
+                        "the database engine panicked while executing the query: {}",
+                        crate::util::panic_message(&*payload)
+                    ))),
                 }
             })
         })
