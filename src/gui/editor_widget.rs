@@ -1,5 +1,8 @@
 //! A [`cosmic_text::Buffer`]-backed text buffer with cursor and selection
-//! management. Serves as the core text editing buffer for the editor.rs codebase.
+//! management, plus the iced widget that renders and edits it. Shared by all
+//! GUI text surfaces: the editor (editor.rs), diff viewer, board, home,
+//! settings, git, workspaces, users, and logs views via the helpers in
+//! `widgets.rs`.
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -333,13 +336,13 @@ impl EditorBuffer {
     /// Set the file extension for fallback comment prefix lookup.
     /// The extension should be the file extension without the dot
     /// (e.g., `"yaml"`, `"py"`, `"rs"`).
-    pub fn set_file_extension(&self, ext: Option<&str>) {
+    fn set_file_extension(&self, ext: Option<&str>) {
         *self.file_extension.borrow_mut() = ext.map(String::from);
     }
 
     /// Return the file extension, if any.
     #[must_use]
-    pub fn file_extension(&self) -> Option<String> {
+    fn file_extension(&self) -> Option<String> {
         self.file_extension.borrow().clone()
     }
 
@@ -472,7 +475,7 @@ impl EditorBuffer {
     }
 
     /// Select all text in the buffer.
-    pub fn select_all(&self) {
+    fn select_all(&self) {
         let line_count = self.line_count();
         if line_count == 0 {
             return;
@@ -586,12 +589,12 @@ impl EditorBuffer {
     // ── Expose inner buffer for widget rendering ──────────────────
 
     /// Borrow the underlying [`cosmic_text::Buffer`] for drawing.
-    pub fn borrow_buffer(&self) -> std::cell::Ref<'_, cosmic_text::Buffer> {
+    fn borrow_buffer(&self) -> std::cell::Ref<'_, cosmic_text::Buffer> {
         self.buffer.borrow()
     }
 
     /// Borrow the underlying [`cosmic_text::Buffer`] mutably for shaping.
-    pub fn borrow_buffer_mut(&self) -> std::cell::RefMut<'_, cosmic_text::Buffer> {
+    fn borrow_buffer_mut(&self) -> std::cell::RefMut<'_, cosmic_text::Buffer> {
         self.buffer.borrow_mut()
     }
 
