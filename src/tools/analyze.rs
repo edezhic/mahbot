@@ -883,7 +883,8 @@ fn analyst_slot(
 /// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
 /// ≥2 valid → extract findings and run the shared grouping pass (≥2 with
 /// parseable claims group; a single parseable source skips grouping). Failed
-/// members count as no-response, with their reasons surfaced in the error.
+/// members and completed members without a usable response count as no-response,
+/// with their reasons surfaced in the error.
 async fn consolidate_analyst_runs(
     ws: &Workspace,
     analyze: &str,
@@ -907,11 +908,13 @@ async fn consolidate_analyst_runs(
         .count();
     match valid_count {
         0 => {
-            let reasons: Vec<&str> = runs
+            let reasons: Vec<String> = runs
                 .iter()
-                .filter_map(|r| match r {
-                    AnalyzeRun::Failed { reason } => Some(reason.as_str()),
-                    AnalyzeRun::Completed { .. } => None,
+                .map(|r| match r {
+                    AnalyzeRun::Failed { reason } => reason.clone(),
+                    AnalyzeRun::Completed { agent, .. } => {
+                        agent.failure_reason("analyst produced no response")
+                    }
                 })
                 .collect();
             let suffix = if reasons.is_empty() {
@@ -1868,6 +1871,10 @@ mod tests {
         assert!(
             err.to_string().contains("panicked"),
             "error should surface the panicked-analyst reason: {err}"
+        );
+        assert!(
+            err.to_string().contains("analyst produced no response"),
+            "error should surface the no-response reason: {err}"
         );
     }
 
