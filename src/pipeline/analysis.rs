@@ -457,9 +457,8 @@ async fn maybe_escalate_analysis(
         return true;
     }
     let extraction_prompt = load_prompt("extraction/blocker_verification.md");
-    let blockers_arc = std::sync::Arc::<[String]>::from(
-        entries.iter().map(|e| e.text.clone()).collect::<Vec<_>>(),
-    );
+    let blockers_arc =
+        Arc::<[String]>::from(entries.iter().map(|e| e.text.clone()).collect::<Vec<_>>());
     let (extra, extra_paused) = run_parallel_agents(
         ticket,
         ws,
@@ -634,9 +633,8 @@ async fn resume_escalation_round(
         warn!(ticket = %ticket.id, error = %e, "Failed to re-arm resumed escalation roster slots");
     }
     let extraction_prompt = load_prompt("extraction/blocker_verification.md");
-    let blockers_arc = std::sync::Arc::<[String]>::from(
-        entries.iter().map(|e| e.text.clone()).collect::<Vec<_>>(),
-    );
+    let blockers_arc =
+        Arc::<[String]>::from(entries.iter().map(|e| e.text.clone()).collect::<Vec<_>>());
     let (extra, extra_paused) = run_parallel_agents(
         ticket,
         ws,

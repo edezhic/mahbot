@@ -364,7 +364,7 @@ pub(crate) fn failure_detail(text: &str, label: &str) -> String {
 /// the head and tail ranges would intersect (impossible under the 2/3 + 1/3
 /// split, but guards against future ratio changes).
 #[must_use]
-pub fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> String {
+pub(crate) fn truncate_sandwich(s: &str, max_bytes: usize, label: &str) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
@@ -399,7 +399,7 @@ pub(crate) const TOOL_OUTPUT_BUDGET_BYTES: usize = 5_000;
 /// Truncate tool output for LLM consumption (delegates to [`truncate_sandwich`]
 /// with the shared [`TOOL_OUTPUT_BUDGET_BYTES`] limit). Returns input unchanged if within limit.
 #[must_use]
-pub fn truncate_tool_output(output: &str) -> String {
+pub(crate) fn truncate_tool_output(output: &str) -> String {
     truncate_sandwich(output, TOOL_OUTPUT_BUDGET_BYTES, "tool output")
 }
 
@@ -1006,7 +1006,7 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
 #[must_use]
-pub fn scrub_credentials(input: &str) -> String {
+pub(crate) fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let full_match = &caps[0];
@@ -1074,7 +1074,7 @@ pub fn scrub_credentials(input: &str) -> String {
 /// provider code/message reaches the model even in a nested envelope) and by
 /// the input-image-rejection phrase builder.
 #[must_use]
-pub fn extract_provider_error_detail(error: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_provider_error_detail(error: &serde_json::Value) -> Option<String> {
     if let serde_json::Value::String(s) = error
         && !s.trim().is_empty()
     {
@@ -1172,7 +1172,7 @@ pub(crate) fn cargo_bin_dir() -> Option<PathBuf> {
 /// This is the standard pattern for handling git's quoted path output
 /// (the same approach as git's own `unquote_c_style`).
 #[must_use]
-pub fn unquote_c_style(raw: &str) -> Option<String> {
+pub(crate) fn unquote_c_style(raw: &str) -> Option<String> {
     if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         unescape_c_style(inner)
     } else {

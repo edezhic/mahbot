@@ -88,7 +88,7 @@ pub(crate) struct GroupingOutput {
 /// groups, and an optional summary (accepted only when none was yet).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GroupingDelta {
+struct GroupingDelta {
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -182,7 +182,7 @@ impl<'a> ItemTable<'a> {
 
     /// Agent index of an id — `None` when out of range.
     #[must_use]
-    pub(crate) fn agent(&self, id: usize) -> Option<usize> {
+    fn agent(&self, id: usize) -> Option<usize> {
         self.rows.get(id).map(|r| r.0)
     }
 }
@@ -282,7 +282,7 @@ pub(crate) fn render_ungrouped_section(
 // ── Repair-mode grouping (pipeline synthesis + analyze consolidation) ───────
 
 /// Mutable state of the repair protocol across rounds.
-pub(crate) struct RepairState<'a> {
+struct RepairState<'a> {
     /// Global flat id table for this operation (id → agent, text).
     table: ItemTable<'a>,
     /// Accepted (frozen) groups in order — indices are stable references.
@@ -300,7 +300,7 @@ pub(crate) struct RepairState<'a> {
 }
 
 impl<'a> RepairState<'a> {
-    pub(crate) fn new(items_by_agent: &'a [Vec<String>]) -> Self {
+    fn new(items_by_agent: &'a [Vec<String>]) -> Self {
         Self {
             table: ItemTable::new(items_by_agent),
             frozen_groups: Vec::new(),
@@ -313,7 +313,7 @@ impl<'a> RepairState<'a> {
 
     /// Deterministic remainder: every non-placed item id in global order.
     #[must_use]
-    pub(crate) fn remainder(&self) -> Vec<usize> {
+    fn remainder(&self) -> Vec<usize> {
         (0..self.table.len())
             .filter(|id| !self.placed.contains(id))
             .collect()
@@ -323,14 +323,14 @@ impl<'a> RepairState<'a> {
     /// reference — nothing left to place (pinned items render in the ungrouped
     /// section), so the run terminates without a redundant empty round.
     #[must_use]
-    pub(crate) fn complete(&self) -> bool {
+    fn complete(&self) -> bool {
         (0..self.table.len()).all(|id| self.placed.contains(&id) || self.pinned.contains(&id))
     }
 }
 
 /// One round's proposal, parsed from the full schema (round 1) or the
 /// repair-delta schema (repair rounds).
-pub(crate) struct RoundInput {
+struct RoundInput {
     pub summary: Option<String>,
     pub groups: Vec<GroupingGroup>,
     pub ungrouped: Vec<GroupingMember>,
@@ -339,7 +339,7 @@ pub(crate) struct RoundInput {
 
 /// Per-round acceptance result.
 #[derive(Default)]
-pub(crate) struct RoundOutcome {
+struct RoundOutcome {
     /// Round-level rejection (incomplete coverage) — nothing froze this round.
     pub round_rejection: Option<String>,
     /// Per-group/per-entry rejections fed to the next round, each with its
@@ -373,7 +373,7 @@ fn reject(outcome: &mut RoundOutcome, cause: FailureClass, msg: String) {
 /// duplicate placement, set completeness, contradiction ≥2 distinct agents
 /// (see [`ItemTable`] for the accepted wrong-but-valid-id risk).
 #[expect(clippy::too_many_lines)]
-pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome {
+fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome {
     let RoundInput {
         summary,
         groups,
@@ -386,11 +386,7 @@ pub(crate) fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> R
     // must appear in a proposed group or the ungrouped list.
     let mut raw: HashSet<usize> = HashSet::new();
     for g in &groups {
-        raw.extend(
-            g.members
-                .iter()
-                .flat_map(crate::consensus::GroupingMember::ids),
-        );
+        raw.extend(g.members.iter().flat_map(GroupingMember::ids));
     }
     raw.extend(ungrouped.iter().map(|m| m.id));
     for id in 0..state.table.len() {

@@ -106,7 +106,7 @@ pub(crate) struct JointRound {
 impl JointRound {
     /// Number of valid verdicts (responding agents with parseable verdicts).
     #[must_use]
-    pub fn n_valid(&self) -> usize {
+    fn n_valid(&self) -> usize {
         self.verdicts.len()
     }
 
@@ -172,7 +172,7 @@ fn synthesis_request(
 /// Run the repair-mode synthesis pass through the shared consensus core
 /// (1 full call + up to N-1 repair rounds; frozen groups; per-group
 /// acceptance; deterministic remainder placement; narrowed fail-open).
-pub(crate) async fn run_synthesis(
+async fn run_synthesis(
     round: &JointRound,
     role: Role,
     ws: &Workspace,
@@ -546,7 +546,7 @@ pub(crate) fn deserialize_verdict_outcome(outcome: &str) -> ParallelVerdict {
 
 /// Build the joint comment for a round: deterministic merge + a single LLM
 /// synthesis pass.
-pub(crate) async fn build_round_joint_comment(
+async fn build_round_joint_comment(
     stage: &'static str,
     results: &[ParallelVerdict],
     threshold: u8,

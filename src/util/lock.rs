@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Used by [`crate::self_update`] for the instance lock.
 #[must_use]
-pub fn lock_file_path(storage_root: &Path) -> PathBuf {
+pub(crate) fn lock_file_path(storage_root: &Path) -> PathBuf {
     storage_root.join("mahbot.lock")
 }
 
@@ -105,7 +105,7 @@ pub fn try_flock(file: &File) -> io::Result<bool> {
 /// read-only open is safe. The probe acquires and immediately releases the
 /// lock in the daemon-down case, so it never leaves the lock held.
 #[must_use]
-pub fn daemon_holds_lock(storage_root: &Path) -> bool {
+pub(crate) fn daemon_holds_lock(storage_root: &Path) -> bool {
     let lock_path = lock_file_path(storage_root);
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
@@ -132,7 +132,7 @@ const LOCK_SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_mill
 /// free — the daemon is genuinely down. The extra ~300 ms latency is a CLI
 /// diagnostic tool, not a hot path.
 #[must_use]
-pub fn daemon_holds_lock_settled(storage_root: &Path) -> bool {
+pub(crate) fn daemon_holds_lock_settled(storage_root: &Path) -> bool {
     for i in 0..=LOCK_SETTLE_RECHECKS {
         if daemon_holds_lock(storage_root) {
             return true;

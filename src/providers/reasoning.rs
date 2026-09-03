@@ -96,7 +96,7 @@ pub(crate) fn strip_think_tags(s: &str) -> Option<String> {
 
 /// Prefer `reasoning_content`, then `reasoning` (`OpenRouter`). **Display / effective text only**
 /// — never use for API replay fields.
-pub(crate) fn merged_reasoning_string(
+fn merged_reasoning_string(
     reasoning_content: Option<String>,
     reasoning: Option<String>,
 ) -> Option<String> {
@@ -109,7 +109,7 @@ pub(crate) fn merged_reasoning_string(
 
 /// Human-readable thinking line for UI (merges plaintext fields; extracts from details when needed).
 #[must_use]
-pub fn plaintext_for_display(reasoning: Option<&Reasoning>) -> Option<String> {
+pub(crate) fn plaintext_for_display(reasoning: Option<&Reasoning>) -> Option<String> {
     let r = reasoning?;
     merged_reasoning_string(r.reasoning_content.clone(), r.reasoning.clone()).or_else(|| {
         r.reasoning_details.as_ref().and_then(|d| {
@@ -120,7 +120,7 @@ pub fn plaintext_for_display(reasoning: Option<&Reasoning>) -> Option<String> {
 }
 
 /// True when `reasoning_details` carries at least one block worth replaying (non-empty array, etc.).
-pub(crate) fn details_has_preservable_blocks(details: &Value) -> bool {
+fn details_has_preservable_blocks(details: &Value) -> bool {
     match details {
         Value::Array(a) => !a.is_empty(),
         Value::Object(m) => !m.is_empty(),
@@ -134,7 +134,7 @@ pub(crate) fn details_has_preservable_blocks(details: &Value) -> bool {
 /// string), `DeepSeek` behind `OpenRouter` still expects a `reasoning_content` field on **tool-call**
 /// turns — derive text from details or send an empty string when details exist but are not textual,
 /// or when the API returns an **empty** `reasoning` string (schema placeholder with no `CoT` yet).
-pub fn reasoning_plaintext_for_roundtrip(
+fn reasoning_plaintext_for_roundtrip(
     explicit: Option<&str>,
     details: Option<&Value>,
     has_tool_calls: bool,
@@ -182,7 +182,7 @@ pub(crate) fn native_reasoning_triple_for_replay(
 }
 
 /// `reasoning_details` when present (opaque JSON).
-pub(crate) fn json_reasoning_details(value: &Value) -> Option<Value> {
+fn json_reasoning_details(value: &Value) -> Option<Value> {
     value
         .get("reasoning_details")
         .cloned()

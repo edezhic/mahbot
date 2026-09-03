@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 /// tables are schema-locked to the same launched/done/failed dictionary
 /// ('failed' is written in prod: failed agent outcomes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowStatus {
+pub(crate) enum RowStatus {
     Launched,
     Done,
     Failed,
@@ -103,7 +103,7 @@ impl std::str::FromStr for JobMode {
 
 /// Values of `agents.kind` — dispatch-slot kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentKind {
+pub(crate) enum AgentKind {
     Analyst,
     Verifier,
     Engineer,
@@ -131,7 +131,7 @@ impl AgentKind {
 
 /// Graceful-shutdown drain cap: in-flight work completes within this window,
 /// then stragglers are force-cancelled.
-pub const DRAIN_CAP_SECS: u64 = 10 * 60;
+pub(crate) const DRAIN_CAP_SECS: u64 = 10 * 60;
 
 /// Stale-purge cutoff (hours): only ticket-phase `jobs` rows older than this
 /// are purged (they are recoverable from `tickets.phase`). Non-phase launched

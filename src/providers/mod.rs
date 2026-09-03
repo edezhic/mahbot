@@ -13,7 +13,7 @@ pub(crate) use reasoning::plaintext_for_display;
 
 use crate::config::{CONFIG, normalize_endpoint_url, trimmed_or_none};
 use crate::util::UnwrapPoison;
-pub(crate) use crate::{ChatRequest, ChatResponse, Provider};
+use crate::{ChatRequest, ChatResponse, Provider};
 
 #[cfg(test)]
 use crate::ChatMessage;
@@ -41,7 +41,8 @@ pub(crate) fn test_request(
 
 use std::sync::{Arc, RwLock};
 
-pub(crate) use crate::providers::transcribe::{MediaTranscriber, transcribe_video_file};
+use crate::providers::transcribe::MediaTranscriber;
+pub(crate) use crate::providers::transcribe::transcribe_video_file;
 
 use crate::retry::{FailureClass, RetryFailureRecord};
 use compatible::OpenAiCompatibleProvider;

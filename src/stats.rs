@@ -46,7 +46,7 @@ pub struct ToolErrorEntry {
 ///
 /// All fields are optional — `None` means no filter is applied.
 #[derive(Debug, Clone, Default)]
-pub struct ToolErrorQuery {
+pub(crate) struct ToolErrorQuery {
     /// Optional search text filter (substring match via `LIKE` on error text).
     pub search: Option<String>,
 }
@@ -152,7 +152,7 @@ impl crate::logs::LogStore {
 
     /// Persist one per-operation LLM request stat to the dedicated
     /// `llm_requests` table. Metadata only — no request inputs/outputs.
-    pub(crate) async fn record_llm_request(&self, rec: &LlmRequestRecord) -> Result<()> {
+    async fn record_llm_request(&self, rec: &LlmRequestRecord) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO llm_requests \
@@ -198,7 +198,7 @@ impl crate::logs::LogStore {
 /// [`LlmRequestRecord::retry_attempts`]. Metadata only: no request inputs or
 /// outputs.
 #[derive(Debug, Clone)]
-pub(crate) struct LlmRequestRecord {
+struct LlmRequestRecord {
     pub purpose: &'static str,
     pub agent_id: String,
     pub role: String,
@@ -303,7 +303,7 @@ pub(crate) fn swap_test_log_store(
 /// Resolve the logs store for stat writes: test override wins, else the global.
 /// Used by the llm_requests persistence path so tests observe its writes
 /// through the same override.
-pub(crate) fn log_store_for_stats() -> Option<crate::logs::LogStore> {
+fn log_store_for_stats() -> Option<crate::logs::LogStore> {
     #[cfg(test)]
     if let Some(store) = TEST_LOG_STORE
         .read()
@@ -323,7 +323,7 @@ pub(crate) fn log_store_for_stats() -> Option<crate::logs::LogStore> {
 /// Failure-path semantics: `upstream_provider` / `system_fingerprint` /
 /// `cost` / `cost_details` are only populated from a successful response
 /// envelope — failed requests have no response, so those columns stay NULL.
-pub(crate) async fn record_llm_operation(
+async fn record_llm_operation(
     request: &crate::ChatRequest,
     duration_ms: u64,
     attempts: u32,
