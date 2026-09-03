@@ -2701,8 +2701,7 @@ mod tests {
         //
         // `try_init_from_cache()` resolves the same directory that was
         // pre-flight checked above (via models_subdir → test-owned storage
-        // root → symlink → real cache; `try_init_from_dir` was removed as
-        // dead code — its only caller was this test).
+        // root → symlink → real cache).
 
         if !crate::audio::local_transcriber::try_init_from_cache().await {
             eprintln!(

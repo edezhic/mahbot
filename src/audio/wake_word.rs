@@ -65,8 +65,8 @@ pub(crate) const WAKE_WORD_EMBEDDING_DIM: usize = 1024;
 /// with 76 frames).  76 frames still yields ~10 tokens per window.
 pub(crate) const WINDOW_MEL_FRAMES: usize = 76;
 
-/// Detection window in samples: [`WINDOW_MEL_FRAMES`] × 160-sample hop.
-pub(crate) const WINDOW_SAMPLES: usize = WINDOW_MEL_FRAMES * 160;
+/// Detection window in samples: [`WINDOW_MEL_FRAMES`] × mel hop ([`qwen_asr::config::HOP_LENGTH`]).
+pub(crate) const WINDOW_SAMPLES: usize = WINDOW_MEL_FRAMES * qwen_asr::config::HOP_LENGTH;
 
 /// Maximum encoder tokens any window can produce: a full 100-frame chunk
 /// yields 13 tokens (conv-stem output sizes w1=50, w2=25, w3=13).  A
@@ -211,6 +211,38 @@ fn l2_normalize_in_place(v: &mut [f32]) {
             *x *= inv;
         }
     }
+}
+
+/// L2-normalized centroid (mean, then normalize) of the utterance
+/// embeddings — the enrollment prototype.
+///
+/// Shared by [`WakeWordEnrollment::build`] and the enrollment
+/// consistency gate in `super::voice`.  Float op order is load-bearing
+/// for calibration reproducibility: `+=` accumulate, scale by
+/// `1.0 / len`, then [`l2_normalize_in_place`].
+///
+/// # Errors
+/// Returns the offending embedding's length when an utterance does not
+/// have exactly [`WAKE_WORD_EMBEDDING_DIM`] dimensions.
+pub(crate) fn normalized_centroid(utterance_embeddings: &[Vec<f32>]) -> Result<Vec<f32>, usize> {
+    debug_assert!(!utterance_embeddings.is_empty());
+    let dim = WAKE_WORD_EMBEDDING_DIM;
+    let mut centroid = vec![0.0f32; dim];
+    for emb in utterance_embeddings {
+        if emb.len() != dim {
+            return Err(emb.len());
+        }
+        for (c, e) in centroid.iter_mut().zip(emb) {
+            *c += e;
+        }
+    }
+    #[expect(clippy::cast_precision_loss)]
+    let inv = 1.0 / utterance_embeddings.len() as f32;
+    for c in &mut centroid {
+        *c *= inv;
+    }
+    l2_normalize_in_place(&mut centroid);
+    Ok(centroid)
 }
 
 // ── Persistence schema (v2) ─────────────────────────────────────────────
@@ -370,21 +402,7 @@ impl WakeWordEnrollment {
             return None;
         }
         let dim = WAKE_WORD_EMBEDDING_DIM;
-        let mut prototype = vec![0.0f32; dim];
-        for emb in utterance_embeddings {
-            if emb.len() != dim {
-                return None;
-            }
-            for (p, e) in prototype.iter_mut().zip(emb) {
-                *p += e;
-            }
-        }
-        #[expect(clippy::cast_precision_loss)]
-        let inv = 1.0 / utterance_embeddings.len() as f32;
-        for p in &mut prototype {
-            *p *= inv;
-        }
-        l2_normalize_in_place(&mut prototype);
+        let prototype = normalized_centroid(utterance_embeddings).ok()?;
         Some(Self {
             schema_version: ENROLLMENT_SCHEMA_VERSION,
             phrase,

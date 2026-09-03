@@ -54,7 +54,7 @@
 use crate::audio::wake_word::{
     self, ENROLLMENT_CONSISTENCY_MIN_FRACTION, ENROLLMENT_CONSISTENCY_MIN_SIMILARITY,
     MIN_ENROLLMENT_UTTERANCES, WAKE_WORD_EMBEDDING_DIM, WINDOW_SAMPLES, WakeWordEnrollment,
-    calibrate_negatives, encode_window,
+    calibrate_negatives, encode_window, normalized_centroid,
 };
 use crate::config::{CONFIG, CONFIG_KEY_WAKE_WORD_TEMPLATES};
 use crate::db;
@@ -252,13 +252,14 @@ pub(crate) const WAKE_WORD_WINDOW_SAMPLES: usize = WINDOW_SAMPLES;
 /// samples ≈ 160 ms.  The encoder forward is heavy, so the stride is widened
 /// to keep the real-time budget sane while the rolling window (N=3) still
 /// spans ~0.5 s of speech.
-const SCORE_STRIDE_SAMPLES: usize = crate::audio::wake_word::SCORE_STRIDE_MEL_FRAMES * 160;
+const SCORE_STRIDE_SAMPLES: usize =
+    crate::audio::wake_word::SCORE_STRIDE_MEL_FRAMES * qwen_asr::config::HOP_LENGTH;
 
 /// Cap for the raw audio ring (~2.0 s): one full [`WINDOW_SAMPLES`] window
 /// (12 160 samples) plus up to eight scoring strides of context
 /// (8 × 2560 = 20 480) so the VAD loop and pre-wake recording handoff always
 /// have the most recent audio while older samples drain.
-const AUDIO_BUFFER_MAX: usize = WINDOW_SAMPLES + 16 * 160 * 8;
+const AUDIO_BUFFER_MAX: usize = WINDOW_SAMPLES + 8 * SCORE_STRIDE_SAMPLES;
 
 /// Cooldown after a wake word detection — prevents rapid consecutive false
 /// triggers.
@@ -2946,29 +2947,8 @@ fn enrollment_consistency_check(utterance_embeddings: &[Vec<f32>]) -> Result<Vec
         ));
     }
     let dim = WAKE_WORD_EMBEDDING_DIM;
-    let mut centroid = vec![0.0f32; dim];
-    for emb in utterance_embeddings {
-        if emb.len() != dim {
-            return Err(format!(
-                "Utterance embedding has dim {} (expected {dim})",
-                emb.len(),
-            ));
-        }
-        for (c, v) in centroid.iter_mut().zip(emb) {
-            *c += v;
-        }
-    }
-    let inv = 1.0 / utterance_embeddings.len() as f32;
-    for c in &mut centroid {
-        *c *= inv;
-    }
-    let norm: f32 = centroid.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > 1e-8 {
-        let inv_norm = 1.0 / norm;
-        for c in &mut centroid {
-            *c *= inv_norm;
-        }
-    }
+    let centroid = normalized_centroid(utterance_embeddings)
+        .map_err(|got| format!("Utterance embedding has dim {got} (expected {dim})"))?;
 
     let required =
         (utterance_embeddings.len() as f32 * ENROLLMENT_CONSISTENCY_MIN_FRACTION).ceil() as usize;
@@ -4392,7 +4372,8 @@ mod tests {
     // audio and manually-computed VAD decisions.  No global voice state needed.
 
     /// Test config with a shorter silence threshold (10 frames ≈ 2560 samples
-    /// instead of the default 94 frames ≈ 24000 samples) so tests don't need
+    /// instead of the default ~304 ms ≈ 4864 samples, see
+    /// [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`]) so tests don't need
     /// prohibitively long audio buffers.
     const TEST_VAD_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
         frame_length: FRAME_LENGTH,
