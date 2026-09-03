@@ -113,6 +113,17 @@ const TTS_JSON_NAME: &str = "tts.json";
 const UNICODE_INDEXER_NAME: &str = "unicode_indexer.json";
 const DEFAULT_VOICE_NAME: &str = "M1.json";
 
+/// The six `onnx/` model+config files as `(filename, expected sha256)`.
+/// Single source of truth for the download, cache-check, and test sites below.
+const ONNX_TTS_FILES: &[(&str, &str)] = &[
+    (DP_ONNX_NAME, DP_MODEL_SHA256),
+    (TEXT_ENC_ONNX_NAME, TEXT_ENC_MODEL_SHA256),
+    (VECTOR_EST_ONNX_NAME, VECTOR_EST_MODEL_SHA256),
+    (VOCODER_ONNX_NAME, VOCODER_MODEL_SHA256),
+    (TTS_JSON_NAME, TTS_JSON_SHA256),
+    (UNICODE_INDEXER_NAME, UNICODE_INDEXER_SHA256),
+];
+
 /// All 10 available voice styles from HuggingFace.
 /// F1-F5 are female voices, M1-M5 are male voices.
 const ALL_VOICE_STYLE_NAMES: &[&str] = &[
@@ -657,14 +668,10 @@ pub fn try_load_cached() -> bool {
         return false;
     };
 
-    let mut paths: Vec<PathBuf> = vec![
-        dir.join(ONNX_DIR).join(DP_ONNX_NAME),
-        dir.join(ONNX_DIR).join(TEXT_ENC_ONNX_NAME),
-        dir.join(ONNX_DIR).join(VECTOR_EST_ONNX_NAME),
-        dir.join(ONNX_DIR).join(VOCODER_ONNX_NAME),
-        dir.join(ONNX_DIR).join(TTS_JSON_NAME),
-        dir.join(ONNX_DIR).join(UNICODE_INDEXER_NAME),
-    ];
+    let mut paths: Vec<PathBuf> = ONNX_TTS_FILES
+        .iter()
+        .map(|(name, _)| dir.join(ONNX_DIR).join(name))
+        .collect();
     // Also check that at least the default voice style exists
     paths.push(dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME));
 
@@ -861,38 +868,14 @@ async fn ensure_models_downloaded(dir: &Path) -> Result<()> {
 
     let base = format!("{HF_BASE}/{MODEL_REPO}/resolve/{MODEL_REVISION}");
 
-    let mut files: Vec<TtsFile> = vec![
-        TtsFile {
-            url: format!("{base}/onnx/{DP_ONNX_NAME}"),
-            path: dir.join(ONNX_DIR).join(DP_ONNX_NAME),
-            sha256: DP_MODEL_SHA256,
-        },
-        TtsFile {
-            url: format!("{base}/onnx/{TEXT_ENC_ONNX_NAME}"),
-            path: dir.join(ONNX_DIR).join(TEXT_ENC_ONNX_NAME),
-            sha256: TEXT_ENC_MODEL_SHA256,
-        },
-        TtsFile {
-            url: format!("{base}/onnx/{VECTOR_EST_ONNX_NAME}"),
-            path: dir.join(ONNX_DIR).join(VECTOR_EST_ONNX_NAME),
-            sha256: VECTOR_EST_MODEL_SHA256,
-        },
-        TtsFile {
-            url: format!("{base}/onnx/{VOCODER_ONNX_NAME}"),
-            path: dir.join(ONNX_DIR).join(VOCODER_ONNX_NAME),
-            sha256: VOCODER_MODEL_SHA256,
-        },
-        TtsFile {
-            url: format!("{base}/onnx/{TTS_JSON_NAME}"),
-            path: dir.join(ONNX_DIR).join(TTS_JSON_NAME),
-            sha256: TTS_JSON_SHA256,
-        },
-        TtsFile {
-            url: format!("{base}/onnx/{UNICODE_INDEXER_NAME}"),
-            path: dir.join(ONNX_DIR).join(UNICODE_INDEXER_NAME),
-            sha256: UNICODE_INDEXER_SHA256,
-        },
-    ];
+    let mut files: Vec<TtsFile> = ONNX_TTS_FILES
+        .iter()
+        .map(|(name, sha256)| TtsFile {
+            url: format!("{base}/{ONNX_DIR}/{name}"),
+            path: dir.join(ONNX_DIR).join(name),
+            sha256,
+        })
+        .collect();
 
     // Add all 10 voice style files. Only M1.json has a verified SHA256;
     // the rest have empty hashes (minimum-size check only) until they
@@ -2187,17 +2170,13 @@ mod tests {
     ///
     /// Shared between [`tts_models_cached`] (side-effect-free check) and
     /// [`test_tts_engine`] (model loader) so the file set stays in sync.
-    fn essential_tts_paths(dir: &std::path::Path) -> [std::path::PathBuf; 7] {
-        let onnx_dir = dir.join(ONNX_DIR);
-        [
-            onnx_dir.join(DP_ONNX_NAME),
-            onnx_dir.join(TEXT_ENC_ONNX_NAME),
-            onnx_dir.join(VECTOR_EST_ONNX_NAME),
-            onnx_dir.join(VOCODER_ONNX_NAME),
-            onnx_dir.join(TTS_JSON_NAME),
-            onnx_dir.join(UNICODE_INDEXER_NAME),
-            dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME),
-        ]
+    fn essential_tts_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut paths: Vec<_> = ONNX_TTS_FILES
+            .iter()
+            .map(|(name, _)| dir.join(ONNX_DIR).join(name))
+            .collect();
+        paths.push(dir.join(VOICE_STYLES_DIR).join(DEFAULT_VOICE_NAME));
+        paths
     }
 
     /// Helper to obtain a loaded [`TtsEngine`] for integration tests.
