@@ -399,12 +399,14 @@ CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command)
 
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
-/// Entries `24`–`27` are the consolidated current-shape baseline:
+/// Entries `24`–`26` are the consolidated current-shape baseline; entries
+/// `27`–`30` are the upfill deltas that follow it:
 /// - `24` builds the full core schema; on existing installs every statement is
 ///   `IF NOT EXISTS`, so it is a strict no-op.
-/// - `25` upfills the retired delta `23`'s `chat_history` reply columns — the
-///   one genuine migration a 0.5.0 (one-delta-behind) database needs; it is a
-///   guarded, idempotent no-op on current-main and fresh installs.
+/// - `25` doubles as the baseline for fresh installs and the genuine upfill of
+///   the retired delta `23`'s `chat_history` reply columns — the one migration
+///   a 0.5.0 (one-delta-behind) database needs; it is a guarded, idempotent
+///   no-op on current-main and fresh installs.
 /// - `26` builds the logs baseline; a strict no-op on existing logs stores.
 /// - `27` adds `workspaces.maintainer_recommendations` via a guarded Rust body —
 ///   a real upfill on existing installs, a no-op on fresh ones.
@@ -558,25 +560,12 @@ fn add_chat_history_reply_columns<'a>(
 /// `reply_snippet`) for databases that were fully current before the catalog
 /// consolidation: a 0.5.0 database has neither column, a current-main database
 /// already has both, and a fresh install got them from entry `24`'s
-/// `CREATE TABLE`. Turso has no `ADD COLUMN IF NOT EXISTS`, so the existence
-/// probe lives in this guarded, idempotent body (non-transactional like every
-/// Rust body, re-runnable until recorded).
+/// `CREATE TABLE`. Guarded by [`add_column_if_missing`], so this body is
+/// idempotent (non-transactional like every Rust body, re-runnable until
+/// recorded).
 async fn run_add_chat_history_reply_columns(conn: &Connection) -> anyhow::Result<()> {
-    for (column, ddl) in [
-        (
-            "reply_author",
-            "ALTER TABLE chat_history ADD COLUMN reply_author TEXT",
-        ),
-        (
-            "reply_snippet",
-            "ALTER TABLE chat_history ADD COLUMN reply_snippet TEXT",
-        ),
-    ] {
-        if !column_exists(conn, "chat_history", column).await? {
-            conn.execute(ddl, ())
-                .await
-                .with_context(|| format!("Failed to add chat_history.{column}"))?;
-        }
+    for column in ["reply_author", "reply_snippet"] {
+        add_column_if_missing(conn, "chat_history", column).await?;
     }
     Ok(())
 }
@@ -590,21 +579,13 @@ fn add_workspaces_maintainer_recommendations<'a>(
 
 /// Upfill `workspaces.maintainer_recommendations` for databases created before
 /// delta `27` (0.5.x live installs). Fresh installs get the column from entry
-/// `24`'s `CREATE TABLE`, so the probe makes this a no-op there. Turso has no
-/// `ADD COLUMN IF NOT EXISTS`, so the existence probe lives in this guarded,
-/// idempotent body (non-transactional like every Rust body, re-runnable until
-/// recorded). Holds a replace-only JSON blob of maintainer recommendations:
+/// `24`'s `CREATE TABLE`, so the probe makes this a no-op there. Guarded by
+/// [`add_column_if_missing`], so this body is idempotent (non-transactional
+/// like every Rust body, re-runnable until recorded). Holds a replace-only
+/// JSON blob of maintainer recommendations:
 /// {"recommendations": [...], "generated_at": RFC3339}.
 async fn run_add_workspaces_maintainer_recommendations(conn: &Connection) -> anyhow::Result<()> {
-    if !column_exists(conn, "workspaces", "maintainer_recommendations").await? {
-        conn.execute(
-            "ALTER TABLE workspaces ADD COLUMN maintainer_recommendations TEXT",
-            (),
-        )
-        .await
-        .with_context(|| "Failed to add workspaces.maintainer_recommendations")?;
-    }
-    Ok(())
+    add_column_if_missing(conn, "workspaces", "maintainer_recommendations").await
 }
 
 /// Return whether `column` exists in `table` (via `PRAGMA table_info`).
@@ -620,6 +601,18 @@ async fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::
         .into_iter()
         .any(|row| row.get::<String>(1).ok().as_deref() == Some(column));
     Ok(found)
+}
+
+/// Idempotently add a plain `TEXT` column to `table` (Turso has no
+/// `ADD COLUMN IF NOT EXISTS`): probe with [`column_exists`], then
+/// `ALTER TABLE`. Used by the guarded migration bodies above and below.
+async fn add_column_if_missing(conn: &Connection, table: &str, column: &str) -> anyhow::Result<()> {
+    if !column_exists(conn, table, column).await? {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), ())
+            .await
+            .with_context(|| format!("Failed to add {table}.{column}"))?;
+    }
+    Ok(())
 }
 
 fn add_jobs_caller_agent_and_session_created_at<'a>(
@@ -639,19 +632,8 @@ fn add_jobs_caller_agent_and_session_created_at<'a>(
 /// Idempotent, non-transactional like every Rust body (re-runnable until
 /// recorded).
 async fn run_add_jobs_caller_agent_and_session_created_at(conn: &Connection) -> anyhow::Result<()> {
-    if !column_exists(conn, "jobs", "caller_agent_id").await? {
-        conn.execute("ALTER TABLE jobs ADD COLUMN caller_agent_id TEXT", ())
-            .await
-            .with_context(|| "Failed to add jobs.caller_agent_id")?;
-    }
-    if !column_exists(conn, "session_metadata", "created_at").await? {
-        conn.execute(
-            "ALTER TABLE session_metadata ADD COLUMN created_at TEXT",
-            (),
-        )
-        .await
-        .with_context(|| "Failed to add session_metadata.created_at")?;
-    }
+    add_column_if_missing(conn, "jobs", "caller_agent_id").await?;
+    add_column_if_missing(conn, "session_metadata", "created_at").await?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_jobs_caller_agent \
          ON jobs(caller_agent_id) WHERE caller_agent_id IS NOT NULL;",
@@ -670,16 +652,12 @@ fn add_users_image_and_video_models<'a>(
 
 /// Upfill the per-user image/video model columns for databases created before
 /// delta `29`. Fresh installs get both columns from entry `24`'s `CREATE
-/// TABLE`, so the probes make this a no-op there. Turso has no `ADD COLUMN IF
-/// NOT EXISTS`, so the existence probe lives in this guarded, idempotent body
-/// (non-transactional like every Rust body, re-runnable until recorded).
+/// TABLE`, so the probe makes this a no-op there. Guarded by
+/// [`add_column_if_missing`], so this body is idempotent (non-transactional
+/// like every Rust body, re-runnable until recorded).
 async fn run_add_users_image_and_video_models(conn: &Connection) -> anyhow::Result<()> {
     for column in ["image_gen_model", "video_model"] {
-        if !column_exists(conn, "users", column).await? {
-            conn.execute(&format!("ALTER TABLE users ADD COLUMN {column} TEXT"), ())
-                .await
-                .with_context(|| format!("Failed to add users.{column}"))?;
-        }
+        add_column_if_missing(conn, "users", column).await?;
     }
     Ok(())
 }
@@ -692,15 +670,11 @@ fn add_jobs_mode<'a>(conn: &'a Connection, _root: &'a Path) -> BoxFuture<'a, any
 /// created before delta `30`. Existing rows are backfilled from the
 /// `caller_agent_id` NULL-sentinel (sync = has caller pin, async = NULL).
 /// Fresh installs get the column from entry `24`'s `CREATE TABLE`, so the
-/// probe makes this a no-op there. Turso has no `ADD COLUMN IF NOT EXISTS`,
-/// so the existence probe lives in this guarded, idempotent body
-/// (non-transactional like every Rust body, re-runnable until recorded).
+/// probe makes this a no-op there. Guarded by [`add_column_if_missing`], so
+/// this body is idempotent (non-transactional like every Rust body,
+/// re-runnable until recorded).
 async fn run_add_jobs_mode(conn: &Connection) -> anyhow::Result<()> {
-    if !column_exists(conn, "jobs", "mode").await? {
-        conn.execute("ALTER TABLE jobs ADD COLUMN mode TEXT", ())
-            .await
-            .with_context(|| "Failed to add jobs.mode")?;
-    }
+    add_column_if_missing(conn, "jobs", "mode").await?;
     // Backfill idempotently: rows created before the column existed map from the
     // caller_agent_id NULL-sentinel (sync = has caller pin, async = NULL).
     conn.execute(
@@ -1644,15 +1618,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// Idempotently drop `jobs.paused_frozen` — the finalized add/drop
     /// round-trip cleanup of the retired chain. Turso has no
-    /// `DROP COLUMN IF EXISTS`, so the existence probe lives inside the body.
+    /// `DROP COLUMN IF EXISTS`, so the existence probe is [`column_exists`].
     async fn run_drop_jobs_paused_frozen(conn: &Connection) -> anyhow::Result<()> {
-        let has = conn
-            .query("PRAGMA table_info(jobs)", ())
-            .await
-            .context("Failed to probe jobs.paused_frozen")?
-            .into_iter()
-            .any(|row| row.get::<String>(1).ok().as_deref() == Some("paused_frozen"));
-        if has {
+        if column_exists(conn, "jobs", "paused_frozen").await? {
             conn.execute("ALTER TABLE jobs DROP COLUMN paused_frozen", ())
                 .await
                 .context("Failed to drop jobs.paused_frozen")?;
