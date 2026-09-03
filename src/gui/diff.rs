@@ -1134,11 +1134,7 @@ impl DiffState {
     #[expect(clippy::too_many_lines)]
     fn build_diff_content(&self) -> Element<'_, DiffMessage> {
         if self.diff_files.is_empty() {
-            return container(widgets::vscroll(column![]))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(theme::base_container_style)
-                .into();
+            return widgets::page_bare(widgets::vscroll(column![]));
         }
 
         let truncate_at = compute_truncation_index(
@@ -1260,13 +1256,9 @@ impl DiffState {
             );
         }
 
-        container(widgets::vscroll(
+        widgets::page_bare(widgets::vscroll(
             column(rows).spacing(0).width(Length::Fill),
         ))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(theme::base_container_style)
-        .into()
     }
 
     /// Rebuild per-file cosmic_text buffer data. Called from `update()` when

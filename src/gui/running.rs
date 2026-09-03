@@ -161,14 +161,7 @@ pub(crate) fn view(
         widgets::vscroll(content)
     };
 
-    // Uniform page chrome with the rest of the dashboard: base Flexoki
-    // fill + 24px padding, matching the other pages.
-    let page: Element<'_, RunningMessage> = container(body)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(theme::PAGE_PADDING)
-        .style(theme::base_container_style)
-        .into();
+    let page = widgets::page(body);
     // Confirm-dialog overlay: the page content is stack child 0, the dialog
     // (or a type-stable placeholder) child 1 — the widget shapes never
     // change, so no page state is lost when the dialog opens/closes.

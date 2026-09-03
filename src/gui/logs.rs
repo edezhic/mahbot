@@ -472,11 +472,7 @@ impl LogsState {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::base_container_style)
-            .into()
+        widgets::page_bare(content)
     }
 
     /// Render a warning banner when the log-writer task has observed DB insert
@@ -720,13 +716,7 @@ impl LogsState {
             content = content.push(entries_view);
         }
 
-        let base = container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(theme::PAGE_PADDING)
-            .style(theme::base_container_style);
-
-        base.into()
+        widgets::page(content)
     }
 
     fn render_log_entry(entry: &LogEntry, fade_progress: f32) -> Element<'_, LogMessage> {

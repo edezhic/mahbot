@@ -168,12 +168,7 @@ impl ToolFailuresState {
             content = content.push(entries_view);
         }
 
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(theme::PAGE_PADDING)
-            .style(theme::base_container_style)
-            .into()
+        widgets::page(content)
     }
 
     /// Render a single error row with two-line layout:

@@ -49,6 +49,34 @@ impl std::fmt::Display for PickOption {
     }
 }
 
+// ── Page scaffold ────────────────────────────────────────────────────
+
+/// Standard full-area page/region chrome: the content wrapped in a
+/// Fill×Fill container with the shared [`theme::PAGE_PADDING`] inset and
+/// the base-page background style. Used for top-level page bodies.
+#[must_use]
+pub fn page<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(theme::PAGE_PADDING)
+        .style(theme::base_container_style)
+        .into()
+}
+
+/// [`page`] without the page padding — for nested full-area region containers
+/// (tab bodies, panels) that manage their own inner insets.
+#[must_use]
+pub fn page_bare<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::base_container_style)
+        .into()
+}
+
 // ── Shared single-line editor field ──────────────────────────────────
 
 /// A single shared-editor field frame matching the app's `text_input` visual

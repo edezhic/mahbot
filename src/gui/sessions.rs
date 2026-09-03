@@ -557,12 +557,7 @@ impl SessionsState {
             );
         }
 
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(theme::PAGE_PADDING)
-            .style(theme::base_container_style)
-            .into()
+        widgets::page(content)
     }
 }
 

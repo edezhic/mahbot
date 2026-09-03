@@ -5369,11 +5369,7 @@ impl EditorState {
         let element = iced::Element::new(editor);
         let mapped = element.map(EditorMessage::EditorAction);
 
-        container(mapped)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::base_container_style)
-            .into()
+        widgets::page_bare(mapped)
     }
 
     // ── Context menu action handlers ───────────────────────────────

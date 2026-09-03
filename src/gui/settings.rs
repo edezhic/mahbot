@@ -1673,12 +1673,7 @@ impl SettingsState {
         // page persists automatically, so there is no floating Save button.
         let body = stack([scroll, modal]);
 
-        container(body)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(theme::PAGE_PADDING)
-            .style(theme::base_container_style)
-            .into()
+        widgets::page(body)
     }
 
     // ── Workspace management section ──────────────────────────
