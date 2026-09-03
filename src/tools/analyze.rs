@@ -1051,8 +1051,10 @@ fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
 /// Render the fail-open analyst deliverable: the flat numbered claim list
 /// plus the raw analyst dumps, headed by an explicit `marker` naming why
 /// consolidation produced no groups. The marker is head-placed so it stays
-/// prominently visible in the delivered output. Shared by every no-groups path
-/// so the fallback shape stays identical.
+/// prominently visible in the delivered output. Every no-groups path with at
+/// least one valid claim list goes through this helper; the
+/// total-extraction-failure path (`n_valid == 0`) is a deliberate exception
+/// that renders extraction failures in place of the flat claim list.
 #[must_use]
 fn render_unconsolidated_fallback(
     marker: &str,

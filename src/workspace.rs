@@ -313,7 +313,8 @@ async fn run_workspace_diagnostics(
 ///
 /// - [`DiscoveryOutcome::AllOk`]: sets status to `ready` and unpauses the
 ///   workspace. The discovery flow itself set the analysis pause
-///   (`add`/`rediscover`/pickup write `paused = 1` alongside
+///   (`add` writes `paused = 1` alongside `status = Pending`; rediscover
+///   and pickup — `claim_pending_for_discovery` — write it alongside
 ///   `status = Analyzing`), and rediscovery is the documented unpause path —
 ///   so a successful discovery clears it. While that pause is set, the claim
 ///   pipeline's gate also holds automatic Backlog→Analysis and
@@ -680,7 +681,7 @@ fn pending_pickup_cooldowns() -> &'static std::sync::Mutex<HashMap<String, Picku
 /// In the rare race where a transient finalize lands after a concurrent
 /// delete's clear, the re-armed entry is stale — harmless (the map is bounded
 /// by workspace count) and cleared again on re-add.
-pub(crate) fn record_pending_pickup_cooldown(ws_name: &str) {
+fn record_pending_pickup_cooldown(ws_name: &str) {
     let mut map = pending_pickup_cooldowns().lock().unwrap_poison();
     let attempts = map.get(ws_name).map_or(0, |c| c.attempts) + 1;
     let deadline = Instant::now() + pending_pickup_cooldown_duration(attempts);
@@ -690,7 +691,7 @@ pub(crate) fn record_pending_pickup_cooldown(ws_name: &str) {
 /// Arm the cooldown with an explicit deadline (test hook; production callers
 /// use [`record_pending_pickup_cooldown`]).
 #[cfg(test)]
-pub(crate) fn record_pending_pickup_cooldown_until(ws_name: &str, deadline: Instant) {
+fn record_pending_pickup_cooldown_until(ws_name: &str, deadline: Instant) {
     let mut map = pending_pickup_cooldowns().lock().unwrap_poison();
     map.insert(
         ws_name.to_string(),
@@ -703,7 +704,7 @@ pub(crate) fn record_pending_pickup_cooldown_until(ws_name: &str, deadline: Inst
 
 /// Clear the cooldown for a workspace (successful discovery, manual
 /// rediscover, delete, re-add) — also resets the escalation counter.
-pub(crate) fn clear_pending_pickup_cooldown(ws_name: &str) {
+fn clear_pending_pickup_cooldown(ws_name: &str) {
     pending_pickup_cooldowns()
         .lock()
         .unwrap_poison()
