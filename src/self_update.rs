@@ -439,11 +439,12 @@ pub(crate) fn set_update_cache_for_test(
 
 /// HTTP client for the crates.io sparse index, with a descriptive User-Agent
 /// (crates.io requires one; an empty UA is rejected) and a short timeout so a
-/// hung network never blocks the GUI tick.
+/// hung network never stalls the refresh loop for long.
 ///
 /// Build failure surfaces as `Err` (the builder has no reason to fail in
-/// practice — fixed config, no env interaction — but an `expect()` here would
-/// panic the GUI tick on the off chance it does).
+/// practice — fixed config, no env interaction). The only caller is the
+/// background availability-refresh task, which tolerates the failure and
+/// retries on its next tick.
 fn registry_http_client() -> Result<&'static reqwest::Client> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     CLIENT
@@ -551,7 +552,7 @@ async fn fetch_latest_stable_version() -> Result<Option<semver::Version>> {
 ///
 /// Discovery runs on all platforms: an update found here is installed via the
 /// unified install-to-temp + `self_replace` flow, which works on Windows too.
-pub(crate) async fn check_registry_update() -> Result<Option<semver::Version>> {
+async fn check_registry_update() -> Result<Option<semver::Version>> {
     let Some(latest) = fetch_latest_stable_version().await? else {
         return Ok(None);
     };
