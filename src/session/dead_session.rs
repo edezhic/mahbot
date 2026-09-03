@@ -220,13 +220,11 @@ pub async fn run_dead_session_recovery_loop() {
 ///   already responded.
 /// * `System` tail — no in-flight turn.
 ///
-/// `last_content` is only consulted for the `Assistant` arm; pass `None` for
-/// the other roles.
-fn is_recovery_candidate(last_role: ChatRole, last_content: Option<&str>) -> bool {
+/// `last_content` is only consulted for the `Assistant` arm.
+fn is_recovery_candidate(last_role: ChatRole, last_content: &str) -> bool {
     match last_role {
         ChatRole::User | ChatRole::Tool => true,
-        ChatRole::Assistant => last_content
-            .is_some_and(|content| super::is_dangling_tool_call_frame(last_role, content)),
+        ChatRole::Assistant => super::is_dangling_tool_call_frame(last_role, last_content),
         ChatRole::System => false,
     }
 }
@@ -238,10 +236,10 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 
     // Use SQL-side filtering to avoid loading excluded sessions (manager_ and
     // every prefix in TRANSIENT_AGENT_ID_PREFIXES) from the database.  The
-    // per-session `get_last_message_role` queries below are lightweight
-    // (indexed `ORDER BY id DESC LIMIT 1`) and only run for eligible sessions;
-    // Assistant tails additionally fetch the tail content for the dangling-frame
-    // check (also a single indexed `ORDER BY id DESC LIMIT 1` read).
+    // per-session `get_last_message_tail` queries below are lightweight
+    // (indexed `ORDER BY id DESC LIMIT 1`) — fetching both the role and the
+    // content of the tail row in a single read — and only run for eligible
+    // sessions.
     let sessions = crate::session::store()
         .list_sessions_with_metadata_excluding(
             &crate::session::reserved_agent_id_prefixes().collect::<Vec<&str>>(),
@@ -252,21 +250,14 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         let agent_id = &session.agent_id;
 
         // ── Condition 1: the tail is a recovery candidate ───────────────
-        let Some(last_role) = crate::session::store()
-            .get_last_message_role(agent_id)
+        let Some((last_role, tail_content)) = crate::session::store()
+            .get_last_message_tail(agent_id)
             .await
         else {
             DEAD_SESSION_TRACKER.cleanup(agent_id);
             continue; // empty session — clean up any stale tracker entry
         };
-        let tail_content = if last_role == ChatRole::Assistant {
-            crate::session::store()
-                .get_last_message_content(agent_id)
-                .await
-        } else {
-            None
-        };
-        if !is_recovery_candidate(last_role, tail_content.as_deref()) {
+        if !is_recovery_candidate(last_role, &tail_content) {
             // Last message is an assistant reply that is not a dangling
             // frame, or a system message: the turn is complete — the agent
             // has already responded. Clean up the retry-tracking entry so a
@@ -534,22 +525,22 @@ mod tests {
     #[test]
     fn test_is_recovery_candidate_classification() {
         // User tail: user sent a message, agent never answered → candidate.
-        assert!(is_recovery_candidate(ChatRole::User, None));
+        assert!(is_recovery_candidate(ChatRole::User, ""));
         // Tool tail: committed tool frame without a following assistant reply
         // (turn cut by a drain/restart) → candidate — the recovery re-run
         // continues from the tool result already in the history.
-        assert!(is_recovery_candidate(ChatRole::Tool, None));
+        assert!(is_recovery_candidate(ChatRole::Tool, ""));
         // Assistant tail — only a dangling emission-time tool-call frame is a
         // candidate (interruption mid-tool-round); anything else is healthy.
         // Plain assistant reply: turn completed, agent responded → healthy.
         assert!(!is_recovery_candidate(
             ChatRole::Assistant,
-            Some("plain assistant reply")
+            "plain assistant reply"
         ));
         // Hand-crafted non-frame JSON → healthy (not a tool-call frame).
         assert!(!is_recovery_candidate(
             ChatRole::Assistant,
-            Some(r#"{"answer": 42}"#)
+            r#"{"answer": 42}"#
         ));
         // Emission-time tool-call frame with calls (the real dangling tail
         // encoding) → candidate.
@@ -563,21 +554,21 @@ mod tests {
             None,
         )
         .to_string();
-        assert!(is_recovery_candidate(ChatRole::Assistant, Some(&frame)));
+        assert!(is_recovery_candidate(ChatRole::Assistant, &frame));
         // Hand-crafted EMPTY-calls frame → healthy (must not false-positive;
         // `assistant_replay_payload` with an empty slice omits the key
         // entirely, hence the hand-crafted JSON).
         assert!(!is_recovery_candidate(
             ChatRole::Assistant,
-            Some(r#"{"content":"","tool_calls":[]}"#)
+            r#"{"content":"","tool_calls":[]}"#
         ));
         // Invalid JSON → healthy.
         assert!(!is_recovery_candidate(
             ChatRole::Assistant,
-            Some("not json at all")
+            "not json at all"
         ));
         // System tail: no in-flight turn → healthy.
-        assert!(!is_recovery_candidate(ChatRole::System, None));
+        assert!(!is_recovery_candidate(ChatRole::System, ""));
     }
 
     #[test]
@@ -631,8 +622,8 @@ mod tests {
         }
 
         // should_retry returns false permanently — the entry stays in the
-        // map, and no removal mechanism resets the counter (the critical
-        // bug from try_remove_exhausted was fixed by removing it).
+        // map, and no removal mechanism resets the counter (a previous
+        // removal mechanism had a critical bug and was deliberately removed).
         assert!(!tracker.should_retry(agent_id));
         // Verify it's still blocked on a second check (not a transient
         // failure due to backoff timing)
@@ -836,27 +827,21 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let tail_role = crate::session::store()
-                .get_last_message_role(&agent_id)
+            let tail = crate::session::store()
+                .get_last_message_tail(&agent_id)
                 .await;
-            let tail_content = crate::session::store()
-                .get_last_message_content(&agent_id)
-                .await;
-            if jobs.is_empty()
-                && tail_role == Some(crate::ChatRole::Assistant)
-                && tail_content
-                    .as_deref()
-                    .is_some_and(|c| c.contains("Recovery round"))
-            {
+            let tail_role = tail.as_ref().map(|(role, _)| *role);
+            let tail_has_reply = tail
+                .as_ref()
+                .is_some_and(|(_, content)| content.contains("Recovery round"));
+            if jobs.is_empty() && tail_role == Some(crate::ChatRole::Assistant) && tail_has_reply {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "recovery did not complete within 60s: jobs={jobs:?} \
                  tail_role={tail_role:?} tail_has_reply={}",
-                tail_content
-                    .as_deref()
-                    .is_some_and(|c| c.contains("Recovery round")),
+                tail_has_reply,
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }

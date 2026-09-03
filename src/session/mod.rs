@@ -874,36 +874,23 @@ impl SessionStore {
         .await
     }
 
-    /// Lightweight query: get the role of the last message in a session.
-    /// Returns `None` if the session has no messages.
-    pub(crate) async fn get_last_message_role(&self, agent_id: &str) -> Option<ChatRole> {
+    /// Lightweight query: role and raw content of the session's last message
+    /// row (`None` for an empty session). Powers content-aware tail
+    /// classification (the dead-session poller's dangling-frame check).
+    pub(crate) async fn get_last_message_tail(&self, agent_id: &str) -> Option<(ChatRole, String)> {
         let rows = self
             .conn
             .query(
-                "SELECT role FROM sessions WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT role, content FROM sessions WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1",
                 params![agent_id],
             )
             .await
             .ok()?;
         rows.first().and_then(|row| {
             let role_str: String = row.get(0).ok()?;
-            role_str.parse::<ChatRole>().ok()
+            let content: String = row.get(1).ok()?;
+            Some((role_str.parse::<ChatRole>().ok()?, content))
         })
-    }
-
-    /// Raw content of the session's last message row (`None` for an empty
-    /// session). Companion to [`Self::get_last_message_role`] for content-aware
-    /// tail classification (the dead-session poller's dangling-frame check).
-    pub(crate) async fn get_last_message_content(&self, agent_id: &str) -> Option<String> {
-        let rows = self
-            .conn
-            .query(
-                "SELECT content FROM sessions WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1",
-                params![agent_id],
-            )
-            .await
-            .ok()?;
-        rows.first().and_then(|row| row.get::<String>(0).ok())
     }
 
     /// Retrieve stored session context for a given agent ID.
@@ -1102,7 +1089,7 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
 /// background). The dead-session poller excludes the whole union, while
 /// [`cleanup_old_transient_sessions`] purges only the transient entries
 /// (`manager_` is intentionally excluded there). Both match via SQL
-/// `LIKE 'prefix_%'`, which SQLite applies case-insensitively for ASCII.
+/// `LIKE 'prefix_%'`, which Turso applies case-insensitively for ASCII.
 fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
     std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
 }
@@ -1589,41 +1576,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_get_last_message_role() {
+    async fn session_get_last_message_tail() {
         crate::util::test::init_test_stores().await;
         let agent_id = unique_key();
 
         // Empty session → None.
-        assert!(store().get_last_message_role(&agent_id).await.is_none());
+        assert!(store().get_last_message_tail(&agent_id).await.is_none());
 
-        // Append a user message → User.
+        // Append a user message → (User, "hello").
         store()
             .batch_append(&agent_id, &[ChatMessage::user("hello")])
             .await
             .unwrap();
         assert_eq!(
-            store().get_last_message_role(&agent_id).await,
-            Some(ChatRole::User)
+            store().get_last_message_tail(&agent_id).await,
+            Some((ChatRole::User, "hello".into()))
         );
 
-        // Append an assistant message → Assistant.
+        // Append an assistant message → (Assistant, "world").
         store()
             .batch_append(&agent_id, &[ChatMessage::assistant("world")])
             .await
             .unwrap();
         assert_eq!(
-            store().get_last_message_role(&agent_id).await,
-            Some(ChatRole::Assistant)
+            store().get_last_message_tail(&agent_id).await,
+            Some((ChatRole::Assistant, "world".into()))
         );
-    }
-
-    #[tokio::test]
-    async fn session_get_last_message_content_dangling_frame() {
-        crate::util::test::init_test_stores().await;
-        let agent_id = unique_key();
-
-        // Empty session → None.
-        assert!(store().get_last_message_content(&agent_id).await.is_none());
 
         // Emission-time assistant tool-call frame: the persisted content is the
         // JSON replay payload, and the tail is the dangling-frame signal.
@@ -1648,13 +1626,14 @@ mod tests {
             .await
             .unwrap();
 
-        let content = store()
-            .get_last_message_content(&agent_id)
+        let (role, content) = store()
+            .get_last_message_tail(&agent_id)
             .await
-            .expect("tail content should be readable");
+            .expect("tail should be readable");
+        assert_eq!(role, ChatRole::Assistant);
         assert_eq!(content, frame);
         assert!(super::is_dangling_tool_call_frame(
-            crate::ChatRole::Assistant,
+            ChatRole::Assistant,
             &content
         ));
     }
@@ -2274,7 +2253,8 @@ mod transient_prefix_tests {
             let bare_word = prefix.trim_end_matches('_');
 
             // Capitalized variant (uppercase only the first char) covers the
-            // ASCII case-insensitivity of SQLite LIKE, e.g. `Ticket`, `Manager`.
+            // ASCII case-insensitivity of Turso's SQLite-compatible `LIKE`,
+            // e.g. `Ticket`, `Manager`.
             let capitalized = {
                 let mut chars = bare_word.chars();
                 match chars.next() {
