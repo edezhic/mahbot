@@ -1720,169 +1720,153 @@ impl SettingsState {
                 };
 
                 let ws_row = container(
-                    column![
-                        row![
-                            // Name column (FillPortion: 15)
-                            container(
-                                text(&ws_item.name)
-                                    .size(theme::TEXT_14)
-                                    .color(theme::TEXT_PRIMARY)
-                            )
-                            .width(Length::FillPortion(15))
-                            .align_x(Alignment::Start)
-                            .align_y(Alignment::Center),
-                            // Status column (FillPortion: 18) — status pill,
-                            // maintainer toggle, pause/unpause toggle.
-                            container(
-                                row![
-                                    tooltip(
-                                        widgets::badge_pill(
-                                            ws_item.status.to_string(),
-                                            theme::workspace_status_color(ws_item.status),
-                                            widgets::PILL_MODAL,
-                                        ),
-                                        text("Status").size(theme::TEXT_11),
-                                        tooltip::Position::Top,
-                                    )
-                                    .style(theme::tooltip_style),
-                                    widgets::icon_tooltip_button(
-                                        widgets::maint_badge(maintainer_on),
-                                        if maintainer_on {
-                                            "stop maintenance"
-                                        } else {
-                                            "start maintenance"
-                                        },
-                                        Some(SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::ToggleMaintainer(
-                                                ws_item.name.clone(),
-                                                !maintainer_on,
-                                            ),
-                                        )),
-                                        button::DEFAULT_PADDING,
-                                        theme::button_text,
-                                        tooltip::Position::Top,
-                                    ),
-                                    widgets::icon_tooltip_button(
-                                        pause_icon,
-                                        pause_tooltip,
-                                        Some(SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::TogglePaused(
-                                                ws_item.name.clone(),
-                                                !paused,
-                                            ),
-                                        )),
-                                        button::DEFAULT_PADDING,
-                                        theme::button_text,
-                                        tooltip::Position::Top,
-                                    ),
-                                ]
-                                .spacing(theme::SPACE_4)
-                                .align_y(Alignment::Center),
-                            )
-                            .width(Length::FillPortion(18))
-                            .align_x(Alignment::Start)
-                            .align_y(Alignment::Center),
-                            // Contexts column (FillPortion: 28) — per-role
-                            // context icons, general context, Diag, Notes.
-                            {
-                                let mut left = Row::new()
-                                    .spacing(theme::SPACE_4)
-                                    .align_y(Alignment::Center);
-                                let mut role_btns = Row::new().spacing(theme::SPACE_2);
-                                for role in Role::iter()
-                                    .filter(|r| crate::agent::role::role_info(r).has_discovery)
-                                {
-                                    let name = role.as_str();
-                                    let (color, _bg) = theme::role_badge_color_for(&role);
-                                    role_btns = role_btns.push(widgets::icon_tooltip_button(
-                                        theme::role_icon(&role).size(theme::TEXT_14).color(color),
-                                        role.display_label(),
-                                        Some(SettingsMessage::WorkspaceMsg(
-                                            workspaces::WorkspacesMessage::ViewContext(
-                                                ws_item.name.clone(),
-                                                name.to_string(),
-                                            ),
-                                        )),
-                                        // Halve the default 10px horizontal
-                                        // padding so adjacent role icons sit
-                                        // closer; vertical stays at 5px.
-                                        [theme::PAD_5, theme::PAD_5],
-                                        theme::button_text,
-                                        tooltip::Position::Top,
-                                    ));
-                                }
-                                left = left.push(role_btns);
-                                left = left.push(widgets::icon_tooltip_button(
-                                    theme::general_context_icon()
-                                        .size(theme::TEXT_14)
-                                        .color(theme::ACCENT),
-                                    "General context",
-                                    Some(SettingsMessage::WorkspaceMsg(
-                                        workspaces::WorkspacesMessage::ViewGeneralContext(
-                                            ws_item.name.clone(),
-                                        ),
-                                    )),
-                                    button::DEFAULT_PADDING,
-                                    theme::button_text,
-                                    tooltip::Position::Top,
-                                ));
-                                left = left.push(widgets::icon_tooltip_button(
-                                    theme::diagnostics_icon()
-                                        .size(theme::TEXT_14)
-                                        .color(theme::TEXT_PRIMARY),
-                                    "Diagnostics commands",
-                                    Some(SettingsMessage::WorkspaceMsg(
-                                        workspaces::WorkspacesMessage::ShowDiagnostics(
-                                            ws_item.name.clone(),
-                                        ),
-                                    )),
-                                    button::DEFAULT_PADDING,
-                                    theme::button_text,
-                                    tooltip::Position::Top,
-                                ));
-                                left = left.push(widgets::icon_tooltip_button(
-                                    text("Notes").size(theme::TEXT_14).color(theme::TEXT_MUTED),
-                                    "Custom context",
-                                    Some(SettingsMessage::WorkspaceMsg(
-                                        workspaces::WorkspacesMessage::ToggleNotes(
-                                            ws_item.name.clone(),
-                                        ),
-                                    )),
-                                    button::DEFAULT_PADDING,
-                                    theme::button_text,
-                                    tooltip::Position::Top,
-                                ));
-                                container(left)
-                                    .width(Length::FillPortion(28))
-                                    .align_x(Alignment::Start)
-                                    .align_y(Alignment::Center)
-                            },
-                            // Path column (FillPortion: 39)
-                            container(
-                                text(&ws_item.path)
-                                    .size(theme::TEXT_12)
-                                    .color(theme::TEXT_SECONDARY)
-                            )
-                            .width(Length::FillPortion(39))
-                            .align_x(Alignment::Start)
-                            .align_y(Alignment::Center),
-                        ]
+                    row![
+                        // Name column (FillPortion: 15)
+                        container(
+                            text(&ws_item.name)
+                                .size(theme::TEXT_14)
+                                .color(theme::TEXT_PRIMARY)
+                        )
+                        .width(Length::FillPortion(15))
+                        .align_x(Alignment::Start)
                         .align_y(Alignment::Center),
+                        // Status column (FillPortion: 18) — status pill,
+                        // maintainer toggle, pause/unpause toggle.
+                        container(
+                            row![
+                                tooltip(
+                                    widgets::badge_pill(
+                                        ws_item.status.to_string(),
+                                        theme::workspace_status_color(ws_item.status),
+                                        widgets::PILL_MODAL,
+                                    ),
+                                    text("Status").size(theme::TEXT_11),
+                                    tooltip::Position::Top,
+                                )
+                                .style(theme::tooltip_style),
+                                widgets::icon_tooltip_button(
+                                    widgets::maint_badge(maintainer_on),
+                                    if maintainer_on {
+                                        "stop maintenance"
+                                    } else {
+                                        "start maintenance"
+                                    },
+                                    Some(SettingsMessage::WorkspaceMsg(
+                                        workspaces::WorkspacesMessage::ToggleMaintainer(
+                                            ws_item.name.clone(),
+                                            !maintainer_on,
+                                        ),
+                                    )),
+                                    button::DEFAULT_PADDING,
+                                    theme::button_text,
+                                    tooltip::Position::Top,
+                                ),
+                                widgets::icon_tooltip_button(
+                                    pause_icon,
+                                    pause_tooltip,
+                                    Some(SettingsMessage::WorkspaceMsg(
+                                        workspaces::WorkspacesMessage::TogglePaused(
+                                            ws_item.name.clone(),
+                                            !paused,
+                                        ),
+                                    )),
+                                    button::DEFAULT_PADDING,
+                                    theme::button_text,
+                                    tooltip::Position::Top,
+                                ),
+                            ]
+                            .spacing(theme::SPACE_4)
+                            .align_y(Alignment::Center),
+                        )
+                        .width(Length::FillPortion(18))
+                        .align_x(Alignment::Start)
+                        .align_y(Alignment::Center),
+                        // Contexts column (FillPortion: 28) — per-role
+                        // context icons, general context, Diag, Notes.
                         {
-                            // Second line: next maintenance time
-                            if let Some(label) = super::workspaces::next_maintenance_label(ws_item)
+                            let mut left = Row::new()
+                                .spacing(theme::SPACE_4)
+                                .align_y(Alignment::Center);
+                            let mut role_btns = Row::new().spacing(theme::SPACE_2);
+                            for role in Role::iter()
+                                .filter(|r| crate::agent::role::role_info(r).has_discovery)
                             {
-                                column![
-                                    text(label)
-                                        .size(theme::TEXT_11)
-                                        .color(theme::TEXT_SECONDARY),
-                                ]
-                            } else {
-                                column![]
+                                let name = role.as_str();
+                                let (color, _bg) = theme::role_badge_color_for(&role);
+                                role_btns = role_btns.push(widgets::icon_tooltip_button(
+                                    theme::role_icon(&role).size(theme::TEXT_14).color(color),
+                                    role.display_label(),
+                                    Some(SettingsMessage::WorkspaceMsg(
+                                        workspaces::WorkspacesMessage::ViewContext(
+                                            ws_item.name.clone(),
+                                            name.to_string(),
+                                        ),
+                                    )),
+                                    // Halve the default 10px horizontal
+                                    // padding so adjacent role icons sit
+                                    // closer; vertical stays at 5px.
+                                    [theme::PAD_5, theme::PAD_5],
+                                    theme::button_text,
+                                    tooltip::Position::Top,
+                                ));
                             }
+                            left = left.push(role_btns);
+                            left = left.push(widgets::icon_tooltip_button(
+                                theme::general_context_icon()
+                                    .size(theme::TEXT_14)
+                                    .color(theme::ACCENT),
+                                "General context",
+                                Some(SettingsMessage::WorkspaceMsg(
+                                    workspaces::WorkspacesMessage::ViewGeneralContext(
+                                        ws_item.name.clone(),
+                                    ),
+                                )),
+                                button::DEFAULT_PADDING,
+                                theme::button_text,
+                                tooltip::Position::Top,
+                            ));
+                            left = left.push(widgets::icon_tooltip_button(
+                                theme::diagnostics_icon()
+                                    .size(theme::TEXT_14)
+                                    .color(theme::TEXT_PRIMARY),
+                                "Diagnostics commands",
+                                Some(SettingsMessage::WorkspaceMsg(
+                                    workspaces::WorkspacesMessage::ShowDiagnostics(
+                                        ws_item.name.clone(),
+                                    ),
+                                )),
+                                button::DEFAULT_PADDING,
+                                theme::button_text,
+                                tooltip::Position::Top,
+                            ));
+                            left = left.push(widgets::icon_tooltip_button(
+                                text("Notes").size(theme::TEXT_14).color(theme::TEXT_MUTED),
+                                "Custom context",
+                                Some(SettingsMessage::WorkspaceMsg(
+                                    workspaces::WorkspacesMessage::ToggleNotes(
+                                        ws_item.name.clone(),
+                                    ),
+                                )),
+                                button::DEFAULT_PADDING,
+                                theme::button_text,
+                                tooltip::Position::Top,
+                            ));
+                            container(left)
+                                .width(Length::FillPortion(28))
+                                .align_x(Alignment::Start)
+                                .align_y(Alignment::Center)
                         },
+                        // Path column (FillPortion: 39)
+                        container(
+                            text(&ws_item.path)
+                                .size(theme::TEXT_12)
+                                .color(theme::TEXT_SECONDARY)
+                        )
+                        .width(Length::FillPortion(39))
+                        .align_x(Alignment::Start)
+                        .align_y(Alignment::Center),
                     ]
-                    .spacing(theme::SPACE_4),
+                    .align_y(Alignment::Center),
                 )
                 .padding(theme::PAD_8)
                 .style(theme::surface_card_style);

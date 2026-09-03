@@ -11,41 +11,6 @@ use std::collections::{HashMap, HashSet};
 use super::common::SingleLineEditorState;
 use super::editor_widget::EditorAction;
 
-/// Format the time until the next maintainer run, if applicable.
-///
-/// Returns `None` when maintenance is disabled.
-#[must_use]
-pub(crate) fn next_maintenance_label(ws: &Workspace) -> Option<String> {
-    if !ws.maintenance_enabled {
-        return None;
-    }
-    let Some(ref last_str) = ws.maintainer_last_run_at else {
-        return Some("Next maintenance: pending".to_string());
-    };
-    let last_time = match crate::db::parse_utc_timestamp(last_str) {
-        Ok(dt) => dt,
-        Err(e) => {
-            tracing::warn!(maintainer_last_run_at = %last_str, error = %e, "Failed to parse maintainer_last_run_at in workspace label, showing 'pending'");
-            return Some("Next maintenance: pending".to_string());
-        }
-    };
-    let now = chrono::Utc::now();
-    let next_run = last_time + chrono::Duration::minutes(Workspace::MAINTAINER_DEBOUNCE_MINS);
-    let remaining = next_run - now;
-    let mins = remaining.num_minutes();
-    if mins <= 0 {
-        Some("Next maintenance: due now".to_string())
-    } else {
-        let hours = (mins / 60).cast_unsigned();
-        let minutes = (mins % 60).cast_unsigned();
-        if hours > 0 {
-            Some(format!("Next maintenance in {hours}h {minutes}min"))
-        } else {
-            Some(format!("Next maintenance in {minutes} min"))
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)] // ContextKind is deliberately pub(crate) (see gui/mod.rs Message)
 pub enum WorkspacesMessage {
