@@ -1597,41 +1597,19 @@ async fn route_to_agent(text: String) {
         let pool = crate::users::role_pool(&user_name).await;
         let Some(role) = crate::users::resolve_active_role_from_pool(&user_name, &pool).await
         else {
-            // Empty role pool — no role is allowed to answer.
+            // Empty pool or a failed selected-role store read (fail-closed)
+            // — no role is allowed to answer.
             info!("Voice command dropped (no active role) (user: {user_name}): {text}");
             return;
         };
         let ws = crate::users::resolve_workspace_for_user_name(&user_name).await;
-        // Manager→Assistant fallback in personal workspaces (pool-clamped) and
-        // Assistant/Artist/Support pinning to the personal workspace, atomically.
-        let (role, ws) = crate::users::effective_role_and_workspace(role, ws, &user_name, &pool);
-
-        info!(
-            "Voice command -> {role} (user: {user_name}, workspace: {})",
-            ws.name
-        );
-
-        // Broadcast before routing so the transcript appears immediately
-        // while the agent is still working.
-        broadcast_voice_transcript(&text, &user_name, &ws.name).await;
-
-        crate::agent::message_router::route_user_message(
-            text,
-            ws.name,
-            user_name,
-            "voice".to_string(),
-            role,
-            None,
-        )
-        .await;
+        route_voice_to_role(text, &user_name, role, &pool, ws).await;
         return;
     }
 
     // No active user: fall back to the admin user's DB workspace (same
     // warning + personal fallback as the active-user path). Pool-gated
-    // like the active-user path: an emptied admin pool drops the command,
-    // and the routed role stays inside the pool — including the same
-    // personal-workspace Manager→Assistant clamp.
+    // like the active-user path: an emptied admin pool drops the command.
     let ws = crate::users::resolve_workspace_for_user_name("admin").await;
     let admin_pool = crate::users::role_pool("admin").await;
     if admin_pool.is_empty() {
@@ -1643,19 +1621,42 @@ async fn route_to_agent(text: String) {
     } else {
         admin_pool[0]
     };
-    // Assistant/Artist fall back to admin's personal workspace. The routed
-    // user_name is "admin" (the seeded admin identity) — an empty name would
-    // produce a broken `personal:` path and a malformed bare "_ws_role"
-    // session key, so the no-active-user fallback routes as the admin user.
-    let (role, ws) = crate::users::effective_role_and_workspace(role, ws, "admin", &admin_pool);
+    route_voice_to_role(text, "admin", role, &admin_pool, ws).await;
+}
 
-    info!("Voice command -> {role} (workspace: {})", ws.name);
-    broadcast_voice_transcript(&text, "admin", &ws.name).await;
+/// Shared tail of [`route_to_agent`]: clamp/pin the pool-selected role to
+/// its effective workspace, log, broadcast the transcript, and hand off to
+/// the message router.
+///
+/// Pool-gating applies to both callers: the routed role stays inside the
+/// pool — including the same personal-workspace Manager→Assistant clamp and
+/// Assistant/Artist/Support pinning to the personal workspace, atomically.
+///
+/// The routed user_name is the active user, or "admin" (the seeded admin
+/// identity) for the no-active-user fallback — an empty name would produce
+/// a broken `personal:` path and a malformed bare "_ws_role" session key.
+async fn route_voice_to_role(
+    text: String,
+    user_name: &str,
+    role: crate::Role,
+    pool: &[crate::Role],
+    ws: crate::Workspace,
+) {
+    let (role, ws) = crate::users::effective_role_and_workspace(role, ws, user_name, pool);
+
+    info!(
+        "Voice command -> {role} (user: {user_name}, workspace: {})",
+        ws.name
+    );
+
+    // Broadcast before routing so the transcript appears immediately
+    // while the agent is still working.
+    broadcast_voice_transcript(&text, user_name, &ws.name).await;
 
     crate::agent::message_router::route_user_message(
         text,
         ws.name,
-        "admin".to_string(),
+        user_name.to_string(),
         "voice".to_string(),
         role,
         None,
@@ -4340,10 +4341,10 @@ fn process_phase3_frames(
 ///
 /// Uses independent buffers (`phase3_audio_buf`, `phase3_silence_samples`)
 /// that are NOT shared with `negative_audio_buf` or `utterance_silence_samples`.
-/// Does NOT accumulate `frame_raw_audio` or `frame_vad` (dead code — only
-/// consumed by `segment_utterances_by_vad`).  Does NOT reset
-/// `enrollment_no_speech_frame_count` (no-speech warnings suppressed during
-/// Phase 3).
+/// Does NOT accumulate `frame_raw_audio` or `frame_vad` (Phase 3 never
+/// consumes them — they are only consumed by `segment_utterances_by_vad`
+/// during enrollment).  Does NOT reset `enrollment_no_speech_frame_count`
+/// (no-speech warnings suppressed during Phase 3).
 ///
 /// Uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] for chunk boundary detection —
 /// aligned to streaming's segment timeout, same constant
