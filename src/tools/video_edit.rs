@@ -674,9 +674,7 @@ impl Tool for VideoEditTool {
         let first_frame = super::get_opt_str(&args, "first_frame").filter(|s| !s.is_empty());
         let last_frame = super::get_opt_str(&args, "last_frame").filter(|s| !s.is_empty());
 
-        let user_name = crate::agent::CURRENT_TOOL_USER_NAME
-            .try_with(String::clone)
-            .unwrap_or_default();
+        let user_name = crate::agent::tool_user_name();
         let model = crate::users::resolve_video_model(&user_name).await;
         let spec = classify_model(&model);
 

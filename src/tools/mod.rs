@@ -417,12 +417,8 @@ impl SyncDurableCore {
         let caller_agent_id = crate::agent::CURRENT_TOOL_AGENT_ID
             .try_with(Clone::clone)
             .unwrap_or(None);
-        let user_name = crate::agent::CURRENT_TOOL_USER_NAME
-            .try_with(String::clone)
-            .unwrap_or_default();
-        let channel = crate::agent::CURRENT_TOOL_CHANNEL
-            .try_with(String::clone)
-            .unwrap_or_default();
+        let user_name = crate::agent::tool_user_name();
+        let channel = crate::agent::tool_channel();
         let conn = &crate::session::store().conn;
 
         // This dispatch never binds to prior jobs: if the model re-issues a call

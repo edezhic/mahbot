@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::Workspace;
-use crate::agent::{CURRENT_TOOL_AGENT_ID, CURRENT_TOOL_USER_NAME};
+use crate::agent::CURRENT_TOOL_AGENT_ID;
 use crate::alarms::{add_alarm, format_fire_time, list_alarms, remove_alarm};
 use crate::tools::Tool;
 
@@ -24,9 +24,7 @@ struct AssistantIdentity {
 /// Read the calling Assistant's identity from the tool task-locals, or bail if
 /// there is no user/agent context.
 fn identity() -> Result<AssistantIdentity> {
-    let user_name = CURRENT_TOOL_USER_NAME
-        .try_with(String::clone)
-        .unwrap_or_default();
+    let user_name = crate::agent::tool_user_name();
     let agent_id = CURRENT_TOOL_AGENT_ID
         .try_with(Option::clone)
         .ok()

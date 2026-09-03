@@ -137,12 +137,8 @@ impl Tool for AnalyzeTool {
             let ws = ws.clone();
             let analyze = analyze.to_string();
             let caller_role = self.caller_role;
-            let user_name = crate::agent::CURRENT_TOOL_USER_NAME
-                .try_with(String::clone)
-                .unwrap_or_default();
-            let channel = crate::agent::CURRENT_TOOL_CHANNEL
-                .try_with(String::clone)
-                .unwrap_or_default();
+            let user_name = crate::agent::tool_user_name();
+            let channel = crate::agent::tool_channel();
 
             tokio::spawn(async move {
                 // Catch panics so the caller ALWAYS receives an envelope — a

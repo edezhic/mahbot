@@ -34,12 +34,23 @@ pub(crate) mod skills;
 // - Falls back to `unwrap_or_default()` → empty string for background
 //   agents (management, maintainer, workspace) that have no user context.
 //
-// # Example (in a tool's execute method)
-// ```ignore
-// let user_name = CURRENT_TOOL_USER_NAME
-//     .try_with(|n| n.clone())
-//     .unwrap_or_default();
-// ```
+/// Synchronous read of [`CURRENT_TOOL_USER_NAME`]. See the task-local contract
+/// above: reads must happen before any `tokio::spawn` boundary if the value is
+/// needed across one.
+pub(crate) fn tool_user_name() -> String {
+    CURRENT_TOOL_USER_NAME
+        .try_with(String::clone)
+        .unwrap_or_default()
+}
+
+/// Synchronous read of [`CURRENT_TOOL_CHANNEL`]. Same contract as
+/// [`tool_user_name`].
+pub(crate) fn tool_channel() -> String {
+    CURRENT_TOOL_CHANNEL
+        .try_with(String::clone)
+        .unwrap_or_default()
+}
+
 tokio::task_local! {
     pub(crate) static CURRENT_TOOL_USER_NAME: String;
     pub(crate) static CURRENT_TOOL_CHANNEL: String;
@@ -2978,16 +2989,8 @@ mod tests {
                 _ws: &crate::Workspace,
                 _args: serde_json::Value,
             ) -> anyhow::Result<String> {
-                // Read task-locals synchronously (no async boundary) — the
-                // contract is: the Agent work loop sets these once per tool
-                // batch, and tools must read them before any tokio::spawn
-                // if crossing an async boundary.
-                let user_name = CURRENT_TOOL_USER_NAME
-                    .try_with(String::clone)
-                    .unwrap_or_default();
-                let channel = CURRENT_TOOL_CHANNEL
-                    .try_with(String::clone)
-                    .unwrap_or_default();
+                let user_name = tool_user_name();
+                let channel = tool_channel();
                 Ok(format!("user={user_name},channel={channel}"))
             }
         }
