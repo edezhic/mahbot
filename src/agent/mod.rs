@@ -1481,6 +1481,9 @@ impl Agent {
         // produced a new response, so a transport failure never duplicates
         // the previous thinking.
         let mut tail: Vec<ChatMessage> = vec![
+            // The payload always carries a string "content" key, so it decodes
+            // to Some("") and serializes via the Some arm — never the
+            // omitted-content shape (the serializer backstop covers any drift).
             ChatMessage::assistant(
                 assistant_replay_payload(None, &[], first.reasoning.as_ref()).to_string(),
             ),

@@ -30,7 +30,9 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 /// - Provider/transport/truncation failure → retry byte-identical.
 /// - Tool call, unparseable text, or validation failure (`validate` rejects)
 ///   → treat as parse failure: push raw text + `extraction/retry.md` re-prompt
-///   (the ONLY permitted request mutation — extends the cached prefix).
+///   (the ONLY permitted request mutation — extends the cached prefix). An
+///   empty last_raw pushes the `extraction/retry_no_output.md` marker instead
+///   (a non-empty assistant turn is required to re-prompt).
 /// - Valid JSON matching `T` and passing `validate` → return immediately.
 ///
 /// `validate` (typically a score ∈ [0,10] check for [`crate::Verdict`]) runs
@@ -128,8 +130,12 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 // needed when another attempt will actually run — the final
                 // attempt's re-prompt is never sent.
                 if attempt < policy.max_attempts {
-                    extraction_history
-                        .push(ChatMessage::assistant(last_raw.clone().unwrap_or_default()));
+                    // An empty assistant turn gives the model nothing to
+                    // correct — replay a non-empty marker instead.
+                    let prev = last_raw.clone().filter(|text| !text.trim().is_empty());
+                    extraction_history.push(ChatMessage::assistant(
+                        prev.unwrap_or_else(|| load_prompt("extraction/retry_no_output.md")),
+                    ));
                     extraction_history.push(ChatMessage::user(retry_prompt.as_str()));
                 }
             }
@@ -392,6 +398,59 @@ mod tests {
         assert_ne!(
             fingerprints[1], fingerprints[2],
             "parse-failure re-prompt must extend the request"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn json_reply_reprompts_with_non_empty_assistant_turn() {
+        let _guard = retry_tests_lock();
+        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+        // JSON-shaped but unparseable for the score → parse failure → re-prompt.
+        let fake = Arc::new(
+            FakeProvider::new()
+                .ok(r#"{"verdict": "bad"}"#)
+                .ok(r#"{"score": 4}"#),
+        );
+        let result = extract_with(fake.clone()).await;
+        assert_eq!(result.expect("recovers").score, 4);
+
+        // The JSON-shaped reply is pushed verbatim as the re-prompt assistant
+        // turn (the production trigger). This seam verifies ChatMessages; the
+        // wire form is pinned by the decode-gate and serializer tests.
+        let messages = fake.request_messages.lock().unwrap().clone();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].contains("Assistant"), "{}", messages[1]);
+        assert!(
+            messages[1].contains(r#"{\"verdict\": \"bad\"}"#),
+            "{}",
+            messages[1]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams across the whole test
+    async fn empty_last_raw_reprompts_with_marker_not_empty_turn() {
+        let _guard = retry_tests_lock();
+        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+        // Tool-call-style response with no text → Some("") last_raw → parse failure.
+        let fake = Arc::new(FakeProvider::new().ok("").ok(r#"{"score": 7}"#));
+        let result = extract_with(fake.clone()).await;
+        assert_eq!(result.expect("recovers").score, 7);
+
+        // An empty assistant turn is replaced by the non-empty marker, so the
+        // second request re-prompts with real content, not an empty frame.
+        let messages = fake.request_messages.lock().unwrap().clone();
+        assert_eq!(messages.len(), 2);
+        let marker = crate::prompt::load_prompt("extraction/retry_no_output.md");
+        assert!(messages[1].contains("Assistant"), "{}", messages[1]);
+        assert!(messages[1].contains(marker.as_str()), "{}", messages[1]);
+        assert!(
+            !messages[1].contains("content: \"\""),
+            "empty assistant turn must not be replayed: {}",
+            messages[1]
         );
     }
 

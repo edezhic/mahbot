@@ -1986,6 +1986,70 @@ mod tests {
         assert_eq!(window.len(), 2);
     }
 
+    #[test]
+    fn decode_native_history_message_gates_on_native_shape() {
+        // Bare-JSON answer carries neither key → stays plain text (None).
+        assert!(
+            decode_native_history_message(&ChatMessage::assistant(r#"{"verdict": "bad"}"#))
+                .is_none()
+        );
+        // Reasoning-only keyless JSON is not a frame — no producer emits it.
+        assert!(
+            decode_native_history_message(&ChatMessage::assistant(
+                r#"{"reasoning_content": "think"}"#
+            ))
+            .is_none()
+        );
+
+        // Native frames carry a "content" key (even null) — decode to Assistant.
+        let decoded =
+            decode_native_history_message(&ChatMessage::assistant(r#"{"content": null}"#));
+        assert!(matches!(
+            decoded,
+            Some(DecodedNativeHistoryMessage::Assistant { content: None, .. })
+        ));
+        let decoded =
+            decode_native_history_message(&ChatMessage::assistant(r#"{"content": "hi"}"#));
+        assert!(matches!(
+            decoded,
+            Some(DecodedNativeHistoryMessage::Assistant {
+                content: Some(_),
+                ..
+            })
+        ));
+
+        // Tool-call frame built by the producer decodes to Assistant with calls.
+        let tc = ToolCall {
+            id: "t1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let frame = crate::providers::reasoning::assistant_replay_payload(
+            Some(""),
+            std::slice::from_ref(&tc),
+            None,
+        )
+        .to_string();
+        let decoded = decode_native_history_message(&ChatMessage::assistant(frame));
+        assert!(matches!(
+            decoded,
+            Some(DecodedNativeHistoryMessage::Assistant {
+                tool_calls: Some(_),
+                ..
+            })
+        ));
+
+        // Tool-result payloads decode to ToolResult.
+        let decoded = decode_native_history_message(&ChatMessage::tool_result("t1", "r"));
+        assert!(matches!(
+            decoded,
+            Some(DecodedNativeHistoryMessage::ToolResult {
+                tool_call_id,
+                content
+            }) if tool_call_id == "t1" && content == "r"
+        ));
+    }
+
     #[tokio::test]
     async fn finalize_appends_only_new_assistant_answer() {
         crate::util::test::init_test_stores().await;
@@ -2375,6 +2439,9 @@ pub(crate) fn decode_native_history_message(
 
     if message.role == ChatRole::Assistant
         && let Some(value) = parsed.as_ref()
+        // Native-frame gate: producers always emit a "content" or "tool_calls"
+        // key; bare JSON answers carry neither and stay plain text.
+        && (value.get("content").is_some() || value.get("tool_calls").is_some())
     {
         let content = value
             .get("content")

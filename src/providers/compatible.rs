@@ -568,8 +568,13 @@ impl OpenAiCompatibleProvider {
                 let content = match (&content, has_reasoning, has_tool_calls) {
                     (Some(s), _, _) => Some(MessageContent::Text(s.clone())),
                     (None, true, true) => Some(MessageContent::Null),
-                    (None, true, false) => Some(MessageContent::Text(String::new())),
-                    (None, false, _) => None,
+                    // Backstop: a tool-call-less assistant turn must always
+                    // carry string content — an omitted field 400s on some
+                    // providers.
+                    (None, _, false) => Some(MessageContent::Text(String::new())),
+                    // Tool-call frames keep today's wire shape (null with
+                    // reasoning, omitted without).
+                    (None, false, true) => None,
                 };
                 NativeMessage {
                     role,
@@ -2398,5 +2403,55 @@ mod tests {
             let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
             check(&native, name);
         }
+    }
+
+    #[test]
+    fn convert_messages_for_native_assistant_content_backstop() {
+        let wire = |history_json: serde_json::Value| {
+            let messages = vec![ChatMessage::assistant(history_json.to_string())];
+            let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+            serde_json::to_value(&native[0]).unwrap()
+        };
+
+        // Pure backstop shape: native frame with content None, no tool_calls,
+        // no reasoning — serializes with string content "" (never null/omitted).
+        let value = wire(serde_json::json!({"content": null}));
+        assert_eq!(value["content"], serde_json::json!(""));
+        assert!(value.get("tool_calls").is_none());
+
+        // Tool-call frame with reasoning: content null + tool_calls present.
+        let value = wire(serde_json::json!({
+            "content": null,
+            "tool_calls": [{"id": "tc_1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"}],
+            "reasoning_content": "think",
+        }));
+        assert_eq!(value["content"], serde_json::Value::Null, "{value}");
+        assert!(value.get("tool_calls").is_some());
+
+        // Tool-call frame without reasoning: content omitted + tool_calls present.
+        let value = wire(serde_json::json!({
+            "content": null,
+            "tool_calls": [{"id": "tc_1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"}],
+        }));
+        assert!(value.get("content").is_none(), "{value}");
+        assert!(value.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn convert_messages_for_native_preserves_bare_json_reply() {
+        let messages = vec![ChatMessage::assistant(
+            serde_json::json!({"verdict": "bad"}).to_string(),
+        )];
+        let native = OpenAiCompatibleProvider::convert_messages_for_native(&messages);
+        let value = serde_json::to_value(&native[0]).unwrap();
+
+        // The decode gate keeps a bare-JSON answer plain text, so the raw JSON
+        // text survives on the wire as string content (no blanking, no 400
+        // shape).
+        assert_eq!(
+            value["content"],
+            serde_json::json!({"verdict": "bad"}).to_string()
+        );
+        assert!(value.get("tool_calls").is_none());
     }
 }
