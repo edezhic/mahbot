@@ -257,9 +257,9 @@ async fn run_workspace_diagnostics(
         None,
     )
     .await;
-    let Some(_response) = response else {
+    if response.is_none() {
         return Err(discovery_no_response_error(&agent, "Diagnostics discovery"));
-    };
+    }
 
     // Keep the Agent alive after run_default_agent() for extract_verdict —
     // it needs agent.session.history() and agent.tool_specs.
@@ -739,17 +739,14 @@ async fn spawn_panic_guarded(
     future: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
     let inner = tokio::spawn(future);
-    match inner.await {
-        Ok(()) => {}
-        Err(e) => {
-            let kind = if e.is_panic() { "panic" } else { "cancelled" };
-            tracing::error!(
-                workspace_name = %ws_name,
-                kind = kind,
-                error = %e,
-                "{task} task failed",
-            );
-        }
+    if let Err(e) = inner.await {
+        let kind = if e.is_panic() { "panic" } else { "cancelled" };
+        tracing::error!(
+            workspace_name = %ws_name,
+            kind = kind,
+            error = %e,
+            "{task} task failed",
+        );
     }
 }
 
@@ -771,11 +768,8 @@ pub fn spawn_workspace_discovery(
     let ws = ws.clone();
     tokio::spawn(async move {
         let ws_name = ws.name.clone();
-        let ws_path = ws.path.clone();
-
-        let ws_name_for_finalize = ws_name.clone();
-        let ws_name_for_inner = ws_name.clone();
-        let ws_path_for_finalize = ws_path.clone();
+        let inner_ws_name = ws_name.clone();
+        let inner_ws_path = ws.path.clone();
         let inner = async move {
             // Build role discovery futures (always needed). The general
             // (non-role) project overview discovery runs alongside them.
@@ -795,7 +789,7 @@ pub fn spawn_workspace_discovery(
                 // discovery is bumped by rediscover).
                 let diag_gen = match WORKSPACES.get() {
                     Some(s) => s
-                        .get_generation(&ws_name_for_inner, GenerationColumn::DIAGNOSTICS)
+                        .get_generation(&inner_ws_name, GenerationColumn::DIAGNOSTICS)
                         .await
                         .unwrap_or(0),
                     None => 0,
@@ -839,8 +833,8 @@ pub fn spawn_workspace_discovery(
 
             finalize_discovery(
                 storage,
-                &ws_name_for_finalize,
-                &ws_path_for_finalize,
+                &inner_ws_name,
+                &inner_ws_path,
                 discovery_generation,
                 outcome,
                 &errors,
@@ -889,7 +883,6 @@ pub fn spawn_diagnostics_discovery(ws: &Workspace, diagnostics_generation: i64) 
 /// Rules:
 /// - ASCII letters (a-z, A-Z) and underscores only
 /// - Must start with a letter — no leading underscore
-/// - At least one letter — not underscores-only
 /// - Maximum 40 characters
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -903,9 +896,6 @@ fn validate_name(name: &str) -> Result<()> {
     }
     if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
         anyhow::bail!("Workspace name must start with a letter");
-    }
-    if !name.chars().any(|c| c.is_ascii_alphabetic()) {
-        anyhow::bail!("Workspace name must contain at least one letter");
     }
     Ok(())
 }
@@ -1293,10 +1283,7 @@ impl WorkspaceStore {
             )
             .await?
             .flatten();
-        match json {
-            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
-            None => Ok(None),
-        }
+        Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
     }
 
     /// Set freeform user-curated context notes for a workspace.
@@ -1733,7 +1720,6 @@ pub async fn run_nightly_check_loop() {
             break;
         }
 
-        // Only proceed during the 2:00–3:00 AM local time window.
         if !is_nightly_check_hour(chrono::Local::now().hour()) {
             continue;
         }
@@ -1787,7 +1773,6 @@ pub async fn run_nightly_check_loop() {
 
             let repo_path = std::path::Path::new(&ws.path);
 
-            // Run git rev-parse HEAD to get the current commit.
             let current_hash = match crate::git::commands::run_git_head(repo_path).await {
                 Ok(hash) => hash,
                 Err(e) => {
@@ -1801,7 +1786,6 @@ pub async fn run_nightly_check_loop() {
                 }
             };
 
-            // Compare with the stored hash.
             let should_rediscover =
                 has_new_commits(ws.last_analyzed_commit.as_deref(), &current_hash);
 
