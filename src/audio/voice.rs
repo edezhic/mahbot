@@ -3184,10 +3184,6 @@ pub async fn run_voice_pipeline() {
     // hang forever) and skip auto-start.
     let transcription_disabled = is_transcription_disabled();
     if transcription_disabled {
-        warn!(
-            "Voice assistant: local transcription disabled — wake word is disabled too \
-             (shared ASR model required)"
-        );
         set_status(VoiceStatus::Disabled);
     } else {
         set_status(resolved_model_status(
