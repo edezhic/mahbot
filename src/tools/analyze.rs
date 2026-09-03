@@ -15,14 +15,13 @@
 //! of fresh analysts, appended as a `## Verification` section. Fail-open is
 //! preserved throughout: findings are never silently lost.
 
-use crate::agent::message_router::{self, AgentJob, MessageKind};
+use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::agent::{run_agent, run_default_agent};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::Tool;
 use crate::{Agent, ChatMessage, DEFAULT_MAX_TOKENS, Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
-use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt::Write as _;
@@ -129,76 +128,42 @@ impl Tool for AnalyzeTool {
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let analyze = super::get_str(&args, "analyze")?;
 
-        // Async dispatch path — delegate to analysts in background.
-        // Read user context from task-locals (set once per tool batch by
-        // the Agent work loop) so the queued result carries the correct
-        // user identity for per-user delivery.
+        // Async dispatch path — delegate to analysts in background. Read user
+        // context from task-locals (set once per tool batch by the Agent work
+        // loop) so the queued result carries the correct user identity for
+        // per-user delivery. Spawn/catch-unwind/route semantics live in
+        // `spawn_dispatch_and_route`.
         if self.dispatch_mode.is_async() {
             let ws = ws.clone();
             let analyze = analyze.to_string();
             let caller_role = self.caller_role;
             let user_name = crate::agent::tool_user_name();
             let channel = crate::agent::tool_channel();
+            let ws_name = ws.name.clone();
+            let dispatch_user_name = user_name.clone();
+            let dispatch_channel = channel.clone();
 
-            tokio::spawn(async move {
-                // Catch panics so the caller ALWAYS receives an envelope — a
-                // panic in the dispatch task would otherwise leave the Manager
-                // waiting forever on a result that can never arrive.
-                let round = std::panic::AssertUnwindSafe(async {
+            super::spawn_dispatch_and_route(
+                async move {
                     dispatch_durable_analyze(
                         &ws,
                         &analyze,
                         caller_role,
-                        user_name.clone(),
-                        channel.clone(),
+                        dispatch_user_name,
+                        dispatch_channel,
                     )
                     .await
-                })
-                .catch_unwind()
-                .await;
-                // The dispatch builds the envelope (with pending_job_id set by
-                // the completion tx) — route it as-is so the persisted copy and
-                // the routed copy can never drift. Only the panic path rebuilds
-                // here.
-                let envelope = match round {
-                    Ok(Some(envelope)) => envelope,
-                    Ok(None) => {
-                        // Drain-cut: job stays status='launched' for boot resume —
-                        // route NOTHING now (a spurious error envelope during
-                        // the drain would discard the checkpointed outcomes;
-                        // the result envelope is delivered after boot resume).
-                        return;
-                    }
-                    Err(panic) => {
-                        let panic = crate::util::panic_message(&*panic);
-                        tracing::error!(panic = %panic, "analyze round dispatch panicked");
-                        AgentJob {
-                            content: build_async_analyze_message(&Err(anyhow::anyhow!(
-                                "analyze round dispatch panicked: {panic}"
-                            ))),
-                            workspace_name: ws.name.clone(),
-                            user_name,
-                            channel,
-                            kind: MessageKind::AnalyzeToolResult,
-                            role: caller_role,
-                            reply_target: None,
-                            pending_job_id: None,
-                        }
-                    }
-                };
-
-                // Drain/shutdown fired between the dispatch and the route: the
-                // pending row (if any) survives for boot replay — skip routing
-                // rather than deliver into a consumer that has stopped pulling.
-                // (If the pending INSERT had failed, this also suppresses the
-                // insert-failure policy's best-effort route — the surviving
-                // launched job row is resumed at the next boot, so the result
-                // is deferred, never lost.)
-                if crate::shutdown::aborting() {
-                    return;
-                }
-                message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
-            });
+                },
+                super::AsyncDispatchParams {
+                    workspace_name: ws_name,
+                    caller_role,
+                    user_name,
+                    channel,
+                    kind: MessageKind::AnalyzeToolResult,
+                    tag: "analyze",
+                    build_message: build_async_analyze_message,
+                },
+            );
 
             return Ok("Sub-agent dispatched. Results will follow shortly.".to_string());
         }

@@ -178,7 +178,9 @@ pub(crate) use video_edit::VideoEditTool;
 pub(crate) use video_gen::VideoGenTool;
 pub(crate) use web_search::{WebSearchBackend, WebSearchTool};
 
+use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::{Tool, Workspace};
+use futures_util::FutureExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -529,6 +531,96 @@ impl SyncDurableCore {
             Err(e) => Err(e),
         }
     }
+}
+
+// ── Async dispatch scaffold (analyze/implement) ──────────────────────────
+
+/// Knobs that pair the panic-path envelope with the success-path envelope of
+/// an async analyze/implement dispatch. Bundled as a struct so the call site
+/// cannot silently mismatch a kind with its tag or builder.
+pub(crate) struct AsyncDispatchParams {
+    pub workspace_name: String,
+    pub caller_role: crate::Role,
+    pub user_name: String,
+    pub channel: String,
+    pub kind: MessageKind,
+    /// Panic-site label ("analyze" / "implement") used in the error log line
+    /// and the panic-path error text.
+    pub tag: &'static str,
+    /// Panic-path envelope-content builder — the same named wrapper that
+    /// builds the success-path envelope inside the dispatch future.
+    pub build_message: fn(&anyhow::Result<String>) -> String,
+}
+
+/// Shared async-dispatch scaffold of [`crate::tools::analyze::AnalyzeTool`]
+/// and [`crate::tools::implement::ImplementTool`]: spawn a durable dispatch,
+/// catch its panics, and route the resulting envelope to the caller's agent
+/// channel.
+///
+/// The dispatch future is constructed BY THE CALL SITE (its owned clones of
+/// the workspace + task are passed by reference to the module-private
+/// `dispatch_durable_*` fns, whose borrowing signatures must not change) and
+/// yields the fully-built `AgentJob` envelope. Semantics, in order:
+///
+/// 1. `tokio::spawn` + `catch_unwind` so a panic in the dispatch task can
+///    never leave the caller waiting forever on a result that can never
+///    arrive — the panic path rebuilds an error envelope here.
+/// 2. The dispatch builds the success envelope itself (with pending_job_id
+///    set by the completion tx) — route it as-is so the persisted copy and
+///    the routed copy can never drift.
+/// 3. `Ok(None)` = drain-cut: the job stays status='launched' for boot
+///    resume — route NOTHING now (a spurious error envelope during the drain
+///    would discard the checkpointed outcome; the result envelope is
+///    delivered after boot resume). This silent return is deliberately
+///    BEFORE the aborting() guard.
+/// 4. `crate::shutdown::aborting()` guard: drain/shutdown fired between the
+///    dispatch and the route — the pending row (if any) survives for boot
+///    replay; skip routing rather than deliver into a consumer that has
+///    stopped pulling. (If the pending INSERT had failed, this also
+///    suppresses the insert-failure policy's best-effort route — the
+///    surviving launched job row is resumed at the next boot, so the result
+///    is deferred, never lost.)
+/// 5. `crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope)`.
+///
+/// Note: src/tools/research.rs deliberately does NOT share this scaffold —
+/// its Ok(None) also covers manual cancel, it logs "ended without delivery",
+/// and it omits the pre-route aborting() guard (at-least-once rationale).
+pub(crate) fn spawn_dispatch_and_route(
+    dispatch: impl std::future::Future<Output = Option<AgentJob>> + Send + 'static,
+    params: AsyncDispatchParams,
+) {
+    tokio::spawn(async move {
+        let round = std::panic::AssertUnwindSafe(dispatch).catch_unwind().await;
+        let envelope = match round {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                // Drain-cut (see fn docs): silently route nothing.
+                return;
+            }
+            Err(panic) => {
+                let panic = crate::util::panic_message(&*panic);
+                let tag = params.tag;
+                tracing::error!(panic = %panic, "{tag} round dispatch panicked");
+                AgentJob {
+                    content: (params.build_message)(&Err(anyhow::anyhow!(
+                        "{tag} round dispatch panicked: {panic}"
+                    ))),
+                    workspace_name: params.workspace_name,
+                    user_name: params.user_name,
+                    channel: params.channel,
+                    kind: params.kind,
+                    role: params.caller_role,
+                    reply_target: None,
+                    pending_job_id: None,
+                }
+            }
+        };
+
+        if crate::shutdown::aborting() {
+            return;
+        }
+        crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+    });
 }
 
 /// Outcome for a tool execution.
