@@ -989,10 +989,7 @@ impl ShellTool {
                 let stderr = decode_and_strip_ansi(&stderr);
 
                 let exit_code = status.code(); // Option<i32> — None means signal
-                let exit_note = match exit_code {
-                    Some(c) => format!("[exit status: {c}]"),
-                    None => "[exit status: terminated by signal]".to_string(),
-                };
+                let exit_note = format_exit_status_note(exit_code);
 
                 // All completed commands return output with exit info,
                 // regardless of exit code. Only actual execution failures
@@ -1258,22 +1255,23 @@ impl Tool for ShellTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let timeout_secs = json!({
+            "type": "integer",
+            "description": "Optional custom timeout in seconds (default: 600, max: 3600). Use this for long-running commands that need more than the default 10-minute timeout.",
+            "minimum": 1,
+            "maximum": 3600
+        });
         match self.mode {
             // ReadOnly: byte-identical to the pre-background literal. The
-            // background capability is Full-only; the ReadOnly schema and
-            // description must not drift.
+            // background capability is Full-only; the shared `timeout_secs`
+            // binding below keeps the two schemas from drifting.
             ShellMode::ReadOnly => super::tool_params_schema(
                 &json!({
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute"
                     },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Optional custom timeout in seconds (default: 600, max: 3600). Use this for long-running commands that need more than the default 10-minute timeout.",
-                        "minimum": 1,
-                        "maximum": 3600
-                    },
+                    "timeout_secs": timeout_secs,
                 }),
                 &["command"],
             ),
@@ -1290,12 +1288,7 @@ impl Tool for ShellTool {
                         "type": "string",
                         "description": "The shell command to execute. Required for normal and background runs; not needed (and ignored) when `stop` is set."
                     },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Optional custom timeout in seconds (default: 600, max: 3600). Use this for long-running commands that need more than the default 10-minute timeout.",
-                        "minimum": 1,
-                        "maximum": 3600
-                    },
+                    "timeout_secs": timeout_secs,
                     "background": {
                         "type": "boolean",
                         "description": "When true, run the command in the background: it keeps running after this tool call returns and its raw output is written to a file in the temp area whose path is returned. Read that file with the read tool; when the command exits, the line `[exit status: N]` is appended to its end (including exit 0). `timeout_secs` is ignored in background mode. Default: false.",
@@ -2503,6 +2496,17 @@ fn apply_profile_pipeline(
 fn decode_and_strip_ansi(data: &[u8]) -> String {
     let decoded = String::from_utf8_lossy(data);
     strip_ansi_escapes(&decoded)
+}
+
+/// Format the tool-facing exit-status note: `[exit status: N]`, or
+/// `[exit status: terminated by signal]` when the process was killed by a
+/// signal (exit code `None`). Shared by the foreground and background paths
+/// so the two renderings cannot drift.
+pub(super) fn format_exit_status_note(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(c) => format!("[exit status: {c}]"),
+        None => "[exit status: terminated by signal]".to_string(),
+    }
 }
 
 /// Decode raw shell output bytes (lossy UTF-8), strip ANSI escape sequences,

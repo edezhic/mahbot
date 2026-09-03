@@ -594,13 +594,10 @@ async fn probe_command(
 }
 
 /// Append the unconditional exit-status annotation to the output file —
-/// the only completion signal for background sessions. Matches the
-/// foreground format: `[exit status: N]` / `[exit status: terminated by signal]`.
+/// the only completion signal for background sessions. Uses the shared
+/// foreground format from [`format_exit_status_note`].
 fn append_exit_annotation(output_path: &Path, status: std::process::ExitStatus) {
-    let note = match status.code() {
-        Some(c) => format!("[exit status: {c}]"),
-        None => "[exit status: terminated by signal]".to_string(),
-    };
+    let note = super::format_exit_status_note(status.code());
     match OpenOptions::new().append(true).open(output_path) {
         Ok(mut f) => {
             use std::io::Write;
