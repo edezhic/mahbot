@@ -1078,30 +1078,27 @@ impl Dashboard {
                 let Some(run_key) = self.pending_research_cancel.take() else {
                     return Task::none();
                 };
-                // The cancel is async: fire the run's signal, stop the run's
-                // agents, remove the durable rows, release the folder and
-                // archive. Silent to the Manager/caller — only the GUI gets a
-                // toast.
+                // The cancel is async: fire the run's signal and stop the run's
+                // agents. Silent to the Manager/caller — only the GUI gets a
+                // toast. The cancelled-run handoff (or a no-orchestrator sweep)
+                // owns the cleanup dispatch and folder release.
                 Task::perform(
                     async move { crate::research_cancel::cancel_research_run(&run_key).await },
-                    |result| {
-                        Message::RunningAgents(running::RunningMessage::CancelFinished(result))
-                    },
+                    |()| Message::RunningAgents(running::RunningMessage::CancelFinished),
                 )
             }
             running::RunningMessage::CancelDismissed => {
                 self.pending_research_cancel = None;
                 Task::none()
             }
-            running::RunningMessage::CancelFinished(result) => {
-                let toast = match result {
-                    Ok(()) => ToastMessage::SuccessMsg(
-                        "Research run cancelled — agents stopped, run removed permanently."
-                            .to_string(),
-                    ),
-                    Err(e) => ToastMessage::Error(format!("research cancel failed: {e}")),
-                };
-                self.push_toast_msg(&toast)
+            running::RunningMessage::CancelFinished => {
+                // cancel_research_run is infallible — the handoff (or the
+                // no-orchestrator sweep) always makes progress.
+                self.push_toast_msg(&ToastMessage::SuccessMsg(
+                    "Research run cancelled — agents stopped; the run's temporary \
+                     traces are being removed."
+                        .to_string(),
+                ))
             }
             running::RunningMessage::ToggleAgentExpanded {
                 agent_id,

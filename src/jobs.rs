@@ -362,6 +362,42 @@ pub(crate) async fn spawn_job(
     child: &SpawnChild,
     caller_agent_id: Option<&str>,
 ) -> Result<()> {
+    let tx = conn.begin_tx().await?;
+    insert_job_tx(
+        &tx,
+        id,
+        task,
+        workspace_name,
+        user_name,
+        channel,
+        role,
+        agents,
+        child,
+        caller_agent_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The jobs-row INSERT + agent-roster loop + child-row match, run inside a
+/// live transaction (`tx`). Extracted from [`spawn_job`] so callers that
+/// already hold a handoff transaction (e.g. `transition_research_to_cleanup`)
+/// can reuse the exact same row model. Does NOT commit — the caller owns the
+/// transaction.
+#[expect(clippy::too_many_arguments)]
+async fn insert_job_tx(
+    tx: &TxGuard<'_>,
+    id: &str,
+    task: &str,
+    workspace_name: &str,
+    user_name: &str,
+    channel: &str,
+    role: Role,
+    agents: &[NewAgent],
+    child: &SpawnChild,
+    caller_agent_id: Option<&str>,
+) -> Result<()> {
     let kind = child.kind_str();
     let ticket_id = child_ticket_id(child);
     // The mode is derived from the caller pin (sync ⇔ pin present). A sync
@@ -373,7 +409,6 @@ pub(crate) async fn spawn_job(
         JobMode::Async
     };
     let now = db::now();
-    let tx = conn.begin_tx().await?;
     tx.execute(
         "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
          ticket_id, retry_count, created_at, updated_at, caller_agent_id, mode) \
@@ -420,7 +455,6 @@ pub(crate) async fn spawn_job(
             .with_context(|| format!("failed to insert research_jobs row for job {id}"))?;
         }
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -589,14 +623,75 @@ pub(crate) async fn abandon_session_jobs(caller_agent_id: &str) -> Result<usize>
     Ok(deleted as usize)
 }
 
-/// Cancel + sweep the workspace's research/research_cleanup runs before its
-/// workspace-row deletion: fires each run's cancel signal, cancels its agents,
-/// removes the pending_jobs envelope, deletes the jobs row (roster/child
-/// cascade) and releases the run folder + results archive. Returns the swept
-/// run count. Fail-closed callers abort the workspace deletion when this
-/// fails. The remaining job rows (ticket phases, sync jobs) are deleted by
-/// the CALLER's workspace-row transaction, so the jobs/workspace deletion
-/// commits atomically.
+/// Atomic cancel-handoff row transition for a research run being cancelled:
+/// DELETE the research job row (and its pending envelope) and INSERT the
+/// `research_cleanup` job row reusing id == run_id — all in ONE tx. This is
+/// the crash-safe handoff: the folder can never be orphaned with no cleanup
+/// row, because after the tx a `research_cleanup` row exists for the run and
+/// boot resume picks cleanup up even if the process dies right after. The
+/// reverse order (insert before delete) is impossible — `jobs.id` is a PK, so
+/// the cleanup row cannot be inserted while the research row with the same id
+/// still exists — which is why delete-then-insert inside one tx is the atomic
+/// unit. The cleanup row's existence is the folder-hold + boot-resume marker.
+///
+/// No `research_jobs` child row is created (the child row is research-only; the
+/// cleanup prompt lives in `jobs.task`, exactly like a fresh cleanup dispatch).
+pub(crate) async fn transition_research_to_cleanup(
+    conn: &Connection,
+    run_id: &str,
+    cleanup_task: &str,
+    workspace_name: &str,
+) -> Result<()> {
+    let tx = conn.begin_tx().await?;
+    tx.execute("DELETE FROM pending_jobs WHERE id = ?1", params![run_id])
+        .await
+        .with_context(|| format!("failed to delete pending envelope for run {run_id}"))?;
+    tx.execute("DELETE FROM jobs WHERE id = ?1", params![run_id])
+        .await
+        .with_context(|| format!("failed to delete research job row for run {run_id}"))?;
+    insert_job_tx(
+        &tx,
+        run_id,
+        cleanup_task,
+        workspace_name,
+        "",
+        "",
+        Role::Sanitation,
+        &[NewAgent {
+            agent_id: crate::research_cleanup::cleanup_agent_id(run_id),
+            kind: AgentKind::Sanitation,
+            idx: None,
+            task: cleanup_task.to_string(),
+        }],
+        &SpawnChild::ResearchCleanup,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Cancel the workspace's research/research_cleanup runs before its
+/// workspace-row deletion: fires each run's cancel signal and cancels its
+/// agents, then performs the cancelled-run cleanup handoff. A run with NO live
+/// orchestrator is swept directly by [`crate::research_cancel::cancel_research_run`]
+/// (dump-guarded folder release); a live orchestrator performs its own
+/// cancelled-exit handoff (cleanup agent then folder release) after this
+/// returns. Returns the cancelled-run count — every run whose cancel was fired,
+/// whether swept directly (no live orchestrator) or handed off to a live
+/// orchestrator's cancelled-exit handoff. The remaining job rows (ticket
+/// phases, sync jobs) are deleted by the CALLER's workspace-row transaction,
+/// so the jobs/workspace deletion commits atomically.
+///
+/// Known race: for a registered (live-orchestrator) run the handoff runs
+/// asynchronously AFTER this function returns, while the caller deletes the
+/// workspace row. The cleanup agent then runs against the orchestrator's
+/// in-memory [`Workspace`] handle — it never re-resolves the workspace row — so
+/// the folder is still released by the cleanup tail; the end state is correct.
+/// The caller's blanket job/workspace DELETE and the handoff's
+/// `research_cleanup` row creation are not in one tx, but nothing durable is
+/// orphaned: the row created by the handoff is inserted after the caller's
+/// DELETE and survives until the cleanup tail terminalizes it.
 pub(crate) async fn abandon_workspace_research_runs(workspace_name: &str) -> Result<usize> {
     let conn = &crate::session::store().conn;
     let research_rows = conn
@@ -606,22 +701,13 @@ pub(crate) async fn abandon_workspace_research_runs(workspace_name: &str) -> Res
         )
         .await
         .context("list research jobs for workspace abandon")?;
-    let mut swept = 0usize;
+    let mut cancelled = 0usize;
     for row in &research_rows {
         let id: String = row.get(0)?;
-        // A failed cancel leaves the jobs row for the caller's blanket DELETE,
-        // so it is counted exactly once either way. The sweep's other durable
-        // traces are compensated directly (envelope + folder + archive) — the
-        // blanket DELETE would otherwise remove the row while they leak.
-        match crate::research_cancel::cancel_research_run(&id).await {
-            Ok(()) => swept += 1,
-            Err(e) => {
-                warn!(run = %id, error = %e, "research run cancel failed during workspace abandon — compensating directly");
-                crate::research_cancel::compensate_failed_cancel(&id).await;
-            }
-        }
+        crate::research_cancel::cancel_research_run(&id).await;
+        cancelled += 1;
     }
-    Ok(swept)
+    Ok(cancelled)
 }
 
 // ── Sync caller-owned resume primitives ────────────────────────────────
@@ -1563,9 +1649,10 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
             resumed_other += 1;
         } else if job.kind == "research_cleanup" {
             // A research-run cleanup Sanitation agent interrupted by a
-            // crash. Resume it like any other durable job. Any path that
-            // removes a research_cleanup row must release the run folder in
-            // the same operation.
+            // crash. Resume it like any other durable job. The folder stays
+            // held until the resumed tail releases it; a row removed by the
+            // dump-guarded cancel sweep deliberately leaves a dump-holding
+            // folder for the cleanup tail / OS sweep.
             if workspace_unresolvable(job).await {
                 continue;
             }
@@ -1866,6 +1953,51 @@ mod tests {
             status_retry(conn, "null_analyze").await,
             ("launched".to_string(), 1),
             "the async analyze is check-pointed (retry_count bumped)"
+        );
+    }
+
+    /// Binding 3 on the boot scan: a `research_cleanup` row whose workspace is
+    /// unresolvable (a bogus non-personal name with no `workspaces` row —
+    /// `resolve_workspace` returns `Ok(None)`) is SKIPPED in place, not
+    /// resumed: it stays `launched` with `retry_count` 0 (no checkpoint bump),
+    /// and it is absent from the resumable list.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn boot_scan_leaves_unresolvable_workspace_cleanup_row_in_place() {
+        let _guard = crate::util::test::retry_tests_lock();
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let job_id = "cleanup_missing_ws_1";
+        let ws_name = "ws_boot_scan_missing_1";
+        // NOT personal-prefixed, no `workspaces` row — the binding-3 skip path.
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            job_id,
+            "research_cleanup",
+            "sanitation",
+            ws_name,
+        )
+        .task("cleanup prompt")
+        .timestamps(crate::db::now())
+        .insert()
+        .await
+        .unwrap();
+
+        let resumable = recover_from_restart().await.unwrap();
+
+        // Filter by job id: other tests' rows may legitimately appear in the
+        // shared resumable list.
+        let hit = resumable
+            .iter()
+            .any(|r| matches!(r, ResumableJob::ResearchCleanup { job_id: j, .. } if j == job_id));
+        assert!(
+            !hit,
+            "unresolvable-workspace cleanup row is not resumed (binding-3 skip)"
+        );
+        assert_eq!(
+            status_retry(conn, job_id).await,
+            ("launched".to_string(), 0),
+            "binding-3 skip leaves the cleanup row untouched (no checkpoint bump)"
         );
     }
 

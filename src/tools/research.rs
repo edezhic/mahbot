@@ -257,8 +257,9 @@ impl ResearchState {
     /// persisted sessions (right after each completed round — early sessions
     /// of >8h runs are TTL'd, so collection must be incremental). UNFILTERED:
     /// the full command history is written to the run folder dump; the
-    /// Sanitation cleanup agent does the attribution.
-    async fn capture_round(&mut self, agent_ids: &[String], run_root: &Path) {
+    /// Sanitation cleanup agent does the attribution. `job_id` is threaded to
+    /// the dump write for its logging.
+    async fn capture_round(&mut self, job_id: &str, agent_ids: &[String], run_root: &Path) {
         let fresh = crate::research_cleanup::collect_agent_shell_commands(agent_ids).await;
         for cmd in fresh {
             if self.seen_commands.insert(cmd.clone()) {
@@ -273,7 +274,7 @@ impl ResearchState {
         // cap must be re-admittable when a later round re-issues them, and the
         // set stays bounded by the cap instead of growing without limit.
         self.seen_commands = self.commands.iter().cloned().collect();
-        crate::research_cleanup::write_command_dump(run_root, &self.commands).await;
+        crate::research_cleanup::write_command_dump(run_root, job_id, &self.commands).await;
     }
 }
 
@@ -466,10 +467,10 @@ impl Tool for ResearchTool {
                     // Shutdown/drain abort OR manual cancel: no envelope is
                     // routed now. An abort keeps the run alive for the next
                     // boot's resume (the result and artifacts arrive at the
-                    // real terminalization); a manual cancel removes the run
-                    // permanently (rows + folder + archive swept). The
-                    // distinction is logged by the dispatch path/terminalization
-                    // tail itself — never a "resumes at boot" message here.
+                    // real terminalization); a manual cancel stops the run
+                    // permanently (the cancelled-run handoff dispatches the
+                    // cleanup agent — nothing is delivered). The distinction
+                    // is logged by the dispatch path/terminalization tail
                     tracing::info!(
                         "Research run ended without delivery (aborted or manually cancelled)"
                     );
@@ -514,8 +515,8 @@ impl Tool for ResearchTool {
 /// terminalizations — the envelope is the completion helper's own copy
 /// (pending_job_id set by the tx), routed as-is so persisted and routed copies
 /// cannot drift. Returns `None` on a shutdown/drain abort AND on a manual
-/// cancel — the abort keeps the run alive for boot resume, the cancel sweeps
-/// the run permanently.
+/// cancel — the abort keeps the run alive for boot resume, the cancel stops
+/// the run permanently (cleanup handoff, nothing delivered).
 async fn dispatch_durable_research(
     ws: &Workspace,
     question: &str,
@@ -566,15 +567,19 @@ async fn dispatch_durable_research(
             );
             return None;
         }
-        // Manual cancel: a PERMANENT stop. Remove the run's durable state
-        // (rows + folder + archive) and deliver nothing — the run must never
-        // resume, re-dispatch, or deliver a report.
+        // Manual cancel: a PERMANENT stop — the cancelled-run handoff
+        // dispatches the cleanup agent with the run's dump intent; the folder
+        // is released only by the cleanup tail. Nothing is delivered.
         ResearchExit::Cancelled => {
             tracing::info!(
                 job = %job_id,
                 "Research run manually cancelled — permanent stop, nothing delivered"
             );
-            let _ = crate::research_cancel::sweep_cancelled_run(&job_id).await;
+            if let Err(e) =
+                crate::research_cancel::hand_off_cancelled_run(&job_id, ws, question).await
+            {
+                tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
+            }
             return None;
         }
         ResearchExit::Terminal(result) => result,
@@ -613,7 +618,7 @@ async fn write_terminalization_artifacts(
 ) {
     crate::research_cleanup::write_results_md(job_id, question, delivered).await;
     let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-    crate::research_cleanup::write_command_dump(&run_root, &state.commands).await;
+    crate::research_cleanup::write_command_dump(&run_root, job_id, &state.commands).await;
 }
 
 /// Real-terminalization tail shared by fresh dispatch and boot resume:
@@ -623,7 +628,9 @@ async fn write_terminalization_artifacts(
 /// free it before the cleanup row is spawned). Returns `Some(envelope)` on a
 /// real terminalization — the envelope is the completion helper's own copy
 /// (`pending_job_id` set by the tx, so persisted and routed copies cannot
-/// drift). Returns `None` on a manual cancel (the run is swept permanently).
+/// drift). Returns `None` on a manual cancel (the cancelled-run handoff
+/// dispatches the cleanup agent; the folder is released only by the cleanup
+/// tail).
 /// The caller routes the returned envelope (fresh: via
 /// [`ResearchTool::execute`]; resume: directly), so routing always happens
 /// after the cleanup row exists.
@@ -641,11 +648,14 @@ async fn terminalize_research(
     // Manual-cancel gate BEFORE any artifact is written: a cancel that landed
     // after the orchestrator's last boundary check (mid-terminalization) must
     // not write artifacts, complete the job, dispatch cleanup, or route
-    // anything (a racing write is deleted by the cancel sweep — the bounded
-    // race documented there).
+    // anything. The cancelled-run handoff dispatches the cleanup agent with
+    // the already-final dump — no racing folder deletion, the dump stays
+    // alive for the cleanup agent.
     if crate::research_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research terminalization suppressed by manual cancel");
-        let _ = crate::research_cancel::sweep_cancelled_run(job_id).await;
+        if let Err(e) = crate::research_cancel::hand_off_cancelled_run(job_id, ws, question).await {
+            tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
+        }
         return None;
     }
     let delivered = build_async_research_message(result);
@@ -679,10 +689,13 @@ async fn terminalize_research(
     // Defensive post-completion gate: the in-tx cancel gate in
     // complete_job_with_envelope rolled the completion back when the cancel
     // fired mid-tx — never route the report or dispatch the cleanup. The
-    // sweep (this path or the cancel action's) removes any surviving rows.
+    // cancelled-run handoff suppresses the pending envelope and dispatches the
+    // cleanup agent.
     if crate::research_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research completion suppressed by manual cancel — not routed");
-        let _ = crate::research_cancel::sweep_cancelled_run(job_id).await;
+        if let Err(e) = crate::research_cancel::hand_off_cancelled_run(job_id, ws, question).await {
+            tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
+        }
         return None;
     }
     // Cleanup dispatch AFTER the exactly-once boundary: the cleanup jobs row
@@ -736,7 +749,11 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
                 job = %job_id,
                 "Research resume manually cancelled — permanent stop, nothing delivered",
             );
-            let _ = crate::research_cancel::sweep_cancelled_run(job_id).await;
+            if let Err(e) =
+                crate::research_cancel::hand_off_cancelled_run(job_id, ws, &caller.task).await
+            {
+                tracing::warn!(job = %job_id, error = %e, "cancelled-run cleanup handoff failed — rows stay for boot resume");
+            }
             return;
         }
         ResearchExit::Terminal(result) => result,
@@ -2165,7 +2182,9 @@ async fn run_coder_round(
         Some(question.to_string()),
     )
     .await;
-    state.capture_round(&[agent_id], Path::new(run_root)).await;
+    state
+        .capture_round(job_id, &[agent_id], Path::new(run_root))
+        .await;
     if response.is_some() {
         tracing::info!(job = %job_id, coder_round = round_key, "Coder round completed");
     } else {
@@ -2298,7 +2317,7 @@ async fn gap_rounds(
         )
         .await;
         state
-            .capture_round(&round_agents, Path::new(run_root))
+            .capture_round(job_id, &round_agents, Path::new(run_root))
             .await;
         let round = collect_evidence(&runs, &mut state.ledger, run_stats);
         // Wrap-up stays BEFORE the per-round checkpoint here (unlike round 1):
@@ -3246,7 +3265,7 @@ async fn run_deep_research(
         // Capture on EVERY outcome — a hard decompose failure still leaves
         // the dispatched agents' sessions behind (their OS-temp scratch must
         // reach the command dump).
-        state.capture_round(&round_agents, &run_root).await;
+        state.capture_round(job_id, &round_agents, &run_root).await;
         round_agents.clear();
         let plan = match round0 {
             Ok((plan, marker)) => {
@@ -3321,7 +3340,7 @@ async fn run_deep_research(
                 &recovered,
             )));
         };
-        state.capture_round(&round_agents, &run_root).await;
+        state.capture_round(job_id, &round_agents, &run_root).await;
         round_agents.clear();
         let (_, pending) = state.acc.absorb(&r1);
         annotate_round(
@@ -3391,8 +3410,9 @@ async fn run_deep_research(
             return ResearchExit::Aborted;
         }
         if crate::research_cancel::is_cancelled(job_id) {
-            // Manual cancel: permanent stop — the cancel sweep removes the
-            // durable rows; nothing further is checkpointed or delivered.
+            // Manual cancel: permanent stop — the cancelled-run handoff owns
+            // the cleanup dispatch; nothing further is checkpointed or
+            // delivered.
             return ResearchExit::Cancelled;
         }
         // Round-trip the gap-loop locals on NORMAL exit (coverage complete,
@@ -3480,7 +3500,7 @@ async fn run_deep_research(
             question,
         )
         .await;
-        state.capture_round(&round_agents, &run_root).await;
+        state.capture_round(job_id, &round_agents, &run_root).await;
         round_agents.clear();
         state.budget_spent = budget.spent;
         state.save(job_id).await;
@@ -3764,7 +3784,8 @@ mod tests {
     /// A fired manual-cancel signal must stop the orchestrator at its next
     /// stage boundary with `ResearchExit::Cancelled` (distinct from Aborted) —
     /// before synthesis runs, no LLM calls, no partial report. The durable
-    /// sweep (rows + folder + archive) is covered by research_cancel.rs tests.
+    /// row/fs lifecycle (sweep, dump-guarded folder release, cleanup-row
+    /// transition) is covered by research_cancel.rs tests.
     #[tokio::test]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn cancelled_run_exits_cancelled_at_stage_boundary() {
@@ -4529,8 +4550,12 @@ mod tests {
         .unwrap();
         // Pre-crash command history in the run folder's dump.
         let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
-        crate::research_cleanup::write_command_dump(&run_root, &["pre-crash cmd".to_string()])
-            .await;
+        crate::research_cleanup::write_command_dump(
+            &run_root,
+            job_id,
+            &["pre-crash cmd".to_string()],
+        )
+        .await;
         let loaded = ResearchState::load(job_id).await;
         assert_eq!(
             loaded.commands,

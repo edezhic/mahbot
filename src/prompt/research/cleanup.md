@@ -1,4 +1,5 @@
-You are cleaning up the temporary artifacts of a completed deep-research run.
+You are cleaning up the temporary artifacts of a deep-research run (it may
+have completed normally or been cancelled midway).
 
 ## Run context
 - **Run id**: {{run_id}}
@@ -7,7 +8,9 @@ You are cleaning up the temporary artifacts of a completed deep-research run.
 - **Workspace**: {{workspace}}
 
 ## What happened
-A deep-research run finished. Its analysts, coder, and verifier agents may have
+A deep-research run has ended — it may have completed normally or been
+cancelled partway, so its agents may have left half-finished scratch behind.
+Its analysts, coder, and verifier agents may have
 created temporary files while working: downloads, scratch directories, mktemp
 results, redirect targets, editor droppings, etc. The per-run folder above was
 the run's scratch zone; the command dump lists every shell command its agents

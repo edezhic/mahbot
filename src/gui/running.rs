@@ -109,9 +109,9 @@ pub(crate) enum RunningMessage {
     CancelConfirmed,
     /// Keep/Dismiss (or Escape/backdrop) — close the dialog with no effect.
     CancelDismissed,
-    /// The async cancel finished: `Ok(())` = run stopped and removed
-    /// permanently; `Err` = the durable sweep failed (surfaced as a toast).
-    CancelFinished(Result<(), String>),
+    /// The async cancel finished: the run stopped and the cleanup agent is
+    /// removing its traces (cancel_research_run is infallible).
+    CancelFinished,
     /// Toggle the expanded/collapsed state of a running-agent card. Keyed by
     /// (agent_id, generation) so a recycled agent_id never inherits a stale
     /// expansion.
@@ -565,11 +565,12 @@ fn cancel_confirm_dialog(run_key: &str) -> Element<'static, RunningMessage> {
                 "Confirming will:",
                 "• stop all agents of this run — an in-flight tool or LLM call \
                  may finish, but no further work happens;\n\
-                 • stop the orchestrator — no more rounds, no report, no \
-                 cleanup agent;\n\
-                 • delete the run's temporary folder and archived result;\n\
-                 • remove the run permanently — nothing is delivered to the \
-                 Manager, and it can never resume.",
+                 • stop the orchestrator — no more rounds, no report, and \
+                 nothing is delivered to the Manager;\n\
+                 • remove the run's temporary traces and its run folder — \
+                 dispatching the cleanup agent while the orchestrator is still \
+                 running, a direct sweep otherwise;\n\
+                 • remove the run permanently — it can never resume.",
             ]),
             [
                 dialog::DialogAction::secondary("Keep run", RunningMessage::CancelDismissed),

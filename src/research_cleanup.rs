@@ -13,13 +13,13 @@
 //!
 //! The folder is removed via [`release_run_folder`], the single run-folder
 //! release point, invoked per-job (never as a sweep) from the completion tail
-//! ([`run_cleanup_agent_and_finish`]) and the cancel sweep
-//! ([`crate::research_cancel::sweep_cancelled_run`], including the workspace
-//! abandon's research-run cancellation). There is no periodic or scan-based
-//! run-folder sweep anywhere in the daemon, so folders of crashed runs are
-//! left for the OS temp sweep (see `crate::temp` — the temp-dir cleaner
-//! protects research run folders only by prompt instruction, never
-//! programmatically).
+//! ([`run_cleanup_agent_and_finish`]) and — dump-guarded — from the cancel
+//! sweep ([`crate::research_cancel::sweep_cancelled_run`]) for folders with
+//! NO cleanup intent. A folder WITH a command dump is never deleted except by
+//! the cleanup tail. There is no periodic or scan-based run-folder sweep
+//! anywhere in the daemon, so folders of crashed runs are left for the OS
+//! temp sweep (see `crate::temp` — the temp-dir cleaner protects research run
+//! folders only by prompt instruction, never programmatically).
 //!
 //! ## Command dump + Sanitation cleanup
 //!
@@ -107,6 +107,21 @@ async fn run_folder_exists(job_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Does the run folder hold its command dump (the cleanup intent)? The
+/// cancel-sweep folder-release guard: a folder with a dump must survive for
+/// the cleanup tail / OS sweep. Fail-closed on the SAFE side — the OPPOSITE
+/// direction from [`run_folder_exists`]'s deliberate fail-open: a transient IO
+/// error assumes the dump IS present, so the folder is never released
+/// uncleaned and the handoff never skips cleanup dispatch. [`run_folder_exists`]
+/// fails open because error⇒false guards against re-dispatching a completed
+/// cleanup (the safe direction there); here error⇒true protects the intent.
+/// Only a genuine `Ok(false)` means "no dump".
+pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
+    tokio::fs::try_exists(run_root_path(job_id).join("commands.dump"))
+        .await
+        .unwrap_or(true)
+}
+
 /// Release a run's per-run folder and its search-engine state — the SOLE
 /// run-folder deleter now that the sweeps are gone. Search-engine registry
 /// entry first (drops the picker + LMDB tracker handles), then the whole
@@ -114,9 +129,10 @@ async fn run_folder_exists(job_id: &str) -> bool {
 ///
 /// Called by the completion tail ([`run_cleanup_agent_and_finish`], folder
 /// before row terminalize) and the cancel sweep
-/// ([`crate::research_cancel::sweep_cancelled_run`], including the workspace
-/// abandon's research-run cancellation). The cleanup jobs row is NOT touched
-/// here: callers own row removal.
+/// ([`crate::research_cancel::sweep_cancelled_run`]) only for folders with NO
+/// command dump (dump-guarded upstream in [`command_dump_exists`]); a folder
+/// WITH a `commands.dump` is released only by the cleanup tail. The cleanup
+/// jobs row is NOT touched here: callers own row removal.
 ///
 /// Removal failure is swallowed (the folder is "left for the OS") and the row
 /// is still terminalized by the caller — the crash-window classifier then
@@ -284,14 +300,20 @@ pub(crate) fn cap_command_dump(commands: &mut Vec<String>, cap: usize) {
 /// commands are already credential-scrubbed at collection (see
 /// [`collect_agent_shell_commands`] — the in-memory capture and the dump must
 /// match, or a crash-resume would accumulate both variants). Newest-wins,
-/// capped at [`COMMAND_DUMP_CAP_BYTES`].
-pub(crate) async fn write_command_dump(run_root: &Path, commands: &[String]) {
+/// capped at [`COMMAND_DUMP_CAP_BYTES`]. Never creates the folder (callers
+/// ensure the run root exists); a missing folder is the normal end-state when
+/// a cancel sweep released it, so that is a debug, not a warning.
+pub(crate) async fn write_command_dump(run_root: &Path, job_id: &str, commands: &[String]) {
     let path = run_root.join("commands.dump");
     let mut deduped = dedup_newest_wins(commands);
     cap_command_dump(&mut deduped, COMMAND_DUMP_CAP_BYTES);
     let content = deduped.join("\n") + "\n";
     if let Err(e) = tokio::fs::write(&path, content).await {
-        tracing::warn!(error = %e, "Failed to write command dump — cleanup intent degraded");
+        if e.kind() == std::io::ErrorKind::NotFound {
+            tracing::debug!(job = %job_id, "command dump write skipped — run folder already released (normal end-state)");
+        } else {
+            tracing::warn!(job = %job_id, error = %e, "Failed to write command dump — cleanup intent degraded");
+        }
     }
 }
 
@@ -421,14 +443,6 @@ pub(crate) fn cleanup_agent_id(job_id: &str) -> String {
 /// `Ok(None)` when the row already exists (deduped — the boot-scan arm resumes
 /// the surviving row). Idempotent.
 pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<String>> {
-    // Manual-cancel gate: a cancelled run must never get a cleanup agent —
-    // the cancel sweep owns the folder deletion. The research job row is
-    // already gone at this point (cancelled runs are swept), so this is a
-    // defensive guard for a racing terminalize.
-    if crate::research_cancel::is_cancelled(job_id) {
-        tracing::info!(job = %job_id, "Research cleanup suppressed by manual cancel");
-        return Ok(None);
-    }
     let conn = &crate::session::store().conn;
     // The row itself is the dedup marker: a surviving row means the cleanup is
     // already in flight (crash between dispatch and completion) — no second
@@ -481,18 +495,15 @@ pub(crate) async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Resu
 /// Dispatch the Sanitation-role cleanup agent for a terminalized research run.
 ///
 /// Called at terminalization (all terminalization funnels through the
-/// terminalize_research tail). The
-/// cleanup runs FIRE-AND-FORGET (result delivery is never delayed); the run
-/// folder is held by the durable `research_cleanup` jobs row (id == run_id —
-/// the folder name) until the cleanup completes. Dispatch is UNCONDITIONAL:
-/// research completed + command dump created ⇒ cleanup runs. The row-exists
-/// dedup inside `create_cleanup_job_row` covers the crash window (a resumed
-/// run terminalizes again while its cleanup row survives).
-///
-/// `question` is the research question/task text, threaded observationally to
-/// the cleanup agent so the Running Agents view keeps the group's question
-/// header during the cleanup window (all other run members have deregistered
-/// by then). Purely presentational — never affects cleanup behavior.
+/// terminalize_research tail). The cleanup runs FIRE-AND-FORGET (result
+/// delivery is never delayed) — the spawn itself lives in
+/// [`spawn_cleanup_agent`], which the cancelled-run handoff also calls
+/// directly; the run folder is held by the durable
+/// `research_cleanup` jobs row (id == run_id — the folder name) until the
+/// cleanup completes. Dispatch is UNCONDITIONAL: research completed + command
+/// dump created ⇒ cleanup runs. The row-exists dedup inside
+/// `create_cleanup_job_row` covers the crash window (a resumed run
+/// terminalizes again while its cleanup row survives).
 ///
 /// Delete capability: Role::Sanitation's standard toolset (Read / Shell
 /// ReadOnly) already permits rm/mv/cp under the allowed temp roots —
@@ -506,31 +517,43 @@ pub(crate) async fn dispatch_research_cleanup(
     let Some(prompt) = create_cleanup_job_row(job_id, ws).await? else {
         return Ok(());
     };
+    spawn_cleanup_agent(job_id, question, ws, &prompt);
+    Ok(())
+}
 
-    // Fire-and-forget: never block result delivery on the cleanup LLM round.
-    // Deliberately a raw tokio::spawn, NOT spawn_cancellable: the cleanup is
-    // not a background daemon task. NOTE: a raw spawn task does NOT survive
-    // process shutdown (it is dropped with the runtime) — the durability is
-    // the jobs row, which the boot scan resumes on the next start after a
-    // HARD crash (the drain ignores unregistered agents; if the process dies
-    // mid-run the row is the resume point and the folder stays held). A
-    // graceful-drain abort is different: `run_cleanup_agent_and_finish`
-    // terminalizes the row on EVERY exit path, so a drain-aborted cleanup is
-    // terminalized with its outside-folder scratch never cleaned and never
-    // retried — matching the pinned "terminalize on every exit path"
-    // decision; only hard crashes get the boot-resume retry.
+/// Spawn the Sanitation-role cleanup agent fire-and-forget for a terminalized
+/// (or cancelled) research run whose `research_cleanup` jobs row already
+/// exists with `prompt` as its task.
+///
+/// Fire-and-forget: never block result delivery on the cleanup LLM round.
+/// Deliberately a raw tokio::spawn, NOT spawn_cancellable: the cleanup is
+/// not a background daemon task. NOTE: a raw spawn task does NOT survive
+/// process shutdown (it is dropped with the runtime) — the durability is
+/// the jobs row, which the boot scan resumes on the next start after a
+/// HARD crash (the drain ignores unregistered agents; if the process dies
+/// mid-run the row is the resume point and the folder stays held). A
+/// graceful-drain abort is different: `run_cleanup_agent_and_finish`
+/// terminalizes the row on EVERY exit path, so a drain-aborted cleanup is
+/// terminalized with its outside-folder scratch never cleaned and never
+/// retried — matching the pinned "terminalize on every exit path"
+/// decision; only hard crashes get the boot-resume retry.
+///
+/// `question` is the research question/task text, threaded observationally to
+/// the cleanup agent so the Running Agents view keeps the group's question
+/// header during the cleanup window (all other run members have deregistered
+/// by then). Purely presentational — never affects cleanup behavior.
+pub(crate) fn spawn_cleanup_agent(job_id: &str, question: &str, ws: &Workspace, prompt: &str) {
     let ws = ws.clone();
     let job_id_log = job_id.to_string();
     let agent_id = cleanup_agent_id(job_id);
     let agent_id_log = agent_id.clone();
     let job_id = job_id.to_string();
     let question = question.to_string();
+    let prompt = prompt.to_string();
     tokio::spawn(async move {
         run_cleanup_agent_and_finish(&job_id, Some(&question), &ws, &prompt).await;
     });
-
-    tracing::info!(job = %job_id_log, agent = %agent_id_log, "Research cleanup dispatched");
-    Ok(())
+    tracing::info!(job = %job_id_log, agent = %agent_id_log, "Research cleanup agent spawned");
 }
 
 /// Run the cleanup agent and finish: log the outcome and release the run
@@ -586,11 +609,13 @@ async fn run_cleanup_agent_and_finish(
         "Research cleanup finished: {}",
         crate::util::scrub_credentials(&report)
     );
-    // Release the folder — the SOLE run-folder deleter (no sweeps exist):
-    // search-engine state, then the whole folder, then the row. Folder first,
-    // row last: a crash between folder removal and row terminalize leaves
-    // row + no folder, which boot resume converges from with one extra round.
-    // Invariant: cleanup row exists ⟺ cleanup not finished.
+    // Release the folder — the sole deleter of folders WITH a command dump
+    // (the dump-less cancel sweep, dump-guarded via [`command_dump_exists`],
+    // is the only other release point): search-engine state, then the whole
+    // folder, then the row. Folder first, row last: a crash between folder
+    // removal and row terminalize leaves row + no folder, which boot resume
+    // converges from with one extra round. Invariant (up to that bounded
+    // dump-guarded sweep race): cleanup row exists ⟺ cleanup not finished.
     release_run_folder(job_id).await;
     let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
 }
@@ -610,9 +635,9 @@ pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
     .await
     else {
         // None = drain abort (the row STAYS — the folder stays held for the
-        // next boot) or a gone row (explicit abandon — every row-removal path
-        // releases the run folder in the same operation, so there is nothing
-        // left to release here).
+        // next boot) or a gone row (explicit abandon — the abandon's cancel
+        // sweeps the rows, and its dump-guarded release leaves a dump-holding
+        // folder for the OS sweep; nothing left to release here).
         return;
     };
     let prompt = caller.task.clone();
@@ -1229,7 +1254,7 @@ mod tests {
             .into_iter()
             .map(crate::util::scrub_credentials)
             .collect();
-        write_command_dump(run_root, &commands).await;
+        write_command_dump(run_root, "test", &commands).await;
         let content = tokio::fs::read_to_string(run_root.join("commands.dump"))
             .await
             .unwrap();
@@ -1354,6 +1379,23 @@ mod tests {
         crate::jobs::terminalize_job(&crate::session::store().conn, "run_dedup")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_command_dump_missing_folder_is_a_no_op() {
+        // A missing run root is the normal end-state (a cancel sweep already
+        // released it) — write_command_dump must NOT resurrect the folder.
+        let run_root = run_root_path("dump_write_missing_folder_1");
+        write_command_dump(
+            &run_root,
+            "dump_write_missing_folder_1",
+            &["cmd".to_string()],
+        )
+        .await;
+        assert!(
+            !run_root.exists(),
+            "write_command_dump must not create the missing run folder (NotFound is the normal end-state)"
+        );
     }
 
     /// Insert one artist session (metadata + one message) for a user.
