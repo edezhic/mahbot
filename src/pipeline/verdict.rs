@@ -295,11 +295,7 @@ pub(crate) fn render_joint_comment(
 
     // The first section's leading separator would leave leading blank lines —
     // strip them.
-    crate::util::truncate_sandwich(
-        &crate::util::scrub_credentials(out.trim_start_matches('\n')),
-        crate::util::FAILURE_DETAIL_CAP,
-        "joint verdict comment",
-    )
+    crate::util::failure_detail(out.trim_start_matches('\n'), "joint verdict comment")
 }
 
 /// Resolve a grouped member's issue text via the item table (no text

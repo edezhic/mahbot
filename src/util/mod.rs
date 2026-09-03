@@ -340,6 +340,16 @@ pub(crate) fn log_join_failures(
 /// keeps the head (outermost context) and tail (last attempt's cause).
 pub(crate) const FAILURE_DETAIL_CAP: usize = 24_000;
 
+/// Canonical scrub+truncate failure-comment detail: scrub secrets, then
+/// sandwich-truncate to [`FAILURE_DETAIL_CAP`]. Failure dumps rendered
+/// through this path keep one canonical ordering and cap. (Some adjacent
+/// sites deliberately diverge — scrub-only early-returns and a
+/// truncate-then-scrub raw dump — and are intentionally not unified here.)
+#[must_use]
+pub(crate) fn failure_detail(text: &str, label: &str) -> String {
+    truncate_sandwich(&scrub_credentials(text), FAILURE_DETAIL_CAP, label)
+}
+
 /// Truncate a string to at most `max_bytes` bytes using a head/tail
 /// "sandwich" strategy: keeps the first ~2/3 and last ~1/3, inserting an
 /// omission marker between them. Returns the input unchanged if it fits

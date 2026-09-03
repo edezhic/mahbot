@@ -102,11 +102,7 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     if !synopsis.is_empty() {
         let _ = write!(out, "\n\n### Summary\n{synopsis}");
     }
-    crate::util::truncate_sandwich(
-        &crate::util::scrub_credentials(&out),
-        crate::util::FAILURE_DETAIL_CAP,
-        "engineer summary comment",
-    )
+    crate::util::failure_detail(&out, "engineer summary comment")
 }
 
 /// Build the failure comment for a failed Engineer run.
@@ -119,12 +115,7 @@ fn engineer_failure_comment(shutdown: bool, error: Option<&str>) -> String {
     let Some(detail) = error else {
         return load_prompt("pipeline/engineer_failed.md");
     };
-    let detail = crate::util::scrub_credentials(detail);
-    let detail = crate::util::truncate_sandwich(
-        &detail,
-        crate::util::FAILURE_DETAIL_CAP,
-        "engineer failure",
-    );
+    let detail = crate::util::failure_detail(detail, "engineer failure");
     if detail.contains(RETRY_EXHAUSTION_MARKER) {
         format!("Engineer failed: LLM provider retry exhaustion.\n\n{detail}")
     } else {

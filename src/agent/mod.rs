@@ -2076,11 +2076,7 @@ impl Agent {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        error_chain = %crate::util::truncate_sandwich(
-                            &crate::util::scrub_credentials(&format!("{e:#}")),
-                            crate::util::FAILURE_DETAIL_CAP,
-                            "summarization failure",
-                        ),
+                        error_chain = %crate::util::failure_detail(&format!("{e:#}"), "summarization failure"),
                         "Summarization failed — continuing with full history"
                     );
                 }
@@ -2335,11 +2331,7 @@ pub(crate) async fn run_agent(
             agent.failure = Some(format!("{e:#}"));
             agent.failure_class = failure_class_from_error(&e);
             let classification = failure_classification(&agent, Some(&e));
-            let error_chain = crate::util::truncate_sandwich(
-                &crate::util::scrub_credentials(&format!("{e:#}")),
-                crate::util::FAILURE_DETAIL_CAP,
-                "agent failure log",
-            );
+            let error_chain = crate::util::failure_detail(&format!("{e:#}"), "agent failure log");
             // During global (SIGTERM/SIGINT) shutdown, in-flight agents return
             // errors from work() — expected, not real failures. The global
             // token fires before `shutdown_all()` cancels per-agent tokens, so
