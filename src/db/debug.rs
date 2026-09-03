@@ -800,13 +800,11 @@ fn dump_one_store(file_path: &Path, label: &str) -> Result<()> {
     open_and_dump_readonly(file_path, label)
 }
 
-/// Query a live store through the daemon's debug IPC endpoint (used when the
-/// daemon holds the instance lock and the CLI must not open the store
-/// directly). `physical` is the physical store name the endpoint keys on
-/// ("core" or "logs").
-async fn query_over_ipc(root: &Path, physical: &str, sql: &str) -> Result<()> {
+/// Run one read-only SQL query through the daemon's debug IPC endpoint,
+/// returning the response or the endpoint's error.
+async fn ipc_query_readonly(root: &Path, store: &str, sql: &str) -> Result<ipc::QueryResponse> {
     let req = ipc::QueryRequest {
-        store: physical.to_string(),
+        store: store.to_string(),
         sql: sql.to_string(),
         params: Vec::new(),
     };
@@ -814,6 +812,15 @@ async fn query_over_ipc(root: &Path, physical: &str, sql: &str) -> Result<()> {
     if let Some(err) = &resp.error {
         bail!("{err}");
     }
+    Ok(resp)
+}
+
+/// Query a live store through the daemon's debug IPC endpoint (used when the
+/// daemon holds the instance lock and the CLI must not open the store
+/// directly). `physical` is the physical store name the endpoint keys on
+/// ("core" or "logs").
+async fn query_over_ipc(root: &Path, physical: &str, sql: &str) -> Result<()> {
+    let resp = ipc_query_readonly(root, physical, sql).await?;
     let mut out = String::new();
     out.push_str(&resp.columns.join("|"));
     out.push('\n');
@@ -837,15 +844,7 @@ async fn query_over_ipc(root: &Path, physical: &str, sql: &str) -> Result<()> {
 async fn dump_over_ipc(root: &Path, physical: &str, label: &str) -> Result<()> {
     use std::fmt::Write as _;
     let tables_sql = USER_TABLES_SQL.replace("{filter}", turso_mod::USER_OBJECT_FILTER);
-    let req = ipc::QueryRequest {
-        store: physical.to_string(),
-        sql: tables_sql,
-        params: Vec::new(),
-    };
-    let resp = ipc::ipc_query_with_wait(root, &req).await?;
-    if let Some(err) = &resp.error {
-        bail!("{err}");
-    }
+    let resp = ipc_query_readonly(root, physical, &tables_sql).await?;
     let mut out = format!("== schema dump: {label} ==\n");
     for row in &resp.rows {
         let name = row.first().map(ipc::WireValue::format).unwrap_or_default();
@@ -854,15 +853,7 @@ async fn dump_over_ipc(root: &Path, physical: &str, label: &str) -> Result<()> {
             continue;
         }
         let count_sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&name));
-        let count_req = ipc::QueryRequest {
-            store: physical.to_string(),
-            sql: count_sql,
-            params: Vec::new(),
-        };
-        let count_resp = ipc::ipc_query_with_wait(root, &count_req).await?;
-        if let Some(err) = &count_resp.error {
-            bail!("{err}");
-        }
+        let count_resp = ipc_query_readonly(root, physical, &count_sql).await?;
         let count = count_resp
             .rows
             .first()
@@ -1057,8 +1048,7 @@ fn open_and_dump_readonly(file_path: &Path, label: &str) -> Result<()> {
 }
 
 /// Execute a read-only query on a `turso::core` connection and return the
-/// results as pipe-delimited text (same format as the previous SDK-based
-/// executor).
+/// results as pipe-delimited text.
 ///
 /// Output is accumulated in memory and returned as a single string; the caller
 /// prints it only on success, so a mid-query failure never leaks a partial
