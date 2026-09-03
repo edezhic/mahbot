@@ -1112,6 +1112,50 @@ mod tests {
         store.insert_batch(entries).await.unwrap();
     }
 
+    /// Open a healthy store in a fresh temp dir, seed one entry, and checkpoint
+    /// so all pages land in the main DB file, then close it. Returns the dir —
+    /// it must be held for the lifetime of the reopened store.
+    async fn seeded_closed_store() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        {
+            let store = LogStore::open(tmp.path())
+                .await
+                .expect("open healthy store");
+            seed_entries(
+                &store,
+                &[LogEntry {
+                    timestamp: "2025-01-01T00:00:00Z".into(),
+                    level: "INFO".into(),
+                    target: "test".into(),
+                    message: "pre-corruption".into(),
+                    ..Default::default()
+                }],
+            )
+            .await;
+            store
+                .conn
+                .checkpoint()
+                .await
+                .expect("checkpoint so pages land in the main DB file");
+        }
+        tmp
+    }
+
+    /// Assert that quarantine artifacts exist in the store's `db` dir after a
+    /// corrupted store is reopened and recreated.
+    fn assert_quarantine_artifacts(root: &std::path::Path, what: &str) {
+        let quarantined: Vec<_> = std::fs::read_dir(root.join("db"))
+            .expect("read db dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("quarantine-"))
+            .collect();
+        assert!(
+            !quarantined.is_empty(),
+            "{what} must be quarantined, found: {quarantined:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_spawn_log_writer_writes_to_store() {
         let (store, _dir) = test_store().await;
@@ -1202,9 +1246,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flush_log_batch_retries_then_records() {
-        // After restoring write access, a retried flush must succeed without
-        // recording a failure — the bounded retry absorbs transient errors.
+    async fn test_flush_log_batch_persists_without_failure() {
+        // A healthy flush clears the batch, persists the entry, and records no
+        // write failure. The bounded-retry retry-then-succeed branch
+        // (`LOG_INSERT_MAX_ATTEMPTS` loop) is deliberately left untested since
+        // failure injection isn't worth the machinery.
         let (store, _dir) = test_store().await;
         let baseline = log_write_error_info().count;
 
@@ -1488,29 +1534,8 @@ mod tests {
     /// created in its place, without failing the open.
     #[tokio::test]
     async fn test_log_store_open_quarantines_corrupt_store() {
-        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let tmp = seeded_closed_store().await;
         let root = tmp.path();
-
-        // Build a store with real data, then checkpoint so all pages live in
-        // the main DB file (not the WAL), then close it.
-        {
-            let store = LogStore::open(root).await.expect("open healthy store");
-            store
-                .insert_batch(&[LogEntry {
-                    timestamp: "2025-01-01T00:00:00Z".into(),
-                    level: "INFO".into(),
-                    target: "test".into(),
-                    message: "pre-corruption".into(),
-                    ..Default::default()
-                }])
-                .await
-                .expect("seed entry");
-            store
-                .conn
-                .checkpoint()
-                .await
-                .expect("checkpoint so pages land in the main DB file");
-        }
 
         // Corrupt a b-tree page in the main DB file (zero page 2; the header
         // page 1 stays intact so the file still opens).
@@ -1545,16 +1570,7 @@ mod tests {
             stats_tables, 1,
             "consolidated stats tables must exist after quarantine recreate"
         );
-        let quarantined: Vec<_> = std::fs::read_dir(root.join("db"))
-            .expect("read db dir")
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains("quarantine-"))
-            .collect();
-        assert!(
-            !quarantined.is_empty(),
-            "corrupt artifact family must be quarantined, found: {quarantined:?}"
-        );
+        assert_quarantine_artifacts(root, "corrupt artifact family");
     }
 
     /// Boot-time quarantine via the open-failure path: a store whose header is
@@ -1562,27 +1578,8 @@ mod tests {
     /// quarantined and recreated, rather than failing boot.
     #[tokio::test]
     async fn test_log_store_open_quarantines_unopenable_store() {
-        let tmp = tempfile::TempDir::new().expect("temp dir for test");
+        let tmp = seeded_closed_store().await;
         let root = tmp.path();
-
-        {
-            let store = LogStore::open(root).await.expect("open healthy store");
-            store
-                .insert_batch(&[LogEntry {
-                    timestamp: "2025-01-01T00:00:00Z".into(),
-                    level: "INFO".into(),
-                    target: "test".into(),
-                    message: "pre-corruption".into(),
-                    ..Default::default()
-                }])
-                .await
-                .expect("seed entry");
-            store
-                .conn
-                .checkpoint()
-                .await
-                .expect("checkpoint so pages land in the main DB file");
-        }
 
         // Zero the header's page-size field (big-endian u16 at byte offset 16)
         // so the file cannot be opened at all — Turso bails with a corruption
@@ -1599,15 +1596,6 @@ mod tests {
             .await
             .expect("fresh store query");
         assert_eq!(total, 0, "fresh store must be empty");
-        let quarantined: Vec<_> = std::fs::read_dir(root.join("db"))
-            .expect("read db dir")
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains("quarantine-"))
-            .collect();
-        assert!(
-            !quarantined.is_empty(),
-            "unopenable store must be quarantined, found: {quarantined:?}"
-        );
+        assert_quarantine_artifacts(root, "unopenable store");
     }
 }
