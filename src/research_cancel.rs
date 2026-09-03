@@ -114,14 +114,6 @@ pub(crate) fn is_cancelled(job_id: &str) -> bool {
     RESEARCH_CANCELS.is_cancelled(job_id)
 }
 
-/// Whether a live orchestrator invocation is registered for the run. The
-/// cancel action consults it to decide whether the orchestrator's cancelled-
-/// exit handoff owns the durable sweep (registered) or whether it must sweep
-/// directly (unregistered — no orchestrator alive to observe the signal).
-pub(crate) fn is_registered(job_id: &str) -> bool {
-    RESEARCH_CANCELS.is_registered(job_id)
-}
-
 /// The manual cancel action, run from the GUI on confirm and the workspace
 /// abandon path:
 /// 1. Fire the run's cancel signal FIRST (before any row deletion) so the
@@ -135,11 +127,11 @@ pub(crate) fn is_registered(job_id: &str) -> bool {
 /// 3. Remove the run's observational call-registry rows so the group
 ///    disappears from Running Agents immediately (the guards' drops become
 ///    no-ops).
-/// 4. If no orchestrator is alive to observe the signal ([`is_registered`]),
-///    sweep the durable rows directly ([`sweep_cancelled_run`] — the folder
-///    release is dump-guarded) and log it; if an orchestrator IS alive,
-///    return and let its cancelled-exit handoff own the rest (cleanup
-///    dispatch + folder release).
+/// 4. If no orchestrator is alive to observe the signal
+///    ([`ResearchCancelRegistry::is_registered`]), sweep the durable rows
+///    directly ([`sweep_cancelled_run`] — the folder release is dump-guarded)
+///    and log it; if an orchestrator IS alive, return and let its
+///    cancelled-exit handoff own the rest (cleanup dispatch + folder release).
 ///
 /// Infallible by design: the orchestrator's cancelled-exit path (or the no-
 /// orchestrator sweep) always makes progress, so there is nothing for the GUI
@@ -150,7 +142,7 @@ pub(crate) async fn cancel_research_run(job_id: &str) {
         .cancel_by_parent_key(&ParentKey::Research(job_id.to_string()));
     crate::agent::registry::NON_AGENT_CALLS
         .remove_by_parent_key(&ParentKey::Research(job_id.to_string()));
-    if !is_registered(job_id)
+    if !RESEARCH_CANCELS.is_registered(job_id)
         && let Err(e) = sweep_cancelled_run(job_id).await
     {
         tracing::warn!(job = %job_id, error = %e, "cancel sweep failed — durable rows left for boot resume");
@@ -177,21 +169,16 @@ pub(crate) async fn cancel_research_run(job_id: &str) {
 pub(crate) async fn sweep_cancelled_run(job_id: &str) -> Result<(), String> {
     let conn = &crate::session::store().conn;
     let tx = conn.begin_tx().await.map_err(|e| format!("{e:#}"))?;
-    let outcome: anyhow::Result<()> = async {
-        tx.execute(
-            "DELETE FROM pending_jobs WHERE id = ?1",
-            crate::db::params![job_id],
-        )
-        .await?;
-        tx.execute("DELETE FROM jobs WHERE id = ?1", crate::db::params![job_id])
-            .await?;
-        Ok(())
-    }
-    .await;
-    match outcome {
-        Ok(()) => tx.commit().await.map_err(|e| format!("{e:#}"))?,
-        Err(e) => return Err(format!("{e:#}")),
-    }
+    tx.execute(
+        "DELETE FROM pending_jobs WHERE id = ?1",
+        crate::db::params![job_id],
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    tx.execute("DELETE FROM jobs WHERE id = ?1", crate::db::params![job_id])
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    tx.commit().await.map_err(|e| format!("{e:#}"))?;
     if crate::research_cleanup::command_dump_exists(job_id).await {
         tracing::warn!(
             job = %job_id,
