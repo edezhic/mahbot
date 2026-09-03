@@ -89,7 +89,7 @@ impl Tool for AnalyzeTool {
     fn description(&self) -> String {
         let base = crate::prompt::load_prompt(&format!("tool/{}.md", self.name()));
         if self.dispatch_mode.is_async() {
-            let async_note = crate::prompt::load_prompt("tool/analyze_async.md");
+            let async_note = crate::prompt::load_prompt(&format!("tool/{}_async.md", self.name()));
             format!("{base}\n\n{async_note}")
         } else {
             base
