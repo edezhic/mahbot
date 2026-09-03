@@ -12,6 +12,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
 /// Maximum normalized coordinate value, inclusive on both axes ([`NORMALIZED_MAX`]).
@@ -488,6 +489,130 @@ pub(crate) fn blit_rgba(
         dest[dst_start..dst_start + row_copy * 4]
             .copy_from_slice(&src.rgba[src_start..src_start + row_copy * 4]);
     }
+}
+
+/// ZPixmap tile (`depth` 24/32, 4 bytes/pixel) → RGBA.
+#[cfg_attr(not(target_os = "linux"), expect(dead_code))] // deliberate: only the Linux backend calls this; tests exercise it everywhere
+pub(crate) fn x11_pixels_to_rgba(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    depth: u8,
+    lsb_first: bool,
+) -> Result<Vec<u8>, anyhow::Error> {
+    if depth != 24 && depth != 32 {
+        return Err(taxonomy_error(
+            ERR_DEGRADED,
+            format!("unsupported X11 depth {depth} (need 24/32)"),
+        ));
+    }
+    let pixels = width as usize * height as usize;
+    if data.len() < pixels * 4 {
+        anyhow::bail!("short X11 image body: {} < {}", data.len(), pixels * 4);
+    }
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for px in data.as_chunks::<4>().0.iter().take(pixels) {
+        if lsb_first {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
+        } else {
+            rgba.extend_from_slice(&[px[1], px[2], px[3], 0xff]);
+        }
+    }
+    Ok(rgba)
+}
+
+/// `file://` portal URI → path, percent-decoding `%XX` (`+` kept verbatim).
+/// After `file://`, `[host]/path` with an empty host (`file:///...`) or
+/// exactly `localhost` is accepted; anything else is rejected.
+#[cfg_attr(not(target_os = "linux"), expect(dead_code))] // deliberate: only the Linux backend calls this; tests exercise it everywhere
+pub(crate) fn portal_uri_to_path(uri: &str) -> Result<PathBuf, anyhow::Error> {
+    let stripped = uri.strip_prefix("file://").ok_or_else(|| {
+        taxonomy_error(ERR_DEGRADED, format!("portal uri is not a file uri: {uri}"))
+    })?;
+    let path = if stripped.starts_with('/') {
+        stripped
+    } else {
+        match stripped.find('/') {
+            Some(idx) => {
+                let (host, path) = stripped.split_at(idx);
+                if host != "localhost" {
+                    return Err(taxonomy_error(
+                        ERR_DEGRADED,
+                        "portal uri has unsupported host",
+                    ));
+                }
+                path
+            }
+            None => {
+                return Err(taxonomy_error(
+                    ERR_DEGRADED,
+                    "portal uri has unsupported host",
+                ));
+            }
+        }
+    };
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let bad_escape = || {
+        taxonomy_error(
+            ERR_DEGRADED,
+            format!("bad percent-escape in portal uri: {uri}"),
+        )
+    };
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3).ok_or_else(&bad_escape)?;
+            let hex = std::str::from_utf8(hex).map_err(|_| bad_escape())?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| bad_escape())?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let s = String::from_utf8(out).map_err(|_| {
+        taxonomy_error(
+            ERR_DEGRADED,
+            format!("portal uri is not valid UTF-8: {uri}"),
+        )
+    })?;
+    Ok(PathBuf::from(s))
+}
+
+/// Window extents → pixel rect inside a screen-channel capture: true rect
+/// intersection in buffer space (buffer origin = screen origin, size =
+/// screen size). `crop_rgba` clamps the far edge, so w/h are rounded up to
+/// `>= 1` (mirror `region_to_pixels` style).
+#[cfg_attr(not(target_os = "linux"), expect(dead_code))] // deliberate: only the Linux backend calls this; tests exercise it everywhere
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn window_capture_rect(
+    win: &SurfaceGeometry,
+    screen: &SurfaceGeometry,
+) -> Result<(u32, u32, u32, u32), anyhow::Error> {
+    if win.width <= 0.0 || win.height <= 0.0 {
+        return Err(taxonomy_error(
+            ERR_NOT_MATCHED,
+            "window minimized or no visible area — re-enumerate windows",
+        ));
+    }
+    let x0 = (win.x - screen.x).max(0.0);
+    let y0 = (win.y - screen.y).max(0.0);
+    let x1 = (win.x + win.width - screen.x).min(screen.width);
+    let y1 = (win.y + win.height - screen.y).min(screen.height);
+    if x1 <= x0 || y1 <= y0 {
+        return Err(taxonomy_error(
+            ERR_NOT_MATCHED,
+            "window is off-screen — re-enumerate windows",
+        ));
+    }
+    Ok((
+        x0.round() as u32,
+        y0.round() as u32,
+        (x1 - x0).round().max(1.0) as u32,
+        (y1 - y0).round().max(1.0) as u32,
+    ))
 }
 
 // ── Element-ref lifecycle ───────────────────────────────────────────────
@@ -1015,6 +1140,62 @@ mod tests {
         // Out-of-bounds rect is clamped, never panics.
         let clamp = crop_rgba(&cap, (10, 10, 50, 50)).unwrap();
         assert!(clamp.width >= 1 && clamp.height >= 1);
+    }
+
+    #[test]
+    fn x11_pixels_convert_both_byte_orders() {
+        let rgba = x11_pixels_to_rgba(&[10, 20, 30, 0, 40, 50, 60, 0], 2, 1, 24, true).unwrap();
+        assert_eq!(rgba, vec![30, 20, 10, 255, 60, 50, 40, 255]);
+        let rgba = x11_pixels_to_rgba(&[0, 30, 20, 10], 1, 1, 32, false).unwrap();
+        assert_eq!(rgba, vec![30, 20, 10, 255]);
+        let err = x11_pixels_to_rgba(&[0; 4], 1, 1, 16, true).unwrap_err();
+        assert!(err.to_string().contains("16"), "{err:?}");
+    }
+
+    #[test]
+    fn portal_uri_decodes_to_path() {
+        assert_eq!(
+            portal_uri_to_path("file:///tmp/shot%20one.png").unwrap(),
+            PathBuf::from("/tmp/shot one.png")
+        );
+        assert_eq!(
+            portal_uri_to_path("file://localhost/tmp/shot%20one.png").unwrap(),
+            PathBuf::from("/tmp/shot one.png")
+        );
+        assert!(
+            portal_uri_to_path("file:///tmp/a+b.png")
+                .unwrap()
+                .to_str()
+                .is_some_and(|p| p.contains('+'))
+        );
+        assert!(portal_uri_to_path("https://x/y.png").is_err());
+        assert!(portal_uri_to_path("file://otherhost/tmp/a.png").is_err());
+        assert!(portal_uri_to_path("file://localhost").is_err());
+        assert!(portal_uri_to_path("file:///tmp/a%2").is_err());
+        assert!(portal_uri_to_path("file:///tmp/a%").is_err());
+        assert!(portal_uri_to_path("file:///tmp/a%zz.png").is_err());
+    }
+
+    #[test]
+    fn window_rect_intersects_screen() {
+        let screen = surface(-1920.0, 0.0, 3840.0, 1080.0);
+        // Negative-origin offset into buffer space.
+        let win = surface(-1920.0, 100.0, 800.0, 600.0);
+        assert_eq!(
+            window_capture_rect(&win, &screen).unwrap(),
+            (0, 100, 800, 600)
+        );
+        // Partially off-screen shrinks dims to the visible intersection.
+        let partial = surface(1500.0, 900.0, 800.0, 400.0);
+        assert_eq!(
+            window_capture_rect(&partial, &screen).unwrap(),
+            (3420, 900, 420, 180)
+        );
+        // Fully off-screen errors instead of cropping a misleading 1x1.
+        let off = surface(5000.0, 0.0, 100.0, 100.0);
+        let err = window_capture_rect(&off, &screen).unwrap_err();
+        assert!(err.to_string().contains("off-screen"), "{err:?}");
+        assert!(window_capture_rect(&surface(0.0, 0.0, 0.0, 0.0), &screen).is_err());
     }
 
     #[test]

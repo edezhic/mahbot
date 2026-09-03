@@ -1,8 +1,7 @@
 //! Linux [`Backend`] for the Computer tool: AT-SPI2 accessibility (async D-Bus,
-//! observe/act), XTEST input synthesis via enigo, and X11 capture via xcap. A
-//! THIN adapter over the three mature crates — no re-implementation of what they
-//! already provide. Raw input needs X11 (pure-Wayland surfaces degrade); capture
-//! is best-effort on X11.
+//! observe/act), XTEST input synthesis via enigo, X11 stills via x11rb and
+//! Wayland stills via the Screenshot portal over zbus. All Rust-only: no
+//! system capture packages beyond the session's own daemons.
 //!
 //! Surface geometry is PIXELS on Linux: X11 has no stable logical-point space and
 //! mixed-DPI makes physical↔logical translation unreliable — this is precisely
@@ -10,7 +9,7 @@
 
 #![cfg(target_os = "linux")]
 // A handful of pedantic cast lints are inherent to the C ABI-style integer
-// geometry the atspi/xcap crates expose (i32 screen coords, u32 pixel dims).
+// geometry the atspi/X11 crates expose (i32 screen coords, u32 pixel dims).
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -25,15 +24,22 @@ use super::core::{
     self, AppInfo, Backend, Capture, ElementAct, Locator, Modifier, MouseButton, Observation,
     RawInput, ScrollDirection, SurfaceGeometry, TargetSpec, UiNode, WindowInfo,
 };
-use crate::util::with_block_in_place;
+use crate::util::{UnwrapPoison, with_block_in_place};
 use anyhow::anyhow;
 use async_recursion::async_recursion;
 use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
 use atspi::proxy::proxy_ext::{Proxies, ProxyExt};
 use atspi::{AccessibilityConnection, CoordType, ObjectRefOwned, Role, State as AtspiState};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use futures_util::StreamExt as _;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::debug;
+use x11rb::connection::Connection as _;
+use x11rb::protocol::{randr, xproto};
+use x11rb::rust_connection::RustConnection;
 
 pub(crate) static LINUX_BACKEND: LinuxBackend = LinuxBackend {
     connection: tokio::sync::OnceCell::const_new(),
@@ -88,21 +94,34 @@ impl LinuxBackend {
             }
         }
     }
+
+    /// Screen-channel still: X11 full capture or the single portal attempt,
+    /// caching dims for zoom. Window captures crop out of this in `capture`.
+    async fn capture_screen_channel(&self) -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
+        if wayland_env() {
+            let cap = portal_screenshot().await?;
+            let geo = SurfaceGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: f64::from(cap.width),
+                height: f64::from(cap.height),
+            };
+            // X11 geometry is always live; only Wayland zoom reads the cache.
+            *SCREEN_DIMS.lock().unwrap_poison() = Some((cap.width, cap.height));
+            Ok((cap, geo))
+        } else {
+            with_block_in_place(x11_capture_screen)
+        }
+    }
 }
 
 // ── Pure helpers ─────────────────────────────────────────────────────────
 
-/// True when only a Wayland session is active — XTEST synthesis is impossible
-/// and every raw-input variant must degrade.
-fn is_wayland_only(wayland_display: bool, x11_display: bool) -> bool {
-    wayland_display && !x11_display
-}
-
-fn wayland_only_env() -> bool {
-    is_wayland_only(
-        std::env::var_os("WAYLAND_DISPLAY").is_some(),
-        std::env::var_os("DISPLAY").is_some(),
-    )
+fn wayland_env() -> bool {
+    // XWayland (both `WAYLAND_DISPLAY` and `DISPLAY` set) still counts as
+    // Wayland: XTEST would only drive XWayland windows while native Wayland
+    // windows ignore it, so raw input must degrade.
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// AT-SPI `Role` → the lowercase string the core matches on. Most CamelCase enum
@@ -815,87 +834,349 @@ fn raw_input_blocking(input: RawInput, geo: Option<&SurfaceGeometry>) -> Result<
     }
 }
 
-// ── Capture (xcap / X11) ────────────────────────────────────────────────
+// ── X11 stills (x11rb) ───────────────────────────────────────────────────
+// Blocking throughout; every entry runs inside `with_block_in_place`.
+// Per-CRTC `GetImage` tiles composited over the RandR union (negative origins
+// kept); screen→drawable mapping is `coord − union_min` — the root pixmap
+// spans the bounding box, so capture offsets are union-relative while the
+// geometry keeps the screen-space origin for coordinate mapping.
 
-/// Composite all monitors into one buffer covering the virtual-desktop union.
-/// Rect origins may be negative (offset); on overlaps the later monitor wins.
-fn capture_screen_blocking() -> Result<Capture, anyhow::Error> {
-    let monitors = xcap::Monitor::all()?;
-    if monitors.is_empty() {
-        anyhow::bail!("no monitors found");
+/// Monitor rects `(x, y, w, h)` from the RandR CRTC union. Any RandR failure
+/// or zero-area result falls back to the root window geometry.
+fn x11_monitor_rects(conn: &RustConnection, root: xproto::Window) -> Vec<(i32, i32, i32, i32)> {
+    let resources = randr::get_screen_resources_current(conn, root)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| (r.crtcs, r.config_timestamp))
+        .or_else(|| {
+            randr::get_screen_resources(conn, root)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| (r.crtcs, r.config_timestamp))
+        });
+    if let Some((crtcs, stamp)) = resources {
+        let mut rects = Vec::with_capacity(crtcs.len());
+        for crtc in crtcs {
+            let Some(info) = randr::get_crtc_info(conn, crtc, stamp)
+                .ok()
+                .and_then(|c| c.reply().ok())
+            else {
+                continue;
+            };
+            if info.mode == 0 || info.width == 0 || info.height == 0 {
+                continue;
+            }
+            rects.push((
+                i32::from(info.x),
+                i32::from(info.y),
+                i32::from(info.width),
+                i32::from(info.height),
+            ));
+        }
+        if !rects.is_empty() {
+            return rects;
+        }
     }
-    let mut rects = Vec::with_capacity(monitors.len());
-    for m in &monitors {
-        let w = m.width()? as i32;
-        let h = m.height()? as i32;
-        rects.push((m.x()?, m.y()?, w, h));
+    xproto::get_geometry(conn, root)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|g| vec![(0, 0, i32::from(g.width), i32::from(g.height))])
+        .unwrap_or_default()
+}
+
+/// Virtual-desktop union over the RandR CRTC rects.
+fn x11_screen_geometry() -> Result<SurfaceGeometry, anyhow::Error> {
+    let (conn, screen) = x11rb::connect(None)
+        .map_err(|e| core::taxonomy_error(core::ERR_DEGRADED, format!("no X11 display: {e}")))?;
+    let geo = surface_from_rects(&x11_monitor_rects(&conn, conn.setup().roots[screen].root));
+    if geo.width <= 0.0 || geo.height <= 0.0 {
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            "X11 capture failed: no monitor geometry",
+        ));
     }
+    Ok(geo)
+}
+
+/// Full virtual-desktop still: per-CRTC `GetImage` tiles (row-tiled to the
+/// server's max request size) composited over the RandR union via
+/// `core::blit_rgba`. The X11 root pixmap spans the RandR bounding box with
+/// drawable origin == union min (a pixmap has no negative indices), so
+/// screen→drawable mapping is always `coord - union_min`: one global
+/// coordinate system, no mixed spaces.
+fn x11_capture_screen() -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
+    let (conn, screen) = x11rb::connect(None)
+        .map_err(|e| core::taxonomy_error(core::ERR_DEGRADED, format!("no X11 display: {e}")))?;
+    let root = conn.setup().roots[screen].root;
+    let lsb_first = conn.setup().image_byte_order == xproto::ImageOrder::LSB_FIRST;
+    let cap_bytes = conn
+        .maximum_request_bytes()
+        .min(4 * 1024 * 1024)
+        .max(64 * 1024);
+    let rects = x11_monitor_rects(&conn, root);
     let geo = surface_from_rects(&rects);
-    let (out_w, out_h) = (geo.width.round() as usize, geo.height.round() as usize);
-    if out_w == 0 || out_h == 0 {
-        anyhow::bail!("virtual desktop has zero size");
+    let (w, h) = (geo.width.round() as u32, geo.height.round() as u32);
+    if w == 0 || h == 0 {
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            "X11 capture failed: empty virtual desktop",
+        ));
     }
-    let mut composite = vec![0u8; out_w * out_h * 4];
-    for m in &monitors {
-        let img = m.capture_image()?;
-        let cap = Capture {
-            width: img.width(),
-            height: img.height(),
-            rgba: img.into_raw(),
-        };
-        let dx = (m.x()? - geo.x.round() as i32).max(0) as usize;
-        let dy = (m.y()? - geo.y.round() as i32).max(0) as usize;
-        core::blit_rgba(&mut composite, out_w, out_h, &cap, dx, dy);
+    // `GetImage` takes u16 dims and i16 offsets — the union must fit `i16::MAX`.
+    if w > i16::MAX as u32 || h > i16::MAX as u32 {
+        return Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            "X11 capture failed: virtual desktop too large for the X11 protocol",
+        ));
     }
-    Ok(Capture {
-        width: out_w as u32,
-        height: out_h as u32,
-        rgba: composite,
-    })
+    let (ox, oy) = (geo.x.round() as i32, geo.y.round() as i32);
+    let (out_w, out_h) = (w as usize, h as usize);
+    let mut rgba = vec![0u8; out_w * out_h * 4];
+    for &(rx, ry, rw, rh) in &rects {
+        if rw <= 0 || rh <= 0 {
+            continue;
+        }
+        let tile_w = rw as u32;
+        let rows_per_tile = (cap_bytes / (tile_w as usize * 4)).max(1) as u32;
+        let mut y = 0i32;
+        while y < rh {
+            let tile_h = rows_per_tile.min((rh - y) as u32);
+            // Range-checked by the union guard above: every origin/dim passed
+            // is within `[0, union]`, so the `as i16/u16/usize` casts below
+            // cannot silently wrap.
+            let tile_reply = xproto::get_image(
+                &conn,
+                xproto::ImageFormat::Z_PIXMAP,
+                root,
+                (rx - ox) as i16,
+                (ry - oy + y) as i16,
+                tile_w as u16,
+                tile_h as u16,
+                u32::MAX,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok());
+            let Some(reply) = tile_reply else {
+                return Err(core::taxonomy_error(
+                    core::ERR_DEGRADED,
+                    "X11 capture failed",
+                ));
+            };
+            let tile =
+                core::x11_pixels_to_rgba(&reply.data, tile_w, tile_h, reply.depth, lsb_first)?;
+            let tile_cap = Capture {
+                width: tile_w,
+                height: tile_h,
+                rgba: tile,
+            };
+            core::blit_rgba(
+                &mut rgba,
+                out_w,
+                out_h,
+                &tile_cap,
+                (rx - ox) as usize,
+                (ry - oy + y) as usize,
+            );
+            y += tile_h as i32;
+        }
+    }
+    Ok((
+        Capture {
+            width: w,
+            height: h,
+            rgba,
+        },
+        geo,
+    ))
 }
 
-fn capture_xcap_window(win: &xcap::Window) -> Result<Capture, anyhow::Error> {
-    let img = win.capture_image()?;
-    Ok(Capture {
-        width: img.width(),
-        height: img.height(),
-        rgba: img.into_raw(),
+// ── Wayland stills (Screenshot portal over zbus) ──────────────────────────
+// One Screenshot attempt with short timeouts; deny/timeout/missing portal
+// degrades to accessibility-only — no retries, no prompt spam.
+
+/// Last known screen pixels, stored on every successful `Screen` capture so
+/// zoom can size itself without triggering a second portal dialog.
+static SCREEN_DIMS: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+static PORTAL_TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+const PORTAL_IFACE: &str = "org.freedesktop.portal.Screenshot";
+
+/// The session bus has a portal owner. Never pops a dialog — safe as a probe.
+/// Uses an untyped proxy: the generated `DBus` proxy trait is crate-private in
+/// zbus, so `NameHasOwner` is called by hand.
+async fn portal_available() -> bool {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let conn = zbus::Connection::session().await.ok()?;
+        let proxy = zbus::Proxy::new(
+            &conn,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .await
+        .ok()?;
+        let owned: bool = proxy.call("NameHasOwner", &PORTAL_BUS).await.ok()?;
+        Some(owned)
     })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }
 
-fn capture_window_blocking(pid: Option<u32>, title: &str) -> Result<Capture, anyhow::Error> {
-    let windows = xcap::Window::all()?;
-    let mut candidates: Vec<xcap::Window> = windows
-        .into_iter()
-        .filter(|w| pid.is_none_or(|p| w.pid().map(|wp| wp == p).unwrap_or(false)))
-        .collect();
-    if let Some(win) = candidates
-        .iter()
-        .find(|w| w.title().map(|t| t == title).unwrap_or(false))
-    {
-        return capture_xcap_window(win);
-    }
-    let win = candidates.into_iter().next().ok_or_else(|| {
+/// Single Screenshot-portal attempt: subscribe for the `Response` signal first
+/// (a fast compositor can't beat the subscription), then call, then wait.
+async fn portal_screenshot() -> Result<Capture, anyhow::Error> {
+    let conn = zbus::Connection::session().await.map_err(|e| {
         core::taxonomy_error(
-            core::ERR_NOT_MATCHED,
-            "no matching capture window — re-enumerate windows",
+            core::ERR_DEGRADED,
+            format!(
+                "Screenshot portal missing (no session bus: {e}) — no manual setup needed; \
+                 accessibility observe/act remain available"
+            ),
         )
     })?;
-    capture_xcap_window(&win)
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.portal.Request")?
+        .member("Response")?
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, &conn, None)
+        .await
+        .map_err(|e| {
+            core::taxonomy_error(core::ERR_DEGRADED, format!("portal subscribe failed: {e}"))
+        })?;
+    let token = format!(
+        "mahbot_{}_{}",
+        std::process::id(),
+        PORTAL_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut options = HashMap::new();
+    options.insert("handle_token", zbus::zvariant::Value::from(token));
+    options.insert("modal", zbus::zvariant::Value::from(false));
+    options.insert("interactive", zbus::zvariant::Value::from(false));
+    let proxy = zbus::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, PORTAL_IFACE)
+        .await
+        .map_err(|e| {
+            core::taxonomy_error(
+                core::ERR_DEGRADED,
+                format!("Screenshot portal unavailable ({e}); accessibility observe/act remain available"),
+            )
+        })?;
+    let (req_path,): (zbus::zvariant::OwnedObjectPath,) = tokio::time::timeout(
+        Duration::from_secs(10),
+        proxy.call("Screenshot", &("", options)),
+    )
+    .await
+    .map_err(|_| {
+        core::taxonomy_error(
+            core::ERR_DEGRADED,
+            "Screenshot portal call timed out; accessibility observe/act remain available",
+        )
+    })?
+    .map_err(|e| {
+        core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "Screenshot portal call failed ({e}); accessibility observe/act remain available"
+            ),
+        )
+    })?;
+    let want = req_path.as_str().to_owned();
+    let wait = async {
+        while let Some(msg) = stream.next().await {
+            let msg = msg.map_err(|e| {
+                core::taxonomy_error(
+                    core::ERR_DEGRADED,
+                    format!("portal response stream failed: {e}"),
+                )
+            })?;
+            if !msg
+                .header()
+                .path()
+                .is_some_and(|p| p.as_str() == want.as_str())
+            {
+                continue;
+            }
+            let (code, results): (u32, HashMap<String, zbus::zvariant::OwnedValue>) =
+                msg.body().deserialize().map_err(|e| {
+                    core::taxonomy_error(
+                        core::ERR_DEGRADED,
+                        format!("portal response decode failed: {e}"),
+                    )
+                })?;
+            return portal_response(code, results).await;
+        }
+        Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            "portal closed the Screenshot response stream; accessibility observe/act remain available",
+        ))
+    };
+    tokio::time::timeout(Duration::from_secs(15), wait)
+        .await
+        .map_err(|_| {
+            core::taxonomy_error(
+                core::ERR_DEGRADED,
+                "Screenshot response timed out; accessibility observe/act remain available",
+            )
+        })?
 }
 
-fn screen_surface_blocking() -> Result<SurfaceGeometry, anyhow::Error> {
-    let monitors = xcap::Monitor::all()?;
-    if monitors.is_empty() {
-        anyhow::bail!("no monitors found");
+/// `Response` signal body → pixels. Response 1 is an in-dialog deny/dismiss:
+/// opt-in consent, no auto-retry.
+async fn portal_response(
+    code: u32,
+    results: HashMap<String, zbus::zvariant::OwnedValue>,
+) -> Result<Capture, anyhow::Error> {
+    match code {
+        0 => {
+            let uri_value = results.get("uri").ok_or_else(|| {
+                core::taxonomy_error(core::ERR_DEGRADED, "portal Screenshot reply had no uri")
+            })?;
+            let uri = String::try_from(uri_value.try_clone().map_err(|e| {
+                core::taxonomy_error(core::ERR_DEGRADED, format!("portal uri unreadable: {e}"))
+            })?)
+            .map_err(|e| {
+                core::taxonomy_error(core::ERR_DEGRADED, format!("portal uri not a string: {e}"))
+            })?;
+            let path = core::portal_uri_to_path(&uri)?;
+            let read = tokio::fs::read(&path).await;
+            tokio::fs::remove_file(&path).await.ok();
+            let bytes = read.map_err(|e| {
+                core::taxonomy_error(
+                    core::ERR_DEGRADED,
+                    format!("portal screenshot unreadable: {e}"),
+                )
+            })?;
+            let img =
+                with_block_in_place(move || image::load_from_memory(&bytes)).map_err(|e| {
+                    core::taxonomy_error(
+                        core::ERR_DEGRADED,
+                        format!("portal screenshot undecodable: {e}"),
+                    )
+                })?;
+            let rgba = img.to_rgba8();
+            Ok(Capture {
+                width: rgba.width(),
+                height: rgba.height(),
+                rgba: rgba.into_raw(),
+            })
+        }
+        1 => Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            "screenshot dismissed or denied in the system dialog — screenshots are an opt-in \
+             elevated permission, no auto-retry; accessibility observe/act remain available",
+        )),
+        _ => Err(core::taxonomy_error(
+            core::ERR_DEGRADED,
+            format!(
+                "portal Screenshot failed (response {code}); accessibility observe/act remain available"
+            ),
+        )),
     }
-    let mut rects = Vec::with_capacity(monitors.len());
-    for m in &monitors {
-        let w = m.width()? as i32;
-        let h = m.height()? as i32;
-        rects.push((m.x()?, m.y()?, w, h));
-    }
-    Ok(surface_from_rects(&rects))
 }
 
 // ── Backend impl ─────────────────────────────────────────────────────────
@@ -912,15 +1193,27 @@ impl Backend for LinuxBackend {
     }
 
     async fn capture_available(&self) -> bool {
-        with_block_in_place(|| xcap::Monitor::all().map(|m| !m.is_empty()).unwrap_or(false))
+        if wayland_env() {
+            portal_available().await
+        } else {
+            with_block_in_place(|| x11_screen_geometry().is_ok())
+        }
     }
 
     fn capture_unavailable_error(&self) -> anyhow::Error {
-        core::taxonomy_error(
-            core::ERR_DEGRADED,
-            "screen capture is unavailable (Wayland session without portal support in v1, or \
-             X11 capture init failed); accessibility observe/act remain available",
-        )
+        if wayland_env() {
+            core::taxonomy_error(
+                core::ERR_DEGRADED,
+                "Wayland capture unavailable (Screenshot portal missing or denied) — no manual \
+                 setup needed, screenshots are an opt-in elevated permission; accessibility \
+                 observe/act remain available",
+            )
+        } else {
+            core::taxonomy_error(
+                core::ERR_DEGRADED,
+                "X11 capture init failed — accessibility observe/act remain available",
+            )
+        }
     }
 
     async fn list_apps(&self) -> Result<Vec<AppInfo>, anyhow::Error> {
@@ -975,7 +1268,27 @@ impl Backend for LinuxBackend {
         target: &TargetSpec,
     ) -> Result<SurfaceGeometry, anyhow::Error> {
         match target {
-            TargetSpec::Screen => with_block_in_place(screen_surface_blocking),
+            TargetSpec::Screen => {
+                if wayland_env() {
+                    // Zoom sizes itself from the last Screen capture so it never
+                    // triggers a second portal dialog.
+                    match *SCREEN_DIMS.lock().unwrap_poison() {
+                        Some((w, h)) => Ok(SurfaceGeometry {
+                            x: 0.0,
+                            y: 0.0,
+                            width: f64::from(w),
+                            height: f64::from(h),
+                        }),
+                        None => Err(core::taxonomy_error(
+                            core::ERR_DEGRADED,
+                            "no cached Wayland screen size — capture the screen first; \
+                             accessibility observe/act remain available",
+                        )),
+                    }
+                } else {
+                    with_block_in_place(x11_screen_geometry)
+                }
+            }
             other => {
                 let conn = self.conn().await?;
                 let (window_ref, _app) = resolve_window(&conn, other).await?;
@@ -1077,7 +1390,7 @@ impl Backend for LinuxBackend {
     }
 
     async fn raw_input(&self, target: &TargetSpec, input: RawInput) -> Result<(), anyhow::Error> {
-        if wayland_only_env() {
+        if wayland_env() {
             return Err(core::taxonomy_error(
                 core::ERR_DEGRADED,
                 "Wayland sessions do not support raw input synthesis (no XTEST); use ref-based \
@@ -1094,7 +1407,7 @@ impl Backend for LinuxBackend {
     }
 
     async fn cursor_position(&self) -> Result<(f64, f64), anyhow::Error> {
-        if wayland_only_env() {
+        if wayland_env() {
             return Err(core::taxonomy_error(
                 core::ERR_DEGRADED,
                 "global pointer position is not exposed on Wayland",
@@ -1108,25 +1421,29 @@ impl Backend for LinuxBackend {
         })
     }
 
+    /// Window stills show current visible pixels (occluders visible; use
+    /// observe for the exact tree).
     async fn capture(&self, target: &TargetSpec) -> Result<Capture, anyhow::Error> {
         match target {
-            TargetSpec::Screen => with_block_in_place(capture_screen_blocking),
+            TargetSpec::Screen => Ok(self.capture_screen_channel().await?.0),
             other => {
                 let conn = self.conn().await?;
-                let (window_ref, app_info) = resolve_window(&conn, other).await?;
+                let (window_ref, _app) = resolve_window(&conn, other).await?;
                 let proxy = window_ref
                     .as_accessible_proxy(conn.connection())
                     .await
                     .map_err(|e| dbus_err(e, "open window"))?;
-                let title = proxy.name().await.unwrap_or_default();
-                let pid = app_info.pid;
-                with_block_in_place(|| capture_window_blocking(pid, &title))
+                let win = window_screen_extents(&proxy)
+                    .await
+                    .ok_or_else(|| anyhow!("window geometry unavailable"))?;
+                let (screen_cap, screen_geo) = self.capture_screen_channel().await?;
+                core::crop_rgba(&screen_cap, core::window_capture_rect(&win, &screen_geo)?)
             }
         }
     }
 }
 
-// ── Tests (pure logic only; no D-Bus / enigo / xcap) ─────────────────────
+// ── Tests (pure logic only; no D-Bus / X11 / portal) ─────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1144,14 +1461,6 @@ mod tests {
         // Unknown / unmapped enum variant → Debug name lowercased.
         assert_eq!(role_name(Role::Unknown), "unknown");
         assert_eq!(role_name(Role::Canvas), "canvas");
-    }
-
-    #[test]
-    fn wayland_gating_requires_no_x11() {
-        assert!(is_wayland_only(true, false));
-        assert!(!is_wayland_only(true, true)); // XWayland: DISPLAY set → X11 synthesis works
-        assert!(!is_wayland_only(false, true));
-        assert!(!is_wayland_only(false, false));
     }
 
     #[test]

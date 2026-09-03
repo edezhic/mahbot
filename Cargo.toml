@@ -213,13 +213,13 @@ block2 = "0.6"
 dispatch2 = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Computer Use tool (GUI observe/act): AT-SPI2 accessibility tree (async
-# D-Bus), XTEST input synthesis and X11 capture. The backend is a thin adapter
-# over these mature crates; raw input requires X11 (Wayland surfaces report a
-# clear degraded error instead).
+# Computer Use tool (GUI observe/act): AT-SPI2 accessibility tree over D-Bus,
+# XTEST input synthesis via enigo, X11 stills via x11rb and Wayland stills via
+# the Screenshot portal over zbus — all Rust-only, no system packages.
 atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "wrappers", "tokio"] }
 enigo = { version = "0.6", default-features = false, features = ["x11rb"] }
-xcap = "0.9"
+x11rb = "0.13"
+zbus = "5"
 # Boxes the async AT-SPI tree walk (already a transitive zbus dependency — same
 # version, no new fork); the accessibility tree is inherently recursive.
 async-recursion = "1.1"
