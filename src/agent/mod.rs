@@ -2556,34 +2556,10 @@ mod tests {
     /// Construct an agent with an explicit workspace and id (for tools that
     /// resolve paths against a real directory, e.g. the read tool).
     fn make_agent_on(tools: Vec<Box<dyn Tool>>, agent_id: &str, ws: crate::Workspace) -> Agent {
-        let tool_specs = tools.iter().map(|t| t.spec()).collect();
-        Agent {
-            agent_id: agent_id.to_string(),
-            role: crate::Role::Engineer,
-            session: Session::default(),
-            workspace: std::sync::Arc::new(ws),
-            tools,
-            tool_specs,
-            cancel_token: CancellationToken::new(),
-            pause_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            paused_frozen: std::sync::atomic::AtomicBool::new(false),
-            ticket: None,
-            generation: 0,
-            tool_stats: std::sync::Mutex::new(Vec::new()),
-            user_name: String::new(),
-            channel: String::new(),
-            full_access: false,
-            parent_key: None,
-            parent_label: None,
-            incoming_rx: None,
-            round_ts: None,
-            first_call_notify: None,
-            failure: None,
-            failure_class: None,
-            background_sessions: std::sync::Arc::new(
-                crate::tools::shell::BackgroundSessions::default(),
-            ),
-        }
+        let mut agent = make_agent_with_role(tools, crate::Role::Engineer);
+        agent.agent_id = agent_id.to_string();
+        agent.workspace = std::sync::Arc::new(ws);
+        agent
     }
 
     #[tokio::test]
