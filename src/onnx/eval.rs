@@ -40,16 +40,12 @@ type Value = Tensor;
 // ── Attribute access ──────────────────────────────────────────────────
 
 fn get_attr<'a>(node: &'a Node, name: &str) -> Result<&'a AttrKind> {
-    node.attributes
-        .iter()
-        .find(|a| a.name == name)
-        .map(|a| &a.kind)
-        .ok_or_else(|| {
-            candle_core::Error::Msg(format!(
-                "cannot find the '{name}' attribute in '{}' for {}",
-                node.op_type, node.name
-            ))
-        })
+    get_attr_opt(node, name).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "cannot find the '{name}' attribute in '{}' for {}",
+            node.op_type, node.name
+        ))
+    })
 }
 
 fn get_attr_opt<'a>(node: &'a Node, name: &str) -> Option<&'a AttrKind> {
@@ -79,6 +75,18 @@ fn attr_f(attr: &AttrKind, node: &Node, name: &str) -> Result<f32> {
             node.name
         ),
     }
+}
+
+fn attr_i_opt(node: &Node, name: &str) -> Result<Option<i64>> {
+    get_attr_opt(node, name)
+        .map(|a| attr_i(a, node, name))
+        .transpose()
+}
+
+fn attr_f_opt(node: &Node, name: &str) -> Result<Option<f32>> {
+    get_attr_opt(node, name)
+        .map(|a| attr_f(a, node, name))
+        .transpose()
 }
 
 fn attr_ints<'a>(attr: &'a AttrKind, node: &Node, name: &str) -> Result<&'a [i64]> {
@@ -374,10 +382,9 @@ pub fn simple_eval(
             }
             "Softmax" => {
                 let input = get(&node.inputs[0])?;
-                let output = match get_attr_opt(node, "axis") {
+                let output = match attr_i_opt(node, "axis")? {
                     None => candle_nn::ops::softmax_last_dim(input)?,
-                    Some(attr) => {
-                        let axis = attr_i(attr, node, "axis")?;
+                    Some(axis) => {
                         let axis = input.normalize_axis(axis)?;
                         candle_nn::ops::softmax(input, axis)?
                     }
@@ -412,10 +419,7 @@ pub fn simple_eval(
                 if attr_i(get_attr(node, "training_mode")?, node, "training_mode")? != 0 {
                     bail!("training mode is not supported for BatchNorm");
                 }
-                let eps = get_attr_opt(node, "epsilon")
-                    .map(|a| attr_f(a, node, "epsilon"))
-                    .transpose()?
-                    .unwrap_or(1e-5);
+                let eps = attr_f_opt(node, "epsilon")?.unwrap_or(1e-5);
                 let xs = get(&node.inputs[0])?;
                 let weight = get(&node.inputs[1])?;
                 let bias = get(&node.inputs[2])?;
@@ -522,10 +526,7 @@ pub fn simple_eval(
             "Gather" => {
                 let xs = get(&node.inputs[0])?;
                 let indices = get(&node.inputs[1])?;
-                let axis = match get_attr_opt(node, "axis") {
-                    Some(attr) => attr_i(attr, node, "axis")?,
-                    None => 0,
-                };
+                let axis = attr_i_opt(node, "axis")?.unwrap_or(0);
                 let axis = xs.normalize_axis(axis)?;
 
                 // index_select does not support negative indices, so normalize
@@ -563,14 +564,8 @@ pub fn simple_eval(
             }
             "Shape" => {
                 let xs = get(&node.inputs[0])?;
-                let start = get_attr_opt(node, "start")
-                    .map(|a| attr_i(a, node, "start"))
-                    .transpose()?
-                    .unwrap_or(0);
-                let end = get_attr_opt(node, "end")
-                    .map(|a| attr_i(a, node, "end"))
-                    .transpose()?
-                    .unwrap_or(-1);
+                let start = attr_i_opt(node, "start")?.unwrap_or(0);
+                let end = attr_i_opt(node, "end")?.unwrap_or(-1);
                 let start = xs.normalize_axis(start)?;
                 let end = xs.normalize_axis(end)?;
                 let mut dims = vec![];
@@ -864,14 +859,8 @@ pub fn simple_eval(
             "ReduceSum" => {
                 let input = get(&node.inputs[0])?;
                 let axes = get_opt(1);
-                let keepdims = get_attr_opt(node, "keepdims")
-                    .map(|a| attr_i(a, node, "keepdims"))
-                    .transpose()?
-                    .unwrap_or(1);
-                let noop_with_empty_axes = get_attr_opt(node, "noop_with_empty_axes")
-                    .map(|a| attr_i(a, node, "noop_with_empty_axes"))
-                    .transpose()?
-                    .unwrap_or(0);
+                let keepdims = attr_i_opt(node, "keepdims")?.unwrap_or(1);
+                let noop_with_empty_axes = attr_i_opt(node, "noop_with_empty_axes")?.unwrap_or(0);
 
                 let axes: Vec<usize> = match axes {
                     Some(Ok(axes)) => axes
@@ -897,10 +886,7 @@ pub fn simple_eval(
             }
             "Split" => {
                 let input_tensor = get(&node.inputs[0])?;
-                let axis = get_attr_opt(node, "axis")
-                    .map(|a| attr_i(a, node, "axis"))
-                    .transpose()?
-                    .unwrap_or(0);
+                let axis = attr_i_opt(node, "axis")?.unwrap_or(0);
                 let axis = input_tensor.normalize_axis(axis)?;
 
                 // Determine split sizes: from the split input when provided,
@@ -909,11 +895,8 @@ pub fn simple_eval(
                     let split_tensor = get(&node.inputs[1])?.to_vec1::<i64>()?;
                     split_tensor.iter().map(|&x| x as usize).collect::<Vec<_>>()
                 } else {
-                    let num_outputs = if let Some(attr) = get_attr_opt(node, "num_outputs") {
-                        attr_i(attr, node, "num_outputs")? as usize
-                    } else {
-                        node.outputs.len()
-                    };
+                    let num_outputs = attr_i_opt(node, "num_outputs")?
+                        .map_or_else(|| node.outputs.len(), |v| v as usize);
                     let input_dim = input_tensor.dim(axis)?;
                     let mut split_sizes = vec![input_dim / num_outputs; num_outputs];
                     let remainder = input_dim % num_outputs;
@@ -973,14 +956,8 @@ pub fn simple_eval(
                 } else {
                     None
                 };
-                let axis = get_attr_opt(node, "axis")
-                    .map(|a| attr_i(a, node, "axis"))
-                    .transpose()?
-                    .unwrap_or(-1);
-                let epsilon = get_attr_opt(node, "epsilon")
-                    .map(|a| attr_f(a, node, "epsilon"))
-                    .transpose()?
-                    .unwrap_or(1e-5);
+                let axis = attr_i_opt(node, "axis")?.unwrap_or(-1);
+                let epsilon = attr_f_opt(node, "epsilon")?.unwrap_or(1e-5);
 
                 let n_dims = input.dims().len();
                 let normal_axis: usize = if axis < 0 {
@@ -1016,26 +993,14 @@ pub fn simple_eval(
                 let b = get(&node.inputs[1])?;
                 let c = get(&node.inputs[2])?;
 
-                let alpha = get_attr_opt(node, "alpha")
-                    .map(|attr| attr_f(attr, node, "alpha"))
-                    .transpose()?
-                    .unwrap_or(1.0);
-                let beta = get_attr_opt(node, "beta")
-                    .map(|attr| attr_f(attr, node, "beta"))
-                    .transpose()?
-                    .unwrap_or(1.0);
+                let alpha = attr_f_opt(node, "alpha")?.unwrap_or(1.0);
+                let beta = attr_f_opt(node, "beta")?.unwrap_or(1.0);
 
                 let alpha = Tensor::full(alpha, a.shape(), &Device::Cpu)?;
                 let beta = Tensor::full(beta, c.shape(), &Device::Cpu)?;
 
-                let trans_a = get_attr_opt(node, "transA")
-                    .map(|attr| attr_i(attr, node, "transA"))
-                    .transpose()?
-                    .unwrap_or(0);
-                let trans_b = get_attr_opt(node, "transB")
-                    .map(|attr| attr_i(attr, node, "transB"))
-                    .transpose()?
-                    .unwrap_or(0);
+                let trans_a = attr_i_opt(node, "transA")?.unwrap_or(0);
+                let trans_b = attr_i_opt(node, "transB")?.unwrap_or(0);
 
                 let a = if trans_a == 0 { a.clone() } else { a.t()? };
                 let b = if trans_b == 0 { b.clone() } else { b.t()? };
@@ -1047,10 +1012,7 @@ pub fn simple_eval(
             }
             "Conv" => {
                 let dilations = get_attr_opt(node, "dilations");
-                let groups = get_attr_opt(node, "group")
-                    .map(|a| attr_i(a, node, "group"))
-                    .transpose()?
-                    .unwrap_or(1);
+                let groups = attr_i_opt(node, "group")?.unwrap_or(1);
                 let pads = get_attr_opt(node, "pads");
                 let strides = get_attr_opt(node, "strides");
                 if let Some(auto_pad) = get_attr_opt(node, "auto_pad") {
