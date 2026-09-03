@@ -610,12 +610,11 @@ pub(crate) fn build_async_result_envelope(result: &anyhow::Result<String>, tag: 
     }
 }
 
-/// Shared tail of the resume paths: terminalize a durable
-/// analyze/research job and route its envelope to the stored caller. Takes
-/// pre-built content so the caller's named wrapper keeps kind and tag
-/// paired; the INSERT-failure best-effort route lives inside
-/// [`crate::jobs::complete_durable_job`].
-pub(crate) async fn complete_durable_job_and_route(
+/// Tail of the analyze resume paths: terminalize a durable analyze job and
+/// route its envelope to the stored caller. Takes pre-built content so the
+/// caller's named wrapper keeps kind and tag paired; the INSERT-failure
+/// best-effort route lives inside [`crate::jobs::complete_durable_job`].
+async fn complete_durable_job_and_route(
     job_id: &str,
     content: String,
     kind: MessageKind,
@@ -833,9 +832,31 @@ pub(crate) struct VerificationResult {
     pub queries: Vec<String>,
 }
 
+impl VerificationResult {
+    /// Fail-open verifier outcome: the claim could not be verified (deadline,
+    /// panic, no/empty response, extraction failure, budget exhaustion).
+    /// Canonical home of the "unresolved" verdict string.
+    pub(crate) fn unresolved(
+        claim: &str,
+        evidence: impl Into<String>,
+        tool_calls: usize,
+        searches: usize,
+        queries: Vec<String>,
+    ) -> Self {
+        Self {
+            claim: claim.to_string(),
+            verdict: "unresolved".to_string(),
+            evidence: evidence.into(),
+            tool_calls,
+            searches,
+            queries,
+        }
+    }
+}
+
 /// Reject verification verdicts outside the accepted vocabulary — fail-closed
 /// inside the extraction retry loop.
-pub(crate) fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(), String> {
+fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(), String> {
     if matches!(
         v.verdict.as_str(),
         "supported" | "contradicted" | "unresolved"
@@ -1435,14 +1456,13 @@ pub(crate) async fn dispatch_claim_verifiers(
         .map(|(i, m)| match m {
             RoundMember::Done(v) => v,
             RoundMember::TimedOut | RoundMember::Panicked | RoundMember::Cancelled => {
-                VerificationResult {
-                    claim: targets[i].claim.clone(),
-                    verdict: "unresolved".to_string(),
-                    evidence: "verifier never completed (round deadline or panic)".to_string(),
-                    tool_calls: 0,
-                    searches: 0,
-                    queries: Vec::new(),
-                }
+                VerificationResult::unresolved(
+                    &targets[i].claim,
+                    "verifier never completed (round deadline or panic)",
+                    0,
+                    0,
+                    Vec::new(),
+                )
             }
         })
         .collect();
@@ -1484,24 +1504,22 @@ async fn run_claim_verifier(
     // annotation section (the extra scan is cheap and keeps one shared shape).
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
     let Some(raw) = response else {
-        return VerificationResult {
-            claim: target_claim.to_string(),
-            verdict: "unresolved".to_string(),
-            evidence: "verifier failed to produce a response".to_string(),
+        return VerificationResult::unresolved(
+            target_claim,
+            "verifier failed to produce a response",
             tool_calls,
             searches,
             queries,
-        };
+        );
     };
     if raw.trim().is_empty() {
-        return VerificationResult {
-            claim: target_claim.to_string(),
-            verdict: "unresolved".to_string(),
-            evidence: "verifier produced an empty response".to_string(),
+        return VerificationResult::unresolved(
+            target_claim,
+            "verifier produced an empty response",
             tool_calls,
             searches,
             queries,
-        };
+        );
     }
     match agent
         .extract_verdict::<VerificationVerdict>(
@@ -1521,14 +1539,13 @@ async fn run_claim_verifier(
             searches,
             queries,
         },
-        Err(e) => VerificationResult {
-            claim: target_claim.to_string(),
-            verdict: "unresolved".to_string(),
-            evidence: format!("verification extraction failed: {e}"),
+        Err(e) => VerificationResult::unresolved(
+            target_claim,
+            format!("verification extraction failed: {e}"),
             tool_calls,
             searches,
             queries,
-        },
+        ),
     }
 }
 

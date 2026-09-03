@@ -2930,15 +2930,13 @@ async fn research_verification_pass(
         .skip(results.len())
         .take(primary_count.saturating_sub(results.len()))
     {
-        results.push(VerificationResult {
-            claim: t.claim.clone(),
-            verdict: "unresolved".to_string(),
-            evidence: "verification skipped — budget exhausted or round deadline expired"
-                .to_string(),
-            tool_calls: 0,
-            searches: 0,
-            queries: Vec::new(),
-        });
+        results.push(VerificationResult::unresolved(
+            &t.claim,
+            "verification skipped — budget exhausted or round deadline expired",
+            0,
+            0,
+            Vec::new(),
+        ));
     }
     results
 }
