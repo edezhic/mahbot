@@ -312,7 +312,7 @@ pub fn maint_badge<'a, Message: 'a>(enabled: bool) -> Column<'a, Message> {
     .align_x(Alignment::Center)
 }
 
-/// Page/panel section heading: JetBrains Mono, 16px, accent color.
+/// Page/panel section heading: JetBrains Mono, 16px, secondary text color.
 #[must_use]
 pub fn section_heading<'a>(
     title: impl Into<String>,
@@ -320,7 +320,7 @@ pub fn section_heading<'a>(
     text(title.into())
         .font(theme::JETBRAINS_MONO)
         .size(theme::TEXT_16)
-        .color(theme::ACCENT)
+        .color(theme::TEXT_SECONDARY)
 }
 
 /// Sub-heading inside a section (smaller sibling of [`section_heading`]).
@@ -331,7 +331,7 @@ pub fn section_subheading<'a>(
     text(title.into())
         .font(theme::JETBRAINS_MONO)
         .size(theme::TEXT_13)
-        .color(theme::ACCENT)
+        .color(theme::TEXT_SECONDARY)
 }
 
 /// Icon size of the board's ticket-card action/archive buttons.

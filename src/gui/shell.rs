@@ -280,7 +280,14 @@ impl ShellState {
 
     /// Build a placeholder message when no workspace is selected.
     fn placeholder_view(msg: &str) -> Element<'_, ShellMessage> {
-        Self::centered_title_subtitle("Terminal", theme::ACCENT, msg, 13, theme::TEXT_MUTED, 4)
+        Self::centered_title_subtitle(
+            "Terminal",
+            theme::TEXT_SECONDARY,
+            msg,
+            13,
+            theme::TEXT_MUTED,
+            4,
+        )
     }
 
     /// Build a centered title + subtitle message display.

@@ -3371,7 +3371,7 @@ impl SettingsState {
 
 // ── Shared widgets ───────────────────────────────────────────────
 
-/// Section heading (accent-colored monospace title above the content).
+/// Section heading (secondary-colored monospace title above the content).
 fn section<'a>(
     title: &'static str,
     content: Column<'a, SettingsMessage>,

@@ -510,7 +510,7 @@ fn render_group(
         header_parts.push(
             text("run active")
                 .size(theme::TEXT_11)
-                .color(theme::ACCENT)
+                .color(theme::TEXT_SECONDARY)
                 .into(),
         );
     }

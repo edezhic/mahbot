@@ -1802,7 +1802,9 @@ impl Dashboard {
         if !self.ready {
             return container(
                 column![
-                    text("MahBot").size(theme::TEXT_24).color(theme::ACCENT),
+                    text("MahBot")
+                        .size(theme::TEXT_24)
+                        .color(theme::TEXT_PRIMARY),
                     text("Starting…")
                         .size(theme::TEXT_16)
                         .color(theme::TEXT_MUTED),
