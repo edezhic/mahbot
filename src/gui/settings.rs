@@ -2054,17 +2054,14 @@ impl SettingsState {
                     }
 
                     view_col = view_col.push(Space::new().height(12));
-                    view_col = view_col.push(
-                        row![
-                            Space::new().width(Length::Fill),
-                            button(text("Close").size(theme::TEXT_13))
-                                .style(theme::button_secondary)
-                                .on_press(SettingsMessage::WorkspaceMsg(
-                                    workspaces::WorkspacesMessage::Escape,
-                                )),
-                        ]
-                        .align_y(Alignment::Center),
-                    );
+                    view_col = view_col.push(dialog::dialog_footer_row([button(
+                        text("Close").size(theme::TEXT_13),
+                    )
+                    .style(theme::button_secondary)
+                    .on_press(SettingsMessage::WorkspaceMsg(
+                        workspaces::WorkspacesMessage::Escape,
+                    ))
+                    .into()]));
                     view_col.spacing(theme::SPACE_4).into()
                 }
             };
@@ -3614,23 +3611,21 @@ fn modal_dialog<'a>(
         col = col.push(Space::new().height(16));
     }
 
-    col = col.push(
-        row![
-            Space::new().width(Length::Fill),
-            button(text("Cancel").size(theme::TEXT_13))
-                .style(theme::button_secondary)
-                .on_press(on_cancel),
-            Space::new().width(theme::SPACE_8),
-            button(text(if adding { "Adding..." } else { submit_label }).size(theme::TEXT_13))
-                .style(theme::button_secondary)
-                .on_press_maybe(if adding || !submit_enabled {
-                    None
-                } else {
-                    Some(on_submit)
-                }),
-        ]
-        .align_y(Alignment::Center),
-    );
+    let cancel_btn = button(text("Cancel").size(theme::TEXT_13))
+        .style(theme::button_secondary)
+        .on_press(on_cancel);
+    let submit_btn =
+        button(text(if adding { "Adding..." } else { submit_label }).size(theme::TEXT_13))
+            .style(theme::button_secondary)
+            .on_press_maybe(if adding || !submit_enabled {
+                None
+            } else {
+                Some(on_submit)
+            });
+    col = col.push(dialog::dialog_footer_row([
+        cancel_btn.into(),
+        submit_btn.into(),
+    ]));
 
     dialog::dialog_shell(col, 620.0, 24.0).into()
 }

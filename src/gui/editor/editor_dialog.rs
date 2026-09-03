@@ -21,6 +21,18 @@ use super::{
 
 // ── Overlay helpers ────────────────────────────────────────────────
 
+/// Standard overlay shell: dialog chrome inside a backdrop that closes on Escape.
+fn overlay_shell<'a>(
+    content: impl Into<Element<'a, EditorMessage>>,
+    width: f32,
+) -> Element<'a, EditorMessage> {
+    widgets::modal_backdrop(
+        dialog::dialog_shell(content, width, 12.0),
+        EditorMessage::Escape,
+        0.4,
+    )
+}
+
 /// Style for a search/quick-open result row: transparent by default,
 /// highlighted when selected.
 fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
@@ -28,6 +40,26 @@ fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
         background: Some(iced::Background::Color(bg)),
         ..Default::default()
     }
+}
+
+/// A clickable search-result row: padded content inside a full-width
+/// transparent button whose container is highlighted when selected.
+fn result_entry(
+    content: impl Into<Element<'static, EditorMessage>>,
+    bg: Color,
+    on_press: EditorMessage,
+) -> Element<'static, EditorMessage> {
+    button(
+        container(content)
+            .padding(theme::PAD_4)
+            .width(Length::Fill)
+            .style(result_entry_style(bg)),
+    )
+    .on_press(on_press)
+    .style(theme::button_transparent)
+    .width(Length::Fill)
+    .padding(0)
+    .into()
 }
 
 /// Build the quick-open overlay: a centered dialog with search input
@@ -67,21 +99,15 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
             } else {
                 iced::Color::TRANSPARENT
             };
-            let label = text(path_owned).size(theme::TEXT_12).color(if is_selected {
-                theme::ACCENT
-            } else {
-                theme::TEXT_SECONDARY
-            });
-            let entry = container(label)
-                .padding(theme::PAD_4)
-                .width(Length::Fill)
-                .style(result_entry_style(bg));
-            button(entry)
-                .on_press(EditorMessage::QuickOpenSelect(i))
-                .style(theme::button_transparent)
-                .width(Length::Fill)
-                .padding(0)
-                .into()
+            result_entry(
+                text(path_owned).size(theme::TEXT_12).color(if is_selected {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT_SECONDARY
+                }),
+                bg,
+                EditorMessage::QuickOpenSelect(i),
+            )
         })
         .collect();
 
@@ -117,9 +143,7 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
         .into()
     };
 
-    let dialog = dialog::dialog_shell(content, 400.0, 12.0);
-
-    widgets::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
+    overlay_shell(content, 400.0)
 }
 
 // ── Close dialog ──────────────────────────────────────────────────
@@ -142,6 +166,19 @@ fn dialog_button(
     .into()
 }
 
+/// Warning-icon + bold title row used by destructive confirm dialogs.
+fn warning_title(title: &str) -> Element<'_, EditorMessage> {
+    row![
+        lucide::triangle_alert::<iced::Theme, iced::Renderer>()
+            .size(theme::TEXT_16)
+            .color(theme::STATUS_WARNING),
+        Space::new().width(theme::SPACE_8),
+        dialog::dialog_title(title),
+    ]
+    .align_y(Alignment::Center)
+    .into()
+}
+
 /// Build the close-save-discard dialog overlay.
 pub(super) fn build_close_dialog(
     on_save: EditorMessage,
@@ -151,14 +188,7 @@ pub(super) fn build_close_dialog(
 ) -> Element<'static, EditorMessage> {
     widgets::modal_backdrop(
         dialog::confirm_dialog(
-            row![
-                lucide::triangle_alert::<iced::Theme, iced::Renderer>()
-                    .size(theme::TEXT_16)
-                    .color(theme::STATUS_WARNING),
-                Space::new().width(theme::SPACE_8),
-                dialog::dialog_title("Unsaved changes"),
-            ]
-            .align_y(Alignment::Center),
+            warning_title("Unsaved changes"),
             dialog::dialog_body([description]),
             [
                 dialog::DialogAction::secondary("Cancel", on_cancel.clone()),
@@ -201,14 +231,7 @@ pub(super) fn build_delete_confirm_dialog(
 
     widgets::modal_backdrop(
         dialog::confirm_dialog(
-            row![
-                lucide::triangle_alert::<iced::Theme, iced::Renderer>()
-                    .size(theme::TEXT_16)
-                    .color(theme::STATUS_WARNING),
-                Space::new().width(theme::SPACE_8),
-                dialog::dialog_title(title),
-            ]
-            .align_y(Alignment::Center),
+            warning_title(title),
             dialog::dialog_body([description]),
             [
                 dialog::DialogAction::secondary("Cancel", EditorMessage::CancelDelete),
@@ -416,17 +439,7 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
 
             let entry_content = column![path_label, snippet_label].spacing(theme::SPACE_1);
 
-            let entry = container(entry_content)
-                .padding(theme::PAD_4)
-                .width(Length::Fill)
-                .style(result_entry_style(bg));
-
-            button(entry)
-                .on_press(EditorMessage::GlobalSearchSelect(i))
-                .style(theme::button_transparent)
-                .width(Length::Fill)
-                .padding(0)
-                .into()
+            result_entry(entry_content, bg, EditorMessage::GlobalSearchSelect(i))
         })
         .collect();
 
@@ -448,7 +461,5 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
         .into()
     };
 
-    let dialog = dialog::dialog_shell(content, 600.0, 12.0);
-
-    widgets::modal_backdrop(dialog, EditorMessage::Escape, 0.4)
+    overlay_shell(content, 600.0)
 }
