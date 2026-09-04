@@ -11,6 +11,7 @@ pub(crate) mod edit;
 pub(crate) mod image_gen;
 pub(crate) mod implement;
 pub(crate) mod mahbot_debug;
+pub(crate) mod manager_chat;
 pub mod media_catalog;
 pub(crate) mod path;
 pub(crate) mod read;
@@ -162,6 +163,7 @@ pub(crate) use edit::EditTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use implement::ImplementTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
+pub(crate) use manager_chat::{ReadManagerChatTool, SendMessageToManagerTool};
 pub(crate) use read::{ReadTool, StrictReadTool};
 pub(crate) use research::ResearchTool;
 pub(crate) use search::SearchTool;
@@ -613,6 +615,8 @@ pub(crate) fn spawn_dispatch_and_route(
                     role: params.caller_role,
                     reply_target: None,
                     pending_job_id: None,
+                    reply_to_agent_id: None,
+                    reply_workspace_name: None,
                 }
             }
         };

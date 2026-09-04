@@ -123,6 +123,18 @@ pub enum MessageKind {
     /// suppressed for this kind (the emoji fires once on the original
     /// failure, not on silent retries).
     RecoveryRetry,
+    /// Message sent by an assistant agent into a workspace Manager's session,
+    /// wrapped in an `<assistant-message>` envelope. Manager-bound and durable
+    /// (persisted to `pending_jobs` before routing, same class as Manager-bound
+    /// `UserMessage`); the Manager's chronicle/CDC drain applies. Deliberately
+    /// distinct from `UserMessage` so the failure-emoji gate (`== UserMessage`)
+    /// structurally excludes it.
+    AgentMessage,
+    /// Durable, user-invisible copy of a Manager's response, addressed back
+    /// into the originating Assistant agent's session (`<manager-reply>`
+    /// envelope). Appended to the session like other result kinds; never
+    /// broadcast/persisted to chat_history.
+    ManagerReply,
 }
 
 /// A single unit of work for an agent consumer.
@@ -151,6 +163,18 @@ pub struct AgentJob {
     /// `run_agent` returns — the at-least-once delivery boundary.
     #[serde(default)]
     pub pending_job_id: Option<String>,
+    /// Agent session the response to this job must be addressed to. Set only on
+    /// [`MessageKind::AgentMessage`] jobs (the originating Assistant's agent id,
+    /// copied onto the resulting [`MessageKind::ManagerReply`] envelope job) and on
+    /// `ManagerReply` jobs themselves (the addressed target). `None` on legacy
+    /// persisted envelopes — `serde(default)` keeps them deserializing.
+    #[serde(default)]
+    pub reply_to_agent_id: Option<String>,
+    /// Workspace of the session a response must be routed back into. Set on
+    /// [`MessageKind::AgentMessage`] jobs (the originating Assistant's own
+    /// workspace, consumed by `route_manager_reply`); `None` elsewhere.
+    #[serde(default)]
+    pub reply_workspace_name: Option<String>,
 }
 
 // ── Global router ─────────────────────────────────────────────────────────
@@ -294,26 +318,16 @@ pub async fn route_user_message(
         role,
         reply_target,
         pending_job_id: None,
+        reply_to_agent_id: None,
+        reply_workspace_name: None,
     };
 
     // Manager-bound UserMessage is durable: DURABLE kinds =
     // UserMessage (manager-bound only), AnalyzeToolResult, ResearchResult.
-    let mut persisted = false;
     if job.role == Role::Manager {
-        let id = crate::generate_id();
-        match persist_pending(&job, id.clone()).await {
-            Ok(()) => {
-                job.pending_job_id = Some(id);
-                persisted = true;
-            }
-            Err(e) => {
-                // INSERT-failure policy: fall back to non-durable route
-                // (best-effort) — never drop silently.
-                warn!(
-                    error = %e,
-                    "Failed to persist manager message — routing best-effort (at-most-once)",
-                );
-            }
+        let (persisted, id) = persist_manager_envelope(&job, "manager message").await;
+        if let Some(id) = id {
+            job.pending_job_id = Some(id);
         }
         // Persisted during the drain/shutdown → skip routing (boot replay
         // reclaims). NOT persisted → route best-effort; the realistic rescue
@@ -327,6 +341,85 @@ pub async fn route_user_message(
         }
     }
     route(&agent_id, job);
+}
+
+/// Persist a durable Manager-bound envelope to `pending_jobs` before routing —
+/// the at-least-once delivery boundary. `producer` names the producer in the
+/// failure warn (the message text differs per producer, e.g. "manager message"
+/// vs "agent message"). Returns `(persisted, id)`: on a successful write
+/// `persisted` is `true` and `id` is the row id to stamp onto the job; on a
+/// persistence failure `persisted` is `false` and `id` is `None`, and the
+/// caller falls back to best-effort (at-most-once) routing.
+async fn persist_manager_envelope(job: &AgentJob, producer: &str) -> (bool, Option<String>) {
+    let id = crate::generate_id();
+    match persist_pending(job, id.clone()).await {
+        Ok(()) => (true, Some(id)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                producer,
+                "Failed to persist manager-bound envelope — routing best-effort (at-most-once)",
+            );
+            (false, None)
+        }
+    }
+}
+
+/// Build the `AgentMessage` envelope: the assistant's message normalized and
+/// addressed to the workspace Manager, carrying the originating Assistant's
+/// agent id + workspace for the addressed reply leg.
+fn agent_message_job(
+    content: String,
+    workspace_name: String,
+    origin_workspace_name: String,
+    user_name: &str,
+    reply_to_agent_id: String,
+) -> AgentJob {
+    let user_name =
+        crate::session::normalize_user_name(user_name, "route_agent_message_to_manager")
+            .to_string();
+    AgentJob {
+        content,
+        workspace_name,
+        user_name,
+        channel: "gui".to_string(),
+        kind: MessageKind::AgentMessage,
+        role: Role::Manager,
+        reply_target: None,
+        pending_job_id: None,
+        reply_to_agent_id: Some(reply_to_agent_id),
+        reply_workspace_name: Some(origin_workspace_name),
+    }
+}
+
+/// Route a message from an assistant agent into the workspace Manager's
+/// session (`MessageKind::AgentMessage`), durably: persisted to `pending_jobs`
+/// BEFORE routing (same reliability class as Manager-bound user messages).
+/// `reply_to_agent_id` is the originating Assistant's agent id — the Manager's
+/// response is additionally addressed back into that session.
+pub async fn route_agent_message_to_manager(
+    content: String,
+    workspace_name: String,
+    origin_workspace_name: String,
+    user_name: String,
+    reply_to_agent_id: String,
+) {
+    let mut job = agent_message_job(
+        content,
+        workspace_name,
+        origin_workspace_name,
+        &user_name,
+        reply_to_agent_id,
+    );
+    // Same durable Manager-bound block as route_user_message.
+    let (persisted, id) = persist_manager_envelope(&job, "agent message").await;
+    if let Some(id) = id {
+        job.pending_job_id = Some(id);
+    }
+    if crate::shutdown::aborting() && persisted {
+        return;
+    }
+    route(&crate::jobs::envelope_target(&job), job);
 }
 
 /// Persist an envelope to `pending_jobs`. The target agent id is derived
@@ -516,7 +609,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         // llm_loop. If one arrives here, someone used route() instead of
         // try_route(), or the agent's receiver was dropped.
         let message = match (role, job.kind) {
-            (Role::Manager, MessageKind::UserMessage) => {
+            (Role::Manager, MessageKind::UserMessage | MessageKind::AgentMessage) => {
                 // Flush the CDC drainer so a transition committed moments ago is
                 // materialized into the chronicle before the manager reads it
                 // (delayed, not lost, if skipped — the next drain delivers it).
@@ -608,6 +701,9 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         match role {
             Role::Manager => {
                 deliver_manager_response(&response, &users, &job).await;
+                if let Some(reply_to) = job.reply_to_agent_id.clone() {
+                    route_manager_reply(&response, &job, reply_to).await;
+                }
             }
             _ => {
                 if users.is_empty() {
@@ -748,6 +844,59 @@ async fn deliver_on_channel(
     }
 }
 
+/// Build the addressed `<manager-reply>` envelope (user-invisible, routed into
+/// the originating Assistant's session). `None` when `response` is empty.
+fn manager_reply_job(response: &str, job: &AgentJob, reply_to: &str) -> Option<AgentJob> {
+    if response.is_empty() {
+        return None;
+    }
+    let content = crate::prompt::substitute(
+        &crate::prompt::load_prompt("manager_reply.md"),
+        &[
+            ("{{workspace}}", job.workspace_name.as_str()),
+            ("{{message}}", response),
+        ],
+    );
+    // Reply leg targets the originating Assistant's own workspace (carried on
+    // the AgentMessage job via reply_workspace_name); legacy in-flight
+    // envelopes predate the field and fall back to the personal-workspace pin.
+    // The session is addressed exactly via reply_to_agent_id.
+    Some(AgentJob {
+        content,
+        workspace_name: job
+            .reply_workspace_name
+            .clone()
+            .unwrap_or_else(|| crate::users::personal_workspace_name(&job.user_name)),
+        user_name: job.user_name.clone(),
+        channel: "gui".to_string(),
+        kind: MessageKind::ManagerReply,
+        role: crate::Role::Assistant,
+        reply_target: None,
+        pending_job_id: None,
+        reply_to_agent_id: Some(reply_to.into()),
+        reply_workspace_name: None,
+    })
+}
+
+/// Addressed reply leg for `AgentMessage` jobs: after the Manager's response
+/// is broadcast (unchanged semantics), a durable user-invisible copy is routed
+/// into the originating Assistant's session so it wakes even after a restart.
+/// Persisted BEFORE routing (at-least-once, same class as fire_alarm); a
+/// persist failure degrades to at-most-once with a warn.
+async fn route_manager_reply(response: &str, job: &AgentJob, reply_to: String) {
+    let Some(mut reply_job) = manager_reply_job(response, job, &reply_to) else {
+        return;
+    };
+    let (persisted, id) = persist_manager_envelope(&reply_job, "manager reply envelope").await;
+    if let Some(id) = id {
+        reply_job.pending_job_id = Some(id);
+    }
+    if crate::shutdown::aborting() && persisted {
+        return;
+    }
+    route(&crate::jobs::envelope_target(&reply_job), reply_job);
+}
+
 /// Deliver a response to all workspace users (Manager role).
 async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &AgentJob) {
     if users.is_empty() {
@@ -756,9 +905,23 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
             "Message router [manager]: no users with workspace — response delivered to nobody",
         );
     }
+    deliver_agent_response_to_workspace(response, users, Role::Manager, &job.workspace_name).await;
+}
 
-    let agent_role = Some("manager".to_string());
-    let workspace = &job.workspace_name;
+/// Broadcast + persist one shared-broadcast_id copy per unique workspace user,
+/// then transport-deliver to every channel binding. The shared broadcast id
+/// lets the workspace chat stream dedupe the per-user copies exactly. Skips
+/// silently when `users` is empty.
+pub(crate) async fn deliver_agent_response_to_workspace(
+    response: &str,
+    users: &[UserRecord],
+    role: Role,
+    workspace: &str,
+) {
+    // One broadcast id shared by every per-user copy of this dispatch, so the
+    // workspace stream can dedupe them exactly (distinct copies share it).
+    let broadcast_id = Some(crate::generate_id());
+    let agent_role = Some(role.as_str().to_string());
 
     // ── Broadcast + persist once per user ───────────────────────
     {
@@ -774,35 +937,72 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
                 response,
                 agent_role.clone(),
                 workspace,
+                broadcast_id.clone(),
             )
             .await;
         }
     }
 
+    if !users.is_empty() {
+        deliver_response_over_channels(response, users, role, workspace).await;
+    }
+}
+
+/// Transport-deliver `response` to every channel binding of `users`
+/// (broadcast + chat_history persistence happen at the call sites). Telegram
+/// deliveries get the per-role attribution prefix when the recipient can
+/// switch roles. Logs both diagnostics per reachable binding: an
+/// unresolvable recipient (warn — the response is persisted but not
+/// transport-delivered) and a transport failure (error). `workspace` names
+/// the workspace in the no-channels diagnostic (which also names the affected
+/// users).
+pub(crate) async fn deliver_response_over_channels(
+    response: &str,
+    users: &[UserRecord],
+    role: Role,
+    workspace: &str,
+) {
     let channels = crate::channel_registry().list();
     if channels.is_empty() {
-        error!("Message router [manager]: no channels registered");
+        let user_names = users
+            .iter()
+            .map(|u| u.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        error!(
+            role = %role,
+            workspace = %workspace,
+            users = %user_names,
+            "Message router: no channels registered"
+        );
         return;
     }
 
     for (channel_name, channel) in &channels {
         for user in users {
-            let content =
-                telegram_delivery_content(channel_name, Role::Manager, &user.roles, response);
+            let content = telegram_delivery_content(channel_name, role, &user.roles, response);
             for binding in &user.channels {
                 if binding.channel != *channel_name {
                     continue;
                 }
                 let reply_target = binding.reply_target.as_deref().unwrap_or(&user.name);
-                if let DeliverOutcome::Failed(e) =
-                    deliver_on_channel(channel.as_ref(), &user.name, reply_target, &content).await
+                match deliver_on_channel(channel.as_ref(), &user.name, reply_target, &content).await
                 {
-                    error!(
+                    DeliverOutcome::Failed(e) => error!(
                         channel = %channel_name,
                         user = %user.name,
-                        "Message router [manager]: failed to send response to {}: {e}",
+                        "Message router [{role}]: failed to send response to {}: {e}",
                         user.name,
-                    );
+                    ),
+                    DeliverOutcome::Unresolvable => warn!(
+                        channel = %channel_name,
+                        user = %user.name,
+                        "Message router [{role}]: cannot resolve recipient on {} for {} — \
+                         response was persisted but not delivered via transport",
+                        channel_name,
+                        user.name,
+                    ),
+                    DeliverOutcome::Sent => {}
                 }
             }
         }
@@ -815,8 +1015,10 @@ async fn deliver_manager_response(response: &str, users: &[UserRecord], job: &Ag
 /// `user` is the resolved [`UserRecord`] for the job's sender — guaranteed
 /// non-empty by the consumer loop before calling this function.
 ///
-/// Broadcast+persist is performed exactly once per response (tagged with the
-/// originating channel); transport delivery iterates all registered channels
+/// Broadcast+persist is performed exactly once per response, tagged with the
+/// originating channel and a fresh `broadcast_id` (so the workspace stream
+/// dedupes the agent-direction row exactly); transport delivery is delegated to
+/// [`deliver_response_over_channels`], which iterates all registered channels
 /// and every binding, using each binding's own reply_target. A user registered
 /// on multiple channels sees the reply on all of them, regardless of the
 /// channel the request came in on.
@@ -830,7 +1032,9 @@ async fn deliver_single_user_response(
     job: &AgentJob,
     role: &Role,
 ) {
-    // Broadcast + persist (tagged with the originating channel).
+    // Broadcast + persist (tagged with the originating channel). A fresh
+    // broadcast_id makes every NEW agent-direction row exactly dedupable;
+    // legacy NULL rows keep the (agent_role, content) fallback.
     let channel = job.channel.as_str();
     broadcast_and_persist_agent_response(
         &user.name,
@@ -838,45 +1042,17 @@ async fn deliver_single_user_response(
         response,
         Some(role.as_str().to_string()),
         &job.workspace_name,
+        Some(crate::generate_id()),
     )
     .await;
 
-    let channels = crate::channel_registry().list();
-    if channels.is_empty() {
-        error!(
-            workspace = %job.workspace_name,
-            user = %user.name,
-            "Message router [{role}]: no channels registered",
-        );
-        return;
-    }
-
-    for (channel_name, chan) in &channels {
-        let content = telegram_delivery_content(channel_name, *role, &user.roles, response);
-        for binding in &user.channels {
-            if binding.channel != *channel_name {
-                continue;
-            }
-            let target_addr = binding.reply_target.as_deref().unwrap_or(&user.name);
-            match deliver_on_channel(chan.as_ref(), &user.name, target_addr, &content).await {
-                DeliverOutcome::Failed(e) => error!(
-                    channel = %channel_name,
-                    user = %user.name,
-                    "Message router [{role}]: failed to send response to {}: {e}",
-                    user.name,
-                ),
-                DeliverOutcome::Unresolvable => warn!(
-                    channel = %channel_name,
-                    user = %user.name,
-                    "Message router [{role}]: cannot resolve recipient on {} for {} — \
-                     response was persisted but not delivered via transport",
-                    channel_name,
-                    user.name,
-                ),
-                DeliverOutcome::Sent => {}
-            }
-        }
-    }
+    deliver_response_over_channels(
+        response,
+        std::slice::from_ref(user),
+        *role,
+        &job.workspace_name,
+    )
+    .await;
 }
 
 /// Deliver a response to an unregistered user (no [`UserRecord`] in the users DB).
@@ -899,13 +1075,16 @@ pub async fn deliver_unregistered_user_response(response: &str, job: &AgentJob, 
     let user_name =
         crate::session::normalize_user_name(&job.user_name, "deliver_unregistered_user_response");
 
-    // Broadcast + persist (works with just strings, no UserRecord needed).
+    // Broadcast + persist (works with just strings, no UserRecord needed). A
+    // fresh broadcast_id makes the new agent row exactly dedupable; legacy
+    // NULL rows keep the (agent_role, content) fallback.
     broadcast_and_persist_agent_response(
         user_name,
         ch,
         response,
         Some(role.as_str().to_string()),
         &job.workspace_name,
+        Some(crate::generate_id()),
     )
     .await;
 
@@ -966,6 +1145,8 @@ mod tests {
             role,
             reply_target: None,
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         }
     }
 
@@ -1107,6 +1288,8 @@ mod tests {
 
     /// Resolving a workspace that exists in the DB returns it.
     #[tokio::test]
+    // Shares the process-global stores with the provider-group tests (uniform exclusion).
+    #[serial_test::serial(provider)]
     async fn test_resolve_workspace_found() {
         crate::util::test::init_management_test_stores().await;
 
@@ -1121,6 +1304,7 @@ mod tests {
     /// Resolving a personal workspace constructs it on the fly when
     /// it is NOT in the DB.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_resolve_workspace_personal() {
         crate::util::test::init_management_test_stores().await;
 
@@ -1138,6 +1322,7 @@ mod tests {
     /// Resolving a workspace that genuinely does not exist (and is not
     /// a personal workspace) returns `Ok(None)`.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_resolve_workspace_not_found() {
         crate::util::test::init_management_test_stores().await;
 
@@ -1244,6 +1429,7 @@ mod tests {
 
     /// `resolve_single_user` returns a [`UserRecord`] when the user exists.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_resolve_single_user_found() {
         setup_response_test_infra().await;
 
@@ -1255,6 +1441,7 @@ mod tests {
 
     /// `resolve_single_user` returns `None` for a non-existent user.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_resolve_single_user_not_found() {
         setup_response_test_infra().await;
 
@@ -1266,6 +1453,7 @@ mod tests {
     /// the channel is registered, a user is NOT in the DB, and the fallback
     /// path to `reply_target` is exercised.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_deliver_unregistered_user_response() {
         setup_response_test_infra().await;
 
@@ -1278,6 +1466,8 @@ mod tests {
             role: Role::Assistant,
             reply_target: Some("chat_123".to_string()),
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         };
 
         // Should complete without panic.
@@ -1291,6 +1481,7 @@ mod tests {
     /// "gui" — broadcast+persist runs and transport delivery reaches the
     /// matching "gui" binding. No-panic is the assertion.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_deliver_single_user_response() {
         setup_response_test_infra().await;
 
@@ -1313,6 +1504,8 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         };
 
         // Should complete without panic — broadcasts to the "gui" binding.
@@ -1324,6 +1517,7 @@ mod tests {
     /// channel bindings at all — only broadcast+persist runs, transport
     /// delivery is skipped. No-panic is the assertion.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_deliver_single_user_no_bindings() {
         setup_response_test_infra().await;
 
@@ -1339,6 +1533,8 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         };
 
         // Should complete without panic — broadcast+persist runs, transport
@@ -1358,6 +1554,7 @@ mod tests {
     /// registered channel the user is bound to. The spy captures at least one
     /// send.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_deliver_single_user_broadcasts_to_all_bindings() {
         setup_response_test_infra().await;
 
@@ -1386,6 +1583,8 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         };
 
         deliver_single_user_response("broadcast to all bindings", &user, &job, &Role::Assistant)
@@ -1401,6 +1600,7 @@ mod tests {
     /// `deliver_manager_response` broadcasts to all workspace users without
     /// panic when users have channel bindings.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_deliver_manager_response_with_users() {
         setup_response_test_infra().await;
 
@@ -1421,6 +1621,8 @@ mod tests {
             role: Role::Manager,
             reply_target: None,
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         };
 
         deliver_manager_response("manager response", &[user], &job).await;
@@ -1435,6 +1637,7 @@ mod tests {
     /// registry are process-global and other tests deliver for `admin`
     /// concurrently.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn test_deliver_manager_response_skips_foreign_channel_bindings() {
         const SPY_MATCH: &str = "__test_mgr_spy_match";
         const SPY_OTHER: &str = "__test_mgr_spy_other";
@@ -1470,6 +1673,8 @@ mod tests {
             role: Role::Manager,
             reply_target: None,
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         };
 
         deliver_manager_response("manager response", &[user], &job).await;
@@ -1486,6 +1691,139 @@ mod tests {
             other_sent.lock().unwrap_poison().is_empty(),
             "spy channel without a matching binding must not receive the manager response",
         );
+    }
+
+    // ── Job builder tests ───────────────────────────────────────────────
+
+    /// `agent_message_job` threads the normalized identity + addressing fields.
+    #[test]
+    fn agent_message_job_threading() {
+        let job = agent_message_job(
+            "hello".to_string(),
+            "proj_ws".to_string(),
+            "origin_ws".to_string(),
+            "alice",
+            "agent_123".to_string(),
+        );
+        assert_eq!(job.user_name, "alice");
+        assert_eq!(job.kind, MessageKind::AgentMessage);
+        assert_eq!(job.role, Role::Manager);
+        assert_eq!(job.workspace_name, "proj_ws");
+        assert_eq!(job.reply_to_agent_id.as_deref(), Some("agent_123"));
+        assert_eq!(job.reply_workspace_name.as_deref(), Some("origin_ws"));
+
+        // Empty user_name normalizes to the seeded 'admin'.
+        let job = agent_message_job(
+            "hello".to_string(),
+            "proj_ws".to_string(),
+            "origin_ws".to_string(),
+            "",
+            "agent_124".to_string(),
+        );
+        assert_eq!(job.user_name, "admin");
+    }
+
+    /// `manager_reply_job` addresses the reply into the originating Assistant's
+    /// session and substitutes the carried reply workspace into the envelope.
+    #[test]
+    fn manager_reply_job_threading() {
+        let source = AgentJob {
+            content: "assistant msg".to_string(),
+            workspace_name: "team_ws".to_string(),
+            user_name: "alice".to_string(),
+            channel: "gui".to_string(),
+            kind: MessageKind::AgentMessage,
+            role: Role::Manager,
+            reply_target: None,
+            pending_job_id: None,
+            reply_to_agent_id: Some("assistant_agent_1".to_string()),
+            reply_workspace_name: Some("proj_ws".to_string()),
+        };
+        let reply = manager_reply_job("reply text", &source, "assistant_agent_1")
+            .expect("non-empty response builds a reply job");
+        // The reply routes into the originating Assistant's workspace, while the
+        // envelope tags the Manager's workspace (job.workspace_name).
+        assert_eq!(reply.workspace_name, "proj_ws");
+        assert_eq!(reply.kind, MessageKind::ManagerReply);
+        assert_eq!(reply.role, Role::Assistant);
+        assert_eq!(
+            reply.reply_to_agent_id.as_deref(),
+            Some("assistant_agent_1")
+        );
+        assert_eq!(reply.user_name, "alice");
+        assert!(reply.content.contains("team_ws"));
+        assert!(reply.content.contains("reply text"));
+    }
+
+    /// Legacy in-flight AgentMessage envelopes predate `reply_workspace_name`;
+    /// the reply leg falls back to the personal-workspace pin.
+    #[test]
+    fn manager_reply_job_legacy_fallback() {
+        let source = AgentJob {
+            content: "assistant msg".to_string(),
+            workspace_name: "team_ws".to_string(),
+            user_name: "bob".to_string(),
+            channel: "gui".to_string(),
+            kind: MessageKind::AgentMessage,
+            role: Role::Manager,
+            reply_target: None,
+            pending_job_id: None,
+            reply_to_agent_id: Some("assistant_agent_2".to_string()),
+            reply_workspace_name: None,
+        };
+        let reply = manager_reply_job("reply text", &source, "assistant_agent_2")
+            .expect("non-empty response builds a reply job");
+        assert_eq!(
+            reply.workspace_name,
+            crate::users::personal_workspace_name("bob")
+        );
+    }
+
+    /// Persist-before-route round trip: a ManagerReply envelope written to
+    /// pending_jobs reads back as the same job (kind + workspace), targeted at
+    /// the addressed reply_to_agent_id. Cleans up its row so other tests'
+    /// boot-replay paths never see it.
+    #[tokio::test]
+    #[serial_test::serial(provider)]
+    async fn manager_reply_persist_round_trip() {
+        setup_response_test_infra().await;
+        let source = AgentJob {
+            content: "assistant msg".to_string(),
+            workspace_name: "team_ws".to_string(),
+            user_name: "alice".to_string(),
+            channel: "gui".to_string(),
+            kind: MessageKind::AgentMessage,
+            role: Role::Manager,
+            reply_target: None,
+            pending_job_id: None,
+            reply_to_agent_id: Some("assistant_agent_roundtrip".to_string()),
+            reply_workspace_name: Some("proj_ws".to_string()),
+        };
+        let job = manager_reply_job("reply text", &source, "assistant_agent_roundtrip")
+            .expect("non-empty response builds a reply job");
+        let (persisted, id) = persist_manager_envelope(&job, "test").await;
+        assert!(persisted, "persist should succeed");
+        let id = id.expect("a persisted row id should be returned");
+
+        let conn = &crate::session::store().conn;
+        let pending = crate::jobs::list_pending_jobs(conn)
+            .await
+            .expect("list pending");
+        let matching: Vec<_> = pending
+            .iter()
+            .filter(|r| r.target_agent_id == crate::jobs::envelope_target(&job))
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one addressed pending row");
+        let row = matching[0];
+        assert_eq!(row.id, id);
+        let deserialized: AgentJob =
+            serde_json::from_str(&row.envelope).expect("envelope deserializes to AgentJob");
+        assert_eq!(deserialized.kind, MessageKind::ManagerReply);
+        assert_eq!(deserialized.workspace_name, "proj_ws");
+
+        crate::jobs::delete_pending_job(conn, &id)
+            .await
+            .expect("delete pending row");
     }
 
     // ── register_agent / unregister_agent / try_route tests ────────────
@@ -1668,6 +2006,11 @@ mod tests {
     /// `consumer_loop` uses `job.kind == MessageKind::UserMessage` to decide whether
     /// to send the failure emoji — `RecoveryRetry` is automatically excluded
     /// because the equality check is specific to `UserMessage`.
+    ///
+    /// The same structural invariant holds for the Assistant↔Manager kinds:
+    /// `AgentMessage` and `ManagerReply` are deliberately distinct from
+    /// `UserMessage` (see the `MessageKind` docs) so the emoji gate excludes them
+    /// without any `matches!` broadening.
     ///
     /// This test documents the structural invariant: distinct enum variants of a
     /// `PartialEq` enum never compare equal.  The compiler and derive macro

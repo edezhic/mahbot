@@ -902,6 +902,8 @@ async fn deliver_clear_reply(
             role: effective_role,
             reply_target: Some(msg.reply_target.clone()),
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         },
         &effective_role,
     )

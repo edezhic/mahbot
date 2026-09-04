@@ -2363,6 +2363,7 @@ impl PipelineCtx {
             msg,
             Some("voice".to_string()),
             &ws.name,
+            None,
         )
         .await;
     }

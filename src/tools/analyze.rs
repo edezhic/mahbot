@@ -3011,7 +3011,11 @@ mod tests {
     /// roster is all-Done: the Done slot is reconstructed (zero LLM calls),
     /// the consolidated result settles contiguously after the frame, and the
     /// job is terminalized.
+    // Joins the `provider` serial group: the seam swaps the process-global
+    // provider, so the test must not interleave with the other provider-group
+    // tests (same exclusion the pipeline/retry tests rely on).
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn resume_hook_completion_resumes_durable_analyze() {
         let fake = std::sync::Arc::new(FakeProvider::new());
         let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());

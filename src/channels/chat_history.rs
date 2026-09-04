@@ -28,6 +28,10 @@ pub struct ChatHistoryInsert {
     pub direction: String,
     pub content: String,
     pub agent_role: Option<String>,
+    /// Shared id tagging all per-user copies of one broadcast dispatch;
+    /// `None` for single-user rows and legacy data. Enables exact dedup when
+    /// reading across user partitions.
+    pub broadcast_id: Option<String>,
     pub workspace: String,
     pub timestamp: Option<String>,
     /// Optional reference to the replied-to message, rendered as a quote
@@ -48,8 +52,19 @@ pub struct ChatHistoryEntry {
     pub reply_reference: Option<ReplyReference>,
 }
 
+/// One row of the workspace-wide chat stream for the manager-chat read tool.
+pub(crate) struct WorkspaceChatRow {
+    pub user_name: String,
+    pub direction: ChatDirection,
+    pub agent_role: Option<String>,
+    pub content: String,
+}
+
 /// Maximum number of history entries to load at once.
 const HISTORY_LIMIT: usize = 100;
+
+/// Bounds pathological all-duplicate tables: the fetch window stops growing here.
+const MAX_FETCH_LIMIT: usize = 4096;
 
 // Column definitions for `chat_history` SELECT queries.
 crate::columns! {
@@ -118,8 +133,8 @@ impl ChatHistoryStore {
             .execute(
                 "INSERT OR IGNORE INTO chat_history \
                  (message_id, user_name, direction, content, agent_role, workspace, timestamp, \
-                  reply_author, reply_snippet) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  reply_author, reply_snippet, broadcast_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 db::params![
                     entry.message_id.clone(),
                     entry.user_name.clone(),
@@ -130,6 +145,7 @@ impl ChatHistoryStore {
                     entry.timestamp.clone(),
                     entry.reply_reference.as_ref().map(|r| r.author.clone()),
                     entry.reply_reference.as_ref().map(|r| r.snippet.clone()),
+                    entry.broadcast_id.clone(),
                 ],
             )
             .await?;
@@ -217,6 +233,84 @@ impl ChatHistoryStore {
         self.load_page(user_name, ws1, ws2, Some(before_id)).await
     }
 
+    /// Most recent `limit` unique messages across ALL user partitions of one
+    /// workspace, chronological. Per-user copies of one broadcast dispatch share
+    /// a `broadcast_id` (fresh NanoID per copy otherwise), so agent-direction rows
+    /// are deduped exactly by `broadcast_id`; legacy rows (NULL, pre-delta-33)
+    /// fall back to (agent_role, content) — best-effort only for historic data.
+    /// The query excludes divider rows so they cannot crowd the window — every
+    /// fetched row is a real message.
+    ///
+    /// The fetch window grows on shortfall: it starts at `limit * 4` (one query
+    /// covers the common ≤3-copier fan-out) and doubles until it yields at least
+    /// `limit` unique messages or the table window is exhausted. That makes the
+    /// "at least `limit` logical messages" guarantee structural, independent of
+    /// any user-count estimate. The guarantee is exact for rows carrying a
+    /// `broadcast_id`; legacy pre-delta-33 rows (NULL broadcast_id) dedup
+    /// best-effort on `(agent_role, content)`, so a window dense with
+    /// identical-content legacy agent rows may return fewer than `limit` messages.
+    /// [`MAX_FETCH_LIMIT`] caps the growth for pathological all-duplicate tables.
+    #[expect(clippy::cast_possible_wrap)]
+    pub(crate) async fn load_workspace_stream(
+        &self,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceChatRow>> {
+        let mut fetch_limit = limit.saturating_mul(4);
+        loop {
+            // Column order below: user_name(0), direction(1), agent_role(2),
+            // content(3), broadcast_id(4).
+            let rows = self
+                .conn
+                .query(
+                    "SELECT user_name, direction, agent_role, content, broadcast_id \
+                     FROM chat_history WHERE workspace = ?1 AND direction <> 'divider' \
+                     ORDER BY id DESC LIMIT ?2",
+                    db::params![workspace, fetch_limit as i64],
+                )
+                .await?;
+            let mut out: Vec<WorkspaceChatRow> = Vec::new();
+            let mut seen_broadcast: std::collections::HashSet<String> =
+                std::collections::HashSet::default();
+            let mut seen_legacy_agent: std::collections::HashSet<(Option<String>, String)> =
+                std::collections::HashSet::default();
+            for row in &rows {
+                let direction = match row.get::<String>(1)?.as_str() {
+                    "agent" => ChatDirection::Agent,
+                    _ => ChatDirection::User,
+                };
+                let agent_role = row.get::<Option<String>>(2)?;
+                let content = row.get::<String>(3)?;
+                let broadcast_id = row.get::<Option<String>>(4)?;
+                if direction == ChatDirection::Agent {
+                    let is_duplicate = match broadcast_id {
+                        Some(id) => !seen_broadcast.insert(id),
+                        None => !seen_legacy_agent.insert((agent_role.clone(), content.clone())),
+                    };
+                    if is_duplicate {
+                        continue;
+                    }
+                }
+                out.push(WorkspaceChatRow {
+                    user_name: row.get::<String>(0)?,
+                    direction,
+                    agent_role,
+                    content,
+                });
+            }
+            if out.len() >= limit {
+                out.truncate(limit);
+                out.reverse();
+                return Ok(out);
+            }
+            if rows.len() < fetch_limit || fetch_limit >= MAX_FETCH_LIMIT {
+                out.reverse();
+                return Ok(out);
+            }
+            fetch_limit = fetch_limit.saturating_mul(2).min(MAX_FETCH_LIMIT);
+        }
+    }
+
     /// Insert a divider marker row into chat history to indicate where a
     /// session clear occurred. The row uses `direction='divider'` so the GUI
     /// can detect it and render a visible separator instead of a chat bubble.
@@ -228,6 +322,7 @@ impl ChatHistoryStore {
             direction: "divider".to_string(),
             content: db::now(),
             agent_role: None,
+            broadcast_id: None,
             workspace: workspace.to_string(),
             timestamp: None,
             reply_reference: None,
@@ -269,6 +364,7 @@ mod tests {
                 direction: "user".to_string(),
                 content: "hello".to_string(),
                 agent_role: None,
+                broadcast_id: None,
                 workspace: "ws".to_string(),
                 timestamp: None,
                 reply_reference: None,
@@ -395,6 +491,7 @@ mod tests {
                 direction: "user".to_string(),
                 content: "hello".to_string(),
                 agent_role: None,
+                broadcast_id: None,
                 workspace: "ws1".to_string(),
                 timestamp: None,
                 reply_reference: None,
@@ -416,6 +513,7 @@ mod tests {
                 direction: "user".to_string(),
                 content: "world".to_string(),
                 agent_role: None,
+                broadcast_id: None,
                 workspace: "ws1".to_string(),
                 timestamp: None,
                 reply_reference: None,
@@ -463,6 +561,7 @@ mod tests {
                     direction: "user".to_string(),
                     content: content.to_string(),
                     agent_role: None,
+                    broadcast_id: None,
                     workspace: ws.to_string(),
                     timestamp: None,
                     reply_reference: None,
@@ -509,6 +608,7 @@ mod tests {
                     direction: "user".to_string(),
                     content: format!("c{i}"),
                     agent_role: None,
+                    broadcast_id: None,
                     workspace: ws.to_string(),
                     timestamp: None,
                     reply_reference: None,
@@ -558,6 +658,7 @@ mod tests {
                 direction: "user".to_string(),
                 content: "hello".to_string(),
                 agent_role: None,
+                broadcast_id: None,
                 workspace: "ws1".to_string(),
                 timestamp: Some(crate::db::now()),
                 reply_reference: Some(crate::channels::ReplyReference {
@@ -579,5 +680,203 @@ mod tests {
             .expect("reply reference should survive the round-trip");
         assert_eq!(reply.author, "bob");
         assert_eq!(reply.snippet, "earlier message");
+    }
+
+    /// Insert a chat_history row directly (fills every field), so tests can
+    /// control `broadcast_id` exactly.
+    async fn insert_row(
+        store: &ChatHistoryStore,
+        message_id: &str,
+        user_name: &str,
+        direction: &str,
+        content: &str,
+        agent_role: Option<&str>,
+        broadcast_id: Option<&str>,
+    ) {
+        store
+            .insert(&ChatHistoryInsert {
+                message_id: message_id.to_string(),
+                user_name: user_name.to_string(),
+                direction: direction.to_string(),
+                content: content.to_string(),
+                agent_role: agent_role.map(str::to_string),
+                broadcast_id: broadcast_id.map(str::to_string),
+                workspace: "ws".to_string(),
+                timestamp: None,
+                reply_reference: None,
+            })
+            .await
+            .expect("insert should succeed");
+    }
+
+    #[tokio::test]
+    async fn workspace_stream_dedups_manager_copies_by_broadcast_id() {
+        let (store, _tmp) = test_setup().await;
+        insert_row(&store, "u1-msg", "u1", "user", "hello", None, None).await;
+        insert_row(
+            &store,
+            "mgr-u1",
+            "u1",
+            "agent",
+            "manager reply",
+            Some("manager"),
+            Some("b1"),
+        )
+        .await;
+        insert_row(
+            &store,
+            "mgr-u2",
+            "u2",
+            "agent",
+            "manager reply",
+            Some("manager"),
+            Some("b1"),
+        )
+        .await;
+
+        let rows = store.load_workspace_stream("ws", 5).await.expect("load");
+        // Exactly 2 unique logical messages, chronological: the user row, then
+        // ONE manager copy (u1's copy shares b1 and is deduped away).
+        assert_eq!(rows.len(), 2, "user row + one manager copy");
+        assert_eq!(rows[0].user_name, "u1");
+        assert_eq!(rows[0].direction, ChatDirection::User);
+        assert_eq!(rows[0].content, "hello");
+        assert_eq!(rows[1].user_name, "u2");
+        assert_eq!(rows[1].direction, ChatDirection::Agent);
+        assert_eq!(rows[1].agent_role.as_deref(), Some("manager"));
+        assert_eq!(rows[1].content, "manager reply");
+    }
+
+    #[tokio::test]
+    async fn workspace_stream_growing_window_recovers_from_copies() {
+        let (store, _tmp) = test_setup().await;
+        // Three unique messages, oldest first: two user rows + one manager reply.
+        insert_row(&store, "u1", "u1", "user", "msg-a", None, None).await;
+        insert_row(&store, "u2", "u2", "user", "msg-b", None, None).await;
+        insert_row(
+            &store,
+            "resp",
+            "u3",
+            "agent",
+            "resp",
+            Some("manager"),
+            Some("b1"),
+        )
+        .await;
+        // The newest rows are a flood of duplicated manager copies sharing b1.
+        // A naive fixed window (e.g. limit*2, or even the limit*4 start) would
+        // fetch only copies and under-return; the loader doubles its window
+        // until the unique messages emerge.
+        for i in 0..14 {
+            insert_row(
+                &store,
+                &format!("dup-{i}"),
+                "u3",
+                "agent",
+                "resp",
+                Some("manager"),
+                Some("b1"),
+            )
+            .await;
+        }
+
+        let rows = store.load_workspace_stream("ws", 3).await.expect("load");
+        assert_eq!(
+            rows.len(),
+            3,
+            "growing window must recover the full set of unique messages"
+        );
+        assert_eq!(rows[0].content, "msg-a");
+        assert_eq!(rows[1].content, "msg-b");
+        assert_eq!(rows[2].content, "resp");
+    }
+
+    #[tokio::test]
+    async fn workspace_stream_keeps_distinct_identical_broadcasts() {
+        let (store, _tmp) = test_setup().await;
+        insert_row(&store, "u1", "u1", "user", "hi", None, None).await;
+        insert_row(
+            &store,
+            "m1",
+            "u1",
+            "agent",
+            "same",
+            Some("manager"),
+            Some("b1"),
+        )
+        .await;
+        insert_row(
+            &store,
+            "m2",
+            "u2",
+            "agent",
+            "same",
+            Some("manager"),
+            Some("b2"),
+        )
+        .await;
+
+        let rows = store.load_workspace_stream("ws", 5).await.expect("load");
+        assert_eq!(rows.len(), 3, "distinct broadcast ids must both survive");
+        let agent_count = rows
+            .iter()
+            .filter(|r| r.direction == ChatDirection::Agent)
+            .count();
+        assert_eq!(
+            agent_count, 2,
+            "both identical-content broadcasts are kept (no content-key collision)"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_stream_legacy_rows_fall_back_to_content_dedup() {
+        let (store, _tmp) = test_setup().await;
+        insert_row(&store, "u1", "u1", "user", "hi", None, None).await;
+        insert_row(
+            &store,
+            "legacy-u1",
+            "u1",
+            "agent",
+            "resp",
+            Some("manager"),
+            None,
+        )
+        .await;
+        insert_row(
+            &store,
+            "legacy-u2",
+            "u2",
+            "agent",
+            "resp",
+            Some("manager"),
+            None,
+        )
+        .await;
+
+        let rows = store.load_workspace_stream("ws", 5).await.expect("load");
+        assert_eq!(
+            rows.len(),
+            2,
+            "legacy NULL-broadcast agent rows dedup to one via (agent_role, content)"
+        );
+        assert!(rows.iter().any(|r| r.content == "hi"));
+        assert!(rows.iter().any(|r| r.content == "resp"));
+    }
+
+    #[tokio::test]
+    async fn workspace_stream_excludes_dividers() {
+        let (store, _tmp) = test_setup().await;
+        insert_row(&store, "one", "u1", "user", "one", None, None).await;
+        store
+            .insert_divider("u1", "ws")
+            .await
+            .expect("insert_divider should succeed");
+        insert_row(&store, "two", "u1", "user", "two", None, None).await;
+
+        let rows = store.load_workspace_stream("ws", 5).await.expect("load");
+        assert_eq!(rows.len(), 2, "divider rows are excluded from the stream");
+        assert!(rows.iter().all(|r| r.direction != ChatDirection::Divider));
+        assert_eq!(rows[0].content, "one");
+        assert_eq!(rows[1].content, "two");
     }
 }

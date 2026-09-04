@@ -1152,6 +1152,13 @@ pub(crate) trait Tool: Send + Sync {
         false
     }
 
+    /// Per-call variant of [`Tool::ends_turn_on_success`]: decides turn-end from
+    /// the actual call arguments. Defaults to [`Tool::ends_turn_on_success`].
+    /// Used by tools whose turn-end depends on a parameter (e.g. a `wait` flag).
+    fn ends_turn_for_args(&self, _args: &serde_json::Value) -> bool {
+        self.ends_turn_on_success()
+    }
+
     /// Whether the tool should be advertised to the model right now.
     ///
     /// Returns `true` by default. Tools backed by an external daemon/service

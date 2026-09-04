@@ -486,6 +486,8 @@ impl Tool for ResearchTool {
                         role: caller_role,
                         reply_target: None,
                         pending_job_id: None,
+                        reply_to_agent_id: None,
+                        reply_workspace_name: None,
                     }
                 }
             };

@@ -2483,6 +2483,11 @@ mod tests {
 
     #[test]
     fn discovery_failure_taxonomy_maps_provider_and_genuine_classes() {
+        // classify_discovery_failure consults the process-global drain flag;
+        // hold the lock so a concurrent drain-flag test cannot flip `Fatal`
+        // assertions to `Transient` mid-loop (see
+        // `failure_classification_recognizes_drain` for the convention).
+        let _lock = crate::util::test::retry_tests_lock();
         // Provider-class → Transient (workspace returns to Pending).
         for class in [
             crate::retry::FailureClass::Transport,

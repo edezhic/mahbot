@@ -28,6 +28,7 @@ struct BroadcastPersistEntry {
     content: String,
     direction: ChatDirection,
     agent_role: Option<String>,
+    broadcast_id: Option<String>,
     workspace: String,
     optimistic_id: Option<String>,
     reply_reference: Option<crate::channels::ReplyReference>,
@@ -75,6 +76,7 @@ impl BroadcastPersistEntry {
                 direction: db_direction,
                 content: self.content,
                 agent_role: self.agent_role,
+                broadcast_id: self.broadcast_id,
                 workspace: self.workspace,
                 timestamp: Some(timestamp),
                 reply_reference: self.reply_reference,
@@ -102,6 +104,7 @@ pub(crate) async fn broadcast_and_persist_agent_response(
     content: &str,
     agent_role: Option<String>,
     workspace: &str,
+    broadcast_id: Option<String>,
 ) {
     BroadcastPersistEntry {
         user_name: user_name.to_string(),
@@ -109,6 +112,7 @@ pub(crate) async fn broadcast_and_persist_agent_response(
         content: content.to_string(),
         direction: ChatDirection::Agent,
         agent_role, // moved — no clone needed
+        broadcast_id,
         workspace: workspace.to_string(),
         optimistic_id: None,   // agent messages must not carry one
         reply_reference: None, // agent responses never carry a reply reference
@@ -235,6 +239,7 @@ pub async fn broadcast_and_persist_incoming_message(
                     direction: "user".to_string(),
                     content: persist_content.to_string(),
                     agent_role: None,
+                    broadcast_id: None,
                     workspace: msg.workspace.clone(),
                     timestamp: Some(timestamp),
                     reply_reference: msg.reply_reference.clone(),

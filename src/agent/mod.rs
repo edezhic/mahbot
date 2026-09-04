@@ -43,6 +43,23 @@ pub(crate) fn tool_user_name() -> String {
         .unwrap_or_default()
 }
 
+/// Identity of the agent currently executing a tool call: `(agent_id, user_name)`.
+/// Errors when the call runs outside a user session — there is no addressable
+/// identity to associate side effects with.
+pub(crate) fn tool_identity() -> anyhow::Result<(String, String)> {
+    let user_name = tool_user_name();
+    let agent_id = CURRENT_TOOL_AGENT_ID
+        .try_with(Option::clone)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    anyhow::ensure!(
+        !agent_id.is_empty() && !user_name.is_empty(),
+        "No agent identity available — the tool must run in a user session."
+    );
+    Ok((agent_id, user_name))
+}
+
 /// Synchronous read of [`CURRENT_TOOL_CHANNEL`]. Same contract as
 /// [`tool_user_name`].
 pub(crate) fn tool_channel() -> String {
@@ -1359,7 +1376,7 @@ impl Agent {
                                 success: true,
                                 image_payload,
                                 suspended: false,
-                                ends_turn: tool.ends_turn_on_success(),
+                                ends_turn: tool.ends_turn_for_args(&tool_arguments),
                             },
                             String::new(),
                         )
@@ -3151,6 +3168,8 @@ mod tests {
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         };
         let _ = tx.send(job);
 
@@ -3192,6 +3211,8 @@ mod tests {
             role: crate::Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            reply_to_agent_id: None,
+            reply_workspace_name: None,
         };
         let _ = tx.send(job);
 
@@ -3616,7 +3637,11 @@ mod tests {
     /// Fail-open on leader FAILURE: a leader whose first LLM call errors (the
     /// retry budget exhausts) still fires the first-call signal — followers
     /// are released immediately instead of waiting out the bound.
+    // Joins the `provider` serial group: the seam swaps the process-global
+    // provider, so the test must not interleave with the other provider-group
+    // tests (same exclusion the pipeline/retry tests rely on).
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn leader_first_call_failure_still_fires_signal() {
         use crate::util::test::{
@@ -3668,6 +3693,7 @@ mod tests {
     /// next turn on the session (any wake-up: user message, async result,
     /// alarm) clears the flag and runs normally.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sleep_call_ends_the_run_gracefully_and_flag_resets_on_reengage() {
         use crate::util::test::{FakeProvider, install_fake_provider, retry_tests_lock};
@@ -3821,6 +3847,7 @@ mod tests {
     /// (assistant reasoning payload + the resume nudge), and the nudge never
     /// appears in the original request.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_recovers_reasoning_only_stop_via_continuation() {
         use crate::util::test::{
@@ -3861,6 +3888,7 @@ mod tests {
     /// appends its own (assistant reasoning + nudge) pair, so the request
     /// prefix stays byte-stable and only the tail grows.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_accumulates_tail_until_answer() {
         use crate::util::test::{
@@ -3920,6 +3948,7 @@ mod tests {
     /// error, no provider-retry-exhaustion marker, no transcript trace, and
     /// granular "no_response" classification.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_exhaustion_fails_safely_without_leaking() {
         use crate::util::test::{
@@ -3985,6 +4014,7 @@ mod tests {
     /// retried request is byte-identical, and exhaustion derives the final
     /// class from the last recorded failure (Transport, not NoResponse).
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_transport_error_does_not_duplicate_tail() {
         use crate::util::test::{
@@ -4039,6 +4069,7 @@ mod tests {
     /// A non-retryable provider error mid-recovery breaks immediately instead
     /// of burning the remaining attempts, and keeps the granular class.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_non_retryable_error_breaks_immediately() {
         use crate::util::test::{
@@ -4114,6 +4145,7 @@ mod tests {
     /// "a FAILED call never updates the value" invariant), even though the
     /// invisible in-class response carried real usage.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_exhaustion_does_not_update_session_length() {
         use crate::util::test::{
@@ -4154,6 +4186,7 @@ mod tests {
     /// RESOLVING response only — the in-class response the continuation
     /// consumed is never recorded (no inflated value, no wasted double write).
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_success_records_only_resolving_usage() {
         use crate::util::test::{
@@ -4182,6 +4215,7 @@ mod tests {
 
     /// A normal answer or a tool-call turn never enters the continuation path.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_skips_continuation_for_normal_and_tool_call_turns() {
         use crate::util::test::{
@@ -4223,6 +4257,7 @@ mod tests {
     /// Summarize recovers a reasoning-only stop via the same bounded
     /// continuation; the continuation answer becomes the summary.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn summarize_recovers_reasoning_only_stop_via_continuation() {
         use crate::util::test::{
@@ -4256,6 +4291,7 @@ mod tests {
     /// empty-response error fires (warn + full history in `maybe_summarize`),
     /// and the thinking never leaks into the error.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn summarize_continuation_exhaustion_fails_open_without_leaking() {
         use crate::util::test::{
@@ -5122,6 +5158,7 @@ mod tests {
     /// contiguously after the frame, and only then is the resumed job
     /// terminalized.
     #[tokio::test]
+    #[serial_test::serial(provider)]
     #[expect(clippy::too_many_lines)] // deliberate: the full drain lifecycle + resume is one cohesive assertion bed
     async fn drain_mid_sync_analyze_leaves_call_dangling_then_completion_resumes() {
         let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
@@ -5291,6 +5328,7 @@ mod tests {
     /// (unfinished jobs are never deleted except by explicit abandon).
     #[expect(clippy::too_many_lines)] // large multi-job scenario fixture
     #[tokio::test]
+    #[serial_test::serial(provider)]
     async fn complete_pending_tool_calls_binds_same_kind_calls_to_distinct_jobs() {
         let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
         let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());

@@ -583,6 +583,8 @@ pub(crate) async fn complete_durable_job(
         role: caller_role,
         reply_target: None,
         pending_job_id: Some(job_id.to_string()),
+        reply_to_agent_id: None,
+        reply_workspace_name: None,
     };
     // INSERT-failure policy: fall back to a non-durable best-effort route.
     if complete_job_with_envelope(&crate::session::store().conn, job_id, &envelope)
@@ -1004,6 +1006,14 @@ async fn delete_job_tx(tx: &TxGuard<'_>, job_id: &str) -> Result<()> {
 /// internally, so this is the single canonical form — analyze/research delivery
 /// paths call it instead of reimplementing the branch.
 pub(crate) fn envelope_target(job: &AgentJob) -> String {
+    // ManagerReply envelopes are ADDRESSED: the reply target agent id is
+    // carried explicitly (the originating Assistant's session) rather than
+    // derived, so a boot replay routes to the exact same session.
+    if job.kind == MessageKind::ManagerReply
+        && let Some(id) = &job.reply_to_agent_id
+    {
+        return id.clone();
+    }
     crate::session::resolve_agent_id(&job.user_name, job.role.as_str(), &job.workspace_name)
 }
 

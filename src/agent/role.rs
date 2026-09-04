@@ -264,10 +264,10 @@ use crate::tools::{
     AddAlarmTool, AddCommentTool, AddUserTool, AddWorkspaceTool, AnalyzeTool, BindTelegramTool,
     BrowserTool, ComputerTool, CreateTicketTool, DispatchMode, EditTool, FinalizeTool,
     GetTicketTool, ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool,
-    ListTicketsTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
-    SearchArchivedTicketsTool, SearchTool, SetupTelegramBotTool, SetupWebSearchTool, ShellMode,
-    ShellTool, SleepTool, StrictReadTool, UpdateTicketTool, VideoEditTool, VideoGenTool,
-    WebSearchBackend, WebSearchTool,
+    ListTicketsTool, MahbotDebugTool, ReadManagerChatTool, ReadTool, RemoveAlarmTool, ResearchTool,
+    SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, SetupTelegramBotTool,
+    SetupWebSearchTool, ShellMode, ShellTool, SleepTool, StrictReadTool, UpdateTicketTool,
+    VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -299,13 +299,15 @@ impl Role {
     ///
     /// `full_access` is the triggering user's `permissions='full'` (admin)
     /// flag. It only widens the Assistant's toolset (adding `shell`,
-    /// `implement`, and `research`); every other role's toolset is
-    /// byte-identical regardless of its value.
+    /// `implement`, `research`, `computer`, and the Assistant↔Manager chat
+    /// tools); every other role's toolset is byte-identical regardless of its
+    /// value.
     ///
     /// `browser_sessions` is the run-scoped browser session tracker shared with
     /// the agent's `BrowserTool` so every session the run opens is closed at
     /// run end.
     #[must_use]
+    #[expect(clippy::too_many_lines)]
     pub(crate) fn tools(
         self,
         ws: &Workspace,
@@ -406,6 +408,10 @@ impl Role {
                     // construction). No structural authorization gate beyond
                     // `full_access`, matching the full shell widening.
                     t.push(Box::new(ComputerTool));
+                    // Assistant↔Manager communication (admin/full-access only):
+                    // address the Manager of a project workspace and read its chat.
+                    t.push(Box::new(SendMessageToManagerTool));
+                    t.push(Box::new(ReadManagerChatTool));
                 }
                 t
             }
@@ -675,6 +681,36 @@ mod tests {
                         role.as_str(),
                         if full_access { " (full)" } else { "" }
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn manager_chat_tools_only_in_full_access_assistant() {
+        // Acceptance pin: the Assistant↔Manager chat tools are granted ONLY
+        // to the full-access Assistant. Every other role (base or full) and
+        // the base Assistant never communicate with a Manager directly.
+        let ws = crate::workspace::test_ws("test");
+        for role in Role::iter() {
+            for full_access in [false, true] {
+                let names: Vec<&str> = role
+                    .tools(&ws, full_access, test_sessions())
+                    .iter()
+                    .map(|t| t.name())
+                    .collect();
+                for name in ["send_message_to_manager", "read_manager_chat"] {
+                    let has = names.contains(&name);
+                    if role == crate::Role::Assistant && full_access {
+                        assert!(has, "full-access Assistant must advertise `{name}`");
+                    } else {
+                        assert!(
+                            !has,
+                            "{}{} must not advertise `{name}`",
+                            role.as_str(),
+                            if full_access { " (full)" } else { "" }
+                        );
+                    }
                 }
             }
         }

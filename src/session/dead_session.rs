@@ -422,6 +422,8 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
         // users.  This is an accepted limitation.
         reply_target: None,
         pending_job_id: None,
+        reply_to_agent_id: None,
+        reply_workspace_name: None,
     };
 
     tracing::info!(
@@ -805,6 +807,10 @@ mod tests {
     /// then does the recovery round call the model once — asserted to exactly
     /// one fingerprint.
     #[tokio::test]
+    #[serial_test::serial(provider)]
+    // Joins the `provider` group (order: provider → retry_tests_lock, as in the
+    // pipeline/retry tests) so two per-test runtimes never drive the shared
+    // global stores concurrently.
     async fn recovery_resumes_dangling_durable_job_end_to_end() {
         let fake = std::sync::Arc::new(
             crate::util::test::FakeProvider::new()
@@ -907,6 +913,7 @@ mod tests {
     /// dangling durable job is NOT resumed and no attempt is recorded — the
     /// session is still eligible on a later cycle.
     #[tokio::test]
+    #[serial_test::serial(provider)] // see recovery_resumes_dangling_durable_job_end_to_end
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global drain flag across the whole test
     async fn live_running_session_is_not_recovered() {
         let _lock = crate::util::test::retry_tests_lock();
@@ -994,6 +1001,7 @@ mod tests {
     /// A paused workspace freezes dangling-frame resumption: the pause guard
     /// skips the session before routing (no budget consumed, no job resumed).
     #[tokio::test]
+    #[serial_test::serial(provider)] // see recovery_resumes_dangling_durable_job_end_to_end
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the process-global drain flag across the whole test
     async fn paused_workspace_dangling_frame_is_not_recovered() {
         let _lock = crate::util::test::retry_tests_lock();
@@ -1038,6 +1046,7 @@ mod tests {
     /// poller must not re-invoke it or consume retry budget. Unmarked tool
     /// tails (real crash/drain cuts) keep recovering as before.
     #[tokio::test]
+    #[serial_test::serial(provider)] // see recovery_resumes_dangling_durable_job_end_to_end
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the shared store's recover_dead_sessions runs across tests
     async fn sleep_ended_session_is_not_recovered() {
         let _lock = crate::util::test::retry_tests_lock();
