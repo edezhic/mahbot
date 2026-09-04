@@ -14,6 +14,15 @@
 //! `--version` check) so the browser tool depends on this module and not vice
 //! versa.
 //!
+//! mahbot drives the user's real, logged-in Chrome through the chrome-use
+//! extension relay — no chrome-use `--launch` mode, no profile copies, no CDP
+//! fallbacks. When the relay is down because Chrome is closed, the watchdog
+//! silently auto-launches the user's real Chrome (approved product decision; a
+//! window may appear unasked — the launch inherits the user's real profile/
+//! environment) under its own bounded launch budget, separate from daemon
+//! restarts. An absent extension is unfixable by any launch or restart and
+//! pauses auto-recovery.
+//!
 //! Verified tab-sweep: mahbot-owned session tab groups (`link-enricher-*`) are
 //! closed through the CLI and verified by round-over-round re-enumeration. A
 //! bare `session stop` is not enough — it SIGTERMs the daemon, waits ~1 s, then
@@ -27,6 +36,9 @@
 //!   case, rare, and self-healing — the restart clears the wedge).
 //! - `daemon restart` destroys all session state; recovery guidance notes that
 //!   existing browser sessions are reset.
+//! - The Chrome auto-launch shares the user's profile and environment, so it may
+//!   open a window unasked; on display-less hosts it is paused rather than spend
+//!   the launch budget (launching can never help there).
 
 use crate::util::UnwrapPoison;
 use futures_util::future::join_all;
@@ -61,6 +73,10 @@ const CLI_RECHECK: Duration = Duration::from_mins(5);
 const CLI_MISSING_THRESHOLD: u32 = 2;
 /// Consecutive failed restarts before auto-recovery halts (thrash protection).
 const MAX_RESTART_ATTEMPTS: u32 = 3;
+/// Consecutive failed Chrome auto-launches before the launch budget halts —
+/// independent of the daemon-restart budget (a closed browser is a different
+/// problem than a wedged daemon; fixing one must not consume the other's).
+const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 /// Sustained-health window: the restart-attempt counter resets only after the
 /// daemon-free status has been healthy for this long (≥2 watchdog intervals).
 /// A transient healthy right after a restart must not reopen a bounded cycle
@@ -71,6 +87,13 @@ const MAX_RESTART_ATTEMPTS: u32 = 3;
 const SUSTAINED_HEALTHY_WINDOW: Duration = Duration::from_mins(1);
 /// Backoff between restart attempts (30s → 2min → 10min).
 const RESTART_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_mins(2),
+    Duration::from_mins(10),
+];
+/// Backoff between Chrome auto-launch attempts (30s → 2min → 10min), mirroring
+/// the restart backoff so a host that keeps failing cannot spam launches.
+const LAUNCH_BACKOFF: [Duration; 3] = [
     Duration::from_secs(30),
     Duration::from_mins(2),
     Duration::from_mins(10),
@@ -104,8 +127,14 @@ enum ProbeFailure {
     HostBroken,
     /// Extension installed but disabled (Chrome reports disable reasons).
     ExtensionDisabled,
+    /// The chrome-use extension is absent from Chrome entirely — unfixable by
+    /// any daemon restart or launch; the user must install it from the store.
+    ExtensionAbsent,
     /// Extension enabled but the relay is down — transient, self-heals.
     RelayDown,
+    /// No Chrome/Chromium-family browser process is running. NOT unfixable —
+    /// auto-recovery launches the user's real Chrome (never a daemon restart).
+    ChromeNotRunning,
     /// The session's tab lost its debugger attach (orphaned) — the daemon and
     /// relay are up; only closing the tab by hand unblocks the session.
     UnreachableTab,
@@ -135,15 +164,94 @@ impl ProbeOutcome {
 
 impl ProbeFailure {
     /// Causes a daemon restart cannot fix — reported with their concrete fix
-    /// and never consume restart attempts.
+    /// and never consume restart attempts. `ChromeNotRunning` is deliberately
+    /// NOT here: a closed browser is fixed by launching it, not by restarting
+    /// the daemon.
     fn is_unfixable(self) -> bool {
         matches!(
             self,
             ProbeFailure::NotInstalled
                 | ProbeFailure::HostBroken
                 | ProbeFailure::ExtensionDisabled
+                | ProbeFailure::ExtensionAbsent
                 | ProbeFailure::UnreachableTab
         )
+    }
+}
+
+/// Outcome of a Chrome auto-launch attempt, for honest down messaging about
+/// what the watchdog actually did (never attempted = `None` on [`DaemonHealth`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChromeLaunchOutcome {
+    /// Chrome was spawned (and the relay is still down afterward).
+    Launched,
+    /// No Chrome/Chromium binary found, or it could not be started.
+    Failed,
+    /// No display session on this host — launching would never help.
+    NoDisplay,
+}
+
+/// One bounded attempt budget (backoff between attempts, halt + cooldown after
+/// `max` failures). Pure state — the bounded state machine is unit-testable.
+#[derive(Default)]
+struct AttemptBudget {
+    attempts: u32,
+    next_at: Option<Instant>,
+    halted: bool,
+    halted_until: Option<Instant>,
+}
+
+impl AttemptBudget {
+    /// Decide whether an attempt is allowed, updating the bookkeeping in place.
+    /// Backoff is checked before the attempt cap, so the final long grace after
+    /// the last attempt is honored before the halt fires. Cooldown expiry resets
+    /// and opens a fresh bounded cycle.
+    fn gate(
+        &mut self,
+        max: u32,
+        backoff: &[Duration],
+        cooldown: Duration,
+        now: Instant,
+    ) -> RecoveryGate {
+        if self.halted {
+            if self.halted_until.is_some_and(|until| now < until) {
+                return RecoveryGate::Cooldown;
+            }
+            // Cooldown expired — reset and allow a fresh bounded cycle.
+            self.halted = false;
+            self.attempts = 0;
+            self.halted_until = None;
+            self.next_at = None;
+        }
+        // Backoff is checked before the attempt cap, so the final long grace
+        // after the last attempt is honored before the halt fires.
+        if self.next_at.is_some_and(|next| now < next) {
+            return RecoveryGate::Backoff;
+        }
+        if self.attempts >= max {
+            self.halted = true;
+            self.halted_until = Some(now + cooldown);
+            return RecoveryGate::Halted;
+        }
+        let attempt = self.attempts + 1;
+        self.attempts = attempt;
+        self.next_at = Some(now + backoff[(attempt as usize - 1).min(backoff.len() - 1)]);
+        RecoveryGate::Allowed(attempt)
+    }
+
+    /// Whether a recovery timer is currently pending — when it is, the timer IS
+    /// the wait (callers must not stack their own relay-revive polls on top of it).
+    fn is_waiting(&self, now: Instant) -> bool {
+        self.halted_until.is_some_and(|until| now < until)
+            || self.next_at.is_some_and(|next| now < next)
+    }
+
+    /// Reset to a fresh bounded cycle (sustained health / cooldown expiry).
+    fn reset(&mut self) {
+        self.attempts = 0;
+        self.next_at = None;
+        self.halted = false;
+        self.halted_until = None;
     }
 }
 
@@ -151,10 +259,17 @@ impl ProbeFailure {
 struct DaemonHealth {
     healthy: Option<bool>,
     last_probe: Option<Instant>,
-    restart_attempts: u32,
-    next_restart_at: Option<Instant>,
-    halted: bool,
-    halted_until: Option<Instant>,
+    /// Restart bounded cycle — backoff between attempts, halt + cooldown after
+    /// [`MAX_RESTART_ATTEMPTS`] failures (thrash protection).
+    restart_budget: AttemptBudget,
+    /// Chrome auto-launch bounded cycle — separate from the restart budget (a
+    /// closed browser and a wedged daemon are independent failures, so neither
+    /// should consume the other's bounded cycle).
+    launch_budget: AttemptBudget,
+    /// Outcome of the last Chrome auto-launch — `None` when never attempted or
+    /// superseded by health. Failure outcomes survive until health or the
+    /// sustained-health reset clears them, so down messaging stays honest.
+    launch_outcome: Option<ChromeLaunchOutcome>,
     /// Last classified failure — surfaces the cause in LLM-facing
     /// messages and drives transition-based warning logging.
     last_failure: Option<ProbeFailure>,
@@ -167,9 +282,9 @@ struct DaemonHealth {
     healthy_since: Option<Instant>,
 }
 
-/// Decision from [`DaemonHealth::gate_restart`].
-#[derive(Debug, PartialEq, Eq)]
-enum RestartGate {
+/// Decision from [`DaemonHealth::gate_restart`] / [`DaemonHealth::gate_launch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryGate {
     /// Attempt N is allowed now.
     Allowed(u32),
     /// Backoff between attempts not yet elapsed.
@@ -181,42 +296,25 @@ enum RestartGate {
 }
 
 impl DaemonHealth {
-    /// Decide whether a restart attempt is allowed, updating the bookkeeping
-    /// in place. Pure (no I/O) so the bounded state machine is unit-testable.
-    fn gate_restart(&mut self, now: Instant) -> RestartGate {
-        if self.halted {
-            if self.halted_until.is_some_and(|until| now < until) {
-                return RestartGate::Cooldown;
-            }
-            // Cooldown expired — reset and allow a fresh bounded cycle.
-            self.halted = false;
-            self.restart_attempts = 0;
-            self.halted_until = None;
-            self.next_restart_at = None;
-        }
-        // Backoff is checked before the attempt cap, so the final 10-min grace
-        // after the last restart is honored before the halt fires.
-        if self.next_restart_at.is_some_and(|next| now < next) {
-            return RestartGate::Backoff;
-        }
-        if self.restart_attempts >= MAX_RESTART_ATTEMPTS {
-            self.halted = true;
-            self.halted_until = Some(now + HALT_COOLDOWN);
-            return RestartGate::Halted;
-        }
-        let attempt = self.restart_attempts + 1;
-        self.restart_attempts = attempt;
-        self.next_restart_at =
-            Some(now + RESTART_BACKOFF[(attempt as usize - 1).min(RESTART_BACKOFF.len() - 1)]);
-        RestartGate::Allowed(attempt)
+    /// Decide whether a daemon restart attempt is allowed.
+    fn gate_restart(&mut self, now: Instant) -> RecoveryGate {
+        self.restart_budget
+            .gate(MAX_RESTART_ATTEMPTS, &RESTART_BACKOFF, HALT_COOLDOWN, now)
+    }
+
+    /// Decide whether a Chrome launch attempt is allowed — a separate bounded
+    /// budget from the restart one (a closed browser is not a wedged daemon).
+    fn gate_launch(&mut self, now: Instant) -> RecoveryGate {
+        self.launch_budget
+            .gate(MAX_LAUNCH_ATTEMPTS, &LAUNCH_BACKOFF, HALT_COOLDOWN, now)
     }
 
     /// Apply a health observation. A healthy result opens the sustained-healthy
-    /// window ([`SUSTAINED_HEALTHY_WINDOW`]); the restart budget resets only
-    /// after the window completes, so a transient healthy right after a restart
-    /// (the post-restart verification — `seed_window = false` — or a single
-    /// watchdog interval) cannot reopen a bounded cycle early. Any failure
-    /// aborts the window.
+    /// window ([`SUSTAINED_HEALTHY_WINDOW`]); the restart AND launch budgets
+    /// reset only after the window completes, so a transient healthy right after
+    /// a restart or launch (the post-recovery verification —
+    /// `seed_window = false` — or a single watchdog interval) cannot reopen a
+    /// bounded cycle early. Any failure aborts the window.
     fn apply_outcome(&mut self, outcome: ProbeOutcome, now: Instant, seed_window: bool) {
         let healthy = outcome.is_healthy();
         if healthy {
@@ -224,16 +322,19 @@ impl DaemonHealth {
                 .healthy_since
                 .is_some_and(|since| now.duration_since(since) >= SUSTAINED_HEALTHY_WINDOW)
             {
-                // Sustained health — open a fresh bounded cycle.
-                self.restart_attempts = 0;
-                self.next_restart_at = None;
-                self.halted = false;
-                self.halted_until = None;
+                // Sustained health — open a fresh bounded cycle for both budgets.
+                self.restart_budget.reset();
+                self.launch_budget.reset();
                 self.last_cause_warned = None;
             }
             if seed_window && self.healthy_since.is_none() {
                 self.healthy_since = Some(now);
             }
+            // Any healthy observation supersedes a stale launch record — the
+            // relay is back up, so there is nothing honest to report about the
+            // last launch. Failure outcomes do NOT clear it (it must survive so
+            // the down message stays honest about what happened).
+            self.launch_outcome = None;
         } else {
             self.healthy_since = None;
         }
@@ -256,6 +357,12 @@ fn health() -> &'static Mutex<DaemonHealth> {
 
 fn wake() -> &'static tokio::sync::Notify {
     WAKE.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Record the outcome of a Chrome auto-launch attempt so down messaging stays
+/// honest about what the watchdog actually did (survives until health clears it).
+fn record_launch_outcome(outcome: ChromeLaunchOutcome) {
+    health().lock().unwrap_poison().launch_outcome = Some(outcome);
 }
 
 /// Detect the daemon-unavailable signature chrome-use produces when its
@@ -725,7 +832,10 @@ async fn service_state() -> Option<ProbeFailure> {
 
 /// Classify a `status --json` snapshot (see [`service_state`]). Note:
 /// pre-1.5.86 CLIs whose `status` lacks extension data fall through to `None`
-/// (healthy).
+/// (healthy). On a relay drop, the cause is resolved with deterministic
+/// precedence ([`classify_relay_down`]): extension disabled/absent first (no
+/// recovery action can fix them), then a browser-running probe, then the
+/// transient relay drop.
 async fn classify_service_state(status: &Value) -> Option<ProbeFailure> {
     let ext = status.get("data")?.get("extension")?;
     if ext.get("hostInstalled").and_then(Value::as_bool) == Some(false) {
@@ -735,31 +845,163 @@ async fn classify_service_state(status: &Value) -> Option<ProbeFailure> {
         return Some(ProbeFailure::HostBroken);
     }
     if ext.get("relayUp").and_then(Value::as_bool) == Some(false) {
-        // Distinguish extension-disabled (restart cannot fix) from a transient
-        // relay drop (self-heals). Key on the extension's disable reasons, not
-        // the unreliable active-bit signal.
-        return Some(if extension_disabled().await {
-            ProbeFailure::ExtensionDisabled
+        let ext_state = extension_state().await;
+        // The browser-running probe is only meaningful when launching could
+        // help: an absent/disabled extension cannot be fixed by launching
+        // Chrome, so skip the probe and let the classifier pick the cause.
+        let chrome = if matches!(ext_state, ExtensionState::Present | ExtensionState::Unknown) {
+            chrome_running().await
         } else {
-            ProbeFailure::RelayDown
-        });
+            None
+        };
+        return Some(classify_relay_down(ext_state, chrome));
     }
     None
 }
 
-/// Whether the chrome-use extension is disabled, from `extension status --json`
-/// (daemon-free; reads Chrome's Secure Preferences). Non-empty `disableReasons`
-/// means the extension is genuinely disabled.
-async fn extension_disabled() -> bool {
-    let Some(status) = run_cli_json(&["extension", "status"]).await else {
-        return false; // Unknown → treat as a transient relay drop, not disabled.
-    };
-    status
-        .get("data")
-        .and_then(|d| d.get("chromeExtension"))
-        .and_then(|c| c.get("disableReasons"))
-        .and_then(Value::as_array)
-        .is_some_and(|reasons| !reasons.is_empty())
+/// Extension presence from `extension status --json` (daemon-free; reads
+/// Chrome's Secure Preferences). Pure so parsing is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionState {
+    Present,
+    Disabled,
+    Absent,
+    Unknown,
+}
+
+/// Parse extension presence from a `extension status --json` value. An absent
+/// `chromeExtension` (an explicit `null`) means the extension is not installed
+/// in Chrome at all — distinct from `NotInstalled` (native host missing) and
+/// `Disabled` (installed but disabled). A MISSING `chromeExtension` key on a
+/// successful envelope is shape-uncertain (old CLI, or a CLI that omits the key
+/// for other reasons) — never claim the unfixable absent cause from it; it
+/// fails open through the transient-relay path as `Unknown`. A FAILED status
+/// command also yields `Unknown` (see [`extension_state`]).
+fn extension_state_from(status: &Value) -> ExtensionState {
+    match status.get("data").and_then(|d| d.get("chromeExtension")) {
+        // A missing key on a SUCCESSFUL envelope is shape-uncertain (old CLI, or a
+        // CLI that omits the key for other reasons) — never claim the unfixable
+        // absent cause from it; it fails open through the transient-relay path.
+        None => ExtensionState::Unknown,
+        // The CLI's absence signal: an explicit null chromeExtension.
+        Some(c) if c.is_null() => ExtensionState::Absent,
+        Some(c) => {
+            if c.get("disableReasons")
+                .and_then(Value::as_array)
+                .is_some_and(|r| !r.is_empty())
+            {
+                ExtensionState::Disabled
+            } else {
+                ExtensionState::Present
+            }
+        }
+    }
+}
+
+/// Whether the chrome-use extension is present, disabled, or absent, from
+/// `extension status --json`. A FAILED status command (spawn error, timeout,
+/// structured CLI error) is never "absent" — unknown fails open to the
+/// transient-relay path, since a mere CLI hiccup must not be reported as an
+/// uninstalled extension.
+async fn extension_state() -> ExtensionState {
+    run_cli_json_opt(&["extension", "status"], None)
+        .await
+        .map_or(ExtensionState::Unknown, |v| extension_state_from(&v))
+}
+
+/// Relay-down cause with deterministic precedence: unfixable Chrome-side
+/// causes first (no recovery action can fix them), then the browser-running
+/// probe, then the transient relay drop. `chrome_running == None` means the
+/// probe was inconclusive or not applicable — degrade to RelayDown.
+fn classify_relay_down(ext: ExtensionState, chrome_running: Option<bool>) -> ProbeFailure {
+    match ext {
+        ExtensionState::Disabled => ProbeFailure::ExtensionDisabled,
+        ExtensionState::Absent => ProbeFailure::ExtensionAbsent,
+        ExtensionState::Present | ExtensionState::Unknown => {
+            if chrome_running == Some(false) {
+                ProbeFailure::ChromeNotRunning
+            } else {
+                ProbeFailure::RelayDown
+            }
+        }
+    }
+}
+
+/// macOS app process names for Chrome/Chromium-family browsers.
+#[cfg(not(target_os = "windows"))]
+const CHROME_PROCESS_NAMES: [&str; 6] = [
+    "Google Chrome",
+    "Chromium",
+    "Brave Browser",
+    "chrome",
+    "chromium",
+    "brave",
+];
+/// Windows image names for the same browsers.
+#[cfg(target_os = "windows")]
+const WINDOWS_CHROME_PROCESS_NAMES: [&str; 3] = ["chrome.exe", "chromium.exe", "brave.exe"];
+
+/// Whether a Chrome/Chromium-family browser process is running. Unix probes
+/// `pgrep -x <ERE alternation>` over the known process names in a single spawn
+/// (macOS bundle binaries plus Linux `comm` names); Windows probes `tasklist`
+/// image-name filters. Any match → `Some(true)`; all no-match → `Some(false)`;
+/// spawn error, other exit code, or timeout → `None` (inconclusive → the
+/// classifier degrades to RelayDown). A closed browser is recovered by
+/// launching, not by restarting the daemon.
+async fn chrome_running() -> Option<bool> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        pgrep_running(&CHROME_PROCESS_NAMES.join("|")).await
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for name in WINDOWS_CHROME_PROCESS_NAMES {
+            if tasklist_has(name).await? {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+}
+
+/// Single `pgrep -x <ERE alternation>` probe: exit 0 → a Chrome/Chromium-family
+/// browser process is running, exit 1 → none, any other exit code / spawn error /
+/// timeout → inconclusive.
+#[cfg(not(target_os = "windows"))]
+async fn pgrep_running(pattern: &str) -> Option<bool> {
+    let mut cmd = Command::new("pgrep");
+    cmd.args(["-x", pattern])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(CLI_TIMEOUT, cmd.status())
+        .await
+        .ok()?
+        .ok()?;
+    match status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false), // no process matched
+        _ => None,
+    }
+}
+
+/// `tasklist` image-name probe (Windows): CSV output containing the image name
+/// → running; empty → no match; invocation failure → inconclusive.
+#[cfg(target_os = "windows")]
+async fn tasklist_has(name: &str) -> Option<bool> {
+    let mut cmd = Command::new("tasklist");
+    cmd.args(["/FI", &format!("IMAGENAME eq {name}"), "/NH", "/FO", "CSV"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(CLI_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).contains(name))
 }
 
 /// Classify daemon health from the daemon-free `status` snapshot. Wedges are
@@ -1225,11 +1467,11 @@ fn set_health(outcome: ProbeOutcome) {
     h.apply_outcome(outcome, Instant::now(), true);
 }
 
-/// Health update for the verification right after a restart. Healthy here
-/// must NOT seed the sustained-healthy window — the window counts consecutive
-/// watchdog interval evaluations after recovery, not the immediate
-/// verification.
-fn set_health_after_restart(outcome: ProbeOutcome) {
+/// Health update for the verification right after a recovery action (daemon
+/// restart or Chrome launch). Healthy here must NOT seed the sustained-healthy
+/// window — the window counts consecutive watchdog interval evaluations after
+/// recovery, not the immediate verification.
+fn set_health_after_recovery(outcome: ProbeOutcome) {
     let mut h = health().lock().unwrap_poison();
     h.apply_outcome(outcome, Instant::now(), false);
 }
@@ -1303,11 +1545,33 @@ pub(crate) fn daemon_down_message() -> String {
              restarts cannot fix a Chrome-side disable; health recovers automatically once \
              it is enabled."
         }
+        Some(ProbeFailure::ExtensionAbsent) => {
+            "The chrome-use extension is not installed in Chrome — install/enable the ab-connect \
+             extension from the Chrome Web Store. Daemon restarts and launches cannot fix an \
+             absent extension; health recovers automatically once it is installed."
+        }
+        Some(ProbeFailure::RelayDown)
+            if h.launch_outcome == Some(ChromeLaunchOutcome::Launched) =>
+        {
+            "The extension relay is down even after Chrome was auto-launched — Chrome is \
+             running, but the ab-connect extension is not republishing. If the extension is \
+             only installed in a non-default profile, install it in Chrome's default profile."
+        }
         Some(ProbeFailure::RelayDown) => {
             "The chrome-use extension relay is down (the extension itself is enabled). \
              Auto-recovery restarts the session daemons and waits for the extension to \
              reconnect."
         }
+        Some(ProbeFailure::ChromeNotRunning) => match h.launch_outcome {
+            None | Some(ChromeLaunchOutcome::Launched) => "Chrome is not running.",
+            Some(ChromeLaunchOutcome::Failed) => {
+                "Chrome is not running and the auto-launch attempt failed (binary not found or \
+                 could not start) — start Chrome manually."
+            }
+            Some(ChromeLaunchOutcome::NoDisplay) => {
+                "Chrome is not running and this host has no display — start Chrome manually."
+            }
+        },
         Some(ProbeFailure::UnreachableTab) => {
             "A browser tab the session was driving is unreachable (the extension lost its \
              debugger attach; about:blank tabs are never re-attached) — close the leftover \
@@ -1317,7 +1581,28 @@ pub(crate) fn daemon_down_message() -> String {
             "The chrome-use browser daemon is down or unresponsive."
         }
     };
-    let recovery = if h.halted {
+    let recovery = if matches!(h.last_failure, Some(ProbeFailure::ChromeNotRunning)) {
+        // ChromeNotRunning has its own launch budget, so a halted RESTART state
+        // must not produce restart-halt text here.
+        match h.launch_outcome {
+            Some(ChromeLaunchOutcome::NoDisplay) => {
+                " Auto-recovery is paused for this cause — no launch will be attempted; it \
+                 resumes automatically once a display is available."
+            }
+            _ if h.launch_budget.halted => {
+                " Auto-recovery exhausted its launch attempts and is in a 30-minute cooldown \
+                 (thrash protection); it will retry after the cooldown — start Chrome manually \
+                 if Chrome stays down."
+            }
+            Some(ChromeLaunchOutcome::Failed) => {
+                " Auto-recovery will retry the launch with backoff."
+            }
+            None | Some(ChromeLaunchOutcome::Launched) => {
+                " Auto-recovery will launch Chrome, backing off between attempts — no manual \
+                 action is needed."
+            }
+        }
+    } else if h.restart_budget.halted {
         " Auto-recovery exhausted its restart attempts and is in a 30-minute cooldown (thrash \
          protection); it will retry after the cooldown."
     } else if h.last_failure.is_some_and(ProbeFailure::is_unfixable) {
@@ -1965,6 +2250,179 @@ async fn relay_up() -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
+/// Chrome launch flags applied on auto-launch. Deliberately minimal — no
+/// daemon/profile/home overrides: the launch inherits the user's real
+/// profile/environment, so only flags that suppress first-run friction belong.
+const CHROME_LAUNCH_FLAGS: [&str; 3] = [
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--silent-debugger-extension-api",
+];
+
+/// Launch the user's real Chrome when [`ProbeFailure::ChromeNotRunning`], within
+/// a bounded launch budget separate from daemon restarts. Display-less hosts
+/// are unfixable here: paused, no budget consumed. The launch inherits mahbot's
+/// real environment (NOT `ensure_browser_env` — its HOME override and daemon
+/// flags must never reach the user's browser) and waits for the relay.
+async fn attempt_chrome_launch() {
+    if !display_available() {
+        record_launch_outcome(ChromeLaunchOutcome::NoDisplay);
+        debug!("browser daemon: headless host — Chrome launch skipped; start Chrome manually");
+        return;
+    }
+    let gate = { health().lock().unwrap_poison().gate_launch(Instant::now()) };
+    let RecoveryGate::Allowed(attempt) = gate else {
+        log_gate_denied(gate, "chrome launch", MAX_LAUNCH_ATTEMPTS);
+        return;
+    };
+    let Some(binary) = chrome_binary() else {
+        record_launch_outcome(ChromeLaunchOutcome::Failed);
+        warn!("no Chrome/Chromium binary found — start Chrome manually");
+        return;
+    };
+    if let Err(e) = spawn_chrome_detached(&binary) {
+        record_launch_outcome(ChromeLaunchOutcome::Failed);
+        warn!(error = %e, "failed to launch Chrome — start Chrome manually");
+        return;
+    }
+    info!(
+        attempt,
+        max = MAX_LAUNCH_ATTEMPTS,
+        "launched the user's Chrome; waiting for the extension relay to come up"
+    );
+    wait_for_relay(RELAY_REVIVE_WAIT).await;
+    let outcome = evaluate_health().await;
+    // Verification must not seed the sustained-healthy window (same rationale as
+    // the restart path) — the launch budget resets only on sustained health.
+    set_health_after_recovery(outcome);
+    if outcome.is_healthy() {
+        info!("browser daemon: relay recovered after Chrome launch");
+    } else {
+        record_launch_outcome(ChromeLaunchOutcome::Launched);
+        warn!(
+            "Chrome launched but the extension relay is still down — if the ab-connect \
+             extension is only installed in a non-default profile, install it in Chrome's \
+             default profile"
+        );
+    }
+}
+
+/// Whether a Chrome window can actually appear: Linux needs a display session;
+/// macOS/Windows launch is attempted and degrades via the failure path (SSH/
+/// service sessions surface there).
+fn display_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+/// Resolve the user's real Chrome/Chromium-family binary (standard install
+/// locations, mirroring chrome-use's own resolution in spirit). None → the
+/// launch fails honestly.
+fn chrome_binary() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
+        let mut candidates = Vec::new();
+        for app in ["Google Chrome", "Chromium", "Brave Browser"] {
+            candidates.push(PathBuf::from(format!(
+                "/Applications/{app}.app/Contents/MacOS/{app}"
+            )));
+            if let Some(home) = home.as_deref() {
+                candidates.push(home.join(format!("Applications/{app}.app/Contents/MacOS/{app}")));
+            }
+        }
+        candidates
+            .into_iter()
+            .find(|p| crate::util::is_executable(p))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let names = [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "brave",
+        ];
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(paths) = std::env::var_os("PATH") {
+            dirs.extend(std::env::split_paths(&paths));
+        }
+        dirs.extend([
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/snap/bin"),
+        ]);
+        for dir in dirs {
+            for name in names {
+                let candidate = dir.join(name);
+                if crate::util::is_executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates = Vec::new();
+        for base in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            let Some(base) = std::env::var_os(base) else {
+                continue;
+            };
+            let base = PathBuf::from(base);
+            for rel in [
+                Path::new("Google/Chrome/Application/chrome.exe"),
+                Path::new("Chromium/Application/chrome.exe"),
+                Path::new("BraveSoftware/Brave-Browser/Application/brave.exe"),
+            ] {
+                candidates.push(base.join(rel));
+            }
+        }
+        candidates
+            .into_iter()
+            .find(|p| crate::util::is_executable(p))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Spawn Chrome detached from mahbot: own process group on Unix (terminal
+/// signals to mahbot's group must not kill the browser), detached/no-window
+/// creation flags on Windows (mirrors self_update.rs:1428-1434). The child is
+/// deliberately dropped without wait or kill_on_drop — Chrome must survive
+/// mahbot restarts.
+fn spawn_chrome_detached(binary: &Path) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(CHROME_LAUNCH_FLAGS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Inherit the real env — do NOT touch HOME or add AGENT_BROWSER_*/CHROMIUM_FLAGS.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    cmd.spawn().map(|_| ())
+}
+
 /// Warn once per cause transition — an ongoing failure does not spam every
 /// watchdog interval, but the same cause warns again after a healthy spell.
 fn warn_transition(failure: ProbeFailure) {
@@ -1989,11 +2447,35 @@ fn warn_transition(failure: ProbeFailure) {
              Daemon restarts cannot fix a Chrome-side disable; auto-recovery paused \
              until it is enabled."
         ),
+        ProbeFailure::ExtensionAbsent => warn!(
+            "chrome-use extension is not installed in Chrome — install/enable the \
+             ab-connect extension from the Chrome Web Store. Auto-recovery paused \
+             until it is installed."
+        ),
         ProbeFailure::RelayDown => warn!(
             "chrome-use extension relay is down (the extension is enabled) — waiting \
              for the extension to reconnect and restarting session daemons to clear \
              stale relay bindings."
         ),
+        ProbeFailure::ChromeNotRunning => {
+            // Must match what attempt_recovery will actually do on this host — a
+            // headless machine pauses recovery instead of launching.
+            if !display_available() {
+                warn!(
+                    "Chrome is not running and no display is available (headless host) — \
+                       start Chrome manually; auto-recovery paused."
+                );
+            } else if h.launch_budget.halted {
+                warn!(
+                    "Chrome is not running — launch attempts are paused in a thrash-protection \
+                     cooldown; start Chrome manually."
+                );
+            } else {
+                warn!(
+                    "Chrome is not running — auto-recovery will launch it (bounded launch budget)."
+                );
+            }
+        }
         ProbeFailure::UnreachableTab => warn!(
             "a browser tab the session was driving is unreachable (the extension lost its \
              debugger attach; about:blank tabs are never re-attached) — close the leftover \
@@ -2005,26 +2487,55 @@ fn warn_transition(failure: ProbeFailure) {
     }
 }
 
-/// Bounded auto-recovery: restart session daemons with backoff between attempts
-/// and a halt after MAX_RESTART_ATTEMPTS failures. Causes that a restart cannot
-/// fix — extension disabled, not installed, broken host, unreachable tab — are
-/// reported with their concrete fix and never consume restart attempts. A
-/// transient relay drop is waited out first and consumes no attempt if it
-/// self-heals.
+/// Log a blocked recovery-gate decision — the gated action does not run.
+/// `noun` names the gated action ("restart" / "chrome launch").
+fn log_gate_denied(gate: RecoveryGate, noun: &str, max: u32) {
+    match gate {
+        RecoveryGate::Halted => error!(
+            attempts = max,
+            "browser daemon: {max} consecutive failed {noun} attempts; \
+             auto-recovery halted for 30 min (thrash protection)"
+        ),
+        RecoveryGate::Backoff => {
+            debug!("browser daemon: still down; waiting out {noun} backoff");
+        }
+        RecoveryGate::Cooldown => {
+            debug!("browser daemon: still down; {noun} cooldown in progress (thrash protection)");
+        }
+        RecoveryGate::Allowed(_) => unreachable!(),
+    }
+}
+
+/// Bounded auto-recovery. `ChromeNotRunning` funnels into a bounded Chrome
+/// launch — never a daemon restart, never the restart budget (a closed browser
+/// cannot be fixed by restarting the daemon). Restart causes restart session
+/// daemons with backoff between attempts and a halt after MAX_RESTART_ATTEMPTS
+/// failures. Causes that a restart cannot fix — extension absent/disabled, not
+/// installed, broken host, unreachable tab — are reported with their concrete
+/// fix and never consume restart attempts. A transient relay drop is waited out
+/// first and consumes no attempt if it self-heals.
 async fn attempt_recovery(mut failure: ProbeFailure) {
     warn_transition(failure);
     // Unfixable causes stop here — they never consume restart attempts.
     if failure.is_unfixable() {
         return;
     }
-    // While a recovery timer (restart backoff or halt cooldown) is pending, the
-    // timer IS the wait — don't poll the relay for up to RELAY_REVIVE_WAIT on
-    // top of it. The next watchdog cycle re-evaluates and re-enters recovery.
+    // ChromeNotRunning is handled by a bounded launch, BEFORE the restart
+    // throttle check: the launch budget is independent of restart backoff/halt,
+    // so a halted restart state must not block launching the user's browser.
+    if failure == ProbeFailure::ChromeNotRunning {
+        attempt_chrome_launch().await;
+        return;
+    }
+    // While a recovery timer is pending, the timer IS the wait — don't poll the
+    // relay for up to RELAY_REVIVE_WAIT on top of it. The next watchdog cycle
+    // re-evaluates and re-enters recovery.
     let now = Instant::now();
-    let throttled = {
-        let h = health().lock().unwrap_poison();
-        h.next_restart_at.is_some_and(|t| now < t) || h.halted_until.is_some_and(|t| now < t)
-    };
+    let throttled = health()
+        .lock()
+        .unwrap_poison()
+        .restart_budget
+        .is_waiting(now);
     if throttled {
         return;
     }
@@ -2041,9 +2552,14 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
                 return;
             }
             ProbeOutcome::Down(f) => {
-                // Re-classified (e.g. now a wedge) — re-warn and re-gate below.
+                // Re-classified (e.g. now a wedge or a closed browser) — re-warn
+                // and re-gate below.
                 warn_transition(f);
                 if f.is_unfixable() {
+                    return;
+                }
+                if f == ProbeFailure::ChromeNotRunning {
+                    attempt_chrome_launch().await;
                     return;
                 }
                 failure = f;
@@ -2058,21 +2574,8 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
         let mut h = health().lock().unwrap_poison();
         h.gate_restart(Instant::now())
     };
-    let RestartGate::Allowed(attempt) = gate else {
-        match gate {
-            RestartGate::Halted => error!(
-                attempts = MAX_RESTART_ATTEMPTS,
-                "browser daemon: {MAX_RESTART_ATTEMPTS} consecutive failed restarts; \
-                 auto-recovery halted for 30 min (thrash protection)"
-            ),
-            RestartGate::Backoff => {
-                debug!("browser daemon: still down; waiting out restart backoff");
-            }
-            RestartGate::Cooldown => {
-                debug!("browser daemon: still down; thrash-protection cooldown in progress");
-            }
-            RestartGate::Allowed(_) => unreachable!(),
-        }
+    let RecoveryGate::Allowed(attempt) = gate else {
+        log_gate_denied(gate, "restart", MAX_RESTART_ATTEMPTS);
         return;
     };
 
@@ -2093,7 +2596,7 @@ async fn attempt_recovery(mut failure: ProbeFailure) {
     // Post-restart verification must not seed the sustained-healthy window —
     // the restart budget resets only after consecutive watchdog intervals of
     // genuine health, so a run that keeps failing cannot reopen a fresh cycle.
-    set_health_after_restart(outcome);
+    set_health_after_recovery(outcome);
     if outcome.is_healthy() {
         info!("browser daemon: recovered after restart");
     } else {
@@ -2158,36 +2661,113 @@ mod tests {
         assert!(is_advertised());
     }
 
+    #[tokio::test]
+    async fn daemon_down_message_reflects_launch_state() {
+        let _guard = with_health_test_lock().await;
+        // Each sub-case starts from the pristine (unknown) state so the launch
+        // outcome recorded in one case never leaks into the next.
+        reset_health();
+
+        // Plain relay drop — no launch was attempted, so the auto-launch caveat
+        // must not leak into the message (it names the relay and the restart).
+        set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
+        let msg = daemon_down_message();
+        assert!(msg.contains("relay is down"));
+        assert!(!msg.contains("auto-launched"));
+
+        // Relay still down after a successful auto-launch — the durable caveat
+        // (non-default profile) surfaces instead of the plain relay-drop text.
+        reset_health();
+        set_health(ProbeOutcome::Down(ProbeFailure::RelayDown));
+        record_launch_outcome(ChromeLaunchOutcome::Launched);
+        let msg = daemon_down_message();
+        assert!(msg.contains("even after Chrome was auto-launched"));
+        assert!(msg.contains("non-default profile"));
+
+        // Chrome not running with no recorded launch — the tail promises a
+        // launch, honest whether it fires this cycle or after backoff.
+        reset_health();
+        set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
+        let msg = daemon_down_message();
+        assert!(msg.contains("Chrome is not running."));
+        assert!(msg.contains("will launch Chrome"));
+
+        // Chrome not running, last launch failed — the failed-attempt cause and
+        // the backoff retry tail both appear (the launch budget is not halted).
+        reset_health();
+        set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
+        record_launch_outcome(ChromeLaunchOutcome::Failed);
+        let msg = daemon_down_message();
+        assert!(msg.contains("auto-launch attempt failed"));
+        assert!(msg.contains("start Chrome manually"));
+        assert!(msg.contains("retry the launch with backoff"));
+
+        // Same failed launch but the budget is halted (thrash protection) — the
+        // cooldown text supersedes the backoff retry promise.
+        reset_health();
+        set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
+        record_launch_outcome(ChromeLaunchOutcome::Failed);
+        health().lock().unwrap_poison().launch_budget.halted = true;
+        let msg = daemon_down_message();
+        assert!(msg.contains("exhausted its launch attempts"));
+        assert!(!msg.contains("retry the launch with backoff"));
+
+        // Chrome not running because there is no display — recovery is paused
+        // for this cause instead of spending the launch budget.
+        reset_health();
+        set_health(ProbeOutcome::Down(ProbeFailure::ChromeNotRunning));
+        record_launch_outcome(ChromeLaunchOutcome::NoDisplay);
+        let msg = daemon_down_message();
+        assert!(msg.contains("no display"));
+        assert!(msg.contains("paused for this cause"));
+
+        // Absent extension — the Web Store fix and the paused recovery tail.
+        reset_health();
+        set_health(ProbeOutcome::Down(ProbeFailure::ExtensionAbsent));
+        let msg = daemon_down_message();
+        assert!(msg.contains("Chrome Web Store"));
+        assert!(msg.contains("no restart will be attempted"));
+
+        // Wedged daemon — the generic down text plus the restart tail.
+        reset_health();
+        set_health(ProbeOutcome::Down(ProbeFailure::DaemonWedge));
+        let msg = daemon_down_message();
+        assert!(msg.contains("down or unresponsive"));
+        assert!(msg.contains("restart it automatically"));
+    }
+
     #[test]
     fn sustained_health_resets_restart_attempts() {
         let now = Instant::now();
         let mut h = DaemonHealth {
-            restart_attempts: 2,
-            next_restart_at: Some(now),
-            halted: true,
-            halted_until: Some(now),
+            restart_budget: AttemptBudget {
+                attempts: 2,
+                next_at: Some(now),
+                halted: true,
+                halted_until: Some(now),
+            },
             ..DaemonHealth::default()
         };
         // A transient healthy result (e.g. the post-restart verification probe)
         // must not reset the budget — a runaway cycle would otherwise reopen a
         // fresh bounded cycle on every restart.
         h.apply_outcome(ProbeOutcome::Healthy, now, false);
-        assert_eq!(h.restart_attempts, 2);
-        assert!(h.halted);
+        assert_eq!(h.restart_budget.attempts, 2);
+        assert!(h.restart_budget.halted);
         // The first watchdog healthy seeds the sustained-healthy window…
         h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL, true);
-        assert_eq!(h.restart_attempts, 2);
+        assert_eq!(h.restart_budget.attempts, 2);
         assert!(h.healthy_since.is_some());
         // …but a second healthy before the window elapses still does not reset.
         h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 2, true);
-        assert_eq!(h.restart_attempts, 2);
-        assert!(h.halted);
+        assert_eq!(h.restart_budget.attempts, 2);
+        assert!(h.restart_budget.halted);
         // Only sustained health across the window opens a fresh bounded cycle.
         h.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 3, true);
-        assert_eq!(h.restart_attempts, 0);
-        assert_eq!(h.next_restart_at, None);
-        assert!(!h.halted);
-        assert!(h.halted_until.is_none());
+        assert_eq!(h.restart_budget.attempts, 0);
+        assert_eq!(h.restart_budget.next_at, None);
+        assert!(!h.restart_budget.halted);
+        assert!(h.restart_budget.halted_until.is_none());
         assert_eq!(h.last_failure, None);
     }
 
@@ -2195,8 +2775,11 @@ mod tests {
     fn cause_flapping_and_transient_health_do_not_reset_restart_budget() {
         let now = Instant::now();
         let mut h = DaemonHealth {
-            restart_attempts: 2,
-            next_restart_at: Some(now),
+            restart_budget: AttemptBudget {
+                attempts: 2,
+                next_at: Some(now),
+                ..AttemptBudget::default()
+            },
             last_failure: Some(ProbeFailure::DaemonWedge),
             ..DaemonHealth::default()
         };
@@ -2204,49 +2787,200 @@ mod tests {
         // alternating causes must not evade the 3-attempt halt.
         h.apply_outcome(ProbeOutcome::Down(ProbeFailure::RelayDown), now, true);
         assert_eq!(h.last_failure, Some(ProbeFailure::RelayDown));
-        assert_eq!(h.restart_attempts, 2);
-        assert!(h.next_restart_at.is_some());
+        assert_eq!(h.restart_budget.attempts, 2);
+        assert!(h.restart_budget.next_at.is_some());
         // Flapping back and forth accumulates — never resets.
         h.apply_outcome(ProbeOutcome::Down(ProbeFailure::DaemonWedge), now, true);
         h.apply_outcome(ProbeOutcome::Down(ProbeFailure::RelayDown), now, true);
         assert_eq!(h.last_failure, Some(ProbeFailure::RelayDown));
-        assert_eq!(h.restart_attempts, 2);
+        assert_eq!(h.restart_budget.attempts, 2);
         // A transient healthy result does not reset either — only sustained
         // health across the window opens a fresh bounded cycle.
         h.apply_outcome(ProbeOutcome::Healthy, now, true);
-        assert_eq!(h.restart_attempts, 2);
-        assert!(h.next_restart_at.is_some());
+        assert_eq!(h.restart_budget.attempts, 2);
+        assert!(h.restart_budget.next_at.is_some());
         h.apply_outcome(ProbeOutcome::Healthy, now + SUSTAINED_HEALTHY_WINDOW, true);
         assert_eq!(h.last_failure, None);
-        assert_eq!(h.restart_attempts, 0);
-        assert_eq!(h.next_restart_at, None);
-        assert!(!h.halted);
+        assert_eq!(h.restart_budget.attempts, 0);
+        assert_eq!(h.restart_budget.next_at, None);
+        assert!(!h.restart_budget.halted);
     }
 
     #[test]
     fn gate_honors_backoff_before_halt() {
         let now = Instant::now();
         let mut h = DaemonHealth::default();
-        assert_eq!(h.gate_restart(now), RestartGate::Allowed(1));
+        assert_eq!(h.gate_restart(now), RecoveryGate::Allowed(1));
         // 30s backoff before attempt 2.
-        assert_eq!(h.gate_restart(now), RestartGate::Backoff);
+        assert_eq!(h.gate_restart(now), RecoveryGate::Backoff);
         assert_eq!(
             h.gate_restart(now + RESTART_BACKOFF[0]),
-            RestartGate::Allowed(2)
+            RecoveryGate::Allowed(2)
         );
         // 2min backoff before attempt 3.
         let t2 = now + RESTART_BACKOFF[0] + RESTART_BACKOFF[1];
-        assert_eq!(h.gate_restart(t2), RestartGate::Allowed(3));
+        assert_eq!(h.gate_restart(t2), RecoveryGate::Allowed(3));
         // The final 10-min grace is honored before the halt fires.
-        assert_eq!(h.gate_restart(t2), RestartGate::Backoff);
+        assert_eq!(h.gate_restart(t2), RecoveryGate::Backoff);
         let t3 = t2 + RESTART_BACKOFF[2];
-        assert_eq!(h.gate_restart(t3), RestartGate::Halted);
-        assert!(h.halted);
-        assert_eq!(h.gate_restart(t3), RestartGate::Cooldown);
+        assert_eq!(h.gate_restart(t3), RecoveryGate::Halted);
+        assert!(h.restart_budget.halted);
+        assert_eq!(h.gate_restart(t3), RecoveryGate::Cooldown);
         // After the cooldown a fresh bounded cycle starts.
-        assert_eq!(h.gate_restart(t3 + HALT_COOLDOWN), RestartGate::Allowed(1));
-        assert_eq!(h.restart_attempts, 1);
-        assert!(!h.halted);
+        assert_eq!(h.gate_restart(t3 + HALT_COOLDOWN), RecoveryGate::Allowed(1));
+        assert_eq!(h.restart_budget.attempts, 1);
+        assert!(!h.restart_budget.halted);
+    }
+
+    #[test]
+    fn relay_down_classification_precedence() {
+        // Disabled wins regardless of whether Chrome is running.
+        assert_eq!(
+            classify_relay_down(ExtensionState::Disabled, Some(true)),
+            ProbeFailure::ExtensionDisabled
+        );
+        assert_eq!(
+            classify_relay_down(ExtensionState::Disabled, Some(false)),
+            ProbeFailure::ExtensionDisabled
+        );
+        assert_eq!(
+            classify_relay_down(ExtensionState::Disabled, None),
+            ProbeFailure::ExtensionDisabled
+        );
+        // Absent beats ChromeNotRunning — launching can't fix an uninstalled extension.
+        assert_eq!(
+            classify_relay_down(ExtensionState::Absent, Some(false)),
+            ProbeFailure::ExtensionAbsent
+        );
+        assert_eq!(
+            classify_relay_down(ExtensionState::Absent, None),
+            ProbeFailure::ExtensionAbsent
+        );
+        // Present + no Chrome running → ChromeNotRunning.
+        assert_eq!(
+            classify_relay_down(ExtensionState::Present, Some(false)),
+            ProbeFailure::ChromeNotRunning
+        );
+        // Present + Chrome running (or an inconclusive probe) → transient relay drop.
+        assert_eq!(
+            classify_relay_down(ExtensionState::Present, Some(true)),
+            ProbeFailure::RelayDown
+        );
+        assert_eq!(
+            classify_relay_down(ExtensionState::Present, None),
+            ProbeFailure::RelayDown
+        );
+        // Unknown fails open to the probe; only an explicit no-Chrome proves not running.
+        assert_eq!(
+            classify_relay_down(ExtensionState::Unknown, Some(false)),
+            ProbeFailure::ChromeNotRunning
+        );
+        assert_eq!(
+            classify_relay_down(ExtensionState::Unknown, None),
+            ProbeFailure::RelayDown
+        );
+        // ChromeNotRunning is recoverable (launch), ExtensionAbsent is not.
+        assert!(!ProbeFailure::ChromeNotRunning.is_unfixable());
+        assert!(ProbeFailure::ExtensionAbsent.is_unfixable());
+    }
+
+    #[test]
+    fn extension_state_parsing() {
+        // No `data` at all, or no `chromeExtension` within it → shape-uncertain,
+        // never the unfixable absent cause (fails open as unknown).
+        assert_eq!(
+            extension_state_from(&serde_json::json!({})),
+            ExtensionState::Unknown
+        );
+        assert_eq!(
+            extension_state_from(&serde_json::json!({ "data": {} })),
+            ExtensionState::Unknown
+        );
+        // Explicit null → absent (the CLI reports the extension as not present).
+        assert_eq!(
+            extension_state_from(&serde_json::json!({ "data": { "chromeExtension": null } })),
+            ExtensionState::Absent
+        );
+        // Present with an empty disableReasons, or with no disableReasons at all.
+        assert_eq!(
+            extension_state_from(&serde_json::json!({
+                "data": { "chromeExtension": { "disableReasons": [] } }
+            })),
+            ExtensionState::Present
+        );
+        assert_eq!(
+            extension_state_from(&serde_json::json!({
+                "data": { "chromeExtension": { "enabled": true } }
+            })),
+            ExtensionState::Present
+        );
+        // Disabled when disableReasons is non-empty.
+        assert_eq!(
+            extension_state_from(&serde_json::json!({
+                "data": { "chromeExtension": { "disableReasons": ["user"] } }
+            })),
+            ExtensionState::Disabled
+        );
+    }
+
+    #[test]
+    fn launch_budget_is_independent_of_restart_budget() {
+        let now = Instant::now();
+        // A halted/exhausted RESTART budget must NOT block a launch — the two
+        // bounded cycles are independent.
+        let mut h = DaemonHealth {
+            restart_budget: AttemptBudget {
+                attempts: MAX_RESTART_ATTEMPTS,
+                halted: true,
+                halted_until: Some(now),
+                ..AttemptBudget::default()
+            },
+            ..DaemonHealth::default()
+        };
+        assert!(matches!(h.gate_launch(now), RecoveryGate::Allowed(_)));
+        assert_eq!(h.launch_budget.attempts, 1);
+        // An exhausted LAUNCH budget still leaves the restart gate open.
+        let mut h2 = DaemonHealth {
+            launch_budget: AttemptBudget {
+                attempts: MAX_LAUNCH_ATTEMPTS,
+                ..AttemptBudget::default()
+            },
+            ..DaemonHealth::default()
+        };
+        assert!(!matches!(h2.gate_launch(now), RecoveryGate::Allowed(_)));
+        assert!(matches!(h2.gate_restart(now), RecoveryGate::Allowed(_)));
+        // Sustained health resets both budgets and clears a recorded launch
+        // outcome (a pending Failed launch must not survive recovery).
+        let mut h3 = DaemonHealth {
+            restart_budget: AttemptBudget {
+                attempts: 2,
+                next_at: Some(now),
+                halted: true,
+                halted_until: Some(now),
+            },
+            launch_budget: AttemptBudget {
+                attempts: 2,
+                next_at: Some(now),
+                halted: true,
+                halted_until: Some(now),
+            },
+            launch_outcome: Some(ChromeLaunchOutcome::Failed),
+            ..DaemonHealth::default()
+        };
+        // The first healthy seeds the sustained-healthy window but does not yet
+        // reset either budget; a healthy observation clears a stale launch record.
+        h3.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL, true);
+        assert_eq!(h3.restart_budget.attempts, 2);
+        assert_eq!(h3.launch_budget.attempts, 2);
+        assert!(h3.restart_budget.halted);
+        assert!(h3.launch_budget.halted);
+        assert_eq!(h3.launch_outcome, None);
+        // A healthy across the sustained window opens fresh bounded cycles.
+        h3.apply_outcome(ProbeOutcome::Healthy, now + WATCHDOG_INTERVAL * 3, true);
+        assert_eq!(h3.restart_budget.attempts, 0);
+        assert_eq!(h3.launch_budget.attempts, 0);
+        assert!(!h3.restart_budget.halted);
+        assert!(!h3.launch_budget.halted);
     }
 
     #[test]
