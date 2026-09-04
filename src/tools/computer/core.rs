@@ -492,7 +492,7 @@ pub(crate) fn blit_rgba(
 }
 
 /// ZPixmap tile (`depth` 24/32, 4 bytes/pixel) → RGBA.
-#[cfg_attr(not(target_os = "linux"), expect(dead_code))] // deliberate: only the Linux backend calls this; tests exercise it everywhere
+#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
 pub(crate) fn x11_pixels_to_rgba(
     data: &[u8],
     width: u32,
@@ -524,7 +524,7 @@ pub(crate) fn x11_pixels_to_rgba(
 /// `file://` portal URI → path, percent-decoding `%XX` (`+` kept verbatim).
 /// After `file://`, `[host]/path` with an empty host (`file:///...`) or
 /// exactly `localhost` is accepted; anything else is rejected.
-#[cfg_attr(not(target_os = "linux"), expect(dead_code))] // deliberate: only the Linux backend calls this; tests exercise it everywhere
+#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
 pub(crate) fn portal_uri_to_path(uri: &str) -> Result<PathBuf, anyhow::Error> {
     let stripped = uri.strip_prefix("file://").ok_or_else(|| {
         taxonomy_error(ERR_DEGRADED, format!("portal uri is not a file uri: {uri}"))
@@ -585,7 +585,7 @@ pub(crate) fn portal_uri_to_path(uri: &str) -> Result<PathBuf, anyhow::Error> {
 /// intersection in buffer space (buffer origin = screen origin, size =
 /// screen size). `crop_rgba` clamps the far edge, so w/h are rounded up to
 /// `>= 1` (mirror `region_to_pixels` style).
-#[cfg_attr(not(target_os = "linux"), expect(dead_code))] // deliberate: only the Linux backend calls this; tests exercise it everywhere
+#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code))] // only the Linux backend calls this; tests exercise it everywhere
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn window_capture_rect(
     win: &SurfaceGeometry,

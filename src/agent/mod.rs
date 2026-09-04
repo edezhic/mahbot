@@ -5159,7 +5159,6 @@ mod tests {
     /// terminalized.
     #[tokio::test]
     #[serial_test::serial(provider)]
-    #[expect(clippy::too_many_lines)] // deliberate: the full drain lifecycle + resume is one cohesive assertion bed
     async fn drain_mid_sync_analyze_leaves_call_dangling_then_completion_resumes() {
         let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new());
         let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
@@ -5326,7 +5325,6 @@ mod tests {
     /// terminalized and its checkpointed outcome settles against its own call
     /// id. A THIRD launched job for the pin that binds no call stays launched
     /// (unfinished jobs are never deleted except by explicit abandon).
-    #[expect(clippy::too_many_lines)] // large multi-job scenario fixture
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn complete_pending_tool_calls_binds_same_kind_calls_to_distinct_jobs() {

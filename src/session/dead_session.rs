@@ -859,8 +859,7 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "recovery did not complete within 60s: jobs={jobs:?} \
-                 tail_role={tail_role:?} tail_has_reply={}",
-                tail_has_reply,
+                 tail_role={tail_role:?} tail_has_reply={tail_has_reply}",
             );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
