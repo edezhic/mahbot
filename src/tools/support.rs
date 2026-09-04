@@ -320,7 +320,7 @@ impl Tool for SetupWebSearchTool {
     }
 }
 
-/// Install chrome-use: the binary, skill, and native-messaging host.
+/// Install chrome-use: the release binary and native-messaging host.
 pub(crate) struct InstallChromeUseTool;
 
 #[async_trait]
@@ -338,39 +338,31 @@ impl Tool for InstallChromeUseTool {
     }
 
     async fn execute(&self, _ws: &Workspace, _args: serde_json::Value) -> anyhow::Result<String> {
-        #[cfg(target_os = "windows")]
-        {
-            Err(err(
-                "chrome-use install on Windows requires the Windows .exe — the curl|sh \
-                 installer is macOS/Linux only. Download the .exe from the chrome-use releases, \
-                 then install the Chrome extension manually from the Chrome Web Store (still \
-                 required).",
-            ))
-        }
+        crate::tools::browser_daemon::install_chrome_use()
+            .await
+            .map_err(err)?;
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            crate::tools::browser_daemon::install_chrome_use()
-                .await
-                .map_err(err)?;
-
-            Ok(
-                "chrome-use is installed: the CLI binary and skill were fetched by the \
-                 install script, and the native-messaging host was registered via \
-                 `chrome-use extension install`.\n\
-                 One MANUAL step remains — you must install the chrome-use browser extension \
-                 yourself:\n\
-                 1. Open Chrome and go to the Chrome Web Store.\n\
-                 2. Install the chrome-use extension (per its install docs).\n\
-                 3. Pin it once installed so the native host can reach it.\n\
-                 Only after that will agents be able to drive your normal browser via \
-                 `browser`.\n\
-                 Note: this setup is intentionally invasive — chrome-use gets full control \
-                 over the user's real browser. It must only be run after you (the Support \
-                 agent) have explained what it does and obtained the user's explicit consent."
-                    .to_string(),
-            )
-        }
+        Ok(
+            "chrome-use is installed: the release binary was downloaded directly and \
+             SHA-256-verified, and the native-messaging host was registered via \
+             `chrome-use extension install --no-profile` — no managed-Chrome configuration \
+             profile is ever created, so Chrome never enters \"managed by your organization\" \
+             mode.\n\
+             One MANUAL step remains — you must install the chrome-use browser extension \
+             yourself:\n\
+             1. Open Chrome and go to the Chrome Web Store.\n\
+             2. Install the chrome-use extension (per its install docs).\n\
+             3. Pin it once installed so the native host can reach it.\n\
+             Only after that will agents be able to drive your normal browser via \
+             `browser`.\n\
+             Note: this setup is intentionally invasive — chrome-use gets full control \
+             over the user's real browser. It must only be run after you (the Support \
+             agent) have explained what it does and obtained the user's explicit consent.\n\
+             mahbot auto-updates the chrome-use binary in place (checksum-verified release \
+             download) after service startup — binary only; the extension and native host \
+             are never re-registered."
+                .to_string(),
+        )
     }
 }
 

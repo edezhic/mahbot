@@ -294,9 +294,10 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::browser_daemon::run_watchdog(),
     );
 
-    // chrome-use auto-update: best-effort once-per-boot check that upgrades an
-    // existing installation (binary + native host) to the latest release; skips
-    // silently when offline and never blocks or first-installs without consent.
+    // chrome-use auto-update: best-effort once-per-boot check that swaps an
+    // existing installation's binary in place (binary-only release swap, all
+    // platforms); skips silently when offline and never blocks or first-installs
+    // without consent.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

@@ -112,6 +112,10 @@ semver = "1"
 tempfile = "3"
 unicode-normalization = "0.1"
 
+# chrome-use release archive download/extract (tar.gz sidecar-verified)
+flate2 = "1"
+tar = "0.4"
+
 # Memory / persistence
 # Pinned exactly: the storage layer drives CDC capture (blob-encoding) and the
 # read-only debug/bench paths, so it must not drift under them.

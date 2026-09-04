@@ -30,7 +30,8 @@
 
 use crate::util::UnwrapPoison;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -363,27 +364,29 @@ impl std::fmt::Display for CliProbeFailure {
     }
 }
 
-/// The chrome-use curl|sh install URL — single source of truth, shared by the
-/// not-found install hint and the Support `install_chrome_use` tool.
-const CHROME_USE_INSTALL_URL: &str =
-    "https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh";
+/// GitHub repo whose releases host the chrome-use binary (single source of truth).
+const CHROME_USE_RELEASE_REPO: &str = "leeguooooo/chrome-use";
 
-/// Timeout for the chrome-use curl|sh install and native-host registration:
-/// the download can legitimately take a minute or two, but a hung install must
-/// not block the Support agent's tool call indefinitely. Single source of
-/// truth next to [`CHROME_USE_INSTALL_URL`], used by the auto-updater too.
+/// Timeout for a chrome-use release download (archives are ~9 MB).
+const CHROME_USE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Timeout for resolving the latest chrome-use release tag.
+const CHROME_USE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for a chrome-use native-host registration subprocess (`extension
+/// install`): a hung registration must not block the Support agent's tool call
+/// indefinitely.
 const CHROME_USE_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Install hint for the definitive not-found case — shared by every
-/// user-facing message that names the chrome-use CLI as missing. Derived from
-/// [`CHROME_USE_INSTALL_URL`] so the URL has a single source of truth.
-pub(crate) static CHROME_USE_INSTALL_HINT: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("Install with: curl -fsSL {CHROME_USE_INSTALL_URL} | sh"));
+/// Install hint for the definitive not-found case — appended to every
+/// user-facing message that names the chrome-use CLI as missing.
+pub(crate) const CHROME_USE_INSTALL_HINT: &str = "To install it, the Support agent can run the \
+     user-consented `install_chrome_use` tool (a direct, checksum-verified release download).";
 
-/// Resolved absolute path of the chrome-use binary (PATH first, then common
-/// install locations), cached after the first probe. Re-resolves only when
-/// the cached path vanished or was never found, so a late installation is
-/// picked up by the next probe.
+/// Resolved absolute path of the chrome-use binary (managed dir first, then
+/// PATH, then common install locations), cached after the first probe.
+/// Re-resolves only when the cached path vanished or was never found, so a
+/// late installation is picked up by the next probe.
 static CLI_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 /// Absolute path of the chrome-use binary, or `None` when definitively not
@@ -406,8 +409,8 @@ pub(crate) fn cli_path() -> Option<PathBuf> {
 }
 
 /// Clear the cached CLI path so a relocated binary is re-resolved on the next
-/// probe — the curl installer may move the binary between `/usr/local/bin` and
-/// `~/.local/bin`, so a stale cache would pin the pre-update path.
+/// probe — after a first install the binary lands at a fresh managed-dir path
+/// that a stale cache would not see.
 fn invalidate_cli_path() {
     *CLI_PATH
         .get_or_init(|| Mutex::new(None))
@@ -415,18 +418,41 @@ fn invalidate_cli_path() {
         .unwrap_poison() = None;
 }
 
-/// Locate the chrome-use binary: PATH lookup first, then the common install
-/// locations the curl installer targets (`~/.local/bin`, `~/.cargo/bin`,
-/// `/usr/local/bin`, `/opt/homebrew/bin` — the first two in the installer's
-/// order so a fresh curl install wins over a stale cargo one). Home
-/// resolution goes through [`crate::util::cargo_bin_dir`] and
-/// `directories::UserDirs` (not `$HOME`) so the fallback still works on
-/// HOME-less hosts (docker); when `CARGO_HOME` is set the literal
-/// `~/.cargo/bin` is probed too (belt-and-suspenders, mirroring the shell
-/// module's `extra_shell_path_prefixes`). Candidates must be executable
-/// (`execvp` would skip a non-executable PATH entry, so we do too).
+/// Stable mahbot-owned install dir (`<storage root>/bin`) for the chrome-use
+/// binary. Probed FIRST by [`find_cli_binary`] on every OS — on Windows this
+/// is the only probe that reliably finds mahbot's own install — so the
+/// first-install location and the auto-update swap location are always the
+/// same path.
+#[must_use]
+fn managed_bin_dir() -> Option<PathBuf> {
+    crate::config::CONFIG
+        .try_storage_root()
+        .map(|r| r.join("bin"))
+}
+
+/// Locate the chrome-use binary: the mahbot-managed install dir first
+/// (`<storage root>/bin`, always resolved by [`managed_bin_dir`]), then a PATH
+/// lookup, then the common install locations the old curl installer targeted
+/// (`~/.local/bin`, `~/.cargo/bin`, `/usr/local/bin`, `/opt/homebrew/bin` —
+/// the first two in the installer's order so a fresh curl install wins over a
+/// stale cargo one). The managed dir is probed FIRST on every OS (on Windows
+/// it is the only reliable mahbot-install probe, since the PATH there may not
+/// include it) so the first-install location and the auto-update swap
+/// location are always the same path. Home resolution
+/// goes through [`crate::util::cargo_bin_dir`] and `directories::UserDirs`
+/// (not `$HOME`) so the fallback still works on HOME-less hosts (docker); when
+/// `CARGO_HOME` is set the literal `~/.cargo/bin` is probed too
+/// (belt-and-suspenders, mirroring the shell module's
+/// `extra_shell_path_prefixes`). Candidates must be executable (`execvp` would
+/// skip a non-executable PATH entry, so we do too).
 fn find_cli_binary() -> Option<PathBuf> {
     let name = browser_bin();
+    if let Some(dir) = managed_bin_dir() {
+        let candidate = dir.join(name);
+        if crate::util::is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(name);
@@ -514,6 +540,72 @@ fn parse_release_version(s: &str) -> Option<semver::Version> {
 /// first parseable semver rather than assuming a position.
 fn parse_cli_version(stdout: &str) -> Option<semver::Version> {
     stdout.split_whitespace().find_map(parse_release_version)
+}
+
+/// Release-asset platform tag for chrome-use archives, e.g. `darwin-arm64`
+/// or `linux-musl-x64`. `None` on platform/arch combos the vendor does not
+/// publish. Testable pure function; [`release_asset_name`] wraps it with
+/// the compile-time target triple.
+#[must_use]
+fn release_asset_platform(os: &str, arch: &str, musl: bool) -> Option<String> {
+    let asset = match (os, arch, musl) {
+        ("macos", "x86_64", _) => "darwin-x64",
+        ("macos", "aarch64", _) => "darwin-arm64",
+        ("linux", "x86_64", false) => "linux-x64",
+        ("linux", "aarch64", false) => "linux-arm64",
+        ("linux", "x86_64", true) => "linux-musl-x64",
+        ("linux", "aarch64", true) => "linux-musl-arm64",
+        ("windows", "x86_64", _) => "win32-x64",
+        _ => return None,
+    };
+    Some(asset.to_string())
+}
+
+/// Asset platform tag for THIS build, or `Err` naming the unsupported
+/// platform. Uses the compile-time target triple (`cfg!`) so it is correct
+/// regardless of the runtime host; on Linux, musl is detected by the presence
+/// of a musl loader in `/lib` (mirrors the vendor installer — no `ldd`).
+fn release_asset_name() -> Result<String, String> {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        return Err(format!(
+            "unsupported chrome-use platform: {}",
+            std::env::consts::OS
+        ));
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        return Err(format!(
+            "unsupported chrome-use arch: {}",
+            std::env::consts::ARCH
+        ));
+    };
+    let musl = os == "linux"
+        && (Path::new("/lib/ld-musl-x86_64.so.1").exists()
+            || Path::new("/lib/ld-musl-aarch64.so.1").exists());
+    release_asset_platform(os, arch, musl)
+        .ok_or_else(|| format!("chrome-use has no release asset for {os}-{arch}"))
+}
+
+/// `(hash, filename)` from a `.sha256` sidecar body (`"<hash>  <filename>"`).
+/// The hash must be 64 hex chars (normalized to lowercase to match the
+/// computed digest) and a filename must be present — a bare-hash sidecar is
+/// rejected so a cross-paired sidecar can never verify another asset.
+#[must_use]
+fn parse_sha256_sidecar(body: &str) -> Option<(String, String)> {
+    let mut tokens = body.split_whitespace();
+    let hash = tokens.next()?;
+    let filename = tokens.next()?.to_string();
+    let valid_hash = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+    valid_hash.then(|| (hash.to_ascii_lowercase(), filename))
 }
 
 /// Parse the local chrome-use version from `--version` stdout, bounded by
@@ -1356,33 +1448,261 @@ fn advise_extension_skew(status: &Value) {
     );
 }
 
-/// Install or update chrome-use: run the headless curl|sh installer (binary +
-/// skill), then re-register the native-messaging host — install.sh skips that
-/// step without a TTY. Shared by the Support install tool and the boot
-/// auto-updater. `Err` names the failing step and carries truncated
-/// stdout/stderr for diagnosis.
-pub(crate) async fn install_chrome_use() -> Result<(), String> {
-    let mut installer = Command::new("sh");
-    installer
-        .arg("-c")
-        .arg(format!("curl -fsSL {CHROME_USE_INSTALL_URL} | sh"));
-    run_install_step("chrome-use installer", installer).await?;
+/// Download the chrome-use release archive for `tag` for this platform,
+/// verify it against the published `.sha256` sidecar (missing/unreadable/
+/// mismatching sidecar is a HARD failure), and extract the single binary into
+/// a temp dir. Returns `(temp dir, binary path)` — the caller must keep the
+/// guard alive until the binary has been moved into place.
+async fn download_chrome_use_binary(tag: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
+    use crate::util::http::{DownloadSizeCheck, build_download_client, download_verified};
 
-    // Drop the cached CLI path before resolving for host registration: the
-    // installer may have relocated the binary (e.g. between /usr/local/bin and
-    // ~/.local/bin), and a stale cache would register the host against the
-    // pre-update location.
+    let platform = release_asset_name()?;
+    let asset = format!("chrome-use-{platform}.tar.gz");
+    let base = format!("https://github.com/{CHROME_USE_RELEASE_REPO}/releases/download/{tag}");
+    let tgz_url = format!("{base}/{asset}");
+    let sha_url = format!("{tgz_url}.sha256");
+
+    let client = build_download_client(CHROME_USE_DOWNLOAD_TIMEOUT)
+        .map_err(|e| format!("failed to build download client: {e}"))?;
+
+    // Fetch the `.sha256` sidecar with the same client; a missing/unreadable/
+    // mismatching sidecar is a hard failure so a tampered or partial release is
+    // never installed.
+    let sidecar = client
+        .get(&sha_url)
+        .send()
+        .await
+        .map_err(|e| format!("failed to fetch sha256 sidecar {sha_url}: {e}"))?;
+    if !sidecar.status().is_success() {
+        return Err(format!(
+            "failed to fetch sha256 sidecar {sha_url}: HTTP {}",
+            sidecar.status()
+        ));
+    }
+    let body = sidecar
+        .text()
+        .await
+        .map_err(|e| format!("failed to read sha256 sidecar {sha_url}: {e}"))?;
+    let (hash, sidecar_name) = parse_sha256_sidecar(&body).ok_or_else(|| {
+        format!("sha256 sidecar {sha_url} is malformed (no `64-hex-hash  filename` pair)")
+    })?;
+    // The sidecar names the archive it was published for — a valid hash from a
+    // cross-paired sidecar must not verify a different asset.
+    if sidecar_name != asset {
+        return Err(format!(
+            "sha256 sidecar {sha_url} names '{sidecar_name}', expected '{asset}'"
+        ));
+    }
+
+    let dir = tempfile::tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+    let archive_path = dir.path().join("archive.tar.gz");
+    download_verified(
+        &client,
+        &tgz_url,
+        &archive_path,
+        &hash,
+        None,
+        DownloadSizeCheck::None,
+        |_, _| {},
+    )
+    .await
+    .map_err(|e| format!("failed to download {tgz_url}: {e}"))?;
+
+    let out_path = extract_chrome_use_binary(&archive_path, dir.path())?;
+    Ok((dir, out_path))
+}
+
+/// Extract the single `<browser_bin()>` binary from a chrome-use release
+/// archive into `dir` and return its path. The entry is matched by file name
+/// at any depth but always written to `<dir>/<browser_bin()>`, so a nested
+/// vendor layout still lands correctly; `Err` when the archive has no such
+/// regular-file entry.
+fn extract_chrome_use_binary(archive: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let file = fs::File::open(archive)
+        .map_err(|e| format!("failed to open archive {}: {e}", archive.display()))?;
+    let mut tar_archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let out_path = dir.join(browser_bin());
+    let mut unpacked = false;
+    let entries = tar_archive
+        .entries()
+        .map_err(|e| format!("failed to read archive {}: {e}", archive.display()))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("failed to read archive entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("failed to read archive entry path: {e}"))?
+            .into_owned();
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        if path
+            .file_name()
+            .is_some_and(|n| n == std::ffi::OsStr::new(browser_bin()))
+        {
+            // `unpack` writes exactly to `out_path` (the entry's own internal
+            // path is ignored), keeping the returned path correct for any
+            // archive layout.
+            entry
+                .unpack(&out_path)
+                .map_err(|e| format!("failed to extract {}: {e}", out_path.display()))?;
+            unpacked = true;
+            break;
+        }
+    }
+    if !unpacked {
+        return Err(format!("archive contains no {} binary", browser_bin()));
+    }
+
+    // The freshly extracted binary must be executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&out_path, fs::Permissions::from_mode(0o755)).map_err(|e| {
+            format!(
+                "failed to set executable bit on {}: {e}",
+                out_path.display()
+            )
+        })?;
+    }
+    Ok(out_path)
+}
+
+/// Replace the binary at `dest` with `fresh`, never leaving a broken install.
+/// Unix: copy to a `<dest>.mahbot_tmp` sibling, preserve the old file's
+/// permissions (default 0o755 when `dest` is new), then rename (atomic, safe
+/// over a running binary). Windows: a running exe cannot be overwritten or
+/// deleted but CAN be renamed — rename-aside `dest` → `dest.old`, rename the
+/// temp copy in, restore the aside on failure, and best-effort remove the
+/// aside afterwards (its removal fails while the old binary is still running;
+/// the next successful swap clears it).
+fn swap_binary_in_place(fresh: &Path, dest: &Path) -> Result<(), String> {
+    let tmp = dest.with_extension("mahbot_tmp");
+    let _ = fs::remove_file(&tmp);
+    fs::copy(fresh, &tmp).map_err(|e| {
+        format!(
+            "failed to copy {} to {}: {e}",
+            fresh.display(),
+            tmp.display()
+        )
+    })?;
+    // Unix: keep the old binary's mode (0o755 default on first install) so the
+    // swap never drops the executable bit.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dest).map_or(0o755, |m| m.permissions().mode() & 0o777);
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("failed to set permissions on {}: {e}", tmp.display()))?;
+    }
+
+    if cfg!(target_os = "windows") && dest.exists() {
+        rename_aside_swap(&tmp, dest)
+    } else {
+        fs::rename(&tmp, dest).map_err(|e| {
+            format!(
+                "failed to rename {} to {}: {e}",
+                tmp.display(),
+                dest.display()
+            )
+        })
+    }
+}
+
+/// The rename-aside swap used on Windows, where a running exe cannot be
+/// overwritten or deleted but CAN be renamed: move `dest` aside, rename the
+/// prepared `tmp` copy into place, and restore the aside if the final rename
+/// fails. Aside removal is best-effort — while the old binary still runs it
+/// cannot be removed; the next successful swap clears it. Platform-neutral
+/// plain `fs::rename`/`remove_file`, so it is unit-testable on every OS.
+fn rename_aside_swap(tmp: &Path, dest: &Path) -> Result<(), String> {
+    let aside = dest.with_extension("old");
+    let _ = fs::remove_file(&aside);
+    fs::rename(dest, &aside)
+        .map_err(|e| format!("failed to move {} aside: {e}", dest.display()))?;
+    if let Err(e) = fs::rename(tmp, dest) {
+        // Last-resort restore: if this also fails the install is genuinely
+        // broken, so surface that instead of discarding the error.
+        if let Err(restore) = fs::rename(&aside, dest) {
+            return Err(format!(
+                "failed to rename {} to {}: {e}; the restore also failed ({restore}) — \
+                 {} is missing and chrome-use must be reinstalled",
+                tmp.display(),
+                dest.display(),
+                dest.display()
+            ));
+        }
+        return Err(format!(
+            "failed to rename {} to {}: {e}",
+            tmp.display(),
+            dest.display()
+        ));
+    }
+    let _ = fs::remove_file(&aside);
+    Ok(())
+}
+
+/// First install of chrome-use: download the pinned chrome-use release directly
+/// (SHA-256-verified against the published sidecar), place the single binary at
+/// the stable managed dir that [`find_cli_binary`] always resolves, then do a
+/// one-time native-host registration that never activates managed Chrome mode.
+/// Called by the Support install tool (first install only — the auto-updater
+/// swaps the binary in place and never re-registers). `Err` names the failing
+/// step and carries truncated stdout/stderr for diagnosis.
+pub(crate) async fn install_chrome_use() -> Result<(), String> {
+    let tag = fetch_latest_tag(CHROME_USE_RELEASE_TIMEOUT).await?;
+    let (_temp, fresh) = download_chrome_use_binary(&tag).await?;
+
+    let dest = managed_bin_dir()
+        .ok_or_else(|| "managed chrome-use bin dir unavailable (storage root not set)".to_string())?
+        .join(browser_bin());
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("invalid chrome-use install path {}", dest.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    let fresh_install = !dest.exists();
+    swap_binary_in_place(&fresh, &dest)?;
+
+    // The binary landed at the managed dir; clear any cached path so the next
+    // probe re-resolves to the stable managed location.
     invalidate_cli_path();
 
-    // A freshly curl-installed binary may not be on the daemon's PATH yet, so
-    // prefer the resolved path (PATH + common install locations) and fall back
-    // to the bare name.
-    let mut host = Command::new(cli_path().map_or_else(
-        || "chrome-use".to_string(),
-        |p| p.to_string_lossy().into_owned(),
-    ));
-    host.args(["extension", "install"]);
-    run_install_step("`chrome-use extension install`", host).await
+    // Register the native-messaging host using the absolute freshly-downloaded
+    // binary (never a stale PATH entry). `--no-profile` is REQUIRED on macOS to
+    // avoid chrome-use's default of writing and queueing the
+    // `ab-connect.mobileconfig` managed-configuration profile
+    // (ExtensionInstallForcelist) that flips Chrome into "managed by your
+    // organization" mode; mahbot never creates or re-queues that profile in any
+    // flow. Supported since chrome-use v1.5.93; the binary is always freshly
+    // downloaded so the flag is always available.
+    let mut host = Command::new(&dest);
+    host.args(["extension", "install", "--no-profile"]);
+    match run_install_step("`chrome-use extension install --no-profile`", host).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // A registration failure must not leave a half-installed state: a
+            // freshly created binary is removed again (re-running the tool
+            // re-downloads everything). When it replaced a previously working
+            // install, the binary stays — the host registration still points
+            // at the same absolute path, so the existing setup keeps working.
+            if fresh_install {
+                let _ = fs::remove_file(&dest);
+                invalidate_cli_path();
+                Err(format!(
+                    "{e}\nThe chrome-use binary was placed at {} but the native-host \
+                     registration failed, so it was removed to leave no half-installed state.",
+                    dest.display()
+                ))
+            } else {
+                Err(format!(
+                    "{e}\nThe chrome-use binary at {} was updated, but the native-host \
+                     re-registration failed — the previous registration still references this \
+                     path and keeps working.",
+                    dest.display()
+                ))
+            }
+        }
+    }
 }
 
 /// Run one install subprocess bounded by [`CHROME_USE_INSTALL_TIMEOUT`].
@@ -1406,17 +1726,14 @@ async fn run_install_step(label: &str, mut cmd: Command) -> Result<(), String> {
 /// Best-effort once-per-boot auto-update of an existing chrome-use install.
 /// Runs ~5 minutes after startup (never competes with boot), is skipped when
 /// offline, and never first-installs — the first install stays behind the
-/// Support consent flow. After success there is no periodic re-check (once per
-/// boot).
+/// Support consent flow. On all platforms the update is a binary-only,
+/// checksum-verified release swap in place: the native-messaging launcher and
+/// manifests reference the binary by its fixed absolute path and keep working
+/// after the swap, so there is no re-registration. After success there is no
+/// periodic re-check (once per boot).
 pub async fn run_auto_update() {
-    const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
     const RETRY_WAIT: Duration = Duration::from_mins(10);
     const MAX_RETRIES: u32 = 3;
-
-    if cfg!(target_os = "windows") {
-        debug!("chrome-use auto-update skipped: unsupported platform");
-        return;
-    }
 
     // Spawned task — sleep first so it never competes with service startup.
     tokio::time::sleep(Duration::from_mins(5)).await;
@@ -1427,15 +1744,18 @@ pub async fn run_auto_update() {
     }
     let local = cli_version().await;
 
-    // Resolve the latest release tag (curl the redirect target — no
+    // Resolve the latest release tag (follow the releases/latest redirect — no
     // api.github.com rate limit). Retry on network failure; a non-semver tag
-    // gives up immediately (cannot compare).
+    // gives up immediately (cannot compare). The raw tag string is captured so
+    // the later download uses the SAME tag (no re-resolution race).
     let mut latest: Option<semver::Version> = None;
+    let mut resolve_tag = String::new();
     for attempt in 0..MAX_RETRIES {
-        match fetch_latest_tag(RELEASE_TIMEOUT).await {
+        match fetch_latest_tag(CHROME_USE_RELEASE_TIMEOUT).await {
             Ok(tag) => {
                 if let Some(v) = parse_release_version(&tag) {
                     latest = Some(v);
+                    resolve_tag = tag;
                     break;
                 }
                 info!(
@@ -1469,52 +1789,72 @@ pub async fn run_auto_update() {
     let local = local.map_or_else(|| "unknown version".to_string(), |v| v.to_string());
     debug!("chrome-use auto-update: updating {local} → {latest}");
 
-    // Run the same headless installer + native-host registration. On failure
-    // there is no retry and no rollback (v1 policy) — log and give up for
-    // this boot. The failing step is named in the error (binary install vs
-    // host registration), so partial progress stays diagnosable.
-    match install_chrome_use().await {
-        Ok(()) => info!("chrome-use auto-updated to {latest} (binary + native host)"),
-        Err(e) => info!(
+    // The install path is the one the resolver found (the same path identity as
+    // the first install — [`find_cli_binary`] always probes the managed dir
+    // first). If it vanished, give up for this boot.
+    let Some(dest) = cli_path() else {
+        debug!("chrome-use auto-update skipped: CLI path vanished");
+        return;
+    };
+
+    // Binary-only, checksum-verified release swap. The swap helper never leaves
+    // a broken install, so on any error the previous binary stays untouched and
+    // there is no same-boot retry (v1 policy). The native-messaging
+    // launcher/manifests reference the binary by its fixed absolute path and
+    // keep working after the swap — no `extension install`, no path
+    // invalidation. The failing step is named in the error.
+    // The temp-dir guard must be bound OUTSIDE the match: it owns the freshly
+    // extracted binary, and dropping it at the end of a match arm would delete
+    // the file before the swap runs.
+    let (_temp, fresh) = match download_chrome_use_binary(&resolve_tag).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            info!(
+                "chrome-use auto-update failed: {}",
+                crate::util::truncate(&e, 1024)
+            );
+            return;
+        }
+    };
+    if let Err(e) = swap_binary_in_place(&fresh, &dest) {
+        info!(
             "chrome-use auto-update failed: {}",
             crate::util::truncate(&e, 1024)
-        ),
+        );
+        return;
     }
+    info!("chrome-use auto-updated to {latest} (binary in place)");
 }
 
 /// Follow the GitHub `releases/latest` redirect and return the last path
-/// segment (the release tag) — same technique install.sh uses, and it avoids
-/// the api.github.com rate limit. Plain curl, no browser env.
+/// segment (the release tag) — avoids the api.github.com rate limit. reqwest
+/// follows the redirect by default; the final response URL is the tag page.
 async fn fetch_latest_tag(timeout: Duration) -> Result<String, String> {
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-fsSLI",
-        "-o",
-        "/dev/null",
-        "-w",
-        "%{url_effective}",
-        "https://github.com/leeguooooo/chrome-use/releases/latest",
-    ]);
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(timeout, cmd.output())
+    use crate::util::http::build_download_client;
+
+    let url = format!("https://github.com/{CHROME_USE_RELEASE_REPO}/releases/latest");
+    let client =
+        build_download_client(timeout).map_err(|e| format!("release check client failed: {e}"))?;
+    let response = client
+        .get(&url)
+        .send()
         .await
-        .map_err(|_| "release check timed out".to_string())?
-        .map_err(|e| format!("release check spawn failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("release check exited with {}", out.status));
+        .map_err(|e| format!("release check request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "release check got HTTP {} from {url}",
+            response.status()
+        ));
     }
-    let url = String::from_utf8_lossy(&out.stdout);
-    let tag = url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
+    let tag = response
+        .url()
+        .path_segments()
+        .and_then(|mut segments| segments.next_back().map(str::to_string))
         .unwrap_or_default();
     if tag.is_empty() {
         return Err("release redirect resolved to an empty tag".to_string());
     }
-    Ok(tag.to_string())
+    Ok(tag)
 }
 
 /// One-time cleanup of stale mahbot-owned browser-session artifacts at watchdog
@@ -2055,5 +2395,216 @@ mod tests {
             Some(false)
         );
         assert_eq!(v(serde_json::json!({"data": {}})), None);
+    }
+
+    #[test]
+    fn release_asset_platform_maps_supported_combos() {
+        assert_eq!(
+            release_asset_platform("macos", "x86_64", false).as_deref(),
+            Some("darwin-x64")
+        );
+        assert_eq!(
+            release_asset_platform("macos", "aarch64", false).as_deref(),
+            Some("darwin-arm64")
+        );
+        assert_eq!(
+            release_asset_platform("linux", "x86_64", false).as_deref(),
+            Some("linux-x64")
+        );
+        assert_eq!(
+            release_asset_platform("linux", "aarch64", false).as_deref(),
+            Some("linux-arm64")
+        );
+        assert_eq!(
+            release_asset_platform("linux", "x86_64", true).as_deref(),
+            Some("linux-musl-x64")
+        );
+        assert_eq!(
+            release_asset_platform("linux", "aarch64", true).as_deref(),
+            Some("linux-musl-arm64")
+        );
+        // The musl flag is ignored for non-linux platforms.
+        assert_eq!(
+            release_asset_platform("windows", "x86_64", true).as_deref(),
+            Some("win32-x64")
+        );
+        assert_eq!(
+            release_asset_platform("macos", "aarch64", true).as_deref(),
+            Some("darwin-arm64")
+        );
+        // Unsupported platform/arch combos return None.
+        assert_eq!(release_asset_platform("windows", "aarch64", false), None);
+        assert_eq!(release_asset_platform("freebsd", "x86_64", false), None);
+    }
+
+    #[test]
+    fn sha256_sidecar_parses_hash_and_filename() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        // Real two-space sidecar format.
+        assert_eq!(
+            parse_sha256_sidecar(&format!("{hash}  chrome-use-linux-x64.tar.gz")),
+            Some((hash.to_string(), "chrome-use-linux-x64.tar.gz".to_string()))
+        );
+        // Leading whitespace and trailing newline are tolerated; an uppercase
+        // hash is normalized to lowercase (the computed digest is lowercase).
+        assert_eq!(
+            parse_sha256_sidecar(&format!("  {hash}  chrome-use-darwin-arm64.tar.gz\n")),
+            Some((
+                hash.to_string(),
+                "chrome-use-darwin-arm64.tar.gz".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_sha256_sidecar(&format!("{}  x.tar.gz", hash.to_uppercase())),
+            Some((hash.to_string(), "x.tar.gz".to_string()))
+        );
+        // A bare-hash sidecar (no filename) is rejected — the filename is what
+        // guards against cross-paired sidecars.
+        assert_eq!(parse_sha256_sidecar(hash), None);
+        // Rejects short, non-hex, and empty hashes.
+        assert_eq!(parse_sha256_sidecar("abcd  x.tar.gz"), None);
+        assert_eq!(
+            parse_sha256_sidecar(&format!("{}  x.tar.gz", "g".repeat(64))),
+            None
+        );
+        assert_eq!(parse_sha256_sidecar(""), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn swap_binary_in_place_preserves_permissions_and_leaves_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let dest = dir.path().join("chrome-use");
+        let fresh = dir.path().join("fresh");
+
+        fs::write(&dest, "old").expect("write old dest");
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).expect("chmod dest");
+        fs::write(&fresh, "new").expect("write fresh");
+        fs::set_permissions(&fresh, fs::Permissions::from_mode(0o755)).expect("chmod fresh");
+
+        swap_binary_in_place(&fresh, &dest).expect("swap");
+        assert_eq!(fs::read(&dest).expect("read dest"), b"new".as_slice());
+        assert_eq!(
+            fs::metadata(&dest).expect("stat dest").permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(
+            !dest.with_extension("mahbot_tmp").exists(),
+            "no temp sibling left"
+        );
+
+        // Second swap over an existing install keeps the running binary's mode.
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o700)).expect("chmod dest");
+        fs::write(&fresh, "newer").expect("write fresh 2");
+        swap_binary_in_place(&fresh, &dest).expect("swap 2");
+        assert_eq!(fs::read(&dest).expect("read dest"), b"newer".as_slice());
+        assert_eq!(
+            fs::metadata(&dest).expect("stat dest").permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            !dest.with_extension("mahbot_tmp").exists(),
+            "no temp sibling left"
+        );
+    }
+
+    #[test]
+    fn rename_aside_swap_replaces_and_cleans_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("chrome-use");
+        let tmp = dir.path().join("prepared");
+        fs::write(&dest, "old").expect("write dest");
+        fs::write(&tmp, "new").expect("write tmp");
+
+        rename_aside_swap(&tmp, &dest).expect("swap");
+        assert_eq!(fs::read(&dest).expect("read dest"), b"new");
+        // The aside and the prepared copy are both gone after a clean swap.
+        assert!(!dest.with_extension("old").exists());
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn rename_aside_swap_restores_dest_when_the_final_rename_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("chrome-use");
+        // The prepared copy does not exist, so the final rename fails.
+        let tmp = dir.path().join("missing");
+        fs::write(&dest, "old").expect("write dest");
+
+        assert!(rename_aside_swap(&tmp, &dest).is_err());
+        // The previous binary was restored at its original location.
+        assert_eq!(fs::read(&dest).expect("read dest"), b"old");
+        assert!(!dest.with_extension("old").exists(), "aside was moved back");
+    }
+
+    /// Build a tar.gz archive in `dir` with the given (path, contents) entries.
+    fn write_test_archive(dir: &std::path::Path, entries: &[(&str, &[u8])]) -> fs::File {
+        let enc = flate2::write::GzEncoder::new(
+            fs::File::create(dir.join("pkg.tar.gz")).expect("create archive"),
+            flate2::Compression::default(),
+        );
+        let mut builder = tar::Builder::new(enc);
+        for (path, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            builder
+                .append_data(&mut header, path, *contents)
+                .expect("append entry");
+        }
+        builder
+            .into_inner()
+            .expect("finish archive")
+            .finish()
+            .expect("finish gzip")
+    }
+
+    #[test]
+    fn extract_chrome_use_binary_lands_at_the_dir_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_test_archive(dir.path(), &[(browser_bin(), b"BIN" as &[u8])]);
+
+        let out =
+            extract_chrome_use_binary(&dir.path().join("pkg.tar.gz"), dir.path()).expect("extract");
+        assert_eq!(out, dir.path().join(browser_bin()));
+        assert_eq!(fs::read(&out).expect("read extracted"), b"BIN");
+        // The extracted binary must be executable (the exec-bit chmod is
+        // unix-only; on Windows executability is the .exe extension).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                fs::metadata(&out)
+                    .expect("stat extracted")
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn extract_chrome_use_binary_handles_a_nested_layout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = format!("pkg/bin/{}", browser_bin());
+        write_test_archive(dir.path(), &[(entry.as_str(), b"NESTED" as &[u8])]);
+
+        let out =
+            extract_chrome_use_binary(&dir.path().join("pkg.tar.gz"), dir.path()).expect("extract");
+        // Matched by file name at any depth, but always written to the dir root.
+        assert_eq!(out, dir.path().join(browser_bin()));
+        assert_eq!(fs::read(&out).expect("read extracted"), b"NESTED");
+    }
+
+    #[test]
+    fn extract_chrome_use_binary_errors_without_the_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_test_archive(dir.path(), &[("readme.txt", b"no bin" as &[u8])]);
+
+        assert!(extract_chrome_use_binary(&dir.path().join("pkg.tar.gz"), dir.path()).is_err());
     }
 }
