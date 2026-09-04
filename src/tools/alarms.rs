@@ -40,7 +40,18 @@ fn identity() -> Result<AssistantIdentity> {
     })
 }
 
-pub struct AddAlarmTool;
+/// The `add_alarm` tool. `admin` (full-access Assistant) unlocks the
+/// optional `command` parameter — command-armed alarms that wake the
+/// Assistant only when the command produces output or fails.
+pub struct AddAlarmTool {
+    admin: bool,
+}
+
+impl AddAlarmTool {
+    pub(crate) const fn new(admin: bool) -> Self {
+        Self { admin }
+    }
+}
 
 #[async_trait]
 impl Tool for AddAlarmTool {
@@ -48,27 +59,69 @@ impl Tool for AddAlarmTool {
         "add_alarm"
     }
 
+    fn description(&self) -> String {
+        let base = crate::prompt::load_prompt("tool/add_alarm.md");
+        if self.admin {
+            format!(
+                "{base}\n\n{}",
+                crate::prompt::load_prompt("tool/add_alarm_command.md")
+            )
+        } else {
+            base
+        }
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
-        super::tool_params_schema(
-            &json!({
-                "text": {
-                    "type": "string",
-                    "description": "The reminder text to store"
-                },
-                "fire_at": {
-                    "type": "string",
-                    "description": "RFC3339/ISO-8601 absolute fire time in UTC (e.g. 2026-08-28T10:30:00Z). Convert user-provided local times to UTC."
-                },
-                "interval_seconds": {
-                    "type": "integer",
-                    "description": "Periodic interval in seconds (minimum 10). Exactly one of fire_at or interval_seconds must be provided."
-                }
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "text".to_string(),
+            json!({
+                "type": "string",
+                "description": "The reminder text to store"
             }),
-            &["text"],
-        )
+        );
+        properties.insert(
+            "fire_at".to_string(),
+            json!({
+                "type": "string",
+                "description": "RFC3339/ISO-8601 absolute fire time in UTC (e.g. 2026-08-28T10:30:00Z). Convert user-provided local times to UTC."
+            }),
+        );
+        properties.insert(
+            "interval_seconds".to_string(),
+            json!({
+                "type": "integer",
+                "description": "Periodic interval in seconds (minimum 10). Exactly one of fire_at or interval_seconds must be provided."
+            }),
+        );
+        if self.admin {
+            properties.insert(
+                "command".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "Shell command run at fire time in your personal workspace. The reminder wakes you only when the command produces output or fails; a successful command with empty output stays silent. Maximum 2000 characters."
+                }),
+            );
+        }
+        super::tool_params_schema(&json!(properties), &["text"])
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
+        // Reject BEFORE reading anything else: a non-admin must never get a
+        // silently-degraded plain alarm when it asked for a command-armed one.
+        // Explicit null is treated as absent, matching the admin path below.
+        if !self.admin && args.get("command").is_some_and(|v| !v.is_null()) {
+            anyhow::bail!(
+                "The `command` parameter is only available in full-access (admin) sessions."
+            );
+        }
+        // An admin passing a non-string `command` is a caller error, never a
+        // silent plain alarm.
+        let command = match args.get("command") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.as_str()),
+            Some(_) => anyhow::bail!("The `command` parameter must be a string."),
+        };
         let ident = identity()?;
         let text = super::get_str(&args, "text")?;
         let fire_at = super::get_opt_str(&args, "fire_at");
@@ -80,16 +133,21 @@ impl Tool for AddAlarmTool {
             text,
             fire_at,
             interval_seconds,
+            command,
         )
         .await?;
         let display = format_fire_time(&alarm.next_fire_at)?;
-        if let Some(interval) = alarm.interval_seconds {
-            Ok(format!(
+        let mut base = if let Some(interval) = alarm.interval_seconds {
+            format!(
                 "Alarm scheduled every {interval} seconds. Next fire at {display}.\nText: {text}"
-            ))
+            )
         } else {
-            Ok(format!("Alarm set for {display}.\nText: {text}"))
+            format!("Alarm set for {display}.\nText: {text}")
+        };
+        if let Some(cmd) = command {
+            let _ = write!(base, "\nCommand: {cmd}");
         }
+        Ok(base)
     }
 }
 
@@ -118,11 +176,22 @@ impl Tool for ListAlarmsTool {
         let mut out = String::new();
         for alarm in alarms {
             let display = format_fire_time(&alarm.next_fire_at)?;
-            let _ = writeln!(
-                out,
-                "- {}, {}, {}, next fire: {}",
-                alarm.id, alarm.kind, alarm.text, display
-            );
+            match alarm.command {
+                Some(cmd) => {
+                    let _ = writeln!(
+                        out,
+                        "- {}, {}, {}, next fire: {}, command: {}",
+                        alarm.id, alarm.kind, alarm.text, display, cmd
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "- {}, {}, {}, next fire: {}",
+                        alarm.id, alarm.kind, alarm.text, display
+                    );
+                }
+            }
         }
         Ok(out.trim().to_string())
     }

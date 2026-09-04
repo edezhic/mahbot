@@ -660,7 +660,7 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
 /// Build a `Workspace` struct for a personal workspace.
 /// Has no diagnostics, no maintenance, no discovery — minimal defaults.
 #[must_use]
-fn personal_workspace_struct(user_name: &str) -> Workspace {
+pub(crate) fn personal_workspace_struct(user_name: &str) -> Workspace {
     let mut ws = Workspace::from_path(&personal_workspace_path(user_name));
     ws.name = personal_workspace_name(user_name);
     ws.status = WorkspaceStatus::Ready;

@@ -569,6 +569,103 @@ async fn run_command_with_timeout(
     }
 }
 
+/// Outcome of a raw (un-annotated) command run, used by command-armed alarms.
+///
+/// `output` is the combined stdout+stderr AFTER ANSI stripping but WITHOUT
+/// credential scrubbing and WITHOUT the shell pipeline's annotations
+/// (exit-status note, timing, spill hints) — the delivery path scrubs the
+/// composed notification once. `has_output` is the wake/no-wake signal,
+/// computed from the pre-redaction text, so ANSI-escape-only or fully
+/// credential-redacted output counts as no output.
+pub(crate) struct RawCommandOutcome {
+    pub success: bool,
+    pub detail: String,
+    pub output: String,
+    pub has_output: bool,
+}
+
+/// Build the outcome for a run that produced (possibly partial) raw streams.
+/// A run with no streams at all (spawn failure) yields empty, no-output.
+fn raw_command_outcome(
+    success: bool,
+    detail: String,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> RawCommandOutcome {
+    let output = decode_raw_streams(stdout, stderr);
+    RawCommandOutcome {
+        success,
+        detail,
+        has_output: !crate::util::is_blank_after_redaction(&output),
+        output,
+    }
+}
+
+/// Run `command` in `ws` with the shell machinery's containment (sanitized
+/// SAFE_ENV_VARS env, process-group kill on timeout, fixed
+/// `DEFAULT_SHELL_TIMEOUT_SECS` timeout) but NO output profiles, NO read-only
+/// validation, NO grep-engine interception, and NO spill files.
+pub(crate) async fn run_raw_command(ws: &Workspace, command: &str) -> RawCommandOutcome {
+    let mut cmd = build_shell_command(command, ws.as_path());
+    let result = run_command_with_timeout(
+        &mut cmd,
+        Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
+        output_drain_timeout(),
+    )
+    .await;
+
+    match result {
+        ShellRunResult::Completed {
+            stdout,
+            stderr,
+            status,
+            ..
+        } => {
+            let code = status.code();
+            raw_command_outcome(
+                code == Some(0),
+                match code {
+                    Some(n) => format!("exit status {n}"),
+                    None => "terminated by signal".to_string(),
+                },
+                &stdout,
+                &stderr,
+            )
+        }
+        ShellRunResult::TimedOut { stdout, stderr, .. } => raw_command_outcome(
+            false,
+            format!("timed out after {DEFAULT_SHELL_TIMEOUT_SECS}s (process group killed)"),
+            &stdout,
+            &stderr,
+        ),
+        ShellRunResult::DrainTimedOut { stdout, stderr, .. } => raw_command_outcome(
+            false,
+            "output drain overrun — a leftover process held the pipes".to_string(),
+            &stdout,
+            &stderr,
+        ),
+        ShellRunResult::SpawnFailed(e) => {
+            raw_command_outcome(false, format!("failed to start: {e}"), &[], &[])
+        }
+    }
+}
+
+/// Decode both raw streams (lossy UTF-8 + ANSI strip) and combine stderr onto
+/// its own line when non-blank (never a leading blank line when stdout is
+/// empty). Output is NOT credential-scrubbed here — the caller scrubs the
+/// composed notification once.
+fn decode_raw_streams(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = decode_and_strip_ansi(stdout);
+    let stderr = decode_and_strip_ansi(stderr);
+    if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    }
+}
+
 fn tail_chars(s: &str, max_chars: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_chars {
@@ -3267,6 +3364,51 @@ mod tests {
             !stdout.contains("CARGO_HOME="),
             "CARGO_HOME must not leak into subprocess env"
         );
+    }
+
+    #[tokio::test]
+    async fn run_raw_command_reports_success_output_and_failure() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = crate::workspace::test_ws(tmp.path());
+
+        // Success with stdout — raw, un-annotated output.
+        let out = run_raw_command(&ws, "echo hello-raw-out").await;
+        assert!(out.success);
+        assert!(out.has_output);
+        assert!(out.output.contains("hello-raw-out"), "got: {}", out.output);
+        assert!(!out.output.contains("[exit status"), "got: {}", out.output);
+        assert_eq!(out.detail, "exit status 0");
+
+        // stderr counts as output — with no leading blank line.
+        let out = run_raw_command(&ws, "echo only-warnings >&2").await;
+        assert!(out.success && out.has_output);
+        assert!(
+            out.output.starts_with("only-warnings"),
+            "got: {:?}",
+            out.output
+        );
+
+        // ANSI-escape-only output counts as empty.
+        let out = run_raw_command(&ws, "printf '\\033[32m\\033[0m'").await;
+        assert!(out.success && !out.has_output);
+
+        // Empty success stays empty.
+        let out = run_raw_command(&ws, "true").await;
+        assert!(out.success && !out.has_output && out.output.is_empty());
+
+        // Non-zero exit is a failure with the exit code in the detail.
+        let out = run_raw_command(&ws, "exit 3").await;
+        assert!(!out.success);
+        assert!(!out.has_output);
+        assert_eq!(out.detail, "exit status 3");
+
+        // Spawn failure (command not found): sh itself reports the error on
+        // stderr and exits 127 — the shell's error message counts as output.
+        let out = run_raw_command(&ws, "mahbot-no-such-binary-xyz").await;
+        assert!(!out.success);
+        assert!(out.has_output);
+        assert!(out.output.contains("not found"), "got: {}", out.output);
+        assert_eq!(out.detail, "exit status 127");
     }
 
     #[tokio::test]

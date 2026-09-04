@@ -369,7 +369,7 @@ impl Role {
             Role::Assistant => {
                 let mut t: Vec<Box<dyn Tool>> = vec![
                     Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Assistant)),
-                    Box::new(AddAlarmTool),
+                    Box::new(AddAlarmTool::new(full_access)),
                     Box::new(ListAlarmsTool),
                     Box::new(RemoveAlarmTool),
                     Box::new(EditTool),
@@ -686,6 +686,65 @@ mod tests {
                     assert!(
                         !has,
                         "{}{} must not advertise `sleep`",
+                        role.as_str(),
+                        if full_access { " (full)" } else { "" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn add_alarm_command_param_is_admin_only() {
+        // Acceptance pin: `add_alarm`'s `command` parameter is granted ONLY to
+        // the full-access Assistant. Every other combination — including the
+        // base Assistant and every non-Assistant role — must neither advertise
+        // the property in the schema nor append the command capability doc to
+        // the description. The description check is structural (base vs
+        // base + `tool/add_alarm_command.md`) so prompt rewording cannot
+        // silently break or bypass it.
+        let ws = crate::workspace::test_ws("test");
+        let base_desc = AddAlarmTool::new(false).description();
+        let command_doc = crate::prompt::load_prompt("tool/add_alarm_command.md");
+        assert!(
+            command_doc.contains("`command`"),
+            "add_alarm_command.md must document the `command` parameter"
+        );
+        for role in Role::iter() {
+            for full_access in [false, true] {
+                let has_tool = role
+                    .tools(&ws, full_access)
+                    .into_iter()
+                    .find(|t| t.name() == "add_alarm");
+                let Some(tool) = has_tool else {
+                    // `add_alarm` is Assistant-only; a role that never
+                    // advertises it cannot leak the command capability either.
+                    continue;
+                };
+                let has_command = tool.parameters_schema()["properties"]
+                    .get("command")
+                    .is_some();
+                let appends_doc = tool.description().contains(&command_doc);
+                if role == crate::Role::Assistant && full_access {
+                    assert!(
+                        has_command,
+                        "full-access Assistant must advertise `add_alarm.command`"
+                    );
+                    assert!(
+                        appends_doc,
+                        "full-access Assistant description must append the command doc"
+                    );
+                } else {
+                    assert!(
+                        !has_command,
+                        "{}{} must not advertise `add_alarm.command`",
+                        role.as_str(),
+                        if full_access { " (full)" } else { "" }
+                    );
+                    assert_eq!(
+                        tool.description(),
+                        base_desc,
+                        "{}{} must not append the command doc",
                         role.as_str(),
                         if full_access { " (full)" } else { "" }
                     );

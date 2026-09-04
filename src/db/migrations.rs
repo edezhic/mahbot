@@ -22,14 +22,14 @@
 //! a fresh file), and the id-only applied check makes their recorded ids
 //! `1`–`23` harmless no-ops. The baseline (`24`–`26`) creates the exact
 //! current shape on fresh installs and is a strict no-op on existing ones,
-//! except entries `25`/`27`–`31`, which genuinely upfill the retired delta
+//! except entries `25`/`27`–`32`, which genuinely upfill the retired delta
 //! `23`'s `chat_history` reply columns, the `workspaces.maintainer_recommendations`
 //! and `jobs.caller_agent_id` / `session_metadata.created_at` columns, the
 //! per-user `image_gen_model` / `video_model` columns, the backfilled
-//! `jobs.mode` discriminator, and the `session_metadata.sleep_ended` marker
-//! on one-delta-behind / current databases.
+//! `jobs.mode` discriminator, the `session_metadata.sleep_ended` marker, and
+//! the `alarms.command` column on one-delta-behind / current databases.
 //!
-//! Future schema changes resume the chain at id `32` with monotonically
+//! Future schema changes resume the chain at id `33` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -284,7 +284,8 @@ CREATE TABLE IF NOT EXISTS alarms (
     interval_seconds INTEGER,
     next_fire_at     TEXT NOT NULL,
     status           TEXT NOT NULL DEFAULT 'active',
-    created_at       TEXT NOT NULL
+    created_at       TEXT NOT NULL,
+    command          TEXT
 );
 -- ── Indexes ────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
@@ -419,6 +420,7 @@ CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command)
 ///   NULL-sentinel (sync = has caller pin, async = NULL).
 /// - `31` adds the `session_metadata.sleep_ended` marker via a guarded Rust
 ///   body — a real upfill on existing installs, a no-op on fresh ones.
+/// - `32` adds the nullable `alarms.command` column.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -459,6 +461,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "31",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_session_metadata_sleep_ended),
+    },
+    Migration {
+        id: "32",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_alarms_command),
     },
 ];
 
@@ -713,6 +720,22 @@ async fn run_add_session_metadata_sleep_ended(conn: &Connection) -> anyhow::Resu
     add_column_if_missing(conn, "session_metadata", "sleep_ended").await
 }
 
+fn add_alarms_command<'a>(
+    conn: &'a Connection,
+    _root: &'a Path,
+) -> BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(run_add_alarms_command(conn))
+}
+
+/// Upfill the nullable `alarms.command` column for databases created before
+/// delta `32`. Fresh installs get the column from entry `24`'s `CREATE TABLE`,
+/// so the probe makes this a no-op there. Guarded by [`add_column_if_missing`],
+/// so this body is idempotent (non-transactional like every Rust body,
+/// re-runnable until recorded).
+async fn run_add_alarms_command(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "alarms", "command").await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +886,7 @@ mod tests {
                 "next_fire_at",
                 "status",
                 "created_at",
+                "command",
             ],
         ),
         (
@@ -2031,9 +2055,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "28".to_string(),
                 "29".to_string(),
                 "30".to_string(),
-                "31".to_string()
+                "31".to_string(),
+                "32".to_string()
             ],
-            "fresh core applies baseline 24/25/27/28/29/30/31 exactly"
+            "fresh core applies baseline 24/25/27/28/29/30/31/32 exactly"
         );
     }
 
@@ -2243,13 +2268,14 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
 
     /// The core fleet-wide boot-safety pin: a database shaped by the REAL
     /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`/`28`/`29`/`30`/`31`) as a STRICT no-op
-    /// except the delta-27 `workspaces.maintainer_recommendations` column
+    /// the new baseline (`24`/`25`/`27`/`28`/`29`/`30`/`31`/`32`) as a STRICT
+    /// no-op except the delta-27 `workspaces.maintainer_recommendations` column
     /// upfill, the delta-28 `jobs.caller_agent_id` /
     /// `session_metadata.created_at` column upfills (plus the delta-28
     /// `idx_jobs_caller_agent` index), the delta-29 per-user model columns, and
-    /// the delta-30 `jobs.mode` column upfill + backfill, plus the delta-31
-    /// `sleep_ended` column upfill, all asserted explicitly. This also proves
+    /// the delta-30 `jobs.mode` column upfill + backfill, the delta-31
+    /// `sleep_ended` column upfill, and the delta-32 `alarms.command` column
+    /// upfill, all asserted explicitly. This also proves
     /// Turso honors `IF NOT EXISTS` on the FTS index when the baseline re-runs it.
     #[tokio::test]
     async fn old_catalog_current_db_reopens_as_noop() {
@@ -2281,23 +2307,24 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("29".to_string());
         expected_ids.push("30".to_string());
         expected_ids.push("31".to_string());
+        expected_ids.push("32".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31"
+            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
         // jobs/session_metadata (delta 28), users (delta 29), jobs.mode
-        // (delta 30) and session_metadata.sleep_ended (delta 31) gain their
-        // columns, appended at the end by the ALTER, and the delta-28
-        // `idx_jobs_caller_agent` index is added.
+        // (delta 30), session_metadata.sleep_ended (delta 31) and
+        // alarms.command (delta 32) gain their columns, appended at the end by
+        // the ALTER, and the delta-28 `idx_jobs_caller_agent` index is added.
         assert_core_catalog_unchanged(
             &conn,
             &before,
-            &["workspaces", "jobs", "session_metadata", "users"],
+            &["workspaces", "jobs", "session_metadata", "users", "alarms"],
             &["idx_jobs_caller_agent"],
         )
         .await;
@@ -2331,6 +2358,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert_eq!(
             after_users_cols["users"], expected_users_cols,
             "reopen must append exactly image_gen_model/video_model to users columns"
+        );
+        let after_alarms_cols = column_sets(&conn, &["alarms"]).await;
+        let mut expected_alarms_cols = before.cols["alarms"].clone();
+        expected_alarms_cols.push("command".to_string());
+        assert_eq!(
+            after_alarms_cols["alarms"], expected_alarms_cols,
+            "reopen must append exactly command to alarms columns"
         );
     }
 
@@ -2398,9 +2432,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// baseline entry `25` upfills exactly those two columns, entry `27` adds
     /// `workspaces.maintainer_recommendations`, entry `28` adds
     /// `jobs.caller_agent_id` / `session_metadata.created_at` (plus its
-    /// partial index), entry `30` adds `jobs.mode`, and entry `31` adds
-    /// `session_metadata.sleep_ended`, leaving every row and every other
-    /// table's schema untouched.
+    /// partial index), entry `30` adds `jobs.mode`, entry `31` adds
+    /// `session_metadata.sleep_ended`, and entry `32` adds `alarms.command`,
+    /// leaving every row and every other table's schema untouched.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -2454,6 +2488,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                     && *n != "jobs"
                     && *n != "session_metadata"
                     && *n != "users"
+                    && *n != "alarms"
                     && *n != "schema_migrations"
             })
             .collect();
@@ -2509,12 +2544,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("29".to_string());
         expected_ids.push("30".to_string());
         expected_ids.push("31".to_string());
+        expected_ids.push("32".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31"
+            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -2526,13 +2562,19 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             after_users_cols.contains(&"video_model".to_string()),
             "video_model must be added to users"
         );
+        let after_alarms_cols = column_names(&conn, "alarms").await;
+        assert!(
+            after_alarms_cols.contains(&"command".to_string()),
+            "command must be added to alarms"
+        );
 
         assert_eq!(
             column_sets(&conn, &untouched_tables).await,
             before_other,
             "only chat_history (delta 25), workspaces (delta 27), \
-             jobs/session_metadata (delta 28), users (delta 29) and jobs.mode \
-             (delta 30) columns may change on the 0.5.0 upgrade"
+             jobs/session_metadata (delta 28), users (delta 29), jobs.mode \
+             (delta 30), session_metadata.sleep_ended (delta 31) and \
+             alarms.command (delta 32) columns may change on the 0.5.0 upgrade"
         );
     }
 }

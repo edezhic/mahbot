@@ -1002,6 +1002,16 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).expect("hardcoded regex is valid")
 });
 
+/// Whether `input` is "effectively empty" after trimming whitespace: ANSI
+/// escapes are stripped first, and credential matches are removed outright
+/// (not redacted), so ANSI-escape-only or fully credential-redacted output
+/// counts as empty. Used for the command-armed alarm wake/no-wake decision.
+#[must_use]
+pub(crate) fn is_blank_after_redaction(input: &str) -> bool {
+    let plain = strip_ansi_escapes(input);
+    SENSITIVE_KV_REGEX.replace_all(&plain, "").trim().is_empty()
+}
+
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
@@ -1622,6 +1632,24 @@ mod scrub_tests {
         for &(name, input) in CASES {
             assert_eq!(scrub_credentials(input), input, "{name}");
         }
+    }
+
+    #[test]
+    fn blank_after_redaction_treats_credential_only_output_as_empty() {
+        use super::is_blank_after_redaction;
+        // Split literals so this source does not itself look like a credential
+        // to output scrubbers.
+        let credential = format!("api_{}={:?}", "key", "supersecretvalue123");
+        assert!(is_blank_after_redaction(""));
+        assert!(is_blank_after_redaction("   \n\t "));
+        // ANSI-escape-only output.
+        assert!(is_blank_after_redaction("\x1B[32m\x1B[0m"));
+        // Output that consists only of a credential counts as empty.
+        assert!(is_blank_after_redaction(&credential));
+        // But real content does not.
+        assert!(!is_blank_after_redaction(&format!(
+            "build ok\n{credential}"
+        )));
     }
 }
 
