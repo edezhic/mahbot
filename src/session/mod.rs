@@ -29,13 +29,24 @@ use std::borrow::Cow;
 /// The session's current length in tokens is the input + output tokens of the
 /// most recent successful agent LLM call (see
 /// [`crate::Agent::record_session_usage`]), persisted per session in
-/// `session_metadata.token_length` and loaded at session init. Sessions that
-/// never recorded a value (new sessions, pre-migration sessions — approved
-/// no-backfill semantics) are treated as below the threshold.
+/// `session_metadata.token_length` and loaded at session init. `None` — no
+/// successful usage-bearing call ever recorded a value (new sessions,
+/// pre-migration sessions; approved no-backfill semantics) — only disables
+/// this token trigger; the image-accumulation trigger
+/// ([`SUMMARIZATION_IMAGE_COUNT`]) still applies.
 ///
 /// **200,000** is a conservative default chosen to work across models with
 /// varying context window sizes (250K–1M).
 pub(crate) const SUMMARIZATION_THRESHOLD: u64 = 200_000;
+
+/// Summarization also fires on image accumulation: when the session's user
+/// messages carry at least this many DISTINCT data-URI image markers. The
+/// count is a prefix-gate superset of the markers promoted to provider
+/// vision parts — it never undercounts, but a malformed `data:image/*`
+/// payload may be counted too. `>=` deliberately differs from the strict
+/// token threshold: images are a hard floor on context quality regardless
+/// of how a provider tokenizes them.
+pub(crate) const SUMMARIZATION_IMAGE_COUNT: usize = 10;
 
 /// Number of latest user messages / assistant answers retained per side
 /// after summarization compaction.

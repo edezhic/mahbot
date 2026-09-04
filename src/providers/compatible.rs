@@ -1194,18 +1194,8 @@ async fn scoped_http_error(
 mod tests {
     use super::*;
     use crate::providers::test_request;
+    use crate::util::test::tiny_png_data_uri;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-
-    /// 1×1 red PNG as a data URI — used wherever tests need a payload that
-    /// survives the media gate's base64 + bounded raster decode.
-    fn tiny_png_data_uri() -> String {
-        use std::io::Cursor;
-        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
-        let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-            .expect("test PNG must encode");
-        format!("data:image/png;base64,{}", STANDARD.encode(&buf))
-    }
 
     #[tokio::test]
     async fn chat_without_key_attempts_request() {

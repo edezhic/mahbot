@@ -183,25 +183,47 @@ fn extract_media_from_outcomes(
     paths
 }
 
+/// Iterate the values carried by `[IMAGE:...]` markers in the session's user
+/// messages. Only User-role messages are scanned: that is where images are
+/// promoted to provider vision parts (`parse_image_markers`).
+fn user_image_marker_values(history: &[ChatMessage]) -> impl Iterator<Item = &str> {
+    history
+        .iter()
+        .filter(|msg| msg.role == crate::ChatRole::User)
+        .flat_map(|msg| {
+            MEDIA_MARKER_RE
+                .captures_iter(&msg.content)
+                .filter_map(|caps| {
+                    let (kind, path) = parse_media_marker(&caps);
+                    (kind == "IMAGE").then_some(path)
+                })
+        })
+}
+
 /// Collect the values carried by `[IMAGE:...]` markers already present in the
 /// session's user messages (the read tool's synthetic injection data-URIs, or
 /// file paths from other tools' media markers). Used as the dedup key for the
 /// read tool's synthetic image injection: a repeat read of an already-attached
 /// image (same marker value) is not injected again.
 fn existing_image_marker_values(history: &[ChatMessage]) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    for msg in history {
-        if msg.role != crate::ChatRole::User {
-            continue;
-        }
-        for caps in MEDIA_MARKER_RE.captures_iter(&msg.content) {
-            let (kind, path) = parse_media_marker(&caps);
-            if kind == "IMAGE" {
-                set.insert(path.to_string());
-            }
-        }
-    }
-    set
+    user_image_marker_values(history)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Count DISTINCT data-URI image markers in the session's user messages —
+/// the second summarization trigger
+/// ([`crate::session::SUMMARIZATION_IMAGE_COUNT`]). The `data:image/` prefix
+/// pre-gate keeps the per-turn scan cheap (no full raster decode per marker)
+/// and never undercounts: every marker the provider promotes to a vision
+/// part (`is_native_data_uri` accepts PNG/JPEG/WebP only, all
+/// `data:image/…`) passes the gate. The gate is deliberately a superset —
+/// an invalid `data:image/*` payload may be counted too.
+fn session_image_marker_count(history: &[ChatMessage]) -> usize {
+    user_image_marker_values(history)
+        .filter(|value| value.starts_with("data:image/"))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 /// Derive an [`ImagePayload`] from a successful tool's raw output when the tool
@@ -1063,8 +1085,9 @@ impl Agent {
                     tool_calls,
                     history_content,
                 } = prepare_assistant_turn(
-                    llm_result
-                        .with_context(|| format!("LLM step failed at tool round {tool_rounds}"))?,
+                    llm_result.with_context(|| {
+                        llm_step_failure_context(&self.session, tool_rounds)
+                    })?,
                 );
 
                 if tool_calls.is_empty() {
@@ -2088,57 +2111,77 @@ impl Agent {
         Ok(crate::util::truncate(&summary_text, 32_000))
     }
 
-    /// Check the session length against [`SUMMARIZATION_THRESHOLD`] and
-    /// summarise if necessary.
+    /// Check the session against the summarization triggers and summarise if
+    /// necessary: the provider-reported session token length exceeding
+    /// [`SUMMARIZATION_THRESHOLD`], or the history accumulating
+    /// [`SUMMARIZATION_IMAGE_COUNT`] distinct data-URI images (see
+    /// [`session_image_marker_count`]). The token length is the REAL
+    /// provider-reported value (input + output tokens of the last successful
+    /// agent LLM call), loaded at session init; `None` — no successful
+    /// usage-bearing call ever recorded a value (new sessions, pre-migration
+    /// sessions; approved no-backfill) — only disables the token trigger. A
+    /// FAILED call never updates the value (the session did not change).
     ///
-    /// The session length is the REAL provider-reported value (input +
-    /// output tokens of the last successful agent LLM call), loaded at
-    /// session init. `None` — no successful usage-bearing call ever recorded
-    /// a value (new sessions, pre-migration sessions; approved no-backfill)
-    /// — is treated as below the threshold: no summarization. A FAILED call
-    /// never updates the value (the session did not change).
-    ///
-    /// KV-cache preservation: [`Agent::summarize`] keeps all parameters identical
-    /// (see [`Agent::build_chat_request`]) so the cached prefix is reusable.
+    /// KV-cache preservation: [`Agent::summarize`] keeps all parameters
+    /// identical (see [`Agent::build_chat_request`]) so the cached prefix is
+    /// reusable.
     async fn maybe_summarize(&mut self) {
-        let Some(token_length) = self.session.token_length() else {
-            return;
-        };
+        let token_length = self.session.token_length();
+        let image_count = session_image_marker_count(self.session.history());
         tracing::debug!(
             agent_id = %self.agent_id,
             role = %self.role,
             token_length,
-            "Session token length",
+            image_count,
+            "Session token length / image count",
         );
-        if token_length > crate::session::SUMMARIZATION_THRESHOLD {
-            tracing::info!(
-                agent_id = %self.agent_id,
-                role = %self.role,
-                token_length,
-                "Session exceeded summarization threshold",
-            );
-            match self.summarize().await {
-                Ok(summary) => {
-                    self.session
-                        .apply_summary(
-                            &self.agent_id,
-                            &summary,
-                            &self.workspace,
-                            &self.role,
-                            self.ticket.as_ref(),
-                            self.full_access,
-                            &self.user_name,
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error_chain = %crate::util::failure_detail(&format!("{e:#}"), "summarization failure"),
-                        "Summarization failed — continuing with full history"
-                    );
-                }
+        let Some(trigger) = summarization_trigger(token_length, image_count) else {
+            return;
+        };
+        tracing::info!(
+            agent_id = %self.agent_id,
+            role = %self.role,
+            trigger,
+            token_length,
+            image_count,
+            "Session exceeded summarization trigger ({trigger})",
+        );
+        match self.summarize().await {
+            Ok(summary) => {
+                self.session
+                    .apply_summary(
+                        &self.agent_id,
+                        &summary,
+                        &self.workspace,
+                        &self.role,
+                        self.ticket.as_ref(),
+                        self.full_access,
+                        &self.user_name,
+                    )
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error_chain = %crate::util::failure_detail(&format!("{e:#}"), "summarization failure"),
+                    "Summarization failed — continuing with full history"
+                );
             }
         }
+    }
+}
+
+/// Decide whether [`Agent::maybe_summarize`] should compact, and why.
+/// Strict `>` for the token threshold, `>=` for the image count — the
+/// asymmetry is deliberate (see [`crate::session::SUMMARIZATION_IMAGE_COUNT`]).
+/// Returns `None` when no trigger fires.
+#[must_use]
+fn summarization_trigger(token_length: Option<u64>, image_count: usize) -> Option<&'static str> {
+    if token_length.is_some_and(|t| t > crate::session::SUMMARIZATION_THRESHOLD) {
+        Some("token threshold")
+    } else if image_count >= crate::session::SUMMARIZATION_IMAGE_COUNT {
+        Some("image count")
+    } else {
+        None
     }
 }
 
@@ -2176,6 +2219,20 @@ struct PreparedAssistantTurn {
 #[must_use]
 fn is_reasoning_only_stop(response: &ChatResponse) -> bool {
     response.tool_calls.is_empty() && response.text.as_deref().is_none_or(|t| t.trim().is_empty())
+}
+
+/// Context for a failed LLM step: the run-local tool-round counter plus the
+/// session depth — a resumed long-lived session must not read as freshly
+/// started ("tool round 0"). The token segment is omitted when unknown.
+fn llm_step_failure_context(session: &Session, tool_rounds: usize) -> String {
+    let tokens = session
+        .token_length()
+        .map_or_else(String::new, |t| format!(", {t} tokens"));
+    format!(
+        "LLM step failed at tool round {tool_rounds} (run-local counter; \
+         session history: {} messages{tokens})",
+        session.history().len(),
+    )
 }
 
 /// Prepare assistant response data from the LLM response.
@@ -4290,10 +4347,39 @@ mod tests {
         assert_eq!(agent.session.token_length(), Some(u64::MAX));
     }
 
+    /// The LLM-step failure context carries BOTH the run-local tool round and
+    /// the session depth (history length + token length, the latter omitted
+    /// when unknown) — a resumed 100-round-deep session must not read as
+    /// freshly started.
+    #[tokio::test]
+    async fn llm_step_failure_context_reports_run_round_and_session_depth() {
+        crate::util::test::init_test_stores().await;
+        let mut agent = make_agent(vec![]);
+        agent
+            .session
+            .push_messages_unpersisted(&[ChatMessage::user("hello"), ChatMessage::assistant("hi")]);
+        agent.session.set_token_length(Some(42_110));
+
+        let ctx = llm_step_failure_context(&agent.session, 0);
+        assert!(ctx.contains("tool round 0"), "run-local round: {ctx}");
+        assert!(ctx.contains("2 messages"), "session depth: {ctx}");
+        assert!(ctx.contains("42110 tokens"), "token segment: {ctx}");
+
+        agent.session.set_token_length(None);
+        let ctx = llm_step_failure_context(&agent.session, 3);
+        assert!(ctx.contains("tool round 3"), "round after increment: {ctx}");
+        assert!(ctx.contains("2 messages"), "session depth: {ctx}");
+        assert!(
+            !ctx.contains("tokens"),
+            "None omits the token segment: {ctx}"
+        );
+    }
+
     /// An unknown session length (`None` — no successful usage-bearing call
-    /// ever recorded) is below the summarization threshold: the check exits
-    /// before the summarize LLM call. No provider is installed on purpose —
-    /// reaching [`Agent::summarize`] would panic on the unset provider.
+    /// ever recorded) only disables the token trigger; with no images present
+    /// it is still a no-op: the check exits before the summarize LLM call. No
+    /// provider is installed on purpose — reaching [`Agent::summarize`] would
+    /// panic on the unset provider.
     #[tokio::test]
     async fn maybe_summarize_none_and_below_threshold_are_noops() {
         crate::util::test::init_test_stores().await;
@@ -4549,6 +4635,60 @@ mod tests {
             "only IMAGE markers are collected, got: {set:?}"
         );
         assert!(set.contains("data:image/jpeg;base64,aaa"));
+    }
+
+    /// `session_image_marker_count` counts DISTINCT `data:image/`-prefixed
+    /// IMAGE markers in User-role messages. The gate is prefix-only (no full
+    /// raster decode): real PNG data-URIs count, duplicates collapse to one,
+    /// while file-path markers, non-IMAGE kinds, and assistant-role messages
+    /// do not count.
+    #[test]
+    fn session_image_marker_count_prefix_gate() {
+        let png = crate::util::test::tiny_png_data_uri();
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(format!("[IMAGE:{png}] first")),
+            ChatMessage::user(format!("[IMAGE:{png}] duplicate — same URI")),
+            ChatMessage::user("[IMAGE:/local/path.png] file path"),
+            ChatMessage::user("[AUDIO:data:audio/ogg;base64,zzz]"),
+            ChatMessage::assistant(format!("[IMAGE:{png}] assistant role must not count")),
+        ];
+        assert_eq!(
+            session_image_marker_count(&history),
+            1,
+            "only the distinct native data-URI IMAGE marker in User messages counts"
+        );
+    }
+
+    /// The trigger decision is asymmetric by design: strict `>` for the token
+    /// threshold, `>=` for the image count; the token trigger reports as the
+    /// reason when both fire (both still lead to one summarize).
+    #[test]
+    fn summarization_trigger_decides_reason() {
+        use crate::session::{SUMMARIZATION_IMAGE_COUNT, SUMMARIZATION_THRESHOLD};
+        let nine = SUMMARIZATION_IMAGE_COUNT - 1;
+        assert_eq!(summarization_trigger(None, nine), None);
+        assert_eq!(
+            summarization_trigger(None, SUMMARIZATION_IMAGE_COUNT),
+            Some("image count")
+        );
+        assert_eq!(
+            summarization_trigger(Some(SUMMARIZATION_THRESHOLD), 0),
+            None
+        );
+        assert_eq!(
+            summarization_trigger(Some(SUMMARIZATION_THRESHOLD + 1), 0),
+            Some("token threshold")
+        );
+        assert_eq!(
+            summarization_trigger(Some(SUMMARIZATION_THRESHOLD + 1), SUMMARIZATION_IMAGE_COUNT,),
+            Some("token threshold")
+        );
+        assert_eq!(summarization_trigger(Some(1), nine), None);
+        assert_eq!(
+            summarization_trigger(Some(1), SUMMARIZATION_IMAGE_COUNT),
+            Some("image count")
+        );
     }
 
     /// `commit_tool_results` injects the synthetic image user message AFTER the

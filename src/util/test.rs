@@ -552,6 +552,19 @@ pub fn make_executable(path: &Path) {
     let _ = path;
 }
 
+/// 1×1 red PNG as a native data-URI — a payload that survives the media
+/// gate's base64 + bounded raster decode; used wherever tests need a marker
+/// the provider promotes to a vision part.
+pub(crate) fn tiny_png_data_uri() -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+    let mut buf = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .expect("test PNG must encode");
+    format!("data:image/png;base64,{}", STANDARD.encode(&buf))
+}
+
 /// The single process-level test temp root.
 ///
 /// All test-owned process-global state that needs a temp directory — the
