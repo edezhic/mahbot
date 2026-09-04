@@ -7,11 +7,14 @@
 //! endpoint, and reused for [`CATALOG_TTL`]. A failed fetch — including a
 //! timeout — is stored as a short-lived negative cache
 //! ([`CATALOG_RETRY_BACKOFF`]) and degrades to fail-open: [`Catalog::get`]
-//! returns `None` and callers proceed without capability data.
+//! returns `None` and callers proceed without capability data. Capability
+//! checks can force a refresh on a membership miss via [`Catalog::refresh_for_miss`]
+//! (cooldown-bounded); a plain [`Catalog::get`] never refreshes.
 
 use crate::util::UnwrapPoison;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -32,6 +35,19 @@ const CATALOG_RETRY_BACKOFF: Duration = Duration::from_mins(1);
 /// retried only after the backoff window. Accepted: a bounded first-message
 /// latency is worth more than a slow catalog.
 const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A single catalog fetch: URL → response body. Production resolves to
+/// [`crate::util::http::get_json_from_provider`]; tests install a scripted
+/// fetch so refresh/cooldown behavior is hermetic. A fn pointer keeps
+/// `Catalog` const-constructible for the static catalog clients.
+pub(crate) type FetchFuture = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>;
+pub(crate) type FetchFn = fn(url: &str, label: &str) -> FetchFuture;
+
+fn fetch_from_provider(url: &str, label: &str) -> FetchFuture {
+    let url = url.to_string();
+    let label = label.to_string();
+    Box::pin(async move { crate::util::http::get_json_from_provider(&url, &label).await })
+}
 
 /// Parse a `{ "data": [...] }` catalog envelope into a model map. The
 /// per-entry parser is supplied by each catalog client (field shapes differ).
@@ -84,10 +100,16 @@ pub(crate) struct Catalog<T> {
     label: &'static str,
     /// Parses a fetched response body into the catalog type.
     parse: fn(&Value) -> anyhow::Result<T>,
+    /// Injected fetch transport — resolves to [`fetch_from_provider`] in
+    /// production; tests install a scripted fetch.
+    fetch: FetchFn,
     cache: OnceLock<RwLock<Option<CacheEntry<T>>>>,
     /// Serializes concurrent fetches — one network call regardless of how many
     /// callers hit the catalog at once.
     fetch_lock: OnceLock<tokio::sync::Mutex<()>>,
+    /// Per-endpoint timestamp of the last miss-triggered refresh attempt, for
+    /// the cooldown.
+    last_miss_refresh: OnceLock<RwLock<Option<(String, Instant)>>>,
 }
 
 impl<T> Catalog<T> {
@@ -100,9 +122,18 @@ impl<T> Catalog<T> {
             path,
             label,
             parse,
+            fetch: fetch_from_provider,
             cache: OnceLock::new(),
             fetch_lock: OnceLock::new(),
+            last_miss_refresh: OnceLock::new(),
         }
+    }
+
+    /// Test-only: replace the fetch transport with a scripted one.
+    #[cfg(test)]
+    pub(crate) const fn with_fetch(mut self, fetch: FetchFn) -> Self {
+        self.fetch = fetch;
+        self
     }
 
     /// Return the cached catalog for `endpoint` if fresh, otherwise fetch it
@@ -121,13 +152,16 @@ impl<T> Catalog<T> {
             Lookup::Backoff => return None,
             Lookup::Miss => {}
         }
+        self.fetch_and_store(base).await
+    }
 
+    /// Fetch the catalog for the already-normalized `base` (bypassing any cache
+    /// check) and store the outcome: fresh catalog on success, negative cache on
+    /// failure. Returns the fetched catalog, or `None` on any failure (fail-open).
+    async fn fetch_and_store(&self, base: String) -> Option<Arc<T>> {
         let url = format!("{base}{}", self.path);
-        let fetched = tokio::time::timeout(
-            CATALOG_FETCH_TIMEOUT,
-            crate::util::http::get_json_from_provider(&url, self.label),
-        )
-        .await;
+        let fetched =
+            tokio::time::timeout(CATALOG_FETCH_TIMEOUT, (self.fetch)(&url, self.label)).await;
         match fetched {
             Err(_) => {
                 tracing::warn!(
@@ -159,6 +193,46 @@ impl<T> Catalog<T> {
                 None
             }
         }
+    }
+
+    /// Forced refresh for a capability-check membership miss: the model id is
+    /// absent from the cached snapshot, so the snapshot may predate the model's
+    /// OpenRouter listing. Atomic — acquires the fetch lock (single-flight),
+    /// bypasses the TTL check, fetches, stores. Bounded by a per-endpoint
+    /// cooldown ([`CATALOG_RETRY_BACKOFF`]): inside the window no refetch
+    /// happens and the last fetched snapshot is returned as-is, so absence
+    /// confirmed by a successful fresh fetch stands (the caller rejects).
+    /// Returns the refreshed/last snapshot, or `None` when the fetch failed
+    /// (fail-open — the caller must not reject on a stale/missing catalog).
+    pub(crate) async fn refresh_for_miss(&self, endpoint: &str) -> Option<Arc<T>> {
+        let base = crate::providers::ensure_base_url(endpoint);
+        let _guard = self.fetch_lock().await;
+        if self.miss_refresh_in_cooldown(&base) {
+            // Cooldown window: re-check against the last fetched snapshot.
+            return match self.lookup(&base) {
+                Lookup::Fresh(catalog) => Some(catalog),
+                _ => None,
+            };
+        }
+        self.record_miss_refresh(&base);
+        self.fetch_and_store(base).await
+    }
+
+    fn miss_refresh_in_cooldown(&self, endpoint: &str) -> bool {
+        self.last_miss_refresh
+            .get_or_init(|| RwLock::new(None))
+            .read()
+            .unwrap_poison()
+            .as_ref()
+            .is_some_and(|(ep, at)| ep == endpoint && at.elapsed() < CATALOG_RETRY_BACKOFF)
+    }
+
+    fn record_miss_refresh(&self, endpoint: &str) {
+        *self
+            .last_miss_refresh
+            .get_or_init(|| RwLock::new(None))
+            .write()
+            .unwrap_poison() = Some((endpoint.to_string(), Instant::now()));
     }
 
     fn lookup(&self, endpoint: &str) -> Lookup<T> {

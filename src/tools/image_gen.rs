@@ -1,5 +1,5 @@
 use crate::retry::RETRY_AFTER_MAX_MS;
-use crate::tools::media_catalog::image::{ImageModelInfo, check_image_capability};
+use crate::tools::media_catalog::image::{ImageModelInfo, resolve_image_model};
 use crate::util::error::retry_after_header;
 use crate::util::http::{bearer_auth_header, read_error_body};
 use crate::{Tool, Workspace};
@@ -59,13 +59,12 @@ impl Tool for ImageGenTool {
         let size = super::get_opt_str(&args, "size");
         let images: Vec<String> = super::get_str_array(&args, "images");
 
-        // Capability and parameter decisions come from the catalog; a catalog
-        // outage degrades to minimal user-provided parameters (fail-open).
-        let catalog = crate::tools::media_catalog::image::get_catalog().await;
-        let info = match &catalog {
-            Some(catalog) => Some(check_image_capability(&model, catalog)?),
-            None => None,
-        };
+        // Capability and parameter decisions come from the catalog. A membership
+        // miss forces one catalog refresh before the verdict; a catalog outage
+        // degrades to minimal user-provided parameters (fail-open), while a model
+        // confirmed absent from a freshly fetched catalog rejects generation.
+        let info = resolve_image_model(crate::config::DEFAULT_PROVIDER_ENDPOINT, &model).await?;
+        let info = info.as_ref();
 
         // Pre-flight reference-count validation BEFORE loading any files: a
         // too-many-refs error must not first read every reference into memory.
@@ -882,98 +881,6 @@ mod tests {
         let body = build_request_body("any/model", "p", None, None, &[], None);
         assert!(body.get("aspect_ratio").is_none());
         assert!(body.get("input_references").is_none());
-    }
-
-    #[test]
-    fn check_image_capability_cases() {
-        // One merged catalog covering the rejects cases (qwen capable, unknown
-        // absent, text-only) and the shape-drift case (drift/model missing
-        // output_modalities → fails open as capable). `ImageCatalog` is not
-        // Clone/Copy, so a single merged catalog is built here directly.
-        struct Case {
-            name: &'static str,
-            model: &'static str,
-            // Empty → expect Ok; otherwise every fragment must appear in the
-            // error message (preserving the rejects test's substring checks).
-            expect_err_fragments: &'static [&'static str],
-        }
-
-        let catalog = parse_catalog(&json!({
-            "data": [
-                {
-                    "id": "qwen/qwen-image-3-pro",
-                    "architecture": { "output_modalities": ["image"] },
-                    "supported_parameters": {
-                        "resolution": { "type": "enum", "values": ["1K", "2K"] },
-                        "aspect_ratio": { "type": "enum", "values": ["1:1", "9:16"] },
-                        "input_references": { "type": "range", "min": 0, "max": 4 }
-                    }
-                },
-                {
-                    "id": "text-only/model",
-                    "architecture": { "output_modalities": ["text"] },
-                    "supported_parameters": {}
-                },
-                {
-                    "id": "drift/model",
-                    "supported_parameters": {}
-                }
-            ]
-        }))
-        .expect("valid merged catalog");
-
-        let cases = [
-            Case {
-                name: "capable_qwen",
-                model: "qwen/qwen-image-3-pro",
-                expect_err_fragments: &[],
-            },
-            Case {
-                name: "unknown_model_rejected",
-                model: "unknown/model",
-                expect_err_fragments: &[
-                    "cannot generate images",
-                    "not in the OpenRouter image-models catalog",
-                ],
-            },
-            Case {
-                name: "text_only_rejected",
-                model: "text-only/model",
-                expect_err_fragments: &["cannot generate images", "does not list image output"],
-            },
-            Case {
-                name: "shape_drift_fails_open",
-                model: "drift/model",
-                expect_err_fragments: &[],
-            },
-        ];
-
-        for case in &cases {
-            match check_image_capability(case.model, &catalog) {
-                Ok(_) if case.expect_err_fragments.is_empty() => {}
-                Ok(_) => panic!(
-                    "case: {name} — expected error containing {fragments:?}, got Ok for `{model}`",
-                    name = case.name,
-                    fragments = case.expect_err_fragments,
-                    model = case.model,
-                ),
-                Err(err) if case.expect_err_fragments.is_empty() => panic!(
-                    "case: {name} — expected Ok for `{model}`, got: {err}",
-                    name = case.name,
-                    model = case.model,
-                ),
-                Err(err) => {
-                    let msg = err.to_string();
-                    for &fragment in case.expect_err_fragments {
-                        assert!(
-                            msg.contains(fragment),
-                            "case: {name} — error should contain {fragment:?}, got: {msg}",
-                            name = case.name,
-                        );
-                    }
-                }
-            }
-        }
     }
 
     #[test]

@@ -184,26 +184,9 @@ pub mod image {
         CATALOG.seed(&endpoint, catalog);
     }
 
-    /// Reject models that cannot generate images on the dedicated surface:
-    /// unknown model ids or models that explicitly declare text-only output.
-    /// Returns the model's catalog info for request building; models whose
-    /// catalog entry lacks output modalities (shape drift) are allowed through.
-    /// Catalog-driven — no per-model branches.
-    ///
-    /// # Errors
-    ///
-    /// - The model is absent from the catalog or explicitly declares no image output.
-    pub(crate) fn check_image_capability<'a>(
-        model: &str,
-        catalog: &'a ImageCatalog,
-    ) -> anyhow::Result<&'a ImageModelInfo> {
-        let Some(info) = catalog.find(model) else {
-            anyhow::bail!(
-                "Model `{model}` cannot generate images: it is not in the OpenRouter \
-                 image-models catalog. Set an image-capable model in Settings → \
-                 Image Generation and retry."
-            );
-        };
+    /// Reject a catalog-listed model that explicitly declares text-only output.
+    /// (Shape drift — missing/empty modalities — is tolerated as capable.)
+    fn reject_text_only(model: &str, info: &ImageModelInfo) -> anyhow::Result<()> {
         if info.image_output == ImageOutput::TextOnly {
             anyhow::bail!(
                 "Model `{model}` cannot generate images: the OpenRouter image-models catalog \
@@ -211,13 +194,65 @@ pub mod image {
                  Settings → Image Generation and retry."
             );
         }
-        Ok(info)
+        Ok(())
+    }
+
+    /// Shared image-model capability resolver — the single validation entry
+    /// point for all three consumers (GUI model picker, Telegram model setter,
+    /// and the generation-time image-gen check).
+    ///
+    /// Resolution order: a hit against the cached catalog yields the capability
+    /// verdict immediately (no network). A membership miss forces one atomic
+    /// catalog refresh ([`Catalog::refresh_for_miss`], cooldown-bounded) and
+    /// re-checks, so a model added to OpenRouter after the cached snapshot was
+    /// taken is accepted instead of being rejected for up to [`CATALOG_TTL`].
+    /// Outcomes:
+    /// - `Ok(Some(info))` — present and not text-only; `info` feeds request building;
+    /// - `Ok(None)` — catalog unavailable (fetch failed/negative backoff) → fail-open;
+    /// - `Err` — confirmed absent from a freshly fetched catalog, or text-only.
+    pub(crate) async fn resolve_image_model(
+        endpoint: &str,
+        model: &str,
+    ) -> anyhow::Result<Option<ImageModelInfo>> {
+        resolve_capability_with(&CATALOG, endpoint, model).await
+    }
+
+    /// Resolver core, generic over the catalog cache so tests can drive a
+    /// scripted fetch on a local instance (the real `CATALOG` static is global).
+    async fn resolve_capability_with(
+        catalog: &Catalog<ImageCatalog>,
+        endpoint: &str,
+        model: &str,
+    ) -> anyhow::Result<Option<ImageModelInfo>> {
+        let base = crate::providers::ensure_base_url(endpoint);
+        let Some(snapshot) = catalog.get(&base).await else {
+            tracing::warn!(
+                "Image-models catalog unavailable — skipping image-model validation (fail-open)"
+            );
+            return Ok(None);
+        };
+        if let Some(info) = snapshot.find(model) {
+            return reject_text_only(model, info).map(|()| Some(info.clone()));
+        }
+        // Membership miss: one forced refresh + re-check. Only absence from a
+        // freshly fetched catalog rejects; a failed refresh degrades to fail-open.
+        let Some(snapshot) = catalog.refresh_for_miss(&base).await else {
+            return Ok(None);
+        };
+        match snapshot.find(model) {
+            Some(info) => reject_text_only(model, info).map(|()| Some(info.clone())),
+            None => anyhow::bail!(
+                "Model `{model}` cannot generate images: it is not in the OpenRouter \
+                 image-models catalog. Set an image-capable model in Settings → \
+                 Image Generation and retry."
+            ),
+        }
     }
 
     /// Write-time validation that `model` can generate images, using the catalog
-    /// when available. Fail-open: when the catalog is unavailable the check passes
-    /// (with a warning) — consistent with the generation tool's fail-open
-    /// semantics, so a catalog outage never blocks settings writes.
+    /// when available. Fail-open (a catalog outage passes the check) now lives
+    /// in [`resolve_image_model`] — this validates against the currently
+    /// committed endpoint.
     ///
     /// Used by the settings save path, the GUI model picker, and the Telegram
     /// model commands.
@@ -241,19 +276,17 @@ pub mod image {
         model: &str,
         endpoint: &str,
     ) -> anyhow::Result<()> {
-        let Some(catalog) = get_catalog_for_endpoint(endpoint).await else {
-            tracing::warn!(
-                "Image-models catalog unavailable — skipping write-time model validation (fail-open)"
-            );
-            return Ok(());
-        };
-        check_image_capability(model, &catalog).map(|_| ())
+        resolve_image_model(endpoint, model).await.map(|_| ())
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::util::catalog_cache::FetchFuture;
         use serde_json::json;
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[test]
         fn test_parse_and_query_catalog() {
@@ -307,6 +340,192 @@ pub mod image {
             }))
             .expect("tolerated");
             assert!(catalog.find("m1").is_some());
+        }
+
+        // ── Resolver tests: scripted fetch on a local Catalog (hermetic) ──
+
+        static SCRIPT: Mutex<VecDeque<anyhow::Result<serde_json::Value>>> =
+            Mutex::new(VecDeque::new());
+        static FETCHES: AtomicUsize = AtomicUsize::new(0);
+
+        fn scripted_fetch(_url: &str, _label: &str) -> FetchFuture {
+            FETCHES.fetch_add(1, Ordering::SeqCst);
+            let next = SCRIPT.lock().expect("script lock").pop_front();
+            Box::pin(
+                async move { next.unwrap_or_else(|| Err(anyhow::anyhow!("script exhausted"))) },
+            )
+        }
+
+        fn catalog_with_model(id: &str) -> serde_json::Value {
+            json!({ "data": [ { "id": id, "architecture": { "output_modalities": ["image"] } } ] })
+        }
+
+        fn resolver_catalog() -> Catalog<ImageCatalog> {
+            Catalog::new("/images/models", "Image models catalog", parse_catalog)
+                .with_fetch(scripted_fetch)
+        }
+
+        fn reset_script(entries: Vec<anyhow::Result<serde_json::Value>>) {
+            *SCRIPT.lock().expect("script lock") = entries.into();
+            FETCHES.store(0, Ordering::SeqCst);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(image_resolver)]
+        async fn resolver_hit_path_performs_no_fetch() {
+            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
+            let base = crate::providers::ensure_base_url(endpoint);
+            reset_script(vec![]);
+
+            // Capable model present → Ok(Some), no fetch.
+            let catalog = resolver_catalog();
+            catalog.seed(
+                &base,
+                Some(Arc::new(
+                    parse_catalog(&catalog_with_model("a/model")).expect("capable fixture"),
+                )),
+            );
+            let info = resolve_capability_with(&catalog, endpoint, "a/model")
+                .await
+                .expect("resolved");
+            assert!(info.is_some());
+
+            // Text-only present → Err with the text-only fragment, no fetch.
+            let catalog = resolver_catalog();
+            catalog.seed(
+                &base,
+                Some(Arc::new(
+                    parse_catalog(&json!({
+                        "data": [ { "id": "text/model",
+                                    "architecture": { "output_modalities": ["text"] } } ]
+                    }))
+                    .expect("text-only fixture"),
+                )),
+            );
+            let err = resolve_capability_with(&catalog, endpoint, "text/model")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("does not list image output"));
+
+            // Shape drift (missing architecture) → Ok(Some), no fetch.
+            let catalog = resolver_catalog();
+            catalog.seed(
+                &base,
+                Some(Arc::new(
+                    parse_catalog(&json!({ "data": [ { "id": "drift/model" } ] }))
+                        .expect("drift fixture"),
+                )),
+            );
+            let info = resolve_capability_with(&catalog, endpoint, "drift/model")
+                .await
+                .expect("drift tolerant");
+            assert!(info.is_some());
+
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(image_resolver)]
+        async fn resolver_miss_refresh_accepts_new_model() {
+            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
+            let base = crate::providers::ensure_base_url(endpoint);
+            let catalog = resolver_catalog();
+            catalog.seed(
+                &base,
+                Some(Arc::new(
+                    parse_catalog(&catalog_with_model("other/model")).expect("seed"),
+                )),
+            );
+            reset_script(vec![Ok(catalog_with_model("brand/new-model"))]);
+
+            let info = resolve_capability_with(&catalog, endpoint, "brand/new-model")
+                .await
+                .expect("refreshed");
+            assert!(info.is_some());
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+
+            let info = resolve_capability_with(&catalog, endpoint, "brand/new-model")
+                .await
+                .expect("now cached");
+            assert!(info.is_some());
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(image_resolver)]
+        async fn resolver_fresh_absence_rejects() {
+            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
+            let base = crate::providers::ensure_base_url(endpoint);
+            let catalog = resolver_catalog();
+            catalog.seed(
+                &base,
+                Some(Arc::new(
+                    parse_catalog(&catalog_with_model("other/model")).expect("seed"),
+                )),
+            );
+            reset_script(vec![Ok(catalog_with_model("other/model"))]);
+
+            let err = resolve_capability_with(&catalog, endpoint, "brand/new-model")
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("not in the OpenRouter image-models catalog")
+            );
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(image_resolver)]
+        async fn resolver_cooldown_prevents_refetch_storm() {
+            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
+            let base = crate::providers::ensure_base_url(endpoint);
+            let catalog = resolver_catalog();
+            catalog.seed(
+                &base,
+                Some(Arc::new(
+                    parse_catalog(&catalog_with_model("other/model")).expect("seed"),
+                )),
+            );
+            reset_script(vec![Ok(catalog_with_model("other/model"))]);
+
+            for _ in 0..2 {
+                let err = resolve_capability_with(&catalog, endpoint, "brand/new-model")
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("not in the OpenRouter image-models catalog")
+                );
+            }
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(image_resolver)]
+        async fn resolver_refresh_failure_fails_open() {
+            let endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
+            let base = crate::providers::ensure_base_url(endpoint);
+            let catalog = resolver_catalog();
+            catalog.seed(
+                &base,
+                Some(Arc::new(
+                    parse_catalog(&catalog_with_model("other/model")).expect("seed"),
+                )),
+            );
+            reset_script(vec![Err(anyhow::anyhow!("upstream down"))]);
+
+            let info = resolve_capability_with(&catalog, endpoint, "brand/new-model")
+                .await
+                .expect("fail-open");
+            assert!(info.is_none());
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
+
+            let info = resolve_capability_with(&catalog, endpoint, "brand/new-model")
+                .await
+                .expect("fail-open");
+            assert!(info.is_none());
+            assert_eq!(FETCHES.load(Ordering::SeqCst), 1);
         }
     }
 }
