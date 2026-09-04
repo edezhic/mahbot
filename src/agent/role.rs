@@ -301,8 +301,17 @@ impl Role {
     /// flag. It only widens the Assistant's toolset (adding `shell`,
     /// `implement`, and `research`); every other role's toolset is
     /// byte-identical regardless of its value.
+    ///
+    /// `browser_sessions` is the run-scoped browser session tracker shared with
+    /// the agent's `BrowserTool` so every session the run opens is closed at
+    /// run end.
     #[must_use]
-    pub(crate) fn tools(self, ws: &Workspace, full_access: bool) -> Vec<Box<dyn Tool>> {
+    pub(crate) fn tools(
+        self,
+        ws: &Workspace,
+        full_access: bool,
+        browser_sessions: std::sync::Arc<crate::tools::browser::BrowserRunSessions>,
+    ) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> = match self {
             Role::Engineer => {
                 let mut t = Self::full_core_tools();
@@ -331,7 +340,7 @@ impl Role {
             }
             Role::Analyst => {
                 let mut t = Self::readonly_core_tools();
-                t.push(Box::new(BrowserTool::default()));
+                t.push(Box::new(BrowserTool::new(browser_sessions)));
                 t
             }
             Role::Coder => Self::full_core_tools(),
@@ -461,6 +470,12 @@ impl Role {
 mod tests {
     use super::*;
 
+    /// Run-scoped browser session tracker for toolset tests — the caller-visible
+    /// per-run tracker is never used here (these tests never open a browser).
+    fn test_sessions() -> std::sync::Arc<crate::tools::browser::BrowserRunSessions> {
+        std::sync::Arc::new(crate::tools::browser::BrowserRunSessions::default())
+    }
+
     #[test]
     fn role_roundtrip() {
         // FromStr for every variant by lowercase name
@@ -532,7 +547,7 @@ mod tests {
         // missing arms in the match, but cannot catch an arm that returns
         // vec![]. Every role needs at least one tool to function.
         for role in Role::iter() {
-            let tools = role.tools(&crate::workspace::test_ws("test"), false);
+            let tools = role.tools(&crate::workspace::test_ws("test"), false, test_sessions());
             assert!(
                 !tools.is_empty(),
                 "{}: Role::tools() must not be empty — every role needs at least one tool",
@@ -552,7 +567,7 @@ mod tests {
         let _ = crate::config::CONFIG.set_string_field("web_search_provider", "exa");
         let _ = crate::config::CONFIG.set_string_field("exa_key", "test-key");
         let names: Vec<&str> = crate::Role::Sanitation
-            .tools(&crate::workspace::test_ws("test"), false)
+            .tools(&crate::workspace::test_ws("test"), false, test_sessions())
             .iter()
             .map(|t| t.name())
             .collect();
@@ -570,7 +585,7 @@ mod tests {
         // advertises `mahbot_debug` — it must not appear for the Analyst, the
         // Assistant (either base or full-access), or any other role.
         let ws = crate::workspace::test_ws("test");
-        let tools = crate::Role::Support.tools(&ws, false);
+        let tools = crate::Role::Support.tools(&ws, false, test_sessions());
         assert!(
             tools.iter().any(|t| t.name() == "mahbot_debug"),
             "support toolset must contain `mahbot_debug`"
@@ -589,7 +604,7 @@ mod tests {
             (crate::Role::Assistant, false),
             (crate::Role::Assistant, true),
         ] {
-            let tools = role.tools(&ws, full_access);
+            let tools = role.tools(&ws, full_access, test_sessions());
             assert!(
                 !tools.iter().any(|t| t.name() == "mahbot_debug"),
                 "{} must not advertise `mahbot_debug`",
@@ -605,8 +620,8 @@ mod tests {
         // computer, full mode does. Base gets the workspace-only StrictReadTool;
         // full keeps the general ReadTool (which also permits dependency sources).
         let ws = crate::workspace::test_ws("test");
-        let base = crate::Role::Assistant.tools(&ws, false);
-        let full = crate::Role::Assistant.tools(&ws, true);
+        let base = crate::Role::Assistant.tools(&ws, false, test_sessions());
+        let full = crate::Role::Assistant.tools(&ws, true, test_sessions());
 
         for name in ["shell", "implement", "research", "computer"] {
             assert!(
@@ -648,7 +663,7 @@ mod tests {
         for role in Role::iter() {
             for full_access in [false, true] {
                 let has = role
-                    .tools(&ws, full_access)
+                    .tools(&ws, full_access, test_sessions())
                     .iter()
                     .any(|t| t.name() == "computer");
                 if role == crate::Role::Assistant && full_access {
@@ -674,7 +689,7 @@ mod tests {
         for role in Role::iter() {
             for full_access in [false, true] {
                 let has = role
-                    .tools(&ws, full_access)
+                    .tools(&ws, full_access, test_sessions())
                     .iter()
                     .any(|t| t.name() == "sleep");
                 if role == crate::Role::Assistant {
@@ -713,7 +728,7 @@ mod tests {
         for role in Role::iter() {
             for full_access in [false, true] {
                 let has_tool = role
-                    .tools(&ws, full_access)
+                    .tools(&ws, full_access, test_sessions())
                     .into_iter()
                     .find(|t| t.name() == "add_alarm");
                 let Some(tool) = has_tool else {

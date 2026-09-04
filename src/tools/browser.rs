@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures_util::future::join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use std::process::Stdio;
@@ -116,10 +116,29 @@ const fn true_val() -> bool {
     true
 }
 
+/// Browser sessions one agent run's browser tooling opened. chrome-use
+/// ≥1.5.101 no longer closes external Chrome tabs when the daemon idles out,
+/// so every session name the run used is recorded here and closed at run end —
+/// the created-only close path, never an enumeration sweep (a sweep could
+/// close the user's own tabs).
+#[derive(Default)]
+pub(crate) struct BrowserRunSessions(std::sync::Mutex<BTreeSet<String>>);
+
+impl BrowserRunSessions {
+    fn track(&self, name: &str) {
+        self.0.lock().unwrap_poison().insert(name.to_string());
+    }
+    pub(crate) fn snapshot(&self) -> Vec<String> {
+        self.0.lock().unwrap_poison().iter().cloned().collect()
+    }
+}
+
 /// Browser tool for fetching content from web pages.
 ///
 /// Each operation requires a `tab` name — separate browser sessions
-/// (isolated via `--session`). Use `"default"` for most browsing.
+/// (isolated via `--session`). The default session is unique per tool
+/// instance (one agent run), not the shared `"default"` — concurrent runs
+/// never collide on a shared session. Every session used is closed at run end.
 /// Operations on the same tab are serialized via a per-tab lock.
 #[derive(Default)]
 pub struct BrowserTool {
@@ -131,9 +150,24 @@ pub struct BrowserTool {
     /// call is guarded by the action being `Screenshot`, so a stale value from
     /// a prior round can never be re-attached to a non-screenshot call.
     last_screenshot: std::sync::Mutex<Option<String>>,
+    /// Lazily generated per-instance default session name — unique per tool
+    /// instance (one agent run) so concurrent runs never collide on a shared
+    /// session, and closing it at run end can't clobber another run's tabs.
+    default_session: std::sync::OnceLock<String>,
+    /// Browser sessions this run's browser tooling used — closed at run end.
+    browser_sessions: std::sync::Arc<BrowserRunSessions>,
 }
 
 impl BrowserTool {
+    /// Construct a browser tool for one agent run, sharing the run's session
+    /// tracker so every session the run opens is closed at run end.
+    pub(crate) fn new(browser_sessions: std::sync::Arc<BrowserRunSessions>) -> Self {
+        Self {
+            browser_sessions,
+            ..Default::default()
+        }
+    }
+
     /// Acquire a per-tab lock for serializing operations on the same tab.
     /// Different tabs run fully concurrently.
     async fn acquire_tab_lock(&self, tab: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -189,8 +223,9 @@ impl BrowserTool {
     /// is swept (enumerate → close → re-enumerate convergence) so a leftover
     /// cannot be orphaned silently by a kill-based close. Only the target
     /// session's own tabs are touched. Non-mahbot session names (e.g. the
-    /// agent-facing `default` tab) are refused by the sweep's strict-scope
-    /// rule — the tab then persists until the daemon's idle timeout.
+    /// agent-facing `agent-tab-*` sessions) are refused by the sweep's
+    /// strict-scope rule — agent-facing sessions are instead closed at run end
+    /// (chrome-use ≥1.5.101 idle no longer closes them).
     pub async fn close_session(&self, tab: &str) {
         super::browser_daemon::sweep_session(tab).await;
     }
@@ -198,7 +233,7 @@ impl BrowserTool {
     /// If the response shows the tab still on the scratch `about:blank` page,
     /// the navigation never committed — close the session (verified sweep) and
     /// fail with the cause. The close is refused for non-mahbot session names
-    /// (strict-scope rule), leaving the tab to the daemon's idle timeout. No-op
+    /// (strict-scope rule), leaving the tab to the run-end session close. No-op
     /// when the navigation committed.
     async fn bail_on_blank_navigation(
         &self,
@@ -295,6 +330,10 @@ impl BrowserTool {
         cmd.args(args);
         cmd.arg("--json");
         cmd.args(["--session", tab]);
+        // Record the session name after the CLI path resolved, so a missing
+        // CLI never registers a pointless close — the run-end close only needs
+        // sessions that were actually dispatched.
+        self.browser_sessions.track(tab);
 
         debug!("chrome-use args: {:?}", cmd.as_std().get_args());
 
@@ -696,11 +735,11 @@ impl Tool for BrowserTool {
                 "tab": {
                     "type": "string",
                     "description": "Logical name for this browser session. \
-                     Use \"default\" for most browsing. Missing or empty \
-                     defaults to \"default\". Only use a different \
-                     name (e.g. \"docs\", \"github\") if you need to keep \
-                     multiple pages open simultaneously. Same tab = serialized \
-                     operations on that page."
+                     Missing or empty defaults to a unique per-run session \
+                     (closed automatically when your run ends). Only use an \
+                     explicit name (e.g. \"docs\", \"github\") if you need to \
+                     keep multiple pages open simultaneously. Same tab = \
+                     serialized operations on that page."
                 }
             },
             "required": ["action", "tab"]
@@ -710,7 +749,7 @@ impl Tool for BrowserTool {
     #[expect(clippy::too_many_lines)]
     async fn execute(&self, _ws: &Workspace, args: Value) -> anyhow::Result<String> {
         let mut normalized_notes: Vec<String> = Vec::new();
-        let (tab, tab_note) = normalize_tab(&args);
+        let (tab, tab_note) = self.normalize_tab(&args);
         if let Some(note) = tab_note {
             normalized_notes.push(note);
         }
@@ -914,6 +953,24 @@ impl BrowserTool {
         format!("[normalized] {}\n{output}", notes.join("; "))
     }
 
+    /// Resolve the tab for a call. An explicit non-empty tab passes through
+    /// unchanged; missing/empty falls back to the per-run default session — unique
+    /// per `BrowserTool` instance (one agent run) so concurrent runs never collide
+    /// on a shared session, and closing it at run end can't clobber another run's
+    /// tabs. Defaulting is echoed in tool output.
+    fn normalize_tab(&self, args: &Value) -> (String, Option<String>) {
+        if let Some(tab) = super::get_opt_str(args, "tab").filter(|s| !s.is_empty()) {
+            (tab.to_string(), None)
+        } else {
+            let default = self
+                .default_session
+                .get_or_init(|| format!("agent-tab-{}", crate::generate_suffix()))
+                .clone();
+            let note = format!("missing/empty tab defaulted to \"{default}\"");
+            (default, Some(note))
+        }
+    }
+
     /// Capture a screenshot of the current tab to a PNG under the safe temp
     /// root, record its path, and return a textual result describing it. The
     /// per-tab lock is already held by the caller.
@@ -1041,18 +1098,6 @@ fn corrective_action_error(received: &Value) -> String {
         "Invalid browser action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}, \
          plus a \"tab\" string. Received: {received}"
     )
-}
-
-/// Missing/empty tab defaults to the documented default session. Tabs are
-/// isolated sessions, so defaulting is safe and echoed in tool output.
-fn normalize_tab(args: &Value) -> (String, Option<String>) {
-    match super::get_opt_str(args, "tab").filter(|s| !s.is_empty()) {
-        Some(tab) => (tab.to_string(), None),
-        None => (
-            "default".to_string(),
-            Some("missing/empty tab defaulted to \"default\"".to_string()),
-        ),
-    }
 }
 
 /// Normalize a model-supplied browser `action` value into the canonical
@@ -1932,17 +1977,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_empty_tab_defaults_to_default() {
-        // Missing tab → documented default session, echoed in tool output.
-        let (tab, note) = normalize_tab(&json!({"action":{"open":{"url":"https://example.com"}}}));
-        assert_eq!(tab, "default");
+    fn missing_or_empty_tab_defaults_to_per_run_session() {
+        // Missing tab → the per-run default session, echoed in tool output.
+        let tool = BrowserTool::default();
+        let (tab, note) =
+            tool.normalize_tab(&json!({"action":{"open":{"url":"https://example.com"}}}));
+        assert!(
+            tab.starts_with("agent-tab-"),
+            "missing tab should default to a per-run session, got {tab}"
+        );
         assert!(note.is_some(), "defaulting should be echoed in tool output");
-        // Empty tab → same defaulting.
-        let (tab, note) = normalize_tab(&json!({"tab":"","action":{"open":{"url":"x"}}}));
-        assert_eq!(tab, "default");
+        // Empty tab → same defaulting …
+        let (tab, note) = tool.normalize_tab(&json!({"tab":"","action":{"open":{"url":"x"}}}));
+        assert!(tab.starts_with("agent-tab-"));
         assert!(note.is_some());
+        // … and the SAME tool yields the SAME name (OnceLock stability).
+        let (tab2, _note) = tool.normalize_tab(&json!({"tab":"","action":{"open":{"url":"x"}}}));
+        assert_eq!(
+            tab, tab2,
+            "default session must be stable per tool instance"
+        );
+        // A DIFFERENT BrowserTool instance yields a DIFFERENT name (no
+        // cross-run collision).
+        let other = BrowserTool::default();
+        let (other_tab, _note) =
+            other.normalize_tab(&json!({"tab":"","action":{"open":{"url":"x"}}}));
+        assert_ne!(tab, other_tab, "each tool instance needs its own session");
         // Explicit tab passes through unchanged.
-        let (tab, note) = normalize_tab(&json!({"tab":"docs","action":{"open":{"url":"x"}}}));
+        let (tab, note) = tool.normalize_tab(&json!({"tab":"docs","action":{"open":{"url":"x"}}}));
         assert_eq!(tab, "docs");
         assert!(note.is_none());
     }

@@ -29,6 +29,7 @@
 //!   existing browser sessions are reset.
 
 use crate::util::UnwrapPoison;
+use futures_util::future::join_all;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -649,10 +650,10 @@ pub(crate) fn ensure_browser_env(cmd: &mut Command) {
     // Default 15-second timeout for all chrome-use actions (including
     // `wait --text` which would otherwise block much longer).
     cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", "15000");
-    // 5-minute idle timeout — the chrome-use daemon shuts down after
-    // 5 minutes of inactivity, closing the tabs it created. The watchdog no
-    // longer keeps any daemon resident, so browser sessions idle out on this
-    // bound naturally.
+    // 5-minute idle timeout — the chrome-use daemon still stops after 5 idle
+    // minutes, but chrome-use ≥1.5.101 PRESERVES external Chrome tabs on idle
+    // (only an explicit close/session stop cleans them up), so mahbot closes
+    // agent-opened sessions explicitly at run end.
     cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000");
     // Enable human-like interaction speed for bot-detection avoidance.
     // chrome-use supports the same env vars as agent-browser for backward
@@ -792,7 +793,9 @@ struct SweepTab {
 }
 
 // chrome-use CLI behaviors this sweep relies on (live-verified against
-// 1.5.100):
+// 1.5.100; note the installed CLI auto-updates past that version, and that
+// ≥1.5.101 idle keeps external tabs alive — the explicit close/stop the sweep
+// uses still cleans up, so the verified behaviors below are unchanged):
 // - `tab list --session <name>` enumerates only that session's tab group (the
 //   relay scopes `Target.getTargets` per announced group, issue #40). When the
 //   session has no daemon the CLI spawns one: an empty group makes it create a
@@ -919,6 +922,54 @@ pub(crate) async fn sweep_session(name: &str) {
         }
     }
     sweep_warn_transition(SweepWarn::Deferred);
+}
+
+/// Close the browser sessions one agent run's browser tooling used, via the
+/// created-only close (`--session <name> close` — chrome-use drops the
+/// session's own tabs without enumerating anything, so the user's own tabs
+/// are never touched). Best-effort and strictly warn-only: a failed close
+/// (daemon down, wedged CLI) leaks the session's tabs — an accepted edge, the
+/// same class as the other cleanup paths. Called from the agent run end
+/// (`run_agent`).
+pub(crate) async fn close_run_sessions(sessions: &super::browser::BrowserRunSessions) {
+    let names = sessions.snapshot();
+    if names.is_empty() {
+        return;
+    }
+    // Nothing can be closed while the relay/daemon is down; skip the
+    // guaranteed-to-fail CLI round-trips (same skip gate as the sweep).
+    if let Some(failure) = service_state().await {
+        for name in &names {
+            warn!(
+                session = name,
+                ?failure,
+                "agent-run browser session close skipped — browser service unavailable"
+            );
+        }
+        return;
+    }
+    let closes: Vec<_> = names.iter().map(|name| close_run_session(name)).collect();
+    join_all(closes).await;
+}
+
+async fn close_run_session(name: &str) {
+    match run_cli_bounded(&["close"], Some(name)).await {
+        None => warn!(
+            session = name,
+            "agent-run browser session close timed out or daemon unavailable — tabs may leak until closed by hand"
+        ),
+        Some(out) if !out.status.success() => warn!(
+            session = name,
+            "agent-run browser session close failed: {}",
+            // run_cli_bounded nulls stderr — the envelope error on stdout is
+            // the only failure detail available.
+            extract_error(&out.stdout).unwrap_or_else(|| {
+                let status = out.status;
+                format!("exit status {status}")
+            })
+        ),
+        Some(_) => debug!(session = name, "agent-run browser session closed"),
+    }
 }
 
 /// Only mahbot-owned session names may be swept — user, default, and other
@@ -1862,9 +1913,11 @@ async fn fetch_latest_tag(timeout: Duration) -> Result<String, String> {
 /// accumulate. Each sweep is verified (round-over-round convergence) and only
 /// ever closes the target session's own tabs — sessions owned by other agents
 /// or the user (explicit tabs, `default`, any non-mahbot name) are never
-/// touched. Dead-daemon link-enricher orphans are not enumerable (no pid file;
-/// the session names are per-message) and stay until the tab is closed by hand
-/// — a documented residual limit.
+/// touched. Agent-run sessions are instead closed at run end, but a hard-killed
+/// run's `agent-tab-*` sessions may leak (accepted residual, the same class as
+/// dead-daemon link-enricher orphans — they are not enumerable here). Dead
+/// link-enricher orphans stay until the tab is closed by hand — a documented
+/// residual limit.
 async fn cleanup_stale_sessions() {
     let Some(sessions) = registered_sessions().await else {
         return;

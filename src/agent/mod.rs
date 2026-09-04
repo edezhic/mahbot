@@ -325,20 +325,29 @@ async fn tool_result_content(
 /// One-pass derivation of a role's advertised tools and their specs — the
 /// single source for both [`Agent::new`] and the research wrap-up snapshot
 /// (`.1`), so the frozen post-deadline replay can never drift from the live
-/// agent's tools (KV-cache byte identity).
+/// agent's tools (KV-cache byte identity). The returned `browser_sessions` is
+/// the run-scoped tracker (`BrowserTool` records every session it opens into
+/// it; [`crate::tools::browser_daemon::close_run_sessions`] closes them at
+/// run end).
 #[must_use]
 pub(crate) fn role_tools_and_specs(
     role: crate::Role,
     ws: &crate::Workspace,
     full_access: bool,
-) -> (Vec<Box<dyn Tool>>, Vec<crate::ToolSpec>) {
+) -> (
+    Vec<Box<dyn Tool>>,
+    Vec<crate::ToolSpec>,
+    std::sync::Arc<crate::tools::browser::BrowserRunSessions>,
+) {
+    let browser_sessions =
+        std::sync::Arc::new(crate::tools::browser::BrowserRunSessions::default());
     let tools: Vec<Box<dyn Tool>> = role
-        .tools(ws, full_access)
+        .tools(ws, full_access, browser_sessions.clone())
         .into_iter()
         .filter(|t| t.is_advertised())
         .collect();
     let tool_specs = tools.iter().map(|t| t.spec()).collect();
-    (tools, tool_specs)
+    (tools, tool_specs, browser_sessions)
 }
 
 /// A role's derived chat-request triplet (model slot → per-model provider
@@ -435,7 +444,7 @@ impl Agent {
         parent_key: Option<crate::agent::registry::ParentKey>,
         parent_label: Option<String>,
     ) -> Self {
-        let (tools, tool_specs) = role_tools_and_specs(role, ws, full_access);
+        let (tools, tool_specs, browser_sessions) = role_tools_and_specs(role, ws, full_access);
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -514,6 +523,7 @@ impl Agent {
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
+            browser_sessions,
         }
     }
 }
@@ -2434,6 +2444,10 @@ pub(crate) async fn run_agent(
     }
     let result = agent.work(message, resume).await;
 
+    // Capture the run-scoped browser-session tracker before the match moves
+    // `agent` into the outcome — the run-end close needs it after cleanup.
+    let browser_sessions = std::sync::Arc::clone(&agent.browser_sessions);
+
     // A completed Ok result is kept regardless of cancel cause — the token may
     // have fired just as work() finished; downstream finalizers are the
     // authority on how a cancelled run's result is used.
@@ -2489,6 +2503,9 @@ pub(crate) async fn run_agent(
     // Drop the per-agent computer registry entries (observation/target/capture)
     // so they never leak into a later run.
     crate::tools::computer::cleanup_agent_state(&agent_id_for_cleanup);
+    // Close the browser sessions this run opened — chrome-use ≥1.5.101 keeps
+    // external Chrome tabs alive on daemon idle, so the close must be explicit.
+    crate::tools::browser_daemon::close_run_sessions(&browser_sessions).await;
     outcome
 }
 
@@ -2659,6 +2676,9 @@ mod tests {
             sleep_ended: false,
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
+            ),
+            browser_sessions: std::sync::Arc::new(
+                crate::tools::browser::BrowserRunSessions::default(),
             ),
         }
     }

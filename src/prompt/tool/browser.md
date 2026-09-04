@@ -1,7 +1,7 @@
 Headless browser for navigating web pages, interacting with elements, extracting content, and capturing screenshots for visual inspection. Returns an accessibility-tree snapshot for AI consumption.
 
 ## Required parameter
-`tab` — a logical session name. Use `"default"` for most browsing. Use different names to keep multiple pages open simultaneously. Same tab = serialized operations on that page.
+`tab` — a logical session name. Missing or empty uses a unique per-run session that is closed automatically when your run ends. Use an explicit different name (e.g. "docs") only to keep multiple pages open simultaneously. Same tab = serialized operations on that page.
 
 ## Workflow
 ### 1. Navigate: `open <url>`

@@ -717,6 +717,9 @@ pub struct Agent {
     workspace: Arc<crate::Workspace>,
     /// Agent-owned tool set.
     tools: Vec<Box<dyn crate::Tool>>,
+    /// Browser sessions this run's browser tooling used — closed at run end
+    /// (chrome-use ≥1.5.101 no longer closes external Chrome tabs on daemon idle).
+    browser_sessions: std::sync::Arc<crate::tools::browser::BrowserRunSessions>,
     /// Cached tool specs — computed once from `tools` at construction time.
     pub(crate) tool_specs: Vec<ToolSpec>,
     /// Cancellation token for cooperative mid-loop cancellation (a deliberate
