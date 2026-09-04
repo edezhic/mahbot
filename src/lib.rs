@@ -788,6 +788,8 @@ pub struct Agent {
     /// to distinguish provider-class failures (workspace returns to Pending)
     /// from genuine failures (workspace goes Failed).
     pub(crate) failure_class: Option<crate::retry::FailureClass>,
+    /// Whether the turn ended via a successful `sleep` call.
+    pub(crate) sleep_ended: bool,
     /// Agent-scoped registry of background shell sessions (Full shell roles
     /// only). Live sessions are force-killed on agent teardown ([`Drop`]) —
     /// see [`crate::tools::shell::BackgroundSessions`]. Reachable from the
@@ -1138,6 +1140,13 @@ pub(crate) trait Tool: Send + Sync {
     /// be grouped for parallel execution within a single LLM turn.
     fn side_effects(&self) -> bool {
         true
+    }
+
+    /// Whether a SUCCESSFUL execution ends the agent's run gracefully after the
+    /// current tool round commits (no further LLM call). Failed outcomes never
+    /// end the turn. Used by the `sleep` tool; every other tool keeps `false`.
+    fn ends_turn_on_success(&self) -> bool {
+        false
     }
 
     /// Whether the tool should be advertised to the model right now.

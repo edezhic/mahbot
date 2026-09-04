@@ -593,6 +593,14 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             continue;
         };
 
+        // Sleep-ended turn: the Assistant deliberately went silent waiting for
+        // new input — deliver nothing (no empty bubble, no failure emoji), but
+        // still confirm the at-least-once pending-jobs boundary.
+        if agent.sleep_ended {
+            confirm_pending_delivery(&job).await;
+            continue;
+        }
+
         // ── Response delivery ─────────────────────────────────────────
         // Manager: broadcast + persist to all workspace users.
         // Other roles: broadcast to all of the triggering user's channel

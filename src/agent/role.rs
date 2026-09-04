@@ -266,8 +266,8 @@ use crate::tools::{
     GetTicketTool, ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool,
     ListTicketsTool, MahbotDebugTool, ReadTool, RemoveAlarmTool, ResearchTool,
     SearchArchivedTicketsTool, SearchTool, SetupTelegramBotTool, SetupWebSearchTool, ShellMode,
-    ShellTool, StrictReadTool, UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchBackend,
-    WebSearchTool,
+    ShellTool, SleepTool, StrictReadTool, UpdateTicketTool, VideoEditTool, VideoGenTool,
+    WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -374,6 +374,7 @@ impl Role {
                     Box::new(RemoveAlarmTool),
                     Box::new(EditTool),
                     Box::new(SearchTool),
+                    Box::new(SleepTool),
                 ];
                 // Base Assistant is workspace-bounded (strict read only);
                 // full-access retains the general ReadTool so it can also read
@@ -656,6 +657,35 @@ mod tests {
                     assert!(
                         !has,
                         "{}{} must not advertise `computer`",
+                        role.as_str(),
+                        if full_access { " (full)" } else { "" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sleep_tool_only_in_assistant_toolsets() {
+        // Acceptance pin: `sleep` is granted ONLY to the Assistant, in both the
+        // base and full-access toolsets. Every other role never advertises it —
+        // they always have pending work to do and must not end their turn.
+        let ws = crate::workspace::test_ws("test");
+        for role in Role::iter() {
+            for full_access in [false, true] {
+                let has = role
+                    .tools(&ws, full_access)
+                    .iter()
+                    .any(|t| t.name() == "sleep");
+                if role == crate::Role::Assistant {
+                    assert!(
+                        has,
+                        "Assistant (full_access={full_access}) must advertise `sleep`"
+                    );
+                } else {
+                    assert!(
+                        !has,
+                        "{}{} must not advertise `sleep`",
                         role.as_str(),
                         if full_access { " (full)" } else { "" }
                     );

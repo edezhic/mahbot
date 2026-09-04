@@ -417,6 +417,7 @@ async fn list_sessions_where(
 enum MetadataColumn {
     ActiveModels,
     TokenLength,
+    SleepEnded,
 }
 
 impl MetadataColumn {
@@ -424,6 +425,7 @@ impl MetadataColumn {
         match self {
             Self::ActiveModels => "active_models",
             Self::TokenLength => "token_length",
+            Self::SleepEnded => "sleep_ended",
         }
     }
 }
@@ -1018,6 +1020,31 @@ impl SessionStore {
             },
         )
         .await
+    }
+
+    /// Persist the sleep-ended marker (`"1"`) or clear it (`"0"`) for a session
+    /// that ended its turn via the `sleep` tool. Read by the dead-session
+    /// recovery poller to exclude intentional turn-ends.
+    pub(crate) async fn set_sleep_ended(&self, agent_id: &str, ended: bool) -> Result<()> {
+        let flag = if ended { "1" } else { "0" };
+        self.set_metadata_value(
+            agent_id,
+            MetadataColumn::SleepEnded,
+            db::Value::Text(flag.into()),
+        )
+        .await
+    }
+
+    /// Whether the session's last turn ended via the `sleep` tool.
+    pub(crate) async fn get_sleep_ended(&self, agent_id: &str) -> bool {
+        self.get_metadata_value(
+            agent_id,
+            MetadataColumn::SleepEnded,
+            "Failed to read sleep-ended flag",
+            |row| row.get::<Option<String>>(0),
+        )
+        .await
+        .is_some_and(|flag| flag == "1")
     }
 }
 

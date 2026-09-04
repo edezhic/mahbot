@@ -488,6 +488,7 @@ impl Agent {
             first_call_notify: None,
             failure: None,
             failure_class: None,
+            sleep_ended: false,
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
@@ -525,7 +526,8 @@ impl Agent {
     /// An empty unpersisted tail is logged here with full agent/role/workspace/
     /// ticket attribution: at INFO when the graceful drain cut the turn
     /// (expected and lossless — committed tool frames are durable, ticket
-    /// rounds resume at boot), at WARN otherwise (genuine anomaly).
+    /// rounds resume at boot), at DEBUG when the turn ended via the `sleep`
+    /// tool (equally expected), at WARN otherwise (genuine anomaly).
     pub async fn finalize_session(&mut self) -> anyhow::Result<()> {
         // Drain accumulated tool usage stats
         let stats = {
@@ -585,6 +587,17 @@ impl Agent {
                         ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
                         "Session finalize no-op: turn cut by graceful drain — \
                          committed frames are durable; resumes at boot or on the next user message"
+                    );
+                } else if self.sleep_ended {
+                    // Turn ended via the sleep tool: the round's tool results are
+                    // durable and the Assistant is intentionally silent while waiting
+                    // for new input — a normal outcome, not the anomaly below.
+                    tracing::debug!(
+                        agent_id = %self.agent_id,
+                        role = %self.role,
+                        workspace = %self.workspace.name,
+                        ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
+                        "Session finalize no-op: turn ended via sleep — waiting for new input"
                     );
                 } else {
                     // Genuine anomaly: the turn ended with no persisted output
@@ -650,6 +663,26 @@ impl Agent {
         // message lands (results insert directly after their frame, so the
         // history stays provider-valid even when the frame is not the tail).
         self.session.init(&self.agent_id).await?;
+
+        // The session is re-engaging (any job kind: user message, async result,
+        // alarm, boot replay): clear a stale sleep-ended flag BEFORE this turn
+        // runs, so a genuine crash mid-round on this turn is still recovered
+        // normally by the dead-session poller. Only the Assistant can write
+        // the flag (`sleep` is Assistant-only), so other roles skip the read.
+        if matches!(self.role, crate::Role::Assistant)
+            && crate::session::store()
+                .get_sleep_ended(&self.agent_id)
+                .await
+            && let Err(e) = crate::session::store()
+                .set_sleep_ended(&self.agent_id, false)
+                .await
+        {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                error = %e,
+                "Failed to clear sleep-ended flag"
+            );
+        }
 
         // Universal deterministic resume-completion: settle the session's last
         // tool-call frame's result-less calls BEFORE any LLM call, on every
@@ -1074,6 +1107,22 @@ impl Agent {
 
                 self.commit_tool_results(&tool_calls, &all_outcomes).await?;
 
+                // Sleep stop: a successful `sleep` call ends the run gracefully AFTER
+                // this round — every tool result above is already committed, nothing
+                // is lost. Ordered before the loop-top MAX_TOOL_ROUNDS guard: the
+                // return happens before the next iteration is even evaluated.
+                if all_outcomes.iter().any(|o| o.success && o.ends_turn) {
+                    self.sleep_ended = true;
+                    if let Err(e) = crate::session::store().set_sleep_ended(&self.agent_id, true).await {
+                        tracing::warn!(
+                            agent_id = %self.agent_id,
+                            error = %e,
+                            "Failed to persist sleep-ended flag — a stale tool-tail session may be re-recovered (accepted)"
+                        );
+                    }
+                    return Ok(String::new());
+                }
+
                 tool_rounds += 1;
             }
         }
@@ -1202,6 +1251,7 @@ impl Agent {
                 success: false,
                 image_payload: None,
                 suspended: false,
+                ends_turn: false,
             },
             reason,
         )
@@ -1276,6 +1326,7 @@ impl Agent {
                                 success: true,
                                 image_payload,
                                 suspended: false,
+                                ends_turn: tool.ends_turn_on_success(),
                             },
                             String::new(),
                         )
@@ -1304,6 +1355,7 @@ impl Agent {
                                     success: false,
                                     image_payload: None,
                                     suspended: true,
+                                    ends_turn: false,
                                 },
                                 String::new(),
                             )
@@ -2547,6 +2599,7 @@ mod tests {
             first_call_notify: None,
             failure: None,
             failure_class: None,
+            sleep_ended: false,
             background_sessions: std::sync::Arc::new(
                 crate::tools::shell::BackgroundSessions::default(),
             ),
@@ -2893,6 +2946,7 @@ mod tests {
                     success: o.success,
                     image_payload: None,
                     suspended: false,
+                    ends_turn: false,
                 })
                 .collect();
 
@@ -3528,6 +3582,99 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
             .await
             .expect("first-call signal must fire even when the call fails");
+    }
+
+    /// A successful `sleep` call ends the run gracefully: the round's tool
+    /// result commits as a normal tool result, the loop stops WITHOUT a
+    /// follow-up LLM call (the empty response is the intended silent end,
+    /// never the failure path), and the durable sleep-ended flag is set. The
+    /// next turn on the session (any wake-up: user message, async result,
+    /// alarm) clears the flag and runs normally.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
+    async fn sleep_call_ends_the_run_gracefully_and_flag_resets_on_reengage() {
+        use crate::util::test::{FakeProvider, install_fake_provider, retry_tests_lock};
+        let _lock = retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        // Script exactly ONE sleep tool call; a follow-up LLM call would pop
+        // the second scripted item and the first turn would end with a text
+        // response instead of the silent empty one.
+        let fake = std::sync::Arc::new(FakeProvider::new().ok_tool_call("sleep").ok("back online"));
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let ws = crate::workspace::test_ws_named("/tmp/ws_sleep_stop", "sleep_stop");
+        let agent_id = "sleep_stop_agent".to_string();
+
+        // ── Turn 1: the sleep call ends the run ──────────────────────
+        let (agent, response) = run_agent(
+            agent_id.clone(),
+            crate::Role::Assistant,
+            &ws,
+            None,
+            "hello",
+            "sleep_user".to_string(),
+            "gui".to_string(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(agent.sleep_ended, "sleep must mark the turn sleep-ended");
+        assert_eq!(
+            response.as_deref(),
+            Some(""),
+            "the turn must end silently — any text would mean the loop continued"
+        );
+        assert_eq!(
+            fake.request_messages.lock().unwrap().len(),
+            1,
+            "no LLM call may follow the committed sleep round"
+        );
+        // The round committed: the session tail is the sleep tool result.
+        let (tail_role, tail_content) = crate::session::store()
+            .get_last_message_tail(&agent_id)
+            .await
+            .expect("session must have history");
+        assert_eq!(tail_role, crate::ChatRole::Tool);
+        // The tool tail is the raw tool-result payload (JSON with the call id
+        // and content) — the committed "Zzz..." result.
+        assert!(
+            tail_content.contains("\"tool_call_id\":\"call_test\"")
+                && tail_content.contains("\"content\":\"Zzz...\""),
+            "sleep tool result must be committed as a normal tool result: {tail_content}"
+        );
+        assert!(
+            crate::session::store().get_sleep_ended(&agent_id).await,
+            "the durable sleep-ended flag must be set"
+        );
+
+        // ── Turn 2: re-engagement clears the flag and runs normally ──
+        let (agent2, response2) = run_agent(
+            agent_id.clone(),
+            crate::Role::Assistant,
+            &ws,
+            None,
+            "wake up",
+            "sleep_user".to_string(),
+            "gui".to_string(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response2.as_deref(), Some("back online"));
+        assert!(!agent2.sleep_ended);
+        assert!(
+            !crate::session::store().get_sleep_ended(&agent_id).await,
+            "the flag must be cleared when the session re-engages"
+        );
     }
 
     // ── Reasoning-only stop recovery ─────────────────────────────────
@@ -4449,6 +4596,7 @@ mod tests {
                     source: crate::tools::ImagePayloadSource::Read,
                 }),
                 suspended: false,
+                ends_turn: false,
             },
             ToolExecutionOutcome {
                 output: "Read image file /b.png (1x1, PNG).".into(),
@@ -4463,6 +4611,7 @@ mod tests {
                     source: crate::tools::ImagePayloadSource::Read,
                 }),
                 suspended: false,
+                ends_turn: false,
             },
         ];
 
@@ -4584,6 +4733,7 @@ mod tests {
                     source: crate::tools::ImagePayloadSource::Read,
                 }),
                 suspended: false,
+                ends_turn: false,
             },
             ToolExecutionOutcome {
                 output: "Read image file /a.png (PNG).".into(),
@@ -4598,6 +4748,7 @@ mod tests {
                     source: crate::tools::ImagePayloadSource::Read,
                 }),
                 suspended: false,
+                ends_turn: false,
             },
         ];
 
@@ -4673,6 +4824,7 @@ mod tests {
             success: true,
             image_payload: None,
             suspended: false,
+            ends_turn: false,
         }];
 
         agent

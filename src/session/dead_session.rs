@@ -285,6 +285,19 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue;
         }
 
+        // ── Condition 4: sleep-ended sessions ended their turns deliberately ──
+        if crate::session::store().get_sleep_ended(agent_id).await {
+            // The Assistant ended its turn via the `sleep` tool: the tool tail
+            // is an intentional stop while waiting for new input, not a crash —
+            // never recover it. Unmarked tool tails (real crash/drain cuts)
+            // keep recovering exactly as before. The session has self-healed:
+            // reset any stale retry budget from an earlier episode so a later
+            // genuine crash on this session recovers with a fresh cap
+            // (consecutive-failures-per-episode semantics).
+            DEAD_SESSION_TRACKER.cleanup(agent_id);
+            continue;
+        }
+
         // ── Safety guard: retry cap / adaptive backoff ─────────────────
         if !DEAD_SESSION_TRACKER.should_retry(agent_id) {
             // Either the session exhausted its retries (the entry persists
@@ -852,7 +865,7 @@ mod tests {
         let last2 = conn
             .query(
                 "SELECT role, content FROM sessions WHERE agent_id = ?1 ORDER BY id DESC LIMIT 2",
-                crate::db::params![agent_id],
+                crate::db::params![agent_id.as_str()],
             )
             .await
             .unwrap();
@@ -950,7 +963,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "DELETE FROM session_metadata WHERE agent_id = ?1",
-            crate::db::params![agent_id],
+            crate::db::params![agent_id.as_str()],
         )
         .await
         .unwrap();
@@ -1018,5 +1031,78 @@ mod tests {
             DEAD_SESSION_TRACKER.should_retry(&agent_id),
             "no recovery attempt recorded for a paused workspace"
         );
+    }
+
+    /// A sleep-ended session is excluded from recovery: the tool tail is an
+    /// intentional turn end (the Assistant waiting for new input), so the
+    /// poller must not re-invoke it or consume retry budget. Unmarked tool
+    /// tails (real crash/drain cuts) keep recovering as before.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes the shared store's recover_dead_sessions runs across tests
+    async fn sleep_ended_session_is_not_recovered() {
+        let _lock = crate::util::test::retry_tests_lock();
+        crate::util::test::init_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            "/tmp/dead_session_sleep_ws",
+            "dead_session_sleep_ws",
+        )
+        .await;
+        let agent_id = format!("e2e_user_{}_engineer", ws.name);
+        let conn = &crate::session::store().conn;
+
+        // Tool tail: a committed tool result is the last row — a recovery
+        // candidate for unmarked sessions.
+        crate::session::store()
+            .append_messages(
+                &agent_id,
+                &[
+                    crate::ChatMessage::user("hello"),
+                    crate::ChatMessage::tool_result("call_sleep", "Zzz..."),
+                ],
+                false,
+                Some(("gui", "e2e_user", ws.name.as_str(), "assistant")),
+            )
+            .await
+            .unwrap();
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        conn.execute(
+            "UPDATE session_metadata SET last_activity = ?1 WHERE agent_id = ?2",
+            crate::db::params![past, agent_id.as_str()],
+        )
+        .await
+        .unwrap();
+        crate::session::store()
+            .set_sleep_ended(&agent_id, true)
+            .await
+            .unwrap();
+
+        recover_dead_sessions().await.unwrap();
+
+        // Condition 4 skipped the session BEFORE the retry-budget guard: no
+        // attempt recorded, the flag survives the poll cycle.
+        assert!(
+            DEAD_SESSION_TRACKER.should_retry(&agent_id),
+            "no recovery attempt recorded for a sleep-ended session"
+        );
+        assert!(
+            crate::session::store().get_sleep_ended(&agent_id).await,
+            "sleep-ended flag must survive the poll cycle"
+        );
+
+        // Clean up the seeded candidate so a LATER recover_dead_sessions
+        // (serialized after us by retry_tests_lock) does not route a recovery
+        // for this leftover session.
+        conn.execute(
+            "DELETE FROM sessions WHERE agent_id = ?1",
+            crate::db::params![agent_id.as_str()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "DELETE FROM session_metadata WHERE agent_id = ?1",
+            crate::db::params![agent_id.as_str()],
+        )
+        .await
+        .unwrap();
     }
 }

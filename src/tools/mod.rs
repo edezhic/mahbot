@@ -18,6 +18,7 @@ pub(crate) mod research;
 pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod shell;
+pub(crate) mod sleep;
 pub(crate) mod support;
 pub(crate) mod ticket;
 pub(crate) mod video_edit;
@@ -166,6 +167,7 @@ pub(crate) use research::ResearchTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
 pub(crate) use shell::{ShellMode, ShellTool};
+pub(crate) use sleep::SleepTool;
 pub(crate) use support::{
     AddUserTool, AddWorkspaceTool, BindTelegramTool, FinalizeTool, InstallChromeUseTool,
     SetupTelegramBotTool, SetupWebSearchTool,
@@ -639,6 +641,10 @@ pub(crate) struct ToolExecutionOutcome {
     /// outcomes are SKIPPED by the tool-result commit — no row is written and
     /// the call stays dangling.
     pub suspended: bool,
+    /// `true` when a successful outcome should end the agent run gracefully
+    /// after the round's results commit (sleep tool); failed/unknown calls
+    /// never set it.
+    pub ends_turn: bool,
 }
 
 /// Discriminates the tool that produced an [`ImagePayload`] so the agent loop can
