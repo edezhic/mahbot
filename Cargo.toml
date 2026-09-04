@@ -12,8 +12,8 @@ keywords = ["ai", "agent"]
 categories = ["development-tools"]
 rust-version = "1.96"
 resolver = "2"
-# `scripts/` is a dev-only release tool; never ship it to crates.io.
-exclude = [".DS_Store", "scripts"]
+# `scripts/` and `benches/` are dev-only assets; never ship them to crates.io.
+exclude = [".DS_Store", "scripts", "benches"]
 
 [features]
 # `full` is a default-on marker feature used by `required-features` on the app
