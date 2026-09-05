@@ -208,7 +208,7 @@ fn run_debug_detect(args: &[String], home_override: Option<PathBuf>) -> Result<(
             status.wal_size,
             status.has_stale_tshm,
         ))?;
-        if status.class == wal_guard::StoreClass::Structural {
+        if status.class == wal_guard::BootDiagnosis::Structural {
             failures += 1;
         }
     }

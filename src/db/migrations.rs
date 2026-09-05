@@ -22,15 +22,16 @@
 //! a fresh file), and the id-only applied check makes their recorded ids
 //! `1`–`23` harmless no-ops. The baseline (`24`–`26`) creates the exact
 //! current shape on fresh installs and is a strict no-op on existing ones,
-//! except entries `25`/`27`–`33`, which genuinely upfill the retired delta
+//! except entries `25`/`27`–`34`, which genuinely upfill the retired delta
 //! `23`'s `chat_history` reply columns, the `workspaces.maintainer_recommendations`
 //! and `jobs.caller_agent_id` / `session_metadata.created_at` columns, the
 //! per-user `image_gen_model` / `video_model` columns, the backfilled
 //! `jobs.mode` discriminator, the `session_metadata.sleep_ended` marker, the
-//! `alarms.command` column, and the `chat_history.broadcast_id` column on
+//! `alarms.command` column, the `chat_history.broadcast_id` column, and the
+//! `tickets.last_transition_actor` / `ticket_chronicle.actor` columns on
 //! one-delta-behind / current databases.
 //!
-//! Future schema changes resume the chain at id `34` with monotonically
+//! Future schema changes resume the chain at id `35` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!

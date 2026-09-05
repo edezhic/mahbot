@@ -66,7 +66,9 @@ pub(crate) fn has_boot_diagnosis(db_path: &Path) -> bool {
 /// Per-store classification captured by the boot pre-flight scan,
 /// before any store is opened. The heal strategy flows from this map —
 /// turso's own reopen (RebuildFromDisk → install_snapshot) would consume the
-/// evidence, so the strategy must not be re-derived post-open.
+/// evidence, so the strategy must not be re-derived post-open. The same
+/// classification is surfaced by [`inspect_store`] / [`StoreArtifactStatus`]
+/// for the `debug detect` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BootDiagnosis {
     /// No damaged state (fresh install, post-TRUNCATE, or a healthy store).
@@ -80,41 +82,9 @@ pub(crate) enum BootDiagnosis {
 }
 
 impl BootDiagnosis {
-    #[must_use]
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::DurableB => "durable-b",
-            Self::Structural => "structural",
-        }
-    }
-
-    /// Map to the single-process [`StoreClass`].
-    #[must_use]
-    fn into_store_class(self) -> StoreClass {
-        match self {
-            Self::Healthy => StoreClass::Healthy,
-            Self::DurableB => StoreClass::DurableB,
-            Self::Structural => StoreClass::Structural,
-        }
-    }
-}
-
-/// Single-process store classification (no `.tshm` coordination): the genuine
-/// corruption classes are structural (bad/truncated main-DB header) and
-/// durable-B (0-byte main DB with a non-empty WAL). `has_stale_tshm` reports a
-/// leftover `.tshm` from a pre-removal multiprocess run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StoreClass {
-    Healthy,
-    DurableB,
-    Structural,
-}
-
-impl StoreClass {
     /// Short stable label for logs and the `debug detect` output.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
             Self::DurableB => "durable-b",
@@ -128,8 +98,9 @@ impl StoreClass {
 pub(super) struct StoreArtifactStatus {
     /// Store name (matches the `--db` argument of `mahbot debug`).
     pub store: String,
-    /// Single-process corruption class (main-DB header + WAL size).
-    pub class: StoreClass,
+    /// Corruption class (main-DB header + WAL size); stale `.tshm` debris is
+    /// reported separately by [`StoreArtifactStatus::has_stale_tshm`].
+    pub class: BootDiagnosis,
     /// On-disk `-wal` size in bytes (0 when missing or empty).
     pub wal_size: u64,
     /// True when a leftover `.tshm` file exists (stale coordination debris).
@@ -147,7 +118,7 @@ pub(super) fn inspect_store_at(db_path: &Path) -> StoreArtifactStatus {
     let sidecars = crate::db::store_sidecars(db_path);
     let wal_size = std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len());
     let has_stale_tshm = sidecars.tshm.exists();
-    let class = classify_main_db(db_path, sidecars.wal.exists(), wal_size).into_store_class();
+    let class = classify_main_db(db_path, sidecars.wal.exists(), wal_size);
     let store = db_path.file_stem().map_or_else(
         || db_path.display().to_string(),
         |s| s.to_string_lossy().into_owned(),
@@ -323,24 +294,24 @@ mod tests {
         db[16..18].copy_from_slice(&1u16.to_be_bytes());
         write(&dir.join("db/core.db"), &db);
         let s = inspect_store(&dir, "board");
-        assert_eq!(s.class, StoreClass::Healthy);
+        assert_eq!(s.class, BootDiagnosis::Healthy);
         assert!(!s.has_stale_tshm);
 
         // Structural: truncated main-DB header.
         write(&dir.join("db/core.db"), &[0u8; 64]);
         let s = inspect_store(&dir, "sessions");
-        assert_eq!(s.class, StoreClass::Structural);
+        assert_eq!(s.class, BootDiagnosis::Structural);
 
         // Durable-B: 0-byte main DB with a non-empty WAL.
         write(&dir.join("db/core.db"), &[]);
         write(&dir.join("db/core.db-wal"), &[0u8; 512]);
         let s = inspect_store(&dir, "users");
-        assert_eq!(s.class, StoreClass::DurableB);
+        assert_eq!(s.class, BootDiagnosis::DurableB);
 
         // Fresh store: no main DB file → healthy.
         let _ = std::fs::remove_file(dir.join("db/core.db"));
         let s = inspect_store(&dir, "config");
-        assert_eq!(s.class, StoreClass::Healthy);
+        assert_eq!(s.class, BootDiagnosis::Healthy);
 
         // Stale .tshm debris is reported (never quarantined) while the class
         // is still computed from the main DB / WAL only.
@@ -368,7 +339,7 @@ mod tests {
             let s = inspect_store(&dir, name);
             assert_eq!(
                 s.class,
-                StoreClass::Healthy,
+                BootDiagnosis::Healthy,
                 "fixture store {name} must be healthy"
             );
         }
