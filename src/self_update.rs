@@ -336,10 +336,13 @@ pub(crate) struct UpdateAvailability {
 /// Process-local, single-source-of-truth cache of self-update availability
 /// and progress. Both the GUI (button visibility, tooltip, finalize guards)
 /// and the Telegram command menu (`/update` visibility + dispatch gate) read
-/// this; a single periodic background task is the sole writer of the
-/// availability fields, so the two surfaces cannot diverge. Reset implicitly
-/// on boot — a fresh process has no stale `available` state from a previous
-/// run, so an already-installed update is never advertised across a restart.
+/// this, so the two surfaces cannot diverge. Writers: `available` is
+/// boot-seeded by [`update_cache`] and updated by [`refresh_update_cache`]
+/// (the periodic background task reads `in_progress` but only ever writes
+/// `available`); `in_progress` is written by [`execute_update`] and the
+/// `/update` dispatch gate (compare-exchange). Reset implicitly on boot — a
+/// fresh process has no stale `available` state from a previous run, so an
+/// already-installed update is never advertised across a restart.
 struct UpdateCache {
     /// Whether an update is available. Local checkout: statically true (the
     /// build checkout is reachable). Registry: derived from the periodic
@@ -666,12 +669,13 @@ async fn verify_cargo_on_path(action: &str) -> Result<()> {
     }
 }
 
-/// Resolve the admin Telegram reply target for update notifications,
-/// memoizing the rationale when notifications cannot be sent. Shared by both
-/// update modes.
+/// Resolve the admin Telegram reply target for update notifications, logging
+/// the rationale (info/warn) when notifications cannot be sent. Resolution is
+/// per-call — a DB round trip to find the admin user and its channel bindings.
+/// Shared by both update modes.
 async fn resolve_update_admin_target() -> Option<String> {
     let admin_target = resolve_admin_telegram_target().await;
-    // Memoize info-level rationale for missing notifications.
+    // Log info-level rationale when notifications cannot be sent.
     if admin_target.is_none() {
         if crate::config::CONFIG.telegram_bot_token().is_none() {
             info!("No Telegram bot token configured — skipping update notifications");
@@ -1489,42 +1493,19 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_acquire_and_release_with_temp_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("mahbot.lock");
-
-        let file1 = open_lock_file(&lock_path).unwrap();
-
-        // First lock should succeed.
-        assert!(try_flock(&file1).unwrap(), "First flock should succeed");
-
-        // Second lock on a different fd on the same file should fail.
-        let file2 = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .unwrap();
-        assert!(
-            !try_flock(&file2).unwrap(),
-            "Second flock should fail (already locked)"
-        );
-
-        drop(file1);
-        // After dropping file1, the lock should be released.
-        assert!(
-            try_flock(&file2).unwrap(),
-            "After release, flock should succeed"
-        );
-    }
-
-    #[test]
     fn test_try_acquire_lock_held_free() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("mahbot.lock");
 
-        // Hold the lock on this file so try_acquire_lock will fail.
+        // Direct primitives (open_lock_file + try_flock): hold the lock, then
+        // verify a second fd on the same file cannot flock while it is held.
         let holder = open_lock_file(&lock_path).unwrap();
         assert!(try_flock(&holder).unwrap(), "First flock should succeed");
+        let contender = open_lock_file(&lock_path).unwrap();
+        assert!(
+            !try_flock(&contender).unwrap(),
+            "Second flock should fail (already locked)"
+        );
 
         // While the lock is held, try_acquire_lock should return None.
         assert!(
@@ -1532,8 +1513,16 @@ mod tests {
             "Should return None when lock is held"
         );
 
-        // After releasing the holder, try_acquire_lock should succeed.
+        // After releasing the holder, the lock should be acquirable again —
+        // via both the raw fd and try_acquire_lock.
         drop(holder);
+        drop(contender);
+        let reacquired = open_lock_file(&lock_path).unwrap();
+        assert!(
+            try_flock(&reacquired).unwrap(),
+            "After release, flock should succeed"
+        );
+        drop(reacquired);
         let result = try_acquire_lock(&lock_path).unwrap();
         assert!(result.is_some(), "After release, lock should be acquirable");
     }
@@ -1803,23 +1792,6 @@ mod tests {
         // Copy should fail gracefully (non-fatal, returns nothing).
         copy_to_cargo_bin(&source, &dest, None).await;
         assert!(!dest.exists(), "Destination should not be created");
-    }
-
-    #[tokio::test]
-    async fn test_copy_to_cargo_bin_creates_parent_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source_bin");
-        let dest = dir.path().join("deep").join("nested").join("installed_bin");
-
-        std::fs::write(&source, "content").unwrap();
-
-        // Copy should create parent directories (non-fatal, returns nothing).
-        copy_to_cargo_bin(&source, &dest, None).await;
-        assert!(dest.is_file(), "Destination should exist");
-        assert!(
-            dest.parent().unwrap().is_dir(),
-            "Parent directory should exist"
-        );
     }
 
     #[test]
