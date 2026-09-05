@@ -203,7 +203,7 @@ impl EditorAction {
 
     /// Returns `true` if this action moves the cursor (including extending selection).
     #[must_use]
-    pub const fn is_cursor_movement(&self) -> bool {
+    const fn is_cursor_movement(&self) -> bool {
         matches!(
             self,
             Self::Move { .. }
@@ -378,7 +378,7 @@ impl EditorBuffer {
 
     /// Returns `true` when every line in the buffer is empty (blank content).
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.buffer
             .borrow()
             .lines
@@ -404,7 +404,7 @@ impl EditorBuffer {
     }
 
     /// Return the number of lines in the buffer.
-    pub fn line_count(&self) -> usize {
+    fn line_count(&self) -> usize {
         self.buffer.borrow().lines.len()
     }
 
@@ -1206,11 +1206,7 @@ impl EditorBuffer {
             let line = self.cursor_line.get();
             let col = self.cursor_col.get();
             let page_lines = PAGE_SCROLL_LINES;
-            Some(if line > page_lines {
-                (line - page_lines, col)
-            } else {
-                (0, col)
-            })
+            Some((line.saturating_sub(page_lines), col))
         });
     }
 
@@ -1814,7 +1810,7 @@ pub(crate) enum LineEnding {
 impl LineEnding {
     /// Return the string representation of this line ending.
     #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             LineEnding::Lf => "\n",
             LineEnding::Crlf => "\r\n",
@@ -1909,16 +1905,11 @@ fn find_word_start(text: &str, offset: usize) -> usize {
     // Skip non-word chars and whitespace immediately before offset
     let mut pos = offset;
 
-    // Skip whitespace/non-word chars going backwards
+    // Skip whitespace and non-word chars going backwards (`is_word_char` is
+    // alphanumeric-or-underscore, so every whitespace char is non-word).
     while pos > 0 {
-        let c = text[..pos].chars().last();
-        match c {
-            Some(ch) if !is_word_char(ch) && !ch.is_whitespace() => {
-                pos -= ch.len_utf8();
-            }
-            Some(ch) if ch.is_whitespace() => {
-                pos -= ch.len_utf8();
-            }
+        match text[..pos].chars().last() {
+            Some(ch) if !is_word_char(ch) => pos -= ch.len_utf8(),
             _ => break,
         }
     }
@@ -2504,6 +2495,46 @@ impl<'a> EditorWidget<'a> {
             preedit: state.preedit.as_ref().map(input_method::Preedit::as_ref),
         }
     }
+
+    /// Re-shape the buffer against the current viewport (text area rect and
+    /// scroll offsets from `state`) and run `f` with the shaped buffer.
+    ///
+    /// `layout()` runs after events, but scroll handling only calls
+    /// `invalidate_layout()` — the buffer still has the pre-scroll shape when
+    /// the next event (click hit-test, visual row navigation) arrives. Without
+    /// this reshape, hit-tests return stale positions and the auto-scroll in
+    /// the next `layout()` jumps the viewport to the wrong line.
+    ///
+    /// # Panics
+    /// The buffer `RefMut` is held for the duration of `f`, so `f` must not
+    /// re-borrow the buffer contents (`borrow`/`text`); `cursor()` is safe —
+    /// it reads only `Cell` fields.
+    fn with_viewport_shaped<R>(
+        &self,
+        layout: &Layout<'_>,
+        state: &EditorWidgetState,
+        f: impl FnOnce(&mut cosmic_text::Buffer) -> R,
+    ) -> R {
+        let text_rect = text_area_rect(
+            layout.bounds(),
+            self.padding,
+            self.padding,
+            state.gutter_width,
+        );
+        let (scroll_y, scroll_x) = (state.scroll_y, state.scroll_x);
+        with_font_system(|font_sys| {
+            let mut buffer = self.buffer.borrow_buffer_mut();
+            reshape_and_shape(
+                &mut buffer,
+                font_sys,
+                Some(scroll_y),
+                scroll_x,
+                text_rect.width,
+                text_rect.height,
+            );
+            f(&mut buffer)
+        })
+    }
 }
 
 /// Resolve the desired layout-node height for the editor's content.
@@ -2941,33 +2972,9 @@ where
                 if self.focus_id.is_some() {
                     state.is_focused = cursor.position_in(layout.bounds()).is_some();
                 }
-                // Re-shape the buffer with the current scroll BEFORE hit-test.
-                // layout() runs after events, but WheelScrolled only calls
-                // invalidate_layout() — the buffer still has the pre-scroll
-                // shape when click arrives.  Without this reshape, hit_test
-                // returns a stale line number, then auto-scroll in the next
-                // layout() jumps the viewport to that wrong line.
-                {
-                    let bounds = layout.bounds();
-                    let text_rect =
-                        text_area_rect(bounds, self.padding, self.padding, state.gutter_width);
-                    let text_area_width = text_rect.width;
-                    let text_area_height = text_rect.height;
-
-                    let scroll_y = state.scroll_y;
-                    let scroll_x = state.scroll_x;
-                    with_font_system(|font_sys| {
-                        let mut buffer = self.buffer.borrow_buffer_mut();
-                        reshape_and_shape(
-                            &mut buffer,
-                            font_sys,
-                            Some(scroll_y),
-                            scroll_x,
-                            text_area_width,
-                            text_area_height,
-                        );
-                    });
-                }
+                // Re-shape the buffer with the current scroll BEFORE hit-test
+                // (see `with_viewport_shaped`).
+                self.with_viewport_shaped(&layout, state, |_| ());
 
                 if let Some((line, col)) = hit_test(
                     self.buffer,
@@ -3223,27 +3230,7 @@ where
                     let is_arrow_down = matches!(key_press, key::Key::Named(key::Named::ArrowDown));
 
                     if (is_arrow_up || is_arrow_down) && !platform_mod && !alt {
-                        // Shape the buffer with current scroll so layout runs
-                        // reflect the viewport (same as mouse click handler).
-                        let bounds = layout.bounds();
-                        let text_rect =
-                            text_area_rect(bounds, self.padding, self.padding, state.gutter_width);
-                        let text_area_width = text_rect.width;
-                        let text_area_height = text_rect.height;
-
-                        let scroll_y = state.scroll_y;
-                        let scroll_x = state.scroll_x;
-                        let result = with_font_system(|font_sys| {
-                            let mut buffer = self.buffer.borrow_buffer_mut();
-                            reshape_and_shape(
-                                &mut buffer,
-                                font_sys,
-                                Some(scroll_y),
-                                scroll_x,
-                                text_area_width,
-                                text_area_height,
-                            );
-
+                        let result = self.with_viewport_shaped(&layout, state, |buffer| {
                             let cursor = self.buffer.cursor();
                             let metrics = font_metrics();
 
@@ -3298,7 +3285,7 @@ where
                                     (hit.line, col)
                                 })
                             }
-                        }); // with_font_system drops guard
+                        });
 
                         if let Some((target_line, target_col)) = result {
                             publish_move_or_select(shell, shift, target_line, target_col);
@@ -3327,26 +3314,7 @@ where
                         && matches!(key_press, key::Key::Named(key::Named::ArrowRight));
 
                     if is_cmd_left || is_cmd_right {
-                        // Shape the buffer so layout runs reflect the viewport.
-                        let bounds = layout.bounds();
-                        let text_rect =
-                            text_area_rect(bounds, self.padding, self.padding, state.gutter_width);
-                        let text_area_width = text_rect.width;
-                        let text_area_height = text_rect.height;
-
-                        let scroll_y = state.scroll_y;
-                        let scroll_x = state.scroll_x;
-                        let result = with_font_system(|font_sys| {
-                            let mut buffer = self.buffer.borrow_buffer_mut();
-                            reshape_and_shape(
-                                &mut buffer,
-                                font_sys,
-                                Some(scroll_y),
-                                scroll_x,
-                                text_area_width,
-                                text_area_height,
-                            );
-
+                        let result = self.with_viewport_shaped(&layout, state, |buffer| {
                             let cursor = self.buffer.cursor();
                             let cursor_run =
                                 find_cursor_run(buffer.layout_runs(), cursor.line, cursor.column);
@@ -3389,7 +3357,7 @@ where
                                     }
                                 }
                             })
-                        }); // with_font_system drops guard
+                        });
 
                         if let Some((target_line, target_col)) = result {
                             publish_move_or_select(shell, shift, target_line, target_col);
