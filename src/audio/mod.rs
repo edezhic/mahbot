@@ -24,16 +24,12 @@ use tracing::{info, warn};
 
 use crate::util::model_state::{AtomicModelState, ModelLoadGuard, ModelState};
 
-pub(crate) fn onnx_output_name(model: &crate::onnx::Model) -> String {
-    model.output_name().to_string()
-}
-
 pub(crate) fn extract_output(
     mut outputs: HashMap<String, Tensor>,
     model: &crate::onnx::Model,
     label: &str,
 ) -> Result<Tensor> {
-    let name = onnx_output_name(model);
+    let name = model.output_name().to_string();
     outputs
         .remove(&name)
         .ok_or_else(|| anyhow!("{label}: output '{name}' not found"))

@@ -2455,8 +2455,6 @@ impl PipelineCtx {
         self.reset_pipeline_state(ResetLevel::Full);
         self.is_listening = false;
         self.enrollment_mode = false;
-        // Abort any mic-button recording — the mic is being torn down.
-        self.set_manual_recording(false);
         self.resume_listening_after_recording = false;
         drop(self.mic_stream.take());
         self.mic_rx = None;
