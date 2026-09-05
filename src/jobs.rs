@@ -64,14 +64,15 @@ impl std::str::FromStr for RowStatus {
 
 /// Explicit dispatch mode of a job — replaces the NULL-sentinel overload of
 /// `caller_agent_id`. `Sync` jobs are owned by the caller session pin
-/// (`caller_agent_id`); `Async` jobs (research/research_cleanup/temp_cleanup,
-/// ticket phases, and pin-less analyze/implement dispatches) resume at boot.
+/// (`caller_agent_id`); `Async` jobs (research/analyze, research_cleanup,
+/// ticket phases, and pin-less implement dispatches) resume at boot, while
+/// `temp_cleanup` rows are terminalized instead.
 ///
 /// The string values are intrinsic Rust/SQL coupling: `as_str()`, the SQL
 /// literals in [`find_owned_launched_jobs`] / [`abandon_session_jobs`], and
 /// migration delta `30`'s backfill CASE must stay in sync on a rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JobMode {
+enum JobMode {
     Sync,
     Async,
 }
@@ -131,7 +132,7 @@ impl AgentKind {
 
 /// Graceful-shutdown drain cap: in-flight work completes within this window,
 /// then stragglers are force-cancelled.
-pub(crate) const DRAIN_CAP_SECS: u64 = 10 * 60;
+const DRAIN_CAP_SECS: u64 = 10 * 60;
 
 /// Stale-purge cutoff (hours): only ticket-phase `jobs` rows older than this
 /// are purged (they are recoverable from `tickets.phase`). Non-phase launched
@@ -159,7 +160,7 @@ pub(crate) struct JobRow {
     pub caller_agent_id: Option<String>,
     /// Explicit dispatch mode (see [`JobMode`]) — the discriminator that
     /// replaces the NULL-sentinel overload of `caller_agent_id`.
-    pub mode: JobMode,
+    mode: JobMode,
 }
 
 /// A row of the `agents` table. Carries the slot `idx` (in addition to the
@@ -350,7 +351,7 @@ impl SpawnChild {
 
 /// `jobs.ticket_id` for a spawn child — `Some` only for ticket phase jobs.
 #[must_use]
-pub(crate) fn child_ticket_id(child: &SpawnChild) -> Option<&str> {
+fn child_ticket_id(child: &SpawnChild) -> Option<&str> {
     match child {
         SpawnChild::Phase { ticket_id, .. } => Some(ticket_id.as_str()),
         _ => None,
@@ -482,8 +483,10 @@ pub(crate) struct NewAgent {
 
 /// Checkpoint a job row: bump retry_count and touch `updated_at` (a plain
 /// recency marker — the phase-only purge keys off it).
-pub(crate) async fn checkpoint_job(conn: &Connection, id: &str, retry_count: i64) -> Result<()> {
-    // Boot resumes re-arm status to Launched (failed → launched re-activation).
+async fn checkpoint_job(conn: &Connection, id: &str, retry_count: i64) -> Result<()> {
+    // Boot resume re-arms the row unconditionally — status is reset to
+    // Launched regardless of its prior value (list_active_jobs selects
+    // status != 'done').
     let status = RowStatus::Launched;
     let now = db::now();
     conn.execute(
@@ -1059,7 +1062,7 @@ pub(crate) enum SyncResumeOutcome {
 }
 
 /// Load the task + caller identity of a job from the `jobs` row alone.
-pub(crate) async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>> {
+async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>> {
     conn.query_optional(
         "SELECT task, role, user_name, channel FROM jobs WHERE id = ?1",
         params![job_id],
@@ -1155,7 +1158,7 @@ pub(crate) async fn job_retry_count(conn: &Connection, job_id: &str) -> i64 {
 // ── Queries ─────────────────────────────────────────────────────────────
 
 /// Load all non-terminal jobs (launched|failed) for the boot scan.
-pub(crate) async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
+async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
             &format!(
@@ -1484,7 +1487,7 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
 /// Stale-job purge.
 ///
 /// Cutoff = 8h. Deletes only stale TICKET-PHASE jobs (kinds matching
-/// [`is_ticket_phase_kind`]) whose updated_at predates the cutoff AND whose
+/// `is_ticket_phase_kind`) whose updated_at predates the cutoff AND whose
 /// roster agents' sessions are all stale too (live sessions referenced by
 /// unfinished jobs are NEVER purged — the agents table IS the marker).
 /// A stale ticket phase job is deleted here; the puller re-creates it for the
@@ -1505,7 +1508,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     let rows = conn
         .query(
             &format!(
-                "SELECT j.id, j.kind, j.workspace_name, j.ticket_id \
+                "SELECT j.id, j.workspace_name \
                  FROM jobs j \
                  WHERE j.updated_at < ?1 \
                    AND j.kind IN ({phase_kinds}) \
@@ -1535,7 +1538,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
     let mut purge_ids: Vec<String> = Vec::with_capacity(rows.len());
     for row in &rows {
         let id: String = row.get(0)?;
-        let workspace_name: String = row.get(2)?;
+        let workspace_name: String = row.get(1)?;
         // A paused workspace's phase job is frozen — purge-immune.
         if paused_ws.contains(&workspace_name) {
             continue;
@@ -1563,7 +1566,7 @@ pub async fn purge_stale_jobs(cutoff: &str) -> Result<u64> {
 
 /// `jobs.kind` values of the ticket working-phase kinds — the single source
 /// shared by [`is_ticket_phase_kind`] and the purge's SQL filter.
-pub(crate) const TICKET_PHASE_KINDS: &[&str] = &[
+const TICKET_PHASE_KINDS: &[&str] = &[
     "analysis",
     "in_development",
     "in_diagnostics",
@@ -1574,7 +1577,7 @@ pub(crate) const TICKET_PHASE_KINDS: &[&str] = &[
 
 /// Is this `jobs.kind` one of the ticket working-phase kinds?
 #[must_use]
-pub(crate) fn is_ticket_phase_kind(kind: &str) -> bool {
+fn is_ticket_phase_kind(kind: &str) -> bool {
     TICKET_PHASE_KINDS.contains(&kind)
 }
 
@@ -1779,7 +1782,7 @@ pub(crate) async fn upsert_session_pin(
 /// final `_{role}` (workspace names allow underscores, so ticket ids like
 /// `my_ws-42` are valid — only the final suffix is stripped).
 #[must_use]
-pub(crate) fn session_pin_ticket_id(agent_id: &str, role: Role) -> Option<String> {
+fn session_pin_ticket_id(agent_id: &str, role: Role) -> Option<String> {
     agent_id
         .strip_prefix("ticket_")
         .and_then(|rest| {
