@@ -22,7 +22,7 @@ use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Column, Id, Row, Space, button, column, container, pick_list, row, stack, text, toggler,
+    Column, Id, Row, Space, Text, button, column, container, pick_list, row, stack, text, toggler,
     tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
@@ -75,14 +75,10 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>) {
     };
 }
 
-/// Build one model-picker entry row: a plain model label plus a gray X
-/// removal button. The active-selection indicator is gone — the current model
-/// is per-user and not managed here. The X is the shared compact gray
-/// [`widgets::compact_x_button`] with a 24px-wide hit area.
+/// Build one model-picker entry row: a plain model label plus the shared
+/// compact gray [`widgets::compact_x_button`] removal button.
 fn model_entry_row(target: ModelPickerTarget, model: String) -> Element<'static, SettingsMessage> {
     let mut entry = row![text(model.clone()).size(theme::TEXT_12)];
-    // 12px glyph + 6px padding on every side = the same 24px-wide
-    // hit area the old 24px glyph button provided.
     entry = entry
         .push(Space::new().width(theme::SPACE_4))
         .push(widgets::compact_x_button(
@@ -197,6 +193,15 @@ fn picker_list_field<'a>(
     match t {
         ModelPickerTarget::ImageGen => &mut config.image_gen_models,
         ModelPickerTarget::Video => &mut config.video_models,
+    }
+}
+
+/// Map a `ModelPickerTarget` to its `config:…` settings field key — the
+/// persisted-form counterpart of [`picker_list_field`].
+fn picker_list_key(t: ModelPickerTarget) -> &'static str {
+    match t {
+        ModelPickerTarget::ImageGen => "config:image_gen_models",
+        ModelPickerTarget::Video => "config:video_models",
     }
 }
 
@@ -748,13 +753,17 @@ impl SettingsState {
         self.add_user_adding = false;
     }
 
+    /// Mirror a config value into both snapshots: the editable `self.config`
+    /// and the global `CONFIG`, so a refresh() can't revert the change.
+    fn set_both(&mut self, key: &str, value: &str) {
+        let _ = self.config.set_string_field(key, value);
+        let _ = crate::config::CONFIG.set_string_field(key, value);
+    }
+
     /// Mirror a toggle in both config snapshots: `"true"`/`""` (the empty
-    /// string keeps the `non_empty` accessor collapsing to None = disabled),
-    /// plus the global CONFIG so refresh() can't revert the change.
+    /// string keeps the `non_empty` accessor collapsing to None = disabled).
     fn set_toggle(&mut self, key: &str, enabled: bool) {
-        let val = if enabled { "true" } else { "" };
-        let _ = self.config.set_string_field(key, val);
-        let _ = crate::config::CONFIG.set_string_field(key, val);
+        self.set_both(key, if enabled { "true" } else { "" });
     }
 
     /// Shared voice/TTS toggle arm: mirror the new state, fire the per-toggle
@@ -981,16 +990,10 @@ impl SettingsState {
     /// Persist a model-picker's list field immediately (discrete action —
     /// add/remove a model). Clears the picker's inline error and settles now.
     fn persist_picker_list(&mut self, target: ModelPickerTarget) -> Task<SettingsMessage> {
-        let (field, value) = match target {
-            ModelPickerTarget::ImageGen => (
-                "config:image_gen_models",
-                self.config.image_gen_models.clone().unwrap_or_default(),
-            ),
-            ModelPickerTarget::Video => (
-                "config:video_models",
-                self.config.video_models.clone().unwrap_or_default(),
-            ),
-        };
+        let field = picker_list_key(target);
+        let value = picker_list_field(&target, &mut self.config)
+            .clone()
+            .unwrap_or_default();
         self.field_errors.remove(field);
         self.settle_now(field, value)
     }
@@ -1203,22 +1206,17 @@ impl SettingsState {
                 self.transcription_toggle_gen += 1;
                 let generation = self.transcription_toggle_gen;
                 let voice_was_enabled = self.config.voice_enabled.as_deref() == Some("true");
-                // Mirror into both snapshots (enabled → "" = absent row;
-                // disabled → "false"), matching the persisted row semantics.
+                // enabled → "" = absent row; disabled → "false", matching the
+                // persisted row semantics.
                 let transcription_value = if enabled { "" } else { "false" };
-                let _ = self.config.set_string_field(
-                    CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL,
-                    transcription_value,
-                );
-                let _ = crate::config::CONFIG.set_string_field(
+                self.set_both(
                     CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL,
                     transcription_value,
                 );
                 // Turning transcription OFF also turns Wake Word Detection OFF
                 // (shared ASR model): stop the pipeline now.
                 if !enabled && voice_was_enabled {
-                    let _ = self.config.set_string_field(CONFIG_KEY_VOICE_ENABLED, "");
-                    let _ = crate::config::CONFIG.set_string_field(CONFIG_KEY_VOICE_ENABLED, "");
+                    self.set_both(CONFIG_KEY_VOICE_ENABLED, "");
                     sync_voice_state(false);
                 }
                 // Toggle ON: kick the model load/download in the background —
@@ -1271,18 +1269,10 @@ impl SettingsState {
                         let currently_off =
                             self.config.audio_transcription_use_local.as_deref() == Some("false");
                         let restore = if currently_off { "" } else { "false" };
-                        let _ = self
-                            .config
-                            .set_string_field(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, restore);
-                        let _ = crate::config::CONFIG
-                            .set_string_field(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, restore);
+                        self.set_both(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, restore);
                         // Restore the wake-word state the cascade disabled.
                         if voice_was_enabled {
-                            let _ = self
-                                .config
-                                .set_string_field(CONFIG_KEY_VOICE_ENABLED, "true");
-                            let _ = crate::config::CONFIG
-                                .set_string_field(CONFIG_KEY_VOICE_ENABLED, "true");
+                            self.set_both(CONFIG_KEY_VOICE_ENABLED, "true");
                             sync_voice_state(true);
                         }
                         Task::none()
@@ -1578,10 +1568,7 @@ impl SettingsState {
                 Err(e) => {
                     // Inline error on the picker — no toast (silent success /
                     // inline rejection for config validation).
-                    let key = match target {
-                        ModelPickerTarget::ImageGen => "config:image_gen_models",
-                        ModelPickerTarget::Video => "config:video_models",
-                    };
+                    let key = picker_list_key(target);
                     self.field_errors
                         .insert(key.to_string(), format!("Model `{model}` rejected: {e}"));
                     Task::none()
@@ -1993,17 +1980,8 @@ impl SettingsState {
             }
         }
 
-        // Inline "+" button in the section header
-        let plus_btn = widgets::icon_tooltip_button(
-            lucide::plus::<iced::Theme, iced::Renderer>()
-                .size(theme::TEXT_16)
-                .color(theme::ACCENT),
-            "Add workspace",
-            Some(SettingsMessage::ToggleAddWorkspaceModal),
-            button::DEFAULT_PADDING,
-            theme::button_text,
-            tooltip::Position::Top,
-        );
+        let plus_btn =
+            section_plus_button("Add workspace", SettingsMessage::ToggleAddWorkspaceModal);
 
         let mut section_content = column![rows];
 
@@ -2398,17 +2376,7 @@ impl SettingsState {
             }
         }
 
-        // Inline "+" button in the section header
-        let plus_btn = widgets::icon_tooltip_button(
-            lucide::plus::<iced::Theme, iced::Renderer>()
-                .size(theme::TEXT_16)
-                .color(theme::ACCENT),
-            "Add user",
-            Some(SettingsMessage::ToggleAddUserModal),
-            button::DEFAULT_PADDING,
-            theme::button_text,
-            tooltip::Position::Top,
-        );
+        let plus_btn = section_plus_button("Add user", SettingsMessage::ToggleAddUserModal);
 
         section_with_header_action("Users", plus_btn, column![rows])
     }
@@ -2659,13 +2627,9 @@ impl SettingsState {
     }
     // ── Config-field builders ────────────────────────────────────
     //
-    // Collapse the repeated ~20-line block (a `field_row`/`field_row_with_error`
-    // wrapping a shared single-line editor that emits `ConfigFieldAction` /
-    // `PasswordFieldAction` on input, styled + fixed-width, with the
-    // `field_errors` lookup) into a single helper per input kind. Behavior-
-    // preserving: the field id is always `config:<key>` derived from the
-    // `CONFIG_KEY_*` const, which is `stringify!` of the snake_case field name —
-    // no per-call literal ids.
+    // The field id is always `config:<key>` derived from the `CONFIG_KEY_*`
+    // const — `stringify!` of the snake_case field name — no per-call
+    // literal ids.
 
     /// A single inline-editable text config field row (with error placement).
     fn config_text_field<'a>(
@@ -2854,8 +2818,6 @@ impl SettingsState {
 
     #[expect(clippy::too_many_lines)]
     fn audio_section(&self) -> Element<'_, SettingsMessage> {
-        use iced::widget::Text;
-
         let transcription_enabled =
             self.config.audio_transcription_use_local.as_deref() != Some("false");
         let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
@@ -2881,15 +2843,12 @@ impl SettingsState {
         };
         let transcription_row = field_row(
             "Transcription",
-            row![
+            toggle_status_row(
                 toggler(transcription_enabled)
                     .on_toggle(SettingsMessage::TranscriptionToggle)
                     .style(theme::toggler_style),
-                Space::new().width(theme::SPACE_12),
                 transcription_status,
-            ]
-            .align_y(Alignment::Center)
-            .into(),
+            ),
             Some("using local CPU-optimized Qwen3-ASR"),
         );
 
@@ -2946,7 +2905,7 @@ impl SettingsState {
         // share the loaded ASR model). Turning Transcription OFF cascades it off.
         let wake_row = field_row(
             "Wake Word Detection",
-            row![
+            toggle_status_row(
                 toggler(voice_enabled)
                     .on_toggle_maybe(if transcription_enabled {
                         Some(SettingsMessage::VoiceToggle)
@@ -2954,11 +2913,8 @@ impl SettingsState {
                         None
                     })
                     .style(theme::toggler_style),
-                Space::new().width(theme::SPACE_12),
                 wake_status,
-            ]
-            .align_y(Alignment::Center)
-            .into(),
+            ),
             Some(if transcription_enabled {
                 "Hands-free voice commands with wake word detection"
             } else {
@@ -2989,15 +2945,12 @@ impl SettingsState {
         };
         let tts_row = field_row(
             "Text to Speech",
-            row![
+            toggle_status_row(
                 toggler(tts_enabled)
                     .on_toggle(SettingsMessage::TtsToggle)
                     .style(theme::toggler_style),
-                Space::new().width(theme::SPACE_12),
                 tts_status,
-            ]
-            .align_y(Alignment::Center)
-            .into(),
+            ),
             Some("Text-to-speech for agent responses"),
         );
 
@@ -3117,38 +3070,14 @@ impl SettingsState {
                     lines.push("Processing…".to_string());
                 }
 
-                let cancel_btn = cancel_enrollment_button();
-                Some(
-                    Column::new()
-                        .push(Space::new().height(8))
-                        .push(Text::new(lines.join("\n")).size(theme::TEXT_13))
-                        .push(Space::new().height(8))
-                        .push(cancel_btn)
-                        .into(),
-                )
+                Some(enrollment_status_column(lines.join("\n")))
             }
             crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. } => {
-                let cancel_btn = cancel_enrollment_button();
-                Some(
-                    Column::new()
-                        .push(Space::new().height(8))
-                        .push(Text::new("Listening…").size(theme::TEXT_13))
-                        .push(Space::new().height(8))
-                        .push(cancel_btn)
-                        .into(),
-                )
+                Some(enrollment_status_column("Listening…".to_string()))
             }
-            crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => {
-                let cancel_btn = cancel_enrollment_button();
-                Some(
-                    Column::new()
-                        .push(Space::new().height(8))
-                        .push(Text::new("Keep silent to confirm…").size(theme::TEXT_13))
-                        .push(Space::new().height(8))
-                        .push(cancel_btn)
-                        .into(),
-                )
-            }
+            crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. } => Some(
+                enrollment_status_column("Keep silent to confirm…".to_string()),
+            ),
             crate::audio::voice::VoiceStatus::EnrollingNegatives {
                 accumulated_secs,
                 target_secs,
@@ -3157,21 +3086,10 @@ impl SettingsState {
                 let pct = (accumulated_secs * 100)
                     .checked_div(target_secs)
                     .unwrap_or(0);
-                let cancel_btn = cancel_enrollment_button();
-                Some(
-                    Column::new()
-                        .push(Space::new().height(8))
-                        .push(
-                            Text::new(format!(
-                                "Collecting negative samples… {accumulated_secs}s/{target_secs}s \
-                                 ({pct}%) elapsed {wall_clock_elapsed}s"
-                            ))
-                            .size(theme::TEXT_13),
-                        )
-                        .push(Space::new().height(8))
-                        .push(cancel_btn)
-                        .into(),
-                )
+                Some(enrollment_status_column(format!(
+                    "Collecting negative samples… {accumulated_secs}s/{target_secs}s \
+                     ({pct}%) elapsed {wall_clock_elapsed}s"
+                )))
             }
             _ => None,
         };
@@ -3409,21 +3327,24 @@ fn field_row<'a>(
     field_row_with_error(label, input, hint, None)
 }
 
-/// The inline error label rendered under a control: small, error-colored,
-/// indented `left_pad` px to align with the input column.
-fn inline_error(err: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
-    container(text(err).size(theme::TEXT_10).color(theme::STATUS_ERROR))
+/// Small inline status label in the given color, indented `left_pad` px to
+/// align with the input column — shared body of [`inline_error`] and
+/// [`inline_warning`].
+fn inline_label(msg: &str, left_pad: f32, color: iced::Color) -> Element<'_, SettingsMessage> {
+    container(text(msg).size(theme::TEXT_10).color(color))
         .padding(iced::Padding::default().left(left_pad))
         .into()
 }
 
-/// The inline warning label rendered under a control: small, warning-colored,
-/// indented `left_pad` px to align with the input column. Non-fatal — the
-/// value was still saved (e.g. an unreachable custom endpoint).
+/// The inline error label rendered under a control, in the error color.
+fn inline_error(err: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
+    inline_label(err, left_pad, theme::STATUS_ERROR)
+}
+
+/// The inline warning label rendered under a control, in the warning color.
+/// Non-fatal — the value was still saved (e.g. an unreachable custom endpoint).
 fn inline_warning(msg: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
-    container(text(msg).size(theme::TEXT_10).color(theme::STATUS_WARNING))
-        .padding(iced::Padding::default().left(left_pad))
-        .into()
+    inline_label(msg, left_pad, theme::STATUS_WARNING)
 }
 
 /// The gray "Disabled" inline status label shared by the audio rows.
@@ -3432,6 +3353,21 @@ fn disabled_status() -> Element<'static, SettingsMessage> {
         .size(theme::TEXT_13)
         .color(theme::TEXT_SECONDARY)
         .into()
+}
+
+/// Toggle + inline status side by side — the shared frame of the three
+/// audio rows (Transcription / Wake Word / Text to Speech).
+fn toggle_status_row<'a>(
+    toggler: impl Into<Element<'a, SettingsMessage>>,
+    status: impl Into<Element<'a, SettingsMessage>>,
+) -> Element<'a, SettingsMessage> {
+    row![
+        toggler.into(),
+        Space::new().width(theme::SPACE_12),
+        status.into()
+    ]
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// Inline "status label + Retry" row for a failed download / model load.
@@ -3451,6 +3387,24 @@ fn retry_status_row(
     .into()
 }
 
+/// Accent "+" header button shared by the Workspaces and Users section
+/// headers.
+fn section_plus_button(
+    tooltip_text: &'static str,
+    on_press: SettingsMessage,
+) -> Element<'static, SettingsMessage> {
+    widgets::icon_tooltip_button(
+        lucide::plus::<iced::Theme, iced::Renderer>()
+            .size(theme::TEXT_16)
+            .color(theme::ACCENT),
+        tooltip_text,
+        Some(on_press),
+        button::DEFAULT_PADDING,
+        theme::button_text,
+        tooltip::Position::Top,
+    )
+}
+
 /// The Cancel button closing each live-enrollment progress column.
 fn cancel_enrollment_button() -> Element<'static, SettingsMessage> {
     container(
@@ -3460,6 +3414,17 @@ fn cancel_enrollment_button() -> Element<'static, SettingsMessage> {
             .padding(theme::PAD_6),
     )
     .into()
+}
+
+/// Status text framed by vertical spacers above the Cancel button — the
+/// shared skeleton of the four active-enrollment status columns.
+fn enrollment_status_column(status: String) -> Element<'static, SettingsMessage> {
+    Column::new()
+        .push(Space::new().height(8))
+        .push(Text::new(status).size(theme::TEXT_13))
+        .push(Space::new().height(8))
+        .push(cancel_enrollment_button())
+        .into()
 }
 
 /// Like [`field_row`], with an optional inline error rendered under the
