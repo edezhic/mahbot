@@ -22,8 +22,8 @@ use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
 use iced::widget::{
-    Column, Id, Row, Space, Text, button, column, container, pick_list, row, stack, text, toggler,
-    tooltip,
+    Column, Id, Row, Space, Text, button, column, container, pick_list, row, stack, text,
+    text::IntoFragment, toggler, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -62,6 +62,19 @@ fn add_model_to_list(input: &mut SingleLineEditorState, list: &mut Option<String
         }
         input.clear();
     }
+}
+
+/// Shared body of the single-line editor update arms: route
+/// focus-navigation actions out, otherwise apply the edit to the buffer.
+fn apply_simple_editor_action(
+    editor: &mut SingleLineEditorState,
+    action: EditorAction,
+) -> Task<SettingsMessage> {
+    if let Some(task) = super::common::focus_navigation_task(&action) {
+        return task;
+    }
+    editor.apply_action(action);
+    Task::none()
 }
 
 /// Remove a model from a list.
@@ -326,7 +339,6 @@ pub enum SettingsMessage {
         model: String,
         ok: Result<(), String>,
     },
-    // ── Voice assistant messages ──────────────────────────
     // ── Transcription messages ────────────────────────────
     /// Toggle local transcription on/off. Turning it OFF also turns Wake Word
     /// Detection off (they share the loaded ASR model — the cascade persists
@@ -345,6 +357,7 @@ pub enum SettingsMessage {
     /// Retry the local ASR model load/download after a terminal failure
     /// (re-toggling alone cannot recover — a dedicated action is required).
     RetryTranscription,
+    // ── Voice assistant messages ──────────────────────────
     /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
     VoiceToggle(bool),
     /// Result of async DB persistence after a voice toggle.
@@ -399,6 +412,13 @@ const TEXT_INPUT_KEYS: &[&str] = &[
 /// [`SettingsMessage::TranscriptionToggle`] toggle with its own transactional
 /// persist path.
 const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER];
+
+/// Field id of the custom chat-endpoint URL (the `config:`-prefixed form of
+/// [`CONFIG_KEY_PROVIDER_ENDPOINT`]).
+const CONFIG_FIELD_PROVIDER_ENDPOINT: &str = "config:provider_endpoint";
+/// Field id of the custom chat-endpoint API key (the `config:`-prefixed form
+/// of [`CONFIG_KEY_PROVIDER_ENDPOINT_KEY`]).
+const CONFIG_FIELD_PROVIDER_ENDPOINT_KEY: &str = "config:provider_endpoint_key";
 
 /// The two routable model slots (manager + worker), resolved to their
 /// trimmed/default model names. This is the set of models represented by
@@ -950,20 +970,14 @@ impl SettingsState {
         }
     }
 
-    /// Revert a field's staged snapshot value to the last persisted value
-    /// (used when a persist fails and the control is a discrete state —
-    /// toggle / picker — rather than free text).
-    fn revert_field(&mut self, field: &str) {
-        self.sync_field(field, None);
-        self.resync_field_editor(field);
-    }
-
-    /// Apply a canonical persisted value back into the editable snapshot
+    /// Sync a field's staged snapshot and editor with the last persisted value:
+    /// `None` reverts the staged value (a failed persist on a discrete
+    /// toggle/picker control), `Some(value)` applies a canonical persisted value
     /// (a settled text field may have been replaced by a refresh while the
-    /// persist was in flight — the persisted value is the user's last edit
-    /// and must win).
-    fn apply_persisted_value(&mut self, field: &str, value: &str) {
-        self.sync_field(field, Some(value));
+    /// persist was in flight — the persisted value is the user's last edit and
+    /// must win).
+    fn sync_persisted(&mut self, field: &str, value: Option<&str>) {
+        self.sync_field(field, value);
         self.resync_field_editor(field);
     }
 
@@ -983,7 +997,7 @@ impl SettingsState {
             "config:web_search_provider"
                 | "config:image_gen_models"
                 | "config:video_models"
-                | "config:provider_endpoint"
+                | CONFIG_FIELD_PROVIDER_ENDPOINT
         )
     }
 
@@ -1088,38 +1102,38 @@ impl SettingsState {
                 match result {
                     Ok(outcome) => {
                         self.field_errors.remove(&field);
-                        self.apply_persisted_value(&field, &outcome.value);
+                        self.sync_persisted(&field, Some(&outcome.value));
                         // Only the endpoint persist arm can produce a warning —
                         // a key-field result must never touch the endpoint
                         // warning slot.
-                        if field == "config:provider_endpoint" {
+                        if field == CONFIG_FIELD_PROVIDER_ENDPOINT {
                             self.endpoint_warning = outcome.warning;
                         }
                         Task::none()
                     }
                     Err(e) => {
                         self.field_errors.insert(field.clone(), e.clone());
-                        if field == "config:provider_endpoint" {
+                        if field == CONFIG_FIELD_PROVIDER_ENDPOINT {
                             self.endpoint_warning = None;
                         }
                         if Self::field_reverts_on_error(&field) {
                             // Discrete-state controls (toggles/pickers) roll
                             // back to the last persisted value; free text
                             // keeps the typed value for correction.
-                            self.revert_field(&field);
+                            self.sync_persisted(&field, None);
                             // A failed endpoint save means no configuration change — close
                             // the revealed section so the toggle cannot show ON while the
                             // runtime stays on OpenRouter. The error stays visible in the
                             // bottom banner (the inline row hides with the section) and
                             // re-appears inline if the user reveals the section again.
-                            if field == "config:provider_endpoint" {
+                            if field == CONFIG_FIELD_PROVIDER_ENDPOINT {
                                 self.custom_revealed = false;
                                 self.error = Some(e);
                                 // Toggle-off clears both endpoint fields as one discrete
                                 // action — a failed endpoint persist must restore the key
                                 // field too, so the UI cannot show a half-reverted custom
                                 // setup (endpoint defaulted, key cleared).
-                                self.revert_field("config:provider_endpoint_key");
+                                self.sync_persisted(CONFIG_FIELD_PROVIDER_ENDPOINT_KEY, None);
                             }
                         }
                         Task::none()
@@ -1134,8 +1148,7 @@ impl SettingsState {
                 // never leaves a spurious persisted row, and the toggle state
                 // never diverges from the normalized runtime endpoint.
                 self.custom_revealed = true;
-                self.field_errors
-                    .remove(&format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT}"));
+                self.field_errors.remove(CONFIG_FIELD_PROVIDER_ENDPOINT);
                 Task::none()
             }
             SettingsMessage::CustomEndpointToggle(false) => {
@@ -1145,20 +1158,20 @@ impl SettingsState {
                 // snapshot, then settle the endpoint field with `""` — the
                 // persist path cascades the provider_endpoint_key row deletion.
                 self.custom_revealed = false;
-                let endpoint_field = format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT}");
-                let key_field = format!("config:{CONFIG_KEY_PROVIDER_ENDPOINT_KEY}");
-                self.bump_gen(&endpoint_field);
-                self.bump_gen(&key_field);
-                self.pending_persists.remove(&endpoint_field);
-                self.pending_persists.remove(&key_field);
+                let endpoint_field = CONFIG_FIELD_PROVIDER_ENDPOINT;
+                let key_field = CONFIG_FIELD_PROVIDER_ENDPOINT_KEY;
+                self.bump_gen(endpoint_field);
+                self.bump_gen(key_field);
+                self.pending_persists.remove(endpoint_field);
+                self.pending_persists.remove(key_field);
                 self.config.provider_endpoint = None;
                 self.config.provider_endpoint_key = None;
-                self.field_errors.remove(&endpoint_field);
-                self.field_errors.remove(&key_field);
+                self.field_errors.remove(endpoint_field);
+                self.field_errors.remove(key_field);
                 self.endpoint_warning = None;
-                self.resync_field_editor(&endpoint_field);
-                self.resync_field_editor(&key_field);
-                self.settle_now(&endpoint_field, String::new())
+                self.resync_field_editor(endpoint_field);
+                self.resync_field_editor(key_field);
+                self.settle_now(endpoint_field, String::new())
             }
             SettingsMessage::ModelRoutingOrder { model, action } => {
                 if let Some(task) = super::common::focus_navigation_task(&action) {
@@ -1343,11 +1356,7 @@ impl SettingsState {
                 Task::none()
             }
             SettingsMessage::WakeWordPhraseInput(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.wake_word_phrase_input.apply_action(action);
-                Task::none()
+                apply_simple_editor_action(&mut self.wake_word_phrase_input, action)
             }
             SettingsMessage::CancelVoiceEnrollment => {
                 crate::audio::voice::send_command(
@@ -1376,18 +1385,10 @@ impl SettingsState {
                 Task::none()
             }
             SettingsMessage::AddWorkspaceName(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.add_workspace_name.apply_action(action);
-                Task::none()
+                apply_simple_editor_action(&mut self.add_workspace_name, action)
             }
             SettingsMessage::AddWorkspacePath(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.add_workspace_path.apply_action(action);
-                Task::none()
+                apply_simple_editor_action(&mut self.add_workspace_path, action)
             }
             SettingsMessage::SubmitAddWorkspace => {
                 if self.add_workspace_name.text().is_empty()
@@ -1437,11 +1438,7 @@ impl SettingsState {
                 Task::none()
             }
             SettingsMessage::AddUserSender(action) => {
-                if let Some(task) = super::common::focus_navigation_task(&action) {
-                    return task;
-                }
-                self.add_user_sender.apply_action(action);
-                Task::none()
+                apply_simple_editor_action(&mut self.add_user_sender, action)
             }
             SettingsMessage::AddUserDefaultRole(idx) => {
                 if idx < [Role::Assistant, Role::Artist].len() {
@@ -1496,11 +1493,7 @@ impl SettingsState {
             SettingsMessage::ModelPicker { target, action } => {
                 match (target, action) {
                     (t, ModelPickerAction::AddInput(action)) => {
-                        if let Some(task) = super::common::focus_navigation_task(&action) {
-                            return task;
-                        }
-                        self.model_picker_inputs[t.idx()].apply_action(action);
-                        Task::none()
+                        apply_simple_editor_action(&mut self.model_picker_inputs[t.idx()], action)
                     }
                     (t, ModelPickerAction::AddModel) => match t {
                         // Image-gen additions are validated against the catalog
@@ -2835,11 +2828,11 @@ impl SettingsState {
         let transcription_status: Element<'_, SettingsMessage> = if !transcription_enabled {
             disabled_status()
         } else if crate::audio::local_transcriber::is_loaded() {
-            Text::new("Ready").size(theme::TEXT_13).into()
+            status_label("Ready")
         } else if crate::audio::local_transcriber::is_failed() {
             retry_status_row("Download failed", SettingsMessage::RetryTranscription)
         } else {
-            Text::new("Downloading…").size(theme::TEXT_13).into()
+            status_label("Downloading…")
         };
         let transcription_row = field_row(
             "Transcription",
@@ -2858,48 +2851,30 @@ impl SettingsState {
         // model error …) is current after each coalesced event.
         let wake_status: Element<'_, SettingsMessage> = match status.clone() {
             crate::audio::voice::VoiceStatus::Disabled => disabled_status(),
-            crate::audio::voice::VoiceStatus::LoadingModels => {
-                Text::new("Loading models…").size(theme::TEXT_13).into()
-            }
+            crate::audio::voice::VoiceStatus::LoadingModels => status_label("Loading models…"),
             crate::audio::voice::VoiceStatus::ModelError => {
                 retry_status_row("Model error", SettingsMessage::RetryVoiceModels)
             }
-            crate::audio::voice::VoiceStatus::Listening => Text::new("Listening for wake word")
-                .size(theme::TEXT_13)
-                .into(),
-            crate::audio::voice::VoiceStatus::Recording => {
-                Text::new("Recording command").size(theme::TEXT_13).into()
-            }
+            crate::audio::voice::VoiceStatus::Listening => status_label("Listening for wake word"),
+            crate::audio::voice::VoiceStatus::Recording => status_label("Recording command"),
             crate::audio::voice::VoiceStatus::RecordingManual => {
-                Text::new("Recording voice message")
-                    .size(theme::TEXT_13)
-                    .into()
+                status_label("Recording voice message")
             }
-            crate::audio::voice::VoiceStatus::Transcribing => {
-                Text::new("Transcribing…").size(theme::TEXT_13).into()
-            }
+            crate::audio::voice::VoiceStatus::Transcribing => status_label("Transcribing…"),
             crate::audio::voice::VoiceStatus::MicPermissionDenied => {
-                Text::new("Microphone permission denied")
-                    .size(theme::TEXT_13)
-                    .into()
+                status_label("Microphone permission denied")
             }
             crate::audio::voice::VoiceStatus::MicDisconnected => {
-                Text::new("Microphone disconnected")
-                    .size(theme::TEXT_13)
-                    .into()
+                status_label("Microphone disconnected")
             }
             crate::audio::voice::VoiceStatus::Enrolling { .. }
             | crate::audio::voice::VoiceStatus::ListeningDuringEnrollment { .. }
             | crate::audio::voice::VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
             | crate::audio::voice::VoiceStatus::EnrollingNegatives { .. } => {
-                Text::new("Enrolling…").size(theme::TEXT_13).into()
+                status_label("Enrolling…")
             }
-            crate::audio::voice::VoiceStatus::Enrolled => {
-                Text::new("Enrolled").size(theme::TEXT_13).into()
-            }
-            crate::audio::voice::VoiceStatus::Error(msg) => {
-                Text::new(msg).size(theme::TEXT_13).into()
-            }
+            crate::audio::voice::VoiceStatus::Enrolled => status_label("Enrolled"),
+            crate::audio::voice::VoiceStatus::Error(msg) => status_label(msg),
         };
         // Gated: wake word can only be enabled while Transcription is ON (they
         // share the loaded ASR model). Turning Transcription OFF cascades it off.
@@ -2931,7 +2906,7 @@ impl SettingsState {
             disabled_status()
         } else if tts_ready {
             if audio_ok {
-                Text::new("Ready").size(theme::TEXT_13).into()
+                status_label("Ready")
             } else {
                 Text::new("No audio output device")
                     .size(theme::TEXT_13)
@@ -2941,7 +2916,7 @@ impl SettingsState {
         } else if tts_failed {
             retry_status_row("Model download failed", SettingsMessage::TtsRetryModels)
         } else {
-            Text::new("Downloading models…").size(theme::TEXT_13).into()
+            status_label("Downloading models…")
         };
         let tts_row = field_row(
             "Text to Speech",
@@ -3334,6 +3309,12 @@ fn inline_label(msg: &str, left_pad: f32, color: iced::Color) -> Element<'_, Set
     container(text(msg).size(theme::TEXT_10).color(color))
         .padding(iced::Padding::default().left(left_pad))
         .into()
+}
+
+/// Plain-text inline status cell at the default text size — shared body of
+/// the audio-row status arms.
+fn status_label<'a>(msg: impl IntoFragment<'a>) -> Element<'a, SettingsMessage> {
+    Text::new(msg).size(theme::TEXT_13).into()
 }
 
 /// The inline error label rendered under a control, in the error color.
@@ -4469,7 +4450,7 @@ mod tests {
             "ON must not stage or persist an endpoint — a reveal alone must not configure one"
         );
         assert!(
-            !state.field_gen.contains_key("config:provider_endpoint"),
+            !state.field_gen.contains_key(CONFIG_FIELD_PROVIDER_ENDPOINT),
             "ON must not arm a settle — no spurious persisted row"
         );
 
@@ -4486,7 +4467,9 @@ mod tests {
             "OFF clears the endpoint key field"
         );
         assert!(
-            state.field_gen.contains_key("config:provider_endpoint_key"),
+            state
+                .field_gen
+                .contains_key(CONFIG_FIELD_PROVIDER_ENDPOINT_KEY),
             "OFF bumps the key field's generation (drops pending settles/results)"
         );
 
@@ -4498,11 +4481,11 @@ mod tests {
         assert!(state.custom_revealed, "re-reveal opens the section");
         let endpoint_generation = state
             .field_gen
-            .get("config:provider_endpoint")
+            .get(CONFIG_FIELD_PROVIDER_ENDPOINT)
             .copied()
             .unwrap_or(0);
         let _task = state.update(SettingsMessage::ConfigFieldSaveResult {
-            field: "config:provider_endpoint".into(),
+            field: CONFIG_FIELD_PROVIDER_ENDPOINT.into(),
             generation: endpoint_generation,
             result: Err("invalid endpoint URL".into()),
         });
