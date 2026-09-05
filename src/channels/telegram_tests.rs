@@ -324,22 +324,23 @@ async fn parse_update_message_uses_chat_id_as_reply_target() {
     assert_eq!(msg.content, "hello");
 }
 
+/// Write a real 1×1 red PNG raster — the classifier rejects non-raster
+/// "images", so fixtures must decode.
+fn write_test_png(path: &std::path::Path) {
+    let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+    let mut buf = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .expect("test PNG must encode");
+    std::fs::write(path, buf).unwrap();
+}
+
 #[test]
 fn parse_attachment_markers_tests() {
     let dir = tempfile::tempdir().unwrap();
     let png = dir.path().join("a.png");
     let ogg = dir.path().join("voice.ogg");
     let vid = dir.path().join("vid.mp4");
-    // The IMAGE fixture must be a real decodable raster — the classifier
-    // rejects a non-image file, keeping the marker as literal text.
-    std::fs::write(&png, {
-        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
-        let mut buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-            .expect("test PNG must encode");
-        buf
-    })
-    .unwrap();
+    write_test_png(&png);
     std::fs::write(&ogg, b"fake-ogg").unwrap();
     std::fs::write(&vid, b"fake-mp4").unwrap();
 
@@ -405,11 +406,7 @@ fn parse_path_only_attachment_tests() {
 
     // A real 1×1 PNG raster is a valid image target → attached as a photo.
     let p = dir.path().join("snap.png");
-    let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
-    let mut buf = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-        .unwrap();
-    std::fs::write(&p, &buf).unwrap();
+    write_test_png(&p);
     let parsed = parse_path_only_attachment(p.to_string_lossy().as_ref()).unwrap();
     assert_eq!(parsed.kind, TelegramAttachmentKind::Image);
     assert_eq!(parsed.target, p.to_string_lossy());
@@ -634,9 +631,9 @@ fn wrapped_chunks_respect_telegram_limit() {
     // Simulate send_text_chunks wrapping to verify no chunk exceeds the
     // 4096-char limit after continuation prefixes are prepended.
     //
-    // Middle chunk overhead: "(continued)\n\n...\n\n(continues...)" = 28 chars
+    // Middle chunk overhead: "(continued)\n\n...\n\n(continues...)" = 29 chars
     // Last chunk overhead:  "(continued)\n\n..."                   = 13 chars
-    // First chunk (multi):  "...\n\n(continues...)"               = 15 chars
+    // First chunk (multi):  "...\n\n(continues...)"               = 16 chars
 
     // Build a message designed to force 3+ chunks, then verify wrapping.
     let msg = format!("X{}X", "a".repeat(9000));
@@ -1923,6 +1920,29 @@ fn voice_msg(user_name: &str, content: &str) -> ChannelMessage {
     }
 }
 
+/// Shared happy-path mirror harness: sets up the mirror environment, binds
+/// `user_name` to `reply_target`, mirrors `msg`, and returns the single
+/// message sent to `reply_target` (panics unless exactly one was sent).
+/// Per-test assertions stay in the callers.
+async fn mirror_single_to_binding(
+    user_name: &str,
+    reply_target: &str,
+    msg: &ChannelMessage,
+) -> SendMessage {
+    let (sent, _lock) = setup_mirror_test_env().await;
+    setup_user_with_telegram_binding(user_name, reply_target, user_name).await;
+
+    super::mirror_gui_message_to_telegram(msg).await;
+
+    let guard = sent.lock().unwrap_poison();
+    let our_msgs: Vec<_> = guard
+        .iter()
+        .filter(|m| m.recipient == reply_target)
+        .collect();
+    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    our_msgs[0].clone()
+}
+
 // ── Guard tests: early-return conditions ─────────────────────────────
 
 /// Per-case setup for `assert_mirror_skips`, applied after the shared
@@ -2042,48 +2062,35 @@ async fn mirror_skips_guard_cases() {
 
 #[tokio::test]
 async fn sends_blockquote_to_single_binding() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("single_user", "unique_single", "single_user").await;
-
-    let msg = gui_msg("single_user", "Hello, world!");
-    super::mirror_gui_message_to_telegram(&msg).await;
-
-    let guard = sent.lock().unwrap_poison();
-    // Filter to our test's messages by recipient.
-    let our_msgs: Vec<_> = guard
-        .iter()
-        .filter(|m| m.recipient == "unique_single")
-        .collect();
-    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    let mirrored = mirror_single_to_binding(
+        "single_user",
+        "unique_single",
+        &gui_msg("single_user", "Hello, world!"),
+    )
+    .await;
     assert_eq!(
-        our_msgs[0].content,
+        mirrored.content,
         "<blockquote>\nHello, world!\n</blockquote>"
     );
-    assert!(our_msgs[0].reply_markup.is_none());
+    assert!(mirrored.reply_markup.is_none());
 }
 
 #[tokio::test]
 async fn mirrors_voice_transcript_to_telegram() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("voice_user", "unique_voice", "voice_user").await;
-
     // Voice-originated messages (GUI mic-button recording / wake-word
     // command) must mirror exactly like GUI text: same recipient bindings,
     // same blockquote format, no audio payload.
-    let msg = voice_msg("voice_user", "Record this voice note");
-    super::mirror_gui_message_to_telegram(&msg).await;
-
-    let guard = sent.lock().unwrap_poison();
-    let our_msgs: Vec<_> = guard
-        .iter()
-        .filter(|m| m.recipient == "unique_voice")
-        .collect();
-    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    let mirrored = mirror_single_to_binding(
+        "voice_user",
+        "unique_voice",
+        &voice_msg("voice_user", "Record this voice note"),
+    )
+    .await;
     assert_eq!(
-        our_msgs[0].content,
+        mirrored.content,
         "<blockquote>\nRecord this voice note\n</blockquote>"
     );
-    assert!(our_msgs[0].reply_markup.is_none());
+    assert!(mirrored.reply_markup.is_none());
 }
 
 #[tokio::test]
@@ -2130,30 +2137,17 @@ async fn sends_to_multiple_telegram_bindings() {
     assert!(recipients.contains(&"unique_multi_b"));
 }
 
-/// Shared helper for media-marker-stripping tests.
-///
-/// Sets up the mirror test environment, binds `user_name` to `reply_target` in the
-/// Telegram channel, mirrors a GUI message with `content`, and asserts that the quoted
-/// output equals `expected_quote`.
+/// Shared helper for media-marker-stripping tests: mirrors a GUI message
+/// with `content` and asserts that the quoted output equals `expected_quote`.
 async fn assert_mirror_strips_markers(
     user_name: &str,
     reply_target: &str,
     content: &str,
     expected_quote: &str,
 ) {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding(user_name, reply_target, user_name).await;
-
-    let msg = gui_msg(user_name, content);
-    super::mirror_gui_message_to_telegram(&msg).await;
-
-    let guard = sent.lock().unwrap_poison();
-    let our_msgs: Vec<_> = guard
-        .iter()
-        .filter(|m| m.recipient == reply_target)
-        .collect();
-    assert_eq!(our_msgs.len(), 1);
-    assert_eq!(our_msgs[0].content, expected_quote);
+    let mirrored =
+        mirror_single_to_binding(user_name, reply_target, &gui_msg(user_name, content)).await;
+    assert_eq!(mirrored.content, expected_quote);
 }
 
 #[tokio::test]
@@ -2182,71 +2176,45 @@ async fn strips_lowercase_media_markers_from_content() {
 
 #[tokio::test]
 async fn preserves_markdown_formatting_in_blockquote() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("md_user", "unique_md", "md_user").await;
-
-    let msg = gui_msg("md_user", "**bold** and `code` and *italic*");
-    super::mirror_gui_message_to_telegram(&msg).await;
-
-    let guard = sent.lock().unwrap_poison();
-    let our_msgs: Vec<_> = guard
-        .iter()
-        .filter(|m| m.recipient == "unique_md")
-        .collect();
-    assert_eq!(our_msgs.len(), 1);
+    let mirrored = mirror_single_to_binding(
+        "md_user",
+        "unique_md",
+        &gui_msg("md_user", "**bold** and `code` and *italic*"),
+    )
+    .await;
     // Markdown syntax inside the blockquote passes through — the Telegram
     // channel's markdown_to_telegram_html will handle formatting later.
     assert_eq!(
-        our_msgs[0].content,
+        mirrored.content,
         "<blockquote>\n**bold** and `code` and *italic*\n</blockquote>"
     );
 }
 
 #[tokio::test]
 async fn mirrors_reply_reference_header() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("ref_user", "unique_ref", "ref_user").await;
-
     let mut msg = gui_msg("ref_user", "hello");
     msg.reply_reference = Some(crate::channels::ReplyReference {
         author: "alice".to_string(),
         snippet: "hi there".to_string(),
     });
-    super::mirror_gui_message_to_telegram(&msg).await;
-
-    let guard = sent.lock().unwrap_poison();
-    let our_msgs: Vec<_> = guard
-        .iter()
-        .filter(|m| m.recipient == "unique_ref")
-        .collect();
-    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    let mirrored = mirror_single_to_binding("ref_user", "unique_ref", &msg).await;
     assert_eq!(
-        our_msgs[0].content,
+        mirrored.content,
         "<blockquote>\n↩ alice: hi there\nhello\n</blockquote>"
     );
 }
 
 #[tokio::test]
 async fn mirrors_media_only_with_reply_reference() {
-    let (sent, _lock) = setup_mirror_test_env().await;
-    setup_user_with_telegram_binding("media_ref", "unique_media_ref", "media_ref").await;
-
     let mut msg = gui_msg("media_ref", "[IMAGE:/tmp/screenshot.png]");
     msg.reply_reference = Some(crate::channels::ReplyReference {
         author: "bob".to_string(),
         snippet: "[Photo]".to_string(),
     });
-    super::mirror_gui_message_to_telegram(&msg).await;
-
-    let guard = sent.lock().unwrap_poison();
-    let our_msgs: Vec<_> = guard
-        .iter()
-        .filter(|m| m.recipient == "unique_media_ref")
-        .collect();
-    assert_eq!(our_msgs.len(), 1, "expected exactly one message");
+    let mirrored = mirror_single_to_binding("media_ref", "unique_media_ref", &msg).await;
     // Media-only content (markers stripped) still mirrors the `↩` line.
     assert_eq!(
-        our_msgs[0].content,
+        mirrored.content,
         "<blockquote>\n↩ bob: [Photo]\n</blockquote>"
     );
 }

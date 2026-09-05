@@ -15,7 +15,8 @@ use std::time::Duration;
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 /// Reserve space for continuation markers added by `send_text_chunks`:
-/// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
+/// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 29 extra
+/// chars (middle chunk); 30 keeps 4066+29 = 4095 within the 4096 limit.
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 
 /// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
@@ -569,6 +570,21 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
     }
 }
 
+/// Attachment-target acceptance gate shared by `parse_path_only_attachment`
+/// and `parse_attachment_markers`: image markers may only attach a real
+/// raster or an http(s) URL (via `media_target::classify_media_image_target`);
+/// every other kind — and an unknown marker kind (`None`) — accepts an
+/// http(s) URL or an existing regular file.
+fn is_attachable_target(kind: Option<TelegramAttachmentKind>, target: &str) -> bool {
+    match kind {
+        Some(TelegramAttachmentKind::Image) => matches!(
+            media_target::classify_media_image_target(target),
+            MediaTarget::LocalImage | MediaTarget::RemoteUrl
+        ),
+        _ => is_http_url(target) || Path::new(target).is_file(),
+    }
+}
+
 fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
@@ -587,14 +603,7 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     // non-image or an existing non-raster file stays plain text, matching the
     // `[IMAGE:...]` marker gate. Audio/video/document keep their existing
     // URL-or-existing-regular-file semantics.
-    if kind == TelegramAttachmentKind::Image {
-        if !matches!(
-            media_target::classify_media_image_target(candidate),
-            MediaTarget::LocalImage | MediaTarget::RemoteUrl
-        ) {
-            return None;
-        }
-    } else if !is_http_url(candidate) && !Path::new(candidate).is_file() {
+    if !is_attachable_target(Some(kind), candidate) {
         return None;
     }
 
@@ -620,30 +629,16 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
             let (kind_str, path) = parse_media_marker(caps);
             let path = path.trim();
 
-            // For IMAGE markers, only a valid image target is attached — an
-            // existing regular raster file or an http(s) URL. A data-URI IMAGE
-            // marker (or a non-image target) stays as literal text, because
-            // telegram's `send_attachment` reads a local file path or sends
-            // by URL and cannot send a data URI. The kind gate is
-            // case-insensitive to match TELEGRAM_MEDIA_MARKER_RE (lowercase
-            // `[image:...]` must not bypass the classifier into the loose
-            // is_file check). AUDIO/VIDEO markers keep their existing
-            // semantics (an http(s) URL or an existing regular file); prose
-            // quoting the marker syntax must stay visible and never abort the
-            // send of other attachments in the same message.
+            // Only a valid image target is attached as a photo; everything
+            // else — including a data-URI, which the classifier rejects
+            // cheaply (no decode, and Telegram cannot send inline data URIs)
+            // — stays as literal text. The kind gate is case-insensitive to
+            // match TELEGRAM_MEDIA_MARKER_RE. Unknown marker kinds fall
+            // through to the loose URL-or-file check: an invalid target keeps
+            // the marker as literal text, a valid one is stripped without
+            // producing an attachment.
             let k = TelegramAttachmentKind::from_marker(kind_str);
-            if k == Some(TelegramAttachmentKind::Image) {
-                // Only a valid image target is attached; everything else —
-                // including a data-URI, which the classifier rejects cheaply
-                // (no decode, and Telegram cannot send inline data URIs) —
-                // stays as literal text.
-                if !matches!(
-                    media_target::classify_media_image_target(path),
-                    MediaTarget::LocalImage | MediaTarget::RemoteUrl
-                ) {
-                    return caps.get_match().as_str().to_string();
-                }
-            } else if path.is_empty() || (!is_http_url(path) && !Path::new(path).is_file()) {
+            if !is_attachable_target(k, path) {
                 return caps.get_match().as_str().to_string();
             }
 
