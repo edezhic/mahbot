@@ -278,10 +278,8 @@ pub(crate) async fn run_analyze_with_job(
     // AND the new ids would not match the stored roster rows).
     let (slots, pre_done) = if resume {
         let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
-        // Slot-resume skeleton: reuse the stored roster (agent ids + final
-        // tasks) — never regenerate ids (the PK would conflict AND the new ids
-        // would not match the stored roster rows) — and split Done (reconstruct
-        // from stored outcome) from not-Done (re-run with stored task).
+        // Split Done (reconstruct from stored outcome) from not-Done (re-run
+        // with the stored task).
         let split = crate::jobs::split_slot_resume(&rows);
         let slots: Vec<AnalyzeSlot> = rows
             .iter()
@@ -775,7 +773,7 @@ impl AnalyzeRun {
 /// [`dispatch_claim_verifiers`] (the deep research tool and the analyze
 /// dispute-verification round).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct VerificationVerdict {
+struct VerificationVerdict {
     pub verdict: String,
     pub evidence: String,
 }
@@ -1822,32 +1820,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_consolidate_zero_responses_returns_error() {
-        let ws = test_ws("/tmp/test_ws");
-        let runs = vec![
-            test_analyst_run(&ws, None),
-            test_analyst_run(&ws, None),
-            test_analyst_run(&ws, None),
-        ];
-        let result = consolidate_analyst_runs(
-            &ws,
-            "test question",
-            runs,
-            std::time::Instant::now() + Duration::from_mins(1),
-            "test_round",
-        )
-        .await;
-        assert!(result.is_err(), "0 responses should error");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("All parallel analysts failed"),
-            "Error should mention analyst failure"
-        );
-    }
-
-    #[tokio::test]
     async fn test_consolidate_zero_responses_surfaces_failure_reasons() {
         let ws = test_ws("/tmp/test_ws");
         let runs = vec![
@@ -1864,6 +1836,10 @@ mod tests {
         )
         .await;
         let err = result.expect_err("0 valid responses should error");
+        assert!(
+            err.to_string().contains("All parallel analysts failed"),
+            "error should mention analyst failure: {err}"
+        );
         assert!(
             err.to_string().contains("deadline expired"),
             "error should surface the stuck-analyst reason: {err}"

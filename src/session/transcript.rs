@@ -1,10 +1,10 @@
 //! Live read-only transcript snapshots for running agents.
 //!
 //! A running agent's in-memory `Session` conversation is not yet fully
-//! persisted (the unpersisted tail) — the Sessions page reads the durable DB
-//! and Running Agents sees only metadata. This module exposes the live
-//! transcript as a lock-free, read-only, point-in-time snapshot that any
-//! in-process reader (the Running Agents GUI) can load.
+//! persisted (the unpersisted tail). This module exposes the live transcript
+//! as a lock-free, read-only, point-in-time snapshot that in-process readers —
+//! the Running Agents GUI and the Sessions page's live-session view — load on
+//! top of the durable DB rows.
 //!
 //! ## Mechanism
 //!
@@ -36,7 +36,7 @@ use crate::util::UnwrapPoison;
 /// recorded by the agent — not a finalized-only figure.
 #[derive(Debug, Default)]
 pub struct TranscriptSnapshot {
-    pub history: Arc<Vec<ChatMessage>>,
+    pub history: Vec<ChatMessage>,
     pub token_count: Option<u64>,
 }
 
@@ -158,7 +158,7 @@ mod tests {
         let generation = next_gen();
         let holder = TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation);
         let snap = TranscriptSnapshot {
-            history: Arc::new(vec![ChatMessage::assistant("hello")]),
+            history: vec![ChatMessage::assistant("hello")],
             token_count: Some(42),
         };
         holder.store(Arc::new(snap));

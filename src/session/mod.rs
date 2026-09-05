@@ -149,8 +149,8 @@ crate::columns! {
 // and from the dead-session recovery poller; scanning the full message table
 // per refresh was the largest repeated query in the system). The count is
 // maintained in the same transaction as message writes
-// (see `insert_messages_in_transaction`) and backfilled once by migration
-// 002 for pre-migration stores.
+// (see `insert_messages_in_transaction`). It is NOT backfilled: sessions that
+// predate the metadata column default to 0. Schema: `db/migrations.rs`.
 crate::columns! {
     SESSION_LIST_COLUMNS [SL] {
         AGENT_ID       => "sm.agent_id",
@@ -386,8 +386,9 @@ where
 /// [`SessionStore::list_sessions_with_metadata_excluding`].
 ///
 /// The message count is read from the denormalized `session_metadata.message_count`
-/// column (maintained in the same transaction as message writes, backfilled by
-/// migration 002) — the historical LEFT JOIN + GROUP BY over the full `sessions`
+/// column (maintained in the same transaction as message writes; NOT backfilled —
+/// sessions predating the metadata column default to 0). The historical
+/// LEFT JOIN + GROUP BY over the full `sessions`
 /// table was the largest repeated query in the system (this list refreshes on
 /// Sessions-page navigation and from the dead-session recovery poller) and has
 /// been removed. Ordering and filtering are unchanged.

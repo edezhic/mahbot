@@ -251,7 +251,7 @@ impl Session {
     fn publish_transcript(&self) {
         if let Some(holder) = &self.transcript {
             let snapshot = TranscriptSnapshot {
-                history: Arc::new(self.history.clone()),
+                history: self.history.clone(),
                 token_count: self.token_length,
             };
             holder.store(Arc::new(snapshot));
