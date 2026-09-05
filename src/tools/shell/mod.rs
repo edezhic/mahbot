@@ -3515,7 +3515,7 @@ mod tests {
 
         // The read tool can read the output file (temp-area allowlist covers
         // the .agent directory) — no allowlist changes were needed.
-        let content = crate::tools::ReadTool
+        let content = crate::tools::ReadTool::general()
             .execute(&ws, json!({"path": path.to_string_lossy().to_string()}))
             .await
             .expect("read tool must read the bg output file");

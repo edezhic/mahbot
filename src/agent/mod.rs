@@ -5117,7 +5117,7 @@ mod tests {
             .unwrap();
 
         let mut agent = make_agent_on(
-            vec![Box::new(crate::tools::ReadTool)],
+            vec![Box::new(crate::tools::ReadTool::general())],
             "test-read-reexec",
             ws,
         );

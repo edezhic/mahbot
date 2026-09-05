@@ -266,8 +266,8 @@ use crate::tools::{
     GetTicketTool, ImageGenTool, ImplementTool, InstallChromeUseTool, ListAlarmsTool,
     ListTicketsTool, MahbotDebugTool, ReadManagerChatTool, ReadTool, RemoveAlarmTool, ResearchTool,
     SearchArchivedTicketsTool, SearchTool, SendMessageToManagerTool, SetupTelegramBotTool,
-    SetupWebSearchTool, ShellMode, ShellTool, SleepTool, StrictReadTool, UpdateTicketTool,
-    VideoEditTool, VideoGenTool, WebSearchBackend, WebSearchTool,
+    SetupWebSearchTool, ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoEditTool,
+    VideoGenTool, WebSearchBackend, WebSearchTool,
 };
 
 impl Role {
@@ -275,7 +275,7 @@ impl Role {
     /// (Analyst, QA, Reviewer, Discovery, Maintainer).
     fn readonly_core_tools() -> Vec<Box<dyn Tool>> {
         vec![
-            Box::new(ReadTool),
+            Box::new(ReadTool::general()),
             Box::new(SearchTool),
             Box::new(ShellTool::new(ShellMode::ReadOnly)),
         ]
@@ -286,7 +286,7 @@ impl Role {
     fn full_core_tools() -> Vec<Box<dyn Tool>> {
         vec![
             Box::new(ShellTool::new(ShellMode::Full)),
-            Box::new(ReadTool),
+            Box::new(ReadTool::general()),
             Box::new(EditTool),
             Box::new(SearchTool),
         ]
@@ -360,7 +360,7 @@ impl Role {
                 // start filesystem watchers. Read + read-only shell cover
                 // inspection and temp-root mutation.
                 vec![
-                    Box::new(ReadTool),
+                    Box::new(ReadTool::general()),
                     Box::new(ShellTool::new(ShellMode::ReadOnly)),
                 ]
             }
@@ -395,9 +395,9 @@ impl Role {
                 // full-access retains the general ReadTool so it can also read
                 // dependency sources / temp files.
                 if full_access {
-                    t.push(Box::new(ReadTool));
+                    t.push(Box::new(ReadTool::general()));
                 } else {
-                    t.push(Box::new(StrictReadTool));
+                    t.push(Box::new(ReadTool::workspace_only()));
                 }
                 if full_access {
                     t.push(Box::new(ShellTool::new(ShellMode::Full)));
@@ -627,8 +627,9 @@ mod tests {
     fn assistant_toolset_gates_full_access_tools() {
         // The Assistant toolset must differ by the triggering user's
         // full-access (admin) flag: base mode has no shell/implement/research/
-        // computer, full mode does. Base gets the workspace-only StrictReadTool;
-        // full keeps the general ReadTool (which also permits dependency sources).
+        // computer, full mode does. Base gets the workspace-only read
+        // (`ReadTool::workspace_only()`); full keeps the general read (which
+        // also permits dependency sources).
         let ws = crate::workspace::test_ws("test");
         let base = crate::Role::Assistant.tools(&ws, false, test_sessions());
         let full = crate::Role::Assistant.tools(&ws, true, test_sessions());

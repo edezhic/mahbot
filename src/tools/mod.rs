@@ -165,7 +165,7 @@ pub(crate) use image_gen::ImageGenTool;
 pub(crate) use implement::ImplementTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
 pub(crate) use manager_chat::{ReadManagerChatTool, SendMessageToManagerTool};
-pub(crate) use read::{ReadTool, StrictReadTool};
+pub(crate) use read::ReadTool;
 pub(crate) use research::ResearchTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
@@ -1191,7 +1191,7 @@ mod tests {
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(SearchTool),
             Box::new(ShellTool::new(ShellMode::Full)),
-            Box::new(ReadTool),
+            Box::new(ReadTool::general()),
             Box::new(EditTool),
         ];
 

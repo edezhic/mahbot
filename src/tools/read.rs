@@ -11,7 +11,27 @@ use async_trait::async_trait;
 use serde_json::json;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
-pub struct ReadTool;
+/// The `read` tool. `strict` selects the workspace-only variant used by the
+/// Assistant: it permits no path outside the workspace (no dependency-source
+/// caches, temp spill files, or `/tmp`). The general variant additionally
+/// permits those outside paths.
+pub struct ReadTool {
+    strict: bool,
+}
+
+impl ReadTool {
+    /// General read: workspace plus dependency-source / temp-file paths.
+    #[must_use]
+    pub fn general() -> Self {
+        Self { strict: false }
+    }
+
+    /// Workspace-only read (the Assistant's restricted variant).
+    #[must_use]
+    pub fn workspace_only() -> Self {
+        Self { strict: true }
+    }
+}
 
 /// Recognized sensitive file extensions whose read output should be scrubbed for credentials.
 const SENSITIVE_EXTENSIONS: &[&str] = &["cer", "crt", "env", "key", "p12", "pem", "pfx"];
@@ -150,6 +170,12 @@ fn image_read_annotation(path: &Path, kind: SniffedImage) -> String {
     }
 }
 
+/// Shared content-mode gate: a raster read (detected by magic bytes, never
+/// the extension) yields the image annotation instead of text.
+fn sniff_guard(resolved_path: &Path, bytes: &[u8]) -> Option<String> {
+    sniff_read_image(bytes).map(|kind| image_read_annotation(resolved_path, kind))
+}
+
 /// Candidate paths for a literal `path` that `resolve_read_target` could not
 /// resolve (a typo/missing path). Queried by filename, as
 /// [`recover_missing_path`] does. This is the
@@ -256,14 +282,24 @@ impl Tool for ReadTool {
         "read"
     }
 
+    fn description(&self) -> String {
+        crate::prompt::load_prompt(if self.strict {
+            "tool/read_strict.md"
+        } else {
+            "tool/read.md"
+        })
+    }
+
     fn parameters_schema(&self) -> serde_json::Value {
-        read_parameters_schema(
-            "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist.",
-        )
+        read_parameters_schema(if self.strict {
+            "Path to the file within the personal workspace. Only the workspace is accessible — dependency sources, temp files, and other outside paths are rejected."
+        } else {
+            "Path to the file. Relative paths resolve from workspace; outside paths require policy allowlist."
+        })
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        execute_read(ws, args, false).await
+        execute_read(ws, args, self.strict).await
     }
 
     fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
@@ -323,7 +359,7 @@ impl Tool for ReadTool {
         ws: &Workspace,
         args: &serde_json::Value,
     ) -> Option<crate::tools::ImagePayload> {
-        read_image_payload(ws, args, false).await
+        read_image_payload(ws, args, self.strict).await
     }
 }
 
@@ -368,54 +404,6 @@ async fn read_image_payload(
     ))
 }
 
-/// Workspace-only read — the Assistant's restricted read variant. Unlike
-/// `ReadTool`, it permits NO path outside the workspace: no dependency-source
-/// caches, no temp spill files, no `/tmp`. Edit is already workspace-strict.
-pub struct StrictReadTool;
-
-#[async_trait]
-impl Tool for StrictReadTool {
-    fn name(&self) -> &'static str {
-        "read"
-    }
-
-    fn description(&self) -> String {
-        crate::prompt::load_prompt("tool/read_strict.md")
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        read_parameters_schema(
-            "Path to the file within the personal workspace. Only the workspace is accessible — dependency sources, temp files, and other outside paths are rejected.",
-        )
-    }
-
-    async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        execute_read(ws, args, true).await
-    }
-
-    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        // See `ReadTool::should_scrub_output` — the read tool scrubs internally
-        // in `read_resolved` based on the resolved path.
-        false
-    }
-
-    fn side_effects(&self) -> bool {
-        false // read-only file inspection
-    }
-
-    fn format_output(&self, output: &str) -> String {
-        ReadTool.format_output(output)
-    }
-
-    async fn image_payload(
-        &self,
-        ws: &Workspace,
-        args: &serde_json::Value,
-    ) -> Option<crate::tools::ImagePayload> {
-        read_image_payload(ws, args, true).await
-    }
-}
-
 /// Scrub a file-read's output when the *resolved* file is credential-bearing.
 ///
 /// Deciding here rather than from `should_scrub_output` is what makes the
@@ -430,6 +418,16 @@ fn scrub_if_sensitive(resolved_path: &Path, body: String) -> String {
         crate::util::scrub_credentials(&body)
     } else {
         body
+    }
+}
+
+/// Shared tail of [`read_resolved`]: scrub the body when the resolved file is
+/// credential-bearing, then prefix the typo-recovery note, if any.
+fn finish_read_body(resolved_path: &Path, body: String, recovery_note: Option<&str>) -> String {
+    let body = scrub_if_sensitive(resolved_path, body);
+    match recovery_note {
+        Some(note) => format!("{note}\n{body}"),
+        None => body,
     }
 }
 
@@ -454,12 +452,11 @@ async fn read_resolved(
             if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
                 let bytes = read_fifo(resolved_path, fifo_read_timeout()).await?;
                 let contents = String::from_utf8_lossy(&bytes);
-                let body = format_content(&contents, args);
-                let body = scrub_if_sensitive(resolved_path, body);
-                return Ok(match recovery_note {
-                    Some(note) => format!("{note}\n{body}"),
-                    None => body,
-                });
+                return Ok(finish_read_body(
+                    resolved_path,
+                    format_content(&contents, args),
+                    recovery_note,
+                ));
             }
         }
         Err(e) => match e.kind() {
@@ -482,12 +479,8 @@ async fn read_resolved(
         "zoom" => execute_zoom(resolved_path, args).await?,
         _ => execute_content(resolved_path, args).await?,
     };
-    let body = scrub_if_sensitive(resolved_path, body);
 
-    Ok(match recovery_note {
-        Some(note) => format!("{note}\n{body}"),
-        None => body,
-    })
+    Ok(finish_read_body(resolved_path, body, recovery_note))
 }
 
 /// Wildcard path: return matching workspace files instead of failing open.
@@ -545,8 +538,8 @@ async fn execute_content(resolved_path: &Path, args: &serde_json::Value) -> anyh
             // text so it gets the image annotation rather than rendering as
             // garbage. SVG, source, and other text are not image magic and
             // stay readable.
-            if let Some(kind) = sniff_read_image(contents.as_bytes()) {
-                return Ok(image_read_annotation(resolved_path, kind));
+            if let Some(annotation) = sniff_guard(resolved_path, contents.as_bytes()) {
+                return Ok(annotation);
             }
             Ok(format_content(&contents, args))
         }
@@ -562,8 +555,8 @@ async fn execute_content(resolved_path: &Path, args: &serde_json::Value) -> anyh
             // Content-sniff (magic bytes, never the extension) so SVG and
             // other text files stay readable as text and only real raster
             // images take the image path.
-            if let Some(kind) = sniff_read_image(&bytes) {
-                return Ok(image_read_annotation(resolved_path, kind));
+            if let Some(annotation) = sniff_guard(resolved_path, &bytes) {
+                return Ok(annotation);
             }
 
             // Lossy fallback — replaces invalid bytes with U+FFFD
@@ -730,9 +723,7 @@ fn format_content(contents: &str, args: &serde_json::Value) -> String {
     }
 
     let offset = super::get_opt_u64(args, "offset").map_or(0, |v| {
-        usize::try_from(v.max(1))
-            .unwrap_or(usize::MAX)
-            .saturating_sub(1)
+        usize::try_from(v).unwrap_or(usize::MAX).saturating_sub(1)
     });
     let start = offset.min(total);
 
@@ -1166,18 +1157,12 @@ fn parse_header_line_count(header: &str) -> usize {
         // "[Lines X-Y of Z]"
         if let Some(inner) = rest.strip_suffix(']')
             && let Some(range) = inner.strip_prefix("Lines ")
-            && let Some((start, end)) = range.split_once(" of ")
+            && let Some((start, _end)) = range.split_once(" of ")
+            && let Some((lo, hi)) = start.split_once('-')
         {
-            if let Some((lo, hi)) = start.split_once('-') {
-                let lo: usize = lo.parse().unwrap_or(0);
-                let hi: usize = hi.parse().unwrap_or(0);
-                return hi.saturating_sub(lo) + 1;
-            }
-            // edge: "[Lines X of Z]" shouldn't happen but handle gracefully
-            if let Ok(n) = start.parse::<usize>() {
-                let end_n: usize = end.parse().unwrap_or(0);
-                return end_n.saturating_sub(n) + 1;
-            }
+            let lo: usize = lo.parse().unwrap_or(0);
+            let hi: usize = hi.parse().unwrap_or(0);
+            return hi.saturating_sub(lo) + 1;
         }
     }
     0
@@ -1207,6 +1192,11 @@ mod tests {
     use crate::workspace::test_ws;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// Default (non-strict) read tool for the common test scenarios.
+    fn tool() -> ReadTool {
+        ReadTool::general()
+    }
 
     /// Create a temporary workspace directory for read tests.
     /// Writes initial `files` (relative_path, content) if any.
@@ -1269,7 +1259,7 @@ mod tests {
         let (_dir, ws_path) = temp_workspace(&[("test.txt", "hello world")]);
 
         // existing file
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "test.txt"}))
             .await;
         assert!(result.is_ok(), "read should succeed: {result:?}");
@@ -1277,7 +1267,7 @@ mod tests {
         assert!(result.contains("1: hello world"));
         assert!(result.contains("[1 lines total]"));
         // nonexistent file
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "nope.txt"}))
             .await;
         assert!(
@@ -1290,7 +1280,7 @@ mod tests {
         tokio::fs::write(ws_path.join("empty.txt"), "")
             .await
             .unwrap();
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "empty.txt"}),
@@ -1313,7 +1303,7 @@ mod tests {
 
         let (_dir, ws_path) = temp_workspace(&[("alpha.rs", "fn alpha() {}")]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(&test_ws(&ws_path), json!({"path": "*.rs"}))
             .await;
         assert!(
@@ -1332,7 +1322,7 @@ mod tests {
         // path traversal
         let (dir1, ws_path1) = temp_workspace(&[]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path1),
                 json!({"path": "../../../etc/passwd"}),
@@ -1342,7 +1332,7 @@ mod tests {
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("not allowed"));
         // absolute path
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path1),
                 json!({"path": "/etc/passwd"}),
@@ -1358,7 +1348,7 @@ mod tests {
         drop(dir1);
         let (_dir2, ws_path2) = temp_workspace(&[]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path2),
                 json!({"path": "test\0evil.txt"}),
@@ -1376,7 +1366,7 @@ mod tests {
     async fn file_read_nested_path() {
         let (_dir, ws_path) = temp_workspace(&[("sub/dir/deep.txt", "deep content")]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "sub/dir/deep.txt"}),
@@ -1402,7 +1392,7 @@ mod tests {
         // Symlink to /etc/passwd — a real file outside workspace and temp_dir
         symlink("/etc/passwd", workspace.join("escape.txt")).unwrap();
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&workspace),
                 json!({"path": "escape.txt"}),
@@ -1425,7 +1415,10 @@ mod tests {
         // Workspace file literally named `id_rsa` — denied in both variants.
         let (dir, ws_path) = temp_workspace(&[("id_rsa", "secret")]);
         let ws = Workspace::from_path(&ws_path);
-        for tool in [&ReadTool as &dyn Tool, &StrictReadTool as &dyn Tool] {
+        for tool in [
+            &ReadTool::general() as &dyn Tool,
+            &ReadTool::workspace_only() as &dyn Tool,
+        ] {
             let result = tool.execute(&ws, json!({"path": "id_rsa"})).await;
             assert!(result.is_err(), "id_rsa should be denied: {result:?}");
             let err = format!("{}", result.unwrap_err());
@@ -1444,7 +1437,7 @@ mod tests {
         symlink(keys_dir.join("id_rsa"), workspace.join("data.txt")).unwrap();
 
         let ws = Workspace::from_path(&workspace);
-        let result = ReadTool.execute(&ws, json!({"path": "data.txt"})).await;
+        let result = tool().execute(&ws, json!({"path": "data.txt"})).await;
         assert!(
             result.is_err(),
             "symlinked key should be denied: {result:?}"
@@ -1456,9 +1449,7 @@ mod tests {
         // under it is protected; the directory-link itself is the path-level case
         // already covered in path.rs.
         symlink(&keys_dir, workspace.join("dirlink")).unwrap();
-        let result = ReadTool
-            .execute(&ws, json!({"path": "dirlink/id_rsa"}))
-            .await;
+        let result = tool().execute(&ws, json!({"path": "dirlink/id_rsa"})).await;
         assert!(
             result.is_err(),
             "dir-symlinked key should be denied: {result:?}"
@@ -1472,7 +1463,7 @@ mod tests {
         // A credential-bearing config file is readable (Ok) — hardening is the
         // scrub tier (output scrubbing in `read_resolved`), not a hard deny.
         let (_dir, ws_path) = temp_workspace(&[("settings.xml", "<settings/>")]);
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "settings.xml"}),
@@ -1486,7 +1477,7 @@ mod tests {
         // End-to-end scrub tier: the resolved path `.env` is credential-bearing,
         // so the output is scrubbed before the LLM sees it.
         let (_dir, ws_path) = temp_workspace(&[(".env", "API_KEY=sk-1234567890")]);
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": ".env"}))
             .await;
         assert!(result.is_ok(), "read should succeed: {result:?}");
@@ -1511,7 +1502,7 @@ mod tests {
 
         let (_dir, ws_path) = temp_workspace(&[(".env", "API_KEY=sk-1234567890")]);
         symlink(".env", ws_path.join("innocent.txt")).unwrap();
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "innocent.txt"}),
@@ -1533,7 +1524,7 @@ mod tests {
     async fn read_does_not_scrub_plain_file() {
         // A non-sensitive filename with the same content is returned verbatim.
         let (_dir, ws_path) = temp_workspace(&[("notes.txt", "API_KEY=sk-1234567890")]);
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "notes.txt"}),
@@ -1556,7 +1547,7 @@ mod tests {
         let (_dir, ws_path) = temp_workspace(&[("lines.txt", "aaa\nbbb\nccc\nddd\neee")]);
 
         // Read lines 2-3
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "lines.txt", "offset": 2, "limit": 2}),
@@ -1567,7 +1558,7 @@ mod tests {
         assert!(result.contains("2: bbb") && result.contains("3: ccc"));
         assert!(!result.contains("1: aaa") && !result.contains("4: ddd"));
         // Offset to end
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "lines.txt", "offset": 4}),
@@ -1577,7 +1568,7 @@ mod tests {
         let result = result.unwrap();
         assert!(result.contains("4: ddd") && result.contains("5: eee"));
         // Limit only (first 2 lines)
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "lines.txt", "limit": 2}),
@@ -1590,7 +1581,7 @@ mod tests {
         tokio::fs::write(ws_path.join("short.txt"), "one\ntwo")
             .await
             .unwrap();
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "short.txt", "offset": 100}),
@@ -1615,7 +1606,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "huge.bin"}))
             .await;
         assert!(
@@ -1638,7 +1629,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "data.bin"}))
             .await;
 
@@ -1680,7 +1671,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "bad.gif"}))
             .await
             .expect("unsupported image read must succeed");
@@ -1706,7 +1697,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "corrupt.png"}),
@@ -1733,7 +1724,7 @@ mod tests {
             .unwrap();
         let ws = Workspace::from_path(&ws_path);
 
-        let payload = ReadTool
+        let payload = tool()
             .image_payload(&ws, &json!({"path": "tiny.png"}))
             .await;
         let payload = payload.expect("image payload must be produced");
@@ -1762,7 +1753,7 @@ mod tests {
     async fn image_payload_non_image_returns_none() {
         let (_dir, ws_path) = temp_workspace(&[("hello.txt", "hello world")]);
         let ws = Workspace::from_path(&ws_path);
-        let payload = ReadTool
+        let payload = tool()
             .image_payload(&ws, &json!({"path": "hello.txt"}))
             .await;
         assert!(payload.is_none());
@@ -1782,7 +1773,7 @@ mod tests {
             .unwrap();
         let ws = Workspace::from_path(&ws_path);
 
-        let result = ReadTool
+        let result = tool()
             .execute(&ws, json!({"path": "tiny.png"}))
             .await
             .expect("native image read must succeed");
@@ -1793,7 +1784,7 @@ mod tests {
             "execute output must stay claim-neutral, got: {result}"
         );
 
-        let payload = ReadTool
+        let payload = tool()
             .image_payload(&ws, &json!({"path": "tiny.png"}))
             .await
             .expect("pipeline image payload must be produced");
@@ -1822,7 +1813,7 @@ mod tests {
         let ws = Workspace::from_path(&ws_path);
 
         // execute with a typo'd path that the fuzzy matcher recovers to the file.
-        let result = ReadTool
+        let result = tool()
             .execute(&ws, json!({"path": "tiny_imag.png"}))
             .await
             .expect("recovered image read must succeed");
@@ -1831,7 +1822,7 @@ mod tests {
 
         // image_payload must attach the recovered image (not just annotate it),
         // and surface the recovery note for the tool-result annotation.
-        let payload = ReadTool
+        let payload = tool()
             .image_payload(&ws, &json!({"path": "tiny_imag.png"}))
             .await
             .expect("recovered image payload must be produced");
@@ -1879,7 +1870,7 @@ mod tests {
     #[test]
     fn format_output_short_passthrough() {
         let input = "[3 lines total]\n1: a\n2: b\n3: c";
-        let result = ReadTool.format_output(input);
+        let result = tool().format_output(input);
         assert_eq!(result, input);
     }
 
@@ -1894,7 +1885,7 @@ mod tests {
             .join("\n");
         let input = format!("{header}\n{body_lines}");
 
-        let result = ReadTool.format_output(&input);
+        let result = tool().format_output(&input);
 
         // Header must be at the top, preserved
         assert!(result.starts_with(header), "header must be first");
@@ -1924,7 +1915,7 @@ mod tests {
     #[test]
     fn format_output_fallback_for_unstructured_output() {
         let input = "a".repeat(6000);
-        let result = ReadTool.format_output(&input);
+        let result = tool().format_output(&input);
         assert!(result.contains("bytes omitted at tool output truncation"));
     }
 
@@ -1944,7 +1935,7 @@ mod utils;
 ";
         let (_dir, ws_path) = temp_workspace(&[("lib.rs", code)]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "lib.rs", "mode": "symbols"}),
@@ -1972,7 +1963,7 @@ mod utils;
     async fn symbols_mode_unsupported_extension() {
         let (_dir, ws_path) = temp_workspace(&[("data.yaml", "{}")]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "data.yaml", "mode": "symbols"}),
@@ -1995,7 +1986,7 @@ mod utils;
             "fn greet(name: &str) -> String {\n    format!(\"Hi, {name}!\")\n}\n\nfn main() {}";
         let (_dir, ws_path) = temp_workspace(&[("main.rs", code)]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &test_ws(&ws_path),
                 json!({"path": "main.rs", "mode": "zoom", "symbol": "greet"}),
@@ -2019,7 +2010,7 @@ mod utils;
     async fn zoom_mode_symbol_not_found() {
         let (_dir, ws_path) = temp_workspace(&[("lib.rs", "fn existing() {}")]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &test_ws(&ws_path),
                 json!({"path": "lib.rs", "mode": "zoom", "symbol": "nope"}),
@@ -2043,7 +2034,7 @@ mod utils;
     async fn zoom_mode_missing_symbol_param() {
         let (_dir, ws_path) = temp_workspace(&[("lib.rs", "fn f() {}")]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "lib.rs", "mode": "zoom"}),
@@ -2063,7 +2054,7 @@ mod utils;
         let (_dir, ws_path) = temp_workspace(&[("a.txt", "alpha"), ("b.rs", "beta")]);
         tokio::fs::create_dir(ws_path.join("sub")).await.unwrap();
 
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
             .await;
         assert!(result.is_ok(), "dir listing should succeed: {result:?}");
@@ -2082,7 +2073,7 @@ mod utils;
     async fn directory_listing_subdir_without_trailing_slash() {
         let (_dir, ws_path) = temp_workspace(&[("sub/inside.txt", "nested")]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "sub"}))
             .await;
         assert!(
@@ -2105,7 +2096,7 @@ mod utils;
     async fn directory_listing_empty() {
         let (_dir, ws_path) = temp_workspace(&[]);
 
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
             .await;
         assert!(
@@ -2130,7 +2121,7 @@ mod utils;
             .await
             .unwrap();
 
-        let result = ReadTool
+        let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
             .await;
         assert!(result.is_ok(), "dir with spaces should succeed: {result:?}");
@@ -2154,7 +2145,7 @@ mod utils;
         symlink(&real_dir, &link).unwrap();
 
         // Reading the symlink directly (it resolves to the directory)
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "link_to_real"}),
@@ -2326,7 +2317,7 @@ impl Baz {}
         // The tool-level path also errors instead of hanging (bounded via env).
         let _guard = crate::util::test::set_env_var("MAHBOT_FIFO_READ_TIMEOUT_SECS", Some("1"));
         let ws = test_ws(dir.path());
-        let result = ReadTool
+        let result = tool()
             .execute(
                 &ws,
                 json!({"path": fifo_path.to_string_lossy().into_owned()}),
