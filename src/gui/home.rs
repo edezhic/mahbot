@@ -1234,15 +1234,7 @@ impl HomeState {
         } else {
             role_btn.into()
         };
-        controls.push(
-            tooltip(
-                role_btn,
-                text("switch agent").size(theme::TEXT_11),
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .into(),
-        );
+        controls.push(super::widgets::tooltip_hint(role_btn, "switch agent"));
 
         let mic_tooltip = if transcription_disabled {
             "voice recording unavailable — local transcription is disabled"

@@ -396,6 +396,24 @@ where
     .into()
 }
 
+/// Bare text-hint tooltip: wraps `content` in a top-positioned tooltip with a
+/// [`theme::TEXT_11`] label styled by [`theme::tooltip_style`]. Sites that
+/// chain extra `Tooltip` modifiers (`.delay`, `.gap`, other positions) or a
+/// non-default-size label keep their bespoke construction.
+#[must_use]
+pub(crate) fn tooltip_hint<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl Into<Cow<'a, str>>,
+) -> Element<'a, Message> {
+    tooltip(
+        content,
+        text(label.into()).size(theme::TEXT_11),
+        tooltip::Position::Top,
+    )
+    .style(theme::tooltip_style)
+    .into()
+}
+
 /// Compact gray X removal/cancel control: a 12px [`lucide::x`] glyph in
 /// [`theme::TEXT_SECONDARY`] on a transparent button that highlights on
 /// hover (like [`theme::button_text`]). The glyph is the button's only

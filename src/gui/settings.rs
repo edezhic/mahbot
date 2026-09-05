@@ -1704,16 +1704,14 @@ impl SettingsState {
                         // maintainer toggle, pause/unpause toggle.
                         container(
                             row![
-                                tooltip(
+                                widgets::tooltip_hint(
                                     widgets::badge_pill(
                                         ws_item.status.to_string(),
                                         theme::workspace_status_color(ws_item.status),
                                         widgets::PILL_MODAL,
                                     ),
-                                    text("Status").size(theme::TEXT_11),
-                                    tooltip::Position::Top,
-                                )
-                                .style(theme::tooltip_style),
+                                    "Status",
+                                ),
                                 widgets::icon_tooltip_button(
                                     widgets::maint_badge(maintainer_on),
                                     if maintainer_on {
@@ -2255,29 +2253,19 @@ impl SettingsState {
                                 .iter()
                                 .find(|o| o.value == ws_value)
                                 .cloned();
-                            container(
-                                tooltip(
-                                    pick_list(
-                                        us.workspace_options.as_slice(),
-                                        ws_selected,
-                                        |opt| {
-                                            SettingsMessage::UserMsg(
-                                                users::UsersMessage::UpdateWorkspace(
-                                                    user.name.clone(),
-                                                    opt.value,
-                                                ),
-                                            )
-                                        },
-                                    )
-                                    .style(theme::pick_list_style)
-                                    .menu_style(theme::pick_list_menu_style)
-                                    .padding([theme::PAD_4, theme::PAD_8])
-                                    .width(Length::Fixed(120.0)),
-                                    text("Active workspace").size(theme::TEXT_11),
-                                    tooltip::Position::Top,
-                                )
-                                .style(theme::tooltip_style),
-                            )
+                            container(widgets::tooltip_hint(
+                                pick_list(us.workspace_options.as_slice(), ws_selected, |opt| {
+                                    SettingsMessage::UserMsg(users::UsersMessage::UpdateWorkspace(
+                                        user.name.clone(),
+                                        opt.value,
+                                    ))
+                                })
+                                .style(theme::pick_list_style)
+                                .menu_style(theme::pick_list_menu_style)
+                                .padding([theme::PAD_4, theme::PAD_8])
+                                .width(Length::Fixed(120.0)),
+                                "Active workspace",
+                            ))
                             .width(Length::FillPortion(20))
                             .align_x(Alignment::Start)
                             .align_y(Alignment::Center)
@@ -2301,7 +2289,7 @@ impl SettingsState {
                                             // (the first pool role).
                                             options.first().cloned()
                                         });
-                                    tooltip(
+                                    widgets::tooltip_hint(
                                         pick_list(options.as_slice(), role_selected, |opt| {
                                             SettingsMessage::UserMsg(
                                                 users::UsersMessage::UpdateRole(
@@ -2314,11 +2302,8 @@ impl SettingsState {
                                         .menu_style(theme::pick_list_menu_style)
                                         .padding([theme::PAD_4, theme::PAD_8])
                                         .width(Length::Fixed(120.0)),
-                                        text("Active role").size(theme::TEXT_11),
-                                        tooltip::Position::Top,
+                                        "Active role",
                                     )
-                                    .style(theme::tooltip_style)
-                                    .into()
                                 }
                                 _ => text("none")
                                     .size(theme::TEXT_12)

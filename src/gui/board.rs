@@ -16,6 +16,7 @@ use super::dialog;
 use super::theme;
 use super::widgets::{
     self, PILL_COMPACT, PILL_MODAL, PillMetrics, badge_pill, diff_stats_row, selectable_text,
+    tooltip_hint,
 };
 
 /// Per-file stat from `git show --numstat`.
@@ -807,26 +808,14 @@ impl BoardState {
     fn phase_badge<'a>(phase: TicketPhase, metrics: PillMetrics) -> Element<'a, BoardMessage> {
         let (fg, bg) = theme::ticket_phase_color(phase);
         let pill = badge_pill(phase.display_name(), (fg, bg), metrics);
-        tooltip(
-            pill,
-            text("Current phase").size(theme::TEXT_11),
-            tooltip::Position::Top,
-        )
-        .style(theme::tooltip_style)
-        .into()
+        tooltip_hint(pill, "Current phase")
     }
 
     /// Priority chip pill; colors from [`theme::ticket_priority_color`].
     fn priority_badge<'a>(priority: i64, metrics: PillMetrics) -> Element<'a, BoardMessage> {
         let (fg, bg) = theme::ticket_priority_color(priority);
         let pill = badge_pill(format!("P{priority}"), (fg, bg), metrics);
-        tooltip(
-            pill,
-            text("Priority").size(theme::TEXT_11),
-            tooltip::Position::Top,
-        )
-        .style(theme::tooltip_style)
-        .into()
+        tooltip_hint(pill, "Priority")
     }
 
     /// Bounce-count badge (icon + count + tooltip, matching the prereq indicator
@@ -858,15 +847,7 @@ impl BoardState {
             "Validation bounces: {bounce_count} (max {})",
             crate::pipeline::MAX_BOUNCES,
         );
-        Some(
-            tooltip(
-                indicator,
-                text(tooltip_text).size(theme::TEXT_11),
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .into(),
-        )
+        Some(tooltip_hint(indicator, tooltip_text))
     }
 
     /// Compute how many of this ticket's prerequisites are still unfulfilled.
@@ -1522,14 +1503,7 @@ impl BoardState {
             let indicator = row![pause_icon, count_text]
                 .spacing(theme::SPACE_2)
                 .align_y(Alignment::Center);
-            badge_row = badge_row.push(
-                tooltip(
-                    indicator,
-                    text(tooltip_text).size(theme::TEXT_11),
-                    tooltip::Position::Top,
-                )
-                .style(theme::tooltip_style),
-            );
+            badge_row = badge_row.push(tooltip_hint(indicator, tooltip_text));
         }
 
         // Inline commit stats: +added/−removed with color coding,
@@ -1585,7 +1559,7 @@ impl BoardState {
 
         let mut card_children: Vec<Element<'_, BoardMessage>> = vec![
             // Title + ID row: both clickable
-            tooltip(
+            tooltip_hint(
                 button(
                     column![
                         text(&ticket.title)
@@ -1601,11 +1575,8 @@ impl BoardState {
                 .width(Length::Fill)
                 .style(theme::button_text)
                 .on_press(BoardMessage::OpenModal(ticket.id.clone())),
-                text("open ticket details").size(theme::TEXT_11),
-                tooltip::Position::Top,
-            )
-            .style(theme::tooltip_style)
-            .into(),
+                "open ticket details",
+            ),
         ];
 
         // Badge + optional prereq indicator + icon row (below the clickable area)
