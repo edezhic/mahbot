@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::git::commands::{parse_numstat_lines, run_git_output};
-use crate::pipeline::board::{Ticket, TicketPhase};
+use crate::pipeline::board::{Ticket, TicketComment, TicketPhase};
 
 use iced::widget::{Column, Row, Space, button, column, container, markdown, row, text, tooltip};
 use iced::{Alignment, Element, Length, Task};
@@ -598,6 +598,16 @@ impl BoardState {
         )
     }
 
+    /// Parse all comments into the cached-markdown form used by
+    /// `comments_md` (`(index, items)` pairs).
+    fn parse_comments_md(comments: &[TicketComment]) -> Vec<(usize, Vec<markdown::Item>)> {
+        comments
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, markdown::parse(&c.content).collect()))
+            .collect()
+    }
+
     /// Apply fresh ticket detail to the modal display state.
     ///
     /// Clears the stale error, rebuilds the description/comment markdown
@@ -624,12 +634,7 @@ impl BoardState {
         } else {
             Some(markdown::parse(&ticket.description).collect())
         };
-        self.comments_md = ticket
-            .comments
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i, markdown::parse(&c.content).collect()))
-            .collect();
+        self.comments_md = Self::parse_comments_md(&ticket.comments);
         let hash_changed = self
             .selected_ticket
             .as_ref()
@@ -1169,13 +1174,7 @@ impl BoardState {
                         content: content.clone(),
                         created_at: now,
                     });
-                    // Rebuild cached markdown for all comments.
-                    self.comments_md = ticket
-                        .comments
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| (i, markdown::parse(&c.content).collect()))
-                        .collect();
+                    self.comments_md = Self::parse_comments_md(&ticket.comments);
                 }
 
                 self.sending_comment = true;
@@ -1195,7 +1194,7 @@ impl BoardState {
                     |(g, result)| BoardMessage::CommentSent(g, result),
                 )
             }
-            BoardMessage::CommentSent(generation, Ok(())) => {
+            BoardMessage::CommentSent(generation, result) => {
                 // Stale callback guard: if the modal closed or the user switched
                 // tickets since this async was dispatched, drop the result.
                 if generation != self.comment_generation {
@@ -1203,35 +1202,26 @@ impl BoardState {
                     return Task::none();
                 }
                 self.sending_comment = false;
-                // Refresh ticket detail from DB for consistency.
-                if let Some(ref ticket) = self.selected_ticket {
-                    let refresh = Self::fetch_ticket(ticket.id.clone());
-                    let toast = Task::done(BoardMessage::Toast(super::ToastMessage::SuccessMsg(
-                        "Comment added.".into(),
-                    )));
-                    Task::batch([refresh, toast])
-                } else {
-                    Task::none()
+                if let Err(e) = &result {
+                    tracing::warn!(error = %e, "Board: failed to add comment");
                 }
-            }
-            BoardMessage::CommentSent(generation, Err(e)) => {
-                // Stale callback guard
-                if generation != self.comment_generation {
-                    self.sending_comment = false;
-                    return Task::none();
-                }
-                self.sending_comment = false;
-                tracing::warn!(error = %e, "Board: failed to add comment");
-                // Remove the optimistic comment by refetching from DB.
-                let refetch = if let Some(ref ticket) = self.selected_ticket {
-                    Self::fetch_ticket(ticket.id.clone())
-                } else {
-                    Task::none()
+                // Refresh ticket detail from DB for consistency; on error this
+                // also removes the optimistic comment.
+                let refresh = match self.selected_ticket.as_ref() {
+                    Some(ticket) => Self::fetch_ticket(ticket.id.clone()),
+                    None => Task::none(),
                 };
-                let toast = Task::done(BoardMessage::Toast(super::ToastMessage::Error(format!(
-                    "Failed to add comment: {e}"
-                ))));
-                Task::batch([refetch, toast])
+                // The success toast requires an open modal; errors always surface.
+                let toast = match (&result, self.selected_ticket.as_ref()) {
+                    (Ok(()), Some(_)) => Task::done(BoardMessage::Toast(
+                        super::ToastMessage::SuccessMsg("Comment added.".into()),
+                    )),
+                    (Ok(()), None) => Task::none(),
+                    (Err(e), _) => Task::done(BoardMessage::Toast(super::ToastMessage::Error(
+                        format!("Failed to add comment: {e}"),
+                    ))),
+                };
+                Task::batch([refresh, toast])
             }
             BoardMessage::LinkClicked(_)
             | BoardMessage::Toast(_)
