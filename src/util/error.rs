@@ -77,7 +77,7 @@ pub(crate) fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option
 ///
 /// Accepts decimal seconds (e.g., `"5"`, `"2.5"`, `"120"`).
 /// Rejects negative, NaN, or infinite values.
-pub(crate) fn parse_retry_after_value(value: &str) -> Option<u64> {
+fn parse_retry_after_value(value: &str) -> Option<u64> {
     let num_str: String = value
         .trim()
         .chars()

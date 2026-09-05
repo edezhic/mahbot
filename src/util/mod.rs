@@ -494,10 +494,9 @@ pub(crate) async fn local_image_to_compressed_data_uri_with_meta(
 
 /// Map a decodable raster format to its uppercase source-format label used in
 /// image annotations (`"PNG" | "JPEG" | "WEBP"`). Returns `None` for any format
-/// mahbot does not attach natively (GIF/BMP/...). This is the single source of
-/// the native PNG/JPEG/WebP set: both the read tool's content sniff and the
-/// inbound-compression path derive their format decision here, so a future
-/// change to the native set only touches this one function (no drift risk).
+/// mahbot does not attach natively (GIF/BMP/...). Callers that derive their
+/// format decision here: the read tool's content sniff, the inbound-compression
+/// path, `mime_for_raster_bytes`, and media_target's image classification.
 #[must_use]
 pub(crate) fn image_format_native_label(fmt: image::ImageFormat) -> Option<&'static str> {
     use image::ImageFormat;
@@ -519,20 +518,51 @@ pub(crate) fn image_format_native_label(fmt: image::ImageFormat) -> Option<&'sta
 /// `flatten_alpha_onto_white` helpers. The input-size ceiling is enforced by
 /// the caller (`local_image_to_compressed_data_uri_with_meta`, metadata-first).
 fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32, String)> {
-    use image::GenericImageView;
-    let mut img = image::load_from_memory(bytes).context("Failed to decode inbound image")?;
     let format = match image::guess_format(bytes) {
         Ok(f) => image_format_native_label(f).unwrap_or("IMAGE"),
         Err(_) => "IMAGE",
     };
+    let (out, width, height) = compress_jpeg_core(
+        bytes,
+        "inbound",
+        |w, h| {
+            let longest = w.max(h);
+            #[expect(clippy::cast_precision_loss)]
+            let scale = INBOUND_IMAGE_MAX_SIDE as f32 / longest as f32;
+            scale
+        },
+        INBOUND_IMAGE_JPEG_QUALITY,
+    )?;
+    Ok((out, width, height, format.to_string()))
+}
+
+/// Shared compression core of [`compress_inbound_image`] and
+/// [`compress_reference_step`]: decode, apply EXIF orientation, optionally
+/// downscale (when `scale_for` yields < 1.0; aspect-preserving, Triangle
+/// filter, min 1 px), flatten alpha onto white, and re-encode as JPEG at
+/// `quality`. `label` threads the caller-specific error context ("inbound" /
+/// "reference"); returns the encoded bytes plus the final (post-resize/
+/// post-flatten) dimensions.
+fn compress_jpeg_core(
+    bytes: &[u8],
+    label: &str,
+    scale_for: impl FnOnce(u32, u32) -> f32,
+    quality: u8,
+) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    use image::GenericImageView;
+    let mut img = image::load_from_memory(bytes)
+        .with_context(|| format!("Failed to decode {label} image"))?;
+    // EXIF orientation is metadata, not pixels: `load_from_memory` returns the
+    // stored pixels as-is, and the JPEG encoder below starts from an empty EXIF
+    // buffer — so over-cap phone JPEGs would otherwise be re-encoded silently
+    // rotated from the user's intent. Apply the tag before downscaling so the
+    // output dimensions reflect the true orientation.
     if let Some(orientation) = exif_orientation(bytes) {
         img.apply_orientation(orientation);
     }
     let (w, h) = img.dimensions();
-    let longest = w.max(h);
-    let img = if longest > INBOUND_IMAGE_MAX_SIDE {
-        #[expect(clippy::cast_precision_loss)]
-        let scale = INBOUND_IMAGE_MAX_SIDE as f32 / longest as f32;
+    let scale = scale_for(w, h);
+    let img = if scale < 1.0 {
         #[expect(
             clippy::cast_precision_loss,
             clippy::cast_possible_truncation,
@@ -553,10 +583,7 @@ fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32, St
     let (width, height) = rgb.dimensions();
     let mut out = Vec::new();
     {
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-            &mut out,
-            INBOUND_IMAGE_JPEG_QUALITY,
-        );
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
         encoder
             .encode(
                 rgb.as_raw(),
@@ -564,9 +591,9 @@ fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32, St
                 rgb.height(),
                 image::ExtendedColorType::Rgb8,
             )
-            .context("Failed to encode compressed inbound image")?;
+            .with_context(|| format!("Failed to encode compressed {label} image"))?;
     }
-    Ok((out, width, height, format.to_string()))
+    Ok((out, width, height))
 }
 
 // ── Reference-image loading & compression (image_gen / video_gen) ────────
@@ -580,7 +607,7 @@ const MAX_REFERENCE_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 /// per-image ceiling does not bound a multi-reference total, and the fail-open
 /// path (no catalog cap) would otherwise hold up to 16 × 50 MB of source bytes
 /// in memory before the body budget runs.
-pub(crate) const MAX_TOTAL_REFERENCE_INPUT_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_TOTAL_REFERENCE_INPUT_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Bound on a reference-image read: guards the narrow metadata→read window
 /// where a path swapped to a FIFO/special file could otherwise block forever
@@ -798,62 +825,22 @@ fn sniff_reference_content(path: &Path, bytes: &[u8]) -> anyhow::Result<image::I
             path.display(),
         )
     })?;
-    match format {
-        image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP => Ok(format),
-        other => anyhow::bail!(
-            "Reference image {}: unsupported image format ({other:?}). Only PNG, JPEG, \
+    if image_format_native_label(format).is_none() {
+        anyhow::bail!(
+            "Reference image {}: unsupported image format ({format:?}). Only PNG, JPEG, \
              or WebP images are accepted.",
             path.display(),
-        ),
+        );
     }
+    Ok(format)
 }
 
 /// One bounded compression step: decode, optionally downscale, flatten alpha
 /// onto white, and re-encode as JPEG at the ladder's quality.
 fn compress_reference_step(bytes: &[u8], step: usize) -> anyhow::Result<Vec<u8>> {
-    use image::GenericImageView;
     // Both call sites guarantee `step < REFERENCE_COMPRESSION_LADDER.len()`.
     let (scale, quality) = REFERENCE_COMPRESSION_LADDER[step];
-    let mut img = image::load_from_memory(bytes).context("Failed to decode reference image")?;
-    // EXIF orientation is metadata, not pixels: `load_from_memory` returns the
-    // stored pixels as-is, and the JPEG encoder below starts from an empty EXIF
-    // buffer — so over-cap phone JPEGs would otherwise be re-encoded silently
-    // rotated from the user's intent. Apply the tag before downscaling so the
-    // output dimensions reflect the true orientation.
-    if let Some(orientation) = exif_orientation(bytes) {
-        img.apply_orientation(orientation);
-    }
-    let img = if scale < 1.0 {
-        let (w, h) = img.dimensions();
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let nw = (w as f32 * scale).round().max(1.0) as u32;
-        #[expect(
-            clippy::cast_precision_loss,
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss
-        )]
-        let nh = (h as f32 * scale).round().max(1.0) as u32;
-        img.resize(nw, nh, image::imageops::FilterType::Triangle)
-    } else {
-        img
-    };
-    let rgb = flatten_alpha_onto_white(&img);
-    let mut out = Vec::new();
-    {
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
-        encoder
-            .encode(
-                rgb.as_raw(),
-                rgb.width(),
-                rgb.height(),
-                image::ExtendedColorType::Rgb8,
-            )
-            .context("Failed to encode compressed reference image")?;
-    }
+    let (out, _, _) = compress_jpeg_core(bytes, "reference", |_, _| scale, quality)?;
     Ok(out)
 }
 
@@ -900,7 +887,7 @@ pub(crate) const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm
 /// editing); unsupported formats silently fall back to the plain annotation.
 /// The transcription path uploads with the extension-derived MIME, so every
 /// whitelisted format is served with its real content type.
-pub(crate) const TRANSCRIBABLE_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mpeg", "mov", "webm"];
+const TRANSCRIBABLE_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mpeg", "mov", "webm"];
 
 /// Recognized image file extensions for video_edit image inputs (reference
 /// images and frame anchors), matching the provider-declared formats. It
