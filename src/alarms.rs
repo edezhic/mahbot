@@ -239,6 +239,22 @@ pub(crate) async fn remove_alarm(session_id: &str, id: &str) -> Result<Option<Al
     Ok(Some(alarm))
 }
 
+/// Soft-delete an alarm regardless of its current status (idempotent).
+///
+/// Unlike [`remove_alarm`] this has no `status = 'active'` gate, so it also
+/// deletes an already-fired one-shot. Used on command-alarm failure so a
+/// failed alarm can never re-fire.
+async fn delete_alarm_after_failure(alarm: &Alarm) -> Result<()> {
+    store()
+        .conn
+        .execute(
+            "UPDATE alarms SET status = 'removed' WHERE id = ?1 AND session_id = ?2",
+            db::params![alarm.id.as_str(), alarm.session_id.as_str()],
+        )
+        .await?;
+    Ok(())
+}
+
 /// The due alarms at `now` (RFC3339 UTC), ordered by next fire time.
 pub(crate) async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
     let sql = format!(
@@ -372,7 +388,8 @@ static COMMANDS_IN_FLIGHT: LazyLock<std::sync::Mutex<HashSet<String>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
 /// Fire a command-armed alarm: re-verify ownership, advance state, then spawn
-/// a detached task that runs the command and delivers its output.
+/// a detached task that runs the command and delivers its output. A failed
+/// command also soft-deletes the alarm (see [`run_alarm_command_task`]).
 async fn fire_command_alarm(alarm: &Alarm, command: &str) -> Result<()> {
     // Admin re-verification at fire time: the owner must still have admin
     // rights, else degrade to a plain reminder.
@@ -417,7 +434,9 @@ impl Drop for InFlightGuard {
 
 /// Run a command-armed alarm's command in the owner's personal workspace and
 /// deliver its notification — or stay silent when the command succeeded with
-/// no output (see [`alarm_command_notification`]).
+/// no output (see [`alarm_command_notification`]). On command failure the
+/// alarm is soft-deleted before the notification is delivered, so a broken
+/// command can never keep the alarm armed and re-firing.
 async fn run_alarm_command_task(alarm: Alarm, command: String) {
     // The in-flight marker is removed unconditionally on drop.
     let _in_flight = InFlightGuard(alarm.id.clone());
@@ -425,7 +444,17 @@ async fn run_alarm_command_task(alarm: Alarm, command: String) {
     let ws = crate::users::personal_workspace_struct(&alarm.user_name);
     let outcome = crate::tools::shell::run_raw_command(&ws, &command).await;
 
-    match alarm_command_notification(&alarm, &command, &outcome) {
+    // A failed command deletes the alarm before the notification is delivered,
+    // so the agent can never observe it still scheduled to re-fire. Track
+    // whether the delete actually committed — the notification must not claim
+    // a deletion that didn't happen.
+    let deletion = if outcome.success {
+        None
+    } else {
+        Some(delete_alarm_after_failure(&alarm).await)
+    };
+
+    match alarm_command_notification(&alarm, &command, &outcome, deletion.as_ref()) {
         Some(content) => {
             if let Err(e) = deliver_alarm_notification(&alarm, content).await {
                 tracing::warn!(alarm = %alarm.id, error = %e, "Failed to deliver alarm command notification");
@@ -439,15 +468,18 @@ async fn run_alarm_command_task(alarm: Alarm, command: String) {
 
 /// Decide the delivery for a finished alarm-command run: `None` stays silent
 /// (the command succeeded with no output); `Some` is the rendered
-/// `<alarm-notification>` content with the status line and the (scrubbed,
-/// truncated) command output.
+/// `<alarm-notification>` content with the status line, the deletion note
+/// (when the command failed), and the (scrubbed, truncated) command output.
 ///
 /// The wake/no-wake signal is `has_output`, computed pre-redaction — so
-/// ANSI-only or fully credential-redacted output counts as empty.
+/// ANSI-only or fully credential-redacted output counts as empty. `deletion`
+/// carries the result of [`delete_alarm_after_failure`], `None` on the
+/// success path.
 fn alarm_command_notification(
     alarm: &Alarm,
     command: &str,
     outcome: &crate::tools::shell::RawCommandOutcome,
+    deletion: Option<&Result<()>>,
 ) -> Option<String> {
     if outcome.success && !outcome.has_output {
         return None;
@@ -466,6 +498,11 @@ fn alarm_command_notification(
     } else {
         format!("The command FAILED ({}).", outcome.detail)
     };
+    let deletion_line = match deletion {
+        None => String::new(),
+        Some(Ok(())) => crate::prompt::load_prompt("alarm_command_deletion.md"),
+        Some(Err(_)) => crate::prompt::load_prompt("alarm_command_deletion_failed.md"),
+    };
     Some(crate::prompt::substitute(
         &crate::prompt::load_prompt("alarm_command_notification.md"),
         &[
@@ -473,6 +510,7 @@ fn alarm_command_notification(
             ("{{fire_at}}", &alarm.next_fire_at),
             ("{{command}}", command),
             ("{{command_status}}", &status_line),
+            ("{{command_deletion}}", &deletion_line),
             ("{{command_output}}", &output_display),
         ],
     ))
@@ -748,28 +786,53 @@ mod tests {
     fn alarm_command_notification_stays_silent_on_clean_success() {
         let alarm = command_alarm();
         let outcome = raw_outcome(true, false, "");
-        assert!(alarm_command_notification(&alarm, "echo hi", &outcome).is_none());
+        assert!(alarm_command_notification(&alarm, "echo hi", &outcome, None).is_none());
     }
 
     #[test]
     fn alarm_command_notification_wakes_on_output() {
         let alarm = command_alarm();
         let outcome = raw_outcome(true, true, "all good");
-        let content = alarm_command_notification(&alarm, "echo hi", &outcome).unwrap();
+        let content = alarm_command_notification(&alarm, "echo hi", &outcome, None).unwrap();
         assert!(content.contains("<alarm-notification>"));
         assert!(content.contains("check the thing"));
         assert!(content.contains("`echo hi`"));
         assert!(content.contains("exited successfully (exit status 0)"));
         assert!(content.contains("all good"));
+        assert!(
+            !content.contains("DELETED"),
+            "success path must not report a deletion"
+        );
     }
 
     #[test]
     fn alarm_command_notification_wakes_on_failure_even_when_empty() {
         let alarm = command_alarm();
         let outcome = raw_outcome(false, false, "");
-        let content = alarm_command_notification(&alarm, "echo hi", &outcome).unwrap();
+        let content =
+            alarm_command_notification(&alarm, "echo hi", &outcome, Some(&Ok(()))).unwrap();
         assert!(content.contains("FAILED (exit status 2)"), "got: {content}");
         assert!(content.contains("(no output)"), "got: {content}");
+        assert!(content.contains("DELETED"), "got: {content}");
+    }
+
+    #[test]
+    fn alarm_command_notification_reports_failed_deletion() {
+        let alarm = command_alarm();
+        let outcome = raw_outcome(false, false, "");
+        let content = alarm_command_notification(
+            &alarm,
+            "echo hi",
+            &outcome,
+            Some(&Err(anyhow::anyhow!("db down"))),
+        )
+        .unwrap();
+        assert!(content.contains("FAILED"), "got: {content}");
+        assert!(content.contains("delete"), "got: {content}");
+        assert!(
+            !content.contains("was DELETED because the command failed"),
+            "must not claim a successful deletion"
+        );
     }
 
     #[test]
@@ -891,5 +954,81 @@ mod tests {
             job.content
         );
         crate::agent::message_router::unregister_agent("assistant:alarm-admin-it");
+    }
+
+    /// Fire-time integration: a failing command-armed alarm soft-deletes the
+    /// alarm and notifies the agent that it was deleted, so a broken command
+    /// never keeps the alarm armed and re-firing.
+    #[tokio::test]
+    async fn fire_alarm_deletes_alarm_and_notifies_on_command_failure() {
+        crate::util::test::init_test_stores().await;
+        let _ = crate::agent::message_router::init_global();
+        let owner = "alarm-admin-fail";
+        crate::users::USER_STORE
+            .get()
+            .expect("user store initialized")
+            .add_user(owner, Some("full"), crate::Role::Assistant)
+            .await
+            .unwrap();
+        let mut rx = crate::agent::message_router::register_agent("assistant:alarm-admin-fail");
+        // Insert the one-shot row so the post-fire status query has something to read.
+        store()
+            .conn
+            .execute(
+                "INSERT INTO alarms \
+                 (id, session_id, user_name, kind, text, fire_at, interval_seconds, next_fire_at, status, created_at, command) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10)",
+                db::params![
+                    "alarm-fail-run",
+                    "assistant:alarm-admin-fail",
+                    owner,
+                    "one-shot",
+                    "poll the thing",
+                    "2020-01-01T00:00:00+00:00",
+                    None::<i64>,
+                    "2020-01-01T00:00:00+00:00",
+                    db::now(),
+                    "exit 3",
+                ],
+            )
+            .await
+            .unwrap();
+        let alarm = Alarm {
+            id: "alarm-fail-run".to_string(),
+            session_id: "assistant:alarm-admin-fail".to_string(),
+            user_name: owner.to_string(),
+            kind: "one-shot".to_string(),
+            text: "poll the thing".to_string(),
+            interval_seconds: None,
+            next_fire_at: "2020-01-01T00:00:00+00:00".to_string(),
+            command: Some("exit 3".to_string()),
+        };
+
+        fire_alarm(&alarm).await.unwrap();
+
+        let job = tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+            .await
+            .expect("command run must finish in time")
+            .expect("failed command notification must route");
+        assert!(job.content.contains("<alarm-notification>"));
+        assert!(job.content.contains("poll the thing"));
+        assert!(job.content.contains("FAILED"), "got: {}", job.content);
+        assert!(job.content.contains("DELETED"), "got: {}", job.content);
+        crate::agent::message_router::unregister_agent("assistant:alarm-admin-fail");
+
+        let status: String = store()
+            .conn
+            .query(
+                "SELECT status FROM alarms WHERE id = ?1",
+                db::params!["alarm-fail-run"],
+            )
+            .await
+            .unwrap()
+            .first()
+            .map(|r| r.get(0))
+            .transpose()
+            .unwrap()
+            .expect("alarm row must exist");
+        assert_eq!(status, "removed", "failed one-shot must be soft-deleted");
     }
 }

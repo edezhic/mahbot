@@ -1,0 +1,1 @@
+The alarm was DELETED because the command failed — it was auto-deleted to avoid repeated failures. Fix the underlying problem, then recreate the alarm.
