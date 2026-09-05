@@ -24,9 +24,10 @@ use futures_util::future::join_all;
 use crate::pipeline::board::BOARD;
 use crate::prompt::{build_workspace_context, format_ticket_block, load_prompt, substitute};
 use crate::runtime_events::RuntimeEvent;
-use crate::workspace::truncate_workspace_notes;
+use crate::workspace::{WORKSPACES, truncate_workspace_notes};
 
 use crate::agent::skills;
+use crate::alarms::Alarm;
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
 use crate::{ChatMessage, ChatRole, Role, Workspace};
 
@@ -579,6 +580,8 @@ impl Session {
     /// active_models_opts     — Artist only, when the catalogs are available
     /// workspace boilerplate  — from src/prompt/context/workspace.md, substituted (always)
     /// skills                 — if any skills exist in the workspace
+    /// alarms                 — Assistant only, when the user has active alarms
+    /// workspaces             — full-access Assistant only, when workspaces are registered
     /// board_context          — Manager role only, when active tickets exist
     /// ticket_block           — when a ticket is assigned to this session
     /// ```
@@ -660,6 +663,15 @@ impl Session {
         if !skills.is_empty() {
             msgs.push(ChatMessage::system(skills::skills_to_prompt(&skills, ws)));
         }
+        // Assistant sessions carry the user's alarm snapshot and, for a
+        // full-access Assistant, the registered workspace list — the same
+        // snapshot-at-session-start contract as the board block below.
+        if matches!(role, Role::Assistant) {
+            let (alarms, workspaces) = fetch_assistant_context(user_name, full_access).await;
+            for block in assistant_context_blocks(full_access, &alarms, &workspaces) {
+                msgs.push(ChatMessage::system(&block));
+            }
+        }
         if let Some(board_context) = board_context {
             msgs.push(ChatMessage::system(&board_context));
         }
@@ -672,14 +684,15 @@ impl Session {
     /// Build fresh system prompt + ticket context + user message for the
     /// current turn.
     /// Returns messages: [role_description, active_models_opts?, workspace_boilerplate,
-    /// skills?, board_context?, ticket_block?, user_msg] plus the rendered
-    /// active-models snapshot (Artist only; `Default` when no block injected).
+    /// skills?, alarms?, workspaces?, board_context?, ticket_block?, user_msg]
+    /// plus the rendered active-models snapshot (Artist only; `Default` when no
+    /// block injected).
     ///
     /// # Caching contract
     /// The output of this function is intended to be persisted to the session
-    /// DB on the **first** turn (via `batch_append` in [`Session::init`]) and
-    /// loaded from there on subsequent turns. This function is NOT called
-    /// every turn — only on new sessions.
+    /// DB on the **first** turn (via `batch_append_with_context` in
+    /// [`Self::append_turn_message`]) and loaded from there on subsequent turns.
+    /// This function is NOT called every turn — only on new sessions.
     ///
     /// System prompts are cached; user messages carry the timestamp block —
     /// round-pinned for parallel-round first messages, fresh for everything
@@ -852,6 +865,132 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     }
     output.push_str("</workspace-board>");
     Some(output)
+}
+
+// ── Assistant context blocks (alarms + workspaces) ──────────────────────
+
+/// Upper char bound for a workspace's collapsed discovery-summary line.
+const MAX_WORKSPACE_SUMMARY_CHARS: usize = 200;
+
+/// Fetch the data for the Assistant's context blocks. Fail-open per store:
+/// an uninitialized store (`ALARMS.get()` / `WORKSPACES.get()` returning
+/// `None`) or a read error yields empty data, so the corresponding block is
+/// omitted — same contract as `build_board_context`. The alarm fetch and the
+/// workspace fetch run concurrently, and the per-workspace general-context
+/// reads are batched via `join_all`.
+async fn fetch_assistant_context(
+    user_name: &str,
+    full_access: bool,
+) -> (Vec<Alarm>, Vec<(Workspace, Option<String>)>) {
+    let alarms = async {
+        if crate::alarms::ALARMS.get().is_none() {
+            return Vec::new();
+        }
+        crate::alarms::list_user_alarms(user_name)
+            .await
+            .unwrap_or_default()
+    };
+    let workspaces = async {
+        if !full_access {
+            return Vec::new();
+        }
+        let Some(workspaces) = WORKSPACES.get() else {
+            return Vec::new();
+        };
+        let Ok(all) = workspaces.list().await else {
+            return Vec::new();
+        };
+        // Defensive: personal workspaces are never registered rows, but never
+        // let one leak into the block (or pay a context read for it).
+        let registered: Vec<Workspace> = all
+            .into_iter()
+            .filter(|w| !w.name.starts_with("personal:"))
+            .collect();
+        let summaries = join_all(
+            registered
+                .iter()
+                .map(|w| workspaces.get_general_context(&w.name)),
+        )
+        .await
+        .into_iter()
+        .map(|res| res.ok().flatten())
+        .collect::<Vec<_>>();
+        registered.into_iter().zip(summaries).collect()
+    };
+    tokio::join!(alarms, workspaces)
+}
+
+/// Compose the Assistant-only system-prompt blocks from pre-fetched data.
+/// Pure and fail-open: each block is omitted entirely when its content is
+/// empty, and the workspace list appears only for a full-access Assistant.
+/// The caller gates on `role == Assistant` (before fetching).
+fn assistant_context_blocks(
+    full_access: bool,
+    alarms: &[Alarm],
+    workspaces: &[(Workspace, Option<String>)],
+) -> Vec<String> {
+    let mut blocks = Vec::new();
+    if let Some(lines) = render_alarm_lines(alarms) {
+        blocks.push(substitute(
+            &load_prompt("context/alarms.md"),
+            &[("{{alarms}}", &lines)],
+        ));
+    }
+    if full_access && let Some(lines) = render_workspace_lines(workspaces) {
+        blocks.push(substitute(
+            &load_prompt("context/workspaces.md"),
+            &[("{{workspaces}}", &lines)],
+        ));
+    }
+    blocks
+}
+
+/// Render one line per alarm — same shape as the `list_alarms` tool output,
+/// plus the interval for periodic alarms. The command field passes through
+/// `scrub_credentials` (same contract as fired-alarm notifications) before it
+/// can land in the persisted system prompt. `None` when there are no alarms.
+fn render_alarm_lines(alarms: &[Alarm]) -> Option<String> {
+    if alarms.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for alarm in alarms {
+        let fire = crate::alarms::format_fire_time(&alarm.next_fire_at)
+            .unwrap_or_else(|_| alarm.next_fire_at.clone());
+        let _ = write!(out, "- {}, {}", alarm.id, alarm.kind);
+        if let Some(interval) = alarm.interval_seconds {
+            let _ = write!(out, " (every {interval} seconds)");
+        }
+        let _ = write!(out, ", {}, next fire: {}", alarm.text, fire);
+        if let Some(cmd) = &alarm.command {
+            let _ = write!(out, ", command: {}", crate::util::scrub_credentials(cmd));
+        }
+        out.push('\n');
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// Render one entry per registered workspace — name, status (strum Display),
+/// path, plus a one-line collapsed discovery summary when one exists. A
+/// workspace without a summary (Pending/Failed, discovery not run) is still
+/// listed, just without the summary line. Personal rows are filtered upstream
+/// in [`fetch_assistant_context`]. `None` when nothing remains.
+fn render_workspace_lines(workspaces: &[(Workspace, Option<String>)]) -> Option<String> {
+    let mut out = String::new();
+    for (ws, summary) in workspaces {
+        let _ = writeln!(out, "- {} ({}): {}", ws.name, ws.status, ws.path);
+        if let Some(summary) = summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let _ = writeln!(
+                out,
+                "  {}",
+                crate::util::truncate(
+                    &summary.split_whitespace().collect::<Vec<_>>().join(" "),
+                    MAX_WORKSPACE_SUMMARY_CHARS,
+                )
+            );
+        }
+    }
+    (!out.is_empty()).then(|| out.trim_end().to_string())
 }
 
 /// Try to find a stored workspace context for the given workspace and role.
@@ -1408,5 +1547,102 @@ mod tests {
         let b_payload: crate::ToolResultPayload =
             serde_json::from_str(&rows[3].get::<String>(2).unwrap()).unwrap();
         assert_eq!(b_payload.content, "result b", "captured sibling verbatim");
+    }
+
+    /// Pure gating of the Assistant context blocks: a plain Assistant gets
+    /// only the alarms block (the workspace list is full-access only); a
+    /// full-access Assistant gets both blocks in alarms-then-workspaces
+    /// order; empty data omits both. (Role gating lives at the call site.)
+    #[test]
+    fn assistant_blocks_gating() {
+        let alarm = Alarm {
+            id: "a1".to_string(),
+            session_id: "s1".to_string(),
+            user_name: "u".to_string(),
+            kind: "one-shot".to_string(),
+            text: "hello".to_string(),
+            command: None,
+            interval_seconds: None,
+            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        let workspaces = vec![(
+            crate::workspace::test_ws_named("/tmp/proj", "proj"),
+            Some("summary".to_string()),
+        )];
+
+        // Plain Assistant: alarms block only, no workspace list.
+        let blocks = assistant_context_blocks(false, &[alarm.clone()], &workspaces);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains("<user-alarms>"));
+        assert!(!blocks[0].contains("<registered-workspaces>"));
+
+        // Full-access Assistant: both blocks, alarms first.
+        let blocks = assistant_context_blocks(true, &[alarm.clone()], &workspaces);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].contains("<user-alarms>"));
+        assert!(blocks[1].contains("<registered-workspaces>"));
+
+        // Empty data omits both blocks.
+        assert!(assistant_context_blocks(true, &[], &[]).is_empty());
+    }
+
+    /// Alarm line rendering: a periodic interval is annotated, the command is
+    /// credential-scrubbed (raw secret never leaks), and an empty alarm set
+    /// renders as `None`.
+    #[test]
+    fn alarm_lines_scrub_and_interval() {
+        let one_shot = Alarm {
+            id: "a1".to_string(),
+            session_id: "s1".to_string(),
+            user_name: "u".to_string(),
+            kind: "one-shot".to_string(),
+            text: "hello".to_string(),
+            command: None,
+            interval_seconds: None,
+            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        let periodic = Alarm {
+            id: "a2".to_string(),
+            session_id: "s1".to_string(),
+            user_name: "u".to_string(),
+            kind: "periodic".to_string(),
+            text: "check".to_string(),
+            command: Some("curl -s -H 'api_key: supersecretvalue123' https://x".to_string()),
+            interval_seconds: Some(3600),
+            next_fire_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+
+        let lines = render_alarm_lines(&[one_shot, periodic]).expect("alarms render");
+        assert!(lines.contains("every 3600 seconds"));
+        assert!(lines.contains("command:"));
+        assert!(!lines.contains("supersecretvalue123"));
+        assert!(lines.contains("*[REDACTED]"));
+        assert!(lines.contains("next fire:"));
+
+        assert!(render_alarm_lines(&[]).is_none());
+    }
+
+    /// Workspace list rendering: the discovery summary is collapsed to one
+    /// line and a summary-less workspace is still listed. (Personal-row
+    /// filtering lives in the fetcher.) An empty slice renders as `None`.
+    #[test]
+    fn workspace_lines_summary_collapse() {
+        let workspaces = vec![
+            (
+                crate::workspace::test_ws_named("/data/proj", "proj"),
+                Some("Multi   line\nsummary text".to_string()),
+            ),
+            (
+                crate::workspace::test_ws_named("/data/other", "other"),
+                None,
+            ),
+        ];
+
+        let lines = render_workspace_lines(&workspaces).expect("workspaces render");
+        assert!(lines.contains("- proj (pending): /data/proj"));
+        assert!(lines.contains("\n  Multi line summary text"));
+        assert!(lines.contains("- other (pending): /data/other"));
+
+        assert!(render_workspace_lines(&[]).is_none());
     }
 }

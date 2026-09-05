@@ -215,6 +215,19 @@ pub(crate) async fn list_alarms(session_id: &str) -> Result<Vec<Alarm>> {
     Ok(rows.iter().map(alarm_from_row).collect::<Result<_, _>>()?)
 }
 
+/// List the active alarms for a user across all their sessions, ordered by
+/// next fire time. Unlike [`list_alarms`] (session-scoped) this is the
+/// user-wide view backing the Assistant's system-prompt alarm snapshot.
+pub(crate) async fn list_user_alarms(user_name: &str) -> Result<Vec<Alarm>> {
+    let sql = format!(
+        "SELECT {ALARM_COLUMNS} FROM alarms \
+         WHERE user_name = ?1 AND status = 'active' \
+         ORDER BY next_fire_at ASC"
+    );
+    let rows = store().conn.query(&sql, db::params![user_name]).await?;
+    Ok(rows.iter().map(alarm_from_row).collect::<Result<_, _>>()?)
+}
+
 /// Mark an active alarm as removed; returns the removed alarm or `None`.
 pub(crate) async fn remove_alarm(session_id: &str, id: &str) -> Result<Option<Alarm>> {
     let sql = format!(

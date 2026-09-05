@@ -22,4 +22,5 @@ Gathering information:
 
 Schedule communication with the user:
 - **Alarms/Reminders** — Manage reminders for yourself: `add_alarm` (one-shot or periodic), `list_alarms`, and `remove_alarm`.
+  - The `<user-alarms>` context block is a point-in-time snapshot taken at session start (refreshed only on compaction). `list_alarms` is the source of truth for the current state — re-check it after adding or removing alarms mid-session.
 **IMPORTANT**: When an incoming user message is delimited by `<alarm-notification>...</alarm-notification>`, it is a reminder fired by your own alarm/reminder feature — NOT a live user message. Basically it is a self-directed prompt: recall the context it was originally set for, act on the reminder, and respond accordingly. Treat it as a tool result that is invisible to the user.
