@@ -39,7 +39,7 @@ use crate::channels::{
 use crate::db;
 use crate::users::UserRecord;
 use crate::util::UnwrapPoison;
-use crate::{Channel, ChatEvent, Role, SendMessage, Workspace};
+use crate::{Channel, ChatEvent, Role, SendMessage};
 
 // ── Job definition ─────────────────────────────────────────────────────────
 
@@ -492,22 +492,6 @@ pub fn try_route(agent_id: &str, job: AgentJob) -> bool {
     }
 }
 
-// ── Workspace resolution ───────────────────────────────────────────────────
-
-/// Resolve a workspace by name, with personal workspace fallback.
-///
-/// Personal workspaces (names starting with `"personal:"`) are NOT stored
-/// in the `workspaces` table — they live at `~/.mahbot/userspaces/<user>/` and are
-/// constructed on the fly as ephemeral [`Workspace`] structs.
-///
-/// Returns `Ok(Some(ws))` when the workspace is found or constructed.
-/// Returns `Ok(None)` when the workspace genuinely does not exist
-/// (and is not a personal workspace).
-/// Returns `Err(e)` on database errors.
-async fn resolve_workspace(workspace_name: &str) -> anyhow::Result<Option<Workspace>> {
-    crate::users::resolve_workspace(workspace_name).await
-}
-
 // ── Consumer loop ─────────────────────────────────────────────────────────
 
 /// The consumer task that processes agent jobs for a single agent instance,
@@ -574,7 +558,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
         );
 
         // ── Resolve workspace by name ─────────────────────────────────
-        let ws = match resolve_workspace(&job.workspace_name).await {
+        let ws = match crate::users::resolve_workspace(&job.workspace_name).await {
             Ok(Some(ws)) => ws,
             Ok(None) => {
                 error!(
@@ -990,7 +974,7 @@ pub(crate) async fn deliver_agent_response_to_workspace(
 /// transport-delivered) and a transport failure (error). `workspace` names
 /// the workspace in the no-channels diagnostic (which also names the affected
 /// users).
-pub(crate) async fn deliver_response_over_channels(
+async fn deliver_response_over_channels(
     response: &str,
     users: &[UserRecord],
     role: Role,
@@ -1329,7 +1313,7 @@ mod tests {
 
         crate::util::test::create_test_workspace("/tmp/test_resolve_ws", "test_resolve_ws").await;
 
-        let result = resolve_workspace("test_resolve_ws").await;
+        let result = crate::users::resolve_workspace("test_resolve_ws").await;
         let resolved = result.expect("resolve should succeed for DB workspace");
         assert!(resolved.is_some(), "DB workspace should be found");
         assert_eq!(resolved.unwrap().name, "test_resolve_ws");
@@ -1342,7 +1326,7 @@ mod tests {
     async fn test_resolve_workspace_personal() {
         crate::util::test::init_management_test_stores().await;
 
-        let result = resolve_workspace("personal:liliana").await;
+        let result = crate::users::resolve_workspace("personal:liliana").await;
         let resolved = result.expect("resolve should succeed for personal workspace");
         let ws = resolved.expect("personal workspace should be constructed on the fly");
 
@@ -1360,7 +1344,7 @@ mod tests {
     async fn test_resolve_workspace_not_found() {
         crate::util::test::init_management_test_stores().await;
 
-        let result = resolve_workspace("nonexistent_workspace").await;
+        let result = crate::users::resolve_workspace("nonexistent_workspace").await;
         let resolved = result.expect("resolve should succeed (no error) for missing workspace");
         assert!(
             resolved.is_none(),

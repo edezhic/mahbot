@@ -633,6 +633,14 @@ async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
 /// Resolve a workspace by name, synthesizing a personal workspace
 /// (`personal:{user}`) when the name is not in the `workspaces` table.
 ///
+/// Personal workspaces are NOT stored in the table — they live at
+/// `~/.mahbot/userspaces/<user>/` and are constructed on the fly as ephemeral
+/// [`Workspace`] structs.
+///
+/// Returns `Ok(Some(ws))` when the workspace is found or constructed,
+/// `Ok(None)` when the workspace genuinely does not exist (and is not a
+/// personal workspace), `Err` on database errors.
+///
 /// Shared by the message router and the boot resume path so both treat
 /// synthetic personal workspaces identically.
 pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>> {

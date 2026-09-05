@@ -51,6 +51,7 @@ use chrono::{DateTime, Utc};
 use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::agent::registry::AGENT_REGISTRY;
 use crate::session::SessionContext;
+use crate::util::UnwrapPoison;
 use crate::{ChatRole, Role};
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -115,7 +116,7 @@ impl DeadSessionTracker {
     /// Returns `true` if the session has not exceeded the retry cap AND
     /// the adaptive backoff period has elapsed since the last attempt.
     fn should_retry(&self, agent_id: &str) -> bool {
-        let map = self.inner.lock().expect("DeadSessionTracker lock poisoned");
+        let map = self.inner.lock().unwrap_poison();
         match map.get(agent_id) {
             Some(state) => {
                 if state.attempt_count >= MAX_RETRIES {
@@ -136,7 +137,7 @@ impl DeadSessionTracker {
     /// (persistent agent failures like rate limits or API errors), since
     /// routing success ≠ recovery success.
     fn record_attempt(&self, agent_id: &str) {
-        let mut map = self.inner.lock().expect("DeadSessionTracker lock poisoned");
+        let mut map = self.inner.lock().unwrap_poison();
         let state = map.entry(agent_id.to_string()).or_insert(RetryState {
             attempt_count: 0,
             last_attempt_at: Utc::now(),
@@ -157,16 +158,13 @@ impl DeadSessionTracker {
     ///
     /// Safe to call for untracked sessions (no-op).
     fn cleanup(&self, agent_id: &str) {
-        self.inner
-            .lock()
-            .expect("DeadSessionTracker lock poisoned")
-            .remove(agent_id);
+        self.inner.lock().unwrap_poison().remove(agent_id);
     }
 
     /// Check whether a session has exhausted all retries (for logging).
     #[cfg(test)]
     fn has_exhausted_retries(&self, agent_id: &str) -> bool {
-        let map = self.inner.lock().expect("DeadSessionTracker lock poisoned");
+        let map = self.inner.lock().unwrap_poison();
         map.get(agent_id)
             .is_some_and(|s| s.attempt_count >= MAX_RETRIES)
     }

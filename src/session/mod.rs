@@ -52,17 +52,23 @@ pub(crate) const SUMMARIZATION_IMAGE_COUNT: usize = 10;
 /// after summarization compaction.
 pub(crate) const RETENTION_PER_SIDE: usize = 3;
 
+/// Decode the tool-call payload of a native assistant history frame.
+/// Returns `Some(calls)` only when the message decodes as an assistant frame
+/// carrying a tool-call payload; `None` covers non-assistant frames, decode
+/// failures, and frames without a payload. `Some([])` (payload present but
+/// empty) stays distinguishable from `None`.
+fn decoded_tool_calls(msg: &ChatMessage) -> Option<Vec<ToolCall>> {
+    match decode_native_history_message(msg) {
+        Some(DecodedNativeHistoryMessage::Assistant { tool_calls, .. }) => tool_calls,
+        _ => None,
+    }
+}
+
 /// Assistant messages carrying tool-call payloads are tool traffic — never
 /// counted toward the retention window. Mirrors the app-wide history-rendering
 /// discriminator ([`decode_native_history_message`]).
 fn is_tool_call_frame(msg: &ChatMessage) -> bool {
-    matches!(
-        decode_native_history_message(msg),
-        Some(DecodedNativeHistoryMessage::Assistant {
-            tool_calls: Some(_),
-            ..
-        })
-    )
+    decoded_tool_calls(msg).is_some()
 }
 
 /// True when the message decodes as a native assistant tool-call frame
@@ -71,16 +77,11 @@ fn is_tool_call_frame(msg: &ChatMessage) -> bool {
 /// a frame that is the session TAIL can have no following result rows, so
 /// non-empty calls there means unresolved calls.
 pub(crate) fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
-    matches!(
-        decode_native_history_message(&ChatMessage {
-            role,
-            content: content.to_string(),
-        }),
-        Some(DecodedNativeHistoryMessage::Assistant {
-            tool_calls: Some(calls),
-            ..
-        }) if !calls.is_empty()
-    )
+    decoded_tool_calls(&ChatMessage {
+        role,
+        content: content.to_string(),
+    })
+    .is_some_and(|calls| !calls.is_empty())
 }
 
 /// Select the latest [`RETENTION_PER_SIDE`] user messages and assistant answers
@@ -1088,18 +1089,21 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
         p
     };
 
-    // Delete session messages for matching transient sessions. The agents
-    // table IS the protection marker: a session referenced by any agents row
-    // is never purged. For ticket-phase jobs that protection ends when the
-    // phase purge removes the job row; launched non-phase jobs are never
-    // time-deleted, so their protection is indefinite by design (released by
-    // completion or explicit abandon).
+    // Safety-critical predicate shared by both DELETEs. The agents table IS
+    // the protection marker: a session referenced by any agents row is never
+    // purged. For ticket-phase jobs that protection ends when the phase purge
+    // removes the job row; launched non-phase jobs are never time-deleted, so
+    // their protection is indefinite by design (released by completion or
+    // explicit abandon).
+    let safety_predicate = format!(
+        "last_activity < ? AND {prefix_patterns} \
+         AND agent_id NOT IN (SELECT agent_id FROM agents)"
+    );
+
     tx.execute(
         &format!(
             "DELETE FROM sessions WHERE agent_id IN ( \
-             SELECT agent_id FROM session_metadata \
-             WHERE last_activity < ? AND {prefix_patterns} \
-               AND agent_id NOT IN (SELECT agent_id FROM agents))"
+             SELECT agent_id FROM session_metadata WHERE {safety_predicate})"
         ),
         build_params.clone(),
     )
@@ -1108,11 +1112,8 @@ pub async fn cleanup_old_transient_sessions(cutoff: &str) -> Result<u64> {
     // Delete the metadata entries themselves
     let deleted = tx
         .execute(
-            &format!(
-                "DELETE FROM session_metadata WHERE last_activity < ? AND {prefix_patterns} \
-                 AND agent_id NOT IN (SELECT agent_id FROM agents)"
-            ),
-            build_params.clone(),
+            &format!("DELETE FROM session_metadata WHERE {safety_predicate}"),
+            build_params,
         )
         .await?;
 
