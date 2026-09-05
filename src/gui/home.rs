@@ -23,8 +23,12 @@ use super::menus::{ContextMenu, MenuItem, RoleMenu, RoleMenuItem};
 use super::theme;
 use super::widgets::PickOption;
 
-/// Maximum number of message IDs to keep in the dedup set before pruning.
+/// Dedup-set prune trigger: when `seen_ids` grows past this many IDs, it is
+/// pruned down to the most recent [`DEDUP_RETAIN`] IDs.
 const DEDUP_PRUNE_THRESHOLD: usize = 500;
+
+/// Number of most-recent message IDs retained after a dedup-set prune.
+const DEDUP_RETAIN: usize = 200;
 
 /// Debounce window (ms) after a text/reply change before the draft is
 /// persisted to disk.
@@ -36,11 +40,11 @@ pub(super) const CHAT_SCROLL_ID: Id = Id::new("home_chat_scroll");
 
 /// Focus id for the chat composer editor, used to refocus it after selecting
 /// a reply target.
-pub(super) const CHAT_COMPOSER_ID: Id = Id::new("home_chat_composer");
+const CHAT_COMPOSER_ID: Id = Id::new("home_chat_composer");
 
 /// A displayed chat message in the scroll view.
 #[derive(Debug, Clone)]
-pub struct DisplayMessage {
+struct DisplayMessage {
     /// Database row ID (Some for history-loaded, None for live arrivals).
     pub id: Option<i64>,
     pub message_id: String,
@@ -118,6 +122,33 @@ impl From<ChatHistoryEntry> for DisplayMessage {
             false,
         )
     }
+}
+
+/// Broadcast a transient GUI chat event, wrapping
+/// [`crate::channels::broadcast_transient_event`] with the constants shared by
+/// every GUI call site: the `"gui"` channel, no reply reference, and a fresh
+/// timestamp. Callers pass the user and the workspace of the visible chat.
+fn broadcast_gui_transient(
+    user: &str,
+    workspace: &str,
+    message_id: &str,
+    content: &str,
+    direction: ChatDirection,
+    agent_role: Option<String>,
+    optimistic_id: Option<String>,
+) {
+    crate::channels::broadcast_transient_event(
+        message_id,
+        user,
+        content,
+        direction,
+        "gui",
+        agent_role,
+        workspace,
+        optimistic_id,
+        None,
+        &crate::db::now(),
+    );
 }
 
 /// Wrap a chat bubble in a 3:1 FillPortion row so it occupies 75% width,
@@ -729,17 +760,14 @@ impl HomeState {
             // empty picker can't strand `onboarding_script_active` with no script.
             self.onboarding_script_active = true;
             for (i, msg) in crate::onboarding::intro_messages().into_iter().enumerate() {
-                crate::channels::broadcast_transient_event(
-                    &format!("onboarding-intro-{i}"),
+                broadcast_gui_transient(
                     &user,
+                    &workspace,
+                    &format!("onboarding-intro-{i}"),
                     msg,
                     crate::ChatDirection::Agent,
-                    "gui",
                     Some("support".to_string()),
-                    &workspace,
                     None,
-                    None,
-                    &crate::db::now(),
                 );
             }
             Task::none()
@@ -810,8 +838,9 @@ impl HomeState {
     /// Try to deduplicate a message by its ID.
     ///
     /// Returns `true` if the message was already seen (caller should bail).
-    /// Inserts fresh IDs into `seen_ids` and prunes the set (keeping the
-    /// most recent 200 IDs) when it exceeds [`DEDUP_PRUNE_THRESHOLD`].
+    /// Inserts fresh IDs into `seen_ids` and, once it exceeds
+    /// [`DEDUP_PRUNE_THRESHOLD`], prunes it to the most recent [`DEDUP_RETAIN`]
+    /// IDs.
     fn try_dedup(&mut self, message_id: &str) -> bool {
         if self.seen_ids.contains(message_id) {
             return true;
@@ -823,7 +852,7 @@ impl HomeState {
                 .messages
                 .iter()
                 .rev()
-                .take(200)
+                .take(DEDUP_RETAIN)
                 .map(|m| m.message_id.clone())
                 .collect();
             self.seen_ids.retain(|id| retain.contains(id));
@@ -1982,21 +2011,24 @@ impl HomeState {
         // so it cannot resurrect on a later restore.
         self.drop_current_draft();
 
-        // Spawn a safety timeout: if sending stays true for 30 seconds
-        // (silent agent failure, crash, cancellation), auto-clear it.
-        // Generation counter prevents a stale timeout from clearing
-        // sending during a new send.
+        // Snap to end on optimistic push if auto-scroll enabled.
+        Task::batch([self.sending_timeout_task(), self.maybe_snap()])
+    }
+
+    /// Arm the 30-second SendingTimeout guard: if `sending` stays true for 30
+    /// seconds (silent agent failure, crash, cancellation), auto-clear it. The
+    /// generation counter prevents a stale timeout from clearing `sending`
+    /// during a new send.
+    fn sending_timeout_task(&mut self) -> Task<HomeMessage> {
         self.sending_gen = self.sending_gen.wrapping_add(1);
         let generation = self.sending_gen;
-        let timeout_task = Task::perform(
+        Task::perform(
             async move {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 HomeMessage::SendingTimeout(generation)
             },
             |msg| msg,
-        );
-        // Snap to end on optimistic push if auto-scroll enabled.
-        Task::batch([timeout_task, self.maybe_snap()])
+        )
     }
 
     /// Handle a Phase-1 scripted submit: broadcast the user's message
@@ -2016,67 +2048,54 @@ impl HomeState {
             Some(chat) => chat.primary.clone(),
             None => return Task::none(),
         };
-        let opt = optimistic_id;
         let send_task = Task::perform(
             async move {
                 let parsed = crate::onboarding::parse_provider_input(&content);
                 // Replace the optimistic bubble with the user's transient message.
-                crate::channels::broadcast_transient_event(
-                    &crate::generate_id(),
+                broadcast_gui_transient(
                     &user,
+                    &workspace,
+                    &crate::generate_id(),
                     &content,
                     crate::ChatDirection::User,
-                    "gui",
                     None,
-                    &workspace,
-                    opt,
-                    None,
-                    &crate::db::now(),
+                    optimistic_id,
                 );
                 let outcome: Result<(), String> = match parsed {
                     crate::onboarding::ProviderInput::Invalid => {
-                        crate::channels::broadcast_transient_event(
-                            &crate::generate_id(),
+                        broadcast_gui_transient(
                             &user,
+                            &workspace,
+                            &crate::generate_id(),
                             crate::onboarding::invalid_message(),
                             crate::ChatDirection::Agent,
-                            "gui",
                             Some("support".to_string()),
-                            &workspace,
                             None,
-                            None,
-                            &crate::db::now(),
                         );
                         Err("invalid provider input".to_string())
                     }
                     valid => match crate::onboarding::persist_provider_input(&valid).await {
                         Ok(()) => {
-                            crate::channels::broadcast_transient_event(
-                                &crate::generate_id(),
+                            broadcast_gui_transient(
                                 &user,
+                                &workspace,
+                                &crate::generate_id(),
                                 crate::onboarding::success_message(),
                                 crate::ChatDirection::Agent,
-                                "gui",
                                 Some("support".to_string()),
-                                &workspace,
                                 None,
-                                None,
-                                &crate::db::now(),
                             );
                             Ok(())
                         }
                         Err(e) => {
-                            crate::channels::broadcast_transient_event(
-                                &crate::generate_id(),
+                            broadcast_gui_transient(
                                 &user,
+                                &workspace,
+                                &crate::generate_id(),
                                 &format!("Couldn't save that: {e:#}"),
                                 crate::ChatDirection::Agent,
-                                "gui",
                                 Some("support".to_string()),
-                                &workspace,
                                 None,
-                                None,
-                                &crate::db::now(),
                             );
                             Err(e.to_string())
                         }
@@ -2089,18 +2108,7 @@ impl HomeState {
             },
             std::convert::identity,
         );
-        // Arm the 30s SendingTimeout guard (same as the normal send path) so a
-        // stalled persist can't leave `sending=true` forever.
-        self.sending_gen = self.sending_gen.wrapping_add(1);
-        let generation = self.sending_gen;
-        let timeout_task = Task::perform(
-            async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                HomeMessage::SendingTimeout(generation)
-            },
-            |msg| msg,
-        );
-        Task::batch([send_task, timeout_task])
+        Task::batch([send_task, self.sending_timeout_task()])
     }
 }
 
