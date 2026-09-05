@@ -361,9 +361,10 @@ impl Session {
     }
 
     /// Test-only thin wrapper: run the store's self-transactional settle and
-    /// mirror the rewrite into the in-memory history. Production uses
-    /// [`Self::settle_tool_results_tx`] inside the agent's atomic
-    /// settle+terminalize transaction.
+    /// mirror the rewrite into the in-memory history. Production invokes
+    /// [`SessionStore::settle_tool_results_tx`](super::SessionStore::settle_tool_results_tx)
+    /// directly inside the agent's atomic settle+terminalize transaction and
+    /// mirrors via [`Self::mirror_settled`] only after the commit.
     #[cfg(test)]
     pub(crate) async fn settle_tool_results(
         &mut self,
@@ -376,34 +377,6 @@ impl Session {
             .await?;
         self.mirror_settled(settled)?;
         Ok(())
-    }
-
-    /// Settle tool results directly after the session's last tool-call frame —
-    /// the durable half of the universal resume-completion step.
-    ///
-    /// The store rewrites the rows after the frame (delete, then re-insert the
-    /// returned final sequence: new results in frame order, then the follow-up
-    /// rows — e.g. the synthetic `user(IMAGE_*)` message). The frame-order
-    /// interleaving is the contract; the only production caller runs before
-    /// `append_turn_message`, so the dangling frame is always the session tail
-    /// and captured rows are only its sibling tool rows. Returns the settled
-    /// rows for the caller to mirror via [`Self::mirror_settled`] — which MUST
-    /// happen only after the caller's transaction commits, so a commit failure
-    /// never leaves the in-memory history settled while the DB is not.
-    ///
-    /// Runs against an IN-FLIGHT transaction so the agent's atomic
-    /// settle+terminalize commits the store rewrite and the job deletion in one
-    /// transaction. The caller owns `commit`/`rollback`.
-    pub(crate) async fn settle_tool_results_tx(
-        &self,
-        tx: &crate::db::TxGuard<'_>,
-        agent_id: &str,
-        results: &[(String, String)],
-        follow_up: &[ChatMessage],
-    ) -> Result<Vec<super::SettledRow>> {
-        crate::session::store()
-            .settle_tool_results_tx(tx, agent_id, results, follow_up)
-            .await
     }
 
     /// Mirror a store settle's returned sequence into the in-memory history:
@@ -1571,13 +1544,13 @@ mod tests {
         )];
 
         // Plain Assistant: alarms block only, no workspace list.
-        let blocks = assistant_context_blocks(false, &[alarm.clone()], &workspaces);
+        let blocks = assistant_context_blocks(false, std::slice::from_ref(&alarm), &workspaces);
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].contains("<user-alarms>"));
         assert!(!blocks[0].contains("<registered-workspaces>"));
 
         // Full-access Assistant: both blocks, alarms first.
-        let blocks = assistant_context_blocks(true, &[alarm.clone()], &workspaces);
+        let blocks = assistant_context_blocks(true, std::slice::from_ref(&alarm), &workspaces);
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].contains("<user-alarms>"));
         assert!(blocks[1].contains("<registered-workspaces>"));

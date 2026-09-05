@@ -987,8 +987,7 @@ impl Agent {
                     .begin_tx()
                     .await
                     .context("begin settle+terminalize tx")?;
-                let settled = self
-                    .session
+                let settled = crate::session::store()
                     .settle_tool_results_tx(&tx, &self.agent_id, &pairs, &follow_up)
                     .await
                     .context("settle resumed results")?;

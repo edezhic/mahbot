@@ -208,9 +208,11 @@ pub(crate) struct SessionMetadata {
 
 /// Context data stored alongside a session for recovery purposes.
 ///
-/// Populated when a user initiates a direct agent session so the dead-session
-/// recovery poller can reconstruct an [`AgentJob`](crate::agent::message_router::AgentJob)
-/// without parsing the agent ID string.
+/// Written on every non-empty turn for all roles (see
+/// [`Session::append_turn_message`](crate::session::Session::append_turn_message)),
+/// so the dead-session recovery poller can always reconstruct an
+/// [`AgentJob`](crate::agent::message_router::AgentJob) without parsing the
+/// agent ID string.
 ///
 /// # Column naming note
 ///
@@ -251,6 +253,11 @@ fn session_metadata_from_row(
     })
 }
 
+/// Row insert shared by the append and settle paths — the only two writers of
+/// `sessions` rows.
+const INSERT_SESSION_ROW: &str =
+    "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)";
+
 /// Insert messages into `sessions` and upsert `session_metadata` within an existing transaction.
 /// Shared helper used by [`SessionStore::append_messages`].
 ///
@@ -272,13 +279,9 @@ async fn insert_messages_in_transaction(
     replace: bool,
 ) -> Result<()> {
     let now = db::now();
-    // `created_at` stamps the session_metadata row only on creation (the
-    // session's creation timestamp); it must never be touched by the
-    // ON CONFLICT DO UPDATE clauses below.
-    let created_at = now.clone();
     for msg in messages {
         tx.execute(
-            "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            INSERT_SESSION_ROW,
             params![
                 agent_id,
                 msg.role.to_string(),
@@ -296,13 +299,17 @@ async fn insert_messages_in_transaction(
     // (replace). The INSERT branches rely on the `NOT NULL DEFAULT 0`
     // declaration for rows created by other paths (e.g. `set_token_length`).
     let count = i64::try_from(messages.len()).context("message batch exceeds i64")?;
-    let count_clause = if replace {
-        "message_count = excluded.message_count"
-    } else {
-        "message_count = message_count + excluded.message_count"
-    };
     match context {
         Some((channel, user_name, workspace_name, role)) => {
+            // `created_at` stamps the session_metadata row only on creation
+            // (the session's creation timestamp); it must never be touched by
+            // the ON CONFLICT DO UPDATE clause below.
+            let created_at = now.clone();
+            let count_clause = if replace {
+                "message_count = excluded.message_count"
+            } else {
+                "message_count = message_count + excluded.message_count"
+            };
             tx.execute(
                 &format!(
                     "INSERT INTO session_metadata (agent_id, last_activity, message_count, \
@@ -329,20 +336,40 @@ async fn insert_messages_in_transaction(
             )
             .await?;
         }
-        None => {
-            tx.execute(
-                &format!(
-                    "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
-                     VALUES (?1, ?2, ?3, ?4) \
-                     ON CONFLICT(agent_id) DO UPDATE SET \
-                     last_activity = excluded.last_activity, \
-                     {count_clause}"
-                ),
-                params![agent_id, now, count, created_at],
-            )
-            .await?;
-        }
+        None => upsert_message_count(tx, agent_id, count, &now, replace).await?,
     }
+    Ok(())
+}
+
+/// Upsert the context-free `session_metadata` count row: `last_activity` is
+/// stamped, `message_count` is added on append/settle (`replace=false`) or
+/// overwritten on the replace path (`replace=true`, where the old rows are
+/// already deleted so a shared increment would double-count). `created_at`
+/// is INSERT-only: it stamps the session's creation time and is never touched
+/// by the ON CONFLICT clause.
+async fn upsert_message_count(
+    tx: &TxGuard<'_>,
+    agent_id: &str,
+    count: i64,
+    now: &str,
+    replace: bool,
+) -> Result<()> {
+    let count_clause = if replace {
+        "message_count = excluded.message_count"
+    } else {
+        "message_count = message_count + excluded.message_count"
+    };
+    tx.execute(
+        &format!(
+            "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(agent_id) DO UPDATE SET \
+             last_activity = excluded.last_activity, \
+             {count_clause}"
+        ),
+        params![agent_id, now, count, now],
+    )
+    .await?;
     Ok(())
 }
 
@@ -699,10 +726,9 @@ impl SessionStore {
     /// The frame-locate SELECTs run on the SAME tx as the delete/rebuild so the
     /// locate+write is one unit — a crash (or concurrent writer) can never
     /// observe a half-settled frame. The caller owns `commit`/`rollback`.
-    #[expect(clippy::too_many_lines)] // deliberate: locate + rebuild in one tx
     pub(crate) async fn settle_tool_results_tx(
         &self,
-        tx: &crate::db::TxGuard<'_>,
+        tx: &TxGuard<'_>,
         agent_id: &str,
         results: &[(String, String)],
         follow_up: &[ChatMessage],
@@ -774,6 +800,9 @@ impl SessionStore {
         };
 
         let captured: Vec<SettledRow> = tx
+            // Raw column indices: `created_at` has no COL_SM_* constant (it is
+            // not part of SESSION_MESSAGE_COLUMNS), so the row mapping cannot
+            // go through the shared column list.
             .query_map_strict(
                 "SELECT role, content, created_at FROM sessions WHERE agent_id = ?1 AND id > ?2 ORDER BY id",
                 params![agent_id, frame_row_id],
@@ -801,7 +830,7 @@ impl SessionStore {
         let sequence = build_settle_sequence(&captured, &frame_calls, results, follow_up, &now)?;
         for row in &sequence {
             tx.execute(
-                "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+                INSERT_SESSION_ROW,
                 params![
                     agent_id,
                     row.role.clone(),
@@ -815,20 +844,12 @@ impl SessionStore {
 
         // Message count: the captured rows were deleted + re-inserted (net
         // zero); the new results and follow-up rows add exactly `results.len()
-        // + follow_up.len()`. `created_at` is the session's creation timestamp
-        // (INSERT-only).
+        // + follow_up.len()`.
         let count = i64::try_from(results.len() + follow_up.len())
             .context("settle result count exceeds i64")?;
-        tx.execute(
-            "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(agent_id) DO UPDATE SET \
-             last_activity = excluded.last_activity, \
-             message_count = message_count + excluded.message_count",
-            params![agent_id, now.clone(), count, now],
-        )
-        .await
-        .context("bump settle message count")?;
+        upsert_message_count(tx, agent_id, count, &now, false)
+            .await
+            .context("bump settle message count")?;
 
         Ok(sequence)
     }
@@ -896,14 +917,17 @@ impl SessionStore {
         let rows = self
             .conn
             .query(
-                "SELECT role, content FROM sessions WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1",
+                &format!(
+                    "SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions \
+                     WHERE agent_id = ?1 ORDER BY id DESC LIMIT 1"
+                ),
                 params![agent_id],
             )
             .await
             .ok()?;
         rows.first().and_then(|row| {
-            let role_str: String = row.get(0).ok()?;
-            let content: String = row.get(1).ok()?;
+            let role_str: String = row.get(COL_SM_ROLE).ok()?;
+            let content: String = row.get(COL_SM_CONTENT).ok()?;
             Some((role_str.parse::<ChatRole>().ok()?, content))
         })
     }

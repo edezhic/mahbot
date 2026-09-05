@@ -100,12 +100,12 @@ struct RetryState {
 ///   daemon's lifetime.
 /// * On daemon restart all entries are lost, giving every session a fresh
 ///   retry budget.
-pub(crate) struct DeadSessionTracker {
+struct DeadSessionTracker {
     inner: Mutex<HashMap<String, RetryState>>,
 }
 
 impl DeadSessionTracker {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
         }
@@ -172,7 +172,7 @@ impl DeadSessionTracker {
 
 // ── Global instance ─────────────────────────────────────────────────────────
 
-pub(crate) static DEAD_SESSION_TRACKER: std::sync::LazyLock<DeadSessionTracker> =
+static DEAD_SESSION_TRACKER: std::sync::LazyLock<DeadSessionTracker> =
     std::sync::LazyLock::new(DeadSessionTracker::new);
 
 // ── Poller loop ─────────────────────────────────────────────────────────────
