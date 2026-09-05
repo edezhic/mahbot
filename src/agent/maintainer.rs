@@ -105,7 +105,7 @@ pub async fn run_maintainer_loop() {
         }
 
         // Fetch all workspaces
-        let workspaces = match crate::workspace::get_workspaces().await {
+        let workspaces = match crate::workspace::store().list().await {
             Ok(list) => list,
             Err(e) => {
                 warn!(error = %e, "Maintainer: failed to list workspaces");

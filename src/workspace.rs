@@ -860,7 +860,7 @@ pub fn spawn_workspace_discovery(
 /// `diagnostics_generation` is the generation counter captured at spawn time.
 /// [`run_workspace_diagnostics`] uses it to guard against stale writes via
 /// [`check_generation`].
-pub fn spawn_diagnostics_discovery(ws: &Workspace, diagnostics_generation: i64) {
+fn spawn_diagnostics_discovery(ws: &Workspace, diagnostics_generation: i64) {
     let ws = ws.clone();
     tokio::spawn(async move {
         let ws_name = ws.name.clone();
@@ -1422,7 +1422,7 @@ impl WorkspaceStore {
     }
 
     /// Upsert a single context entry for a workspace and role.
-    pub async fn set_context(&self, name: &str, role: &str, content: &str) -> Result<()> {
+    async fn set_context(&self, name: &str, role: &str, content: &str) -> Result<()> {
         let now = db::now();
         self.conn
             .execute(
@@ -1448,7 +1448,7 @@ impl WorkspaceStore {
 
     /// Upsert the general (non-role) workspace context. The partial unique
     /// index guarantees at most one NULL-role row per workspace.
-    pub async fn set_general_context(&self, name: &str, content: &str) -> Result<()> {
+    async fn set_general_context(&self, name: &str, content: &str) -> Result<()> {
         let now = db::now();
         self.conn
             .execute(
@@ -1549,14 +1549,6 @@ pub struct EditorTabRecord {
     pub is_dirty: bool,
     /// Unsaved buffer text when `is_dirty` is true.
     pub dirty_content: Option<String>,
-}
-
-/// List all workspaces (for display).
-pub async fn get_workspaces() -> anyhow::Result<Vec<Workspace>> {
-    let store = WORKSPACES
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("Workspace store not initialized"))?;
-    store.list().await
 }
 
 /// `config_kv` key holding the RFC 3339 UTC timestamp of the last nightly
