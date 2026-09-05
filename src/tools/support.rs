@@ -343,24 +343,33 @@ impl Tool for InstallChromeUseTool {
             .map_err(err)?;
 
         Ok(
-            "chrome-use is installed: the release binary was downloaded directly and \
-             SHA-256-verified, and the native-messaging host was registered via \
-             `chrome-use extension install --no-profile` — no managed-Chrome configuration \
-             profile is ever created, so Chrome never enters \"managed by your organization\" \
-             mode.\n\
-             One MANUAL step remains — you must install the chrome-use browser extension \
-             yourself:\n\
+            "chrome-use is installed: the release binary was downloaded from the latest \
+             chrome-use GitHub release (the version is resolved at install time — only the \
+             SHA-256 checksum is pinned, verified against the published `.sha256` sidecar), \
+             placed at mahbot's managed bin location, and the native-messaging host was \
+             registered via `chrome-use extension install --no-profile` — no managed-Chrome \
+             configuration profile is ever created, so Chrome never enters \
+             \"managed by your organization\" mode. A guarded PATH block was appended to \
+             ~/.zshrc/~/.bashrc (Unix) so the `chrome-use` CLI is reachable from the \
+             user's shell.\n\
+             One MANUAL step remains — the user must install the chrome-use browser \
+             extension:\n\
              1. Open Chrome and go to the Chrome Web Store.\n\
-             2. Install the chrome-use extension (per its install docs).\n\
-             3. Pin it once installed so the native host can reach it.\n\
-             Only after that will agents be able to drive your normal browser via \
+             2. Install the `chrome-use` extension (Web Store listing `chrome-use`, ID \
+             knfcmbamhjmaonkfnjhldjedeobeafmk; `ab-connect` is its internal codename, seen \
+             in runtime messages like ab-connect.mobileconfig — same product, don't search \
+             the Store for \"ab-connect\").\n\
+             3. The connection works as soon as the extension is installed and enabled. \
+             Pinning it to the toolbar is an optional UX tip only — it is NOT required for \
+             connectivity (Chrome native messaging, no debug port).\n\
+             Only after that will agents be able to drive the user's normal browser via \
              `browser`.\n\
              Note: this setup is intentionally invasive — chrome-use gets full control \
              over the user's real browser. It must only be run after you (the Support \
              agent) have explained what it does and obtained the user's explicit consent.\n\
-             mahbot auto-updates the chrome-use binary in place (checksum-verified release \
-             download) after service startup — binary only; the extension and native host \
-             are never re-registered."
+             mahbot auto-updates the chrome-use binary once per boot, ~5 minutes after \
+             service startup — a binary-only, checksum-verified in-place swap that never \
+             first-installs and never re-registers the extension or native host."
                 .to_string(),
         )
     }
