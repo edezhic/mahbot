@@ -28,12 +28,15 @@ pub(crate) mod session_view;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod shell;
+pub(crate) mod spinner;
 pub(crate) mod text_rendering;
 pub(crate) mod theme;
 pub(crate) mod tool_failures;
 pub(crate) mod users;
 pub(crate) mod widgets;
 pub(crate) mod workspaces;
+
+pub(crate) use self::spinner::spinner;
 
 use crate::logs::LogStore;
 use crate::pipeline::board::Ticket;
@@ -1221,7 +1224,17 @@ impl Dashboard {
                     &mut self.running_expanded,
                     &crate::agent::registry::AGENT_REGISTRY.list(),
                 );
-                Task::none()
+                // The tick's Sessions work (list-cache refresh + live
+                // transcript merge) is only observable while the page is
+                // visible; navigating onto it refreshes, so gating here
+                // cannot go stale.
+                if self.page == Page::Sessions {
+                    self.sessions_state
+                        .update(sessions::SessionsMessage::RuntimeChanged)
+                        .map(Message::Sessions)
+                } else {
+                    Task::none()
+                }
             }
             Message::Home(msg) => {
                 // Intercept RequestWorkspaceChange: the Home page detected

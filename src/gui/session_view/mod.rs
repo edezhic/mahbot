@@ -31,7 +31,7 @@ pub(crate) use render::{
 /// assistant, optionally carrying a thinking block) or one assistant
 /// tool-call round (one assistant message's calls plus their
 /// tool_call_id-matched results).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SessionEntry {
     Message {
         role: crate::ChatRole,
@@ -50,7 +50,7 @@ pub(crate) enum SessionEntry {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ToolCallEntry {
     pub tool_call_id: String,
     /// Full unscrubbed args pairs (RunningTool flattening).

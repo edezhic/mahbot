@@ -71,7 +71,7 @@ pub enum ParentKey {
 /// arguments (bare strings/arrays/null) collapse to a single `("args", …)`
 /// pair. The row view truncates values at display time; the hover tooltip
 /// shows everything untruncated.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RunningTool {
     pub name: String,
     pub args: Vec<(String, String)>,

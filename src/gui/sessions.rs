@@ -93,6 +93,10 @@ pub(crate) enum SessionsMessage {
     /// A session delete finished — remove it from the list. The bool is the
     /// store-reported row deletion (`true` when a real removal happened).
     SessionDeleted(String, bool),
+
+    /// Coalesced runtime-change tick (250 ms): refresh list timestamps and
+    /// merge the selected session's live transcript when its agent is running.
+    RuntimeChanged,
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +143,8 @@ pub(crate) struct SessionsState {
     /// only new elements are measured lazily. Mutated during layout (the
     /// bubble width is only known there), hence `RefCell`.
     measure_cache: RefCell<HashMap<(usize, usize), MessageMeasure>>,
-    /// Cached session list display data. Rebuilt only when `sessions` changes.
+    /// Cached session list display data. Rebuilt when `sessions` changes and
+    /// on each runtime-change tick (to refresh relative-time labels).
     /// `view()` builds widgets from this data on every frame.
     cached_session_items: Option<Vec<CachedSessionItem>>,
 
@@ -303,6 +308,7 @@ impl SessionsState {
                     Task::none()
                 }
             }
+            SessionsMessage::RuntimeChanged => self.on_runtime_changed(),
             SessionsMessage::Toast(_) | SessionsMessage::LinkClicked(_) => Task::none(),
             SessionsMessage::Escape => {
                 self.clear_selection();
@@ -344,7 +350,8 @@ impl SessionsState {
     }
 
     /// Rebuild the cached session list display data. Called when `self.sessions`
-    /// changes. `view()` builds widgets from this data on every frame.
+    /// changes and on each runtime-change tick (to refresh relative-time labels).
+    /// `view()` builds widgets from this data on every frame.
     fn rebuild_session_cache(&mut self) {
         let now = chrono::Local::now();
         let items: Vec<CachedSessionItem> = self
@@ -377,6 +384,54 @@ impl SessionsState {
         self.cached_session_items = if items.is_empty() { None } else { Some(items) };
     }
 
+    /// Coalesced runtime-change tick: refresh the cached relative-time labels
+    /// and, when the selected session's agent is running, merge its live
+    /// transcript into the view.
+    ///
+    /// The merge is append-oriented and diffed by the longest common entry
+    /// prefix, so markdown re-parsing is limited to the changed tail and
+    /// measurement-cache keys of unchanged entries stay valid (built entries
+    /// drop their key and re-measure lazily; an in-place edit changes
+    /// `content_len`, which the stale fingerprint re-measures anyway).
+    /// Index-keyed expansion sets stay valid because the tail is append-only
+    /// and out-of-range keys are harmless. Snapshot lookup doubles as the
+    /// running check — `None` when the agent is not running; a recycled agent
+    /// id surfaces the new run's fresh (empty) holder, replacing the displayed
+    /// transcript wholesale.
+    fn on_runtime_changed(&mut self) -> Task<SessionsMessage> {
+        self.rebuild_session_cache();
+
+        let Some(ref key) = self.selected_session else {
+            return Task::none();
+        };
+        if self.selected_loading {
+            return Task::none();
+        }
+        let Some(snapshot) = crate::session::TRANSCRIPT_REGISTRY.snapshot(key) else {
+            return Task::none();
+        };
+        let live = session_view::build_ledger(&snapshot.history);
+        let common = common_entry_prefix(&self.entries, &live);
+        if common == self.entries.len() && common == live.len() {
+            return Task::none();
+        }
+        self.measure_cache
+            .borrow_mut()
+            .retain(|(i, _), _| *i < common);
+        self.entries = live;
+        self.entry_md.truncate(common);
+        self.entry_md
+            .extend(session_view::parse_entry_bodies(&self.entries[common..]));
+
+        // Live updates only auto-scroll when the user was already following
+        // the bottom (same rule as the fresh-load path).
+        if self.auto_scroll_enabled {
+            iced::widget::operation::snap_to_end(self.scrollable_id.clone())
+        } else {
+            Task::none()
+        }
+    }
+
     #[expect(clippy::too_many_lines)]
     pub(crate) fn view(&self) -> Element<'_, SessionsMessage> {
         let mut content = column![];
@@ -394,14 +449,22 @@ impl SessionsState {
             ));
         } else {
             // Session list on the left side — built from cached display data.
-            // The cache is rebuilt only when `self.sessions` changes (in
-            // `Refreshed`); cards are rebuilt from it on every frame.
+            // The cache is rebuilt when `self.sessions` changes (in
+            // `Refreshed`) and on each runtime-change tick (to refresh
+            // relative-time labels); cards are rebuilt from it on every frame.
             let mut session_list = Column::new().spacing(theme::SPACE_4);
             if let Some(ref cached) = self.cached_session_items {
+                // Live running agent ids, computed once per frame for the
+                // per-card running indicator. `list()` returns owned handles;
+                // keep them alive for the loop so the `&str` ids stay valid.
+                let running_agents = crate::agent::registry::AGENT_REGISTRY.list();
+                let running_ids: HashSet<&str> =
+                    running_agents.iter().map(|h| h.agent_id.as_str()).collect();
                 for item in cached {
                     let is_selected = self.selected_session.as_deref() == Some(&item.agent_id);
 
                     let mut title_row = iced::widget::Row::new()
+                        .width(Length::Fill)
                         .spacing(theme::SPACE_6)
                         .align_y(Alignment::Center);
                     if let Some(role) = item.role {
@@ -421,6 +484,11 @@ impl SessionsState {
                             .size(theme::TEXT_13)
                             .color(title_color),
                     );
+                    if running_ids.contains(item.agent_id.as_str()) {
+                        title_row = title_row
+                            .push(Space::new().width(Length::Fill))
+                            .push(super::spinner(theme::TEXT_14));
+                    }
 
                     let sess_row: Element<'_, SessionsMessage> = ContextMenu::new(
                         container(
@@ -559,6 +627,13 @@ impl SessionsState {
 
         widgets::page(content)
     }
+}
+
+/// Length of the longest common prefix of two ledgers (first differing
+/// entry index). `build_ledger` is deterministic, so an unchanged message
+/// prefix yields an identical entry prefix.
+fn common_entry_prefix(old: &[SessionEntry], new: &[SessionEntry]) -> usize {
+    old.iter().zip(new).take_while(|(a, b)| a == b).count()
 }
 
 /// Wrap a chat bubble in a 3:1 FillPortion row so it occupies 75% width,
@@ -1030,4 +1105,78 @@ fn render_transcript<'a>(
         scrollable_id.clone(),
         SessionsMessage::ScrollChanged,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ChatRole;
+    use crate::agent::registry::RunningTool;
+
+    fn msg(role: ChatRole, content: Option<&str>) -> SessionEntry {
+        SessionEntry::Message {
+            role,
+            content: content.map(str::to_string),
+            thinking: None,
+        }
+    }
+
+    fn tool_round() -> SessionEntry {
+        SessionEntry::ToolRound {
+            narration: Some("checking the file".to_string()),
+            reasoning: None,
+            calls: vec![ToolCallEntry {
+                tool_call_id: "call_0".to_string(),
+                tool: RunningTool {
+                    name: "read".to_string(),
+                    args: vec![("path".to_string(), "a.rs".to_string())],
+                },
+                result: Some("ok".to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn common_entry_prefix_empty_vs_empty() {
+        assert_eq!(common_entry_prefix(&[], &[]), 0);
+    }
+
+    #[test]
+    fn common_entry_prefix_identical() {
+        let old = vec![msg(ChatRole::User, Some("hi")), tool_round()];
+        let new = old.clone();
+        assert_eq!(common_entry_prefix(&old, &new), old.len());
+    }
+
+    #[test]
+    fn common_entry_prefix_pure_append() {
+        let old = vec![msg(ChatRole::User, Some("hi"))];
+        let mut new = old.clone();
+        new.push(msg(ChatRole::Assistant, Some("hello")));
+        new.push(tool_round());
+        assert_eq!(common_entry_prefix(&old, &new), old.len());
+    }
+
+    #[test]
+    fn common_entry_prefix_in_place_edit() {
+        let old = vec![
+            msg(ChatRole::User, Some("a")),
+            msg(ChatRole::Assistant, Some("b")),
+            msg(ChatRole::User, Some("c")),
+            msg(ChatRole::Assistant, Some("d")),
+        ];
+        let mut new = old.clone();
+        new[2] = msg(ChatRole::User, Some("edited"));
+        assert_eq!(common_entry_prefix(&old, &new), 2);
+    }
+
+    #[test]
+    fn common_entry_prefix_differing_lengths() {
+        let old = vec![
+            msg(ChatRole::User, Some("a")),
+            msg(ChatRole::Assistant, Some("b")),
+        ];
+        let new = vec![msg(ChatRole::User, Some("a"))];
+        assert_eq!(common_entry_prefix(&old, &new), 1);
+    }
 }
