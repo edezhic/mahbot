@@ -120,7 +120,7 @@ const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
 /// Note: this is deliberately NOT the [`TicketPhase`] declaration order —
 /// `InSanitation` is dispatched last, after review and QA. Both the dispatch
 /// snapshot query and its phase-major grouping derive from this constant.
-pub(crate) const WORKING_PHASES: &[TicketPhase] = &[
+const WORKING_PHASES: &[TicketPhase] = &[
     TicketPhase::Analysis,
     TicketPhase::InDevelopment,
     TicketPhase::InDiagnostics,
@@ -143,7 +143,7 @@ pub(crate) const WORKING_PHASES: &[TicketPhase] = &[
 /// here, `is_unblocking()` automatically picks it up; if the set ever
 /// needs to diverge from the unblocking set, this delegation must be
 /// broken explicitly.
-pub const UNBLOCKING_PHASES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase::Cancelled];
+const UNBLOCKING_PHASES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase::Cancelled];
 
 /// Terminal phases — a ticket in one of these can no longer be claimed.
 ///
@@ -151,7 +151,7 @@ pub const UNBLOCKING_PHASES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase::
 ///
 /// Note: `Failed` is deliberately included here even though it is excluded
 /// from [`UNBLOCKING_PHASES`] (a failed ticket permanently blocks dependents).
-pub const TERMINAL_PHASES: &[TicketPhase] = &[
+const TERMINAL_PHASES: &[TicketPhase] = &[
     TicketPhase::Done,
     TicketPhase::Cancelled,
     TicketPhase::Failed,
@@ -429,20 +429,12 @@ impl Ticket {
 
     /// Format comments as a `"Comments:"` block suitable for [`crate::tools::ticket::GetTicketTool`].
     ///
-    /// Returns a string starting with `"Comments:"` followed by one line per
-    /// comment in the format `"\n  [{role}] ({timestamp}): {content}"`, or
-    /// `"Comments:\n  (no comments)"` if the comment list is empty.
+    /// Renders every comment in full by delegating to [`Self::format_comments_limited`]
+    /// with unlimited characters and no truncation window; returns
+    /// `"Comments:\n  (no comments)"` when the list is empty.
     #[must_use]
     fn format_comments(&self) -> String {
-        let mut s = String::from("Comments:");
-        if self.comments.is_empty() {
-            s.push_str("\n  (no comments)");
-        } else {
-            for c in &self.comments {
-                s.push_str(&Self::comment_line(c, &c.content));
-            }
-        }
-        s
+        self.format_comments_limited(usize::MAX, self.comments.len())
     }
 
     /// Like [`Self::format_comments`], but caps each comment's content at
@@ -504,13 +496,14 @@ pub enum TicketPhase {
 }
 
 impl TicketPhase {
-    /// Returns `true` for phases that unblock dependent tickets.
+    /// Returns `true` for phases that unblock dependent tickets (`Done`,
+    /// `Cancelled`).
     ///
-    /// Delegates to [`UNBLOCKING_PHASES`] so the unblocking set can never
-    /// accidentally diverge from the prerequisite-unblocking set.
-    /// [`TicketPhase::Failed`] is not in [`UNBLOCKING_PHASES`] and is
-    /// therefore not unblocking — a failed ticket permanently blocks its
-    /// dependents and remains visible in active views for manual triage.
+    /// Delegates to the crate-private unblocking-phase set so the sets can
+    /// never accidentally diverge from the prerequisite-unblocking set.
+    /// [`TicketPhase::Failed`] is deliberately excluded — a failed ticket
+    /// permanently blocks its dependents and remains visible in active views
+    /// for manual triage.
     #[must_use]
     pub fn is_unblocking(&self) -> bool {
         UNBLOCKING_PHASES.contains(self)
@@ -520,8 +513,9 @@ impl TicketPhase {
     /// ticket in one of these can no longer be claimed, so its phase job is
     /// finished.
     ///
-    /// Delegates to [`TERMINAL_PHASES`] so the terminal set is authoritative
-    /// for both the transition-clearing clause and the implementation completion.
+    /// Delegates to the crate-private terminal-phase set so the terminal set
+    /// is authoritative for both the transition-clearing clause and the
+    /// implementation completion.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         TERMINAL_PHASES.contains(self)
@@ -1849,7 +1843,7 @@ impl BoardStore {
         Ok(updated)
     }
 
-    pub async fn archive_stale_cancelled(&self, hours: i64) -> Result<u64> {
+    async fn archive_stale_cancelled(&self, hours: i64) -> Result<u64> {
         let now = db::now();
         let cutoff = (Utc::now() - Duration::hours(hours)).to_rfc3339();
         let updated = self
@@ -1901,9 +1895,7 @@ impl BoardStore {
     /// timestamp DESC (created_at fallback), then Cancelled by created_at
     /// DESC.
     #[must_use]
-    pub fn partition_board_tickets(
-        tickets: &[Ticket],
-    ) -> (Vec<&Ticket>, Vec<&Ticket>, Vec<&Ticket>) {
+    fn partition_board_tickets(tickets: &[Ticket]) -> (Vec<&Ticket>, Vec<&Ticket>, Vec<&Ticket>) {
         let mut pending = Vec::new();
         let mut pipeline = Vec::new();
         let mut completed = Vec::new();

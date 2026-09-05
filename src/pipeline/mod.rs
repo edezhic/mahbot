@@ -65,7 +65,7 @@ use sanitation::finalize_sanitation_stage;
 
 /// Returns the global [`BoardStore`] singleton.
 #[inline]
-pub(crate) fn board() -> &'static BoardStore {
+fn board() -> &'static BoardStore {
     crate::pipeline::board::store()
 }
 
@@ -715,7 +715,7 @@ where
 
 /// Write a comment to a ticket, then transition it to a new phase.
 #[must_use]
-pub(crate) async fn comment_and_transition(
+async fn comment_and_transition(
     ctx: TransitionCtx<'_, '_>,
     role: &str,
     text: &str,
@@ -841,7 +841,7 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
 /// ticket agents, leaves an explanatory comment, pauses the workspace only for
 /// the implementation phases, and deletes the phase job. Consumes no bounce
 /// budget.
-pub(crate) async fn reset_phase_attempt(
+async fn reset_phase_attempt(
     ticket: &Ticket,
     phase: TicketPhase,
     job_id: &str,
@@ -1287,7 +1287,7 @@ async fn run_parallel_agents(
 }
 
 /// Build the raw-response dump section for a verdict-extraction failure comment.
-pub(crate) fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
+fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     match failure.last_raw.as_deref() {
         Some(text) if !text.trim().is_empty() => format!(
             "Raw agent response (last attempt):\n```\n{}\n```",
@@ -1545,7 +1545,7 @@ async fn drain_queued_siblings(ticket: &Ticket) {
 /// to Failed (terminal); the phase job is deleted and the puller re-drives.
 /// On a non-exhausting bounce the ticket goes back to InDevelopment and the
 /// phase job is deleted so the puller creates a fresh engineer attempt.
-pub(crate) async fn bounce_to_development(
+async fn bounce_to_development(
     ticket: &Ticket,
     source: TicketPhase,
     log_label: &str,
