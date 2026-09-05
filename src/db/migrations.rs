@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     reviewed_head    TEXT,
     reviewed_tree    TEXT,
     done_at          TEXT,
-    bounce_count     INTEGER NOT NULL DEFAULT 0
+    bounce_count     INTEGER NOT NULL DEFAULT 0,
+    last_transition_actor TEXT
 );
 CREATE TABLE IF NOT EXISTS ticket_comments (
     id          TEXT PRIMARY KEY,
@@ -274,7 +275,8 @@ CREATE TABLE IF NOT EXISTS ticket_chronicle (
     workspace_name TEXT NOT NULL,
     source_phase   TEXT NOT NULL,
     target_phase   TEXT NOT NULL,
-    at             TEXT NOT NULL
+    at             TEXT NOT NULL,
+    actor          TEXT
 );
 CREATE TABLE IF NOT EXISTS alarms (
     id               TEXT PRIMARY KEY,
@@ -424,6 +426,8 @@ CREATE INDEX IF NOT EXISTS idx_grep_telemetry_command ON grep_telemetry(command)
 ///   body — a real upfill on existing installs, a no-op on fresh ones.
 /// - `32` adds the nullable `alarms.command` column.
 /// - `33` adds the nullable `chat_history.broadcast_id` column.
+/// - `34` adds the `tickets.last_transition_actor` and
+///   `ticket_chronicle.actor` columns for phase-transition actor attribution.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -474,6 +478,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "33",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_chat_history_broadcast_id),
+    },
+    Migration {
+        id: "34",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_ticket_transition_actor),
     },
 ];
 
@@ -610,6 +619,26 @@ fn add_chat_history_broadcast_id<'a>(
 /// recorded).
 async fn run_add_chat_history_broadcast_id(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "chat_history", "broadcast_id").await
+}
+
+fn add_ticket_transition_actor<'a>(
+    conn: &'a Connection,
+    _root: &'a Path,
+) -> BoxFuture<'a, anyhow::Result<()>> {
+    Box::pin(run_add_ticket_transition_actor(conn))
+}
+
+/// Upfill the phase-transition actor columns for databases created before
+/// delta `34`: `tickets.last_transition_actor` (the acting identity written by
+/// every phase-changing UPDATE) and `ticket_chronicle.actor` (the same value
+/// copied by the CDC materializer). Fresh installs get both columns from entry
+/// `24`'s `CREATE TABLE`, so the probes make this a no-op there. Guarded by
+/// [`add_column_if_missing`], so this body is idempotent (non-transactional
+/// like every Rust body, re-runnable until recorded). No backfill — legacy
+/// rows fall back to `"system"` at render time.
+async fn run_add_ticket_transition_actor(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "tickets", "last_transition_actor").await?;
+    add_column_if_missing(conn, "ticket_chronicle", "actor").await
 }
 
 fn add_workspaces_maintainer_recommendations<'a>(
@@ -1001,6 +1030,7 @@ mod tests {
                 "source_phase",
                 "target_phase",
                 "at",
+                "actor",
             ],
         ),
         (
@@ -1032,6 +1062,7 @@ mod tests {
                 "reviewed_tree",
                 "done_at",
                 "bounce_count",
+                "last_transition_actor",
             ],
         ),
         (
@@ -2084,9 +2115,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "30".to_string(),
                 "31".to_string(),
                 "32".to_string(),
-                "33".to_string()
+                "33".to_string(),
+                "34".to_string()
             ],
-            "fresh core applies baseline 24/25/27/28/29/30/31/32/33 exactly"
+            "fresh core applies baseline 24/25/27/28/29/30/31/32/33/34 exactly"
         );
     }
 
@@ -2303,7 +2335,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `idx_jobs_caller_agent` index), the delta-29 per-user model columns, and
     /// the delta-30 `jobs.mode` column upfill + backfill, the delta-31
     /// `sleep_ended` column upfill, the delta-32 `alarms.command` column
-    /// upfill, and the delta-33 `chat_history.broadcast_id` column upfill, all
+    /// upfill, and the delta-33 `chat_history.broadcast_id` column upfill, and
+    /// the delta-34 `tickets.last_transition_actor` /
+    /// `ticket_chronicle.actor` column upfill, all
     /// asserted explicitly. This also proves
     /// Turso honors `IF NOT EXISTS` on the FTS index when the baseline re-runs it.
     #[tokio::test]
@@ -2338,12 +2372,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("31".to_string());
         expected_ids.push("32".to_string());
         expected_ids.push("33".to_string());
+        expected_ids.push("34".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33"
+            "reopen must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34"
         );
 
         // Everything else is a strict no-op; only workspaces (delta 27),
@@ -2362,6 +2397,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "users",
                 "alarms",
                 "chat_history",
+                "tickets",
+                "ticket_chronicle",
             ],
             &["idx_jobs_caller_agent"],
         )
@@ -2410,6 +2447,20 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert_eq!(
             after_chat_cols["chat_history"], expected_chat_cols,
             "reopen must append exactly broadcast_id to chat_history columns"
+        );
+        let after_tickets_cols = column_sets(&conn, &["tickets"]).await;
+        let mut expected_tickets_cols = before.cols["tickets"].clone();
+        expected_tickets_cols.push("last_transition_actor".to_string());
+        assert_eq!(
+            after_tickets_cols["tickets"], expected_tickets_cols,
+            "reopen must append exactly last_transition_actor to tickets columns"
+        );
+        let after_chronicle_cols = column_sets(&conn, &["ticket_chronicle"]).await;
+        let mut expected_chronicle_cols = before.cols["ticket_chronicle"].clone();
+        expected_chronicle_cols.push("actor".to_string());
+        assert_eq!(
+            after_chronicle_cols["ticket_chronicle"], expected_chronicle_cols,
+            "reopen must append exactly actor to ticket_chronicle columns"
         );
     }
 
@@ -2479,7 +2530,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     /// `jobs.caller_agent_id` / `session_metadata.created_at` (plus its
     /// partial index), entry `30` adds `jobs.mode`, entry `31` adds
     /// `session_metadata.sleep_ended`, entry `32` adds `alarms.command`, and
-    /// entry `33` adds `chat_history.broadcast_id`,
+    /// entry `33` adds `chat_history.broadcast_id`, and entry `34` adds
+    /// `tickets.last_transition_actor` / `ticket_chronicle.actor`,
     /// leaving every row and every other table's schema untouched.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
@@ -2535,6 +2587,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                     && *n != "session_metadata"
                     && *n != "users"
                     && *n != "alarms"
+                    && *n != "tickets"
+                    && *n != "ticket_chronicle"
                     && *n != "schema_migrations"
             })
             .collect();
@@ -2592,12 +2646,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_ids.push("31".to_string());
         expected_ids.push("32".to_string());
         expected_ids.push("33".to_string());
+        expected_ids.push("34".to_string());
         expected_ids.sort();
         let mut after_ids = applied_ids(&conn).await;
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33"
+            "upgrade must record exactly old ids ∪ 24/25/27/28/29/30/31/32/33/34"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -2619,14 +2674,25 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             after_chat_cols.contains(&"broadcast_id".to_string()),
             "broadcast_id must be added to chat_history"
         );
+        let after_tickets_cols = column_names(&conn, "tickets").await;
+        assert!(
+            after_tickets_cols.contains(&"last_transition_actor".to_string()),
+            "last_transition_actor must be added to tickets"
+        );
+        let after_chronicle_cols = column_names(&conn, "ticket_chronicle").await;
+        assert!(
+            after_chronicle_cols.contains(&"actor".to_string()),
+            "actor must be added to ticket_chronicle"
+        );
 
         assert_eq!(
             column_sets(&conn, &untouched_tables).await,
             before_other,
             "only chat_history (delta 25/33), workspaces (delta 27), \
              jobs/session_metadata (delta 28), users (delta 29), jobs.mode \
-             (delta 30), session_metadata.sleep_ended (delta 31) and \
-             alarms.command (delta 32) columns may change on the 0.5.0 upgrade"
+             (delta 30), session_metadata.sleep_ended (delta 31), \
+             alarms.command (delta 32) and tickets/ticket_chronicle (delta 34) \
+             columns may change on the 0.5.0 upgrade"
         );
     }
 }

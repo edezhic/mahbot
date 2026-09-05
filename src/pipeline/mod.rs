@@ -45,7 +45,7 @@ use crate::agent::role::{DIAGNOSTICS_ROLE, SYSTEM_ROLE};
 use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
 use crate::db::TxGuard;
 use crate::git::commands::{list_new_or_untracked_files, run_git_status};
-use crate::pipeline::board::{BoardStore, Ticket, TicketPhase};
+use crate::pipeline::board::{BoardStore, PIPELINE_ACTOR, Ticket, TicketPhase};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::session::manager_agent_id;
 use crate::util::UnwrapPoison;
@@ -609,6 +609,7 @@ pub(crate) struct TransitionCtx<'t, 'l> {
     target: TicketPhase,
     notify: NotifyPolicy,
     log_label: &'l str,
+    actor: &'l str,
     /// True when this Failed transition was a bounce-breaker drain.
     breaker_trip: bool,
 }
@@ -620,6 +621,7 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
         target: TicketPhase,
         notify: NotifyPolicy,
         log_label: &'l str,
+        actor: &'l str,
     ) -> Self {
         Self {
             ticket,
@@ -627,6 +629,7 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
             target,
             notify,
             log_label,
+            actor,
             breaker_trip: false,
         }
     }
@@ -635,16 +638,32 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
         source: TicketPhase,
         target: TicketPhase,
         log_label: &'l str,
+        actor: &'l str,
     ) -> Self {
-        Self::new(ticket, source, target, NotifyPolicy::Notify, log_label)
+        Self::new(
+            ticket,
+            source,
+            target,
+            NotifyPolicy::Notify,
+            log_label,
+            actor,
+        )
     }
     pub(crate) fn buffered(
         ticket: &'t Ticket,
         source: TicketPhase,
         target: TicketPhase,
         log_label: &'l str,
+        actor: &'l str,
     ) -> Self {
-        Self::new(ticket, source, target, NotifyPolicy::Buffer, log_label)
+        Self::new(
+            ticket,
+            source,
+            target,
+            NotifyPolicy::Buffer,
+            log_label,
+            actor,
+        )
     }
     fn with_breaker(mut self, breaker_trip: bool) -> Self {
         self.breaker_trip = breaker_trip;
@@ -675,7 +694,14 @@ where
         ctx.log_label,
         async move |tx| {
             write_comments(tx).await?;
-            BoardStore::transition_to_tx(tx, &ctx.ticket.id, Some(ctx.source), ctx.target).await
+            BoardStore::transition_to_tx(
+                tx,
+                &ctx.ticket.id,
+                Some(ctx.source),
+                ctx.target,
+                ctx.actor,
+            )
+            .await
         },
     )
     .await
@@ -703,7 +729,14 @@ where
     if matches!(outcome, FinalizeOutcome::Applied) {
         match ctx.notify {
             NotifyPolicy::Notify => {
-                notify_ticket(ctx.ticket, ctx.source, ctx.target, ctx.breaker_trip).await;
+                notify_ticket(
+                    ctx.ticket,
+                    ctx.source,
+                    ctx.target,
+                    ctx.breaker_trip,
+                    ctx.actor,
+                )
+                .await;
             }
             // Buffer: the transition is materialized by the CDC-driven chronicle
             // subscriber and delivered on the next drain.
@@ -878,6 +911,7 @@ async fn notify_ticket(
     source: TicketPhase,
     target_phase: TicketPhase,
     breaker_trip: bool,
+    actor: &str,
 ) {
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
         error!(
@@ -890,7 +924,7 @@ async fn notify_ticket(
 
     let transition_log = format!(
         "[{}] {}: {} → {}",
-        ticket.reporter,
+        actor,
         ticket.id,
         source.as_ref(),
         target_phase.as_ref(),
@@ -1512,7 +1546,7 @@ fn bounce_exhausted(bounce_count: i64) -> bool {
 /// Move all other Queued tickets in the workspace to Planning.
 async fn drain_queued_siblings(ticket: &Ticket) {
     match board()
-        .drain_queued_to_planning(&ticket.workspace_name)
+        .drain_queued_to_planning(&ticket.workspace_name, PIPELINE_ACTOR)
         .await
     {
         Ok(updated) if updated > 0 => {
@@ -1545,12 +1579,15 @@ async fn drain_queued_siblings(ticket: &Ticket) {
 /// to Failed (terminal); the phase job is deleted and the puller re-drives.
 /// On a non-exhausting bounce the ticket goes back to InDevelopment and the
 /// phase job is deleted so the puller creates a fresh engineer attempt.
+///
+/// `failure_role` authors the failure comment; `actor` is kept separate as the
+/// transition's recorded identity (the stage role, e.g. `verifier.role.as_str()`).
 async fn bounce_to_development(
     ticket: &Ticket,
     source: TicketPhase,
     log_label: &str,
-    drains_siblings: bool,
     failure_role: &str,
+    actor: &str,
     failure_comment: &str,
     job_id: &str,
 ) -> FinalizeOutcome {
@@ -1566,8 +1603,8 @@ async fn bounce_to_development(
         NotifyPolicy::Buffer
     };
     let trip_comment = trip.then(bounce_breaker_trip_comment);
-    let ctx = TransitionCtx::new(ticket, source, target, notify, log_label)
-        .with_breaker(trip && drains_siblings);
+    let ctx =
+        TransitionCtx::new(ticket, source, target, notify, log_label, actor).with_breaker(trip);
 
     let outcome = with_comment_and_transition(ctx, async |tx| {
         if let Some(comment) = &trip_comment {
@@ -1590,9 +1627,7 @@ async fn bounce_to_development(
         // tripped breaker leaves the ticket failed.
         let _ = crate::jobs::terminalize_job(conn, job_id).await;
         if trip {
-            if drains_siblings {
-                drain_queued_siblings(ticket).await;
-            }
+            drain_queued_siblings(ticket).await;
             info!(
                 ticket = %ticket.id,
                 "Bounce circuit breaker tripped ({} bounces) — ticket failed",

@@ -132,6 +132,7 @@ async fn claim_backlog_honors_prerequisites() {
             &prereq_analysis,
             Some(TicketPhase::Analysis),
             TicketPhase::Done,
+            "test",
         )
         .await
         .unwrap();
@@ -180,6 +181,7 @@ async fn claim_queued_honors_prerequisites() {
             &prereq_analysis,
             Some(TicketPhase::Analysis),
             TicketPhase::Done,
+            "test",
         )
         .await
         .unwrap();
@@ -251,6 +253,7 @@ async fn claim_probes_agree_with_claim_outcomes() {
                 &prereq_analysis,
                 Some(TicketPhase::Analysis),
                 TicketPhase::Done,
+                "test",
             )
             .await
             .unwrap();
@@ -295,6 +298,7 @@ async fn claim_probes_agree_with_claim_outcomes() {
                 &prereq_analysis,
                 Some(TicketPhase::Analysis),
                 TicketPhase::Done,
+                "test",
             )
             .await
             .unwrap();
@@ -467,8 +471,8 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
         &expect_ticket(store, &id).await,
         TicketPhase::InReview,
         "Reviewers",
-        true,
         "Reviewer",
+        "reviewer",
         "failed",
         &job_id,
     )
@@ -532,8 +536,8 @@ async fn bounce_breaker_trips_to_failed() {
         &expect_ticket(store, &id).await,
         TicketPhase::InReview,
         "Reviewers",
-        true,
         "Reviewer",
+        "reviewer",
         "failed",
         &job_id,
     )
@@ -542,6 +546,16 @@ async fn bounce_breaker_trips_to_failed() {
     let ticket = expect_ticket(store, &id).await;
     assert_eq!(ticket.phase, TicketPhase::Failed);
     assert_eq!(ticket.bounce_count, budget); // terminal: no further increment
+    let actor: String = store
+        .conn
+        .query_row(
+            "SELECT last_transition_actor FROM tickets WHERE id = ?1",
+            crate::db::params![id.clone()],
+            |row| row.get(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(actor, "reviewer", "the bounce records the stage role actor");
 }
 
 /// `reset_phase_attempt` destroys the current attempt: it comments, cancels
@@ -889,7 +903,12 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
 
     // Manual Planning → Queued, then puller claim Queued → InDevelopment.
     store
-        .transition_to(&id, Some(TicketPhase::Planning), TicketPhase::Queued)
+        .transition_to(
+            &id,
+            Some(TicketPhase::Planning),
+            TicketPhase::Queued,
+            "test",
+        )
         .await
         .unwrap();
     super::run_claim_pipeline(&ws).await;
@@ -1910,7 +1929,7 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
         .await;
         crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&id);
         store
-            .transition_to(&id, None, TicketPhase::Cancelled)
+            .transition_to(&id, None, TicketPhase::Cancelled, "test")
             .await
             .unwrap();
         handle.await.unwrap();

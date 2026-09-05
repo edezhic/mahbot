@@ -51,7 +51,13 @@ pub(crate) async fn maybe_skip_review(
                 "Content identical to reviewed base — skipping reviewer dispatch",
             );
             let _ = comment_and_transition(
-                TransitionCtx::buffered(ticket, vi.active_phase, TicketPhase::InQa, vi.log_label),
+                TransitionCtx::buffered(
+                    ticket,
+                    vi.active_phase,
+                    TicketPhase::InQa,
+                    vi.log_label,
+                    Role::Reviewer.as_str(),
+                ),
                 SYSTEM_ROLE,
                 "Content is identical to the reviewed base recorded for this ticket \
                  (same HEAD commit and index tree, no working-tree changes). \

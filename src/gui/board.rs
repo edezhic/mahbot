@@ -1071,7 +1071,7 @@ impl BoardState {
                         // validation non-success (the unified bounce) — there
                         // is no manual "Redo Queued" action anymore.
                         board
-                            .transition_to(&ticket_id, None, phase)
+                            .transition_to(&ticket_id, None, phase, "user")
                             .await
                             .map_err(|e| e.to_string())?;
                         Ok(())
@@ -1263,7 +1263,7 @@ impl BoardState {
                         let board = crate::pipeline::board::store();
                         let mut total = 0u64;
                         for ws in &workspaces {
-                            match board.drain_queued_to_planning(ws).await {
+                            match board.drain_queued_to_planning(ws, "user").await {
                                 Ok(moved) => total += moved,
                                 Err(e) => return Err(e.to_string()),
                             }

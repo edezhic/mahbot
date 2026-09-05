@@ -224,7 +224,9 @@ impl Tool for CreateTicketTool {
         if let Some(supersede_id) = supersede_id {
             guard_not_pipeline_occupied(store, &supersede_id).await?;
 
-            let id = store.supersede_and_create(&supersede_id, &params).await?;
+            let id = store
+                .supersede_and_create(&supersede_id, &params, &self.reporter)
+                .await?;
             Ok(format!(
                 "Superseded {supersede_id} → created ticket {id}: {title}{prereq_note}"
             ))
@@ -282,7 +284,9 @@ impl Tool for UpdateTicketTool {
         // Guard: refuse to update a ticket that is in a pipeline-occupied phase.
         guard_not_pipeline_occupied(store, &ticket_id).await?;
 
-        store.transition_to(&ticket_id, None, parsed_phase).await?;
+        store
+            .transition_to(&ticket_id, None, parsed_phase, Role::Manager.as_str())
+            .await?;
 
         Ok(format!("Ticket {ticket_id} phase updated to '{new_phase}'"))
     }
@@ -623,11 +627,16 @@ mod tests {
         .await;
         // Transition C to 'done' and B to 'cancelled'
         store
-            .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done)
+            .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done, "test")
             .await
             .expect("transition to done");
         store
-            .transition_to(&id_b, Some(TicketPhase::Backlog), TicketPhase::Cancelled)
+            .transition_to(
+                &id_b,
+                Some(TicketPhase::Backlog),
+                TicketPhase::Cancelled,
+                "test",
+            )
             .await
             .expect("transition to cancelled");
 

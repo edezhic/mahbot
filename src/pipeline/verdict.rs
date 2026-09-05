@@ -757,8 +757,8 @@ pub(crate) async fn process_verifier_verdicts(
         ticket,
         verifier.active_phase,
         verifier.log_label,
-        /* drains_siblings */ true,
         stage_name(verifier.role),
+        verifier.role.as_str(),
         &joint_comment,
         job_id,
     )
@@ -782,6 +782,7 @@ async fn apply_clean_verifier_round(
                 verifier.active_phase,
                 verifier.success_phase,
                 verifier.log_label,
+                verifier.role.as_str(),
             ),
             stage_name(verifier.role),
             joint_comment,

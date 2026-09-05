@@ -53,6 +53,17 @@ pub async fn run_archive_cancelled_loop() {
 /// archived by [`run_archive_cancelled_loop`].
 const CANCELLED_ARCHIVE_HOURS: i64 = 1;
 
+/// The acting identity recorded for pipeline-driven phase transitions (poller
+/// claims, breaker-trip drain-to-planning). Stage finalizations, supersede
+/// cancels and the `UpdateTicketTool`/GUI manual paths write role labels or
+/// `"user"` instead.
+///
+/// Invariant: every phase-changing UPDATE on `tickets` must write
+/// `last_transition_actor` in the same statement — the chronicle materializer
+/// reads whatever value is current in the CDC after-row, so a phase change
+/// that leaves the column stale would misattribute the *previous* actor.
+pub(crate) const PIPELINE_ACTOR: &str = "pipeline";
+
 // Column definitions for ticket SELECT/RETURNING queries.
 crate::columns! {
     TICKET_COLUMNS [TICKET] {
@@ -853,6 +864,7 @@ impl BoardStore {
         &self,
         supersede_id: &str,
         params: &TicketParams,
+        actor: &str,
     ) -> Result<String> {
         anyhow::ensure!(
             !params.prerequisites.iter().any(|p| p == supersede_id),
@@ -890,13 +902,15 @@ impl BoardStore {
         let cancelled_rows = tx
             .execute(
                 "UPDATE tickets SET phase = ?1, updated_at = ?2, \
-                 superseded_by = ?4, is_archived = 1, done_at = NULL \
+                 superseded_by = ?4, is_archived = 1, done_at = NULL, \
+                 last_transition_actor = ?5 \
                  WHERE id = ?3",
                 db::params![
                     TicketPhase::Cancelled.as_ref(),
                     now,
                     supersede_id,
                     new_id.as_str(),
+                    actor,
                 ],
             )
             .await?;
@@ -1016,13 +1030,13 @@ impl BoardStore {
     /// Core claim: atomically transition a workspace's oldest eligible ticket
     /// from `source` to `target` in a single `UPDATE..RETURNING`. Always
     /// filters by `workspace_name` so only tickets from that workspace are
-    /// eligible. The WHERE clause includes `t1.phase = ?3` bound to `source`,
+    /// eligible. The WHERE clause includes `t1.phase = ?4` bound to `source`,
     /// providing CAS-style atomicity — if no matching ticket exists, the claim
     /// returns `None`.
     ///
     /// The WHERE predicate comes from [`claim_candidate_where`] with base
-    /// placeholder offset 3 (`?1`/`?2` are the SET-clause phase/updated_at
-    /// binds), the same builder the read-only probe uses — so the claim and
+    /// placeholder offset 4 (`?1`–`?3` are the SET-clause phase/updated_at/
+    /// actor binds), the same builder the read-only probe uses — so the claim and
     /// its probe cannot drift. Only Backlog carries the `grace_cutoff` bind
     /// (it must be `Some` only for [`TicketPhase::Backlog`]); only Queued
     /// enforces pipeline occupancy. `now` and `grace_cutoff` are supplied by
@@ -1057,12 +1071,13 @@ impl BoardStore {
         grace_cutoff: Option<&str>,
     ) -> Result<Option<Ticket>> {
         let sql = format!(
-            "UPDATE tickets SET phase = ?1, updated_at = ?2 \
+            "UPDATE tickets SET phase = ?1, updated_at = ?2, \
+             last_transition_actor = ?3 \
              WHERE id = (SELECT t1.id FROM tickets t1 \
              WHERE {} \
              ORDER BY t1.priority ASC, t1.created_at ASC LIMIT 1) \
              RETURNING {TICKET_COLUMNS}",
-            claim_candidate_where(3, source),
+            claim_candidate_where(4, source),
         );
         let rows = match grace_cutoff {
             Some(cutoff) => {
@@ -1072,6 +1087,7 @@ impl BoardStore {
                         db::params![
                             target.as_ref(),
                             now,
+                            PIPELINE_ACTOR,
                             source.as_ref(),
                             workspace_name,
                             cutoff
@@ -1083,7 +1099,13 @@ impl BoardStore {
                 self.conn
                     .query_cached(
                         &sql,
-                        db::params![target.as_ref(), now, source.as_ref(), workspace_name],
+                        db::params![
+                            target.as_ref(),
+                            now,
+                            PIPELINE_ACTOR,
+                            source.as_ref(),
+                            workspace_name
+                        ],
                     )
                     .await?
             }
@@ -1262,8 +1284,9 @@ impl BoardStore {
     /// [`transition_to_tx`](Self::transition_to_tx).
     ///
     /// Note: this does **not** use [`Self::build_ticket_update_with_updated_at`]
-    /// because it has an extra SET column (`done_at = CASE ...`) and an
-    /// additional WHERE condition (`AND (?4 IS NULL OR phase = ?4)`) that
+    /// because it has extra SET columns (`last_transition_actor = ?3` and
+    /// `done_at = CASE ...`) and an
+    /// additional WHERE condition (`AND (?5 IS NULL OR phase = ?5)`) that
     /// don't fit the helper's fixed pattern.
     ///
     /// `done_at` is set to `?2` (now) when the target is `done` — overwriting
@@ -1274,17 +1297,20 @@ impl BoardStore {
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
+        actor: &str,
     ) -> PreparedUpdate {
         let now = db::now();
         let guard: Option<&str> = expected_phase.as_ref().map(TicketPhase::as_ref);
         let sql = "UPDATE tickets SET phase = ?1, updated_at = ?2, \
+                    last_transition_actor = ?3, \
                     done_at = CASE WHEN ?1 = 'done' THEN ?2 \
                                    WHEN phase = 'done' THEN NULL \
                                    ELSE done_at END \
-                    WHERE id = ?3 AND (?4 IS NULL OR phase = ?4)";
+                    WHERE id = ?4 AND (?5 IS NULL OR phase = ?5)";
         let params: Vec<db::Value> = vec![
             Value::from(target_phase.as_ref()),
             Value::from(now),
+            Value::from(actor),
             Value::from(ticket_id),
             Value::from(guard),
         ];
@@ -1298,6 +1324,10 @@ impl BoardStore {
     /// Update ticket phase, optionally guarded by an expected phase for CAS-style
     /// atomicity. Always cancels running agents.
     ///
+    /// `actor` is recorded as `last_transition_actor` for the transition:
+    /// manual/GUI callers pass a role label or `"user"`; pipeline callers pass
+    /// [`PIPELINE_ACTOR`].
+    ///
     /// # Errors
     ///
     /// Returns an error when the UPDATE matched 0 rows or a database error occurs.
@@ -1306,8 +1336,9 @@ impl BoardStore {
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
+        actor: &str,
     ) -> Result<()> {
-        let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase);
+        let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase, actor);
         prepared.execute_and_cancel(&self.conn).await?;
         // A terminal transition (Done/Cancelled/Failed) completes the ticket's
         // phase jobs (idempotent; no-op when the ticket has none) so a manual
@@ -1344,8 +1375,9 @@ impl BoardStore {
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
         target_phase: TicketPhase,
+        actor: &str,
     ) -> Result<bool> {
-        let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase);
+        let prepared = Self::build_transition_sql(ticket_id, expected_phase, target_phase, actor);
         prepared.execute_tx_matched(tx).await
     }
 
@@ -1825,16 +1857,22 @@ impl BoardStore {
     /// its new phase on the next poll cycle via the standard poll loop.
     ///
     /// Returns the number of tickets moved.
-    pub(crate) async fn drain_queued_to_planning(&self, workspace_name: &str) -> Result<u64> {
+    pub(crate) async fn drain_queued_to_planning(
+        &self,
+        workspace_name: &str,
+        actor: &str,
+    ) -> Result<u64> {
         let now = db::now();
         let updated = self
             .conn
             .execute(
-                "UPDATE tickets SET phase = ?1, updated_at = ?2 \
-                 WHERE phase = ?3 AND workspace_name = ?4 AND is_archived = 0",
+                "UPDATE tickets SET phase = ?1, updated_at = ?2, \
+                 last_transition_actor = ?3 \
+                 WHERE phase = ?4 AND workspace_name = ?5 AND is_archived = 0",
                 db::params![
                     TicketPhase::Planning.as_ref(),
                     now,
+                    actor,
                     TicketPhase::Queued.as_ref(),
                     workspace_name,
                 ],

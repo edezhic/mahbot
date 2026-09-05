@@ -830,7 +830,8 @@ async fn process_analyst_verdicts(
                 ticket,
                 TicketPhase::Analysis,
                 TicketPhase::Planning,
-                "Analyst"
+                "Analyst",
+                Role::Analyst.as_str(),
             ),
             async |tx| {
                 BoardStore::add_comment_tx(

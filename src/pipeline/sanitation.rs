@@ -29,7 +29,14 @@ async fn transition_ticket_to_done_no_comment(ticket: &Ticket, source: TicketPha
     let notify_policy = determine_notify_policy(&ticket.workspace_name, &ticket.id).await;
     if matches!(
         with_comment_and_transition(
-            TransitionCtx::new(ticket, source, TicketPhase::Done, notify_policy, "Finalize"),
+            TransitionCtx::new(
+                ticket,
+                source,
+                TicketPhase::Done,
+                notify_policy,
+                "Finalize",
+                Role::Sanitation.as_str(),
+            ),
             async |_tx| Ok(()),
         )
         .await,
@@ -157,7 +164,14 @@ async fn finalize_commit_and_transition(
 
     if matches!(
         with_comment_and_transition(
-            TransitionCtx::new(ticket, source, TicketPhase::Done, notify_policy, &log_label),
+            TransitionCtx::new(
+                ticket,
+                source,
+                TicketPhase::Done,
+                notify_policy,
+                &log_label,
+                Role::Sanitation.as_str(),
+            ),
             async |tx| {
                 BoardStore::set_commit_info_tx(
                     tx,
@@ -321,7 +335,7 @@ async fn process_sanitation_verdict(
             ticket,
             TicketPhase::InSanitation,
             "Sanitation",
-            /* drains_siblings */ true,
+            Role::Sanitation.as_str(),
             Role::Sanitation.as_str(),
             &comment,
             job_id,

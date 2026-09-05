@@ -188,6 +188,7 @@ pub(crate) async fn finalize_engineer_stage(
                 TicketPhase::InDevelopment,
                 TicketPhase::InDiagnostics,
                 "Engineer",
+                Role::Engineer.as_str(),
             ),
             Role::Engineer.as_str(),
             &comment_text,

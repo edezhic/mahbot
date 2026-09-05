@@ -30,9 +30,18 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::{Mutex, OnceLock};
 
+use crate::agent::role::SYSTEM_ROLE;
 use crate::db::{Connection, params};
 use crate::pipeline::board::{TicketPhase, store as board};
 use crate::util::UnwrapPoison;
+
+/// Normalize a stored actor: absent or empty/whitespace values fall back to
+/// [`SYSTEM_ROLE`] (legacy rows materialized before actor tracking, or a
+/// transition that left `last_transition_actor` empty/NULL). Shared by the CDC
+/// materializer and the drain read path so the two fallbacks cannot drift.
+fn attributed_actor(raw: Option<&str>) -> &str {
+    raw.filter(|s| !s.trim().is_empty()).unwrap_or(SYSTEM_ROLE)
+}
 
 /// Per-workspace manager delivery cursor: the last delivered chronicle row id.
 /// `-1` means "not yet seeded from the service-start baseline". This is the
@@ -165,11 +174,25 @@ async fn apply_change(
             },
             str::to_string,
         );
+    let actor = attributed_actor(
+        event
+            .after
+            .as_ref()
+            .and_then(|r| r.get("last_transition_actor"))
+            .and_then(crate::db::cdc::CdcValue::as_text),
+    );
     let rows = conn
         .execute(
             "INSERT OR IGNORE INTO ticket_chronicle (ticket_id, workspace_name, source_phase, \
-             target_phase, at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![ticket_id, workspace, source.as_ref(), target.as_ref(), at],
+             target_phase, at, actor) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                ticket_id,
+                workspace,
+                source.as_ref(),
+                target.as_ref(),
+                at,
+                actor
+            ],
         )
         .await?;
     Ok(rows > 0)
@@ -239,7 +262,7 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
     }
     let rows = match conn
         .query(
-            "SELECT id, ticket_id, source_phase, target_phase, at \
+            "SELECT id, ticket_id, source_phase, target_phase, at, actor \
              FROM ticket_chronicle \
              WHERE workspace_name = ?1 AND id > ?2 ORDER BY id",
             params![workspace_name, cursor.last_id],
@@ -278,6 +301,13 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
                 .ok()
                 .and_then(|v| v.as_text().cloned())
                 .unwrap_or_default(),
+            actor: attributed_actor(
+                row.get_value(5)
+                    .ok()
+                    .and_then(|v| v.as_text().cloned())
+                    .as_deref(),
+            )
+            .to_string(),
         })
         .collect();
     let last_id = rows
@@ -303,11 +333,12 @@ struct Hop {
     source: String,
     target: String,
     at: String,
+    actor: String,
 }
 
 /// Render hops into the `<ticket-updates>` block. Consecutive hops of the same
 /// ticket are grouped (run-based) under a single header; new header on any
-/// ticket change. Each hop keeps its full RFC 3339 timestamp.
+/// ticket change. Each hop keeps its full RFC 3339 timestamp and actor.
 fn format_chronicle(hops: &[Hop]) -> String {
     if hops.is_empty() {
         return String::new();
@@ -319,7 +350,11 @@ fn format_chronicle(hops: &[Hop]) -> String {
             let _ = writeln!(out, "• {}:", hop.id);
             current = Some(&hop.id);
         }
-        let _ = writeln!(out, "    {} → {} ({})", hop.source, hop.target, hop.at);
+        let _ = writeln!(
+            out,
+            "    {} → {} ({}) [{}]",
+            hop.source, hop.target, hop.at, hop.actor
+        );
     }
     let _ = writeln!(out, "</ticket-updates>");
     out
@@ -344,25 +379,26 @@ mod tests {
                 source: "in_development".into(),
                 target: "in_diagnostics".into(),
                 at: "2026-08-17T08:11:34.225709+00:00".into(),
+                actor: "engineer".into(),
             },
             Hop {
                 id: "mahbot-1736".into(),
                 source: "in_diagnostics".into(),
                 target: "in_review".into(),
                 at: "2026-08-17T08:21:19.225709+00:00".into(),
+                actor: "system".into(),
             },
         ];
         let result = format_chronicle(&hops);
         assert!(result.starts_with("<ticket-updates>\n"));
         assert!(result.ends_with("</ticket-updates>\n"));
         assert_eq!(result.matches("• mahbot-1736:").count(), 1);
-        assert!(
-            result
-                .contains("    in_development → in_diagnostics (2026-08-17T08:11:34.225709+00:00)")
-        );
-        assert!(
-            result.contains("    in_diagnostics → in_review (2026-08-17T08:21:19.225709+00:00)")
-        );
+        assert!(result.contains(
+            "    in_development → in_diagnostics (2026-08-17T08:11:34.225709+00:00) [engineer]"
+        ));
+        assert!(result.contains(
+            "    in_diagnostics → in_review (2026-08-17T08:21:19.225709+00:00) [system]"
+        ));
     }
 
     #[test]
@@ -373,18 +409,21 @@ mod tests {
                 source: "backlog".into(),
                 target: "analysis".into(),
                 at: "2026-08-17T08:00:00+00:00".into(),
+                actor: "system".into(),
             },
             Hop {
                 id: "mahbot-B".into(),
                 source: "analysis".into(),
                 target: "planning".into(),
                 at: "2026-08-17T08:01:00+00:00".into(),
+                actor: "analyst".into(),
             },
             Hop {
                 id: "mahbot-A".into(),
                 source: "planning".into(),
                 target: "queued".into(),
                 at: "2026-08-17T08:02:00+00:00".into(),
+                actor: "system".into(),
             },
         ];
         let result = format_chronicle(&hops);
@@ -420,6 +459,7 @@ mod tests {
                 &ticket_id,
                 Some(TicketPhase::Backlog),
                 TicketPhase::Analysis,
+                "pipeline",
             )
             .await
             .unwrap();
@@ -447,9 +487,54 @@ mod tests {
             "a phase change materializes exactly one chronicle row"
         );
 
+        // A second transition that leaves `last_transition_actor` empty: clear
+        // the field (no phase change → no chronicle row), then move phase in a
+        // raw UPDATE that never touches the column. The CDC after record carries
+        // an empty actor, so the materialized row falls back to `[system]`.
+        board
+            .conn
+            .execute(
+                "UPDATE tickets SET last_transition_actor = '' WHERE id = ?1",
+                crate::db::params![ticket_id.as_str()],
+            )
+            .await
+            .unwrap();
+        board
+            .conn
+            .execute(
+                "UPDATE tickets SET phase = ?1 WHERE id = ?2",
+                crate::db::params![TicketPhase::Planning.as_ref(), ticket_id.as_str()],
+            )
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            crate::db::cdc::drain_once(&board.conn).await.unwrap();
+            count = board
+                .conn
+                .query("SELECT COUNT(*) FROM ticket_chronicle", ())
+                .await
+                .unwrap()[0]
+                .get_value(0)
+                .unwrap()
+                .as_integer()
+                .copied()
+                .unwrap_or(0);
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            count, 2,
+            "both transitions materialize one chronicle row each"
+        );
+
         let block = drain(ws.name.as_str()).await;
         assert!(block.contains("<ticket-updates>"));
         assert!(block.contains(&format!("• {ticket_id}:")));
         assert!(block.contains("backlog → analysis"));
+        assert!(block.contains("[pipeline]"));
+        assert!(block.contains("analysis → planning"));
+        assert!(block.contains("[system]"));
     }
 }
