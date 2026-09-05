@@ -399,7 +399,7 @@ impl Message {
     /// because `home.rs` handles its own inline context links internally
     /// (see `HomeState::update`).  Do not add it without understanding
     /// the Home page's self-handling logic.
-    pub(crate) fn as_link_url(&self) -> Option<&str> {
+    fn as_link_url(&self) -> Option<&str> {
         match self {
             Message::Board(board::BoardMessage::LinkClicked(url))
             | Message::Sessions(sessions::SessionsMessage::LinkClicked(url))

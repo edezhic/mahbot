@@ -614,6 +614,34 @@ fn hscroll<'a, Message: 'a>(
 /// the Sessions transcript inter-entry spacing.
 pub const CHAT_VERTICAL_RHYTHM: f32 = 8.0;
 
+/// Chat-bubble alignment polarity: user messages render **left**,
+/// agent/typing indicators render **right**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BubbleSide {
+    /// Bubble flush left, spacer right.
+    Left,
+    /// Spacer left, bubble flush right.
+    Right,
+}
+
+/// Wrap a chat bubble (or label) in a 3:1 FillPortion row so it sits flush to
+/// `side` with a spacer on the opposite side, keeping it at ~75% width.
+///
+/// The element itself carries its own width (full bubbles set
+/// `.width(FillPortion(3))` before being passed in); this function only
+/// creates the spacer row.
+#[must_use]
+pub(crate) fn align_bubble<'a, Msg: 'a>(
+    element: impl Into<Element<'a, Msg>>,
+    side: BubbleSide,
+) -> Element<'a, Msg> {
+    let element = element.into();
+    match side {
+        BubbleSide::Left => row![element, Space::new().width(Length::FillPortion(1))].into(),
+        BubbleSide::Right => row![Space::new().width(Length::FillPortion(1)), element].into(),
+    }
+}
+
 /// Options for [`chat_composer`] that differ between the Home and Board
 /// pages. Bundled so the shared signature does not grow with page-specific
 /// knobs.
@@ -902,7 +930,7 @@ impl FileTree {
     ///
     /// No-op when the tree is not focused, or when already at the top.
     #[must_use]
-    pub fn nav_up(&mut self) -> bool {
+    fn nav_up(&mut self) -> bool {
         if self.tree_focused && self.tree_focus_index > 0 {
             self.tree_focus_index -= 1;
             true
@@ -915,7 +943,7 @@ impl FileTree {
     ///
     /// No-op when the tree is not focused, or when already at the bottom.
     #[must_use]
-    pub fn nav_down(&mut self) -> bool {
+    fn nav_down(&mut self) -> bool {
         if self.tree_focused && self.tree_focus_index + 1 < self.visible_tree_nodes.len() {
             self.tree_focus_index += 1;
             true
@@ -1104,7 +1132,7 @@ impl FileTree {
     /// `Path::new(&path).parent().map(|p| p.to_string_lossy().to_string())`
     /// pattern in tree-navigation keyboard handlers.
     #[must_use]
-    pub fn focused_parent_path(&self) -> Option<String> {
+    fn focused_parent_path(&self) -> Option<String> {
         let (_idx, path, _is_dir) = self.focused_tree_node()?;
         let parent = Path::new(&path).parent()?;
         let parent_str = parent.to_string_lossy().to_string();

@@ -571,7 +571,7 @@ impl BoardState {
     /// Carries the comment generation captured at dispatch; the
     /// [`BoardMessage::TicketDetailsRefreshed`] handler drops stale
     /// callbacks (modal closed or ticket switched while in flight).
-    pub fn refresh_selected_ticket(&mut self) -> Task<BoardMessage> {
+    fn refresh_selected_ticket(&mut self) -> Task<BoardMessage> {
         if self.selected_loading || self.sending_comment || self.detail_refresh_in_flight {
             return Task::none();
         }

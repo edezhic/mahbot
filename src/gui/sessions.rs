@@ -22,8 +22,7 @@ use super::session_view::preview::{
 };
 use super::session_view::{self, SessionEntry, ToolCallEntry};
 use super::theme;
-use super::widgets;
-use super::widgets::selectable_text;
+use super::widgets::{self, BubbleSide, align_bubble, selectable_text};
 
 /// Fraction of the transcript row width a chat bubble occupies (FillPortion 3
 /// of a 3:1 row). The collapse measurement uses this to narrow the measured
@@ -630,24 +629,6 @@ fn common_entry_prefix(old: &[SessionEntry], new: &[SessionEntry]) -> usize {
     old.iter().zip(new).take_while(|(a, b)| a == b).count()
 }
 
-/// Wrap a chat bubble in a 3:1 FillPortion row so it occupies 75% width,
-/// aligned to the right for assistant messages or to the left for
-/// system/user/tool messages. The caller must set `.width(FillPortion(3))`
-/// on the bubble before passing it — this function only creates the spacer row.
-fn align_bubble<'a>(
-    bubble: impl Into<Element<'a, SessionsMessage>>,
-    assistant: bool,
-) -> Element<'a, SessionsMessage> {
-    let bubble = bubble.into();
-    if assistant {
-        // Assistant: spacer left, bubble right.
-        row![Space::new().width(Length::FillPortion(1)), bubble].into()
-    } else {
-        // System/user/tool: bubble left, spacer right.
-        row![bubble, Space::new().width(Length::FillPortion(1))].into()
-    }
-}
-
 /// Author label above a bubble, aligned to the bubble's side. One non-accent
 /// color for every role, so roles stay visually consistent.
 fn author_label<'a>(role: crate::ChatRole, assistant: bool) -> Element<'a, SessionsMessage> {
@@ -658,11 +639,14 @@ fn author_label<'a>(role: crate::ChatRole, assistant: bool) -> Element<'a, Sessi
         crate::ChatRole::Tool => "Tool",
     };
     let label = text(name).size(theme::TEXT_11).color(theme::TEXT_SECONDARY);
-    if assistant {
-        row![Space::new().width(Length::FillPortion(1)), label].into()
-    } else {
-        row![label, Space::new().width(Length::FillPortion(1))].into()
-    }
+    align_bubble(
+        label,
+        if assistant {
+            BubbleSide::Right
+        } else {
+            BubbleSide::Left
+        },
+    )
 }
 
 /// Author-labeled chat-bubble row for one ledger entry: the label sits above
@@ -686,7 +670,14 @@ fn bubble_row(
         .width(Length::FillPortion(3));
     column![
         author_label(role, assistant),
-        align_bubble(bubble, assistant)
+        align_bubble(
+            bubble,
+            if assistant {
+                BubbleSide::Right
+            } else {
+                BubbleSide::Left
+            },
+        )
     ]
     .spacing(theme::SPACE_2)
     .into()

@@ -21,7 +21,7 @@ use super::ToastMessage;
 use super::common::MAX_INPUT_CHARS;
 use super::menus::{ContextMenu, MenuItem, RoleMenu, RoleMenuItem};
 use super::theme;
-use super::widgets::PickOption;
+use super::widgets::{BubbleSide, PickOption, align_bubble};
 
 /// Dedup-set prune trigger: when `seen_ids` grows past this many IDs, it is
 /// pruned down to the most recent [`DEDUP_RETAIN`] IDs.
@@ -149,25 +149,6 @@ fn broadcast_gui_transient(
         None,
         &crate::db::now(),
     );
-}
-
-/// Wrap a chat bubble in a 3:1 FillPortion row so it occupies 75% width,
-/// aligned to the right for user messages or to the left for agent/typing.
-///
-/// The caller must set `.width(Length::FillPortion(3))` on the bubble before
-/// passing it — this function only creates the spacer row.
-fn align_bubble<'a>(
-    bubble: impl Into<Element<'a, HomeMessage>>,
-    is_user: bool,
-) -> Element<'a, HomeMessage> {
-    let bubble = bubble.into();
-    if is_user {
-        // User: bubble left, spacer right
-        row![bubble, Space::new().width(Length::FillPortion(1)),].into()
-    } else {
-        // Agent: spacer left, bubble right
-        row![Space::new().width(Length::FillPortion(1)), bubble,].into()
-    }
 }
 
 /// Derive the [`ReplyReference`] captured for a reply-to action. User messages
@@ -1094,7 +1075,14 @@ impl HomeState {
                     let bubble: Element<'_, HomeMessage> =
                         ContextMenu::new(bubble_region, menu_items).into();
 
-                    align_bubble(bubble, is_user)
+                    align_bubble(
+                        bubble,
+                        if is_user {
+                            BubbleSide::Left
+                        } else {
+                            BubbleSide::Right
+                        },
+                    )
                 })
                 .collect();
 
@@ -1110,7 +1098,8 @@ impl HomeState {
                     .style(theme::bubble_style(theme::BG_SURFACE, None))
                     .width(Length::FillPortion(3));
 
-                children.push(align_bubble(typing_bubble, false));
+                // Typing indicator always renders on the agent (right) side.
+                children.push(align_bubble(typing_bubble, BubbleSide::Right));
             }
 
             // Prepend "Load older messages" button when applicable.
