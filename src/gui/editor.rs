@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{
-    Alignment, Element, Length, Subscription, Task,
+    Alignment, Color, Element, Length, Subscription, Task,
     keyboard::{self},
     widget::Id,
 };
@@ -1138,6 +1138,20 @@ fn update_dirty_flag(
         tab.is_dirty = current_hash != tab_data.saved_text_hash;
     }
 }
+/// Transparent text button used by the find/replace and go-to-line bars.
+fn bar_text_button(
+    label: &str,
+    message: EditorMessage,
+    size: f32,
+    color: Color,
+    padding: [f32; 2],
+) -> Element<'_, EditorMessage> {
+    button(text(label).size(size).color(color))
+        .on_press(message)
+        .style(theme::button_transparent)
+        .padding(padding)
+        .into()
+}
 
 // ── Helpers — tree building ──────────────────────────────────────
 
@@ -1789,7 +1803,7 @@ impl EditorState {
     /// Uses the shared atomic counter for stale-result prevention: the pre-write
     /// guard inside the async task checks whether a newer save has superseded
     /// this one before writing.
-    pub(crate) fn try_save_current_tabs(&self) -> Option<Task<EditorMessage>> {
+    fn try_save_current_tabs(&self) -> Option<Task<EditorMessage>> {
         if !self.session_initialized {
             return None;
         }
@@ -1816,7 +1830,7 @@ impl EditorState {
     /// Most callers should use this wrapper; only use
     /// [`try_save_current_tabs`](Self::try_save_current_tabs) directly when you
     /// need to inspect whether a save was actually dispatched.
-    pub(crate) fn save_current_tabs(&mut self) -> Task<EditorMessage> {
+    fn save_current_tabs(&mut self) -> Task<EditorMessage> {
         self.try_save_current_tabs().unwrap_or(Task::none())
     }
 
@@ -3079,7 +3093,10 @@ impl EditorState {
                 }
             }
         }
-        update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
+        // Recompute the dirty flag only when the buffer actually changed.
+        if toast.is_some() {
+            update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
+        }
         if let Some(t) = toast {
             Task::done(t)
         } else {
@@ -3213,12 +3230,21 @@ impl EditorState {
                 }
                 self.save_current_tabs()
             }
-            CloseAction::Cancel => {
-                self.active_modal = None;
-                self.pending_close = None;
-                Task::none()
-            }
+            CloseAction::Cancel => self.cancel_close_dialog(),
         }
+    }
+
+    /// Dismiss a close dialog without taking any action.
+    fn cancel_close_dialog(&mut self) -> Task<EditorMessage> {
+        self.active_modal = None;
+        self.pending_close = None;
+        Task::none()
+    }
+
+    /// Close all tabs except `keep_idx` and persist the remaining tab list.
+    fn close_all_tabs_except_and_save(&mut self, keep_idx: usize) -> Task<EditorMessage> {
+        self.remove_all_tabs_except(keep_idx);
+        self.save_current_tabs()
     }
 
     /// Handle close-others-dialog — saves dirty tabs then closes all but keep_idx.
@@ -3232,8 +3258,7 @@ impl EditorState {
                     .collect();
                 if dirty.is_empty() {
                     // Nothing to save — just close the rest and persist.
-                    self.remove_all_tabs_except(keep_idx);
-                    return self.save_current_tabs();
+                    return self.close_all_tabs_except_and_save(keep_idx);
                 }
                 // Start saving the first dirty tab in the queue.
                 let first = dirty.remove(0);
@@ -3247,14 +3272,9 @@ impl EditorState {
                 self.active_modal = None;
                 self.pending_close = None;
                 // Close all tabs except keep_idx, discarding unsaved changes.
-                self.remove_all_tabs_except(keep_idx);
-                self.save_current_tabs()
+                self.close_all_tabs_except_and_save(keep_idx)
             }
-            CloseAction::Cancel => {
-                self.active_modal = None;
-                self.pending_close = None;
-                Task::none()
-            }
+            CloseAction::Cancel => self.cancel_close_dialog(),
         }
     }
 
@@ -3269,8 +3289,7 @@ impl EditorState {
             .collect();
         if dirty.is_empty() {
             // No unsaved changes — close immediately and persist.
-            self.remove_all_tabs_except(idx);
-            return self.save_current_tabs();
+            return self.close_all_tabs_except_and_save(idx);
         }
         self.active_modal = Some(ModalKind::CloseOthers(idx));
         Task::none()
@@ -4150,7 +4169,6 @@ impl EditorState {
                 ))
             })
         else {
-            update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
             return Task::none();
         };
 
@@ -4158,7 +4176,6 @@ impl EditorState {
 
         // Guard: no-op replacement (empty text on zero-width range).
         if replace_text.is_empty() && range.start >= range.end {
-            update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
             return Task::none();
         }
 
@@ -5180,33 +5197,37 @@ impl EditorState {
             String::new()
         };
 
-        let prev_btn = button(text("‹").size(theme::TEXT_14).color(theme::TEXT_SECONDARY))
-            .on_press(EditorMessage::FindPrev)
-            .style(theme::button_transparent)
-            .padding([theme::PAD_2, theme::PAD_8]);
+        let prev_btn = bar_text_button(
+            "‹",
+            EditorMessage::FindPrev,
+            theme::TEXT_14,
+            theme::TEXT_SECONDARY,
+            [theme::PAD_2, theme::PAD_8],
+        );
 
-        let next_btn = button(text("›").size(theme::TEXT_14).color(theme::TEXT_SECONDARY))
-            .on_press(EditorMessage::FindNext)
-            .style(theme::button_transparent)
-            .padding([theme::PAD_2, theme::PAD_8]);
+        let next_btn = bar_text_button(
+            "›",
+            EditorMessage::FindNext,
+            theme::TEXT_14,
+            theme::TEXT_SECONDARY,
+            [theme::PAD_2, theme::PAD_8],
+        );
 
-        let replace_btn = button(
-            text("Replace")
-                .size(theme::TEXT_11)
-                .color(theme::TEXT_SECONDARY),
-        )
-        .on_press(EditorMessage::FindReplace)
-        .style(theme::button_transparent)
-        .padding([theme::PAD_2, theme::PAD_6]);
+        let replace_btn = bar_text_button(
+            "Replace",
+            EditorMessage::FindReplace,
+            theme::TEXT_11,
+            theme::TEXT_SECONDARY,
+            [theme::PAD_2, theme::PAD_6],
+        );
 
-        let replace_all_btn = button(
-            text("All")
-                .size(theme::TEXT_11)
-                .color(theme::TEXT_SECONDARY),
-        )
-        .on_press(EditorMessage::FindReplaceAll)
-        .style(theme::button_transparent)
-        .padding([theme::PAD_2, theme::PAD_6]);
+        let replace_all_btn = bar_text_button(
+            "All",
+            EditorMessage::FindReplaceAll,
+            theme::TEXT_11,
+            theme::TEXT_SECONDARY,
+            [theme::PAD_2, theme::PAD_6],
+        );
 
         // Case sensitivity toggle: "Aa" label, highlighted when active.
         let case_label_color = if state.case_sensitive {
@@ -5214,10 +5235,13 @@ impl EditorState {
         } else {
             theme::TEXT_SECONDARY
         };
-        let case_btn = button(text("Aa").size(theme::TEXT_11).color(case_label_color))
-            .on_press(EditorMessage::FindToggleCaseSensitivity)
-            .style(theme::button_transparent)
-            .padding([theme::PAD_2, theme::PAD_6]);
+        let case_btn = bar_text_button(
+            "Aa",
+            EditorMessage::FindToggleCaseSensitivity,
+            theme::TEXT_11,
+            case_label_color,
+            [theme::PAD_2, theme::PAD_6],
+        );
 
         let bar = row![
             search_input,
@@ -5258,10 +5282,13 @@ impl EditorState {
             },
         );
 
-        let go_btn = button(text("Go").size(theme::TEXT_12).color(theme::TEXT_SECONDARY))
-            .on_press(EditorMessage::GoToLineGo)
-            .style(theme::button_transparent)
-            .padding([theme::PAD_2, theme::PAD_8]);
+        let go_btn = bar_text_button(
+            "Go",
+            EditorMessage::GoToLineGo,
+            theme::TEXT_12,
+            theme::TEXT_SECONDARY,
+            [theme::PAD_2, theme::PAD_8],
+        );
 
         let bar = row![
             text("Go to line:")

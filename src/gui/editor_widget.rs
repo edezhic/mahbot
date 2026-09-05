@@ -1638,10 +1638,7 @@ pub fn find_matching_bracket(
 /// for YAML (which has no `HighlightLanguage` variant yet). Returns `None`
 /// for any unrecognised extension.
 #[must_use]
-pub fn line_comment_prefix(
-    lang: Option<HighlightLanguage>,
-    ext: Option<&str>,
-) -> Option<&'static str> {
+fn line_comment_prefix(lang: Option<HighlightLanguage>, ext: Option<&str>) -> Option<&'static str> {
     // Prefer the HighlightLanguage match.
     if let Some(lang) = lang {
         return match lang {
@@ -1827,7 +1824,7 @@ impl LineEnding {
 
 /// Check whether a string has a trailing newline.
 #[must_use]
-pub(crate) fn has_trailing_newline(text: &str) -> bool {
+fn has_trailing_newline(text: &str) -> bool {
     text.ends_with('\n')
 }
 
@@ -1886,18 +1883,18 @@ pub(crate) fn byte_offset_to_line_col(text: &str, offset: usize) -> (usize, usiz
 
 /// Convert a character-based column on a single line to a byte offset within
 /// that line's text. Used when passing indices to `cosmic_text::Cursor`.
-pub(crate) fn char_col_to_byte_offset_in_line(line_text: &str, char_col: usize) -> usize {
+fn char_col_to_byte_offset_in_line(line_text: &str, char_col: usize) -> usize {
     line_text.chars().take(char_col).map(char::len_utf8).sum()
 }
 
 /// Convert a byte-based column on a single line to a character-based column.
-pub(crate) fn byte_col_to_char_col_in_line(line_text: &str, byte_col: usize) -> usize {
+fn byte_col_to_char_col_in_line(line_text: &str, byte_col: usize) -> usize {
     line_text[..byte_col.min(line_text.len())].chars().count()
 }
 
 /// Byte range `[start, end)` covering the single character at `char_col` on
 /// `line_text`, or an empty range at the line end if `char_col` is past EOF.
-pub(crate) fn char_col_to_byte_range_in_line(line_text: &str, char_col: usize) -> (usize, usize) {
+fn char_col_to_byte_range_in_line(line_text: &str, char_col: usize) -> (usize, usize) {
     let start = char_col_to_byte_offset_in_line(line_text, char_col);
     let end = line_text[start..]
         .chars()
