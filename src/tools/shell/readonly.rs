@@ -2104,15 +2104,11 @@ fn resolve_var(name: &str, state: &ValidationState) -> VarValue {
             None => VarValue::Opaque,
             Some(VarBinding { poisoned: true, .. }) => VarValue::Blocked,
             Some(VarBinding { value: None, .. }) => VarValue::TempRoot,
+            // Empty binding (`unset NAME`) expands to ''.
             Some(VarBinding {
                 value: Some(v),
                 poisoned: false,
-            }) if !v.is_empty() => VarValue::Concrete(v.clone()),
-            // Empty binding (`unset NAME` — bash expands to '').
-            Some(VarBinding {
-                value: Some(_),
-                poisoned: false,
-            }) => VarValue::Concrete(String::new()),
+            }) => VarValue::Concrete(v.clone()),
         },
     }
 }
@@ -3379,10 +3375,28 @@ fn word_parts(w: &str) -> Vec<WordPart> {
     parts
 }
 
-/// Fixed output of a substitution body that provably echoes plain tokens
-/// (`$(echo foo bar)`); `None` when the output is unprovable (any other
-/// command, `-`-prefixed or quoted args, `$var`, nested spans, ...).
-fn simple_echo_output(body: &str) -> Option<String> {
+/// True when `c` is a safe echo-fold char: ASCII alphanumeric plus a fixed
+/// punctuation set (no quotes, globs, `$`, backslash, redirection, ...).
+fn is_safe_echo_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '_' | '.' | '/' | '+' | ':' | '@' | '%' | '=' | ',' | '-')
+}
+
+/// Leading-dash policy for [`echo_token_fold`].
+#[derive(Clone, Copy)]
+enum EchoDashes {
+    /// Reject `-`-prefixed tokens (they could be `echo` flags like `-e` that
+    /// alter output).
+    Reject,
+    /// Allow `-`-prefixed literal tokens (`echo -i`-style: a single provable
+    /// flag value must fold).
+    Allow,
+}
+
+/// Fold a substitution BODY to its provable output when it is an `echo` of
+/// literal safe-char tokens (`$(echo foo bar)`); `None` when the output is
+/// unprovable (any other command, quoted args, `$var`, nested spans, ...).
+fn echo_token_fold(body: &str, dashes: EchoDashes) -> Option<String> {
     let body = body.trim();
     let (cmd, args) = body.split_once(char::is_whitespace)?;
     if cmd != "echo" {
@@ -3390,17 +3404,22 @@ fn simple_echo_output(body: &str) -> Option<String> {
     }
     let toks: Vec<&str> = args.split_whitespace().collect();
     if toks.is_empty()
-        || toks.iter().any(|t| {
-            t.starts_with('-')
-                || !t.chars().all(|c| {
-                    c.is_ascii_alphanumeric()
-                        || matches!(c, '_' | '.' | '/' | '+' | ':' | '@' | '%' | '=' | ',' | '-')
-                })
+        || toks.iter().any(|t| match dashes {
+            EchoDashes::Reject if t.starts_with('-') => true,
+            _ => !t.chars().all(is_safe_echo_char),
         })
     {
         return None;
     }
     Some(toks.join(" "))
+}
+
+/// Simple [`echo_token_fold`] with [`EchoDashes::Reject`]: fixed output of a
+/// substitution body that provably echoes plain tokens (`$(echo foo bar)`);
+/// `None` when unprovable (any other command, `-`-prefixed or quoted args,
+/// `$var`, nested spans, ...).
+fn simple_echo_output(body: &str) -> Option<String> {
+    echo_token_fold(body, EchoDashes::Reject)
 }
 
 /// True when a substitution word `w` could expand to a mutation token at a
@@ -3865,10 +3884,9 @@ fn var_value_is_inplace_flag(value: &str) -> bool {
 }
 
 /// Fold a whole-word substitution to its provable output when the word is
-/// exactly one substitution span that `echo`s literal tokens. Reuses
-/// [`simple_echo_output`] first (which deliberately does not fold
-/// `-`-prefixed tokens); the sed gate additionally folds `echo -i`-style
-/// bodies so a provable `-i` value is rejected (and `echo -n` is not).
+/// exactly one substitution span that `echo`s literal tokens. Uses
+/// [`sed_echo_fold`], which tolerates `-`-prefixed tokens (`echo -i`-style),
+/// so a provable `-i` value is rejected (and `echo -n` is not).
 /// Returns `None` for any other body (unprovable) or non-whole-word words.
 fn sed_whole_word_substitution_fold(w: &str) -> Option<String> {
     // Strip a balanced outer quote so `"$(echo -i)"` and `$(echo -i)` parse alike.
@@ -3882,30 +3900,11 @@ fn sed_whole_word_substitution_fold(w: &str) -> Option<String> {
 
 /// Fold one substitution BODY to its provable output when it is an `echo` of
 /// literal safe-char tokens. `None` = unprovable.
+///
+/// Uses [`EchoDashes::Allow`], so `-`-prefixed literal tokens fold (`echo
+/// -i`-style: a single provable flag value folds to its value).
 fn sed_echo_fold(body: &str) -> Option<String> {
-    if let Some(out) = simple_echo_output(body) {
-        return Some(out);
-    }
-    // `echo -i`-style: same safe-char guard as [`simple_echo_output`] but
-    // allowing `-`-prefixed literal tokens, so a single provable flag field
-    // folds to its value.
-    let body = body.trim();
-    let (cmd, args) = body.split_once(char::is_whitespace)?;
-    if cmd != "echo" {
-        return None;
-    }
-    let toks: Vec<&str> = args.split_whitespace().collect();
-    if toks.is_empty()
-        || toks.iter().any(|t| {
-            !t.chars().all(|c| {
-                c.is_ascii_alphanumeric()
-                    || matches!(c, '_' | '.' | '/' | '+' | ':' | '@' | '%' | '=' | ',' | '-')
-            })
-        })
-    {
-        return None;
-    }
-    Some(toks.join(" "))
+    echo_token_fold(body, EchoDashes::Allow)
 }
 
 /// Check if `sed` has an in-place flag in a way that mutates files outside temp.
@@ -4453,13 +4452,14 @@ fn check_git_ref_subcommand(subcommand: &str, sub: &str) -> Result<(), String> {
         // bare-name rule.
         if w.starts_with('-') && w.len() > 1 {
             let is_name_less_mutation = if w.starts_with("--") {
-                [
-                    "--set-upstream-to",
-                    "--unset-upstream",
-                    "--edit-description",
-                ]
-                .iter()
-                .any(|m| w == *m || w.starts_with(&format!("{m}=")))
+                matches_mutation_token(
+                    &w,
+                    &[
+                        "--set-upstream-to",
+                        "--unset-upstream",
+                        "--edit-description",
+                    ],
+                )
             } else {
                 w[1..].contains('u') // branch `-u<upstream>` (attached value)
             };
