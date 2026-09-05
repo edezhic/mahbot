@@ -356,18 +356,28 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 /// `image/x-ms-bmp` alias) never route as images.
 const IMAGE_MIME_PREFIXES: &[&str] = &["image/png", "image/jpeg", "image/jpg", "image/webp"];
 
+/// Shared username → `@u`, else `first_name` label chain. Used by both
+/// [`format_sender_label`] and the non-bot branch of [`replied_to_sender_label`];
+/// they differ only in the terminal fallback sentinel.
+fn sender_label_with_fallback(from: &serde_json::Value, fallback: &str) -> String {
+    from.get("username")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || {
+                from.get("first_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(fallback)
+                    .to_string()
+            },
+            |u| format!("@{u}"),
+        )
+}
+
 /// Format a sender label for display: `@username` if a username is present,
 /// otherwise the display name (first_name, or `"unknown"` as ultimate fallback).
 #[must_use]
 fn format_sender_label(from: &serde_json::Value) -> String {
-    if let Some(username) = from.get("username").and_then(serde_json::Value::as_str) {
-        format!("@{username}")
-    } else {
-        from.get("first_name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(crate::users::TELEGRAM_UNKNOWN_SENTINEL)
-            .to_string()
-    }
+    sender_label_with_fallback(from, crate::users::TELEGRAM_UNKNOWN_SENTINEL)
 }
 
 /// Resolve the display label for a replied-to message's author.
@@ -401,17 +411,7 @@ fn replied_to_sender_label(message: &serde_json::Value) -> String {
                 .and_then(serde_json::Value::as_str)
                 .map_or_else(|| "bot".to_string(), |u| format!("@{u}"))
         } else {
-            from.get("username")
-                .and_then(serde_json::Value::as_str)
-                .map_or_else(
-                    || {
-                        from.get("first_name")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("user")
-                            .to_string()
-                    },
-                    |u| format!("@{u}"),
-                )
+            sender_label_with_fallback(from, "user")
         }
     } else {
         "user".to_string()
@@ -778,7 +778,7 @@ async fn resolve_authorized_sender(
 /// spans like `****` or `*` with no content between delimiters).
 ///
 /// This is a helper to deduplicate the 5 structurally identical inline
-/// formatting branches (bold, italic, code, strikethrough). Callers that
+/// formatting branches (bold `**`/`__`, italic, code, strikethrough). Callers that
 /// need to guard against matching a single character when the previous
 /// character is the same (e.g. the second `*` of `**` for italic, or the
 /// second `` ` `` of ` `` ` for inline code) must apply that guard before

@@ -1331,15 +1331,6 @@ fn attachment_image_and_video_helpers() {
     for p in ["file.md", "file.png", "file", "clip.mpg"] {
         assert!(!crate::util::is_video_extension(std::path::Path::new(p)));
     }
-    // photo with caption
-    let content = format!(
-        "[IMAGE:{}]\n\nLook at this screenshot",
-        std::path::Path::new("/tmp/workspace/photo.jpg").display()
-    );
-    assert_eq!(
-        content,
-        "[IMAGE:/tmp/workspace/photo.jpg]\n\nLook at this screenshot"
-    );
 }
 
 #[test]
@@ -1875,12 +1866,14 @@ async fn setup_mirror_test_env() -> (
     (sent, lock)
 }
 
-fn gui_msg(user_name: &str, content: &str) -> ChannelMessage {
+/// Shared `ChannelMessage` constructor core; the `gui_msg`/`telegram_msg`/
+/// `voice_msg` wrappers differ only in `channel` and `reply_target`.
+fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -> ChannelMessage {
     ChannelMessage {
         user_name: user_name.to_string(),
-        reply_target: String::new(),
+        reply_target: reply_target.to_string(),
         content: content.to_string(),
-        channel: "gui".to_string(),
+        channel: channel.to_string(),
         workspace: "test".to_string(),
         optimistic_id: None,
         callback_query_id: None,
@@ -1888,36 +1881,18 @@ fn gui_msg(user_name: &str, content: &str) -> ChannelMessage {
         chat_id: None,
         message_id: None,
     }
+}
+
+fn gui_msg(user_name: &str, content: &str) -> ChannelMessage {
+    test_msg(user_name, content, "gui", "")
 }
 
 fn telegram_msg(user_name: &str, content: &str) -> ChannelMessage {
-    ChannelMessage {
-        user_name: user_name.to_string(),
-        reply_target: "chat:thread".to_string(),
-        content: content.to_string(),
-        channel: "telegram".to_string(),
-        workspace: "test".to_string(),
-        optimistic_id: None,
-        callback_query_id: None,
-        reply_reference: None,
-        chat_id: None,
-        message_id: None,
-    }
+    test_msg(user_name, content, "telegram", "chat:thread")
 }
 
 fn voice_msg(user_name: &str, content: &str) -> ChannelMessage {
-    ChannelMessage {
-        user_name: user_name.to_string(),
-        reply_target: String::new(),
-        content: content.to_string(),
-        channel: "voice".to_string(),
-        workspace: "test".to_string(),
-        optimistic_id: None,
-        callback_query_id: None,
-        reply_reference: None,
-        chat_id: None,
-        message_id: None,
-    }
+    test_msg(user_name, content, "voice", "")
 }
 
 /// Shared happy-path mirror harness: sets up the mirror environment, binds
@@ -2159,14 +2134,10 @@ async fn strips_media_markers_from_content() {
         "<blockquote>\nCheck this  and my\n</blockquote>",
     )
     .await;
-}
-
-#[tokio::test]
-async fn strips_lowercase_media_markers_from_content() {
-    // Regression test: the mirror path must use a case-insensitive regex
-    // to strip lowercase markers like [image:...] and [audio:...].
+    // Regression: the mirror path must use a case-insensitive regex to strip
+    // lowercase markers like [image:...] and [audio:...].
     assert_mirror_strips_markers(
-        "lowercase_markers",
+        "strip_markers",
         "unique_lowercase",
         "See [image:/tmp/photo.png] and hear [audio:/tmp/sound.mp3]",
         "<blockquote>\nSee  and hear\n</blockquote>",
