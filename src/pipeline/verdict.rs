@@ -415,6 +415,16 @@ pub(crate) enum ParallelVerdict {
     BlockerVerification(BlockerVerificationVerdict),
 }
 
+impl ParallelVerdict {
+    /// True when the round never produced a result at all (no response or
+    /// unparseable output) — a hard technical failure, as opposed to a
+    /// completed-but-rework verdict.
+    #[must_use]
+    pub(crate) fn is_technical_failure(&self) -> bool {
+        matches!(self, Self::NoResponse(_) | Self::ParseFailed(_))
+    }
+}
+
 /// Structured-extraction behavior for a parallel round member.
 #[derive(Clone)]
 pub(crate) enum ExtractionMode {
@@ -692,12 +702,7 @@ pub(crate) async fn process_verifier_verdicts(
     // (comment + delete job + pause; no bounce budget). A verifier that DID
     // complete but found issues (a Verdict below threshold) is a rework verdict
     // — bounce to development, consuming bounce budget.
-    let technical_failure = results.iter().any(|r| {
-        matches!(
-            r,
-            ParallelVerdict::NoResponse(_) | ParallelVerdict::ParseFailed(_)
-        )
-    });
+    let technical_failure = results.iter().any(ParallelVerdict::is_technical_failure);
     let rework_failure = !technical_failure
         && results.iter().any(|r| match r {
             ParallelVerdict::Verdict(v) => !verdict_passes(v),

@@ -806,12 +806,7 @@ async fn process_analyst_verdicts(
 ) {
     let missing_analysis = base_results
         .iter()
-        .filter(|r| {
-            matches!(
-                r,
-                ParallelVerdict::NoResponse(_) | ParallelVerdict::ParseFailed(_)
-            )
-        })
+        .filter(|r| r.is_technical_failure())
         .count();
     let dispatched = base_results.len();
     let extracted_count = dispatched - missing_analysis;

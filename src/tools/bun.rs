@@ -253,12 +253,7 @@ async fn install_tag(tag: &str) -> Result<PathBuf, String> {
     // lost its executable bit would survive a reinstall unchanged — force the
     // bit back on after every swap (the fresh copy is 0o755, but the swap may
     // override it from the dest).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("failed to set executable bit on {}: {e}", dest.display()))?;
-    }
+    crate::util::managed_bin::set_executable(&dest)?;
     Ok(dest)
 }
 

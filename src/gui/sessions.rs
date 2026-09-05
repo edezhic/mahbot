@@ -454,12 +454,6 @@ impl SessionsState {
             // relative-time labels); cards are rebuilt from it on every frame.
             let mut session_list = Column::new().spacing(theme::SPACE_4);
             if let Some(ref cached) = self.cached_session_items {
-                // Live running agent ids, computed once per frame for the
-                // per-card running indicator. `list()` returns owned handles;
-                // keep them alive for the loop so the `&str` ids stay valid.
-                let running_agents = crate::agent::registry::AGENT_REGISTRY.list();
-                let running_ids: HashSet<&str> =
-                    running_agents.iter().map(|h| h.agent_id.as_str()).collect();
                 for item in cached {
                     let is_selected = self.selected_session.as_deref() == Some(&item.agent_id);
 
@@ -484,7 +478,7 @@ impl SessionsState {
                             .size(theme::TEXT_13)
                             .color(title_color),
                     );
-                    if running_ids.contains(item.agent_id.as_str()) {
+                    if crate::agent::registry::AGENT_REGISTRY.contains(item.agent_id.as_str()) {
                         title_row = title_row
                             .push(Space::new().width(Length::Fill))
                             .push(super::spinner(theme::TEXT_14));

@@ -1091,10 +1091,7 @@ async fn checkpoint_parallel_outcomes(
         // A ParseFailed member must be treated as not-Done (re-run on a resume)
         // — it did produce a response but the extraction failed, so its stored
         // outcome is only a diagnostic dump, not a completed verdict.
-        let status = if matches!(
-            result,
-            ParallelVerdict::NoResponse(_) | ParallelVerdict::ParseFailed(_)
-        ) {
+        let status = if result.is_technical_failure() {
             crate::jobs::RowStatus::Failed
         } else {
             crate::jobs::RowStatus::Done

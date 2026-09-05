@@ -1918,8 +1918,9 @@ mod tests {
             .collect();
 
         for id in std::iter::once(&direct_id).chain(prefixed_ids.iter()) {
-            // list_sessions_with_metadata joins with session_metadata, so the
-            // context columns are needed too (append alone doesn't create them).
+            // list_sessions_with_metadata reads FROM session_metadata directly;
+            // the append path upserts the row (context columns stay NULL
+            // when context is None).
             store
                 .append_with_context(
                     id,

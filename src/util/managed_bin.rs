@@ -191,16 +191,7 @@ pub(crate) fn extract_single_file_tar_gz(
     }
 
     // The freshly extracted binary must be executable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&out_path, fs::Permissions::from_mode(0o755)).map_err(|e| {
-            format!(
-                "failed to set executable bit on {}: {e}",
-                out_path.display()
-            )
-        })?;
-    }
+    set_executable(&out_path)?;
     Ok(out_path)
 }
 
@@ -245,17 +236,21 @@ pub(crate) fn extract_single_file_zip(
     }
 
     // The freshly extracted binary must be executable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&out_path, fs::Permissions::from_mode(0o755)).map_err(|e| {
-            format!(
-                "failed to set executable bit on {}: {e}",
-                out_path.display()
-            )
-        })?;
-    }
+    set_executable(&out_path)?;
     Ok(out_path)
+}
+
+/// Force the executable bit on a freshly extracted/installed binary.
+#[cfg(unix)]
+pub(crate) fn set_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("failed to set executable bit on {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 // ── Host detection ──────────────────────────────────────────────────
