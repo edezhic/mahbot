@@ -1957,6 +1957,8 @@ impl HomeState {
             optimistic_id,
             callback_query_id: None,
             reply_reference: reply,
+            chat_id: None,
+            message_id: None,
         };
 
         // Push to GUI_MESSAGE_TX.

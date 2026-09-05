@@ -766,13 +766,18 @@ async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
     mahbot::channels::telegram::send_reply(&msg.reply_target, &content).await;
 }
 
+/// Serializes role-switch writes with their feedback (pinned text + picker
+/// checkmark) so two rapid taps commit and repaint in tap order. Held across
+/// the Telegram HTTP feedback: role switches are human-paced and the HTTP
+/// client timeout caps any stall — the accepted tradeoff for deterministic
+/// ordering.
+static ROLE_SWITCH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
 /// Handle a role switch request — pool-gated (revalidated at tap time),
 /// persists the new active role and confirms after a successful switch.
 async fn handle_role_switch(msg: &ChannelMessage, role: Role) {
-    if !mahbot::users::role_pool(&msg.user_name)
-        .await
-        .contains(&role)
-    {
+    let pool = mahbot::users::role_pool(&msg.user_name).await;
+    if !pool.contains(&role) {
         send_telegram_reply(
             msg,
             format!(
@@ -783,26 +788,41 @@ async fn handle_role_switch(msg: &ChannelMessage, role: Role) {
         .await;
         return;
     }
-    match mahbot::users::switch_active_role(&msg.user_name, role).await {
-        Ok(()) => {
-            let text = format!("Active role switched to {}.", role.display_label());
-            // Telegram-only pin flow; detached so an unreachable API can't
-            // stall the dispatch loop — fire-and-forget, so a shutdown may
-            // drop the notification (the switch is already persisted).
-            let Some(channel) = mahbot::channel_registry().get("telegram") else {
-                return;
-            };
-            let reply_target = msg.reply_target.clone();
-            tokio::spawn(async move {
-                let tc = channel
-                    .as_any()
-                    .downcast_ref::<mahbot::channels::telegram::TelegramChannel>()
-                    .expect("registered telegram channel");
-                tc.send_role_switch_notification(&reply_target, &text).await;
-            });
-        }
-        Err(e) => send_telegram_reply(msg, format!("Failed to switch role: {e}")).await,
+    // The pinned notification carries just the role name.
+    let text = role.display_label().to_string();
+    let picker_refresh = msg
+        .chat_id
+        .clone()
+        .zip(msg.message_id)
+        .map(|(chat_id, message_id)| {
+            (
+                chat_id,
+                message_id,
+                build_role_picker_keyboard(&pool, Some(role)),
+            )
+        });
+    // Awaited inline (the callback handler is spawned per message, so this
+    // never stalls the dispatch loop) under the lock that also covers the
+    // write, making the persisted role and the last checkmark tap-ordered.
+    let guard = ROLE_SWITCH_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    if let Err(e) = mahbot::users::switch_active_role(&msg.user_name, role).await {
+        // Release before the denial reply's network I/O.
+        drop(guard);
+        send_telegram_reply(msg, format!("Failed to switch role: {e}")).await;
+        return;
     }
+    let Some(channel) = mahbot::channel_registry().get("telegram") else {
+        return;
+    };
+    let tc = channel
+        .as_any()
+        .downcast_ref::<mahbot::channels::telegram::TelegramChannel>()
+        .expect("registered telegram channel");
+    tc.send_role_switch_feedback(&msg.reply_target, &text, picker_refresh)
+        .await;
 }
 
 /// Handle `/agents` — send the inline role picker listing the roles in the
@@ -1178,8 +1198,9 @@ static MODEL_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 /// Common handler for setting a per-user model via callback action.
 ///
 /// Validates the payload (image models against the catalog, fail-open),
-/// writes the user's `image_gen_model`/`video_model` column, and acknowledges
-/// the callback with a toast.
+/// writes the user's `image_gen_model`/`video_model` column, refreshes the
+/// pressed picker's ✓ in place on success, and acknowledges the callback
+/// with a toast.
 async fn handle_set_model_action(
     msg: &ChannelMessage,
     payload: &str,
@@ -1190,15 +1211,43 @@ async fn handle_set_model_action(
     // lock serializes rapid taps of the same picker — without it, concurrent
     // single-statement upserts would commit last-write-wins in
     // nondeterministic order instead of tap order. Acquired before validation;
-    // held only over the decision+write, not the callback ack (network I/O).
+    // held over the decision+write and the pressed keyboard's in-place ✓
+    // refresh so the checkmark lands in tap order too (not the callback ack).
+    // Network I/O under the lock is the accepted tradeoff for deterministic
+    // ordering — human-paced taps and the HTTP client timeout cap any stall.
     let toast = {
         let _guard = MODEL_WRITE_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await;
-        set_user_model(&msg.user_name, payload, display_name, validate_image).await
+        match set_user_model(&msg.user_name, payload, display_name, validate_image).await {
+            Ok(toast) => {
+                refresh_pressed_models_keyboard(msg, validate_image).await;
+                Some(toast)
+            }
+            Err(toast) => Some(toast),
+        }
     };
     answer_telegram_callback(msg, toast).await;
+}
+
+/// Best-effort in-place refresh of the pressed model-picker keyboard: moves
+/// the ✓ to the just-saved model. Any failure (deleted/48h-expired message,
+/// identical keyboard, transport error) is cosmetic — log and skip. No-op
+/// when the callback didn't carry its source message identity.
+async fn refresh_pressed_models_keyboard(msg: &ChannelMessage, is_image: bool) {
+    let (Some(chat_id), Some(message_id)) = (&msg.chat_id, msg.message_id) else {
+        return;
+    };
+    let keyboard = build_models_keyboard(is_image, &msg.user_name).await;
+    if let Some(channel) = mahbot::channel_registry().get("telegram")
+        && let Some(tc) = channel
+            .as_any()
+            .downcast_ref::<mahbot::channels::telegram::TelegramChannel>()
+        && let Err(e) = tc.edit_reply_markup(chat_id, message_id, &keyboard).await
+    {
+        tracing::debug!(?e, "model picker keyboard refresh skipped");
+    }
 }
 
 /// Validate and write one per-user model pick, returning the callback toast.
@@ -1212,19 +1261,19 @@ async fn set_user_model(
     payload: &str,
     display_name: &str,
     validate_image: bool,
-) -> Option<String> {
+) -> Result<String, String> {
     if payload.is_empty() {
         tracing::warn!(display_name, "{display_name} action with empty payload");
-        return Some("No model specified.".to_string());
+        return Err("No model specified.".to_string());
     }
     if validate_image
         && let Err(e) = mahbot::tools::media_catalog::image::validate_image_model(payload).await
     {
-        return Some(format!("Invalid image model: {e}"));
+        return Err(format!("Invalid image model: {e}"));
     }
     let store = mahbot::users::store();
     if !store.user_exists(user_name).await.unwrap_or(false) {
-        return Some("User is not registered.".to_string());
+        return Err("User is not registered.".to_string());
     }
     let result = if validate_image {
         store.set_image_gen_model(user_name, payload).await
@@ -1232,10 +1281,10 @@ async fn set_user_model(
         store.set_video_model(user_name, payload).await
     };
     match result {
-        Ok(()) => Some(format!("{display_name} model set to: {payload}")),
+        Ok(()) => Ok(format!("{display_name} model set to: {payload}")),
         Err(e) => {
             tracing::error!(user_name, error = %e, "Failed to save per-user model");
-            Some(format!("Failed to save model: {e}"))
+            Err(format!("Failed to save model: {e}"))
         }
     }
 }

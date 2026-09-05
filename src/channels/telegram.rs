@@ -240,6 +240,8 @@ impl MessageContext {
             optimistic_id: None,
             callback_query_id: cq_id,
             reply_reference: self.reply_reference,
+            chat_id: (!self.chat_id.is_empty()).then_some(self.chat_id),
+            message_id: (self.message_id != 0).then_some(self.message_id),
         }
     }
 }
@@ -954,13 +956,15 @@ fn strip_html_tags(s: &str) -> String {
     out
 }
 
-/// Classification of an `editMessageText` failure for the role-switch pin
-/// flow — matched on stable substrings independent of Telegram's wording;
-/// a reworded error hits `Other` (delivery unaffected, no recovery).
-enum EditMessageFailure {
-    /// Target message was deleted — re-send + pin + persist a fresh id.
+/// Classification of a Telegram edit failure (`editMessageText` or
+/// `editMessageReplyMarkup`) — matched on stable substrings independent of
+/// Telegram's wording; a reworded error hits `Other` (delivery unaffected,
+/// no recovery).
+#[derive(Debug)]
+pub enum EditMessageFailure {
+    /// Target message was deleted.
     NotFound,
-    /// Past Telegram's 48-hour edit window — re-send + pin + persist a fresh id.
+    /// Past Telegram's 48-hour edit window.
     CannotEdit,
     /// Text is identical ("message is not modified") — success/no-op.
     NotModified,
@@ -1066,8 +1070,10 @@ impl TelegramChannel {
             .and_then(serde_json::Value::as_str)
             .map(String::from);
 
-        // Auth is clicker-based (cq.from), never msg author; chat_id/message_id unused.
-        let Some((user_name, _, reply_target)) = resolve_authorized_sender(cq, msg).await else {
+        // Auth is clicker-based (cq.from), never msg author; chat_id/message_id
+        // identify the pressed keyboard's message so handlers can edit it in place.
+        let Some((user_name, chat_id, reply_target)) = resolve_authorized_sender(cq, msg).await
+        else {
             tracing::debug!(
                 "Telegram: ignoring callback query from unknown user '{}'",
                 extract_sender_user_name(cq)
@@ -1075,10 +1081,14 @@ impl TelegramChannel {
             return None;
         };
 
+        let message_id = msg
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
         let ctx = MessageContext {
             user_name,
-            chat_id: String::new(),
-            message_id: 0,
+            chat_id,
+            message_id,
             reply_target,
             reply_reference: None,
         };
@@ -1733,6 +1743,31 @@ impl TelegramChannel {
             .map(|_| ())
     }
 
+    /// Replace a previously sent message's inline keyboard in place
+    /// (`editMessageReplyMarkup`). `reply_markup` must be a full
+    /// `{"inline_keyboard": [...]}` value (or `Value::Null` to remove the
+    /// keyboard). Failures are classified with the shared edit-failure
+    /// classifier; callers typically treat every failure as a no-op.
+    pub async fn edit_reply_markup(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        reply_markup: &serde_json::Value,
+    ) -> Result<(), EditMessageFailure> {
+        self.post_telegram_json(
+            "editMessageReplyMarkup",
+            serde_json::json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reply_markup": reply_markup,
+            }),
+            "editMessageReplyMarkup error",
+        )
+        .await
+        .map(|_| ())
+        .map_err(|(_, desc)| classify_edit_failure(&desc))
+    }
+
     /// Pin a message in a chat. Pins are always silent in private chats;
     /// `disable_notification` additionally suppresses any service notice.
     async fn pin_chat_message(
@@ -1751,6 +1786,36 @@ impl TelegramChannel {
             .map(|_| ())
     }
 
+    /// Send the role-switch feedback: the pinned success notification plus,
+    /// when the tap carried the pressed picker's identity, an in-place ✓ move
+    /// on that picker's keyboard. Callers must serialize the preceding
+    /// `switch_active_role` write with this call (the bin holds one lock over
+    /// both) so rapid taps can't leave the last-landed checkmark or pin text
+    /// disagreeing with the persisted role; the internal pin lock additionally
+    /// serializes concurrent callers. The lock is held across the HTTP calls
+    /// (role switches are human-paced; the HTTP client timeout caps any
+    /// stall) — the accepted tradeoff for deterministic ordering.
+    pub async fn send_role_switch_feedback(
+        &self,
+        reply_target: &str,
+        text: &str,
+        picker_refresh: Option<(String, i64, serde_json::Value)>,
+    ) {
+        // The lock is held across the HTTP calls — role switches are
+        // human-paced, so contention is negligible.
+        let _guard = self.pin_lock.lock().await;
+        self.send_role_switch_notification(reply_target, text).await;
+        if let Some((chat_id, message_id, keyboard)) = picker_refresh
+            && let Err(e) = self
+                .edit_reply_markup(&chat_id, message_id, &keyboard)
+                .await
+        {
+            // Best-effort: a deleted/48h-expired message or an identical
+            // keyboard (re-tap of the active role) is cosmetic — log and skip.
+            tracing::debug!(?e, "role picker keyboard refresh skipped");
+        }
+    }
+
     /// Send the role-switch success notification in a Telegram private chat,
     /// pinned at the top: the first switch sends + pins + persists the message
     /// id (per chat in `config_kv`); later switches edit it in place and
@@ -1760,10 +1825,7 @@ impl TelegramChannel {
     /// plain message while the stored id is kept (only 'not found'/'can't be
     /// edited' recover), and a failed re-pin after a successful edit is only
     /// logged. Groups and threads get a plain notification (no pin).
-    pub async fn send_role_switch_notification(&self, reply_target: &str, text: &str) {
-        // Serialize per channel (the lock is held across the HTTP calls —
-        // role switches are human-paced, so contention is negligible).
-        let _guard = self.pin_lock.lock().await;
+    async fn send_role_switch_notification(&self, reply_target: &str, text: &str) {
         let (chat_id, thread_id) = parse_recipient(reply_target);
         // Same command-menu refresh the normal send path triggers.
         self.spawn_menu_refresh(chat_id);

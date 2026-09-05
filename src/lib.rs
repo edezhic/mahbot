@@ -448,6 +448,13 @@ pub struct ChannelMessage {
     /// Reference to the message this message is replying to, used to render a
     /// quote header. `None` for messages with no reply target.
     pub reply_reference: Option<crate::channels::ReplyReference>,
+    /// Channel-side chat id of the message this message originated from.
+    /// Populated for Telegram messages and callback queries; `None` for
+    /// other channels. Used to address the source message in place (e.g.
+    /// editing the role-picker keyboard after a callback).
+    pub chat_id: Option<String>,
+    /// Channel-side message id of the originating message (see [`Self::chat_id`]).
+    pub message_id: Option<i64>,
 }
 
 /// An outbound message to deliver on a channel.

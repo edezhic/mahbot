@@ -716,6 +716,8 @@ mod tests {
             optimistic_id: None,
             callback_query_id: None,
             reply_reference: None,
+            chat_id: None,
+            message_id: None,
         }
     }
 

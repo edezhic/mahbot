@@ -518,6 +518,8 @@ async fn parse_callback_query_returns_message_with_extracted_fields() {
     assert_eq!(msg.content, "set_model|test-model");
     assert_eq!(msg.channel, "telegram");
     assert_eq!(msg.callback_query_id.as_deref(), Some("12345"));
+    assert_eq!(msg.chat_id.as_deref(), Some("-100200300"));
+    assert_eq!(msg.message_id, Some(100));
 }
 
 #[tokio::test]
@@ -981,6 +983,8 @@ async fn attachment_message_reply_carries_reference() {
     let reply = ctx.reply_reference.expect("media reply carries reference");
     assert_eq!(reply.author, "@bob");
     assert_eq!(reply.snippet, "[Photo]");
+    assert_eq!(ctx.chat_id, "100");
+    assert_eq!(ctx.message_id, 7);
 }
 
 #[tokio::test]
@@ -1884,6 +1888,8 @@ fn gui_msg(user_name: &str, content: &str) -> ChannelMessage {
         optimistic_id: None,
         callback_query_id: None,
         reply_reference: None,
+        chat_id: None,
+        message_id: None,
     }
 }
 
@@ -1897,6 +1903,8 @@ fn telegram_msg(user_name: &str, content: &str) -> ChannelMessage {
         optimistic_id: None,
         callback_query_id: None,
         reply_reference: None,
+        chat_id: None,
+        message_id: None,
     }
 }
 
@@ -1910,6 +1918,8 @@ fn voice_msg(user_name: &str, content: &str) -> ChannelMessage {
         optimistic_id: None,
         callback_query_id: None,
         reply_reference: None,
+        chat_id: None,
+        message_id: None,
     }
 }
 
