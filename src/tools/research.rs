@@ -3558,6 +3558,15 @@ async fn run_deep_research(
 mod tests {
     use super::*;
 
+    fn claim(claim: &str, source: &str, confidence: &str) -> Claim {
+        Claim {
+            claim: claim.into(),
+            source: source.into(),
+            confidence: confidence.into(),
+            contradictions: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_budget_cap_enforced() {
         let mut budget = ResearchBudget::new(RESEARCH_MAX_ANALYSTS);
@@ -3643,12 +3652,7 @@ mod tests {
             gap_list: None,
             acc: AccumulatedEvidence {
                 urls: std::collections::HashSet::new(),
-                claims: vec![crate::tools::analyze::Claim {
-                    claim: "alpha is a real project".into(),
-                    source: "s1".into(),
-                    confidence: "high".into(),
-                    contradictions: vec![],
-                }],
+                claims: vec![claim("alpha is a real project", "s1", "high")],
                 unanswered: vec![],
                 unanswered_keys: std::collections::HashSet::new(),
                 raw_reports: vec![],
@@ -3986,18 +3990,8 @@ mod tests {
         let round1 = EvidenceRound {
             urls: vec!["u1".into(), "u2".into()],
             claims: vec![
-                Claim {
-                    claim: "alpha is true".into(),
-                    source: "u1".into(),
-                    confidence: "high".into(),
-                    contradictions: vec![],
-                },
-                Claim {
-                    claim: "beta is true".into(),
-                    source: "u2".into(),
-                    confidence: "medium".into(),
-                    contradictions: vec![],
-                },
+                claim("alpha is true", "u1", "high"),
+                claim("beta is true", "u2", "medium"),
             ],
             unanswered: vec!["how beta relates to alpha".into()],
             ..Default::default()
@@ -4007,18 +4001,8 @@ mod tests {
         let round2 = EvidenceRound {
             urls: vec!["u1".into(), "u3".into()],
             claims: vec![
-                Claim {
-                    claim: "alpha is true".into(),
-                    source: "u1".into(),
-                    confidence: "high".into(),
-                    contradictions: vec![],
-                },
-                Claim {
-                    claim: "gamma is true".into(),
-                    source: "u3".into(),
-                    confidence: "low".into(),
-                    contradictions: vec![],
-                },
+                claim("alpha is true", "u1", "high"),
+                claim("gamma is true", "u3", "low"),
             ],
             unanswered: vec!["how beta relates to alpha".into(), "delta timeline".into()],
             ..Default::default()
@@ -4036,52 +4020,71 @@ mod tests {
         );
     }
 
+    /// Shared fixture for the verdict x confirm 2x2 matrix: one existing claim,
+    /// one pending claim, a single-annotation pass linking new_id 0 to
+    /// existing_id 0, and a Passed confirm pass with a single link for new_id 0.
+    struct AnnotationsMatrix {
+        acc: AccumulatedEvidence,
+        pending: Vec<Claim>,
+        pass: AnnotationPass,
+        confirm: ConfirmOutcome,
+    }
+
+    fn annotations_matrix(
+        existing: Claim,
+        pending: Claim,
+        verdict: &str,
+        contradiction: Option<&str>,
+        confirm_verdict: &str,
+    ) -> AnnotationsMatrix {
+        let mut acc = AccumulatedEvidence::default();
+        acc.claims.push(existing);
+        AnnotationsMatrix {
+            acc,
+            pending: vec![pending],
+            pass: AnnotationPass {
+                annotations: vec![ClaimAnnotation {
+                    new_id: 0,
+                    verdict: verdict.into(),
+                    existing_id: Some(0),
+                    contradiction: contradiction.map(Into::into),
+                }],
+            },
+            confirm: ConfirmOutcome::Passed(ConfirmPass {
+                links: vec![ConfirmLink {
+                    new_id: 0,
+                    verdict: confirm_verdict.into(),
+                }],
+            }),
+        }
+    }
+
     #[test]
     fn test_apply_annotations_contradicts_appends_and_links() {
         // A contradicting claim is never deduped away: it is appended AND
         // linked to the existing claim so the verification gate targets both
         // sides of the dispute.
-        let mut acc = AccumulatedEvidence::default();
-        acc.claims.push(Claim {
-            claim: "alpha costs $100 in 2024".into(),
-            source: "u1".into(),
-            confidence: "medium".into(),
-            contradictions: vec![],
-        });
-        let pending = vec![Claim {
-            claim: "alpha costs $200 in 2024".into(),
-            source: "u2".into(),
-            confidence: "high".into(),
-            contradictions: vec![],
-        }];
-        let pass = AnnotationPass {
-            annotations: vec![ClaimAnnotation {
-                new_id: 0,
-                verdict: "contradicts".into(),
-                existing_id: Some(0),
-                contradiction: Some("price differs: $200 vs $100".into()),
-            }],
-        };
-        let confirm = ConfirmOutcome::Passed(ConfirmPass {
-            links: vec![ConfirmLink {
-                new_id: 0,
-                verdict: "confirm".into(),
-            }],
-        });
-        let novel = acc.apply_annotations(&pass, &pending, &confirm);
+        let mut m = annotations_matrix(
+            claim("alpha costs $100 in 2024", "u1", "medium"),
+            claim("alpha costs $200 in 2024", "u2", "high"),
+            "contradicts",
+            Some("price differs: $200 vs $100"),
+            "confirm",
+        );
+        let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
         assert_eq!(novel, 1, "a contradicting claim is new evidence");
         assert_eq!(
-            acc.claims.len(),
+            m.acc.claims.len(),
             2,
             "the contradiction is preserved, never merged away"
         );
         assert_eq!(
-            acc.claims[0].contradictions,
+            m.acc.claims[0].contradictions,
             vec!["price differs: $200 vs $100"],
             "the existing claim carries the contradiction note — the verification gate fires"
         );
         assert!(
-            acc.claims[1]
+            m.acc.claims[1]
                 .contradictions
                 .contains(&"alpha costs $100 in 2024".to_string()),
             "the new claim links back to the existing one"
@@ -4093,41 +4096,21 @@ mod tests {
         // A duplicate merges into the existing claim: confidence upgraded,
         // sources joined deduplicated — including multi-source '; ' joins on
         // both sides (duplicate entries must never appear in the merged list).
-        let mut acc = AccumulatedEvidence::default();
-        acc.claims.push(Claim {
-            claim: "alpha is true".into(),
-            source: "u1; u2".into(),
-            confidence: "low".into(),
-            contradictions: vec![],
-        });
-        let pending = vec![Claim {
-            claim: "alpha is true".into(),
-            source: "u2; u3".into(),
-            confidence: "high".into(),
-            contradictions: vec![],
-        }];
-        let pass = AnnotationPass {
-            annotations: vec![ClaimAnnotation {
-                new_id: 0,
-                verdict: "duplicate".into(),
-                existing_id: Some(0),
-                contradiction: None,
-            }],
-        };
-        let confirm = ConfirmOutcome::Passed(ConfirmPass {
-            links: vec![ConfirmLink {
-                new_id: 0,
-                verdict: "confirm".into(),
-            }],
-        });
-        let novel = acc.apply_annotations(&pass, &pending, &confirm);
+        let mut m = annotations_matrix(
+            claim("alpha is true", "u1; u2", "low"),
+            claim("alpha is true", "u2; u3", "high"),
+            "duplicate",
+            None,
+            "confirm",
+        );
+        let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
         assert_eq!(novel, 0, "a duplicate is never counted as novel");
         assert_eq!(
-            acc.claims.len(),
+            m.acc.claims.len(),
             1,
             "a duplicate is never dropped — it merges into the existing claim"
         );
-        let c = &acc.claims[0];
+        let c = &m.acc.claims[0];
         assert_eq!(
             c.confidence, "high",
             "a higher-confidence re-statement upgrades the merged claim"
@@ -4143,47 +4126,27 @@ mod tests {
         // A weak duplicate (confirm pass rejected / unclear / failed) is never
         // merged and never counts as novel: it stays standalone with a hint in
         // the side structure — "keep weak, clarify later".
-        let mut acc = AccumulatedEvidence::default();
-        acc.claims.push(Claim {
-            claim: "alpha is true".into(),
-            source: "u1".into(),
-            confidence: "medium".into(),
-            contradictions: vec![],
-        });
-        let pending = vec![Claim {
-            claim: "alpha is true (restated)".into(),
-            source: "u2".into(),
-            confidence: "high".into(),
-            contradictions: vec![],
-        }];
-        let pass = AnnotationPass {
-            annotations: vec![ClaimAnnotation {
-                new_id: 0,
-                verdict: "duplicate".into(),
-                existing_id: Some(0),
-                contradiction: None,
-            }],
-        };
-        let confirm = ConfirmOutcome::Passed(ConfirmPass {
-            links: vec![ConfirmLink {
-                new_id: 0,
-                verdict: "reject".into(),
-            }],
-        });
-        let novel = acc.apply_annotations(&pass, &pending, &confirm);
+        let mut m = annotations_matrix(
+            claim("alpha is true", "u1", "medium"),
+            claim("alpha is true (restated)", "u2", "high"),
+            "duplicate",
+            None,
+            "reject",
+        );
+        let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
         assert_eq!(novel, 0, "a weak duplicate is never counted as novel");
         assert_eq!(
-            acc.claims.len(),
+            m.acc.claims.len(),
             2,
             "the weak duplicate stays standalone — never merged"
         );
         assert_eq!(
-            acc.weak.duplicates,
+            m.acc.weak.duplicates,
             vec![(1, 0)],
             "the suspected relation is recorded in the side structure"
         );
         assert!(
-            acc.weak.contradictions.is_empty(),
+            m.acc.weak.contradictions.is_empty(),
             "only duplicate hints apply here"
         );
     }
@@ -4193,53 +4156,34 @@ mod tests {
         // A weak contradiction keeps the bidirectional notes (both sides
         // qualify for the verification gate) but records the unconfirmed
         // relation in the side structure — never in the note text.
-        let mut acc = AccumulatedEvidence::default();
-        acc.claims.push(Claim {
-            claim: "alpha costs $100 in 2024".into(),
-            source: "u1".into(),
-            confidence: "medium".into(),
-            contradictions: vec![],
-        });
-        let pending = vec![Claim {
-            claim: "alpha costs $200 in 2024".into(),
-            source: "u2".into(),
-            confidence: "high".into(),
-            contradictions: vec![],
-        }];
-        let pass = AnnotationPass {
-            annotations: vec![ClaimAnnotation {
-                new_id: 0,
-                verdict: "contradicts".into(),
-                existing_id: Some(0),
-                contradiction: Some("price differs: $200 vs $100".into()),
-            }],
-        };
-        let confirm = ConfirmOutcome::Passed(ConfirmPass {
-            links: vec![ConfirmLink {
-                new_id: 0,
-                verdict: "reject".into(),
-            }],
-        });
-        let novel = acc.apply_annotations(&pass, &pending, &confirm);
+        let mut m = annotations_matrix(
+            claim("alpha costs $100 in 2024", "u1", "medium"),
+            claim("alpha costs $200 in 2024", "u2", "high"),
+            "contradicts",
+            Some("price differs: $200 vs $100"),
+            "reject",
+        );
+        let novel = m.acc.apply_annotations(&m.pass, &m.pending, &m.confirm);
         assert_eq!(novel, 1, "a contradiction is new evidence even when weak");
         assert_eq!(
-            acc.claims[0].contradictions,
+            m.acc.claims[0].contradictions,
             vec!["price differs: $200 vs $100"],
             "the existing claim keeps its contradiction note"
         );
         assert!(
-            acc.claims[1]
+            m.acc.claims[1]
                 .contradictions
                 .contains(&"alpha costs $100 in 2024".to_string()),
             "the new claim links back to the existing one"
         );
         assert_eq!(
-            acc.weak.contradictions,
+            m.acc.weak.contradictions,
             vec![(1, 0)],
             "the unconfirmed relation lives in the side structure"
         );
         assert!(
-            acc.claims
+            m.acc
+                .claims
                 .iter()
                 .all(|c| c.contradictions.iter().all(|n| !n.contains("unconfirmed"))),
             "weakness never leaks into note text"
@@ -4249,12 +4193,7 @@ mod tests {
     #[test]
     fn test_verification_targets_primaries_first_weak_dups_fill_empty_slots() {
         let mut acc = AccumulatedEvidence::default();
-        acc.claims.push(Claim {
-            claim: "a".into(),
-            source: "u1".into(),
-            confidence: "low".into(),
-            contradictions: vec![],
-        });
+        acc.claims.push(claim("a", "u1", "low"));
         acc.claims.push(Claim {
             claim: "b".into(),
             source: "u2".into(),
@@ -4262,20 +4201,10 @@ mod tests {
             contradictions: vec!["b vs c".into()],
         });
         // Weak duplicate of claim 0 — appended after primaries.
-        acc.claims.push(Claim {
-            claim: "a restated".into(),
-            source: "u3".into(),
-            confidence: "high".into(),
-            contradictions: vec![],
-        });
+        acc.claims.push(claim("a restated", "u3", "high"));
         // Weak duplicate of claim 1 that is ALSO low confidence — already
         // primary, must not be double-appended.
-        acc.claims.push(Claim {
-            claim: "b restated".into(),
-            source: "u4".into(),
-            confidence: "low".into(),
-            contradictions: vec![],
-        });
+        acc.claims.push(claim("b restated", "u4", "low"));
         acc.weak.duplicates.push((2, 0));
         acc.weak.duplicates.push((3, 1));
         // A weak contradiction must NEVER be appended from the side structure
@@ -4313,25 +4242,10 @@ mod tests {
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
         let ws = crate::workspace::test_ws_named("/tmp/test_ws", "research_annotate_fail_open");
         let mut acc = AccumulatedEvidence::default();
-        acc.claims.push(Claim {
-            claim: "alpha is true".into(),
-            source: "u1".into(),
-            confidence: "medium".into(),
-            contradictions: vec![],
-        });
+        acc.claims.push(claim("alpha is true", "u1", "medium"));
         let pending = vec![
-            Claim {
-                claim: "alpha is true (restated)".into(),
-                source: "u2".into(),
-                confidence: "high".into(),
-                contradictions: vec![],
-            },
-            Claim {
-                claim: "beta contradicts alpha".into(),
-                source: "u3".into(),
-                confidence: "high".into(),
-                contradictions: vec![],
-            },
+            claim("alpha is true (restated)", "u2", "high"),
+            claim("beta contradicts alpha", "u3", "high"),
         ];
         // Script: annotation pass OK (pending 0 = duplicate, pending 1 =
         // contradicts), then the confirm pass hits only transport failures.
