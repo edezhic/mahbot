@@ -7,6 +7,7 @@ pub(crate) mod http;
 pub(crate) mod json;
 pub mod lock;
 pub(crate) mod macros;
+pub(crate) mod managed_bin;
 pub(crate) mod media_target;
 pub(crate) mod model_state;
 #[cfg(test)]

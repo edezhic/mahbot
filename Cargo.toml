@@ -192,6 +192,10 @@ tree-sitter-c = "0.24"
 tree-sitter-sequel = "0.3"
 tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 
+# Managed bun runtime release archive extraction (zip, DEFLATE-compressed).
+# Promoted from candle's transitive dep (the exact major is already in the lock).
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

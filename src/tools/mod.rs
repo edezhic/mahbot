@@ -6,6 +6,7 @@ pub(crate) mod alarms;
 pub(crate) mod analyze;
 pub mod browser;
 pub mod browser_daemon;
+pub mod bun;
 pub mod computer;
 pub(crate) mod edit;
 pub(crate) mod image_gen;

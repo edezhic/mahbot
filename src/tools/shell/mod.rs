@@ -1158,8 +1158,8 @@ impl ShellTool {
 }
 
 /// Extra `PATH` entries prepended for shell subprocesses so developer tools
-/// (`cargo`, Homebrew, npm global bins, etc.) resolve without reading the
-/// parent process `PATH`.
+/// (`cargo`, Homebrew, npm global bins, the managed bun runtime, etc.) resolve
+/// without reading the parent process `PATH`.
 ///
 /// Always includes the cargo bin directory (via `$CARGO_HOME/bin` if set,
 /// else `~/.cargo/bin`) plus commonly expected system tool directories.
@@ -1197,6 +1197,12 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     {
         v.push(PathBuf::from("/opt/homebrew/bin"));
         v.push(PathBuf::from("/usr/local/bin"));
+    }
+
+    // Managed bun runtime (~/.bun/bin) — appended LAST so a user-installed bun
+    // (Homebrew, npm, official installer) keeps precedence over ours.
+    if let Some(dir) = crate::util::managed_bin::bun_bin_dir() {
+        v.push(dir);
     }
     v
 }

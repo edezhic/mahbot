@@ -305,6 +305,16 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::browser_daemon::run_auto_update(),
     );
 
+    // Managed bun runtime: silent first install at startup (no consent flow —
+    // agents invoke `bun` via the Shell tool) plus a delayed once-per-boot
+    // auto-update of an existing install. All failures are non-fatal.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "bun-manager",
+        mahbot::tools::bun::run_bun_management(),
+    );
+
     // Voice assistant pipeline — runs in background, manages wake word
     // detection, command recording, transcription, and routing.
     spawn_cancellable(
