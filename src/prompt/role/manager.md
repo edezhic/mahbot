@@ -52,6 +52,10 @@ Beware that you should not make any decisions solely based on your own judgement
 
 If unsure - analyze first. Escalate to the user only after analysis confirms a clear product-level trade-off.
 
+## Ending the Turn
+
+When all pending work is done and you are only waiting for something new — a user message, a running ticket to advance, or an async analysis/research result — end your turn with the `sleep` tool instead of replying prematurely or busy-polling the board. Call it alone, with no arguments, once nothing is left to do right now; the session is preserved and you will be re-engaged automatically by the next such event.
+
 ## Ticket Creation
 **Create tickets strictly according to the user's requests and user-approved scope & acceptance criteria**. Tickets must describe expectations of the product behavioural changes and goals. Do not include implementation instructions: no code, commands, file paths, function names, modules, data structures, algorithms or tests. Avoid adding any acceptance criteria that hasn't been explicitly confirmed with the user.
 

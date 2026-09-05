@@ -716,9 +716,10 @@ impl Agent {
         // The session is re-engaging (any job kind: user message, async result,
         // alarm, boot replay): clear a stale sleep-ended flag BEFORE this turn
         // runs, so a genuine crash mid-round on this turn is still recovered
-        // normally by the dead-session poller. Only the Assistant can write
-        // the flag (`sleep` is Assistant-only), so other roles skip the read.
-        if matches!(self.role, crate::Role::Assistant)
+        // normally by the dead-session poller. Only the Assistant and the
+        // Manager can write the flag (`sleep` is granted only to them), so
+        // other roles skip the read.
+        if matches!(self.role, crate::Role::Assistant | crate::Role::Manager)
             && crate::session::store()
                 .get_sleep_ended(&self.agent_id)
                 .await

@@ -287,7 +287,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
 
         // ── Condition 4: sleep-ended sessions ended their turns deliberately ──
         if crate::session::store().get_sleep_ended(agent_id).await {
-            // The Assistant ended its turn via the `sleep` tool: the tool tail
+            // The agent ended its turn via the `sleep` tool: the tool tail
             // is an intentional stop while waiting for new input, not a crash —
             // never recover it. Unmarked tool tails (real crash/drain cuts)
             // keep recovering exactly as before. The session has self-healed:

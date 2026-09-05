@@ -1,4 +1,4 @@
-//! Sleep tool — end the Assistant's turn gracefully and go quiet.
+//! Sleep tool — end the agent's turn gracefully and go quiet.
 //!
 //! Called when there is nothing left to do right now and the agent is only
 //! waiting for new input (a user message, an async sub-agent result, or a

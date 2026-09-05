@@ -338,6 +338,10 @@ impl Role {
                     Box::new(SearchArchivedTicketsTool::new(ws)),
                     Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Manager)),
                     Box::new(ResearchTool::new(Role::Manager)),
+                    // The Manager often has nothing to say until a ticket
+                    // advances or an async analysis/research lands — sleep
+                    // ends the turn instead of a premature/no-op reply.
+                    Box::new(SleepTool),
                 ]
             }
             Role::Analyst => {
@@ -717,10 +721,10 @@ mod tests {
     }
 
     #[test]
-    fn sleep_tool_only_in_assistant_toolsets() {
-        // Acceptance pin: `sleep` is granted ONLY to the Assistant, in both the
-        // base and full-access toolsets. Every other role never advertises it —
-        // they always have pending work to do and must not end their turn.
+    fn sleep_tool_only_in_assistant_and_manager_toolsets() {
+        // Acceptance pin: `sleep` is granted ONLY to the Assistant (base and
+        // full-access) and the Manager. Other roles always have pending work
+        // to do and must not end their turn.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for full_access in [false, true] {
@@ -728,10 +732,11 @@ mod tests {
                     .tools(&ws, full_access, test_sessions())
                     .iter()
                     .any(|t| t.name() == "sleep");
-                if role == crate::Role::Assistant {
+                if matches!(role, crate::Role::Assistant | crate::Role::Manager) {
                     assert!(
                         has,
-                        "Assistant (full_access={full_access}) must advertise `sleep`"
+                        "{} (full_access={full_access}) must advertise `sleep`",
+                        role.as_str()
                     );
                 } else {
                     assert!(
