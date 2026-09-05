@@ -513,7 +513,7 @@ static MANUAL_RECORDING_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Wake word detection shares the Qwen3-ASR transcriber model, so "models
 /// ready" means the local transcriber is loaded.
 #[must_use]
-pub fn models_ready() -> bool {
+fn models_ready() -> bool {
     crate::audio::local_transcriber::is_loaded()
 }
 
@@ -852,7 +852,7 @@ pub fn manual_recording_blocked_reason() -> Option<&'static str> {
 }
 
 #[must_use]
-pub fn is_enabled() -> bool {
+fn is_enabled() -> bool {
     voice_state().read().unwrap_poison().enabled
 }
 
@@ -864,7 +864,7 @@ pub fn set_enabled(enabled: bool) {
     }
 }
 
-pub fn set_status(status: VoiceStatus) {
+fn set_status(status: VoiceStatus) {
     set_status_and_notify(&mut voice_state().write().unwrap_poison(), status);
 }
 
@@ -975,8 +975,7 @@ fn is_speech_with_threshold(samples: &[f32], threshold: f32) -> bool {
 /// Reset the Earshot VAD detector's internal state (ring buffer, feature
 /// context).  Used by tests and when the audio source changes to prevent
 /// stale context from contaminating a new stream.
-#[doc(hidden)]
-pub fn reset_vad() {
+fn reset_vad() {
     if let Some(detector) = VAD_DETECTOR.get()
         && let Ok(mut d) = detector.lock()
     {

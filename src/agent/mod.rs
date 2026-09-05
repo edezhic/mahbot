@@ -675,7 +675,7 @@ impl Agent {
     /// Check whether a workspace-pause (strict freeze) cancellation was requested
     /// (distinct from an internal code-driven cancellation).
     #[must_use]
-    pub fn is_cancelled_by_pause(&self) -> bool {
+    fn is_cancelled_by_pause(&self) -> bool {
         self.pause_stop.load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -685,7 +685,7 @@ impl Agent {
     /// from a technical failure even if the workspace is resumed before the
     /// finalizer reads it.
     #[must_use]
-    pub fn is_paused_frozen(&self) -> bool {
+    pub(crate) fn is_paused_frozen(&self) -> bool {
         self.paused_frozen.load(std::sync::atomic::Ordering::SeqCst)
     }
 
