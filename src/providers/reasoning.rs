@@ -55,7 +55,7 @@ fn append_plaintext_from_detail_item(out: &mut String, item: &Value) {
 ///
 /// Handles `reasoning.text`, `reasoning.summary`, and similar `type` strings; skips encrypted blobs.
 #[must_use]
-pub(crate) fn plaintext_from_reasoning_details(details: &Value) -> String {
+fn plaintext_from_reasoning_details(details: &Value) -> String {
     let mut out = String::new();
     match details {
         Value::Array(items) => {

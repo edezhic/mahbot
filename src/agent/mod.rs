@@ -576,7 +576,7 @@ impl Agent {
     /// ticket attribution: at INFO when the graceful drain cut the turn
     /// (expected and lossless — committed tool frames are durable, ticket
     /// rounds resume at boot), at DEBUG when the turn ended via the `sleep`
-    /// tool (equally expected), at WARN otherwise (genuine anomaly).
+    /// tool (equally expected), at INFO otherwise (genuine anomaly).
     pub async fn finalize_session(&mut self) -> anyhow::Result<()> {
         // Drain accumulated tool usage stats
         let stats = {

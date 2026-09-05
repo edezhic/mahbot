@@ -1981,8 +1981,9 @@ fn gap_items(gaps: &[Gap]) -> Vec<String> {
     gaps.iter().map(|g| g.item.clone()).collect()
 }
 
-/// Run one gap round: fresh analysts, one per targeted gap (width-shrinking
-/// 4→3→2). Returns the round's analyst runs plus the dispatch-time snapshots
+/// Run one gap round: fresh analysts, one per gap in the given slice (the
+/// width-shrinking 4→3→2 across rounds is the caller's, see [`gap_rounds`]).
+/// Returns the round's analyst runs plus the dispatch-time snapshots
 /// of analysts aborted by the round deadline (the caller runs the wrap-up
 /// stage AFTER collecting the round's evidence so ledger registrations from
 /// recovered analysts cannot skew the round's saturation counters).
@@ -3130,8 +3131,11 @@ fn render_recovered_findings(recovered: &[AnalystFindings]) -> String {
     out
 }
 
-/// Partial envelope on shutdown mid-run: whatever evidence was gathered is
-/// delivered with an explicit incomplete marker — findings are never lost.
+/// Partial envelope when a run cannot reach synthesis (round 1 skipped on
+/// budget exhaustion, or a synthesis failure): whatever evidence was gathered
+/// is delivered with an explicit incomplete marker — findings are never lost.
+/// Shutdown/abort paths return `ResearchExit::Aborted`/`Cancelled` directly
+/// and never produce this report.
 fn partial_report(
     question: &str,
     acc: &AccumulatedEvidence,

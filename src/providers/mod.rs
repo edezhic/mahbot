@@ -124,10 +124,6 @@ pub(crate) fn ensure_base_url(url: &str) -> String {
 /// skip inserting the routing block entirely (matching the behaviour of the
 /// OpenAI-compatible request builder).
 ///
-/// This works for both comma-separated provider lists (chat completions) and
-/// single-provider strings (transcription) — a single slug survives the
-/// split/trim/filter cycle unchanged.
-///
 /// Fallbacks are explicitly pinned to `false` in the emitted JSON — the
 /// Allow Fallbacks option was removed from the settings and the runtime.
 ///
@@ -154,6 +150,20 @@ static PROVIDER: RwLock<Option<Arc<dyn Provider>>> = RwLock::new(None);
 
 /// Global media transcriber (vision model for video descriptions).
 static MEDIA_TRANSCRIBER: RwLock<Option<MediaTranscriber>> = RwLock::new(None);
+
+/// Spawn a non-fatal background provider warmup.
+///
+/// The provider is Arc-cloned so the task outlives the caller; the endpoint
+/// string is captured for the failure log. The endpoint is the effective
+/// chat endpoint — a persisted custom value is honored.
+fn spawn_warmup(provider: Arc<dyn Provider>, config: &crate::config::ConfigData) {
+    let endpoint_str = crate::config::effective_chat_endpoint(config);
+    tokio::spawn(async move {
+        if let Err(e) = provider.warmup().await {
+            tracing::warn!(endpoint = %endpoint_str, "Provider warmup failed (non-fatal): {e}");
+        }
+    });
+}
 
 /// Build the provider and media transcriber from config (synchronous, no I/O).
 ///
@@ -202,16 +212,8 @@ pub fn init_global() -> anyhow::Result<()> {
     *PROVIDER.write().unwrap_poison() = Some(provider.clone());
     *MEDIA_TRANSCRIBER.write().unwrap_poison() = media_transcriber;
 
-    // Background warmup (non-fatal). The provider is Arc-cloned so the task
-    // outlives init_global; the endpoint string is captured for the log.
-    // The endpoint is the effective chat endpoint — a persisted custom value
-    // is honored.
-    let endpoint_str = crate::config::effective_chat_endpoint(&config);
-    tokio::spawn(async move {
-        if let Err(e) = provider.warmup().await {
-            tracing::warn!(endpoint = %endpoint_str, "Provider warmup failed (non-fatal): {e}");
-        }
-    });
+    // Background warmup (non-fatal).
+    spawn_warmup(provider, &config);
 
     Ok(())
 }
@@ -273,15 +275,10 @@ pub(crate) async fn recreate_all(config: &crate::config::ConfigData, background_
     tracing::info!("Provider and transcriber singletons recreated");
 
     if background_warmup {
-        // Background warmup (non-fatal): the new provider may be unreachable right
-        // now (self-hosted endpoint configured before its server is up) — retries
-        // happen at request time, and the saved value stands regardless.
-        let endpoint_str = crate::config::effective_chat_endpoint(config);
-        tokio::spawn(async move {
-            if let Err(e) = provider.warmup().await {
-                tracing::warn!(endpoint = %endpoint_str, "Provider warmup failed (non-fatal): {e}");
-            }
-        });
+        // The new provider may be unreachable right now (self-hosted endpoint
+        // configured before its server is up) — retries happen at request
+        // time, and the saved value stands regardless.
+        spawn_warmup(provider, config);
     }
 
     // Re-init local transcriber if config enables it and it's not already ready.
@@ -389,7 +386,7 @@ pub(crate) fn restore_transcriber_for_test(previous: Option<MediaTranscriber>) {
 /// for the default endpoint, "Custom endpoint" otherwise — so custom-endpoint
 /// errors never falsely say "OpenRouter".
 ///
-/// Returns an [`OpenAiCompatibleProvider`]; retry orchestration lives in
+/// Returns a boxed [`Provider`]; retry orchestration lives in
 /// [`crate::retry`].
 pub(crate) fn create_provider(api_key: Option<&str>, endpoint: Option<&str>) -> Box<dyn Provider> {
     let key_owned = api_key.and_then(trimmed_or_none);
@@ -585,8 +582,8 @@ mod tests {
                     "allow_fallbacks": false,
                 })),
             },
-            // Transcription call sites pass a single provider slug; the
-            // split/trim/filter cycle must leave it unchanged.
+            // A single slug (no commas) survives the split/trim/filter
+            // cycle unchanged as a one-element list.
             Case {
                 name: "single_slug_survives_split",
                 order: "google-gemini",
