@@ -784,6 +784,12 @@ fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
     }
 }
 
+/// The user-facing roles pinned to the user's personal workspace.
+#[must_use]
+fn is_pinned_role(role: Role) -> bool {
+    matches!(role, Role::Assistant | Role::Artist | Role::Support)
+}
+
 /// Whether an agent role is pinned to the user's personal workspace:
 /// Assistant, Artist, and Support always work there regardless of the
 /// selected workspace. An empty `user_name` disables pinning — there is no
@@ -791,15 +797,38 @@ fn resolve_effective_role(role: Role, ws_name: &str, pool: &[Role]) -> Role {
 /// pass the real user explicitly (the voice admin fallback passes "admin").
 #[must_use]
 fn pins_to_personal(role: Role, ws_name: &str, user_name: &str) -> bool {
-    !user_name.is_empty()
-        && (role == Role::Assistant || role == Role::Artist || role == Role::Support)
-        && !is_personal_workspace(ws_name)
+    !user_name.is_empty() && is_pinned_role(role) && !is_personal_workspace(ws_name)
 }
 
-/// Resolve the [`Workspace`] an agent role actually operates in: Assistant
-/// and Artist always work in the user's personal workspace regardless of the
-/// selected workspace, giving path-dependent callers (enrichment uploads,
-/// generated-media writes) the personal workspace's filesystem path.
+/// Execution-time invariant enforcer: a pinned role (Assistant/Artist/Support)
+/// must never run outside the envelope user's OWN personal workspace,
+/// regardless of what a producer stored — a non-personal workspace is
+/// re-pinned to `personal:{user}`, and a personal workspace belonging to a
+/// different user is re-pinned to the envelope user's own. Returns `None`
+/// when the routing must be refused outright: a pinned role with an empty
+/// `user_name` has no personal identity to pin to, and running it unpinned is
+/// never acceptable, so callers reject the job loudly instead. Non-pinned
+/// roles pass through unchanged.
+#[must_use]
+pub(crate) fn enforce_personal_pinning(
+    role: Role,
+    workspace_name: &str,
+    user_name: &str,
+) -> Option<String> {
+    if !is_pinned_role(role) {
+        return Some(workspace_name.to_string());
+    }
+    if user_name.is_empty() {
+        return None;
+    }
+    Some(personal_workspace_name(user_name))
+}
+
+/// Resolve the [`Workspace`] an agent role actually operates in: Assistant,
+/// Artist, and Support always work in the user's personal workspace
+/// regardless of the selected workspace, giving path-dependent callers
+/// (enrichment uploads, generated-media writes) the personal workspace's
+/// filesystem path.
 /// An empty `user_name` disables pinning (no personal identity to pin to),
 /// so callers must pass a resolvable user (the voice admin fallback passes
 /// "admin").
@@ -815,6 +844,13 @@ pub(crate) fn effective_workspace_for_role(
     if pins_to_personal(role, &ws.name, user_name) {
         personal_workspace_struct(user_name)
     } else {
+        if user_name.is_empty() && is_pinned_role(role) && !is_personal_workspace(&ws.name) {
+            tracing::error!(
+                role = %role.as_str(),
+                workspace = %ws.name,
+                "Personal-workspace pin bypassed: pinned role with empty user_name — caller must pass a resolvable user"
+            );
+        }
         ws
     }
 }
@@ -1176,6 +1212,44 @@ mod tests {
             &[Role::Analyst],
         );
         assert_eq!(role, Role::Manager);
+    }
+
+    #[test]
+    fn enforce_personal_pinning_repins_pinned_roles_and_refuses_empty_user() {
+        // Pinned roles in a non-personal workspace re-pin to the user's personal.
+        for role in [Role::Assistant, Role::Artist, Role::Support] {
+            assert_eq!(
+                enforce_personal_pinning(role, "proj-ws", "alice"),
+                Some("personal:alice".to_string())
+            );
+        }
+        // The user's own personal workspace resolves to itself.
+        assert_eq!(
+            enforce_personal_pinning(Role::Assistant, "personal:alice", "alice"),
+            Some("personal:alice".to_string())
+        );
+        // Another user's personal workspace is re-pinned to the envelope
+        // user's own personal workspace (pinned roles are always own-personal).
+        assert_eq!(
+            enforce_personal_pinning(Role::Assistant, "personal:bob", "alice"),
+            Some("personal:alice".to_string())
+        );
+        // Non-pinned roles pass through unchanged even with an empty user.
+        assert_eq!(
+            enforce_personal_pinning(Role::Manager, "proj-ws", ""),
+            Some("proj-ws".to_string())
+        );
+        assert_eq!(
+            enforce_personal_pinning(Role::Engineer, "proj-ws", ""),
+            Some("proj-ws".to_string())
+        );
+        // Pinned role with empty user has no personal identity — refuse.
+        assert_eq!(
+            enforce_personal_pinning(Role::Assistant, "proj-ws", ""),
+            None
+        );
+        assert_eq!(enforce_personal_pinning(Role::Artist, "proj-ws", ""), None);
+        assert_eq!(enforce_personal_pinning(Role::Support, "proj-ws", ""), None);
     }
 
     #[tokio::test]

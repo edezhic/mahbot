@@ -18,7 +18,7 @@ use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::db::{self, Connection, Row, TxGuard, Value, params};
 use anyhow::{Context, Result};
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ── Job-kind vocabulary (jobs.kind) ─────────────────────────────────────
 // Values of `jobs.kind` are fully determined by the child row (one kind per
@@ -1423,6 +1423,24 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
             }
             continue;
         }
+        // Execution-time invariant: re-pin pinned roles (Assistant/Artist/Support)
+        // to the user's personal workspace; a pinned role with an empty user is
+        // refused and the poisoned envelope deleted so it is not replayed forever.
+        let Some(workspace_name) =
+            crate::users::enforce_personal_pinning(job.role, &job.workspace_name, &job.user_name)
+        else {
+            error!(
+                pending_job = %row.id,
+                role = %job.role.as_str(),
+                workspace = %job.workspace_name,
+                "Pending job replay: pinned role with empty user — dropping poisoned envelope"
+            );
+            if let Err(e) = delete_pending_job(conn, &row.id).await {
+                warn!(pending_job = %row.id, error = %e, "Failed to delete refused pending job");
+            }
+            continue;
+        };
+        job.workspace_name = workspace_name;
         // Crash-window cleanup dispatch: a genuinely-undelivered
         // research-completion envelope whose run has NO `research_cleanup`
         // jobs row means the daemon died between complete_durable_job and

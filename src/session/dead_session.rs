@@ -404,14 +404,37 @@ fn is_excluded_agent_id(agent_id: &str) -> bool {
 /// and validated that the role can be parsed.  The routing is fire-and-forget
 /// (sends on an mpsc channel).
 fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
+    // Execution-time invariant: pinned roles (Assistant/Artist/Support) never
+    // run outside the user's personal workspace, even on recovery. A pinned
+    // role with an empty user has no personal identity — refuse the retry.
+    let Some(workspace_name) =
+        crate::users::enforce_personal_pinning(role, &ctx.workspace_name, &ctx.user_name)
+    else {
+        tracing::error!(
+            agent_id = %agent_id,
+            role = %role.as_str(),
+            workspace = %ctx.workspace_name,
+            "Dead session recovery: pinned role with empty user — refusing to route unpinned"
+        );
+        return;
+    };
     // Recovery retry: uses `RecoveryRetry` kind with empty content so the
     // agent runs against the EXISTING session history (which already contains
     // the user's original message).  No boilerplate message is injected, and
     // no emoji error feedback is sent on retry failures — the emoji fires
     // only once on the original failure.
+    tracing::info!(
+        agent_id = %agent_id,
+        role = %role.as_str(),
+        workspace = %workspace_name,
+        user = %ctx.user_name,
+        channel = %ctx.channel,
+        "Dead session recovery: routing retry job"
+    );
+
     let job = AgentJob {
         content: String::new(),
-        workspace_name: ctx.workspace_name.clone(),
+        workspace_name,
         user_name: ctx.user_name.clone(),
         channel: ctx.channel.clone(),
         kind: MessageKind::RecoveryRetry,
@@ -425,15 +448,6 @@ fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) {
         reply_to_agent_id: None,
         reply_workspace_name: None,
     };
-
-    tracing::info!(
-        agent_id = %agent_id,
-        role = %role.as_str(),
-        workspace = %ctx.workspace_name,
-        user = %ctx.user_name,
-        channel = %ctx.channel,
-        "Dead session recovery: routing retry job"
-    );
 
     crate::agent::message_router::route(agent_id, job);
 }

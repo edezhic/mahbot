@@ -534,7 +534,7 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
             break;
         }
 
-        let job = tokio::select! {
+        let mut job = tokio::select! {
             job = rx.recv() => {
                 match job {
                     Some(job) => job,
@@ -546,6 +546,24 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
                 break;
             }
         };
+
+        // Execution-time invariant: pinned roles (Assistant/Artist/Support)
+        // never run outside the user's personal workspace, no matter what the
+        // producer stored. Empty-user envelopes for pinned roles are refused
+        // outright.
+        let Some(pinned_ws) =
+            crate::users::enforce_personal_pinning(job.role, &job.workspace_name, &job.user_name)
+        else {
+            error!(
+                agent_id = %agent_id,
+                role = %job.role.as_str(),
+                workspace = %job.workspace_name,
+                "Message router: pinned role with empty user — refusing to run unpinned, skipping job"
+            );
+            confirm_pending_delivery(&job).await;
+            continue;
+        };
+        job.workspace_name = pinned_ws;
 
         debug!(
             agent_id = %agent_id,
@@ -719,7 +737,10 @@ async fn consumer_loop(agent_id: String, mut rx: mpsc::UnboundedReceiver<AgentJo
 
 /// Consumer-confirmed delivery: delete the durable pending_jobs row after the
 /// agent ran (at-least-once boundary — the row is created before routing and
-/// reclaimed only here or by boot replay). One sync retry on failure, then
+/// reclaimed only here or by boot replay). Also invoked on the
+/// pin-refusal path (a pinned-role envelope with an empty user): the consumer
+/// accept-and-discards the job, and the row is reclaimed here so boot replay
+/// does not resurrect it. One sync retry on failure, then
 /// log-and-continue: residual duplicate re-delivery at next boot is bounded
 /// and accepted. Never called on workspace-not-found (the consumer skips the
 /// job) — a pending row for a deleted workspace re-routes and consumer-skips
@@ -845,7 +866,8 @@ async fn deliver_on_channel(
 }
 
 /// Build the addressed `<manager-reply>` envelope (user-invisible, routed into
-/// the originating Assistant's session). `None` when `response` is empty.
+/// the originating Assistant's session). `None` when `response` is empty or
+/// when the reply's pinned workspace cannot be resolved (no user identity).
 fn manager_reply_job(response: &str, job: &AgentJob, reply_to: &str) -> Option<AgentJob> {
     if response.is_empty() {
         return None;
@@ -857,16 +879,28 @@ fn manager_reply_job(response: &str, job: &AgentJob, reply_to: &str) -> Option<A
             ("{{message}}", response),
         ],
     );
-    // Reply leg targets the originating Assistant's own workspace (carried on
-    // the AgentMessage job via reply_workspace_name); legacy in-flight
-    // envelopes predate the field and fall back to the personal-workspace pin.
-    // The session is addressed exactly via reply_to_agent_id.
+    // Reply leg targets the originating Assistant's own pinned personal
+    // workspace (carried via reply_workspace_name); legacy in-flight
+    // envelopes predate the field. Re-apply the personal pin so a stale
+    // project-workspace value can never route the reply outside the personal
+    // session. No resolvable user -> refuse the reply leg.
+    let reply_ws = job
+        .reply_workspace_name
+        .clone()
+        .unwrap_or_else(|| crate::users::personal_workspace_name(&job.user_name));
+    let Some(workspace_name) =
+        crate::users::enforce_personal_pinning(crate::Role::Assistant, &reply_ws, &job.user_name)
+    else {
+        error!(
+            reply_to_agent_id = %reply_to,
+            workspace = %reply_ws,
+            "Manager reply leg: pinned role with empty user — refusing to route unpinned, dropping reply"
+        );
+        return None;
+    };
     Some(AgentJob {
         content,
-        workspace_name: job
-            .reply_workspace_name
-            .clone()
-            .unwrap_or_else(|| crate::users::personal_workspace_name(&job.user_name)),
+        workspace_name,
         user_name: job.user_name.clone(),
         channel: "gui".to_string(),
         kind: MessageKind::ManagerReply,
@@ -1724,7 +1758,8 @@ mod tests {
     }
 
     /// `manager_reply_job` addresses the reply into the originating Assistant's
-    /// session and substitutes the carried reply workspace into the envelope.
+    /// session; the carried reply workspace is re-pinned to the Assistant's
+    /// personal workspace (pinned roles never run in a non-personal workspace).
     #[test]
     fn manager_reply_job_threading() {
         let source = AgentJob {
@@ -1741,9 +1776,10 @@ mod tests {
         };
         let reply = manager_reply_job("reply text", &source, "assistant_agent_1")
             .expect("non-empty response builds a reply job");
-        // The reply routes into the originating Assistant's workspace, while the
-        // envelope tags the Manager's workspace (job.workspace_name).
-        assert_eq!(reply.workspace_name, "proj_ws");
+        // The reply routes into the originating Assistant's personal workspace
+        // (the carried project workspace is re-pinned), while the envelope tags
+        // the Manager's workspace (job.workspace_name).
+        assert_eq!(reply.workspace_name, "personal:alice");
         assert_eq!(reply.kind, MessageKind::ManagerReply);
         assert_eq!(reply.role, Role::Assistant);
         assert_eq!(
@@ -1819,7 +1855,7 @@ mod tests {
         let deserialized: AgentJob =
             serde_json::from_str(&row.envelope).expect("envelope deserializes to AgentJob");
         assert_eq!(deserialized.kind, MessageKind::ManagerReply);
-        assert_eq!(deserialized.workspace_name, "proj_ws");
+        assert_eq!(deserialized.workspace_name, "personal:alice");
 
         crate::jobs::delete_pending_job(conn, &id)
             .await
