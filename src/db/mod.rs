@@ -48,10 +48,12 @@ pub(crate) fn parse_utc_timestamp(s: &str) -> Result<DateTime<Utc>, chrono::Pars
 /// [`turso::core::DatabaseOpts`] — see [`experimental_database_opts`] for
 /// the canonical construction.
 ///
-/// [`Connection::open`] derives its `experimental_*()` builder calls from
-/// [`experimental_database_opts`], so this constant and [`experimental_database_opts`]
-/// are the two places that define which features are active. The
-/// `experimental_features_are_consistent` test verifies they match.
+/// Which features are active is defined jointly by [`experimental_database_opts`]
+/// (the canonical opts) and the `experimental_*()` builder mapping in
+/// [`Connection::open`]; this constant is the test-verified name list.
+/// Adding a feature is the three-step process in [`experimental_database_opts`]'s
+/// doc. The `experimental_features_are_consistent` test verifies the mapping
+/// enables exactly the features listed here.
 ///
 /// # API naming asymmetries
 ///
@@ -96,11 +98,12 @@ pub(crate) const CONSOLIDATED_DB_NAME: &str = "core";
 
 /// Logical store names consolidated into [`CONSOLIDATED_DB_NAME`].
 ///
-/// These are the names accepted by `mahbot debug --db <name>` and used to
-/// resolve the consolidated file path; each maps to the single physical
-/// [`CONSOLIDATED_DB_NAME`] file. The logs store is NOT in this list — it
-/// remains its own file.
-pub(crate) const DOMAIN_STORE_NAMES: &[&str] = &[
+/// Each name maps to the single physical [`CONSOLIDATED_DB_NAME`] file via
+/// [`store_db_path`]. These are a subset of the names accepted by
+/// `mahbot debug --db <name>` — the full accepted set is [`debug_db_names`]
+/// ([`store_names`] plus the physical `core` file name). The logs store is
+/// NOT in this list — it remains its own file.
+const DOMAIN_STORE_NAMES: &[&str] = &[
     "board",
     "sessions",
     "workspaces",
@@ -149,7 +152,10 @@ pub(crate) fn iter_checkpoint_stores()
 /// [`store_db_path`]. This is **not** derived from
 /// [`iter_checkpoint_stores`] (which enumerates the *physical* files): the two
 /// lists are intentionally separate — several logical names share one physical
-/// file — so both must be updated when a store is added or consolidated.
+/// file. They change for different reasons: adding a consolidated domain
+/// store only extends [`DOMAIN_STORE_NAMES`], from which this function
+/// derives; [`iter_checkpoint_stores`] changes only when a brand-new physical
+/// file appears. The name→file coupling itself lives in [`store_db_path`].
 ///
 /// Used by:
 /// - `mahbot debug` — validates `--db` argument values.
@@ -192,7 +198,7 @@ pub(crate) fn debug_db_names() -> Vec<&'static str> {
 ///
 /// # Consolidated layout (decision 1)
 ///
-/// The domain stores ([`DOMAIN_STORE_NAMES`]) now share ONE file
+/// The domain stores (`DOMAIN_STORE_NAMES`) now share ONE file
 /// ([`CONSOLIDATED_DB_NAME`]) and ONE shared [`Connection`] ([`DOMAIN_CONN`]) —
 /// every store struct holds a clone of the same connection, so `begin_tx` on
 /// any store acquires the same mutex and phase+stage updates are atomic within
@@ -232,29 +238,26 @@ pub async fn init_all_stores() -> anyhow::Result<()> {
     // capture in open_consolidated_store (above).
     crate::db::cdc::spawn_drainer(conn.clone());
 
-    crate::pipeline::board::BOARD
-        .set(board)
-        .map_err(|_| anyhow::anyhow!("BOARD already initialized"))?;
-    crate::session::SESSIONS
-        .set(session)
-        .map_err(|_| anyhow::anyhow!("SESSIONS already initialized"))?;
-    crate::workspace::WORKSPACES
-        .set(workspace)
-        .map_err(|_| anyhow::anyhow!("WORKSPACES already initialized"))?;
-    crate::users::USER_STORE
-        .set(users)
-        .map_err(|_| anyhow::anyhow!("USER_STORE already initialized"))?;
-    crate::config_db::CONFIG_STORE
-        .set(config)
-        .map_err(|_| anyhow::anyhow!("CONFIG_STORE already initialized"))?;
-    crate::channels::chat_history::CHAT_HISTORY
-        .set(chat_history)
-        .map_err(|_| anyhow::anyhow!("CHAT_HISTORY already initialized"))?;
-    crate::alarms::ALARMS
-        .set(alarms)
-        .map_err(|_| anyhow::anyhow!("ALARMS already initialized"))?;
+    init_cell(&crate::pipeline::board::BOARD, board, "BOARD")?;
+    init_cell(&crate::session::SESSIONS, session, "SESSIONS")?;
+    init_cell(&crate::workspace::WORKSPACES, workspace, "WORKSPACES")?;
+    init_cell(&crate::users::USER_STORE, users, "USER_STORE")?;
+    init_cell(&crate::config_db::CONFIG_STORE, config, "CONFIG_STORE")?;
+    init_cell(
+        &crate::channels::chat_history::CHAT_HISTORY,
+        chat_history,
+        "CHAT_HISTORY",
+    )?;
+    init_cell(&crate::alarms::ALARMS, alarms, "ALARMS")?;
 
     Ok(())
+}
+
+/// Set a store's global cell exactly once, failing with the store's canonical
+/// "already initialized" error otherwise (`name` is the cell's literal name).
+fn init_cell<T>(cell: &tokio::sync::OnceCell<T>, value: T, name: &str) -> anyhow::Result<()> {
+    cell.set(value)
+        .map_err(|_| anyhow::anyhow!("{name} already initialized"))
 }
 
 /// Create [`turso::core::DatabaseOpts`] with all experimental features enabled.
@@ -423,12 +426,15 @@ const FTS_INTERNAL_INDEX_PREFIX: &str = "__turso_internal_fts_dir_";
 pub(crate) const USER_OBJECT_FILTER: &str = "name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' \
      AND name NOT IN ('turso_cdc', 'turso_cdc_version')";
 
-/// Best-effort removal of a rebuild temp family (main + sidecars). Single-process
-/// mode never creates a `-tshm` sidecar, so only `-wal`/`-shm` are removed.
+/// Best-effort removal of a rebuild temp family (main + `-wal`/`-shm`
+/// sidecars, paths built by [`store_sidecars`]). The `-tshm` path is
+/// deliberately **never** removed — a pre-removal multiprocess leftover must
+/// stay available for stale-leftover detection.
 fn remove_rebuild_temp(temp: &Path) {
     let _ = std::fs::remove_file(temp);
-    let _ = std::fs::remove_file(format!("{}-wal", temp.display()));
-    let _ = std::fs::remove_file(format!("{}-shm", temp.display()));
+    let StoreSidecars { wal, shm, .. } = store_sidecars(temp);
+    let _ = std::fs::remove_file(wal);
+    let _ = std::fs::remove_file(shm);
 }
 
 /// RAII cleanup of the rebuild temp family: every exit from the migration —
@@ -448,14 +454,17 @@ impl Drop for TempCleanup<'_> {
 /// other problem row about that index (the row-level scan masks only the exact
 /// count-mismatch message; this is the broader never-REINDEX-the-FTS guard).
 #[must_use]
-pub(crate) fn known_fts_dir_false_positive(message: &str) -> bool {
+fn known_fts_dir_false_positive(message: &str) -> bool {
     message.contains(FTS_INTERNAL_INDEX_PREFIX)
 }
 
 /// Map each row in a slice through a fallible closure, collecting into a
 /// `Vec<turso::Result<T>>` with per-row error conversion.
 ///
-/// Used by `Connection::query_map`.
+/// Shared by the strict and per-row mapping entry points on both the free
+/// connection and the transaction guard: [`Connection::query_map`],
+/// [`Connection::query_map_strict`], [`Connection::query_map_strict_cached`],
+/// and [`TxGuard::query_map_strict`].
 fn map_rows<T, E>(
     rows: &[Row],
     mut map: impl FnMut(&Row) -> std::result::Result<T, E>,
@@ -484,6 +493,16 @@ fn strict_collect<T>(rows: Vec<turso::Result<T>>) -> anyhow::Result<Vec<T>> {
     rows.into_iter()
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Drain a turso row stream into a `Vec` of [`Row`]s (unbounded — callers
+/// already know the query shape).
+async fn drain_rows(mut rows: turso::Rows) -> turso::Result<Vec<Row>> {
+    let mut result = Vec::new();
+    while let Some(row) = rows.next().await? {
+        result.push(row);
+    }
+    Ok(result)
 }
 
 /// Run a read-only query against an already-locked turso connection, bounded
@@ -599,9 +618,10 @@ impl Connection {
         let path_str = path
             .to_str()
             .with_context(|| format!("database path must be UTF-8: {}", path.display()))?;
-        // Derive experimental features from the canonical opts function.
-        // If you need to add/remove an experimental feature, change
-        // experimental_database_opts() and EXPERIMENTAL_FEATURES — not here.
+        // Derive experimental features from the canonical opts function. The
+        // builder mapping below is step 2 of the three-step process in
+        // experimental_database_opts()'s doc: a new feature is added there,
+        // in this mapping, and in EXPERIMENTAL_FEATURES.
         let opts = experimental_database_opts();
         let db = with_open_lock_retry(OPEN_LOCK_RETRY_ATTEMPTS, OPEN_LOCK_RETRY_DELAY, || async {
             Builder::new_local(path_str)
@@ -862,12 +882,8 @@ impl Connection {
         sql: &str,
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
-        let mut rows = conn.query(sql, params).await?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().await? {
-            result.push(row);
-        }
-        Ok(result)
+        let rows = conn.query(sql, params).await?;
+        drain_rows(rows).await
     }
 
     /// Execute a read-only query, mapping each row through a closure.
@@ -994,12 +1010,8 @@ impl Connection {
         params: impl IntoParams + Send + 'static,
     ) -> turso::Result<Vec<Row>> {
         let mut stmt = conn.prepare_cached(sql).await?;
-        let mut rows = stmt.query(params).await?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().await? {
-            result.push(row);
-        }
-        Ok(result)
+        let rows = stmt.query(params).await?;
+        drain_rows(rows).await
     }
 
     /// Map every row, failing on the first per-row error (unlike
@@ -1817,7 +1829,7 @@ async fn execute_schema_ddl(conn: &Connection, sql: &str) -> anyhow::Result<()> 
 ///
 /// # Consolidated layout (decision 1)
 ///
-/// The domain stores ([`DOMAIN_STORE_NAMES`]) are consolidated into ONE file
+/// The domain stores (`DOMAIN_STORE_NAMES`) are consolidated into ONE file
 /// ([`CONSOLIDATED_DB_NAME`]); the logs store remains its own file. So this
 /// function maps every domain name (and the canonical
 /// [`CONSOLIDATED_DB_NAME`] itself) to `root/db/{CONSOLIDATED_DB_NAME}.db`, and
@@ -1951,12 +1963,14 @@ impl std::fmt::Display for RecreateFailed {
 
 impl std::error::Error for RecreateFailed {}
 
-/// Open a store database under `<root>/db/<name>.db`.
+/// Open a store database under `<root>/db/<name>.db` (path built by
+/// [`store_db_path`]).
 ///
 /// Creates parent directories if needed and runs the provided `schema` via
-/// [`open_with_schema`].  This is a convenience helper for the near-identical
-/// [`open`] methods on each store module, keeping the DB filename and path
-/// construction centralised in one place.
+/// [`open_with_schema`]. Per-store `open()` constructors are generated by
+/// [`crate::define_store!`] on top of [`open_consolidated_store`] (which calls
+/// this function for the consolidated file); this free function is the
+/// heal/recreate-aware open path used by that caller and by tests.
 ///
 /// During daemon boot (when a pre-flight diagnosis exists for `name`), the
 /// open runs the per-store heal strategy derived by the pre-flight:
@@ -2089,14 +2103,15 @@ pub(crate) async fn open_store(
 ///
 /// # Catalog, not SCHEMA
 ///
-/// The catalog is now a current-shape baseline (ids `24`–`26`): the entries
-/// create the exact current schema directly (every statement `IF NOT EXISTS`),
-/// so a fresh install converges in one pass and an existing install is a
-/// no-op (except the one-delta-behind `chat_history` reply-column upfill).
-/// The only control flow is the id-based applied check (skip if the id is
-/// already recorded, otherwise run and record). A catalog failure is a hard
-/// boot failure — it is never classified as corruption and never triggers a
-/// quarantine/recreate.
+/// The catalog is a current-shape baseline: the entries create the exact
+/// current schema directly (every statement `IF NOT EXISTS`), so a fresh
+/// install converges in one pass and an existing install is a no-op except
+/// the upfill deltas. The baseline ids, the upfill deltas, and the resume
+/// point live in the [`crate::db::migrations`] module doc — the single owner
+/// of that list. The only control flow is the id-based applied check (skip if
+/// the id is already recorded, otherwise run and record). A catalog failure
+/// is a hard boot failure — it is never classified as corruption and never
+/// triggers a quarantine/recreate.
 ///
 /// # Why tables → ALTER → indexes is baked into the catalog order
 ///
@@ -2243,7 +2258,7 @@ fn classify_repair_target(problems: &[String]) -> RepairTarget {
 /// `{db}.pre-reindex-{stamp}-{pid}`. The base name must stay parseable by
 /// `debug::parse_family_name` — the writer round-trip test locks the coupling.
 #[must_use]
-pub(crate) fn pre_reindex_snapshot_path(db_path: &Path) -> std::path::PathBuf {
+fn pre_reindex_snapshot_path(db_path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(format!(
         "{}.pre-reindex-{}",
         db_path.display(),
@@ -2388,6 +2403,19 @@ async fn repair_btree_index_if_desynced(
     ))
 }
 
+/// Row count of a table by name (the identifier is quoted inside). Both
+/// callers in [`migrate_overflow_aliased_store`] own their per-site error
+/// handling — the pre-count's unreadable-table classification and the
+/// post-swap verification's actionable-signal split differ by site, so the
+/// helper only centralises the quoted `SELECT COUNT(*)` shape.
+async fn count_table_rows(conn: &Connection, table: &str) -> turso::Result<i64> {
+    let quoted = table.replace('"', "\"\"");
+    conn.query_row(&format!("SELECT COUNT(*) FROM \"{quoted}\""), (), |r| {
+        r.get::<i64>(0)
+    })
+    .await
+}
+
 /// Overflow-aliasing repair: rebuild the store's data in a fresh sibling file,
 /// verify it, then swap it into place. The in-file alternative (DROP the
 /// aliased b-trees and recreate) double-frees the shared overflow page — the
@@ -2465,13 +2493,7 @@ async fn migrate_overflow_aliased_store(
                 return Ok((RepairOutcome::NoRepair, conn));
             }
         };
-        let quoted = tbl.replace('"', "\"\"");
-        match conn
-            .query_row(&format!("SELECT COUNT(*) FROM \"{quoted}\""), (), |r| {
-                r.get::<i64>(0)
-            })
-            .await
-        {
+        match count_table_rows(&conn, &tbl).await {
             Ok(count) => counts.push((tbl, count)),
             Err(e) => {
                 crate::boot::boot_diagnostic(format!(
@@ -2639,13 +2661,7 @@ async fn migrate_overflow_aliased_store(
         }
     }
     for (tbl, expected) in &counts {
-        let quoted = tbl.replace('"', "\"\"");
-        match reopened
-            .query_row(&format!("SELECT COUNT(*) FROM \"{quoted}\""), (), |r| {
-                r.get::<i64>(0)
-            })
-            .await
-        {
+        match count_table_rows(&reopened, tbl).await {
             // A read error is not proof of data loss — actionable signals
             // warn transiently, anything else is a genuine finding (the
             // "lost data" diagnostic must not fire on a read failure).
