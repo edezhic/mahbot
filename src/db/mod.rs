@@ -468,6 +468,24 @@ where
         .collect()
 }
 
+/// Fold a single-row query result into `Ok(None)` on
+/// [`turso::Error::QueryReturnedNoRows`], converting other errors into
+/// `anyhow::Error`.
+fn optional_row<T>(r: turso::Result<T>) -> anyhow::Result<Option<T>> {
+    match r {
+        Ok(val) => Ok(Some(val)),
+        Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Collect per-row results, failing on the first per-row error.
+fn strict_collect<T>(rows: Vec<turso::Result<T>>) -> anyhow::Result<Vec<T>> {
+    rows.into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Run a read-only query against an already-locked turso connection, bounded
 /// to `row_limit` rows using LIMIT+1 semantics. Caller is responsible for the
 /// `PRAGMA query_only` guard and its reset.
@@ -881,10 +899,7 @@ impl Connection {
         T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let rows = self.query_map(sql, params, map).await?;
-        rows.into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        strict_collect(self.query_map(sql, params, map).await?)
     }
 
     /// Execute a query that returns exactly one row.
@@ -909,13 +924,8 @@ impl Connection {
     /// Execute a query that returns zero or one row.
     ///
     /// Returns `Ok(Some(val))` if a row is found, `Ok(None)` when no row
-    /// matches (i.e. [`turso::Error::QueryReturnedNoRows`] is caught), or
-    /// `Err` if the query fails for another reason.
-    ///
-    /// This is a convenience wrapper around [`Self::query_row`] that
-    /// eliminates the common `match { Ok(val) => Ok(Some(val)),
-    /// Err(QueryReturnedNoRows) => Ok(None), Err(e) => Err(e.into()) }`
-    /// boilerplate.
+    /// matches, or `Err` if the query fails for another reason. The no-row
+    /// case is folded to `Ok(None)` by [`optional_row`].
     pub async fn query_optional<T, E>(
         &self,
         sql: &str,
@@ -926,11 +936,7 @@ impl Connection {
         T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        match self.query_row(sql, params, map).await {
-            Ok(val) => Ok(Some(val)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        optional_row(self.query_row(sql, params, map).await)
     }
 
     /// Core query_row logic shared by [`Connection::query_row`] and
@@ -1011,10 +1017,7 @@ impl Connection {
         E: std::fmt::Display + Send + Sync + 'static,
     {
         let rows = self.query_cached(sql, params).await?;
-        map_rows(&rows, map)
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        strict_collect(map_rows(&rows, map))
     }
 
     /// Execute a query that returns exactly one row, using the cached
@@ -1050,13 +1053,8 @@ impl Connection {
     /// contract).
     ///
     /// Returns `Ok(Some(val))` if a row is found, `Ok(None)` when no row
-    /// matches (i.e. [`turso::Error::QueryReturnedNoRows`] is caught), or
-    /// `Err` if the query fails for another reason.
-    ///
-    /// This is a convenience wrapper around [`Self::query_row_cached`] that
-    /// eliminates the common `match { Ok(val) => Ok(Some(val)),
-    /// Err(QueryReturnedNoRows) => Ok(None), Err(e) => Err(e.into()) }`
-    /// boilerplate.
+    /// matches, or `Err` if the query fails for another reason. The no-row
+    /// case is folded to `Ok(None)` by [`optional_row`].
     pub async fn query_optional_cached<T, E>(
         &self,
         sql: &str,
@@ -1067,11 +1065,7 @@ impl Connection {
         T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        match self.query_row_cached(sql, params, map).await {
-            Ok(val) => Ok(Some(val)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        optional_row(self.query_row_cached(sql, params, map).await)
     }
 
     /// Force a WAL checkpoint with TRUNCATE mode.
@@ -1263,11 +1257,7 @@ impl TxGuard<'_> {
         T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        match self.query_row(sql, params, map).await {
-            Ok(val) => Ok(Some(val)),
-            Err(::turso::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        optional_row(self.query_row(sql, params, map).await)
     }
 
     /// Execute a query, mapping each row through a closure, failing on the
@@ -1283,10 +1273,7 @@ impl TxGuard<'_> {
         E: std::fmt::Display + Send + Sync + 'static,
     {
         let rows = self.query(sql, params).await?;
-        map_rows(&rows, map)
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        strict_collect(map_rows(&rows, map))
     }
 
     /// Commit the transaction and release the lock.
