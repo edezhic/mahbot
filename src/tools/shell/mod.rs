@@ -1645,23 +1645,14 @@ const fn is_escape_sensitive(c: char) -> bool {
     )
 }
 
-/// True when the segment opens a `case` statement: `case` in command position
-/// (first word, or second after a block keyword that introduces commands).
-fn segment_opens_case(segment: &str) -> bool {
+/// True when `keyword` (e.g. `case` when opening, `esac` when closing a
+/// `case` statement) appears in command position: first word of the segment,
+/// or second after a block keyword that introduces commands.
+fn segment_command_word(segment: &str, keyword: &str) -> bool {
     let mut words = segment.split_whitespace();
     match words.next() {
-        Some("case") => true,
-        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some("case"),
-        _ => false,
-    }
-}
-
-/// True when the segment closes a `case` statement (`esac` in command position).
-fn segment_ends_case(segment: &str) -> bool {
-    let mut words = segment.split_whitespace();
-    match words.next() {
-        Some("esac") => true,
-        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some("esac"),
+        Some(w) if w == keyword => true,
+        Some("do" | "then" | "else" | "elif" | "if") => words.next() == Some(keyword),
         _ => false,
     }
 }
@@ -1689,7 +1680,8 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
         let pushed = !t.is_empty();
         if pushed {
             out.push((t.to_string(), conn.to_string()));
-            *in_case = segment_opens_case(t) || (*in_case && !segment_ends_case(t));
+            *in_case =
+                segment_command_word(t, "case") || (*in_case && !segment_command_word(t, "esac"));
         }
         current.clear();
         pushed || matches!(policy, EmptySegPolicy::Skip)
@@ -1992,23 +1984,18 @@ fn combine_output(
     }
     // Apply keep_stderr filtering on both success and failure paths.
     let filtered = keep_stderr.and_then(|patterns| filter_keep_stderr(stderr, patterns));
+    let with_stderr_section = |body: &str| {
+        if stdout.is_empty() {
+            format!("stderr:\n{body}")
+        } else {
+            format!("{stdout}\nstderr:\n{body}")
+        }
+    };
     match (exit_code == 0, filtered) {
         // Matching lines found — append them as a stderr section.
-        (_, Some(relevant)) => {
-            if stdout.is_empty() {
-                format!("stderr:\n{relevant}")
-            } else {
-                format!("{stdout}\nstderr:\n{relevant}")
-            }
-        }
+        (_, Some(relevant)) => with_stderr_section(&relevant),
         // Failure without keep_stderr: dump all stderr unconditionally.
-        (false, None) if keep_stderr.is_none() => {
-            if stdout.is_empty() {
-                format!("stderr:\n{stderr_trimmed}")
-            } else {
-                format!("{stdout}\nstderr:\n{stderr_trimmed}")
-            }
-        }
+        (false, None) if keep_stderr.is_none() => with_stderr_section(stderr_trimmed),
         // Success or failure with keep_stderr but no matching lines: omit stderr section.
         _ => stdout.to_string(),
     }
@@ -2418,8 +2405,7 @@ fn apply_strip_lines(output: &str, profile: &Profile) -> String {
 ///   `max_lines`-only cap, which calls this as `(output, max, 0, "truncated")`):
 ///   no leading newline before the omission marker. A future `max_lines = 0`
 ///   profile would hit this path too (unreachable today — profiles.rs minimum
-///   is 20) and would format the marker without the leading newline that the
-///   former `cap_at_max_lines(.., 0)` emitted.
+///   is 20) and would format the marker without a leading newline.
 /// - `tail=0` (head-only, e.g., `git log` profile): no trailing newline after
 ///   the omission marker.
 fn format_sandwich(output: &str, head: usize, tail: usize, marker_verb: &str) -> String {

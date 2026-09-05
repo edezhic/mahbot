@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::tools::path::shell_quote;
 use crate::tools::shell::SHELL_PIPE_READ_CAP;
 use crate::tools::shell::scan::strip_heredoc_bodies;
+use crate::util::UnwrapPoison;
 use crate::util::is_word_char;
 
 // ── Protocol constants ────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ pub(super) const STALE_BINARY_LOCK_MSG: &str = "Another instance of mahbot is al
 /// stderr merges suppress it). The shell tool strips the marker line from the
 /// agent-visible stderr and logs the count (per-call stream bytes are
 /// recorded nowhere else).
-pub(super) const STREAM_SIZE_MARKER: &str = "__mahbot_stream_bytes__";
+const STREAM_SIZE_MARKER: &str = "__mahbot_stream_bytes__";
 /// Specs larger than this fall back (argv-size hygiene).
 const MAX_SPEC_JSON: usize = 64 * 1024;
 /// Searcher line-buffer cap; exceeding it is a grep-style error (exit 2).
@@ -109,6 +110,13 @@ struct EngineSpec {
     /// logs it).
     #[serde(default)]
     report_stream_bytes: bool,
+}
+
+/// Output cap handed to the writer: unpiped serves self-cap at OUTPUT_CAP,
+/// piped members are capped by the shell pipe reader instead (byte-identity
+/// with grep).
+fn output_limit(spec: &EngineSpec) -> Option<usize> {
+    if spec.piped { None } else { Some(OUTPUT_CAP) }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,9 +303,10 @@ fn skipped_grep_outcome(reason: String, seg: &str, piped: bool) -> GrepOutcome {
     }
 }
 
-/// Canonical telemetry flag order, shared by `flags_surface` and
-/// `lightweight_scan` so a served and a skipped member render the same flag set
-/// in the same relative order.
+/// Canonical telemetry flag order, used by `lightweight_scan` to render a
+/// skipped member's flag string. `flags_surface` (served-member rendering)
+/// independently orders the `GrepFlags` fields in the same relative order;
+/// the two stay in sync by convention.
 const FLAG_ORDER: &[char] = &[
     'n', 'i', 'v', 'w', 'x', 'a', 'h', 'H', 's', 'r', 'o', 'z', 'c', 'l', 'm', 'C', 'A', 'B',
 ];
@@ -453,14 +462,9 @@ pub(super) fn strip_stream_size_marker(stderr: &mut Vec<u8>) -> Option<u64> {
         .windows(STREAM_SIZE_MARKER.len())
         .position(|w| w == STREAM_SIZE_MARKER.as_bytes())
     {
-        let line_start = rest[..pos]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |p| p + 1);
-        let line_end = rest[pos..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(rest.len(), |p| pos + p + 1);
+        // Reuses locate_line (grep_searcher-mirroring line locator): the
+        // parent-side strip must apply the same line-boundary semantics.
+        let (line_start, line_end) = locate_line(rest, b'\n', pos);
         cleaned.extend_from_slice(&rest[..line_start]);
         if let Some(v) = std::str::from_utf8(&rest[pos + STREAM_SIZE_MARKER.len()..line_end])
             .ok()
@@ -1411,7 +1415,7 @@ fn parse_grep_words(words: &[GrepWord], verb: &str) -> Result<ParsedGrep, Fallba
         }
     }
 
-    // Flag-surface validation (criterion 9). Under -c/-l, -o is inert and
+    // Flag-surface validation: under -c/-l, -o is inert and
     // context flags are accepted but ignored, so their interaction gates
     // don't apply.
     if flags.v {
@@ -1557,18 +1561,25 @@ fn translate_pattern(pattern: &str, mode: MatchMode) -> Result<String, Fallback>
     }
 }
 
+/// Escapes whose BSD-grep semantics differ from the engine (word anchors and
+/// PCRE-style classes): shared by the ERE pre-check and the BRE translator so
+/// the reject list cannot drift between the two paths.
+fn bsd_escaped_class_reject(c: char) -> Option<&'static str> {
+    match c {
+        '<' | '>' => Some(r"\< \>"),
+        's' | 'S' | 'w' | 'W' | 'd' | 'D' => Some(r"\s\w\d"),
+        _ => None,
+    }
+}
+
 /// ERE passes through, but reject constructs whose engine semantics differ
 /// from BSD (backrefs and unknown escapes are caught by compile validation).
 fn check_ere_safe(pattern: &str) -> Result<(), Fallback> {
     let mut escaped = false;
     for c in pattern.chars() {
         if escaped {
-            match c {
-                '<' | '>' => return Err(Fallback::Pattern(r"\< \>".into())),
-                's' | 'S' | 'w' | 'W' | 'd' | 'D' => {
-                    return Err(Fallback::Pattern(r"\s\w\d".into()));
-                }
-                _ => {}
+            if let Some(what) = bsd_escaped_class_reject(c) {
+                return Err(Fallback::Pattern(what.into()));
             }
             escaped = false;
             continue;
@@ -1619,9 +1630,8 @@ fn translate_bre(pattern: &str) -> Result<String, Fallback> {
                 '}' => return Err(Fallback::Pattern(r"lone \}".into())),
                 'b' => out.push_str("\\b"),
                 '1'..='9' => return Err(Fallback::Pattern("backreference".into())),
-                '<' | '>' => return Err(Fallback::Pattern(r"\< \>".into())),
-                's' | 'S' | 'w' | 'W' | 'd' | 'D' => {
-                    return Err(Fallback::Pattern(r"\s\w\d".into()));
+                esc if let Some(what) = bsd_escaped_class_reject(esc) => {
+                    return Err(Fallback::Pattern(what.into()));
                 }
                 '.' | '*' | '\\' | '[' | ']' | '$' | '^' => {
                     out.push('\\');
@@ -2205,7 +2215,7 @@ fn serve(spec: &EngineSpec) -> Result<i32, ()> {
     let matcher = build_matcher(&spec.patterns, spec.mode, &spec.flags).map_err(|_| ())?;
     let mut out = Output::new(
         OutputSink::Stdout(io::BufWriter::with_capacity(16 * 1024, io::stdout())),
-        if spec.piped { None } else { Some(OUTPUT_CAP) },
+        output_limit(spec),
     );
     let stdin_consumed = std::cell::Cell::new(false);
     let stdin = io::stdin();
@@ -2552,7 +2562,7 @@ fn walk_dir(
     let root_display = op.display.clone();
     let exclude_dir = spec.exclude_dir.clone();
     let root_for_filter = root_abs.clone();
-    let limit = if spec.piped { None } else { Some(OUTPUT_CAP) };
+    let limit = output_limit(spec);
 
     let mut builder = ignore::WalkBuilder::new(&root_abs);
     builder.filter_entry({
@@ -2621,9 +2631,7 @@ fn walk_dir(
                     (buf, err, OperandResult::Error)
                 }
             };
-            let mut guard = out_ref
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = out_ref.lock().unwrap_poison();
             guard.write_bytes(&buf);
             for chunk in err.chunks(4096) {
                 guard.write_err(&String::from_utf8_lossy(chunk));
@@ -2631,17 +2639,13 @@ fn walk_dir(
             // Flush so a piped tail (`| head`) sees data as each file completes.
             guard.flush();
             drop(guard);
-            let mut gr = result_ref
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut gr = result_ref.lock().unwrap_poison();
             *gr = (*gr).max(r);
             ignore::WalkState::Continue
         })
     });
 
-    shared_result
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    shared_result.into_inner().unwrap_poison()
 }
 
 /// Display path for a walked entry: the operand spelling + relative suffix.
@@ -3061,10 +3065,7 @@ mod parity_tests {
     ) -> (Vec<u8>, Vec<u8>, i32, Option<u64>) {
         let matcher =
             build_matcher(&spec.patterns, spec.mode, &spec.flags).expect("matcher builds");
-        let mut out = Output::new(
-            OutputSink::Buffer(Vec::new()),
-            if spec.piped { None } else { Some(OUTPUT_CAP) },
-        );
+        let mut out = Output::new(OutputSink::Buffer(Vec::new()), output_limit(spec));
         let consumed = std::cell::Cell::new(false);
         let code = serve_into(spec, &matcher, &mut out, io::Cursor::new(stdin), &consumed);
         let Output {
