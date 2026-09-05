@@ -973,8 +973,8 @@ fn is_speech_with_threshold(samples: &[f32], threshold: f32) -> bool {
 }
 
 /// Reset the Earshot VAD detector's internal state (ring buffer, feature
-/// context).  Used by tests and when the audio source changes to prevent
-/// stale context from contaminating a new stream.
+/// context).  Called when the audio source changes to prevent stale context
+/// from contaminating a new stream.
 fn reset_vad() {
     if let Some(detector) = VAD_DETECTOR.get()
         && let Ok(mut d) = detector.lock()
@@ -1020,27 +1020,15 @@ fn convert_and_send_audio_to_pipeline<T, F>(
 ) where
     F: Fn(&T) -> f32,
 {
-    // Fast path: single channel — no averaging needed, just convert and send.
-    if channels == 1 {
-        let mono: Vec<f32> = data.iter().map(&convert).collect();
-        let resampled = if sample_rate == SAMPLE_RATE {
-            mono
-        } else {
-            crate::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
-        };
-        // try_send: drop-newest policy when the bounded channel is full
-        // (see MIC_CHANNEL_CAPACITY docs).
-        let _ = tx.try_send(resampled);
-        return;
-    }
-
-    // Multi-channel: average each frame across channels.
-    let frames = data.len() / usize::from(channels);
-    let mut mono: Vec<f32> = Vec::with_capacity(frames);
-    for frame in data.chunks_exact(usize::from(channels)) {
-        let sum: f32 = frame.iter().map(&convert).sum();
-        mono.push(sum / f32::from(channels));
-    }
+    let mono: Vec<f32> = if channels == 1 {
+        // Fast path: single channel — no averaging needed, just convert.
+        data.iter().map(&convert).collect()
+    } else {
+        // Multi-channel: average each frame across channels.
+        data.chunks_exact(usize::from(channels))
+            .map(|frame| frame.iter().map(&convert).sum::<f32>() / f32::from(channels))
+            .collect()
+    };
     let resampled = if sample_rate == SAMPLE_RATE {
         mono
     } else {
@@ -1238,7 +1226,7 @@ pub(crate) fn compute_utterance_quality(
     // During enrollment collection, quality is based on duration, clipping,
     // and SNR.
     //
-    // Duration score: 0.0 if too short or too long, ramping up in range.
+    // Duration score: 0.0 if too short, 0.3 if too long, ramping 0.6→1.0 in range.
     let duration_score = if duration_ms < ENROLLMENT_QUALITY_DURATION_MIN_MS {
         0.0
     } else if duration_ms > ENROLLMENT_QUALITY_DURATION_MAX_MS {
@@ -3722,6 +3710,16 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     }
 }
 
+/// Append `samples` to `buf`, draining the front if that pushes the buffer
+/// past `cap`.  Returns the number of samples drained from the front (0 when
+/// under cap) so callers can shift cursors into the buffer accordingly.
+fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> usize {
+    buf.extend_from_slice(samples);
+    let excess = buf.len().saturating_sub(cap);
+    buf.drain(..excess);
+    excess
+}
+
 /// Handle a chunk of raw mic audio during wake-word detection.
 ///
 /// # Pipeline (encoder-window pipeline)
@@ -3744,7 +3742,6 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 /// 5. **Detection→recording handoff** — on detection the ring is moved into
 ///    [`PipelineCtx::command_buffer`] with a Soft reset so recording starts
 ///    with the pre-wake context.
-#[expect(clippy::too_many_lines)]
 pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // ── Cooldown check ──
     // If we recently detected the wake word, skip ALL processing for this
@@ -3759,21 +3756,13 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             "Wake word cooldown active ({}ms elapsed)",
             last.elapsed().as_millis()
         );
-        ctx.audio_buffer.extend_from_slice(samples);
-        if ctx.audio_buffer.len() > AUDIO_BUFFER_MAX {
-            let excess = ctx.audio_buffer.len() - AUDIO_BUFFER_MAX;
-            ctx.audio_buffer.drain(..excess);
-        }
+        push_capped(&mut ctx.audio_buffer, samples, AUDIO_BUFFER_MAX);
         return;
     }
 
     // ── Accumulate into the raw audio ring (capped) ──
-    ctx.audio_buffer.extend_from_slice(samples);
-    if ctx.audio_buffer.len() > AUDIO_BUFFER_MAX {
-        let excess = ctx.audio_buffer.len() - AUDIO_BUFFER_MAX;
-        ctx.audio_buffer.drain(..excess);
-        ctx.vad_cursor = ctx.vad_cursor.saturating_sub(excess);
-    }
+    let excess = push_capped(&mut ctx.audio_buffer, samples, AUDIO_BUFFER_MAX);
+    ctx.vad_cursor = ctx.vad_cursor.saturating_sub(excess);
 
     // ── VAD-gated frame loop ──
     // Iterate HOP_LENGTH frames over the UNCONSUMED audio (from `vad_cursor`),
@@ -3820,11 +3809,11 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
             // encoder sees speech-only audio — the same distribution as
             // enrollment's VAD-segmented utterances.  Capped at
             // WAKE_WORD_WINDOW_SAMPLES (drain the front).
-            ctx.speech_window.extend_from_slice(&frame[..HOP_LENGTH]);
-            if ctx.speech_window.len() > WAKE_WORD_WINDOW_SAMPLES {
-                let excess = ctx.speech_window.len() - WAKE_WORD_WINDOW_SAMPLES;
-                ctx.speech_window.drain(..excess);
-            }
+            push_capped(
+                &mut ctx.speech_window,
+                &frame[..HOP_LENGTH],
+                WAKE_WORD_WINDOW_SAMPLES,
+            );
         } else {
             hop_count += 1;
         }

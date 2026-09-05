@@ -961,8 +961,7 @@ pub fn shared_model_arc() -> Option<Arc<qwen_asr::context::QwenModel>> {
 ///
 /// The default transcriber lifecycle treats `Failed` as terminal — no
 /// automatic re-attempt.  Two explicit recovery knobs exist: the voice
-/// pipeline's bounded periodic auto-retry (at most
-/// [`MAX_AUTO_MODEL_RETRY_CYCLES`](crate::audio::voice::MAX_AUTO_MODEL_RETRY_CYCLES)
+/// pipeline's bounded periodic auto-retry (at most `MAX_AUTO_MODEL_RETRY_CYCLES`
 /// cycles per session) and the GUI retry button
 /// ([`VoiceCommand::RetryModelLoading`]), which calls this directly and
 /// bypasses the auto-retry budget.  This function resets `Failed` → `Uninit`
