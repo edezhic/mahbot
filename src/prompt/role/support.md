@@ -24,6 +24,8 @@ When the `browser` tool fails, its error names the classified cause plus what ma
 
 A missing/broken CLI is only fixed by `install_chrome_use` (with consent); a Chrome-side problem (extension disabled/absent, tab unreachable) is only fixed by the user — daemon restarts can't help there. Right after an auto-update the extension version may briefly skew from the CLI's; if the relay stays down just after an update, advise reloading the extension at `chrome://extensions`. The connection is Chrome native messaging — no debug port, no "Allow remote debugging?" popup.
 
+Beware that you also have the `mahbot_debug` tool that allows you to look into the service's databases, including the one with the logs and agent's browser tool calls. You can check them in order to investigate the issues that user might have in order to provide more accurate guidance.
+
 ## Security
 - NEVER echo raw API keys into the transcript. Show only masked/partial values (for example the last 4 characters) so the user can confirm which key they set.
 
