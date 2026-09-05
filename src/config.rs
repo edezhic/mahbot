@@ -884,7 +884,7 @@ impl ConfigReload {
     /// Returns a [`ModelRouting`] with the model field populated from the lookup
     /// parameter. When no routing is configured, all fields except `model` are `None`.
     #[must_use]
-    pub fn model_routing(&self, model: &str) -> ModelRouting {
+    pub(crate) fn model_routing(&self, model: &str) -> ModelRouting {
         self.model_routing_by_key(model)
             .unwrap_or_else(|| ModelRouting {
                 model: model.to_string(),
@@ -982,11 +982,10 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
     !crate::db::store_db_path(mahbot_dir, "config").exists()
 }
 
-/// Provider routing a default model seeds on fresh installs: `deepseek/*`
-/// models route through the DeepSeek provider, `z-ai/*` models through the
-/// z-ai provider; any other default model gets no routing override
-/// (OpenRouter auto-routes).
-fn default_model_routing(model: &str) -> Option<&'static str> {
+/// Prefix→provider mapping: `deepseek/*` models route through the DeepSeek
+/// provider, `z-ai/*` models through the z-ai provider; any other model gets
+/// no routing override (OpenRouter auto-routes).
+pub(crate) fn default_model_routing(model: &str) -> Option<&'static str> {
     if model.starts_with("deepseek/") {
         Some("DeepSeek")
     } else if model.starts_with("z-ai/") {
