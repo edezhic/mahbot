@@ -974,8 +974,10 @@ pub(crate) async fn run_grouping_repair(
 
 /// Build a grouping request with the given system prompt, user material, and
 /// consumer-supplied model/effort/routing/max_tokens. The `meta` purpose and
-/// agent id are filled in here so every consumer shares the same telemetry
-/// shape (the registry entry uses the same purpose string).
+/// agent id are filled in here so the consumer (analyze consolidation) gets a
+/// uniform telemetry shape. The pipeline joint-verdict path deliberately builds
+/// its own `ChatRequest` instead (see `pipeline::verdict::synthesis_request`)
+/// — verdict telemetry (agent id, role string, max_tokens) differs on purpose.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn grouping_request(
     ws: &Workspace,

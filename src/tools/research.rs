@@ -1,4 +1,5 @@
-//! ResearchTool — Manager-only deep multi-round research orchestrator.
+//! ResearchTool — deep multi-round research orchestrator used by the
+//! Manager and (in full-permission mode) the Assistant.
 //!
 //! Unlike [`AnalyzeTool`](super::analyze::AnalyzeTool) (one round of parallel analysts
 //! for quick clarification), the pipeline is: round 0 decomposes the question
@@ -18,8 +19,8 @@
 //! abstention (every structural quiet round), a verification gate, and a hard
 //! analyst-spawn cap (never self-assessment) — plus budget exhaustion,
 //! deadline expiry, shutdown, and manual cancel. Exactly one envelope reaches
-//! the Manager asynchronously; intermediate rounds never reach the user, and
-//! exhaustion delivers a partial report rather than nothing.
+//! the calling agent asynchronously; intermediate rounds never reach the
+//! user, and exhaustion delivers a partial report rather than nothing.
 //!
 //! A per-round wall-clock deadline (`round_timeout`, default 3h) bounds each
 //! round's member waits; the run has no additional wall-clock cap. Budgeting
@@ -392,8 +393,9 @@ impl ResearchBudget {
 // ── Tool ─────────────────────────────────────────────────────────────────
 
 pub struct ResearchTool {
-    /// The role of the calling agent (Manager).
-    pub caller_role: Role,
+    /// The role of the calling agent (Manager, or Assistant in
+    /// full-permission mode) — set via [`ResearchTool::new`].
+    caller_role: Role,
 }
 
 impl ResearchTool {
@@ -442,7 +444,7 @@ impl Tool for ResearchTool {
         let channel = crate::agent::tool_channel();
 
         tokio::spawn(async move {
-            // Catch panics so the Manager ALWAYS receives the single result
+            // Catch panics so the caller ALWAYS receives the single result
             // envelope — a panic in the dispatch task would otherwise leave
             // the caller waiting forever on a result that can never arrive.
             let run = std::panic::AssertUnwindSafe(async {
@@ -1064,9 +1066,10 @@ impl QueryLedger {
 struct RunStats {
     tool_calls: usize,
     searches: usize,
-    /// Exact/normalized repeats of an earlier round's queries — summary
-    /// telemetry only (the saturation signal lives in
-    /// `EvidenceRound::repeat_queries`, wired in `gap_rounds`).
+    /// Queries already issued earlier in the run (loop rounds, wrap-up, and
+    /// verification all dedupe against the same ledger) — summary telemetry
+    /// only (the saturation signal lives in `EvidenceRound::repeat_queries`,
+    /// wired in `gap_rounds`).
     repeat_queries: usize,
     /// Analysts that failed (no response, empty output, or extraction
     /// failure) — reported explicitly so failures are never silent.
@@ -2997,8 +3000,9 @@ fn render_raw_reports(out: &mut String, raw_reports: &[String], heading: &str) {
     }
 }
 
-/// Render the accumulated evidence as a compact numbered list for the
-/// orchestrator prompts, plus analysts' self-reported unanswered aspects.
+/// Render the accumulated evidence as a compact numbered list, plus
+/// analysts' self-reported unanswered aspects. Used by the orchestrator
+/// prompts and the coder brief (`run_coder_round`).
 /// Claim ids are their stable 0-based indices in `acc.claims` — the
 /// annotation pass and final synthesis reference them by these ids.
 fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
@@ -3029,8 +3033,10 @@ fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
     out
 }
 
-/// Render the run summary: rounds, agents vs budget, tool calls, searches,
-/// wall time, unresolved gaps, and any abstention or incomplete marker.
+/// Render the run summary: rounds, incomplete-gap-round marker, run markers,
+/// agents vs budget, tool calls, searches, repeat queries, failed analysts,
+/// wall time, evidence counts, weak/unconfirmed links, abstention or
+/// incomplete marker, and unresolved gaps.
 #[expect(clippy::too_many_arguments)]
 fn render_run_summary(
     run_stats: &RunStats,
@@ -3623,7 +3629,7 @@ mod tests {
     /// accumulated evidence (ONE provider call), skips the verification pass
     /// (stored results reused — no analysts spawned), terminalizes into the
     /// durable envelope, and delivers to the ORIGINAL caller
-    /// (role/user/channel persisted on the job row, never the Manager).
+    /// (role/user/channel persisted on the job row, not hardcoded to Manager).
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn resume_research_run_continues_at_synthesis_stage() {
