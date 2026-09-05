@@ -123,7 +123,8 @@ pub(crate) const DEFAULT_MANAGER_MODEL: &str = "z-ai/glm-5.3-flash";
 pub(crate) const DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
 
 // The previous compiled defaults for the manager/worker slots, kept only for
-// the one-time migration in `migrate_old_default_models`.
+// the per-row migration in `migrate_old_default_models` (idempotent, run on
+// every boot).
 const OLD_DEFAULT_MANAGER_MODEL: &str = "deepseek/deepseek-v4-flash-vision-exp";
 const OLD_DEFAULT_WORKER_MODEL: &str = "deepseek/deepseek-v4-flash-0731";
 // Video-transcription model is fixed (not user-configurable) and always
@@ -691,11 +692,13 @@ pub(crate) fn is_custom_endpoint(endpoint: &str) -> bool {
     !is_default_endpoint(endpoint)
 }
 
-/// Whether a custom chat-completions endpoint is currently active in the
-/// global CONFIG (default URL and trivial variants never count as custom).
+/// Whether the LLM provider is configured: a non-empty OpenRouter key OR a
+/// genuinely custom endpoint active in the global CONFIG — keyless custom
+/// endpoints count too, while the default URL and trivial variants never do.
+/// Used by the pipeline pickup gate and the GUI boot-to-Settings redirect.
 #[must_use]
-fn custom_endpoint_active() -> bool {
-    is_custom_endpoint(&CONFIG.provider_endpoint())
+pub(crate) fn provider_configured() -> bool {
+    is_custom_endpoint(&CONFIG.provider_endpoint()) || CONFIG.provider_key().is_some()
 }
 
 /// Effective chat-completions endpoint for a config snapshot: the persisted
@@ -717,14 +720,6 @@ pub(crate) fn chat_credential(config: &ConfigData) -> Option<String> {
     } else {
         non_empty(config.provider_key.clone())
     }
-}
-
-/// Whether the LLM provider is configured: a non-empty OpenRouter key OR an
-/// active custom endpoint (keyless custom endpoints included). Used by the
-/// pipeline pickup gate and the GUI boot-to-Settings redirect.
-#[must_use]
-pub(crate) fn provider_configured() -> bool {
-    custom_endpoint_active() || CONFIG.provider_key().is_some()
 }
 
 // ── ConfigReload — global singleton ──────────────────────────────
@@ -1065,7 +1060,7 @@ async fn seed_fresh_install_defaults_from_flag(
     seed_fresh_install_defaults(fresh, store).await
 }
 
-/// One-time idempotent migration: rewrite persisted
+/// Idempotent migration: rewrite persisted
 /// `config_kv` rows that still hold the *previous* manager/worker default
 /// model to the current default. Matching is exact on the full
 /// provider-prefixed string, so only rows the user never overrode are

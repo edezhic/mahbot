@@ -203,10 +203,10 @@ impl Tool for CreateTicketTool {
                 }
             }
             (_, Some(p)) => p,
+            // No explicit priority: maintainer gets 3, while the manager
+            // (and every other reporter) intentionally defaults to 1.
             (None, None) => {
-                if self.reporter == "manager" {
-                    1
-                } else if self.reporter == "maintainer" {
+                if self.reporter == "maintainer" {
                     3
                 } else {
                     1
