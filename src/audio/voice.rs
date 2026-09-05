@@ -1561,15 +1561,10 @@ async fn broadcast_voice_transcript(transcript: &str, user_name: &str, workspace
     // for the no-active-user fallback) — the "no empty user" invariant.
     let msg = crate::ChannelMessage {
         user_name: user_name.to_string(),
-        reply_target: String::new(),
         content: transcript.to_string(),
         channel: "voice".to_string(),
         workspace: workspace.to_string(),
-        optimistic_id: None,
-        callback_query_id: None,
-        reply_reference: None,
-        chat_id: None,
-        message_id: None,
+        ..Default::default()
     };
     crate::channels::broadcast_and_persist_incoming_message(&msg, transcript, transcript).await;
 }

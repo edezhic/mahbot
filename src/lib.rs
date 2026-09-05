@@ -426,7 +426,16 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
 
 // ── Channel trait + types ───────────────────────────────────────
 
-#[derive(Debug, Clone)]
+/// `Default` yields an **undeliverable** placeholder: all string fields empty.
+/// It exists only as a `..Default::default()` spread for local-source
+/// construction sites (voice, onboarding, GUI chat), keeping Telegram-only
+/// fields (`callback_query_id`, `chat_id`, `message_id`, and the other
+/// `Option`s) out of their literals. Never dispatch `ChannelMessage::default()`
+/// directly — an empty `channel`/`user_name`/`content` is not routable.
+///
+/// When adding a new non-`Option` field, remember that spread sites will
+/// silently pick up its default instead of failing to compile.
+#[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
     /// The user's canonical name — stable identifier resolved from channel
     /// binding at auth time. Never derived from Telegram `@username` directly.

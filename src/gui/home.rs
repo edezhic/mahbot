@@ -1973,10 +1973,8 @@ impl HomeState {
             channel: "gui".to_string(),
             workspace: self.selected_workspace.clone().unwrap_or_default(),
             optimistic_id,
-            callback_query_id: None,
             reply_reference: reply,
-            chat_id: None,
-            message_id: None,
+            ..Default::default()
         };
 
         // Push to GUI_MESSAGE_TX.

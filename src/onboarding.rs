@@ -204,11 +204,7 @@ pub async fn kickoff_support(user_name: &str) -> anyhow::Result<()> {
         content: "hi mah bot".to_string(),
         channel: "gui".to_string(),
         workspace: format!("personal:{user_name}"),
-        optimistic_id: None,
-        callback_query_id: None,
-        reply_reference: None,
-        chat_id: None,
-        message_id: None,
+        ..Default::default()
     };
     if let Some(tx) = crate::GUI_MESSAGE_TX.get()
         && let Err(e) = tx.send(msg)
