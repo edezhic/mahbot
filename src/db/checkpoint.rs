@@ -255,11 +255,7 @@ async fn checkpoint_stores(round: CheckpointRound) {
                     status.as_ref().is_some_and(|s| s.wal_size > cap) && truncate_gate
                 }
             };
-            let outcome = if truncate {
-                conn.checkpoint().await
-            } else {
-                conn.checkpoint_passive().await
-            };
+            let outcome = conn.checkpoint_mode(truncate).await;
             match outcome {
                 Ok(o) if o.is_complete() => debug!(
                     db = %name,
@@ -314,13 +310,7 @@ async fn recover_failed_checkpoint(
     truncate: bool,
     root: Option<&Path>,
 ) {
-    let retry = async move {
-        if truncate {
-            conn.checkpoint().await
-        } else {
-            conn.checkpoint_passive().await
-        }
-    };
+    let retry = conn.checkpoint_mode(truncate);
     recover_failed_checkpoint_inner(name, conn, error, root, retry).await;
 }
 

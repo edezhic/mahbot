@@ -40,11 +40,9 @@
 //! A catalog/logic error is a hard boot failure — it is **never** absorbed by
 //! the heal/quarantine/`catch_unwind` wrappers and never triggers a recreate.
 
-use std::collections::HashSet;
-use std::path::Path;
-
 use anyhow::Context;
 use futures_util::future::BoxFuture;
+use std::collections::HashSet;
 
 use crate::db::{Connection, params};
 
@@ -57,7 +55,7 @@ pub(crate) enum TargetDb {
 
 /// A Rust-function migration body. The function is called without a
 /// surrounding transaction (it owns its own transactional/FK semantics).
-type RustFn = for<'a> fn(&'a Connection, &'a Path) -> BoxFuture<'a, anyhow::Result<()>>;
+type RustFn = for<'a> fn(&'a Connection) -> BoxFuture<'a, anyhow::Result<()>>;
 
 /// The body of a migration: ready SQL text, or a Rust function.
 #[derive(Debug, Clone, Copy)]
@@ -494,24 +492,15 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
 /// SQL entry runs inside its own transaction (schema change + tracking row
 /// commit atomically); each Rust entry runs without a surrounding transaction.
 /// A failure propagates — it is a hard boot failure, never healed/quarantined.
-pub(crate) async fn run_migrations(
-    conn: &Connection,
-    db: TargetDb,
-    root: &Path,
-) -> anyhow::Result<()> {
-    run_catalog(conn, db, root, MIGRATIONS).await
+pub(crate) async fn run_migrations(conn: &Connection, db: TargetDb) -> anyhow::Result<()> {
+    run_catalog(conn, db, MIGRATIONS).await
 }
 
 /// The migration loop, parameterized by a catalog so tests can replay the
 /// retired `1`–`23` chain (see the test fixtures). Creates `schema_migrations`,
 /// reads the applied ids, and runs each entry once, in catalog order, targeting
 /// only `db`.
-async fn run_catalog(
-    conn: &Connection,
-    db: TargetDb,
-    root: &Path,
-    catalog: &[Migration],
-) -> anyhow::Result<()> {
+async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> anyhow::Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (\
              id         TEXT PRIMARY KEY,\
@@ -564,7 +553,7 @@ async fn run_catalog(
                 // upfill, which probes before altering — is idempotent and
                 // re-runnable, so a crash between body success and id recording
                 // re-runs the body without corruption on the next boot.
-                run(conn, root)
+                run(conn)
                     .await
                     .with_context(|| format!("Migration '{}' failed", migration.id))?;
                 conn.execute(
@@ -583,10 +572,7 @@ async fn run_catalog(
 
 // ── Rust-function migrations (called without a surrounding transaction) ──
 
-fn add_chat_history_reply_columns<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_chat_history_reply_columns(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_chat_history_reply_columns(conn))
 }
 
@@ -604,10 +590,7 @@ async fn run_add_chat_history_reply_columns(conn: &Connection) -> anyhow::Result
     Ok(())
 }
 
-fn add_chat_history_broadcast_id<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_chat_history_broadcast_id(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_chat_history_broadcast_id(conn))
 }
 
@@ -622,10 +605,7 @@ async fn run_add_chat_history_broadcast_id(conn: &Connection) -> anyhow::Result<
     add_column_if_missing(conn, "chat_history", "broadcast_id").await
 }
 
-fn add_ticket_transition_actor<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_ticket_transition_actor(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_ticket_transition_actor(conn))
 }
 
@@ -642,10 +622,9 @@ async fn run_add_ticket_transition_actor(conn: &Connection) -> anyhow::Result<()
     add_column_if_missing(conn, "ticket_chronicle", "actor").await
 }
 
-fn add_workspaces_maintainer_recommendations<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_workspaces_maintainer_recommendations(
+    conn: &Connection,
+) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_workspaces_maintainer_recommendations(conn))
 }
 
@@ -687,10 +666,9 @@ async fn add_column_if_missing(conn: &Connection, table: &str, column: &str) -> 
     Ok(())
 }
 
-fn add_jobs_caller_agent_and_session_created_at<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_jobs_caller_agent_and_session_created_at(
+    conn: &Connection,
+) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_jobs_caller_agent_and_session_created_at(conn))
 }
 
@@ -715,10 +693,7 @@ async fn run_add_jobs_caller_agent_and_session_created_at(conn: &Connection) -> 
     Ok(())
 }
 
-fn add_users_image_and_video_models<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_users_image_and_video_models(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_users_image_and_video_models(conn))
 }
 
@@ -734,7 +709,7 @@ async fn run_add_users_image_and_video_models(conn: &Connection) -> anyhow::Resu
     Ok(())
 }
 
-fn add_jobs_mode<'a>(conn: &'a Connection, _root: &'a Path) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_jobs_mode(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_jobs_mode(conn))
 }
 
@@ -760,10 +735,7 @@ async fn run_add_jobs_mode(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add_session_metadata_sleep_ended<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_session_metadata_sleep_ended(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_session_metadata_sleep_ended(conn))
 }
 
@@ -776,10 +748,7 @@ async fn run_add_session_metadata_sleep_ended(conn: &Connection) -> anyhow::Resu
     add_column_if_missing(conn, "session_metadata", "sleep_ended").await
 }
 
-fn add_alarms_command<'a>(
-    conn: &'a Connection,
-    _root: &'a Path,
-) -> BoxFuture<'a, anyhow::Result<()>> {
+fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_alarms_command(conn))
 }
 
@@ -1678,17 +1647,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     // ticket_stage_jobs) are fully duplicated by the later chain entries
     // (19, 10, consolidate_005, 15), and its data effects are simulated by
     // direct seeding. The no-op yields the identical final shape.
-    fn noop_import<'a>(
-        _conn: &'a Connection,
-        _root: &'a Path,
-    ) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn noop_import(_conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
-    fn cleanup_legacy_ticket_jobs<'a>(
-        conn: &'a Connection,
-        _root: &'a Path,
-    ) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn cleanup_legacy_ticket_jobs(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(run_import_cleanup(conn))
     }
 
@@ -1718,10 +1681,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         Ok(())
     }
 
-    fn drop_jobs_paused_frozen<'a>(
-        conn: &'a Connection,
-        _root: &'a Path,
-    ) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn drop_jobs_paused_frozen(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(run_drop_jobs_paused_frozen(conn))
     }
 
@@ -1737,10 +1697,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         Ok(())
     }
 
-    fn drop_user_roles_and_seed_onboarding<'a>(
-        conn: &'a Connection,
-        _root: &'a Path,
-    ) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn drop_user_roles_and_seed_onboarding(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(run_drop_user_roles_and_seed_onboarding(conn))
     }
 
@@ -1803,10 +1760,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         Ok(())
     }
 
-    fn rewrite_analysis_verdicts<'a>(
-        conn: &'a Connection,
-        _root: &'a Path,
-    ) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn rewrite_analysis_verdicts(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(run_rewrite_analysis_verdicts(conn))
     }
 
@@ -2135,7 +2089,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         )
         .await
         .expect("open logs");
-        run_migrations(&conn, TargetDb::Logs, root)
+        run_migrations(&conn, TargetDb::Logs)
             .await
             .expect("run logs catalog");
 
@@ -2351,7 +2305,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         )
         .await
         .expect("open core");
-        run_catalog(&conn, TargetDb::Core, root, OLD_CATALOG)
+        run_catalog(&conn, TargetDb::Core, OLD_CATALOG)
             .await
             .expect("old catalog");
         seed_current_core_rows(&conn).await;
@@ -2359,7 +2313,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let before_ids = applied_ids(&conn).await;
         let before = snapshot_core_state(&conn).await;
 
-        run_migrations(&conn, TargetDb::Core, root)
+        run_migrations(&conn, TargetDb::Core)
             .await
             .expect("new catalog");
 
@@ -2478,7 +2432,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         )
         .await
         .expect("open logs");
-        run_catalog(&conn, TargetDb::Logs, root, OLD_CATALOG)
+        run_catalog(&conn, TargetDb::Logs, OLD_CATALOG)
             .await
             .expect("old catalog");
         conn.execute(
@@ -2493,7 +2447,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let before_indexes = index_defs(&conn).await;
         let before_counts = table_row_counts(&conn, &expected_logs_domain_tables()).await;
 
-        run_migrations(&conn, TargetDb::Logs, root)
+        run_migrations(&conn, TargetDb::Logs)
             .await
             .expect("new catalog");
 
@@ -2545,14 +2499,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         )
         .await
         .expect("open core");
-        run_catalog(
-            &conn,
-            TargetDb::Core,
-            root,
-            &old_catalog_without_reply_delta(),
-        )
-        .await
-        .expect("old catalog minus 23");
+        run_catalog(&conn, TargetDb::Core, &old_catalog_without_reply_delta())
+            .await
+            .expect("old catalog minus 23");
 
         let now = crate::db::now();
         conn.execute(
@@ -2597,7 +2546,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         let mut before_ids = applied_ids(&conn).await;
         before_ids.sort();
 
-        run_migrations(&conn, TargetDb::Core, root)
+        run_migrations(&conn, TargetDb::Core)
             .await
             .expect("new catalog");
 

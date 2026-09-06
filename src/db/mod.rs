@@ -487,6 +487,23 @@ fn optional_row<T>(r: turso::Result<T>) -> anyhow::Result<Option<T>> {
         Err(e) => Err(e.into()),
     }
 }
+/// Map the first row of a result stream through a fallible closure, mapping
+/// an empty stream to [`turso::Error::QueryReturnedNoRows`] and per-row
+/// errors to `turso::Error::Error`. Shared by [`Connection::query_row_impl`]
+/// and [`Connection::query_row_cached`].
+async fn map_first_row<T, E>(
+    mut rows: turso::Rows,
+    map: impl FnOnce(&Row) -> std::result::Result<T, E>,
+) -> turso::Result<T>
+where
+    E: std::fmt::Display,
+{
+    let row = rows
+        .next()
+        .await?
+        .ok_or(turso::Error::QueryReturnedNoRows)?;
+    map(&row).map_err(|e| turso::Error::Error(e.to_string()))
+}
 
 /// Collect per-row results, failing on the first per-row error.
 fn strict_collect<T>(rows: Vec<turso::Result<T>>) -> anyhow::Result<Vec<T>> {
@@ -968,12 +985,8 @@ impl Connection {
         T: Send + 'static,
         E: std::fmt::Display + Send + Sync + 'static,
     {
-        let mut rows = conn.query(sql, params).await?;
-        let row = rows
-            .next()
-            .await?
-            .ok_or(turso::Error::QueryReturnedNoRows)?;
-        map(&row).map_err(|e| turso::Error::Error(e.to_string()))
+        let rows = conn.query(sql, params).await?;
+        map_first_row(rows, map).await
     }
 
     /// Execute a query, returning all matching rows, using the connection's
@@ -1049,12 +1062,7 @@ impl Connection {
         self.run_detached(move |conn| {
             Box::pin(async move {
                 let mut stmt = conn.prepare_cached(&sql).await?;
-                let mut rows = stmt.query(params).await?;
-                let row = rows
-                    .next()
-                    .await?
-                    .ok_or(turso::Error::QueryReturnedNoRows)?;
-                map(&row).map_err(|e| turso::Error::Error(e.to_string()))
+                map_first_row(stmt.query(params).await?, map).await
             })
         })
         .await
@@ -1107,6 +1115,20 @@ impl Connection {
     /// TRUNCATE checkpoint runs; callers bound that growth with a size cap.
     pub(crate) async fn checkpoint_passive(&self) -> anyhow::Result<CheckpointOutcome> {
         self.run_checkpoint(CheckpointMode::Passive).await
+    }
+
+    /// Run a WAL checkpoint in TRUNCATE mode when `truncate`, PASSIVE
+    /// otherwise — the bool-based mode selection shared by the periodic
+    /// checkpoint round, the failed-checkpoint recovery retry, and tests.
+    pub(crate) async fn checkpoint_mode(
+        &self,
+        truncate: bool,
+    ) -> anyhow::Result<CheckpointOutcome> {
+        if truncate {
+            self.checkpoint().await
+        } else {
+            self.checkpoint_passive().await
+        }
     }
 
     async fn run_checkpoint(&self, mode: CheckpointMode) -> anyhow::Result<CheckpointOutcome> {
@@ -2129,7 +2151,7 @@ pub(crate) async fn open_consolidated_store(root: &Path) -> anyhow::Result<Conne
     // or quarantined. A fresh/recreated store is empty until the catalog builds
     // the full current shape.
     let conn = open_store(root, CONSOLIDATED_DB_NAME, "").await?;
-    migrations::run_migrations(&conn, migrations::TargetDb::Core, root).await?;
+    migrations::run_migrations(&conn, migrations::TargetDb::Core).await?;
 
     // Enable CDC on the FINAL connection, after all migrations, so
     // boot-time schema writes are not captured. This single chokepoint
@@ -3702,11 +3724,10 @@ mod tests {
             .expect("insert test row");
 
         for mode in ["checkpoint", "checkpoint_passive"] {
-            let outcome = match mode {
-                "checkpoint" => conn.checkpoint().await,
-                _ => conn.checkpoint_passive().await,
-            }
-            .expect("checkpoint should succeed on a healthy database");
+            let outcome = conn
+                .checkpoint_mode(mode == "checkpoint")
+                .await
+                .expect("checkpoint should succeed on a healthy database");
             assert!(
                 outcome.is_complete(),
                 "{mode} outcome must be complete: {outcome:?}"

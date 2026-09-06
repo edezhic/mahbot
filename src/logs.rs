@@ -143,8 +143,7 @@ impl LogStore {
         // The catalog owns the logs schema; run it OUTSIDE the catch_unwind /
         // quarantine wrappers so a catalog failure is a hard boot failure,
         // never reclassified as corruption and healed.
-        crate::db::migrations::run_migrations(&conn, crate::db::migrations::TargetDb::Logs, root)
-            .await?;
+        crate::db::migrations::run_migrations(&conn, crate::db::migrations::TargetDb::Logs).await?;
         Ok(Self { conn })
     }
 
