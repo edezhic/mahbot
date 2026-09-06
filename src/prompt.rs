@@ -355,14 +355,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rules_dir = dir.path().join(".claude").join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
-        // Create a file that looks like a dir (unreadable as file)
-        let bad = rules_dir.join("broken.md");
-        std::fs::write(&bad, "fine").unwrap();
-        // Create a valid one too
+        // A directory named *.md fails read_to_string and is skipped
+        std::fs::create_dir(rules_dir.join("broken.md")).unwrap();
         std::fs::write(rules_dir.join("good.md"), "good content").unwrap();
-        // Both should be found since both are readable
         let rules = discover_claude_rules(dir.path()).await;
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].0, ".claude/rules/good.md");
     }
 
     #[tokio::test]
