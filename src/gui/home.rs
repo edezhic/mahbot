@@ -174,38 +174,37 @@ fn reply_reference_for(
     }
 }
 
+/// Shared lead row of both reply renderings: reply glyph, author (caller-chosen
+/// color), and muted snippet, already spaced and center-aligned. Callers may
+/// `push` extra trailing elements (e.g. the dismiss button).
+fn reply_lead_row(
+    reply: &ReplyReference,
+    author_color: iced::Color,
+) -> iced::widget::Row<'_, HomeMessage> {
+    row![
+        lucide::reply::<iced::Theme, iced::Renderer>()
+            .size(theme::TEXT_12)
+            .color(theme::ACCENT),
+        text(&reply.author).size(theme::TEXT_11).color(author_color),
+        text(&reply.snippet)
+            .size(theme::TEXT_11)
+            .color(theme::TEXT_MUTED),
+    ]
+    .spacing(theme::SPACE_4)
+    .align_y(Alignment::Center)
+}
+
 /// Render the compact reply quote header shown above a bubble that carries a
 /// [`ReplyReference`]: a muted "_author_: snippet" line with a small reply
 /// glyph, aligned to the row the bubble occupies.
 fn reply_quote_header(reply: &ReplyReference) -> Element<'_, HomeMessage> {
-    let icon = lucide::reply::<iced::Theme, iced::Renderer>()
-        .size(theme::TEXT_12)
-        .color(theme::ACCENT);
-    let author = text(&reply.author)
-        .size(theme::TEXT_11)
-        .color(theme::TEXT_SECONDARY);
-    let snippet = text(&reply.snippet)
-        .size(theme::TEXT_11)
-        .color(theme::TEXT_MUTED);
-    row![icon, author, snippet]
-        .spacing(theme::SPACE_4)
-        .align_y(Alignment::Center)
-        .into()
+    reply_lead_row(reply, theme::TEXT_SECONDARY).into()
 }
 
 /// Render the reply preview bar shown between the message list and the
 /// composer when a reply reference is pending: author + snippet on one line
 /// (the snippet's own cap produces the ellipsis) with a dismiss control.
 fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
-    let icon = lucide::reply::<iced::Theme, iced::Renderer>()
-        .size(theme::TEXT_12)
-        .color(theme::ACCENT);
-    let author = text(&reply.author)
-        .size(theme::TEXT_11)
-        .color(theme::TEXT_PRIMARY);
-    let snippet = text(&reply.snippet)
-        .size(theme::TEXT_11)
-        .color(theme::TEXT_MUTED);
     let dismiss = button(
         lucide::x::<iced::Theme, iced::Renderer>()
             .size(theme::TEXT_12)
@@ -215,15 +214,9 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     .style(theme::icon_button_style(false))
     .padding(theme::PAD_2);
     container(
-        row![
-            icon,
-            author,
-            snippet,
-            Space::new().width(Length::Fill),
-            dismiss
-        ]
-        .spacing(theme::SPACE_4)
-        .align_y(Alignment::Center),
+        reply_lead_row(reply, theme::TEXT_PRIMARY)
+            .push(Space::new().width(Length::Fill))
+            .push(dismiss),
     )
     .padding([theme::PAD_4, theme::PAD_8])
     .style(theme::surface_container_style)

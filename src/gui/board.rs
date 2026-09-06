@@ -660,15 +660,6 @@ impl BoardState {
         }
     }
 
-    #[allow(clippy::unused_self)]
-    pub fn subscription(&self) -> iced::Subscription<BoardMessage> {
-        // Undo/Redo in the comment input flows through
-        // `BoardMessage::CommentInputChanged(EditorAction::Undo/Redo)`, which
-        // the shared widget now emits internally. No page-level keyboard
-        // subscription needed.
-        iced::Subscription::none()
-    }
-
     /// Phase transition actions (ported from Board.tsx `availableActions`)
     fn available_actions(phase: TicketPhase) -> Vec<(&'static str, TicketPhase)> {
         match phase {

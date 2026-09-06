@@ -214,24 +214,16 @@ fn counts_slot(file: Option<&DiffFile>) -> CountsSlot {
     }
 }
 
-/// Icon identifier for file headers (avoids widget construction at cache time).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CachedIcon {
-    ArrowRight,
-    FilePlus,
-    FileMinus,
-    FileText,
-}
-
-impl CachedIcon {
-    fn to_text<'a>(self) -> iced::widget::Text<'a, iced::Theme, iced::Renderer> {
-        match self {
-            CachedIcon::ArrowRight => lucide::arrow_right(),
-            CachedIcon::FilePlus => lucide::file_plus(),
-            CachedIcon::FileMinus => lucide::file_minus(),
-            CachedIcon::FileText => lucide::file_text(),
-        }
-    }
+/// Wrap content in the standard diff status-pane chrome (padding + fill + style).
+fn diff_pane_container<'a>(
+    content: impl Into<Element<'a, DiffMessage>>,
+) -> Element<'a, DiffMessage> {
+    container(content)
+        .padding([theme::PAD_8, theme::PAD_12])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::base_container_style)
+        .into()
 }
 
 pub struct DiffState {
@@ -759,7 +751,6 @@ impl DiffState {
         }
     }
 
-    #[expect(clippy::too_many_lines)]
     pub fn view(&self) -> Element<'_, DiffMessage> {
         let has_changes = !self.diff_files.is_empty();
         let show_commit_bar =
@@ -826,30 +817,15 @@ impl DiffState {
         let status: Element<'_, DiffMessage> = if let Some(ref err) = self.error {
             widgets::error_banner(err)
         } else if let Some(ref s) = self.status_message {
-            container(text(s).size(theme::TEXT_13).color(theme::TEXT_SECONDARY))
-                .padding([theme::PAD_8, theme::PAD_12])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(theme::base_container_style)
-                .into()
+            diff_pane_container(text(s).size(theme::TEXT_13).color(theme::TEXT_SECONDARY))
         } else if self.diff_loading && !self.diff_has_loaded {
-            container(widgets::loading_text())
-                .padding([theme::PAD_8, theme::PAD_12])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(theme::base_container_style)
-                .into()
+            diff_pane_container(widgets::loading_text())
         } else if self.selected_workspace_name.is_none() {
-            container(
+            diff_pane_container(
                 text("Select a workspace to view its diff.")
                     .size(theme::TEXT_13)
                     .color(theme::TEXT_MUTED),
             )
-            .padding([theme::PAD_8, theme::PAD_12])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::base_container_style)
-            .into()
         } else if self.diff_files.is_empty() {
             container(
                 column![
@@ -1168,16 +1144,28 @@ impl DiffState {
                         file.old_path.as_deref().unwrap_or("?"),
                         file.path
                     ),
-                    CachedIcon::ArrowRight,
+                    lucide::arrow_right::<iced::Theme, iced::Renderer>(),
                 )
             } else if file.status == DiffFileStatus::Added {
-                (format!("New file: {}", file.path), CachedIcon::FilePlus)
+                (
+                    format!("New file: {}", file.path),
+                    lucide::file_plus::<iced::Theme, iced::Renderer>(),
+                )
             } else if file.status == DiffFileStatus::Deleted {
-                (format!("Deleted: {}", file.path), CachedIcon::FileMinus)
+                (
+                    format!("Deleted: {}", file.path),
+                    lucide::file_minus::<iced::Theme, iced::Renderer>(),
+                )
             } else if file.status == DiffFileStatus::Untracked {
-                (format!("Untracked: {}", file.path), CachedIcon::FilePlus)
+                (
+                    format!("Untracked: {}", file.path),
+                    lucide::file_plus::<iced::Theme, iced::Renderer>(),
+                )
             } else {
-                (file.path.clone(), CachedIcon::FileText)
+                (
+                    file.path.clone(),
+                    lucide::file_text::<iced::Theme, iced::Renderer>(),
+                )
             };
 
             // The tinted band spans the wrapper's content width, so it sits at
@@ -1185,10 +1173,7 @@ impl DiffState {
             rows.push(
                 container(
                     row![
-                        header_icon
-                            .to_text()
-                            .size(theme::TEXT_12)
-                            .color(FILE_HEADER_COLOR),
+                        header_icon.size(theme::TEXT_12).color(FILE_HEADER_COLOR),
                         Space::new().width(theme::SPACE_6),
                         text(header_label)
                             .size(theme::TEXT_12)
