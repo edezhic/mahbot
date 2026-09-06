@@ -95,6 +95,9 @@ pub fn parse_provider_input(raw: &str) -> ProviderInput {
     ProviderInput::Invalid
 }
 
+// Deliberately case-insensitive, unlike the prefix-only `util::is_http_url`
+// (whose case-sensitive contract config validation relies on) — onboarding
+// accepts pasted endpoint URLs leniently regardless of scheme casing.
 fn is_http_url(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")

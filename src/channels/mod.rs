@@ -133,7 +133,7 @@ pub(crate) async fn broadcast_and_persist_agent_response(
 /// never persisted to chat_history (e.g. the Phase-1 scripted onboarding
 /// exchange). Pass `false` for every persisted path.
 #[expect(clippy::too_many_arguments)]
-pub(crate) fn broadcast_chat_event(
+fn broadcast_chat_event(
     message_id: &str,
     user_name: &str,
     content: &str,
@@ -386,7 +386,7 @@ impl Channel for GuiChannel {
 /// The voice pipeline runs its own mic-capture loop independently;
 /// `listen()` is a no-op because incoming voice commands flow through
 /// `crate::audio::voice::route_to_agent`, not through a channel listener.
-pub struct VoiceChannel;
+struct VoiceChannel;
 
 #[async_trait]
 impl Channel for VoiceChannel {

@@ -263,6 +263,13 @@ pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> anyhow::Result<
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Run a git command and return its trimmed stdout.
+///
+/// Shared by the helpers that return a single scalar (hash, branch, message).
+async fn run_git_trimmed(repo_path: &Path, args: &[&str]) -> anyhow::Result<String> {
+    Ok(run_git_command(repo_path, args).await?.trim().to_string())
+}
+
 /// Check if `git status --porcelain` output contains any unstaged changes.
 ///
 /// Looks for any line where the worktree status column (second character) is
@@ -305,10 +312,7 @@ pub async fn run_git_add_all(repo_path: &Path) -> anyhow::Result<String> {
 /// Errors when HEAD cannot be resolved (e.g. a repository with no commits
 /// yet). Callers that need unknown-as-`None` semantics should use `.ok()`.
 pub async fn run_git_head(repo_path: &Path) -> anyhow::Result<String> {
-    Ok(run_git_command(repo_path, &["rev-parse", "HEAD"])
-        .await?
-        .trim()
-        .to_string())
+    run_git_trimmed(repo_path, &["rev-parse", "HEAD"]).await
 }
 
 /// Run `git write-tree` and return the trimmed index tree hash.
@@ -317,10 +321,7 @@ pub async fn run_git_head(repo_path: &Path) -> anyhow::Result<String> {
 /// index cannot be written (e.g. unmerged entries). Callers that need
 /// unknown-as-`None` semantics should use `.ok()`.
 pub async fn run_git_write_tree(repo_path: &Path) -> anyhow::Result<String> {
-    Ok(run_git_command(repo_path, &["write-tree"])
-        .await?
-        .trim()
-        .to_string())
+    run_git_trimmed(repo_path, &["write-tree"]).await
 }
 
 /// Stage all changes and commit with the given message.
@@ -460,7 +461,7 @@ pub fn parse_numstat_lines(stdout: &str) -> Vec<NumstatEntry> {
 
 /// Run `git diff --numstat <range...>` and return the per-file entries.
 /// Callers pass only the range (e.g. `&["HEAD"]` or `&["4b825d…", "HEAD"]`).
-pub(crate) async fn run_git_diff_numstat(
+async fn run_git_diff_numstat(
     repo_path: &Path,
     range: &[&str],
 ) -> anyhow::Result<Vec<NumstatEntry>> {
@@ -507,9 +508,7 @@ pub async fn git_has_commits(repo_path: &Path) -> bool {
 
 /// Get the current branch name (e.g. `main`, `feature/xyz`).
 pub async fn run_git_current_branch(repo_path: &Path) -> anyhow::Result<String> {
-    run_git_command(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .await
-        .map(|s| s.trim().to_string())
+    run_git_trimmed(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]).await
 }
 
 /// Get behind/ahead counts against the upstream branch.
@@ -927,8 +926,7 @@ pub async fn run_git_commit_message(
     if let Some(hash) = commit_hash {
         args.push(hash);
     }
-    let out = run_git_command(repo_path, &args).await?;
-    Ok(out.trim().to_string())
+    run_git_trimmed(repo_path, &args).await
 }
 
 /// List new or untracked files in the working tree.
@@ -983,7 +981,7 @@ fn parse_porcelain_paths(porcelain: &str, predicate: impl FnMut(&&str) -> bool) 
 /// To parse only truly untracked files (those prefixed with `?? `), use
 /// [`parse_untracked_from_porcelain`] instead.
 #[must_use]
-pub(crate) fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
+fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
     parse_porcelain_paths(porcelain, |line| {
         line.starts_with("?? ") || line.starts_with('A')
     })
@@ -1007,7 +1005,10 @@ pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
 /// Parse `git status --porcelain` output into a map of file path → `GitFileStatus`.
 ///
 /// The porcelain format uses a two-column status (index + worktree).
-/// Precedence: modified > added > untracked. Rename entries (`R`) extract
+/// If either column is `M` the file is [`GitFileStatus::Modified`]; otherwise
+/// staged-new (`A`) and untracked (`??`) entries both map to
+/// [`GitFileStatus::Added`]. If a file appears both modified and added,
+/// `Modified` wins. Rename entries (`R`) extract
 /// the new path after ` -> `. Deleted files (`D`) are ignored. Handles
 /// git's C-style quoting for paths with special characters.
 ///
@@ -1015,7 +1016,7 @@ pub(crate) fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
 /// command runs with cwd = the workspace root, these are workspace-relative
 /// paths (the same key space as the editor's file tree).
 #[must_use]
-pub fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
+pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
     let mut map: HashMap<String, GitFileStatus> = HashMap::new();
 
     for line in output.lines() {

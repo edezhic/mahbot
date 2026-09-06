@@ -1,7 +1,8 @@
 //! Chat history persistence — stores all chat messages (both user and agent)
-//! for GUI display and history loading. Messages are written at the point of
-//! delivery: incoming user messages from the GUI send path, outgoing agent
-//! responses from `GuiChannel::send()`.
+//! for GUI display and history loading. Messages are written by the central
+//! broadcast-and-persist paths: `broadcast_and_persist_incoming_message` for
+//! incoming user messages and `broadcast_and_persist_agent_response` /
+//! `BroadcastPersistEntry` for outgoing agent responses.
 //!
 //! Each message gets a NanoID for deduplication.
 
@@ -18,7 +19,7 @@ crate::define_store! {
 
 /// Parameters for inserting a chat history entry.
 ///
-/// This struct bundles the 8 fields needed by [`ChatHistoryStore::insert`].
+/// This struct bundles the fields needed by [`ChatHistoryStore::insert`].
 /// Owned `String` fields match the pattern established by
 /// [`LogEntry`](crate::logs::LogEntry).
 #[derive(Debug, Clone)]
@@ -127,7 +128,7 @@ fn rows_to_page(rows: Vec<Row>) -> Result<(Vec<ChatHistoryEntry>, bool)> {
 
 impl ChatHistoryStore {
     /// Insert a message into the history. `message_id` is a NanoID for dedup.
-    /// Silently ignores duplicate `message_id` values (UPSERT no-op).
+    /// Silently ignores duplicate `message_id` values (`INSERT OR IGNORE`).
     pub async fn insert(&self, entry: &ChatHistoryInsert) -> Result<()> {
         self.conn
             .execute(

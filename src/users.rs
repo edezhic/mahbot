@@ -159,12 +159,12 @@ impl UserStore {
     }
 
     /// Get the selected workspace name for a user, if any.
-    pub async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
+    async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
         self.user_column("selected_workspace", user_name).await
     }
 
     /// Get the active role for a user, if any.
-    pub async fn get_active_role(&self, user_name: &str) -> Result<Option<String>> {
+    async fn get_active_role(&self, user_name: &str) -> Result<Option<String>> {
         self.user_column("selected_role", user_name).await
     }
 

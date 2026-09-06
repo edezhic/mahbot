@@ -21,7 +21,7 @@ pub mod config_db;
 pub(crate) mod consensus;
 pub mod db;
 pub(crate) mod embedder;
-pub mod git;
+pub(crate) mod git;
 pub mod gui;
 pub mod jobs;
 pub mod logs;
