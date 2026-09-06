@@ -227,7 +227,7 @@ static TABLE_INFO: OnceLock<Mutex<HashMap<String, TableInfo>>> = OnceLock::new()
 /// [`init_table_sender`], which keeps the slot and this map on the SAME channel —
 /// if they ever diverged, the drainer would prune rows without broadcasting (it
 /// derives `subscribed_tables` from [`TABLES`] keys and sends via the map).
-/// "tickets" is special-cased in [`subscribe`]/[`broadcast_event`] and does not
+/// "tickets" is special-cased in [`broadcast_event`] and does not
 /// use this map.
 static TABLES: OnceLock<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChangeEvent>>>> =
     OnceLock::new();
@@ -343,13 +343,12 @@ pub(crate) fn register_ticket_materializer(
     let _ = TICKET_MATERIALIZER.set(Arc::new(f));
 }
 
-/// Subscribe to change events for `table`. Multiple subscribers on the same table
-/// are independent; the sender is created on first subscribe. This is the general
-/// multi-table subscription entry point (currently the tickets stream plus the
-/// three dedicated-sender tables — "workspaces", "users", "user_channels" — have
-/// production subscribers); generic non-ticket tables will use it once a consumer
-/// exists, so it is kept crate-visible.
-#[allow(dead_code)]
+/// Test-only generic subscription entry point: returns a receiver for `table`'s
+/// broadcast channel, creating the sender (and a [`TABLES`] registry entry) on
+/// first call. Production subscribers use `ticket_sender()` or the dedicated
+/// `*_sender_lock()` accessors instead; "tickets" is special-cased here the same
+/// way [`broadcast_event`] special-cases it.
+#[cfg(test)]
 pub(crate) fn subscribe(table: &str) -> tokio::sync::broadcast::Receiver<ChangeEvent> {
     if table == "tickets" {
         return ticket_sender().subscribe();
