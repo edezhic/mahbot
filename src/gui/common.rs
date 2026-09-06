@@ -598,7 +598,7 @@ pub(crate) fn apply_editor_action(
 
 /// Restore an undo/redo snapshot into a buffer (`None`, i.e. an empty stack,
 /// is a no-op).
-pub(crate) fn restore_undo_snapshot(content: &mut EditorBuffer, snapshot: Option<UndoSnapshot>) {
+fn restore_undo_snapshot(content: &mut EditorBuffer, snapshot: Option<UndoSnapshot>) {
     if let Some(snapshot) = snapshot {
         content.set_text(&snapshot.text);
         content.move_to(snapshot.cursor.line, snapshot.cursor.column);

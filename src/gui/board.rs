@@ -21,7 +21,7 @@ use super::widgets::{
 
 /// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
-pub struct FileStat {
+struct FileStat {
     path: String,
     additions: i64,
     deletions: i64,
@@ -29,7 +29,7 @@ pub struct FileStat {
 
 /// Parsed commit stats for a ticket's associated commit.
 #[derive(Debug, Clone)]
-pub struct CommitStats {
+pub(crate) struct CommitStats {
     files: Vec<FileStat>,
 }
 
@@ -37,7 +37,7 @@ pub struct CommitStats {
 // both tiny unit variants and sizable ones; that is inherent to a page message.
 #[derive(Debug, Clone)]
 #[expect(clippy::large_enum_variant)]
-pub enum BoardMessage {
+pub(crate) enum BoardMessage {
     Refreshed {
         tickets: Vec<Ticket>,
         generation: u64,
@@ -121,7 +121,6 @@ pub enum BoardMessage {
     /// Navigate to the commit diff view for this ticket.
     ViewCommitDiff {
         commit_hash: String,
-        workspace_name: String,
     },
 
     /// Toggle expansion of a diagnostics comment.
@@ -1500,7 +1499,7 @@ impl BoardState {
         // Inline commit stats: +added/−removed with color coding,
         // positioned after prereq indicator and before fill spacer.
         // Zero-valued sides are hidden; only the non-zero side displays.
-        if let (Some(hash), Some(ws_name)) = (&ticket.commit_hash, &self.workspace_name) {
+        if let Some(hash) = &ticket.commit_hash {
             let added = ticket.lines_added.unwrap_or(0);
             let removed = ticket.lines_removed.unwrap_or(0);
             let stats_parts = row![
@@ -1516,7 +1515,6 @@ impl BoardState {
                 "ticket commit diff",
                 Some(BoardMessage::ViewCommitDiff {
                     commit_hash: hash.clone(),
-                    workspace_name: ws_name.clone(),
                 }),
                 [theme::PAD_2, theme::PAD_6],
                 theme::button_text,

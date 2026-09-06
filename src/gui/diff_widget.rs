@@ -185,7 +185,7 @@ impl<'a> DiffBufferWidget<'a> {
 
 /// Compute the number of digits needed for the widest old/new line number.
 #[must_use]
-pub(crate) fn compute_gutter_digits(line_numbers: &[(Option<usize>, Option<usize>)]) -> usize {
+fn compute_gutter_digits(line_numbers: &[(Option<usize>, Option<usize>)]) -> usize {
     line_numbers
         .iter()
         .flat_map(|(old, new)| [*old, *new])
@@ -224,7 +224,7 @@ fn gutter_column_right_edges(bounds_x: f32, h_padding: f32, gutter_width: f32) -
 /// 5-second auto-refresh that rebuilt byte-identical buffers — reuses the
 /// existing shaped layout, while any content change forces a full re-shape.
 #[must_use]
-pub(crate) fn compute_content_fingerprint(
+fn compute_content_fingerprint(
     text: &str,
     span_data: &[(usize, usize, Color)],
     line_kinds: &[Option<DiffLineKind>],

@@ -379,7 +379,7 @@ pub(crate) fn iced_color_to_cosmic(c: Color) -> cosmic_text::Color {
 /// contiguity check uses pointer arithmetic and would produce undefined
 /// behavior if the slices came from different string allocations. All
 /// current callers uphold this requirement.
-pub(crate) fn push_or_merge<'a>(
+fn push_or_merge<'a>(
     text: &'a str,
     result: &mut Vec<(&'a str, cosmic_text::Attrs<'a>)>,
     new_text: &'a str,
