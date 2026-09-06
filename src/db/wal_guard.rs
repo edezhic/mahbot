@@ -213,16 +213,14 @@ fn classify_main_db(db_path: &Path, wal_exists: bool, wal_size: u64) -> BootDiag
 pub fn diagnose_all_stores(root: &Path) {
     for (name, _) in crate::db::iter_checkpoint_stores() {
         let db_path = crate::db::store_db_path(root, name);
-        let sidecars = crate::db::store_sidecars(&db_path);
-        let wal_size = std::fs::metadata(&sidecars.wal).map_or(0, |m| m.len());
-        let diagnosis = classify_main_db(&db_path, sidecars.wal.exists(), wal_size);
-        set_boot_diagnosis(&db_path, diagnosis);
-        if diagnosis != BootDiagnosis::Healthy {
+        let status = inspect_store_at(&db_path);
+        set_boot_diagnosis(&db_path, status.class);
+        if status.class != BootDiagnosis::Healthy {
             crate::boot::boot_diagnostic(format!(
                 "boot pre-flight: store '{name}' class {} (wal_size={}) — healing will run \
                  before open",
-                diagnosis.label(),
-                wal_size,
+                status.class.label(),
+                status.wal_size,
             ));
         }
     }

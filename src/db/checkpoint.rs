@@ -498,6 +498,7 @@ fn write_checkpoint_error_log(root: &Path, report: &str) -> std::io::Result<std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::test_support::{fts_corruption_ddl, insert_fts_ticket};
 
     /// The checkpoint/verify entry points are no-ops (no panic) when no stores
     /// are initialized (all `OnceCell`s are empty).
@@ -505,17 +506,6 @@ mod tests {
     async fn noop_when_no_stores() {
         checkpoint_all_databases().await;
         periodic_checkpoint_and_verify().await;
-    }
-
-    /// Insert a minimal ticket row whose title is FTS-indexed.
-    async fn insert_fts_ticket(conn: &Connection, id: &str, title: &str) {
-        conn.execute(
-            "INSERT INTO tickets (id, title, description, workspace_name, created_at, updated_at) \
-             VALUES (?1, ?2, 'desc', 'ws', ?3, ?3)",
-            crate::db::params![id.to_string(), title.to_string(), crate::db::now()],
-        )
-        .await
-        .unwrap();
     }
 
     /// A checkpoint failure on a store whose title FTS index was corrupted is
@@ -530,14 +520,8 @@ mod tests {
         insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
         insert_fts_ticket(&conn, "t-2", "Another relevant thing").await;
 
-        // Break it: replace the FTS index with a same-named plain btree (the
-        // same deterministic stand-in as the boot repair test).
-        conn.execute_batch(
-            "DROP INDEX idx_tickets_title_fts; \
-             CREATE INDEX idx_tickets_title_fts ON tickets(title);",
-        )
-        .await
-        .unwrap();
+        // Break it: replace the FTS index with a same-named plain btree.
+        conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
         assert!(
             !crate::db::is_fts_index(&conn, crate::db::TICKETS_FTS_INDEX_NAME).await,
             "index must be a btree before the recovery"
@@ -601,12 +585,7 @@ mod tests {
             .await
             .unwrap();
         insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
-        conn.execute_batch(
-            "DROP INDEX idx_tickets_title_fts; \
-             CREATE INDEX idx_tickets_title_fts ON tickets(title);",
-        )
-        .await
-        .unwrap();
+        conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
 
         let retry = async {
             Err::<crate::db::CheckpointOutcome, anyhow::Error>(anyhow::anyhow!(

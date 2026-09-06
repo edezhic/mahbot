@@ -252,19 +252,16 @@ async fn read_stream_limited(
     buf
 }
 
-/// Spawn a background task that reads from an optional pipe.
+/// Spawn a background task that reads from a pipe.
 /// The task stops early when `cancel` is signalled and returns
 /// whatever data has been buffered so far.
 fn spawn_pipe_reader(
-    pipe: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>,
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<Vec<u8>> {
     tokio::spawn(async move {
-        if let Some(mut reader) = pipe {
-            read_stream_limited(&mut reader, SHELL_PIPE_READ_CAP, cancel).await
-        } else {
-            Vec::new()
-        }
+        let mut pipe = pipe;
+        read_stream_limited(&mut pipe, SHELL_PIPE_READ_CAP, cancel).await
     })
 }
 
@@ -456,8 +453,9 @@ async fn run_command_with_timeout(
     // teardown) must not orphan the child's process group. Disarmed on every
     // path where the child is reaped — post-reap kills risk PID reuse.
     let mut kill_guard = pid.map(KillOnDrop::new);
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
+    // Stdio::piped() was set above, so the handles are always present.
+    let stdout_pipe = child.stdout.take().expect("stdout piped");
+    let stderr_pipe = child.stderr.take().expect("stderr piped");
 
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut stdout_handle = spawn_pipe_reader(stdout_pipe, cancel.clone());
@@ -1894,7 +1892,7 @@ pub(super) fn first_command_word(segment: &str) -> &str {
 /// value misidentified as the subcommand. This is a known limitation: the
 /// returned key won't match any profile, falling through to generic filtering,
 /// which is the same end state as the pre-fix behavior.
-pub(super) fn canonical_command(segment: &str) -> String {
+fn canonical_command(segment: &str) -> String {
     let Some((cmd_idx, cmd, words)) = command_word_from_segment(segment) else {
         return String::new();
     };
@@ -4075,77 +4073,61 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn resolved_shell_path_includes_npm_global_bin() {
-        let path = resolved_shell_path();
-        assert!(
-            path.contains(".npm-global/bin"),
-            "PATH should include ~/.npm-global/bin for globally installed npm tools: {path}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolved_shell_path_includes_cargo_bin() {
-        // Belt-and-suspenders means ~/.cargo/bin is always added regardless
-        // of $CARGO_HOME, so no env manipulation needed here.
-        let path = resolved_shell_path();
-        assert!(
-            path.contains(".cargo/bin"),
-            "PATH should include ~/.cargo/bin: {path}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolved_shell_path_includes_cargo_home_when_set() {
-        let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));
-        let path = resolved_shell_path();
-
-        assert!(
-            path.contains("/custom/cargo/bin"),
-            "PATH should include $CARGO_HOME/bin when CARGO_HOME is set: {path}"
-        );
-        // Default ~/.cargo/bin should also be present (belt-and-suspenders).
-        assert!(
-            path.contains(".cargo/bin"),
-            "PATH should still include ~/.cargo/bin when CARGO_HOME is set (belt-and-suspenders): {path}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolved_shell_path_dedup_cargo_home_and_default() {
-        let Some(dirs) = UserDirs::new() else {
-            // No home directory — skip dedup test (cannot determine default path).
-            return;
-        };
-
-        let default_cargo_home = dirs.home_dir().join(".cargo").to_string_lossy().to_string();
-        let _guard = set_env_var("CARGO_HOME", Some(&default_cargo_home));
-        let path = resolved_shell_path();
-
-        // Count occurrences of the default cargo bin path.
-        let sep = ":";
-        let count = path
-            .split(sep)
-            .filter(|part| *part == format!("{default_cargo_home}/bin"))
-            .count();
-        assert_eq!(
-            count, 1,
-            "$CARGO_HOME/bin and ~/.cargo/bin should deduplicate when they point to the same directory"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resolved_shell_path_includes_homebrew() {
-        let path = resolved_shell_path();
-        assert!(
-            path.contains("/opt/homebrew/bin"),
-            "PATH should include Homebrew bin on macOS: {path}"
-        );
+    fn resolved_shell_path_covers_tool_dirs() {
+        #[cfg(unix)]
+        {
+            let path = resolved_shell_path();
+            assert!(
+                path.contains(".npm-global/bin"),
+                "PATH should include ~/.npm-global/bin for globally installed npm tools: {path}"
+            );
+            // Belt-and-suspenders means ~/.cargo/bin is always added regardless
+            // of $CARGO_HOME, so it shows up in both CARGO_HOME cases below.
+            assert!(
+                path.contains(".cargo/bin"),
+                "PATH should include ~/.cargo/bin: {path}"
+            );
+            {
+                let _guard = set_env_var("CARGO_HOME", Some("/custom/cargo"));
+                let path = resolved_shell_path();
+                assert!(
+                    path.contains("/custom/cargo/bin"),
+                    "PATH should include $CARGO_HOME/bin when CARGO_HOME is set: {path}"
+                );
+                assert!(
+                    path.contains(".cargo/bin"),
+                    "PATH should still include ~/.cargo/bin when CARGO_HOME is set (belt-and-suspenders): {path}"
+                );
+            }
+            // $CARGO_HOME/bin and ~/.cargo/bin must deduplicate when they point
+            // to the same directory (skipped when no home directory exists).
+            if let Some(dirs) = UserDirs::new() {
+                let default_cargo_home = dirs
+                    .home_dir()
+                    .join(".cargo")
+                    .to_string_lossy()
+                    .into_owned();
+                let _guard = set_env_var("CARGO_HOME", Some(&default_cargo_home));
+                let path = resolved_shell_path();
+                let count = path
+                    .split(':')
+                    .filter(|part| *part == format!("{default_cargo_home}/bin"))
+                    .count();
+                assert_eq!(
+                    count, 1,
+                    "$CARGO_HOME/bin and ~/.cargo/bin should deduplicate when they point to the same directory: {path}"
+                );
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let path = resolved_shell_path();
+            assert!(
+                path.contains("/opt/homebrew/bin"),
+                "PATH should include Homebrew bin on macOS: {path}"
+            );
+        }
     }
 
     // ── New feature tests ───────────────────────────────────────────

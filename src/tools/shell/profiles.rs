@@ -19,24 +19,11 @@ pub(super) struct Profile {
     pub(super) tail_lines: Option<usize>,
     pub(super) max_lines: Option<usize>,
     pub(super) on_empty: Option<&'static str>,
-    /// Message used instead of `on_empty` when the exit code is non-zero.
-    /// Self-contained (replaces both the `on_empty` message and the `(failed)`
-    /// suffix), so output like `[cargo clippy: ok] (failed)` is avoided.
-    /// When `None` (the default), the existing `on_empty` + `(failed)` suffix
-    /// behavior is preserved for backward compatibility.
-    ///
-    /// **Note:** This is only used when `on_empty` is also set — it is an
-    /// alternative message for the `on_empty` pathway, not an independent one.
+    /// Message used instead of `on_empty` on non-zero exit; see `on_fail`.
     pub(super) on_fail_msg: Option<&'static str>,
-    /// Optional transform that replaces the pipeline output after line-level
-    /// processing but before `combine_output` and `finish_shell_output`.
-    /// Receives the processed output and exit code, returns the transformed output.
+    /// Pipeline output transform; see `output_transform`.
     pub(super) output_transform: Option<fn(&str, exit_code: i32) -> String>,
-    /// When true, the output_transform is only applied to standalone commands
-    /// (single segment). For chained commands (`&&`, `||`, `;`, `|`), the
-    /// transform is skipped and the output passes through as-is. This prevents
-    /// transforms that assume homogeneous output (e.g., compact_ls) from
-    /// silently dropping output produced by later command segments.
+    /// Restricts `output_transform` to standalone commands; see `standalone_only`.
     pub(super) standalone_only: bool,
 }
 
@@ -109,8 +96,9 @@ impl Profile {
 
     /// Set the message shown when all output is stripped and the exit code is
     /// non-zero. Self-contained — replaces both the `on_empty` message and
-    /// the `(failed)` suffix. When `None` (the default), the existing behavior
-    /// (`on_empty` + `(failed)` suffix) is preserved.
+    /// the `(failed)` suffix, so output like `[cargo clippy: ok] (failed)` is
+    /// avoided. When `None` (the default), the existing behavior (`on_empty`
+    /// + `(failed)` suffix) is preserved.
     ///
     /// **Note:** This is only effective when `on_empty` is also set — it is an
     /// alternative message for the `on_empty` pathway, not an independent one.
@@ -121,6 +109,7 @@ impl Profile {
 
     /// Set an output transform that replaces the pipeline output after line-level
     /// processing but before `combine_output` and `finish_shell_output`.
+    /// Receives the processed output and exit code, returns the transformed output.
     fn output_transform(mut self, transform: fn(&str, exit_code: i32) -> String) -> Self {
         self.output_transform = Some(transform);
         self

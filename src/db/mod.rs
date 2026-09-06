@@ -1118,10 +1118,7 @@ impl Connection {
             .first()
             .context("PRAGMA wal_checkpoint returned no result row")?;
         Ok(CheckpointOutcome {
-            busy: match row.get_value(0)? {
-                Value::Integer(n) => n != 0,
-                _ => anyhow::bail!("Unexpected result from PRAGMA wal_checkpoint"),
-            },
+            busy: int_column(row, 0)? != 0,
             log_frames: int_column(row, 1)?,
             checkpointed_frames: int_column(row, 2)?,
         })
@@ -3218,10 +3215,38 @@ fn family_stamp() -> String {
     )
 }
 
+/// Test-support helpers shared by the db test modules (`mod.rs`, `checkpoint.rs`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{Connection, TICKETS_FTS_INDEX_NAME, now, params};
+
+    /// Insert a minimal ticket row whose title is FTS-indexed (the
+    /// `CREATE INDEX ... USING fts` index is auto-maintained).
+    pub(crate) async fn insert_fts_ticket(conn: &Connection, id: &str, title: &str) {
+        conn.execute(
+            "INSERT INTO tickets (id, title, description, workspace_name, created_at, updated_at) \
+             VALUES (?1, ?2, 'desc', 'ws', ?3, ?3)",
+            params![id.to_string(), title.to_string(), now()],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// DDL replacing the ticket-title FTS index with a same-named plain btree —
+    /// the deterministic corruption stand-in for FTS repair tests.
+    pub(crate) fn fts_corruption_ddl() -> String {
+        format!(
+            "DROP INDEX {TICKETS_FTS_INDEX_NAME}; \
+             CREATE INDEX {TICKETS_FTS_INDEX_NAME} ON tickets(title);"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use test_support::{fts_corruption_ddl, insert_fts_ticket};
 
     #[test]
     fn experimental_features_are_consistent() {
@@ -4367,18 +4392,6 @@ mod tests {
 
     // ── ticket-title FTS boot repair tests ─────────────────────────────
 
-    /// Insert a minimal ticket row whose title is FTS-indexed (the
-    /// `CREATE INDEX ... USING fts` index is auto-maintained).
-    async fn insert_fts_ticket(conn: &Connection, id: &str, title: &str) {
-        conn.execute(
-            "INSERT INTO tickets (id, title, description, workspace_name, created_at, updated_at) \
-             VALUES (?1, ?2, 'desc', 'ws', ?3, ?3)",
-            params![id.to_string(), title.to_string(), now()],
-        )
-        .await
-        .unwrap();
-    }
-
     /// Classification of quick_check problems as attributable to the
     /// ticket-title FTS index (user-visible index name or the internal FTS dir).
     #[test]
@@ -4526,12 +4539,7 @@ mod tests {
         insert_fts_ticket(&conn, "t-1", "Important bug fix one").await;
 
         // Break it: replace the FTS index with a same-named plain btree.
-        conn.execute_batch(
-            "DROP INDEX idx_tickets_title_fts; \
-             CREATE INDEX idx_tickets_title_fts ON tickets(title);",
-        )
-        .await
-        .unwrap();
+        conn.execute_batch(&fts_corruption_ddl()).await.unwrap();
         assert!(!is_fts_index(&conn, "idx_tickets_title_fts").await);
 
         // Full boot entry: detection must fire and the repair must rebuild.
