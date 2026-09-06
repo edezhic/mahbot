@@ -309,7 +309,7 @@ pub async fn route_user_message(
         crate::session::normalize_user_name(&user_name, "route_user_message").to_string();
 
     let agent_id = crate::session::resolve_agent_id(&user_name, role.as_str(), &workspace_name);
-    let mut job = AgentJob {
+    let job = AgentJob {
         content,
         workspace_name,
         user_name,
@@ -325,20 +325,8 @@ pub async fn route_user_message(
     // Manager-bound UserMessage is durable: DURABLE kinds =
     // UserMessage (manager-bound only), AnalyzeToolResult, ResearchResult.
     if job.role == Role::Manager {
-        let (persisted, id) = persist_manager_envelope(&job, "manager message").await;
-        if let Some(id) = id {
-            job.pending_job_id = Some(id);
-        }
-        // Persisted during the drain/shutdown → skip routing (boot replay
-        // reclaims). NOT persisted → route best-effort; the realistic rescue
-        // is the non-drain persist-failure case (the consumer is still
-        // pulling). A drain-time best-effort route may land in a consumer that
-        // has already stopped pulling, so the message can still be lost at
-        // exit — the fix primarily closes the silent-drop on the normal-path
-        // double fault, not the drain window.
-        if crate::shutdown::aborting() && persisted {
-            return;
-        }
+        stamp_and_route(job, &agent_id, "manager message").await;
+        return;
     }
     route(&agent_id, job);
 }
@@ -363,6 +351,28 @@ async fn persist_manager_envelope(job: &AgentJob, producer: &str) -> (bool, Opti
             (false, None)
         }
     }
+}
+
+/// Stamp `job.pending_job_id` from a freshly persisted durable envelope and
+/// route it, unless shutdown drained after persistence (boot replay reclaims
+/// persisted copies).
+///
+/// Persisted during the drain/shutdown → skip routing (boot replay
+/// reclaims). NOT persisted → route best-effort; the realistic rescue
+/// is the non-drain persist-failure case (the consumer is still
+/// pulling). A drain-time best-effort route may land in a consumer that
+/// has already stopped pulling, so the message can still be lost at
+/// exit — the fix primarily closes the silent-drop on the normal-path
+/// double fault, not the drain window.
+async fn stamp_and_route(mut job: AgentJob, target: &str, producer: &str) {
+    let (persisted, id) = persist_manager_envelope(&job, producer).await;
+    if let Some(id) = id {
+        job.pending_job_id = Some(id);
+    }
+    if crate::shutdown::aborting() && persisted {
+        return;
+    }
+    route(target, job);
 }
 
 /// Build the `AgentMessage` envelope: the assistant's message normalized and
@@ -393,8 +403,7 @@ fn agent_message_job(
 }
 
 /// Route a message from an assistant agent into the workspace Manager's
-/// session (`MessageKind::AgentMessage`), durably: persisted to `pending_jobs`
-/// BEFORE routing (same reliability class as Manager-bound user messages).
+/// session (`MessageKind::AgentMessage`).
 /// `reply_to_agent_id` is the originating Assistant's agent id — the Manager's
 /// response is additionally addressed back into that session.
 pub async fn route_agent_message_to_manager(
@@ -404,22 +413,15 @@ pub async fn route_agent_message_to_manager(
     user_name: String,
     reply_to_agent_id: String,
 ) {
-    let mut job = agent_message_job(
+    let job = agent_message_job(
         content,
         workspace_name,
         origin_workspace_name,
         &user_name,
         reply_to_agent_id,
     );
-    // Same durable Manager-bound block as route_user_message.
-    let (persisted, id) = persist_manager_envelope(&job, "agent message").await;
-    if let Some(id) = id {
-        job.pending_job_id = Some(id);
-    }
-    if crate::shutdown::aborting() && persisted {
-        return;
-    }
-    route(&crate::jobs::envelope_target(&job), job);
+    let target = crate::jobs::envelope_target(&job);
+    stamp_and_route(job, &target, "agent message").await;
 }
 
 /// Persist an envelope to `pending_jobs`. The target agent id is derived
@@ -899,20 +901,12 @@ fn manager_reply_job(response: &str, job: &AgentJob, reply_to: &str) -> Option<A
 /// Addressed reply leg for `AgentMessage` jobs: after the Manager's response
 /// is broadcast (unchanged semantics), a durable user-invisible copy is routed
 /// into the originating Assistant's session so it wakes even after a restart.
-/// Persisted BEFORE routing (at-least-once, same class as fire_alarm); a
-/// persist failure degrades to at-most-once with a warn.
 async fn route_manager_reply(response: &str, job: &AgentJob, reply_to: String) {
-    let Some(mut reply_job) = manager_reply_job(response, job, &reply_to) else {
+    let Some(reply_job) = manager_reply_job(response, job, &reply_to) else {
         return;
     };
-    let (persisted, id) = persist_manager_envelope(&reply_job, "manager reply envelope").await;
-    if let Some(id) = id {
-        reply_job.pending_job_id = Some(id);
-    }
-    if crate::shutdown::aborting() && persisted {
-        return;
-    }
-    route(&crate::jobs::envelope_target(&reply_job), reply_job);
+    let target = crate::jobs::envelope_target(&reply_job);
+    stamp_and_route(reply_job, &target, "manager reply envelope").await;
 }
 
 /// Deliver a response to all workspace users (Manager role).
