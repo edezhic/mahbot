@@ -170,7 +170,7 @@ impl Page {
 
 /// Toast notification kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToastKind {
+pub(crate) enum ToastKind {
     Success,
     Warning,
     Error,
@@ -182,7 +182,7 @@ static NEXT_TOAST_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A floating toast notification.
 #[derive(Debug, Clone)]
-pub struct Toast {
+pub(crate) struct Toast {
     /// Stable id used to dismiss the toast when its expiry timer fires.
     pub id: u64,
     pub message: String,
@@ -2989,13 +2989,7 @@ impl Dashboard {
         #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = (progress * 100.0).round() as u32;
         let label = format!("TTS: {file_name} {pct}%");
-        container(
-            text(label)
-                .size(theme::TEXT_12)
-                .color(theme::TEXT_SECONDARY),
-        )
-        .padding([0.0, theme::PAD_12])
-        .into()
+        footer_status_label(label)
     }
 
     /// Render a compact voice status indicator in the footer bar.
@@ -3034,13 +3028,7 @@ impl Dashboard {
             VoiceStatus::Enrolled => "🔊 ✅ Enrolled".into(),
             VoiceStatus::Error(msg) => format!("🔊 Error: {msg}"),
         };
-        container(
-            text(label)
-                .size(theme::TEXT_12)
-                .color(theme::TEXT_SECONDARY),
-        )
-        .padding([0.0, theme::PAD_12])
-        .into()
+        footer_status_label(label)
     }
 
     /// 42px footer bar — nav items (left) and active agents (right).
@@ -3089,6 +3077,17 @@ impl Dashboard {
             .style(theme::surface_container_style)
             .into()
     }
+}
+
+/// Muted 12px status label with side padding, shown in the centre of the footer bar.
+fn footer_status_label(label: String) -> Element<'static, Message> {
+    container(
+        text(label)
+            .size(theme::TEXT_12)
+            .color(theme::TEXT_SECONDARY),
+    )
+    .padding([0.0, theme::PAD_12])
+    .into()
 }
 
 /// Persisted window geometry and selected user.

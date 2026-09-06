@@ -118,7 +118,7 @@ struct CachedSessionItem {
 
 pub(crate) struct SessionsState {
     sessions: Vec<SessionMetadata>,
-    pub(crate) load_state: super::common::AsyncLoadState,
+    load_state: super::common::AsyncLoadState,
     selected_session: Option<String>,
     /// The flat session ledger built from the selected session's messages.
     entries: Vec<SessionEntry>,
@@ -791,6 +791,29 @@ fn click_toggle(
     }
 }
 
+/// Shared collapse-state preamble for the transcript's collapsible elements:
+/// returns `(is_expanded, collapses, preview)` — whether the user expanded the
+/// element, whether it renders more than [`MAX_PREVIEW_LINES`] wrapped lines
+/// at `font_size` (measured at the bubble body width), and the measured
+/// 3-line preview if it can collapse.
+fn collapse_state(
+    ctx: &TranscriptCtx<'_>,
+    key: (usize, usize),
+    content: &str,
+    font_size: f32,
+) -> (bool, bool, Option<String>) {
+    let is_expanded = ctx.expanded.contains(&key);
+    let (wrapped_lines, preview) = element_measurement(
+        ctx.measure_cache,
+        key,
+        ctx.text_width,
+        !is_expanded,
+        content,
+        font_size,
+    );
+    (is_expanded, wrapped_lines > MAX_PREVIEW_LINES, preview)
+}
+
 /// A plain-text collapsible element with the 3-line measured collapse rule:
 /// when it renders more than [`MAX_PREVIEW_LINES`] wrapped lines and is not
 /// expanded, a 3-line preview (with an "ellipsis" marker) is shown; otherwise
@@ -804,16 +827,8 @@ fn plain_collapsible<'a>(
     content: &'a str,
     color: iced::Color,
 ) -> Element<'a, SessionsMessage> {
-    let is_expanded = ctx.expanded.contains(&key);
-    let (wrapped_lines, preview) = element_measurement(
-        ctx.measure_cache,
-        key,
-        ctx.text_width,
-        !is_expanded,
-        content,
-        theme::MARKDOWN_TEXT_SIZE,
-    );
-    let collapses = wrapped_lines > MAX_PREVIEW_LINES;
+    let (is_expanded, collapses, preview) =
+        collapse_state(ctx, key, content, theme::MARKDOWN_TEXT_SIZE);
     let el = collapsible_text_block(
         collapses,
         is_expanded,
@@ -835,16 +850,8 @@ fn thinking_block<'a>(
     key: (usize, usize),
     content: &'a str,
 ) -> Element<'a, SessionsMessage> {
-    let is_expanded = ctx.expanded.contains(&key);
-    let (wrapped_lines, preview) = element_measurement(
-        ctx.measure_cache,
-        key,
-        ctx.text_width,
-        !is_expanded,
-        content,
-        theme::MARKDOWN_TEXT_SIZE,
-    );
-    let collapses = wrapped_lines > MAX_PREVIEW_LINES;
+    let (is_expanded, collapses, preview) =
+        collapse_state(ctx, key, content, theme::MARKDOWN_TEXT_SIZE);
     let header = row![
         lucide::brain::<iced::Theme, iced::Renderer>()
             .size(theme::TEXT_11)
@@ -884,21 +891,12 @@ fn body_block<'a>(
     md: Option<&'a [markdown::Item]>,
     is_narration: bool,
 ) -> Element<'a, SessionsMessage> {
-    let is_expanded = ctx.expanded.contains(&key);
     let size = if is_narration {
         theme::NARRATION_TEXT_SIZE
     } else {
         theme::MARKDOWN_TEXT_SIZE
     };
-    let (wrapped_lines, preview) = element_measurement(
-        ctx.measure_cache,
-        key,
-        ctx.text_width,
-        !is_expanded,
-        content,
-        size,
-    );
-    let collapses = wrapped_lines > MAX_PREVIEW_LINES;
+    let (is_expanded, collapses, preview) = collapse_state(ctx, key, content, size);
     let font = if is_narration {
         theme::FONT_ITALIC
     } else {
