@@ -1153,6 +1153,29 @@ fn wrap_up_params(ws: &Workspace, agent_id: &str, tool_specs: Vec<ToolSpec>) -> 
     )
 }
 
+/// RAII guard for a research-run LLM call: registers with
+/// [`crate::agent::registry::NON_AGENT_CALLS`] under the run's
+/// `ParentKey::Research(run_key)` group. Dropping the guard removes the
+/// registry entry, so the caller must keep the binding alive for the whole
+/// call (or the whole run when `run_lifetime` is set).
+fn research_call_guard(
+    kind: &'static str,
+    ws_name: &str,
+    run_key: &str,
+    run_lifetime: bool,
+    question: &str,
+) -> crate::agent::registry::NonAgentCallGuard {
+    crate::agent::registry::NON_AGENT_CALLS.register(
+        kind,
+        ws_name,
+        Some(crate::agent::registry::ParentKey::Research(
+            run_key.to_string(),
+        )),
+        run_lifetime,
+        Some(question.to_string()),
+    )
+}
+
 /// Wrap-up stage after a round deadline: for every analyst aborted by the
 /// deadline, load its persisted session, register its search queries in the
 /// ledger (BEFORE any LLM call — independent of the extraction outcome),
@@ -1221,15 +1244,7 @@ async fn wrap_up_timed_out(
     // batch actually runs (prep-only stages register nothing). Attaches to the
     // research run's group; the whole-run orchestrator guard already blocks
     // the drain-watch, so this row is purely observational.
-    let _wrap_up_call = crate::agent::registry::NON_AGENT_CALLS.register(
-        "research_wrap_up",
-        &ws.name,
-        Some(crate::agent::registry::ParentKey::Research(
-            run_key.to_string(),
-        )),
-        false,
-        Some(question.to_string()),
-    );
+    let _wrap_up_call = research_call_guard("research_wrap_up", &ws.name, run_key, false, question);
     let wrap_up_prompt = load_prompt("research/wrap_up.md");
     let handles: Vec<_> = prepared
         .into_iter()
@@ -1613,15 +1628,7 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     run_key: &str,
     question: &str,
 ) -> Result<T> {
-    let _call = crate::agent::registry::NON_AGENT_CALLS.register(
-        purpose,
-        &ws.name,
-        Some(crate::agent::registry::ParentKey::Research(
-            run_key.to_string(),
-        )),
-        false,
-        Some(question.to_string()),
-    );
+    let _call = research_call_guard(purpose, &ws.name, run_key, false, question);
     let params = orchestrator_params(ws, purpose);
     let mut messages = Vec::with_capacity(2);
     crate::prompt::prepend_general_context(&mut messages, ws).await;
@@ -2697,15 +2704,7 @@ async fn synthesize(
     abstention: Option<&str>,
     run_key: &str,
 ) -> Result<SynthesisOutput> {
-    let _call = crate::agent::registry::NON_AGENT_CALLS.register(
-        "synthesize",
-        &ws.name,
-        Some(crate::agent::registry::ParentKey::Research(
-            run_key.to_string(),
-        )),
-        false,
-        Some(question.to_string()),
-    );
+    let _call = research_call_guard("synthesize", &ws.name, run_key, false, question);
     let evidence = render_accumulated_evidence(acc);
     let mut base_user = substitute(
         &load_prompt("research/synthesize.md"),
@@ -3221,15 +3220,8 @@ async fn run_deep_research(
     // partial-report path, releasing the guard promptly. Registered as a
     // run-lifetime call: the Running Agents view renders it inside the run's
     // group as a run-lifetime indicator, not a transient LLM-call card.
-    let _orchestrator_guard = crate::agent::registry::NON_AGENT_CALLS.register(
-        "research_orchestrator",
-        &ws.name,
-        Some(crate::agent::registry::ParentKey::Research(
-            job_id.to_string(),
-        )),
-        true,
-        Some(question.to_string()),
-    );
+    let _orchestrator_guard =
+        research_call_guard("research_orchestrator", &ws.name, job_id, true, question);
     let start = Instant::now();
     // One round-wide bound shared by every phase's member waits
     // (decomposition, research rounds, verification): a stuck analyst is

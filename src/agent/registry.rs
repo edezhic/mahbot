@@ -575,6 +575,7 @@ impl NonAgentCallRegistry {
 }
 
 /// RAII guard: removes its registry entry on drop.
+#[must_use]
 pub(crate) struct NonAgentCallGuard {
     id: u64,
     registry: &'static NonAgentCallRegistry,
