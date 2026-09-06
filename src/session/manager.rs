@@ -94,19 +94,6 @@ pub(crate) enum RewriteOutcome {
 impl Session {
     // ── Session lifecycle ──────────────────────────────────────────────
 
-    /// Delete a session row and return the confirmation message. Reached via
-    /// [`crate::session::clear_session`] — the user-initiated /clear command
-    /// (Telegram), the inline clear button, and the GUI Home clear. Those paths
-    /// abandon the session's unfinished sync jobs first; BOTH the abandon and
-    /// the delete propagate errors, so the confirmation is only returned when
-    /// the session rows are really gone. Internal cleanup paths (maintainer
-    /// self-cleanup, transient TTL cleanup) call `store().delete` directly and
-    /// deliberately skip the abandon.
-    pub async fn delete(agent_id: &str) -> anyhow::Result<String> {
-        crate::session::store().delete(agent_id).await?;
-        Ok("Session cleared. Starting fresh.".to_string())
-    }
-
     /// Begin a turn. Loads the persisted history and the real
     /// provider-reported session length (last successful agent LLM call's
     /// input + output tokens), records the persisted prefix, and publishes the

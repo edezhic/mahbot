@@ -130,12 +130,6 @@ impl DeadSessionTracker {
     }
 
     /// Record a recovery attempt (increments counter, updates backoff).
-    ///
-    /// Called after **every** recovery attempt, regardless of whether the
-    /// job was routed successfully.  This ensures the `MAX_RETRIES` cap
-    /// and adaptive backoff work correctly for the primary failure mode
-    /// (persistent agent failures like rate limits or API errors), since
-    /// routing success ≠ recovery success.
     fn record_attempt(&self, agent_id: &str) {
         let mut map = self.inner.lock().unwrap_poison();
         let state = map.entry(agent_id.to_string()).or_insert(RetryState {
@@ -161,14 +155,6 @@ impl DeadSessionTracker {
     /// Safe to call for untracked sessions (no-op).
     fn cleanup(&self, agent_id: &str) {
         self.inner.lock().unwrap_poison().remove(agent_id);
-    }
-
-    /// Check whether a session has exhausted all retries (for logging).
-    #[cfg(test)]
-    fn has_exhausted_retries(&self, agent_id: &str) -> bool {
-        let map = self.inner.lock().unwrap_poison();
-        map.get(agent_id)
-            .is_some_and(|s| s.attempt_count >= MAX_RETRIES)
     }
 }
 
@@ -363,12 +349,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             }
         }
 
-        // Phase 2: route the recovery job.  This is fire-and-forget
-        // (sends on an mpsc channel) — routing success ≠ recovery
-        // success.  The agent executes asynchronously and may still
-        // fail (rate limits, API errors, etc.), so we count every
-        // routed attempt against the retry cap.
-        //
+        // Phase 2: route the recovery job (fire-and-forget mpsc send).
         // Failures in Phase 1 (missing context, invalid role) are NOT
         // counted — they are permanent data issues that will never
         // resolve with retries.
@@ -378,22 +359,6 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Returns `true` if the agent ID belongs to a session that should NOT be
-/// recovered by the poller (`manager_` plus every
-/// [`super::TRANSIENT_AGENT_ID_PREFIXES`] prefix).
-///
-/// Note: the poller itself uses SQL-side filtering now — this function is
-/// retained for test coverage and as documentation of the exclusion criteria.
-#[cfg(test)]
-fn is_excluded_agent_id(agent_id: &str) -> bool {
-    crate::session::reserved_agent_id_prefixes().any(|p| {
-        let bare = p.trim_end_matches('_');
-        // Faithful to SQL `LIKE 'prefix_%'`: the `_` consumes exactly one char
-        // after the bare reserved word, so a bare word alone is NOT excluded.
-        agent_id.len() > bare.len() && crate::session::starts_with_ignore_ascii_case(agent_id, bare)
-    })
 }
 
 /// Route a recovery job for a dead session with validated context.
@@ -460,98 +425,6 @@ mod tests {
     use crate::Tool;
 
     #[test]
-    fn test_is_excluded_agent_id_cases() {
-        struct Case {
-            name: &'static str,
-            id: String,
-            excluded: bool,
-        }
-
-        // Dynamic prefix drift-detection invariant: every registered reserved
-        // prefix must be excluded.  Enumerating these as literal table rows
-        // would silently lose coverage when TRANSIENT_AGENT_ID_PREFIXES grows
-        // (or `manager_` changes), so the union is enumerated at runtime via
-        // `reserved_agent_id_prefixes()` — the same source the poller uses.
-        for prefix in crate::session::reserved_agent_id_prefixes() {
-            let id = format!("{prefix}suffix");
-            assert!(
-                is_excluded_agent_id(&id),
-                "case: transient prefix '{prefix}' — expected '{id}' to be excluded",
-            );
-        }
-
-        let cases = vec![
-            // Direct user-agent sessions should NOT be excluded by the union of
-            // `TRANSIENT_AGENT_ID_PREFIXES` and `"manager_"`.
-            Case {
-                name: "direct_session",
-                id: "alice_main_workspace_engineer".into(),
-                excluded: false,
-            },
-            Case {
-                name: "direct_session_ws_2",
-                id: "bob_my_project_analyst".into(),
-                excluded: false,
-            },
-            Case {
-                name: "direct_session_ws_3",
-                id: "charlie_personal_work_assistant".into(),
-                excluded: false,
-            },
-            // Even if user/workspace names contain underscores, the start of the
-            // agent_id is the user name ("some_user"), which doesn't match any
-            // excluded prefix.
-            Case {
-                name: "underscore_in_names",
-                id: "some_user_my_cool_workspace_reviewer".into(),
-                excluded: false,
-            },
-            // A real user whose name collides with a reserved prefix is escaped by
-            // `direct_agent_id` (a `user_` prefix), so their session is never
-            // mistaken for a transient/background session and is never skipped by
-            // the poller.  These are runtime-built (cannot be `&'static str`
-            // rows) so the live link to the `user_`-escape coupling stays honest.
-            Case {
-                name: "colliding_user_manager",
-                id: crate::session::direct_agent_id("manager", "engineer", "ws"),
-                excluded: false,
-            },
-            Case {
-                name: "colliding_user_ticket",
-                id: crate::session::direct_agent_id("ticket_bob", "analyst", "ws"),
-                excluded: false,
-            },
-            // The production SQL exclusion is `LIKE 'prefix_%'` (case-insensitive
-            // for ASCII), so a case-variant reserved word is also excluded here.
-            Case {
-                name: "case_variant_ticket_upper",
-                id: "Ticket_suffix".into(),
-                excluded: true,
-            },
-            Case {
-                name: "case_variant_ticket_mixed",
-                id: "tIcKeT_suffix".into(),
-                excluded: true,
-            },
-            Case {
-                name: "case_variant_manager",
-                id: "Manager_bob".into(),
-                excluded: true,
-            },
-        ];
-
-        for case in &cases {
-            assert_eq!(
-                is_excluded_agent_id(&case.id),
-                case.excluded,
-                "case: {name} — id='{id}'",
-                name = case.name,
-                id = case.id,
-            );
-        }
-    }
-
-    #[test]
     fn test_is_recovery_candidate_classification() {
         // User tail: user sent a message, agent never answered → candidate.
         assert!(is_recovery_candidate(ChatRole::User, ""));
@@ -601,28 +474,50 @@ mod tests {
     }
 
     #[test]
-    fn test_dead_session_tracker_max_retries() {
+    fn test_dead_session_tracker_exhaustion_is_permanent() {
         let tracker = DeadSessionTracker::new();
-        let agent_id = "test_agent_engineer";
+        let agent_id = "test_permanent_engineer";
 
-        // First attempt should be allowed for brand-new session
+        // First attempt is allowed for a brand-new session; immediately
+        // after recording it, backoff blocks the retry.
         assert!(tracker.should_retry(agent_id));
         tracker.record_attempt(agent_id);
-
-        // Immediately after an attempt, backoff prevents retry
         assert!(!tracker.should_retry(agent_id));
 
-        // Skip the backoff check for remaining MAX_RETRIES-1 attempts
-        // by directly calling record_attempt (simulating that time has passed).
+        // Record the remaining attempts (simulating elapsed backoff).
         for _ in 2..=MAX_RETRIES {
             tracker.record_attempt(agent_id);
         }
 
-        // After max retries reached, should_retry returns false
-        // regardless of backoff state.
+        // Once the cap is reached, should_retry returns false permanently —
+        // the entry stays in the map, and no removal mechanism resets the
+        // counter (a previous removal mechanism had a critical bug and was
+        // deliberately removed).
         assert!(
             !tracker.should_retry(agent_id),
             "should be blocked after {MAX_RETRIES} attempts"
+        );
+
+        // Backdate the last attempt far past any possible backoff: the cap
+        // alone (not backoff timing) must block further retries.
+        if let Some(state) = tracker.inner.lock().unwrap_poison().get_mut(agent_id) {
+            state.last_attempt_at = Utc::now() - chrono::Duration::hours(24);
+        }
+        assert!(
+            !tracker.should_retry(agent_id),
+            "cap must block even after the backoff has long elapsed"
+        );
+
+        // The entry persists with the cap reached — distinguishing a
+        // cap-blocked session from one merely waiting out its backoff.
+        assert_eq!(
+            tracker
+                .inner
+                .lock()
+                .unwrap_poison()
+                .get(agent_id)
+                .map(|s| s.attempt_count),
+            Some(MAX_RETRIES)
         );
     }
 
@@ -638,27 +533,6 @@ mod tests {
         // Cleanup removes the entry, allowing a fresh start
         tracker.cleanup(agent_id);
         assert!(tracker.should_retry(agent_id));
-    }
-
-    #[test]
-    fn test_dead_session_tracker_exhaustion_is_permanent() {
-        let tracker = DeadSessionTracker::new();
-        let agent_id = "test_permanent_engineer";
-
-        // Record MAX_RETRIES attempts
-        for _ in 0..MAX_RETRIES {
-            tracker.record_attempt(agent_id);
-        }
-
-        // should_retry returns false permanently — the entry stays in the
-        // map, and no removal mechanism resets the counter (a previous
-        // removal mechanism had a critical bug and was deliberately removed).
-        assert!(!tracker.should_retry(agent_id));
-        // Verify it's still blocked on a second check (not a transient
-        // failure due to backoff timing)
-        assert!(!tracker.should_retry(agent_id));
-        // Verify has_exhausted_retries agrees
-        assert!(tracker.has_exhausted_retries(agent_id));
     }
 
     #[test]

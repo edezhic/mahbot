@@ -1312,11 +1312,14 @@ pub(crate) fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> St
 /// message. Fail-closed: the session's unfinished sync jobs are abandoned
 /// FIRST, and a failed abandon aborts the clear so the caller can surface the
 /// error — deleting the session rows despite a failed abandon would orphan the
-/// jobs with no caller session left to resume them.
+/// jobs with no caller session left to resume them. Internal cleanup paths
+/// (maintainer self-cleanup) call `store().delete` directly, and the transient
+/// TTL cleanup issues a bulk SQL DELETE — all deliberately skip the abandon.
 pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> anyhow::Result<String> {
     let agent_id = resolve_agent_id(user_name, role, ws_name);
     crate::jobs::abandon_session_jobs(&agent_id).await?;
-    Session::delete(&agent_id).await
+    crate::session::store().delete(&agent_id).await?;
+    Ok("Session cleared. Starting fresh.".to_string())
 }
 
 /// Build a transient agent ID shared by the suffixed builder family
@@ -1943,8 +1946,19 @@ mod tests {
             .iter()
             .map(|p| format!("{p}{}", unique_key()))
             .collect();
+        // The SQL exclusion is `NOT LIKE 'prefix_%'`, and LIKE is ASCII
+        // case-insensitive — so case-variants of reserved words are excluded
+        // too.  These runtime-built rows keep the case-insensitivity of the
+        // live SQL path covered.
+        let case_variant_ids: Vec<String> = ["Manager_", "Ticket_", "tIcKeT_"]
+            .iter()
+            .map(|p| format!("{p}{}", unique_key()))
+            .collect();
 
-        for id in std::iter::once(&direct_id).chain(prefixed_ids.iter()) {
+        for id in std::iter::once(&direct_id)
+            .chain(prefixed_ids.iter())
+            .chain(case_variant_ids.iter())
+        {
             // list_sessions_with_metadata reads FROM session_metadata directly;
             // the append path upserts the row (context columns stay NULL
             // when context is None).
@@ -1961,7 +1975,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Without exclusions, all 7 sessions should be listed.
+        // Without exclusions, all sessions should be listed.
         let all = store.list_sessions_with_metadata().await;
         let all_ids: Vec<&str> = all.iter().map(|s| s.agent_id.as_str()).collect();
         assert!(
@@ -1972,6 +1986,12 @@ mod tests {
             assert!(
                 all_ids.contains(&id.as_str()),
                 "{prefix} session should be in full list"
+            );
+        }
+        for id in &case_variant_ids {
+            assert!(
+                all_ids.contains(&id.as_str()),
+                "case-variant '{id}' should be in full list"
             );
         }
 
@@ -1988,6 +2008,12 @@ mod tests {
             assert!(
                 !excluded_ids.contains(&id.as_str()),
                 "{prefix} session should be excluded"
+            );
+        }
+        for id in &case_variant_ids {
+            assert!(
+                !excluded_ids.contains(&id.as_str()),
+                "case-variant '{id}' should be excluded"
             );
         }
     }
