@@ -417,15 +417,18 @@ async fn dispatch_working_phases(ws: &Workspace) {
 /// from the live ticket each time the phase job is created.
 fn phase_task(ticket: &Ticket, phase: TicketPhase) -> (String, Role) {
     match phase {
-        TicketPhase::Analysis => (
-            crate::prompt::load_prompt(if ticket.reporter == Role::Maintainer.as_str() {
-                "analyze/maintainer_ticket.md"
-            } else {
-                "analyze/manager_ticket.md"
-            }),
-            Role::Analyst,
-        ),
+        TicketPhase::Analysis => (analyst_task_prompt(ticket), Role::Analyst),
         _ => (format!("Implement ticket {}", ticket.title), Role::Engineer),
+    }
+}
+
+/// The Analysis phase task prompt: maintainer-reported tickets get the
+/// maintainer variant, everything else the manager one.
+fn analyst_task_prompt(ticket: &Ticket) -> String {
+    if ticket.reporter == Role::Maintainer.as_str() {
+        crate::prompt::load_prompt("analyze/maintainer_ticket.md")
+    } else {
+        crate::prompt::load_prompt("analyze/manager_ticket.md")
     }
 }
 
@@ -829,6 +832,16 @@ fn paused_workspace_sentence() -> &'static str {
     "all in-flight work stops and no pipeline stage advances until the workspace is resumed"
 }
 
+/// The `{{workspace_status}}` fragment of a failure notification: whether the
+/// failure paused the workspace and what that means for queued tickets.
+fn pause_status_sentence(paused: bool) -> String {
+    if paused {
+        format!("The workspace is paused — {}.", paused_workspace_sentence())
+    } else {
+        "The workspace was not paused — remaining queued tickets may still be claimed.".to_string()
+    }
+}
+
 /// Pause the workspace after a technical/agent failure so queued development
 /// tickets are not claimed and don't cascade through the pipeline failing
 /// identically one after another.
@@ -957,11 +970,8 @@ async fn notify_ticket(
             "Beware that all the other tickets have been moved back from Queued \
              to Planning."
                 .to_string()
-        } else if ws.paused {
-            format!("The workspace is paused — {}.", paused_workspace_sentence())
         } else {
-            "The workspace was not paused — remaining queued tickets may still be claimed."
-                .to_string()
+            pause_status_sentence(ws.paused)
         };
 
         let warning = substitute(
@@ -1165,9 +1175,9 @@ fn assemble_parallel_results(
     results
 }
 
-/// Run `count` agents of the same role in parallel, then extract structured
-/// verdicts from their responses. Returns `(results, paused)` — `paused` is a
-/// typed signal that any member stopped at its pause boundary.
+/// Run the given agent slots in parallel, then extract structured verdicts from
+/// their responses. Returns `(results, paused)` — `paused` is a typed signal
+/// that any member stopped at its pause boundary.
 ///
 /// `resume` marks a slot-resume round: not-Done slots are re-run with
 /// session-continuation semantics (their stored tasks were already seeded), so

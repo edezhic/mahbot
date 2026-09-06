@@ -31,7 +31,7 @@ use std::fmt::Write;
 use std::sync::{Mutex, OnceLock};
 
 use crate::agent::role::SYSTEM_ROLE;
-use crate::db::{Connection, params};
+use crate::db::{Connection, Row, params};
 use crate::pipeline::board::{TicketPhase, store as board};
 use crate::util::UnwrapPoison;
 
@@ -43,14 +43,21 @@ fn attributed_actor(raw: Option<&str>) -> &str {
     raw.filter(|s| !s.trim().is_empty()).unwrap_or(SYSTEM_ROLE)
 }
 
+/// Read a TEXT column as a `String`, mapping NULL/type misses to an empty
+/// string (the empty value then falls back via [`attributed_actor`] where it
+/// matters).
+fn text_cell(row: &Row, idx: usize) -> String {
+    row.get_value(idx)
+        .ok()
+        .and_then(|v| v.as_text().cloned())
+        .unwrap_or_default()
+}
+
 /// Per-workspace manager delivery cursor: the last delivered chronicle row id.
 /// `-1` means "not yet seeded from the service-start baseline". This is the
 /// single in-memory watermark (the monotonic AUTOINCREMENT cursor) — strictly
 /// more precise than a timestamp and restart-safe.
-#[derive(Debug, Clone)]
-struct Cursor {
-    last_id: i64,
-}
+type Cursor = i64;
 
 /// Per-workspace delivery cursors.
 static CURSORS: OnceLock<Mutex<HashMap<String, Cursor>>> = OnceLock::new();
@@ -79,10 +86,7 @@ fn cursor_for(workspace_name: &str) -> Cursor {
         .expect("chronicle not initialized — call init_global() first")
         .lock()
         .unwrap_poison();
-    let cursor = map
-        .entry(workspace_name.to_string())
-        .or_insert_with(|| Cursor { last_id: -1 });
-    cursor.clone()
+    *map.entry(workspace_name.to_string()).or_insert(-1)
 }
 
 fn advance_cursor(workspace_name: &str, last_id: i64) {
@@ -92,7 +96,7 @@ fn advance_cursor(workspace_name: &str, last_id: i64) {
         .lock()
         .unwrap_poison();
     if let Some(cursor) = map.get_mut(workspace_name) {
-        cursor.last_id = last_id;
+        *cursor = last_id;
     }
 }
 
@@ -210,8 +214,8 @@ async fn prune_acked(conn: &Connection) -> anyhow::Result<()> {
             .lock()
             .unwrap_poison();
         map.iter()
-            .filter(|(_, c)| c.last_id >= 0)
-            .map(|(ws, c)| (ws.clone(), c.last_id))
+            .filter(|(_, c)| **c >= 0)
+            .map(|(ws, c)| (ws.clone(), *c))
             .collect()
     };
     for (workspace, last_id) in pairs {
@@ -244,7 +248,7 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
     // block (see [`CURSOR_LOCK`]). The formatted block is built after release.
     let cursor_guard = CURSOR_LOCK.lock().await;
     let mut cursor = cursor_for(workspace_name);
-    if cursor.last_id < 0 {
+    if cursor < 0 {
         let service_start = SERVICE_START.get().cloned().unwrap_or_else(crate::db::now);
         let seed: i64 = conn
             .query_row(
@@ -255,7 +259,7 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
             )
             .await
             .unwrap_or(0);
-        cursor.last_id = seed;
+        cursor = seed;
         // Persist the seed even when there are no rows, so the seed query is
         // not re-run (and re-evaluated) on every subsequent drain.
         advance_cursor(workspace_name, seed);
@@ -265,7 +269,7 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
             "SELECT id, ticket_id, source_phase, target_phase, at, actor \
              FROM ticket_chronicle \
              WHERE workspace_name = ?1 AND id > ?2 ORDER BY id",
-            params![workspace_name, cursor.last_id],
+            params![workspace_name, cursor],
         )
         .await
     {
@@ -280,34 +284,15 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
     }
     let hops: Vec<Hop> = rows
         .iter()
-        .map(|row| Hop {
-            id: row
-                .get_value(1)
-                .ok()
-                .and_then(|v| v.as_text().cloned())
-                .unwrap_or_default(),
-            source: row
-                .get_value(2)
-                .ok()
-                .and_then(|v| v.as_text().cloned())
-                .unwrap_or_default(),
-            target: row
-                .get_value(3)
-                .ok()
-                .and_then(|v| v.as_text().cloned())
-                .unwrap_or_default(),
-            at: row
-                .get_value(4)
-                .ok()
-                .and_then(|v| v.as_text().cloned())
-                .unwrap_or_default(),
-            actor: attributed_actor(
-                row.get_value(5)
-                    .ok()
-                    .and_then(|v| v.as_text().cloned())
-                    .as_deref(),
-            )
-            .to_string(),
+        .map(|row| {
+            let actor = text_cell(row, 5);
+            Hop {
+                id: text_cell(row, 1),
+                source: text_cell(row, 2),
+                target: text_cell(row, 3),
+                at: text_cell(row, 4),
+                actor: attributed_actor(Some(&actor)).to_string(),
+            }
         })
         .collect();
     let last_id = rows
@@ -315,7 +300,7 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
         .filter_map(|row| row.get_value(0).ok())
         .filter_map(|v| v.as_integer().copied())
         .max()
-        .unwrap_or(cursor.last_id);
+        .unwrap_or(cursor);
     advance_cursor(workspace_name, last_id);
     drop(cursor_guard);
     // Prune acked rows now so a workspace that drains and then goes quiet does

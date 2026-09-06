@@ -488,12 +488,7 @@ async fn maybe_escalate_analysis(
 /// verdicts reconstructed from stored outcomes (freezing the blocker list) and
 /// only the not-Done escalation slots are re-run.
 async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
-    let prompt_key = if ticket.reporter == Role::Maintainer.as_str() {
-        "analyze/maintainer_ticket.md"
-    } else {
-        "analyze/manager_ticket.md"
-    };
-    let message = load_prompt(prompt_key);
+    let message = super::analyst_task_prompt(&ticket);
 
     let conn = &crate::session::store().conn;
     let Some(roster) = super::read_roster_or_bail(&ticket.id, job_id).await else {
@@ -508,7 +503,8 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
 
     // Resume: an interrupted round lives on in the roster. Split the base cohort
     // (idx < the base count) from any escalation cohort (idx >= the base count).
-    let base_count = i64::try_from(DEFAULT_PARALLEL_AGENT_COUNT).unwrap_or(i64::MAX);
+    let base_count = i64::try_from(DEFAULT_PARALLEL_AGENT_COUNT)
+        .expect("DEFAULT_PARALLEL_AGENT_COUNT fits in i64");
     let escalation_rows: Vec<&crate::jobs::AgentRow> = roster
         .iter()
         .filter(|r| r.idx.unwrap_or(0) >= base_count)
@@ -600,7 +596,8 @@ async fn resume_escalation_round(
             return;
         }
     };
-    let base_count = i64::try_from(DEFAULT_PARALLEL_AGENT_COUNT).unwrap_or(i64::MAX);
+    let base_count = i64::try_from(DEFAULT_PARALLEL_AGENT_COUNT)
+        .expect("DEFAULT_PARALLEL_AGENT_COUNT fits in i64");
     let escalation_slots: Vec<AgentSlot> = roster
         .iter()
         .filter(|r| r.idx.unwrap_or(0) >= base_count)

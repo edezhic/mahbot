@@ -10,7 +10,7 @@ use crate::{Agent, Role, Workspace};
 use super::{
     RETRY_EXHAUSTION_MARKER, SYSTEM_ROLE, StageRunKind, TicketPhase, TransitionCtx, board,
     comment_and_transition_or_bail, guard_job_phase, guard_stage, info, manager_agent_id,
-    message_router, pause_freezing, pause_workspace_on_failure, paused_workspace_sentence,
+    message_router, pause_freezing, pause_status_sentence, pause_workspace_on_failure,
     run_stage_agent, sync_phase_job_task, warn,
 };
 
@@ -126,11 +126,7 @@ fn engineer_failure_comment(shutdown: bool, error: Option<&str>) -> String {
 /// Notify the Manager that a workspace was paused because of an engineer hard
 /// failure.
 fn notify_engineer_pause(ws: &Workspace, failure_details: &str, paused: bool) {
-    let workspace_status = if paused {
-        format!("The workspace is paused — {}.", paused_workspace_sentence())
-    } else {
-        "The workspace was not paused — remaining queued tickets may still be claimed.".to_string()
-    };
+    let workspace_status = pause_status_sentence(paused);
     let warning = substitute(
         &load_prompt("pipeline/engineer_pause_notification.md"),
         &[
