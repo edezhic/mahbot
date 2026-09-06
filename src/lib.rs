@@ -56,7 +56,7 @@ pub use tools::shell::grep_engine::run_engine as run_grep_engine;
 /// operands); production single-file gate. Only compiled for the e2e harness.
 #[cfg(all(unix, feature = "grep-engine-e2e"))]
 #[doc(hidden)]
-pub use tools::shell::grep_engine::try_serve_command_for_test as grep_engine_rewrite_for_test;
+pub use tools::shell::grep_engine::grep_engine_rewrite_for_test;
 
 /// Whether the served grep member(s) exercise the parallel recursive walk
 /// (subprocess harness relaxes its byte-exact diff to sorted-line comparison).

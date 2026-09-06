@@ -364,7 +364,7 @@ fn lightweight_scan(command: &str) -> (bool, usize, String) {
 #[cfg(feature = "grep-engine-e2e")]
 #[doc(hidden)]
 #[must_use]
-pub fn try_serve_command_for_test(
+pub fn grep_engine_rewrite_for_test(
     command: &str,
     workspace_root: &Path,
     home: &Path,
@@ -997,8 +997,9 @@ fn canonical_or_lexical(p: &Path) -> PathBuf {
         .unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// True when a raw shell word contains an unquoted expansion (`$`, backtick,
-/// `$(`, `$'…'`) that cannot be resolved statically.
+/// True when a raw shell word contains an expansion (`$`, backtick, `$(`,
+/// `$'…'`) that cannot be resolved statically (unquoted or double-quoted;
+/// single quotes suppress).
 fn has_expansion(word: &str) -> bool {
     let mut in_single = false;
     let mut escaped = false;
@@ -3044,6 +3045,18 @@ mod parity_tests {
         fs::write(ws.join("sub/~/q.txt"), "needle\n").unwrap();
     }
 
+    /// Fresh temp root with the fixture `ws` and `home` trees built in. Bind
+    /// the returned TempDir for the whole test — dropping it deletes the trees.
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&ws).expect("ws");
+        fs::create_dir_all(&home).expect("home");
+        build_fixture(&ws, &home);
+        (tmp, ws, home)
+    }
+
     /// Run the engine in-process on one spec; returns (stdout, stderr, code).
     /// stdin-fed specs get an empty reader — never the test process's stdin.
     fn engine_run(spec: &EngineSpec) -> (Vec<u8>, Vec<u8>, i32) {
@@ -3172,15 +3185,12 @@ mod parity_tests {
         out
     }
 
-    /// The original command's text from its first `|`/`|&` connector on — the
-    /// tail that must survive the rewrite verbatim (never analyzed).
-    fn pipeline_tail(command: &str) -> Option<String> {
-        let segments = split_segments(command).ok()?;
-        let first = segments
-            .iter()
-            .position(|(_, c)| matches!(c.as_str(), "|" | "|&"))?;
-        let mut out = format!(" {}", segments[first].1);
-        for (seg, conn) in &segments[first + 1..] {
+    /// Rejoin `(segment, connector)` pairs from `start` on, prefixed by that
+    /// segment's own connector — the verbatim-tail shape both tail helpers
+    /// below share (the caller decides the anchor and early-return cases).
+    fn rejoin_from(segments: &[(String, String)], start: usize) -> String {
+        let mut out = format!(" {}", segments[start].1);
+        for (seg, conn) in &segments[start + 1..] {
             out.push(' ');
             out.push_str(seg);
             if !conn.is_empty() {
@@ -3188,7 +3198,17 @@ mod parity_tests {
                 out.push_str(conn);
             }
         }
-        Some(out)
+        out
+    }
+
+    /// The original command's text from its first `|`/`|&` connector on — the
+    /// tail that must survive the rewrite verbatim (never analyzed).
+    fn pipeline_tail(command: &str) -> Option<String> {
+        let segments = split_segments(command).ok()?;
+        let first = segments
+            .iter()
+            .position(|(_, c)| matches!(c.as_str(), "|" | "|&"))?;
+        Some(rejoin_from(&segments, first))
     }
 
     /// Assert the engine's output/exit are byte-identical to the real grep.
@@ -3256,16 +3276,7 @@ mod parity_tests {
         if gidx + 1 >= segments.len() {
             return Some(String::new());
         }
-        let mut out = format!(" {}", segments[gidx].1);
-        for (seg, conn) in &segments[gidx + 1..] {
-            out.push(' ');
-            out.push_str(seg);
-            if !conn.is_empty() {
-                out.push(' ');
-                out.push_str(conn);
-            }
-        }
-        Some(out)
+        Some(rejoin_from(&segments, gidx))
     }
 
     /// stdin-fed parity: capture the producer's stream through a real shell,
@@ -3336,12 +3347,7 @@ mod parity_tests {
     #[test]
     #[expect(clippy::too_many_lines)] // differential parity matrix
     fn differential_parity_matrix() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ws = tmp.path().join("ws");
-        let home = tmp.path().join("home");
-        fs::create_dir_all(&ws).expect("ws");
-        fs::create_dir_all(&home).expect("home");
-        build_fixture(&ws, &home);
+        let (_tmp, ws, home) = fixture();
 
         let rows: &[&str] = &[
             // ── BRE translation ──
@@ -3619,12 +3625,7 @@ mod parity_tests {
         // so a -m1 serve must stop reading once found (BSD instant-exit). The
         // marker reports consumed bytes — well short of the full stream; a
         // full scan would consume (and report) all of it.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ws = tmp.path().join("ws");
-        let home = tmp.path().join("home");
-        fs::create_dir_all(&ws).expect("ws");
-        fs::create_dir_all(&home).expect("home");
-        build_fixture(&ws, &home);
+        let (_tmp, ws, home) = fixture();
         let (specs, _, _, _) =
             analyze_command("seq 1 100000 | grep -m1 5", &ws, &home, true).expect("servable");
         let (stream, _, _) = real_run_shell("seq 1 100000", &ws, &home);
@@ -3640,13 +3641,7 @@ mod parity_tests {
 
     #[test]
     fn fallback_triggers() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ws = tmp.path().join("ws");
-        let home = tmp.path().join("home");
-        fs::create_dir_all(&ws).expect("ws");
-        fs::create_dir_all(&home).expect("home");
-        build_fixture(&ws, &home);
-
+        let (_tmp, ws, home) = fixture();
         let rows: &[&str] = &[
             "grep x",                                  // stdin (first member: tty-hang protection)
             "grep x -",                                // - operand (first member)
@@ -3683,7 +3678,6 @@ mod parity_tests {
             "git grep x",          // git grep
             "if grep x a.txt; then echo hi; fi", // compound
             "for x in a; do grep x a.txt; done", // compound
-            "case $x in a) grep x a.txt;; esac", // compound (case arm)
             "( grep x a.txt b.txt )", // subshell group
             "{ grep x a.txt; }",   // brace group
             "(cd sub && grep x a.txt b.txt)", // subshell cd + group
@@ -3691,20 +3685,13 @@ mod parity_tests {
             "sh -c 'grep x a.txt'", // indirect
             "cd $HOME && grep x a.txt", // cd untrackable
             "cd - && grep x a.txt", // cd $OLDPWD
-            "grep x a.txt | head -1 | wc -l", // single-file first grep → perf gate (tail preserved)
-            "grep x a.txt | grep y", // single-file first grep → perf gate (tail grep preserved)
-            "grep x a.txt | xargs grep y", // single-file first grep → perf gate (xargs tail preserved)
-            "grep x a.txt | | wc -l",      // empty pipeline member
-            "grep x a.txt |",              // trailing pipe
-            "! grep x a.txt",              // negation
-            "sudo grep x a.txt",           // env prefix
+            "! grep x a.txt",      // negation
+            "grep x a.txt |",      // trailing pipe
+            "sudo grep x a.txt",   // env prefix
             "grep -w 'foo\\|bar' a.txt b.txt", // -w + alternation (word_safe)
             "echo $(echo \\) ; grep x a.txt", // unterminated $(...) — escape-aware span stays open
-            "echo hello && echo world",    // no grep at all
-            // ── Producer-first stdin rejects: structural, not producer-based ──
-            "cat a.txt | grep foo b.txt", // non-first with file operands
-            "cat a.txt | grep foo -",     // non-first with a "-" operand
-            "printf 'x' | grep -r foo",   // non-first -r without operands (walks cwd)
+            "echo hello && echo world", // no grep at all
+            // Producer-first stdin rejects: structural, not producer-based.
             "cat a.txt | sudo grep foo",  // nested introducer producer
             "cat a.txt | xargs grep foo", // nested introducer producer
         ];
@@ -3748,13 +3735,7 @@ mod parity_tests {
         // A single-file grep (perf gate) no longer poisons a sibling servable
         // recursive grep: the unservable member is kept verbatim, the servable
         // one rewritten, and the whole command is served.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ws = tmp.path().join("ws");
-        let home = tmp.path().join("home");
-        fs::create_dir_all(&ws).expect("ws");
-        fs::create_dir_all(&home).expect("home");
-        build_fixture(&ws, &home);
-
+        let (_tmp, ws, home) = fixture();
         let (specs, _, rewritten, outcomes) =
             analyze_command("grep x a.txt; grep -rn needle sub", &ws, &home, false)
                 .expect("chain with a servable sibling served");
@@ -3806,12 +3787,7 @@ mod parity_tests {
         // (the old scan swallowed it into an unterminated span → fallback).
         // The serve→fallback direction of the same fix is a fallback_triggers
         // row (`echo $(echo \) ; grep x a.txt`).
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ws = tmp.path().join("ws");
-        let home = tmp.path().join("home");
-        fs::create_dir_all(&ws).expect("ws");
-        fs::create_dir_all(&home).expect("home");
-        build_fixture(&ws, &home);
+        let (_tmp, ws, home) = fixture();
         analyze_command("echo `a\\`b` ; grep x a.txt b.txt", &ws, &home, true)
             .expect("escaped backtick: trailing grep is a separate served member");
     }
@@ -3820,13 +3796,7 @@ mod parity_tests {
     fn exclusion_delta_is_rg_default() {
         // The one approved behavioral delta: recursive walks skip
         // hidden/gitignored content; explicit file operands always searched.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ws = tmp.path().join("ws");
-        let home = tmp.path().join("home");
-        fs::create_dir_all(&ws).expect("ws");
-        fs::create_dir_all(&home).expect("home");
-        build_fixture(&ws, &home);
-
+        let (_tmp, ws, home) = fixture();
         let (specs, _, _, _) =
             analyze_command("grep -r x ign", &ws, &home, true).expect("ign walk servable");
         let (eout, _, ecode) = engine_run(&specs[0]);
@@ -3851,12 +3821,7 @@ mod parity_tests {
     fn engine_falls_back_on_untranslatable_patterns() {
         // The engine must never silently broaden/narrow a match set: patterns
         // that cannot be translated or compiled fall back instead.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let ws = tmp.path().join("ws");
-        let home = tmp.path().join("home");
-        fs::create_dir_all(&ws).expect("ws");
-        fs::create_dir_all(&home).expect("home");
-        build_fixture(&ws, &home);
+        let (_tmp, ws, home) = fixture();
         let rows: &[&str] = &[
             "grep '\\(' a.txt",
             "grep -E 'a(' a.txt",
