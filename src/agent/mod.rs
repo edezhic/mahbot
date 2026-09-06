@@ -704,6 +704,36 @@ impl Agent {
         }
     }
 
+    /// Single-sourced shutdown/drain bail guard: the session is durable, so
+    /// the round is cut short and resumes when re-driven (boot job replay or
+    /// the next dispatch).
+    fn bail_on_shutdown() -> anyhow::Result<()> {
+        if crate::shutdown::aborting() {
+            anyhow::bail!(
+                "Agent round cut short by shutdown/drain — session is durable; resumes when re-driven"
+            );
+        }
+        Ok(())
+    }
+
+    /// Log-only drain-cut marker for `complete_pending_tool_calls`: drain began
+    /// mid-resume/completion — the call stays dangling for the next cycle.
+    fn log_drain_cut(tool: &str) {
+        tracing::info!(tool = %tool, "Drain-cut during resume-completion — leaving calls dangling");
+    }
+
+    /// Live-view activity guard: shows `label` on the agent's card while an
+    /// observational LLM call runs (extraction, summarization) — these calls
+    /// never register a separate non-agent call row, so the card is the only
+    /// tracker. Clears on drop.
+    fn activity_guard(&self, label: &'static str) -> crate::agent::registry::ActivityGuard {
+        crate::agent::registry::AGENT_REGISTRY.activity_started(
+            &self.agent_id,
+            self.generation,
+            label,
+        )
+    }
+
     /// Run a complete agent turn: initialize session, work loop (with shutdown
     /// cancellation), finalize session.
     pub async fn work(&mut self, msg: &str, resume: bool) -> anyhow::Result<String> {
@@ -765,11 +795,7 @@ impl Agent {
         // compact an over-threshold session before the llm_loop drain
         // check fires. The round is cut before any LLM work; boot resume
         // continues the session.
-        if crate::shutdown::aborting() {
-            anyhow::bail!(
-                "Agent round cut short by shutdown/drain — session is durable; resumes when re-driven"
-            );
-        }
+        Self::bail_on_shutdown()?;
 
         // A resumed stage-agent round starting with an empty message would
         // otherwise never surface board comments (the session-start ticket block
@@ -893,10 +919,7 @@ impl Agent {
                         Ok(crate::jobs::SyncResumeOutcome::DrainCut) => {
                             // Drain began mid-resume — leave everything dangling
                             // for the next completion cycle.
-                            tracing::info!(
-                                tool = %call.name,
-                                "Drain-cut during resume-completion — leaving calls dangling"
-                            );
+                            Self::log_drain_cut(&call.name);
                             return Ok(false);
                         }
                         Ok(crate::jobs::SyncResumeOutcome::Gone) => {
@@ -944,10 +967,7 @@ impl Agent {
                         .await;
                     if outcome.suspended {
                         // Drain-cut mid-execution — leave the call dangling.
-                        tracing::info!(
-                            tool = %call.name,
-                            "Drain-cut during resume-completion — leaving calls dangling"
-                        );
+                        Self::log_drain_cut(&call.name);
                         return Ok(false);
                     }
                     // Format through the tool exactly like the commit path and
@@ -1040,9 +1060,7 @@ impl Agent {
                 // no new LLM call starts once the drain begins (or the token
                 // fires). The round is resumed at boot via the job row
                 // (status='launched').
-                if crate::shutdown::aborting() {
-                    anyhow::bail!("Agent round cut short by shutdown/drain — session is durable; resumes when re-driven");
-                }
+                Self::bail_on_shutdown()?;
                 if tool_rounds >= MAX_TOOL_ROUNDS {
                     anyhow::bail!(
                         "Agent exceeded maximum of {MAX_TOOL_ROUNDS} tool rounds \
@@ -1050,9 +1068,9 @@ impl Agent {
                     );
                 }
 
-                // Drain incoming messages (e.g., ticket comments from the Manager
-                // or comment tool). Messages are injected as user messages with a
-                // descriptive prefix so the agent understands the source.
+                // Messages arrive as user messages with a descriptive prefix so
+                // the model understands their source (ticket comments get the
+                // `format_comment_message` framing).
                 self.drain_incoming_messages().await;
 
                 // Leader-stagger signal: fire after the FIRST LLM call
@@ -1142,10 +1160,6 @@ impl Agent {
                     )
                     .await?;
 
-                // Execute tool calls with ordering: read-only tools can run in
-                // parallel within a group; side-effecting tools run one at a time.
-                // Groups execute sequentially in order — the original ordering is
-                // preserved in `all_outcomes`.
                 let all_outcomes = self.execute_tool_group(&tool_calls).await;
 
                 // Track media generation outcomes for marker fallback
@@ -2070,15 +2084,7 @@ impl Agent {
         validate: Option<&crate::ExtractionValidator<T>>,
         policy_override: Option<&crate::retry::RetryPolicy>,
     ) -> Result<T, crate::retry::RetryExhausted> {
-        // Live-view indicator: the agent's card is the single tracker for
-        // extractions (they never register a separate non-agent call row) —
-        // without it the card would look idle while the extraction LLM call
-        // runs. Purely observational; the guard clears on every exit path.
-        let _activity = crate::agent::registry::AGENT_REGISTRY.activity_started(
-            &self.agent_id,
-            self.generation,
-            "extracting",
-        );
+        let _activity = self.activity_guard("extracting");
         let params = self.build_chat_request(vec![], "extraction");
         crate::agent::extraction::retry_extract_structured_scoped(
             self.session.history(),
@@ -2094,14 +2100,7 @@ impl Agent {
     ///
     /// KV-cache requirements: see [`Self::build_chat_request`].
     pub(crate) async fn summarize(&self) -> anyhow::Result<String> {
-        // Live-view indicator: same single-tracker contract as extraction —
-        // the agent's card shows the summarization phase instead of looking
-        // idle during the (potentially large) compaction call.
-        let _activity = crate::agent::registry::AGENT_REGISTRY.activity_started(
-            &self.agent_id,
-            self.generation,
-            "summarizing",
-        );
+        let _activity = self.activity_guard("summarizing");
         let mut history = self.session.history().to_vec();
         history.push(crate::ChatMessage::user(self.role.summary_prompt()));
 
