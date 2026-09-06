@@ -172,6 +172,14 @@ pub(super) struct GrepTelemetryShape {
 }
 
 impl GrepServe {
+    /// A serve decision that keeps the original command running (no rewrite).
+    fn not_rewritten(outcomes: Vec<GrepOutcome>) -> Self {
+        Self {
+            rewritten: None,
+            outcomes,
+        }
+    }
+
     /// Fold the per-member outcomes into the telemetry shape/count fields.
     /// `applied` gates served_count: when the rewrite wasn't actually applied
     /// (engine unavailable, spec too large, ReadOnly rejection, sentinel
@@ -212,10 +220,7 @@ impl GrepServe {
 /// so the caller runs it in both ReadOnly and Full modes; Unix only.
 pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepServe {
     let Some(home) = pinned_home() else {
-        return GrepServe {
-            rewritten: None,
-            outcomes: Vec::new(),
-        };
+        return GrepServe::not_rewritten(Vec::new());
     };
     let (specs, shapes, rewritten, mut outcomes) =
         match analyze_command(command, workspace_root, &home, false) {
@@ -228,10 +233,7 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepSer
                 // by a structural abort (untrackable `cd`) is demoted so the
                 // row's served field matches the ACTUAL (real-grep) execution.
                 if fail.outcomes.is_empty() {
-                    return GrepServe {
-                        rewritten: None,
-                        outcomes: Vec::new(),
-                    };
+                    return GrepServe::not_rewritten(Vec::new());
                 }
                 tracing::debug!(command = command, %fail.reason, "grep engine: fallback");
                 let AnalyzeFailure {
@@ -241,26 +243,17 @@ pub(super) fn try_serve_command(command: &str, workspace_root: &Path) -> GrepSer
                 if outcomes.iter().any(|o| o.served) {
                     all_not_served(&mut outcomes, &reason.to_string());
                 }
-                return GrepServe {
-                    rewritten: None,
-                    outcomes,
-                };
+                return GrepServe::not_rewritten(outcomes);
             }
         };
     if !engine_available() {
         all_not_served(&mut outcomes, "engine unavailable");
-        return GrepServe {
-            rewritten: None,
-            outcomes,
-        };
+        return GrepServe::not_rewritten(outcomes);
     }
     for spec in &specs {
         if !spec_json_ok(spec) {
             all_not_served(&mut outcomes, "spec exceeds payload limit");
-            return GrepServe {
-                rewritten: None,
-                outcomes,
-            };
+            return GrepServe::not_rewritten(outcomes);
         }
     }
     // Both served forms log at DEBUG — gate-relaxation volume telemetry is
@@ -977,12 +970,20 @@ fn resolve_cd(segment: &str, cwd: &Path, home: &Path) -> Result<PathBuf, Fallbac
         home.join(rest)
     } else if target == "~" {
         home.to_path_buf()
-    } else if target.starts_with('/') {
-        PathBuf::from(target)
     } else {
-        cwd.join(target)
+        absolute_or_cwd(cwd, target)
     };
     Ok(canonical_or_lexical(&resolved))
+}
+
+/// Resolve a shell path word: absolute paths pass through verbatim, anything
+/// else is joined onto the tracked cwd.
+fn absolute_or_cwd(cwd: &Path, word: &str) -> PathBuf {
+    if word.starts_with('/') {
+        PathBuf::from(word)
+    } else {
+        cwd.join(word)
+    }
 }
 
 /// Canonicalize an existing path; lexically normalize otherwise. All inputs
@@ -2004,11 +2005,7 @@ fn resolve_operand(tok: &str, cwd: &Path, home: &Path) -> Result<Vec<Operand>, F
         return Ok(matches
             .iter()
             .map(|m| {
-                let abs = if m.starts_with('/') {
-                    PathBuf::from(m)
-                } else {
-                    cwd.join(m)
-                };
+                let abs = absolute_or_cwd(cwd, m);
                 operand_from_path(m, &abs, false)
             })
             .collect());
@@ -2023,11 +2020,7 @@ fn resolve_operand(tok: &str, cwd: &Path, home: &Path) -> Result<Vec<Operand>, F
     }
     let value = unquote_word(tok)?;
     let trailing_slash = value.ends_with('/');
-    let abs = if value.starts_with('/') {
-        PathBuf::from(&value)
-    } else {
-        cwd.join(&value)
-    };
+    let abs = absolute_or_cwd(cwd, &value);
     Ok(vec![operand_from_path(&value, &abs, trailing_slash)])
 }
 
