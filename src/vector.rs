@@ -60,7 +60,7 @@ pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
 /// Reciprocal Rank Fusion smoothing constant.
 /// Higher values reduce the influence of top-ranked results, making the
 /// fusion less sensitive to score-scale differences across ranking sources.
-pub(crate) const RRF_K: f32 = 60.0;
+const RRF_K: f32 = 60.0;
 
 /// Apply RRF scoring to a ranked list and accumulate into `scores`.
 ///

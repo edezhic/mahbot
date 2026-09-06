@@ -2,36 +2,9 @@
 //!
 //! Each workspace gets a single [`SharedFilePicker`] + [`SharedQueryTracker`] pair that all
 //! agents share. Background filesystem scanning begins eagerly when a workspace
-//! is registered (on app startup or workspace add).
-//!
-//! ## Persistent query tracking
-//!
-//! The [`QueryTracker`] stores query→file associations on disk under
-//! `~/.mahbot/search/{workspace_name}/queries/`. This persists combo-boost data
-//! across agent and application restarts. If the LMDB database cannot be
-//! opened (disk full, corruption, permission issues), we fall back to an
-//! in-memory-only tracker — searches still work but combo-boosting resets on
-//! restart.
-//!
-//! Ephemeral per-run workspaces (the deep-research coder's search over its own
-//! run folder) are different: their tracker lives INSIDE the run folder
-//! (`{run_folder}/.queries` — dot-prefixed). The leading dot keeps it out of
-//! the run folder's own fff-search index: the run folder is a non-git root, so
-//! the walkers skip hidden entries and the per-dir (Linux) watcher never
-//! subscribes to a hidden dir; on macOS the single recursive FSEvents stream
-//! may still deliver write events, but the LMDB files are binary-classified
-//! (excluded from content/grep matches) and the whole folder dies with the
-//! run. Everything temporary lives in temp. On resume, a lost folder recreates
-//! the tracker empty, while a surviving folder re-opens the surviving LMDB —
-//! either way a fail-open ranking cache.
-//!
-//! ## Unready-state handling
-//!
-//! When `ensure_scanned` is called before the background scan has finished,
-//! it blocks for up to 30 seconds. If the scan still isn't done, it returns an
-//! error rather than returning incomplete results. A completed scan that
-//! yields zero files is not an error — the live watcher populates the index
-//! incrementally as files appear.
+//! is registered (on app startup or workspace add). Query tracking persists on
+//! disk via `open_persistent_query_tracker` (with an in-memory fallback), and
+//! `ensure_scanned` gates searches on scan readiness.
 
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
@@ -247,7 +220,7 @@ fn open_persistent_query_tracker(
 ///
 /// This is an async function because [`SharedFilePicker::wait_for_scan`] is a
 /// blocking call — we run it on the tokio blocking thread pool.
-pub(crate) async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), String> {
+async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), String> {
     let picker = entry.picker.clone();
 
     let scanned = tokio::task::spawn_blocking(move || {

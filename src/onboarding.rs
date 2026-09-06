@@ -206,7 +206,7 @@ pub async fn kickoff_support(user_name: &str) -> anyhow::Result<()> {
         reply_target: user_name.to_string(),
         content: "hi mah bot".to_string(),
         channel: "gui".to_string(),
-        workspace: format!("personal:{user_name}"),
+        workspace: crate::users::personal_workspace_name(user_name),
         ..Default::default()
     };
     if let Some(tx) = crate::GUI_MESSAGE_TX.get()

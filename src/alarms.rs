@@ -269,7 +269,7 @@ async fn delete_alarm_after_failure(alarm: &Alarm) -> Result<()> {
 }
 
 /// The due alarms at `now` (RFC3339 UTC), ordered by next fire time.
-pub(crate) async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
+async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
     let sql = format!(
         "SELECT {ALARM_COLUMNS} FROM alarms \
          WHERE status = 'active' AND next_fire_at <= ?1 \
@@ -290,7 +290,7 @@ pub(crate) async fn due_alarms(now: &str) -> Result<Vec<Alarm>> {
 /// resolved directly — never re-derived from the id, which would double-escape
 /// colliding user names). One-shot alarms are terminalized (`status='fired'`);
 /// periodic alarms advance `next_fire_at` past every missed whole period.
-pub(crate) async fn fire_alarm(alarm: &Alarm) -> Result<()> {
+async fn fire_alarm(alarm: &Alarm) -> Result<()> {
     match &alarm.command {
         Some(command) => fire_command_alarm(alarm, command).await,
         None => fire_plain_alarm(alarm).await,
@@ -327,7 +327,7 @@ async fn deliver_alarm_notification(alarm: &Alarm, content: String) -> Result<()
     // Delivery is sourced from the stored raw user/workspace so a reminder
     // targets the right personal session regardless of agent-ID escaping.
     let user = &alarm.user_name;
-    let workspace_name = format!("personal:{user}");
+    let workspace_name = crate::users::personal_workspace_name(user);
     let agent_id = alarm.session_id.clone();
     let mut job = AgentJob {
         content,
@@ -548,7 +548,7 @@ fn next_periodic_fire(now: &str, next_fire: &str, interval_secs: i64) -> Result<
 
 /// Fire up to `batch_limit` due alarms, continuing past individual failures so
 /// one bad alarm cannot block the rest of the sweep.
-pub(crate) async fn run_alarm_sweep(batch_limit: usize) -> Result<()> {
+async fn run_alarm_sweep(batch_limit: usize) -> Result<()> {
     let due = due_alarms(&db::now()).await?;
     let mut fired = 0usize;
     let mut failed = 0usize;

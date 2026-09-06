@@ -426,7 +426,7 @@ pub async fn route_agent_message_to_manager(
 /// from the envelope by [`crate::jobs::pending_job_params`].
 /// Used by the durable producers: manager-bound messages routed here,
 /// analyze/research results via [`crate::jobs::complete_job_with_envelope`],
-/// and alarm notifications from [`crate::alarms::fire_alarm`].
+/// and alarm notifications from the alarm sweep (`alarms::fire_alarm`).
 pub(crate) async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
     let now = db::now();
     crate::session::store()

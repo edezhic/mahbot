@@ -193,7 +193,7 @@ fn ensure_embedder() -> bool {
     // loop (spawned below) will handle load failures by deleting and
     // re-downloading. The sync path is intentionally conservative
     // because a transient filesystem glitch on every embed_query/embed_document call
-    // should not force a 167 MB re-download.
+    // should not force a ~150 MB re-download.
 
     // Check for tokio runtime before spawning a background task.
     // If no tokio runtime is active, we cannot spawn the background
