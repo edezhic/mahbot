@@ -52,9 +52,10 @@ pub(crate) enum MediaTarget {
 /// worker buffers a huge payload.
 pub(crate) const MAX_DATA_URI_ENCODED_BYTES: usize = 20 * 1024 * 1024;
 
-/// Shared raster-decode allocation budget (data-URI classifier and GUI render
-/// downscale). Bounded so a header-bomb target is refused, but generous enough
-/// that a legitimate tall screenshot still decodes.
+/// Shared raster-decode allocation budget (provider data-URI gate, classifier
+/// local-file decode, and the GUI render downscale). Bounded so a header-bomb
+/// target is refused, but generous enough that a legitimate tall screenshot
+/// still decodes.
 const CLASSIFY_DECODE_MAX_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Longest side (px) the shared raster decode will accept — rejects a dimension
@@ -63,8 +64,9 @@ const CLASSIFY_DECODE_MAX_DIMENSION_PX: u32 = 16384;
 
 /// The shared generous raster-decode [`image::Limits`]: a dimension and alloc
 /// cap so a header bomb is refused before any pixel buffer, while a legitimate
-/// tall screenshot still decodes. Used by the classifier's data-URI branch AND
-/// the GUI render decode + downscale step. Built via `Default` + field mutation
+/// tall screenshot still decodes. Used by the provider's data-URI gate
+/// ([`is_native_data_uri`]), the classifier's local-file decode, and the GUI
+/// render decode + downscale step. Built via `Default` + field mutation
 /// (`Limits` is `#[non_exhaustive]`).
 #[must_use]
 pub(crate) fn raster_decode_limits() -> image::Limits {
@@ -236,10 +238,12 @@ pub(crate) fn is_native_data_uri(target: &str) -> bool {
 
 /// Decode standard or URL-safe base64, stripping ASCII whitespace. Rejects
 /// alphabet lookalikes that are not actually decodable (`...`, truncated pad).
-/// Shared with the GUI viewer so its data-URI base64 decode matches the
-/// classifier/provider (a URL-safe payload the provider injects must render too).
+/// Reached by the GUI viewer transitively (via [`decode_native_data_uri`],
+/// which goes through [`parse_native_data_uri`]) so its data-URI base64 decode
+/// matches the provider's gate (a URL-safe payload the provider injects must
+/// render too).
 #[must_use]
-pub(crate) fn decode_base64_payload(s: &str) -> Option<Vec<u8>> {
+fn decode_base64_payload(s: &str) -> Option<Vec<u8>> {
     let compact: Cow<'_, [u8]> = if s.as_bytes().iter().any(u8::is_ascii_whitespace) {
         Cow::Owned(
             s.bytes()

@@ -4,9 +4,9 @@
 //! Unlike [`AnalyzeTool`](super::analyze::AnalyzeTool) (one round of parallel analysts
 //! for quick clarification), the pipeline is: round 0 decomposes the question
 //! via three independent plans merged by id-based coverage; round 1 runs one
-//! analyst per sub-question (two decorrelated angles for high-risk items);
-//! conditional gap rounds with shrinking width follow, each targeting the
-//! named gaps. A coder-in-loop prototype pass (`run_coder_round`) runs before
+//! analyst per sub-question (high-risk items get a decorrelated second
+//! angle); conditional gap rounds with shrinking width follow, each targeting
+//! the named gaps. A coder-in-loop prototype pass (`run_coder_round`) runs before
 //! the first gap round and after every progress round that refreshes a
 //! non-empty gap list, gated by the analyst budget, round deadline,
 //! shutdown/cancel, and a 30-minute minimum-remaining guard (`CODER_MIN_REMAINING`)
@@ -24,8 +24,9 @@
 //! the calling agent asynchronously; intermediate rounds never reach the
 //! user, and exhaustion delivers a partial report rather than nothing.
 //!
-//! A per-round wall-clock deadline (`round_timeout`, default 3h) bounds each
-//! round's member waits; the run has no additional wall-clock cap. Budgeting
+//! A single wall-clock deadline (`round_timeout`, default 3h) is computed
+//! once at the start and bounds every phase's member waits; the run has no
+//! additional wall-clock cap. Budgeting
 //! is by analysts spawned (decomposers, round-1 researchers, gap-round
 //! researchers, verification analysts all count); orchestrator coordination
 //! calls do not. The cap is enforced at reservation time and never refunded;
@@ -1289,8 +1290,9 @@ fn session_has_successful_tool_result(history: &[ChatMessage]) -> bool {
 /// Await the concurrent wrap-up extraction tasks, bounded by the stage
 /// deadline and interrupted by the drain flag (each task's inner provider
 /// call is dropped via the batch cancel token). Returns one result per task
-/// slot. Force-cancel (drain cap / second signal) needs no select arm here —
-/// the inner retry loop is shutdown-abortable and resolves on its own.
+/// slot. The drain and deadline select arms fire once each and cancel the
+/// batch token; force-cancel needs no per-task arm — the inner retry loop is
+/// shutdown-abortable and resolves on its own.
 /// Not shared with [`await_round_members`] deliberately: round waits must NOT
 /// abort on drain (in-flight analysts complete their turn), while the wrap-up
 /// MUST (the ticket's partial-report-not-delayed requirement).
@@ -1438,8 +1440,9 @@ struct AnalystRunOutcome<T> {
 }
 
 /// Run a single analyst agent on `task` and extract structured output `T`
-/// while the agent is alive (KV-cache reuse). Returns the extraction plus
-/// telemetry `(tool_calls, searches, queries)` from the session history.
+/// while the agent is alive (KV-cache reuse). Returns an [`AnalystRun<T>`]:
+/// telemetry `(tool_calls, searches, queries)` from the session history is
+/// folded into the `Findings`/`ParseFailed` outcome.
 ///
 /// `run_key` is the durable research job id — the sub-agent registers in the
 /// Running Agents view under the run's group. `question` is the run's

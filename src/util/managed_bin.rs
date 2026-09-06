@@ -1,9 +1,10 @@
 //! Generic managed-binary release mechanics shared by the rust-installed tool
 //! managers (chrome-use via `browser_daemon`, the managed bun runtime).
 //!
-//! These binaries are all installed into a *managed* directory that mahbot
-//! owns (never a user PATH-looked-up install), updated in place via an atomic
-//! swap, and verified against a SHA-256 checksum published with the release.
+//! These binaries are all installed into a location mahbot manages — the
+//! tool-standard user dir where one applies (bun: `~/.bun/bin`), never
+//! resolved through the user's PATH — updated in place via an atomic swap,
+//! and verified against a SHA-256 checksum published with the release.
 //! The helpers are release-format agnostic: the chrome-use installer reads a
 //! `<asset>.sha256` sidecar and a tar.gz archive, the bun installer reads a
 //! combined `SHASUMS256.txt` file and a zip archive — both share the same
@@ -240,7 +241,8 @@ pub(crate) fn extract_single_file_zip(
     Ok(out_path)
 }
 
-/// Force the executable bit on a freshly extracted/installed binary.
+/// Make a freshly extracted/installed binary executable by resetting its full
+/// mode to 0o755.
 #[cfg(unix)]
 pub(crate) fn set_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;

@@ -20,7 +20,8 @@
 //! 7. **Routing** — transcribed text is routed to the user's active role via
 //!    [`route_to_agent`] (falls back to the Manager if no active user is determined).
 //!
-//! The Assistant role manages this pipeline. It does NOT use an LLM agent loop.
+//! The pipeline runs unconditionally as a boot background task. It does NOT
+//! use an LLM agent loop.
 //! Transcribed commands are routed to the user's currently active role (resolved
 //! via [`route_to_agent`]) as if the user typed them.
 //!
@@ -411,7 +412,7 @@ fn process_wake_word_score(
 ///   adaptive threshold adjustment).
 /// - `adaptive_k` — multiplier for the adaptive threshold's standard-deviation
 ///   term (passed to [`AdaptiveThresholdState::feed`]/[`peek`]).
-pub(crate) fn score_single_embedding(
+fn score_single_embedding(
     embedding: &[f32],
     enrollment: Option<&WakeWordEnrollment>,
     score_window: &mut Vec<f32>,
@@ -942,10 +943,9 @@ pub(crate) fn is_speech_with_detector(
     };
 
     // Process each complete 256-sample frame (Earshot requires exactly 256
-    // samples per call at 16 kHz).  A typical call receives 512-sample frame
-    // (FRAME_LENGTH) from the wake-word / enrollment paths, which naturally
-    // splits into two 256-sample chunks.  Always process both chunks to keep
-    // the detector's sliding window in sync with the actual audio stream.
+    // samples per call at 16 kHz).  Callers pass one HOP_LENGTH (256-sample)
+    // hop; longer slices are chunked at 256 so the detector's sliding window
+    // stays in sync with the actual audio stream.
     for chunk in samples.as_chunks::<256>().0 {
         if detector.predict_f32(&clamp_frame(chunk)) >= threshold {
             any_speech = true;
@@ -1955,8 +1955,9 @@ pub(crate) struct PipelineCtx {
     #[cfg(feature = "voice-tests")]
     pub(crate) injected_vad: Option<earshot::Detector>,
     /// Raw audio ring for wake-word detection.  Accumulates raw mic samples
-    /// (no AGC/NS) capped at [`AUDIO_BUFFER_MAX`]; the trailing ≤1 s window
-    /// is encoded for scoring.
+    /// (no AGC/NS) capped at [`AUDIO_BUFFER_MAX`]; the VAD frame loop walks it
+    /// via [`vad_cursor`], and scoring encodes the VAD-gated
+    /// [`speech_window`] — never this buffer.
     audio_buffer: Vec<f32>,
     /// VAD-gated speech-only window for encoder scoring.
     ///
@@ -1970,8 +1971,9 @@ pub(crate) struct PipelineCtx {
     speech_window: Vec<f32>,
     /// Number of samples at the FRONT of [`audio_buffer`] already consumed by
     /// the VAD frame loop.  The VAD loop advances this cursor instead of
-    /// draining the ring, so the trailing ≤1 s window remains available for
-    /// the encoder even after every frame has been VAD-checked.
+    /// draining the ring, so the ring retains the pre-wake raw context for
+    /// the detection→recording handoff even after every frame has been
+    /// VAD-checked.
     vad_cursor: usize,
     /// Samples processed since the last window encoding (scoring step).
     /// Reset to 0 after each encode; when it reaches [`SCORE_STRIDE_SAMPLES`]
@@ -3730,15 +3732,15 @@ fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> usize {
 ///    [`PipelineCtx::audio_buffer`], capped at [`AUDIO_BUFFER_MAX`].
 /// 3. **VAD-gated frame loop** — each [`HOP_LENGTH`] hop is fed to the global
 ///    earshot VAD detector; per-segment silence is counted and
-///    [`PipelineCtx::reset_detection_segment`] fires at
-///    [`SEGMENT_TIMEOUT_HOPS`].  No mel frames are built — the raw ring is
-///    the encoder input.
+///    [`PipelineCtx::handle_segment_boundary`] resets the segment at
+///    [`SEGMENT_TIMEOUT_HOPS`] (only when not recording).  No mel frames are
+///    built — the raw ring is only the VAD input.
 /// 4. **Window encoding + scoring** — when [`SCORE_STRIDE_SAMPLES`] samples
 ///    have been processed since the last scoring step AND speech was seen in
 ///    this call (or the rolling window is mid-utterance), the trailing ≤1 s
-///    of the ring is encoded through the shared Qwen3-ASR encoder
-///    ([`crate::audio::wake_word::encode_window`]) and scored via
-///    [`score_single_embedding`].
+///    of the VAD-gated [`PipelineCtx::speech_window`] is encoded through the
+///    shared Qwen3-ASR encoder ([`crate::audio::wake_word::encode_window`])
+///    and scored via [`score_single_embedding`].
 /// 5. **Detection→recording handoff** — on detection the ring is moved into
 ///    [`PipelineCtx::command_buffer`] with a Soft reset so recording starts
 ///    with the pre-wake context.
@@ -3769,11 +3771,11 @@ pub(crate) fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx)
     // feeding each frame's NEW HOP_LENGTH samples to the global VAD detector
     // (the 512-sample frame overlaps the previous by 256 samples; feeding the
     // full frame would double-feed overlapping audio and corrupt earshot's
-    // internal ring buffer).  No mel frames are built — the raw ring is the
-    // encoder input, so the VAD loop only tracks speech presence and
-    // per-segment silence.  The ring is NOT drained here: `vad_cursor`
-    // advances instead, keeping the trailing ≤1 s window available for the
-    // encoder even after every frame has been VAD-checked.
+    // internal ring buffer).  No mel frames are built — the VAD loop only
+    // tracks speech presence and per-segment silence; scoring encodes the
+    // VAD-gated `speech_window`, not this ring.  The ring is NOT drained
+    // here: `vad_cursor` advances instead, so on detection the ring still
+    // holds the pre-wake raw context for the recording handoff (step 5).
     let mut speech_seen_this_call = false;
     // Side-channel for consecutive VAD-negative hop tracking, seeded with the
     // accumulated count from previous calls so the counter is continuous.

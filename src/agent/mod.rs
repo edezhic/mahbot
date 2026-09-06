@@ -401,9 +401,8 @@ pub(crate) fn role_chat_params(role: crate::Role) -> RoleChatParams {
 /// Build the byte-relevant chat params (model, tools, reasoning_effort,
 /// routing, max_tokens) for a role. The model/routing/reasoning_effort
 /// triplet comes from [`role_chat_params`] — the single source also used by
-/// [`Agent::build_chat_request`], the research wrap-up snapshot
-/// ([`crate::tools::research::research_params`]),
-/// [`crate::tools::research::orchestrator_params`],
+/// [`Agent::build_chat_request`], the research wrap-up snapshot and
+/// orchestrator params (both in [`crate::tools::research`]),
 /// [`crate::pipeline::verdict::synthesis_request`], and
 /// [`crate::tools::analyze::consolidate_findings`] — so every consumer derives
 /// the same triplet for a role. `meta` is telemetry-only (never part of the
