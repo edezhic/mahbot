@@ -86,7 +86,7 @@ pub fn run_wake_word_benchmark() {
 // Constants
 
 /// Target sample rate: 16 kHz mono.
-pub const SAMPLE_RATE: u32 = 16_000;
+pub(crate) const SAMPLE_RATE: u32 = 16_000;
 
 /// Convert a sample count to milliseconds (truncating integer division —
 /// callers rely on exact threshold semantics).
@@ -108,12 +108,12 @@ pub(crate) const HOP_LENGTH: usize = 256;
 const MAX_RECORD_SECS: usize = 600;
 
 /// Minimum silence duration before stopping command recording.
-pub(crate) const COMMAND_SILENCE_DURATION: Duration = Duration::from_millis(1500);
+const COMMAND_SILENCE_DURATION: Duration = Duration::from_millis(1500);
 
 /// Silence threshold in audio samples at 16 kHz.
 /// Derived from COMMAND_SILENCE_DURATION × SAMPLE_RATE to prevent silent drift
 /// if either constant changes.
-pub(crate) const SILENCE_THRESHOLD_SAMPLES: usize =
+const SILENCE_THRESHOLD_SAMPLES: usize =
     (COMMAND_SILENCE_DURATION.as_millis() as usize * SAMPLE_RATE as usize) / 1000;
 
 /// Enrollment/segmentation silence threshold (~304ms = 19 hops × 256 samples).
@@ -123,7 +123,7 @@ pub(crate) const SILENCE_THRESHOLD_SAMPLES: usize =
 /// The longer [`SILENCE_THRESHOLD_SAMPLES`] is preserved for command recording
 /// (`handle_recording_audio`) where 1.5s is appropriate for natural command
 /// phrasing pauses.
-pub(crate) const ENROLLMENT_SILENCE_THRESHOLD_SAMPLES: usize = SEGMENT_TIMEOUT_HOPS * HOP_LENGTH;
+const ENROLLMENT_SILENCE_THRESHOLD_SAMPLES: usize = SEGMENT_TIMEOUT_HOPS * HOP_LENGTH;
 
 /// Silence threshold (200ms) before showing "Keep silent to confirm…" UI hint.
 /// Intentionally wider than a single frame (16ms) so the UI reliably transitions
@@ -161,7 +161,7 @@ const ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES: usize =
         / (HOP_LENGTH * 1000);
 
 /// Default wake word phrase used when no phrase has been specified.
-pub(crate) const DEFAULT_WAKE_WORD_PHRASE: &str = "mahbot";
+const DEFAULT_WAKE_WORD_PHRASE: &str = "mahbot";
 
 /// Consecutive VAD-negative hops before a detection segment boundary fires
 /// (~300 ms at 16 ms/hop).  The rolling score window and adaptive threshold
@@ -246,7 +246,7 @@ const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
 /// Bounded detection window: the trailing 0.76 s (12 160 samples) of the
 /// VAD-gated speech window — the same [`WINDOW_SAMPLES`] geometry enrollment
 /// uses ([`crate::audio::wake_word::encode_window`]).
-pub(crate) const WAKE_WORD_WINDOW_SAMPLES: usize = WINDOW_SAMPLES;
+const WAKE_WORD_WINDOW_SAMPLES: usize = WINDOW_SAMPLES;
 
 /// Scoring stride in samples: 16 mel frames × 160-sample mel stride = 2560
 /// samples ≈ 160 ms.  The encoder forward is heavy, so the stride is widened
@@ -491,7 +491,7 @@ const VAD_THRESHOLD: f32 = 0.5;
 /// during enrollment (~0ms at 16ms/frame).  Set to 1 to match streaming
 /// detection behavior, which starts accumulating at the first VAD-positive
 /// frame.
-pub(crate) const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
+const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
 
 // Neural VAD (Earshot) — replaces RMS-based `is_speech`
 
@@ -561,6 +561,15 @@ fn resolved_model_status(
     } else {
         VoiceStatus::LoadingModels
     }
+}
+
+/// Current resolved status from the live local-transcriber state machine.
+fn current_model_status() -> VoiceStatus {
+    resolved_model_status(
+        crate::audio::local_transcriber::is_loaded(),
+        crate::audio::local_transcriber::is_failed(),
+        is_enabled(),
+    )
 }
 
 // Voice pipeline status (shared between pipeline task and GUI)
@@ -774,7 +783,6 @@ pub enum VoiceCommand {
     /// timer is parked because transcription is disabled — the loop re-reads
     /// config and re-resolves status / auto-start here.
     ConfigChanged,
-    Shutdown,
 }
 
 fn voice_state() -> &'static RwLock<VoicePipelineState> {
@@ -970,6 +978,20 @@ fn is_speech_with_threshold(samples: &[f32], threshold: f32) -> bool {
     let detector = VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
     let mut detector = detector.lock().unwrap_poison();
     is_speech_with_detector(samples, &mut detector, threshold)
+}
+
+/// Enrollment/negatives VAD decision: prefer the context-local detector to
+/// avoid mode-transition state contamination; fall back to the global
+/// detector path when the enrollment VAD is not initialized (defensive).
+fn enrollment_is_speech(
+    enrollment_vad: &mut Option<earshot::Detector>,
+    threshold: f32,
+    hop: &[f32],
+) -> bool {
+    match enrollment_vad {
+        Some(det) => is_speech_with_detector(hop, det, threshold),
+        None => is_speech_with_threshold(hop, threshold),
+    }
 }
 
 /// Reset the Earshot VAD detector's internal state (ring buffer, feature
@@ -1194,10 +1216,7 @@ async fn transcribe_audio(samples: &[f32]) -> Result<String> {
 ///   first sustained speech detection.  `None` falls back to
 ///   energy-based SNR estimation.
 #[expect(clippy::cast_precision_loss)]
-pub(crate) fn compute_utterance_quality(
-    samples: &[f32],
-    noise_rms: Option<f32>,
-) -> UtteranceQuality {
+fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> UtteranceQuality {
     let duration_ms = samples_to_ms(samples.len(), SAMPLE_RATE);
 
     // ── Clipping detection ───────────────────────────────────────────
@@ -1405,7 +1424,7 @@ pub fn enrollment_prompt_for_sample(sample: usize) -> &'static str {
 /// sites into a single struct.  This reduces the function signature from 8 to
 /// 3 parameters and makes the call sites more resilient to parameter-order
 /// changes.
-pub(crate) struct VadSegmentationConfig {
+struct VadSegmentationConfig {
     /// Frame size in samples (typically [`FRAME_LENGTH`] = 512).
     frame_length: usize,
     /// Frame stride in samples (typically [`HOP_LENGTH`] = 256).
@@ -1427,7 +1446,7 @@ pub(crate) struct VadSegmentationConfig {
 ///
 /// Silence threshold uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (~304ms)
 /// aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`].
-pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
+const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
     frame_length: FRAME_LENGTH,
     hop_length: HOP_LENGTH,
     consecutive_required: ENROLLMENT_VAD_CONSECUTIVE_REQUIRED,
@@ -1470,7 +1489,7 @@ pub(crate) const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSeg
 ///
 /// A list of utterance segments (raw audio samples, **not** VAD-subsampled),
 /// in detection order.
-pub(crate) fn segment_utterances_by_vad(
+fn segment_utterances_by_vad(
     raw_audio: &[f32],
     vad_decisions: &[bool],
     config: &VadSegmentationConfig,
@@ -3150,11 +3169,7 @@ pub async fn run_voice_pipeline() {
     if transcription_disabled {
         set_status(VoiceStatus::Disabled);
     } else {
-        set_status(resolved_model_status(
-            crate::audio::local_transcriber::is_loaded(),
-            crate::audio::local_transcriber::is_failed(),
-            is_enabled(),
-        ));
+        set_status(current_model_status());
     }
 
     let mut ctx = PipelineCtx::new();
@@ -3243,18 +3258,14 @@ pub async fn run_voice_pipeline() {
                             if is_enabled() && !ctx.is_listening {
                                 ctx.auto_start_pending = true;
                             }
-                            set_status(resolved_model_status(
-                                crate::audio::local_transcriber::is_loaded(),
-                                crate::audio::local_transcriber::is_failed(),
-                                is_enabled(),
-                            ));
+                            set_status(current_model_status());
                             // Fire StartListening immediately if models are ready;
                             // otherwise the pending flag keeps it armed so the
                             // (re-armed) periodic tick starts it once loaded.
                             ctx.check_auto_start();
                         }
                     }
-                    Some(VoiceCommand::Shutdown) | None => break,
+                    None => break,
                 }
             }
 
@@ -3346,11 +3357,7 @@ pub async fn run_voice_pipeline() {
                         set_status(VoiceStatus::ModelError);
                     }
                 } else if matches!(get_status(), VoiceStatus::LoadingModels) {
-                    let resolved = resolved_model_status(
-                        crate::audio::local_transcriber::is_loaded(),
-                        crate::audio::local_transcriber::is_failed(),
-                        is_enabled(),
-                    );
+                    let resolved = current_model_status();
                     if !matches!(resolved, VoiceStatus::LoadingModels) {
                         set_status(resolved);
                     }
@@ -3959,23 +3966,15 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
     while consumed + FRAME_LENGTH <= len {
         let frame = &ctx.audio_buffer[consumed..consumed + FRAME_LENGTH];
 
-        // ── Accumulate VAD decision for extracted function ──
-        //
         // Feed only the NEW HOP_LENGTH samples (not the full 512-sample
-        // frame) to avoid double-feeding overlapping audio to earshot's
-        // VAD detector.  Each frame overlaps the previous by 50%
-        // (= HOP_LENGTH), so feeding the full frame duplicates 256 samples,
-        // corrupting earshot's internal ring buffer, pre-emphasis filter,
-        // and feature context.
-        //
-        // Uses the context-specific enrollment VAD detector
-        // to prevent mode-transition state contamination.  Falls back to the
-        // global detector if the enrollment VAD is not initialized (defensive).
-        let is_speech = if let Some(ref mut det) = ctx.enrollment_vad {
-            is_speech_with_detector(&frame[..HOP_LENGTH], det, ctx.vad_threshold)
-        } else {
-            is_speech_with_threshold(&frame[..HOP_LENGTH], ctx.vad_threshold)
-        };
+        // frame) to avoid double-feeding overlapping audio into earshot's
+        // internal state; prefer the context-local detector with a
+        // global-detector fallback (see [`enrollment_is_speech`]).
+        let is_speech = enrollment_is_speech(
+            &mut ctx.enrollment_vad,
+            ctx.vad_threshold,
+            &frame[..HOP_LENGTH],
+        );
         ctx.frame_vad.push(is_speech);
 
         if is_speech {
@@ -4079,7 +4078,7 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 if silence_ui_check < SILENCE_UI_GATE_SAMPLES {
                     set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
                 }
-            } else if !ctx.utterance_had_speech {
+            } else {
                 // Accumulate non-VAD audio for negatives:
                 // pre-enrollment ambient noise, inter-utterance silence, or
                 // any non-wake-word audio between utterances.  Each frame
@@ -4328,13 +4327,7 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
         ctx.phase3_processed,
         ctx.phase3_silence_samples,
         ctx.negatives_speech_samples,
-        |hop| {
-            if let Some(ref mut det) = ctx.enrollment_vad {
-                is_speech_with_detector(hop, det, ctx.vad_threshold)
-            } else {
-                is_speech_with_threshold(hop, ctx.vad_threshold)
-            }
-        },
+        |hop| enrollment_is_speech(&mut ctx.enrollment_vad, ctx.vad_threshold, hop),
     );
     ctx.phase3_processed = progress.processed;
     ctx.phase3_silence_samples = progress.silence_samples;
@@ -4786,68 +4779,110 @@ mod tests {
     // Covers bootstrap phase, mean/std computation, all safeguards, and reset.
 
     #[test]
-    fn adaptive_after_bootstrap_returns_some() {
+    fn adaptive_bootstrap_boundary_and_safe_harbor_clamp() {
         let harbor = legacy_geometry().static_threshold;
+
+        // bootstrap boundary: every feed during bootstrap returns None; the
+        // frame that completes bootstrap returns Some.
         let mut state = AdaptiveThresholdState::new();
         for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             assert!(
                 state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
-                "frame {i} should return None during bootstrap",
+                "bootstrap: feed frame {i} should return None",
             );
         }
-        let result = state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        assert!(result.is_some(), "should return Some after bootstrap");
-    }
+        assert!(
+            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_some(),
+            "bootstrap: feed should return Some after bootstrap",
+        );
 
-    #[test]
-    fn adaptive_safe_harbor_enforced() {
-        // Low, constant scores produce a low adaptive value that must be
-        // overridden by the safe harbor (the caller's static detection
-        // threshold).
-        let harbor = legacy_geometry().static_threshold;
+        // safe-harbor clamp: constant low scores (0.1) yield a low adaptive
+        // value (~0.3) that must be overridden by the caller's static
+        // detection threshold.
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.1, ADAPTIVE_K_DEFAULT, harbor);
         }
-        // adaptive = (0.1 + 2.5 × 0.0) × 3 = 0.3 → well below safe harbor (1.65)
-        let result = state.feed(0.1, ADAPTIVE_K_DEFAULT, harbor);
-        let threshold = result.expect("should return Some after bootstrap");
+        let threshold = state
+            .feed(0.1, ADAPTIVE_K_DEFAULT, harbor)
+            .expect("should return Some after bootstrap");
         assert!(
             (threshold - harbor).abs() < 0.01,
-            "with constant low score, threshold {threshold} should equal safe harbor {harbor}",
+            "safe-harbor clamp: threshold {threshold} should equal safe harbor {harbor}",
         );
     }
 
     #[test]
-    fn adaptive_ceiling_enforced() {
-        // Very high-variance scores produce a high adaptive value that
-        // should be capped by the ceiling.  With alternating 1.0/0.0
-        // scores: mean=0.5, std≈0.5, k=2.5:
-        //   adaptive = (0.5 + 2.5 × 0.5) × 3 = 5.25
-        // Capped by ceiling 2.60 (re-calibrated for the cosine soft space).
+    fn adaptive_ceiling_and_window_eviction() {
         let harbor = legacy_geometry().static_threshold;
+
+        // ceiling clamp: high-variance scores cap at ADAPTIVE_CEILING. With
+        // alternating 1.0/0.0 scores: mean=0.5, std≈0.5, k=2.5, so
+        // adaptive = (0.5 + 2.5 × 0.5) × 3 = 5.25 → capped at 2.60.
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.99, ADAPTIVE_K_DEFAULT, harbor);
         }
-        // Fill window with alternating 1.0/0.0 scores to create variance.
         for i in ADAPTIVE_BOOTSTRAP_FRAMES..ADAPTIVE_WINDOW_N {
             let score = if i % 2 == 0 { 1.0 } else { 0.0 };
             state.feed(score, ADAPTIVE_K_DEFAULT, harbor);
         }
-        let result = state.feed(1.0, ADAPTIVE_K_DEFAULT, harbor);
-        let threshold = result.expect("should return Some after bootstrap");
+        let threshold = state
+            .feed(1.0, ADAPTIVE_K_DEFAULT, harbor)
+            .expect("should return Some after bootstrap");
         assert!(
             (threshold - ADAPTIVE_CEILING).abs() < 0.01,
-            "with high-variance scores, threshold {threshold} should equal ceiling {ADAPTIVE_CEILING}",
+            "ceiling clamp: threshold {threshold} should equal ceiling {ADAPTIVE_CEILING}",
+        );
+
+        // window eviction: after filling the window and cycling scores, the
+        // sum/sum_sq statistics must produce the correct mean (k=0 so the
+        // adaptive value is mean × ROLLING_WINDOW_N, clamped to [harbor, ceiling]).
+        let mut state = AdaptiveThresholdState::new();
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
+        }
+        for _ in ADAPTIVE_BOOTSTRAP_FRAMES..ADAPTIVE_WINDOW_N {
+            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
+        }
+        #[expect(clippy::cast_precision_loss)] // small test constants — exact in f32
+        let window_n = ADAPTIVE_WINDOW_N as f32;
+        #[expect(clippy::cast_precision_loss)] // small test constant — exact in f32
+        let rolling_n = ROLLING_WINDOW_N as f32;
+        let expected_mean = (window_n - 1.0) * 0.5 / window_n + 1.0 / window_n;
+        let threshold = state.feed(1.0, 0.0, harbor).expect("should return Some");
+        let expected_raw = expected_mean * rolling_n;
+        let clamped = expected_raw.clamp(harbor, ADAPTIVE_CEILING);
+        assert!(
+            (threshold - clamped).abs() < 0.001,
+            "window eviction: threshold {threshold} should match expected clamped value {clamped} (raw={expected_raw})",
         );
     }
 
     #[test]
-    fn adaptive_reset_clears_state() {
+    fn adaptive_warmed_clamps_to_safe_harbor() {
+        // warmed() initializes with near-silence scores (~0.033). The
+        // computed adaptive threshold (0.033 + 2.5 × 0.0) × 3 = 0.099 should
+        // be clamped to the safe harbor (1.65), matching production where the
+        // threshold is fed real silence/background scores.
+        let harbor = legacy_geometry().static_threshold;
+        let mut state = AdaptiveThresholdState::warmed(harbor);
+        let threshold = state
+            .feed(0.033, ADAPTIVE_K_DEFAULT, harbor)
+            .expect("warmed() should exit bootstrap");
+        assert!(
+            (threshold - harbor).abs() < 0.01,
+            "warmed(): threshold {threshold} should equal safe harbor {harbor}",
+        );
+        // Verify all bootstrap frames were fed the near-silence score and not
+        // 0.5 (which would produce threshold ~1.5 instead of 1.65).
+        assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
+    }
+
+    #[test]
+    fn adaptive_reset_clears_state_and_peek_empty() {
         let harbor = legacy_geometry().static_threshold;
         let mut state = AdaptiveThresholdState::new();
-        // Advance past bootstrap.
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
         }
@@ -4856,140 +4891,34 @@ mod tests {
 
         state.reset();
 
-        assert_eq!(state.len(), 0, "window should be empty after reset");
+        assert_eq!(state.len(), 0, "reset: window should be empty");
         assert!(
             state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
-            "after reset, first feed should return None (re-enters bootstrap)",
+            "reset: first feed should return None (re-enters bootstrap)",
+        );
+        assert!(
+            state.peek(ADAPTIVE_K_DEFAULT, harbor).is_none(),
+            "reset: peek should return None (empty window)",
         );
     }
 
     #[test]
-    fn adaptive_warmed_clamps_to_safe_harbor() {
-        // warmed() initializes with near-silence scores (~0.033).
-        // The computed adaptive threshold (0.033 + 2.5 × 0.0) × 3 = 0.099
-        // should be clamped to the safe harbor (1.65), matching production
-        // where the threshold is fed real silence/background scores.
+    fn adaptive_peek_does_not_mutate_and_agrees_with_feed() {
         let harbor = legacy_geometry().static_threshold;
-        let mut state = AdaptiveThresholdState::warmed(harbor);
-        let threshold = state
-            .feed(0.033, ADAPTIVE_K_DEFAULT, harbor)
-            .expect("warmed() should exit bootstrap");
-        assert!(
-            (threshold - harbor).abs() < 0.01,
-            "warmed() threshold {threshold} should equal safe harbor {harbor}",
-        );
-        // Verify that all bootstrap frames were fed the near-silence score
-        // and not 0.5 (which would produce threshold ~1.5 instead of 1.65).
-        assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
-    }
 
-    #[test]
-    fn adaptive_window_eviction_correctness() {
-        // After filling the window and cycling scores, verify the sum/sum_sq
-        // statistics produce the correct mean.
-        let harbor = legacy_geometry().static_threshold;
-        let mut state = AdaptiveThresholdState::new();
-        // Bootstrap with 0.5.
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        // Fill remaining window slots with 0.5.
-        for _ in ADAPTIVE_BOOTSTRAP_FRAMES..ADAPTIVE_WINDOW_N {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        // Window now has ADAPTIVE_WINDOW_N entries, all 0.5.
-        // Feed 1.0 to trigger eviction of oldest (0.5).
-        // New window: (ADAPTIVE_WINDOW_N - 1) × 0.5 + 1 × 1.0
-        // mean = ((ADAPTIVE_WINDOW_N - 1) * 0.5 + 1.0) / ADAPTIVE_WINDOW_N
-        #[expect(clippy::cast_precision_loss)] // small test constants — exact in f32
-        let window_n = ADAPTIVE_WINDOW_N as f32;
-        #[expect(clippy::cast_precision_loss)] // small test constant — exact in f32
-        let rolling_n = ROLLING_WINDOW_N as f32;
-        let expected_mean = (window_n - 1.0) * 0.5 / window_n + 1.0 / window_n;
-        let result = state.feed(1.0, 0.0, harbor); // k=0 so adaptive = mean × ROLLING_WINDOW_N
-        let threshold = result.expect("should return Some");
-        // After eviction: mean ≈ 0.533, adaptive = 0.533 * 3 = 1.6, clamped
-        // to the safe harbor 1.65.
-        let expected_raw = expected_mean * rolling_n;
-        let clamped = expected_raw.clamp(harbor, ADAPTIVE_CEILING);
-        assert!(
-            (threshold - clamped).abs() < 0.001,
-            "threshold {threshold} should match expected clamped value {clamped} (raw={expected_raw})",
-        );
-    }
-
-    // ── AdaptiveThresholdState::peek() tests ──────────────────────────────
-    // Tests for the peek() method which returns the current threshold without
-    // updating statistics.  Covers bootstrap guard, empty-window check,
-    // threshold correctness, and the no-mutation invariant.
-
-    #[test]
-    fn adaptive_peek_bootstrap_boundary_and_safe_harbor() {
-        // peek() should return None during bootstrap, just like feed().
-        // On the last bootstrap frame, feed() increments bootstrap_count
-        // past the threshold, so peek() returns Some (bootstrap done).
-        let harbor = legacy_geometry().static_threshold;
-        let mut state = AdaptiveThresholdState::new();
-        // First ADAPTIVE_BOOTSTRAP_FRAMES - 1 frames: both feed and peek return None.
-        for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES - 1 {
-            assert!(
-                state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
-                "feed frame {i} should be None during bootstrap",
-            );
-            assert!(
-                state.peek(ADAPTIVE_K_DEFAULT, harbor).is_none(),
-                "peek frame {i} should be None during bootstrap",
-            );
-        }
-        // Last bootstrap frame: feed returns None (completes bootstrap),
-        // but peek returns Some because feed already incremented bootstrap_count.
-        assert!(
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
-            "last feed during bootstrap should return None",
-        );
-        assert!(
-            state.peek(ADAPTIVE_K_DEFAULT, harbor).is_some(),
-            "peek should return Some after bootstrap is complete",
-        );
-
-        // After bootstrap completes, peek() returns a threshold.  Use low
-        // scores (0.1) so the computed adaptive value (~0.3) stays below the
-        // safe harbor (1.65), verifying that peek() produces a clamped
-        // threshold rather than a raw adaptive value.
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.1, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        let threshold = state
-            .peek(ADAPTIVE_K_DEFAULT, harbor)
-            .expect("peek should return Some after bootstrap");
-        assert!(
-            (threshold - harbor).abs() < 0.01,
-            "peek threshold {threshold} should equal safe harbor {harbor} with constant low input",
-        );
-    }
-
-    #[test]
-    fn adaptive_peek_does_not_mutate_state() {
-        // Calling peek() must not change scores, sum, sum_sq, or bootstrap_count.
-        let harbor = legacy_geometry().static_threshold;
+        // peek() must not change scores, sum, sum_sq, or bootstrap_count.
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
         }
-        // Feed one more to have a non-bootstrap state.
-        state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-
+        state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor); // non-bootstrap state
         let before_scores = state.scores.clone();
         let before_sum = state.sum;
         let before_sum_sq = state.sum_sq;
         let before_bootstrap = state.bootstrap_count;
-
-        // Call peek multiple times.
         for _ in 0..3 {
             let _ = state.peek(ADAPTIVE_K_DEFAULT, harbor);
         }
-
         assert_eq!(state.scores, before_scores, "peek must not modify scores");
         assert!(
             (state.sum - before_sum).abs() < f32::EPSILON,
@@ -5003,24 +4932,62 @@ mod tests {
             state.bootstrap_count, before_bootstrap,
             "peek must not modify bootstrap_count",
         );
-    }
 
-    #[test]
-    fn adaptive_peek_empty_after_reset() {
-        // After reset, peek() must return None (empty window).
-        let harbor = legacy_geometry().static_threshold;
+        // peek() agrees with feed() on the same state.
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
         }
-        assert!(state.peek(ADAPTIVE_K_DEFAULT, harbor).is_some());
-        state.reset();
-        assert!(state.peek(ADAPTIVE_K_DEFAULT, harbor).is_none());
+        state.feed(0.7, ADAPTIVE_K_DEFAULT, harbor);
+        let feed_threshold = state.feed(0.3, ADAPTIVE_K_DEFAULT, harbor);
+        let peek_threshold = state.peek(ADAPTIVE_K_DEFAULT, harbor);
+        assert_eq!(
+            feed_threshold, peek_threshold,
+            "peek must agree with feed on the same state",
+        );
     }
 
     #[test]
-    fn adaptive_peek_threshold_in_valid_range() {
+    fn adaptive_peek_bootstrap_boundary_and_threshold_range() {
         let harbor = legacy_geometry().static_threshold;
+
+        // peek() returns None during bootstrap like feed(); on the last
+        // bootstrap frame feed() increments bootstrap_count past the threshold
+        // so peek() is Some.
+        let mut state = AdaptiveThresholdState::new();
+        for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES - 1 {
+            assert!(
+                state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
+                "bootstrap: feed frame {i} should be None",
+            );
+            assert!(
+                state.peek(ADAPTIVE_K_DEFAULT, harbor).is_none(),
+                "bootstrap: peek frame {i} should be None",
+            );
+        }
+        assert!(
+            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
+            "bootstrap: last feed should be None",
+        );
+        assert!(
+            state.peek(ADAPTIVE_K_DEFAULT, harbor).is_some(),
+            "bootstrap: peek should be Some after bootstrap completed",
+        );
+
+        // peek() clamps to safe harbor on constant low scores (0.1).
+        let mut state = AdaptiveThresholdState::new();
+        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
+            state.feed(0.1, ADAPTIVE_K_DEFAULT, harbor);
+        }
+        let threshold = state
+            .peek(ADAPTIVE_K_DEFAULT, harbor)
+            .expect("peek should return Some after bootstrap");
+        assert!(
+            (threshold - harbor).abs() < 0.01,
+            "safe-harbor clamp: peek threshold {threshold} should equal safe harbor {harbor}",
+        );
+
+        // peek() threshold must lie within [harbor, ceiling].
         let mut state = AdaptiveThresholdState::new();
         for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
             state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
@@ -5030,21 +4997,8 @@ mod tests {
             .expect("Some after bootstrap");
         assert!(
             (harbor..=ADAPTIVE_CEILING).contains(&threshold),
-            "peek threshold {threshold} must be within [{harbor}, {ADAPTIVE_CEILING}]",
+            "valid range: peek threshold {threshold} must be within [{harbor}, {ADAPTIVE_CEILING}]",
         );
-    }
-
-    #[test]
-    fn adaptive_peek_agrees_with_feed_on_same_state() {
-        let harbor = legacy_geometry().static_threshold;
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        state.feed(0.7, ADAPTIVE_K_DEFAULT, harbor);
-        let feed_threshold = state.feed(0.3, ADAPTIVE_K_DEFAULT, harbor);
-        let peek_threshold = state.peek(ADAPTIVE_K_DEFAULT, harbor);
-        assert_eq!(feed_threshold, peek_threshold);
     }
 
     // ── process_wake_word_score tests ───────────────────────────────────
