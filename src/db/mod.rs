@@ -2191,9 +2191,9 @@ enum RepairOutcome {
 
 /// Open with the schema, then run the class-B btree-index repair (boot path
 /// only — single-writer, exclusive access before any live traffic). This
-/// runs a full quick_check on every store at every boot (7× full-DB scans,
-/// plus a verification scan after a repair) — the fixed boot cost of the
-/// repair-at-init design.
+/// runs a full quick_check per store it opens (2 physical stores → 2 full-DB
+/// scans, plus a verification scan after a repair) — the fixed boot cost of
+/// the repair-at-init design.
 async fn open_and_repair(db_path: &Path, name: &str, schema: &str) -> anyhow::Result<Connection> {
     let conn = match open_with_schema(db_path, schema).await {
         Ok(conn) => conn,

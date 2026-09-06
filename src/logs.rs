@@ -305,8 +305,8 @@ enum OpenFailure {
 async fn open_verified_logs_store(root: &Path) -> Result<crate::db::Connection, OpenFailure> {
     let db_path = db::store_db_path(root, "logs");
     // The boot path (a pre-flight diagnosis exists) already ran quick_check
-    // inside open_and_repair — the verify below would duplicate the 7× boot
-    // scan for the logs store. Non-boot opens (tests) verify here.
+    // inside open_and_repair — the verify below would duplicate the logs
+    // store's boot scan. Non-boot opens (tests) verify here.
     let boot_verified = crate::db::wal_guard::has_boot_diagnosis(&db_path);
     let open = AssertUnwindSafe(crate::db::open_store(root, "logs", ""))
         .catch_unwind()
