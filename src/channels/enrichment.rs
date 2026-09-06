@@ -18,8 +18,8 @@
 //! to plain-text annotations and are never read, transcribed, copied into
 //! workspace uploads, or deleted.
 //!
-//! The public entry points are [`enrich_message`] and [`enrich_links`],
-//! re-exported from [`crate::channels`]. The [`EnrichmentStrategy`] struct
+//! The public entry points are [`enrich_message`], [`enrich_links`], and
+//! [`has_only_audio_markers`], re-exported from [`crate::channels`]. The [`EnrichmentStrategy`] struct
 //! carries the per-role knobs: image and video handling are unconditional
 //! (native data-URI parts for images, workspace copy + transcription for
 //! videos — every role), while image compression is role-dependent.

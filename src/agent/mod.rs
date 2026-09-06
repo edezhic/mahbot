@@ -2619,6 +2619,9 @@ fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'sta
 mod tests {
     use super::*;
     use crate::Tool;
+    use crate::util::test::{
+        FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
+    };
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 
@@ -3644,9 +3647,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn leader_first_call_failure_still_fires_signal() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -3696,7 +3696,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn sleep_call_ends_the_run_gracefully_and_flag_resets_on_reengage() {
-        use crate::util::test::{FakeProvider, install_fake_provider, retry_tests_lock};
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         // Script exactly ONE sleep tool call; a follow-up LLM call would pop
@@ -3850,9 +3849,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_recovers_reasoning_only_stop_via_continuation() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -3891,9 +3887,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_accumulates_tail_until_answer() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -3951,9 +3944,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_exhaustion_fails_safely_without_leaking() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4017,9 +4007,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_transport_error_does_not_duplicate_tail() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4072,9 +4059,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_non_retryable_error_breaks_immediately() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4148,9 +4132,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_exhaustion_does_not_update_session_length() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4189,9 +4170,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_continuation_success_records_only_resolving_usage() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4218,9 +4196,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn llm_call_skips_continuation_for_normal_and_tool_call_turns() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4260,9 +4235,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn summarize_recovers_reasoning_only_stop_via_continuation() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4294,9 +4266,6 @@ mod tests {
     #[serial_test::serial(provider)]
     #[expect(clippy::await_holding_lock)] // deliberate: retry_tests_lock() serializes process-global test seams
     async fn summarize_continuation_exhaustion_fails_open_without_leaking() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
@@ -4480,9 +4449,6 @@ mod tests {
     #[serial_test::serial(active_models)] // seeds the process-global catalog caches
     #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
     async fn rejected_input_image_is_stripped_and_run_continues() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         seed_empty_catalogs();
@@ -4570,9 +4536,6 @@ mod tests {
     #[serial_test::serial(active_models)] // seeds the process-global catalog caches
     #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
     async fn text_content_rejection_follows_normal_failure_path() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         seed_empty_catalogs();
@@ -4614,9 +4577,6 @@ mod tests {
     #[serial_test::serial(active_models)] // seeds the process-global catalog caches
     #[expect(clippy::await_holding_lock)] // retry_tests_lock serializes process-global test seams
     async fn subsequent_failure_after_strip_takes_normal_failure_path() {
-        use crate::util::test::{
-            FakeProvider, install_fake_provider, install_test_retry_policy, retry_tests_lock,
-        };
         let _lock = retry_tests_lock();
         crate::util::test::init_test_stores().await;
         seed_empty_catalogs();
