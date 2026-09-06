@@ -734,7 +734,7 @@ impl OpenAiCompatibleProvider {
 
         let mut extra = serde_json::Map::new();
 
-        // OpenRouter provider preferences — OpenRouter-only (req 7):
+        // OpenRouter provider preferences — OpenRouter-only:
         // the block has no meaning outside OpenRouter, so it is never sent to
         // custom endpoints. Per-request `data_collection: allow` overrides the
         // account-level strict privacy default so data-collecting paid endpoints
@@ -1211,7 +1211,7 @@ mod tests {
         );
     }
 
-    /// Provider routing is OpenRouter-only (req 7): asserted on
+    /// Provider routing is OpenRouter-only: asserted on
     /// the serialized request body at the builder choke point — the block is
     /// sent for the default endpoint and suppressed for a custom endpoint,
     /// while `reasoning_effort` is sent unchanged to the default endpoint and
@@ -1521,7 +1521,7 @@ mod tests {
             Omit
         );
 
-        // Requirement 2 — the OpenRouter path stays byte-identical: every
+        // The OpenRouter path stays byte-identical: every
         // family/effort passes through unchanged (no translation).
         let or_endpoint = crate::config::DEFAULT_PROVIDER_ENDPOINT;
         for (label, model, effort, _) in cases {

@@ -196,7 +196,7 @@ pub(crate) fn debug_db_names() -> Vec<&'static str> {
 /// other subsystem is ready. The stats tables (tool_calls, llm_requests)
 /// live in the logs store.
 ///
-/// # Consolidated layout (decision 1)
+/// # Consolidated layout
 ///
 /// The domain stores (`DOMAIN_STORE_NAMES`) now share ONE file
 /// ([`CONSOLIDATED_DB_NAME`]) and ONE shared [`Connection`] ([`DOMAIN_CONN`]) —
@@ -1824,7 +1824,7 @@ async fn execute_schema_ddl(conn: &Connection, sql: &str) -> anyhow::Result<()> 
 
 /// Resolve a logical store name to its physical database file path.
 ///
-/// # Consolidated layout (decision 1)
+/// # Consolidated layout
 ///
 /// The domain stores (`DOMAIN_STORE_NAMES`) are consolidated into ONE file
 /// ([`CONSOLIDATED_DB_NAME`]); the logs store remains its own file. So this

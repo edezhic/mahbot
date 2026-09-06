@@ -192,7 +192,7 @@ fn build_provider_and_transcriber(
 
 /// Initialize the global provider and transcriber singletons from CONFIG.
 ///
-/// Non-blocking by design (decision 4): the globals are swapped in
+/// Non-blocking by design: the globals are swapped in
 /// BEFORE the warmup HTTP round-trip so boot never waits on it (worst case the
 /// endpoint is blackholed for minutes — a failure is non-fatal, retries happen
 /// at request time). The warmup runs as a detached background task and only

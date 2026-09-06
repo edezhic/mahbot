@@ -7,7 +7,7 @@
 use crate::util::UnwrapPoison;
 
 #[derive(Clone)]
-pub struct MediaTranscriber {
+pub(crate) struct MediaTranscriber {
     api_url: String,
     model: String,
 }

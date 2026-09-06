@@ -29,7 +29,7 @@
 //! returns `None` and the init falls through to the download+verify recovery
 //! loop. Note the load is mmap-based, so partial corruption can survive the
 //! load and surface as a SIGBUS at inference rather than a graceful fallback —
-//! accepted tradeoff (ticket decision 1). Missing/corrupt files trigger the
+//! accepted tradeoff. Missing/corrupt files trigger the
 //! background retry loop with exponential backoff.
 //!
 //! # Audio format conversion
@@ -771,8 +771,8 @@ async fn load_from_cache(dir: PathBuf) -> Option<QwenLocalTranscriber> {
 /// download loop re-verifies already-present files on recovery). A silently
 /// corrupted cache is caught at load time instead: a `None` from
 /// [`load_from_cache`] falls through to the download+verify recovery loop.
-/// (Tradeoff: the mmap-based load can succeed on partial corruption — accepted
-/// per ticket decision 1; see module docs.)
+/// (Tradeoff: the mmap-based load can succeed on partial corruption —
+/// accepted; see module docs.)
 async fn try_init_inner(dir: PathBuf) -> bool {
     let model_path = dir.join(MODEL_FILENAME);
     let vocab_path = dir.join(VOCAB_FILENAME);
@@ -870,7 +870,7 @@ pub async fn try_init_from_cache() -> bool {
 }
 
 /// Kick off the local ASR transcriber's load-or-download chain as a background
-/// task (boot path, decisions 2/3).
+/// task (boot path).
 ///
 /// The boot path never awaits this: the app and background services start
 /// regardless, and the ~4 s model load (or a full download when the cache is

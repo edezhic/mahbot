@@ -8145,7 +8145,7 @@ mod tests {
             ("eval '\"t\"ouch /__mahbot_readonly_test_ws__/x'", false),
             ("eval '\"c\"d /etc' && touch f", false),
             // Fully-quoted mutators execute the unquoted command — the
-            // blocklist dispatch normalizes the verb (item 2).
+            // blocklist dispatch normalizes the verb.
             ("\"rm\" -rf /__mahbot_readonly_test_ws__", false),
             ("\"touch\" /__mahbot_readonly_test_ws__/x", false),
             ("\"cp\" /etc/passwd /__mahbot_readonly_test_ws__/out", false),
@@ -8175,7 +8175,7 @@ mod tests {
             ("\"env\" \"ls\" /tmp", true),
             ("\"env\" \"git\" status", true),
             // Brace-expansion verbs (`{touch,}` expands to `touch`) cannot be
-            // normalized to a single word — unprovable, rejected (item 2).
+            // normalized to a single word — unprovable, rejected.
             ("{touch,} f", false),
             ("{cp,} a b", false),
             ("{rm,} -rf /__mahbot_readonly_test_ws__", false),

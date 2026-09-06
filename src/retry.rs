@@ -87,6 +87,9 @@ pub(crate) const DEFAULT_SYNTHESIS_MAX_ATTEMPTS: u32 = 3;
 pub(crate) const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS: u64 = 30_000;
 pub(crate) const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS: u64 = 45_000;
 
+/// Fail-open comment-extraction attempt budget — see [`RetryPolicy::comment`].
+pub(crate) const DEFAULT_COMMENT_MAX_ATTEMPTS: u32 = 3;
+
 /// Dedicated reasoning-only-stop continuation schedule: up to 3 appended-only
 /// continuation re-requests after the original in-class response, bounded by
 /// the attempt count (the [`RetryPolicy::comment`] precedent) so a stuck
@@ -140,11 +143,7 @@ impl RetryPolicy {
     /// Resolve the policy for a scoped operation.
     #[must_use]
     pub(crate) fn current() -> Self {
-        #[cfg(test)]
-        if let Some(p) = test_override() {
-            return p;
-        }
-        Self::default()
+        Self::default().apply_test_override()
     }
 
     /// Build the joint-verdict synthesis policy from the hardcoded constants.
@@ -155,15 +154,12 @@ impl RetryPolicy {
     /// after at most 3 calls.
     #[must_use]
     pub(crate) fn synthesis() -> Self {
-        #[cfg(test)]
-        if let Some(p) = test_override() {
-            return p;
-        }
         Self {
             max_attempts: DEFAULT_SYNTHESIS_MAX_ATTEMPTS,
             base_backoff_ms: DEFAULT_SYNTHESIS_BASE_BACKOFF_MS,
             max_backoff_ms: DEFAULT_SYNTHESIS_MAX_BACKOFF_MS,
         }
+        .apply_test_override()
     }
 
     /// Build the comment-only extraction policy for fail-open callers: the
@@ -172,15 +168,12 @@ impl RetryPolicy {
     /// 13-attempt budget is for verdict gates).
     #[must_use]
     pub(crate) fn comment() -> Self {
-        #[cfg(test)]
-        if let Some(p) = test_override() {
-            return p;
-        }
         Self {
-            max_attempts: 3,
+            max_attempts: DEFAULT_COMMENT_MAX_ATTEMPTS,
             base_backoff_ms: DEFAULT_RETRY_BASE_BACKOFF_MS,
             max_backoff_ms: DEFAULT_RETRY_MAX_BACKOFF_MS,
         }
+        .apply_test_override()
     }
 
     /// Build the reasoning-only-stop continuation policy: bounded recovery for
@@ -195,15 +188,27 @@ impl RetryPolicy {
     /// loop never sleeps between attempts).
     #[must_use]
     pub(crate) fn continuation() -> Self {
-        #[cfg(test)]
-        if let Some(p) = test_override() {
-            return p;
-        }
         Self {
             max_attempts: DEFAULT_CONTINUATION_MAX_ATTEMPTS,
             base_backoff_ms: 0,
             max_backoff_ms: 0,
         }
+        .apply_test_override()
+    }
+
+    /// Test seam: in tests, the override installed via
+    /// [`swap_test_retry_policy`] takes precedence over the hardcoded
+    /// schedule so retry-loop tests don't sleep for minutes; otherwise
+    /// `self` applies unchanged. Poison-tolerant like the other test seams
+    /// ([`crate::util::test::retry_tests_lock`]): a failing test must not
+    /// cascade into later ones. A no-op outside tests.
+    #[must_use]
+    fn apply_test_override(self) -> Self {
+        #[cfg(test)]
+        if let Some(p) = test_override() {
+            return p;
+        }
+        self
     }
 }
 
@@ -212,11 +217,7 @@ impl RetryPolicy {
 #[cfg(test)]
 static TEST_POLICY_OVERRIDE: std::sync::RwLock<Option<RetryPolicy>> = std::sync::RwLock::new(None);
 
-/// In tests, the override installed via [`swap_test_retry_policy`] takes
-/// precedence so retry-loop tests don't sleep for minutes; otherwise the
-/// hardcoded defaults apply. Poison-tolerant like the other test seams
-/// ([`crate::util::test::retry_tests_lock`]): a failing test must not
-/// cascade into later ones.
+/// Read the installed test policy override, if any. Poison-tolerant.
 #[cfg(test)]
 fn test_override() -> Option<RetryPolicy> {
     let guard = TEST_POLICY_OVERRIDE.read().unwrap_poison();
